@@ -1,0 +1,412 @@
+TITLE	BIONIC - TEST INPUT FROM 2780 USING NETWORK REMOTE BATCH
+Subttl	Version and linkage info
+
+	Search MACTEN,JOBDAT,UUOSYM
+
+	VER==5				; Version
+	REL==0				; Release number
+	EDIT==0				; Edits as of version 5
+	
+	LOC 137
+	Byte (9) REL,VER (18) EDIT
+	RELOC
+
+Entry	GETCHR,GORUN
+Extern	RDNAM,CMDLP,OUTDEC
+
+Subttl	Definitions
+
+	T1=1				; temp ac 1
+	T2=2				; temp ac 2
+	T3=3				; temp ac 3
+	T4=4				; temp ac 4
+	C=6				; character pointer
+	PAGE=7				; page pointer
+	FL=16				; flags
+	P=17				; stack
+
+	FIL==1				; file channel
+	TTY==2				; tty channel
+	LOG==3				; log channel
+
+	CASSET==10			; Cassette device
+	D2780==13			; 2780 device code
+	CRLFLG==10			; Carriage-return flag
+	DTAFLG==100			; Data seen flag
+	CR==15				; Carriage-return
+	LF==12				; Line-Feed
+	Pattern==264551322645		; 0101-1010 bit pattern "ZZZZ"
+
+Subttl	Page offset definitions
+
+	loc 0
+
+LOGVER:	Block	1			; Logging version
+LOGLOG:	Block	1			; Logging count
+
+ERRCNT:	Block	1			; Number of errors found
+BUFCNT:	Block	1			; Number of buffers read
+RECCNT:	Block	1			; Records processed
+UPTIME:	Block	1			; Machine uptime
+BIOAUN:	Block	1			; User's AUN
+BIOPPN:	Block	1			; User's PPN
+BIONAM:	Block	2			; User's Username
+
+CCL:	Block	1			; Entry address
+SAVLIC:	Block	1			; User license
+OUTDEV:	Block	1			; Device type
+PARITY:	Block	1			; Setting of device parity
+PAR2:	Block	1			;  ditto
+
+BUFSIZ:	Block	1			; Constant buffer size
+BUFPTR:	Block	1			; Pointer into buffer
+BIOSIZ:	Block	1			; Byte count for input
+BIOBUF:	Block	^D100			; Data buffer for input
+DEVDEF:	Block	3			; Device block for OPEN
+FILNAM:	Block	4			; File name for lookup
+INAM:	Block	5			; File name from scanner
+
+	Reloc
+
+ARRAY	PDL[40]				; Push down list (Stack)
+ARRAY	OBUF[3]				; Buffer header for file
+
+LOGDEV:	EXP	17			; Dump mode (to be mapped)
+	SIXBIT	/DSK/			; Device DSK
+	EXP	0			; No buffer headers
+
+LOGFILE:EXP	3			; Block length 3
+	XWD	1,4			; PPN = [1,4] for (SYS)
+	SIXBIT	/BIONIC/		; File= BIONIC
+	SIXBIT	/LOG/			; Type= LOG
+
+
+Subttl	*** Main-line code ***	SETUP
+
+STPT:	TDZA	T1,T1			; Watch entry point
+	SETO	T1,			;   normal=0 or CCL=-1
+	MOVE	P,[IOWD 40,PDL]		; Setup Push-down-list
+	PUSH	P,T1			; Remember entry point
+	RESET				; Reset all
+
+	HRRZ	PAGE,.JBREL		; Get highest address
+	ADDI	PAGE,2000		; Add two pages
+	CORE	PAGE,			;  to memory
+	  JRST	CORERR			; Can't?
+	HRRZ	PAGE,.JBREL		; Get highest address
+	AOJ	PAGE,			; Add one
+	MOVEM	PAGE,.JBFF		; Setup for other calls
+	LSH	PAGE,-^D9		; Convert to a page number
+	SUBI	PAGE,2			; Remember it for later
+	LSH	PAGE,^D9		; Convert back to address
+
+	POP	P,CCL(PAGE)		; Store entry point
+
+	HRROI	T1,.GTLIC		; Get user's license
+	GETTAB	T1,
+	  Setz	T1,
+	MOVEM	T1,SAVLIC(PAGE)
+	PUSHJ	P,DISABLE		;  and disable license
+
+	HRROI	T1,.GTAUN		; Get user's AUN
+	GETTAB	T1,
+	  Seto	T1,
+	MOVEM	T1,BIOAUN(PAGE)
+	HRROI	T1,.GTPPN		; Get user's PPN
+	GETTAB	T1,
+	  Seto	T1,
+	MOVEM	T1,BIOPPN(PAGE)
+	HRROI	T1,.GTUNM		; Get 1st half of username
+	GETTAB	T1,
+	  Setz	T1,
+	MOVEM	T1,BIONAM(PAGE)
+	HRROI	T1,.GTUN1		; Get 2nd half of username
+	GETTAB	T1,
+	  Setz	T1,
+	MOVEM	T1,BIONAM+1(PAGE)
+
+	MOVEI	T1,^D400		; Use the maximum buffer size
+	SKIPE	CCL(PAGE)		;  except when CCL specified
+	  PUSHJ	P,GETSIZ		;  (read size into T1)
+	MOVEM	T1,BUFSIZ(PAGE)		; and store it.
+
+        HRROI	T1,.AXEP		; (17) even parity
+        SETOM	PAR2(PAGE)		; for read
+        AUXCAL	T1,PAR2(PAGE)		;  of parity state
+
+	PUSHJ	P,CMDLP			; GO SCAN FOR A COMMAND
+
+Subttl	RUN COMMAND - Device Initialization
+
+GORUN:	HRROI	T1,.GTLOG		; (-24) GOING FOR LINE TYPE
+	GETTAB	T1,
+	 SETZ	T1,			; Error: 0 == unknown
+	LSH	T1,-^D24		; Shift to 7777B11 to read
+	ANDI	T1,77			;  off the lower 6 bits
+
+	SETZM	OUTDEV(PAGE)		; Initially 0
+	MOVEI	T2,CASSET		; For cassette type mode
+	CAIN	T1,13			; Check for 2780
+	  MOVEI	T2,D2780		; Yes -- use 2780 mode
+	MOVEM	T2,DEVDEF(PAGE)		; Store for OPEN
+	CAIN	T1,13			; Is this 2780
+	  SETOM	OUTDEV(PAGE)		; Flag it as such
+
+	MOVSI	T1,(SIXBIT/TTY/)	; Set default input device
+	MOVEM	T1,DEVDEF+1(PAGE)	; to 'TTY'
+	SETZM	DEVDEF+2(PAGE)		; without file buffers
+
+	OPEN	TTY,DEVDEF(PAGE)	; Open TTY and set mode
+	 JRST	TTYERR			;  Can't ???
+
+	OPEN	FIL,[EXP 0
+		    SIXBIT /DSK/
+		    XWD OBUF,0]
+	 JRST	INIERR			; Can't init DSK
+
+	OUTSTR	[ASCIZ /OUTPUT TO FILE: /]
+	MOVEI	T4,INAM(PAGE)		; Use this block
+	PUSHJ	P,RDNAM			;  and read in the file name
+	  SKIPA
+	JFCL
+
+RDFIL:	MOVEI	T1,3			; Setup for "short" long
+	MOVEM	T1,FILNAM(PAGE)		;  lookup of the file
+	MOVEI	T1,INAM(PAGE)		; Address of name block
+	SKIPE	(T1)			;  first word blank?
+	MOVEM	T1,FILNAM+1(PAGE)	;  no - username addr
+	DMOVE	T1,2(T4)		; Copy file.ext (T4) = INAM
+	DMOVEM	T1,FILNAM+2(PAGE)	;  into the lookup block
+	ENTER	FIL,FILNAM(PAGE)	; Create/supersede the file
+	  JRST	WRTERR			;  Can't ???
+
+Subttl	RUN COMMAND (continued) - Block I/O setup
+
+	MOVEI	T2,5			; SET INPUT BAUD RATE TO 1200
+	HRROI	T1,.AXIBR		; (15) AUXCAL DISPATCH ENTRY
+	SKIPE	OUTDEV(PAGE)		; DONT SET BAUD FOR NON-2780
+	 AUXCAL	T1,T2			; DO IT.
+	SKIPN	OUTDEV(PAGE)		; Is it a cassette?
+	 OUTCHI	21			;  Yes, then start it
+
+	SETZB	FL,RECCNT(PAGE)		; Clear flags,record-count
+	HRROI	T1,.AXEBM		; Enter BLOCK-IO mode
+	AUXCAL T1,
+	 JRST	[OUTSTR [ASCIZ \COULD NOT SET BLOCK I/O MODE FOR PORT.\]
+		JRST FINIS]
+	OUTSTR  [ASCIZ\READY FOR INPUT
+\]
+	SKIPE	OUTDEV(PAGE)		; Skip if not 2780
+	OUTSTR  [ASCIZ\
+
+
+
+\]
+	MOVE	T1,BUFSIZ(PAGE)		; Block I/O buffer 400 long
+	MOVEM	T1,BIOSIZ(PAGE)		; beginning at BIOBUF-1
+	HRROI	T1,.AXIBS		; Input block & skip
+	AUXCAL	T1,BIOSIZ(PAGE)		; This should always FAIL
+	  JFCL
+
+	MOVE	T1,[1,,10]		; 10 SEC DELAY HACK FOR J KOPF
+	HIBER	T1,			;  zzzzzzzzzzzzzzzzz
+	  JFCL				;
+
+	MOVEI	T1,1			; Set Even Parity
+        MOVEM	T1,PARITY(PAGE)		;  on the TTY port
+	HRROI	T1,.AXEP
+	SKIPE	OUTDEV(PAGE)		; SET PARITY AS A SIGNAL TO THE
+	 AUXCAL	T1,PARITY(PAGE)		; REMOTE TO START 2780 PROTOCOL.
+
+	HRRZI	T1,BIOBUF(PAGE)		; Get address of buffer
+	HRLI	T1,(POINT 8)		;  and setup an 8-bit
+	MOVEM	T1,BUFPTR(PAGE)		;  byte pointer
+
+Subttl	RUN COMMAND (continued) - Data collection loop
+
+LP:	PUSHJ	P,MASKIT		; Setup data mask
+	MOVE	T1,BUFSIZ(PAGE)		; Use the buffer size
+	MOVEM	T1,BIOSIZ(PAGE)		; specified (max = ^D400)
+	HRROI	T1,.AXIBW		; (35) input block and wait
+	AUXCAL	T1,BIOSIZ(PAGE)		; Get the data!
+	  JRST	[OUTSTR [ASCIZ \BLOCK INPUT ERROR.\]
+	        JRST FINIS]
+
+	STATZ	TTY,20000		; EOF?
+	  JRST	LPEND			;  Yes -- skip this rot
+
+	MOVE	T1,[Exp Pattern]	; Bit pattern 0101-1010 repeating
+	CAMN	T1,BIOBUF(PAGE)		; Check first word.
+	  PUSHJ	P,BIOSKP		; Skip found -- report it
+
+	MOVE	T1,BIOSIZ(PAGE)		; Get count in buffer
+	CAMLE	T1,BUFSIZ(PAGE)		; Make sure it's not too big
+	  MOVE	T1,BUFSIZ(PAGE)		;  by truncation if necessary
+	MOVE	C,BUFPTR(PAGE)		; Get pointer to buffer
+
+LP2:	SOSGE	BIOSIZ(PAGE)		; Room left?
+	  JRST	LPEND			; No --- get some more
+	ILDB	T1,C			; Get a byte
+	ANDI	T1,177			; Clear to 7 bits
+	JUMPE	T1,LP2			; Ignore nulls!!!!
+	CAIE	T1,CR			; Handle carriage-returns
+	CAIN	T1,LF			;  or line-feeds
+	 JRST	DOCRLF			;  separately
+	TRO	FL,DTAFLG		; SAY WE HAVE DATA
+NOCR:	TRNE	FL,CRLFLG		; SKIP IF FLAG OFF
+	  JRST	INS.LF			; MUST INSERT A LF
+NOCRLF:	PUSHJ	P,DUMP			; PUSH CHAR. TO FILE
+	JRST	LP2			; GET NEXT CHAR.
+
+LPEND:	STATO	TTY,20000		; End?
+	  JRST	LP			; No - get more
+	TRNN	FL,CRLFLG		; SEE IF CR BUT NO LF YET
+	  JRST	LPEND1			; DONE, SO GO ON
+	MOVEI	T1,LF			; GET THAT LF
+	PUSHJ	P,DUMP
+	AOS	RECCNT(PAGE)		; INCREASE COUNT
+LPEND1:	CLOSE FIL,0			; Close output file
+	HRROI	T1,.AXLBM		;  and shutdown TTY
+	AUXCAL	T1,			;  -- leave block mode --
+	  JFCL				;  -- ignoring errors  --
+	HRROI T1,.AXEP			; Reset parity in the remote.
+	SKIPE	OUTDEV(PAGE)		;  so that program may be
+	AUXCAL T1,PAR2  		;  restarted for 2780!
+	SKIPN	OUTDEV(PAGE)		; Turn off cassette mode
+	 OUTCHI	23			;  for non-2780 devices.
+	OUTSTR  [ASCIZ/
+/]
+	MOVE	T1,RECCNT(PAGE)		; get count of "records"
+	PUSHJ	P,OUTDEC		; print it
+	OUTSTR  [ASCIZ/ RECORDS INPUT/]	; with the message
+	PUSHJ	P,BIOLOG		; and then log usage
+	PUSHJ	P,ENABLE		; then restore license
+        EXIT
+
+Subttl	RUN COMMAND (continued) - Handle CR and LF pairs
+
+DOCRLF: CAIN	T1,LF			;LINE FEED?
+	  JRST	DOLF			;PROCESS IT
+	CAIE	T1,CR			;CARRIAGE RETURN?
+	  JRST	NOCR			;NO, PROCESS NORMALLY
+	TRZ	FL,DTAFLG		;TURN DATA FLAG OFF
+	TRON	FL,CRLFLG		;SEE IF CR AFTER CR
+	  JRST	NOCRLF			;NO, THEN ON WE GO
+	MOVEI	T1,LF			;INSERT LF BETWEEN CR'S
+	PUSHJ	P,DUMP			;SAVE TO FILE
+	AOS	RECCNT(PAGE)		;INCREMENT COUNT
+	MOVEI	T1,CR			;GET CR BACK
+	JRST	NOCRLF			;GO ON AS BEFORE
+DOLF:	TRNN	FL,DTAFLG		;SEE IF LF AFTER DATA
+	  JRST	DONELF			;NO, GO ON AS IS
+	MOVEI	T1,CR			;INSURE CR BEFORE LF
+	PUSHJ	P,DUMP
+	MOVEI	T1,LF			;GET BLACK LF
+	JRST	DONELF			;PROCESS LF NOW
+
+INS.LF:	PUSH	P,T1			;SAVE CHAR.
+	MOVEI	T1,LF			;INSERT LF AFTER CR
+	PUSHJ	P,DUMP			;PUT IT TO FILE
+	POP	P,T1			;RETURN WHATEVER
+	TRO	FL,DTAFLG		;SET ON FOR RETURNED CHAR
+DONELF:	TRZ	FL,CRLFLG		;SAY DONE WITH CR, LF
+	AOS	RECCNT(PAGE)		;ADD TO RECORD COUNT IN
+	JRST	NOCRLF			;PROCESS CURRENT CHAR.
+
+Subttl	Debugging and checking routines
+
+MASKIT:	MOVE	T1,[Exp Pattern]	; Setup our pattern
+	MOVEM	T1,BIOBUF(PAGE)		; in the bio-buf data area
+	HRLZI	T1,BIOBUF(PAGE)		; then copy it
+	HRRI	T1,BIOBUF+1(PAGE)	; throughout
+	MOVE	T2,BUFSIZ(PAGE)		; the entire
+	LSH	T2,-2			; data buffer.
+	ADDI	T2,BIOSIZ(PAGE)
+	BLT	T1,(T2)			; Transfer!
+	POPJ	P,			; Return
+
+BIOSKP:	AOS	ERRCNT(PAGE)		; Increment error count
+	JRST	BIOLOG			; And LOG the error
+
+BIOLOG:	PUSHJ	P,ENABLE		; Enable HF SY license
+	MOVEI	T1,1			; Version 1
+	MOVEM	T1,LOGVER(PAGE)		;  : store it
+	MOVE	T1,[Xwd .NSUPT,.GTNSW]	; Get current system uptime
+	GETTAB	T1,			;  from the monitor
+	  Seto	T1,			;  : use -1 if error
+	MOVEM	T1,UPTIME(PAGE)		; Store in time block
+	OPEN	LOG,LOGDEV		; Open device DSK
+	  JRST	DISABLE			; Can't open - finish up
+	LOOKUP	LOG,LOGFILE		; Lookup BIONIC.LOG
+	  JFCL				; Ignore error - if any
+	ENTER	LOG,LOGFILE		; Enter/supersede file
+	  JRST	DISABLE			; Can't enter - finish up
+	MOVE	T2,[Xwd .CHCFP,LOG]	; Create a page at the end
+	SETO	T3,			;  of the log file
+	CHANIO	T2,T3			;  to be mapped below
+	  JRST	BIOREL			; If errors - abort
+	MOVEI	T2,1000(PAGE)		; Copy page number
+	LSH	T2,-^D9			;  as a page (not an addr)
+	HRLI	T2,(1B7!1B17)		;  ref bit ! count=1
+	VCLEAR	T2,			;  clear page
+	 JFCL				;  (show distrust for monitor)
+	MOVEI	T2,1000(PAGE)		; Copy page number
+	LSH	T2,-^D9			;  as a page (not an addr)
+	HRLI	T2,(.PRRW!1B17)		; Get 1,,page#
+	MOVE	T1,[Xwd .CHMFP,LOG]	; Setup mapping call
+	CHANIO	T1,T2			; Map page from disk
+	  JRST	BIOREL			; Skip if error
+	AOS	LOGLOG(PAGE)		; then count / copy
+	MOVEI	T1,1000(PAGE)		; Get place for store
+	HRL	T1,PAGE			; And where to start
+	BLT	T1,1777(PAGE)		; Then copy it all
+	MOVEI	T2,1000(PAGE)		; Copy page number
+	LSH	T2,-^D9			;  as a page (not an addr)
+	HRLI	T2,(1B7!1B17)		;  ref bit ! count=1
+	VCLEAR	T2,			;  clear page
+	 JFCL				;  (show distrust for monitor)
+	CLOSE	LOG,			;  Close file
+BIOREL:	RELEASE	LOG,			;  Release channel
+	PUSHJ	P,DISABLE		; Disable HF SY license
+	POPJ	P,			; Return
+
+ENABLE:	MOVE	T1,SAVLIC(PAGE)		; Get complete license
+	SETLIC	T1,			; Set it up
+	POPJ	P,			; And return
+
+DISABLE:HRL	T1,SAVLIC(PAGE)		; Get frame license
+	HRR	T1,SAVLIC(PAGE)		;  in both halves
+	SETLIC	T1,			; To make sure user
+	POPJ	P,			;  has all he has
+
+GETSIZ:	MOVEI	T1,^D220		; Use a non-standard size
+	POPJ	P,			; ...
+
+Subttl	Subroutines, error messages and finish up
+
+GETCHR:	INCHWL C			; read a character from tty
+CPOPJ1:	AOS (P)				; then !skip! return
+	POPJ P,				; bye!
+
+DUMP:	SOSG	OBUF+2			; count characters
+	 OUTPUT	FIL,			; output when full
+	IDPB	T1,OBUF+1		; deposit character
+	POPJ	P,			; all done.
+
+CORERR:	OUTSTR [ASCIZ /COULD NOT INITIALIZE MEMORY PAGE./]
+	JRST FINIS
+INIERR:	OUTSTR [ASCIZ /COULD NOT INITIALIZE DSK CHANNEL./]
+	JRST FINIS
+RDERR:	OUTSTR [ASCIZ /COULD NOT LOOKUP COMMAND FILE./]
+	JRST FINIS
+WRTERR:	OUTSTR [ASCIZ /COULD NOT WRITE TO OUTPUT FILE./]
+	JRST FINIS
+TTYERR:	OUTSTR [ASCIZ /COULD NOT INITIALIZE DEVICE TTY./]
+
+FINIS:  HRROI	T1,.AXEP
+        AUXCAL	T1,PAR2
+	PUSHJ	P,ENABLE		; Restore license
+        EXIT   	
+
+	END STPT
+  
