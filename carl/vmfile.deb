@@ -1,0 +1,683 @@
+entry
+
+	VMFile, VMLine, VMFree, VMMove, VMSetC, VMGetC, VMFLic
+	define FT!InternalPages = True;
+	Ifcr not FT!InternalPages thenc , VMInit endc
+
+;
+
+begin "VM Package"
+
+  require "(SAILIB)SAIL.DEF"   source!file;
+  require "(SAILIB)UUOSYM.DEF" source!file;
+
+  redefine !Block(Group, Name, Size) = {
+    Ifcr Length(Cvps(Size)) = 0 thenc assignc Size = 1; Endc
+    Define Group}&{Name = Group;
+    Redefine Group = Group + Size;};
+
+    Define S! = 0;
+    !Block( S!,Dev )			! Device ;
+    !Block( S!,Usr,2 )			! Username ;
+    !Block( S!,Nam )			! Name ;
+    !Block( S!,Ext )			! Extension ;
+
+  Define
+	MinChan = 16			! lowest channel to use ;
+  ,	MaxChan = 47			! highest available ;
+  ,	MaxSlot = MaxChan - MinChan + 1	! number of available slots ;
+  ,	MemMax  = MaxSlot * 512		! pages in words ;
+  ,	CharPerPage = 512 * 5		! characters per page ;
+  ;
+
+  Define MaxSlots = {
+      ifcr FT!InternalPages		! if feature "on" (default) ;
+       thenc MaxSlot			!  then use internal max ;
+       elsec MaxCount			!  else use external value ;
+      endc
+  };
+
+
+  Record!Class F (  Integer Page;	! memory page to use ;
+		    Integer File;	! file page in use ;
+		    Integer Chan;	! channel for file open ;
+		    Integer Char;	! character pointer in file ;
+		    Integer Line;	! line pointer in file +/-;
+		    Integer PTxt;	! text page pointer in file +/- ;
+		    Integer Size;	! character size of file ;
+		    Integer LSiz;	! lines in file (if known) ;
+		    Integer PSiz;	! pages in file (if known) ;
+		    Integer FLic    );	! file license info ;
+
+  R!P (F) S;
+  Safe R!P (F) Array Files[ 1 : MaxSlot ];
+
+  Integer VMBase, VMPage;
+
+  Own Safe Integer Array FileSpec[ S!Dev : S!Ext ];
+
+ Ifcr FT!InternalPages thenc			! selectable by feature sw ;
+  Preset!with [ MemMax + 512 ] 0;		! expect to use 1 : MemMax ;
+  Own Safe Integer Array VM[ 1 : MemMax+512 ];	!  entries minus page slop ;
+ elsec
+  Integer MaxCount;				! remember available slots ;
+ endc
+
+
+Ifcr FT!InternalPages thenc
+  Simple Procedure InitStuff;
+elsec
+  Internal Simple Procedure VMInit( Integer Page, Count );
+endc
+! ----------------------------------------------------------------------;
+!									;
+!	InitStuff							;
+!		Routine to initialize data structures and calculate	;
+!		where to put the initial cache of pages to use for	;
+!		this venture.						;
+!									;
+!	VMInit( FirstPage, Count )					;
+!		Routine to setup a cache of pages for the user to use	;
+!		instead of using the preset range designated by this	;
+!		package.  This is setup via the assembly parameter:	;
+!		(FT!InternalPages).					;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Init"
+
+  Ifcr FT!InternalPages thenc		! internal definition ;
+    VMPage_ (location( VM[1] ) + '777) lsh -9;
+  elsec
+    VMPage_ Page;			! base page ;
+    MaxCount_ Count max MaxSlot;	! count of pages ;
+  endc
+    VMBase_ VMPage lsh 9;		! base memory address ;
+
+
+    ArrClr( Files );			! files not open ;
+
+end "VM Init";
+Ifcr FT!InternalPages thenc
+  require InitStuff initialization;
+endc
+
+
+
+Simple Integer Procedure MapPage( r!p (F) Rec; Integer NewPage );
+! ----------------------------------------------------------------------;
+!									;
+!	MapPage( Rec, NewPage )						;
+!		Routine to map the specified new file-page into the	;
+!		page designated by F:Page[Rec] and update F:File[Rec]	;
+!		to NewPage.						;
+!									;
+! ----------------------------------------------------------------------;
+begin "Map Page"
+    Own safe integer array Arg[ 0:1 ];
+
+    Calli( Arg[0]_ !Xwd('2001, F:Page[Rec]), calli!VCLEAR );
+    Arg[1]_ NewPage;				! point at file page ;
+    Chnior( F:Chan[Rec], Arg[0], !chMFP );	! map the page ;
+
+    If ( !Skip! )				! remember file page ;
+     then F:File[Rec]_ NewPage			!  NewPage (if map ok) ;
+     else F:File[Rec]_ 0;			!  nothing (if map fails) ;
+
+    return( F:File[Rec] );			! return current mapping ;
+
+end "Map Page";
+
+
+Simple Procedure Dbp( Reference Integer Ptr );
+! ----------------------------------------------------------------------;
+!									;
+!	Dbp( AsciiBytePointer )						;
+!		Routine to decrement a 7-bit byte pointer.  Its only	;
+!		magic relies on the assumption that a negative pointer	;
+!		is setup as '440700 from the point/bbpp operation that	;
+!		creates a ildb pointer to the first byte of the word.	;
+!		This routine fixes this to point to the last byte of	;
+!		the previous word whenever this is seen.  In "this"	;
+!		initial case, this works so that the pointer is never	;
+!		decremented the WRONG way.				;
+!									;
+! ----------------------------------------------------------------------;
+begin "Decrement Byte Pointer"
+
+    If ( Ptr < 0 )				! initially '440700,,addr ;
+     then Ptr_ !xwd( '010700, !rh(Ptr) - 1 )	! so set to prev-last byte ;
+     else Ptr_ Ptr + '070000000000;		! else decrement a byte ;
+
+    If ( Ptr < 0 )				! must now be '440700,,addr ;
+     then Ptr_ !xwd( '010700, !rh(Ptr) - 1 );	! so set to prev-last byte ;
+
+end "Decrement Byte Pointer";
+
+
+Simple Boolean Procedure VMSpec( String Line );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMSpec( FileSpecification )					;
+!		Routine to read a string file specification and build	;
+!		the special file block used by the VMFile routine.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Spec"
+    own integer bp,wp,ct;
+
+    arrclr( filespec );			! clear out the array ;
+    filespec[ S!Dev ]_ cvsix( "DSK" );	!  and fill in the device ;
+    
+    if ( "(" = Line )			! if it starts with "(" ;
+     then begin "get user"		!  then pick up username ;
+	bp_ point( 6,filespec[ S!Usr ],-1 );
+	ct_ 12;				! maximum of 12 charcters ;
+	lop( line );			! eat the leading "(" ;
+	while ( length( Line ) and ")" neq wp_ lop( line ) )
+	 do if ( 0 leq ct_ ct - 1 )	! if room in string ;
+	     then if ( wp geq "a" )	!  then check case range ;
+		   then idpb( wp-'100, bp )	! lowercase to sixbit ;
+		   else idpb( wp-'40, bp );	! uppercase to sixbit ;
+     end "get user"
+     else begin "default user"		! set default if no user specified ;
+	filespec[ S!Usr   ]_ calli( -'22, '41 );
+	filespec[ S!Usr+1 ]_ calli( -'21, '41 );
+     end "default user";
+
+    if ( length( Line ) = 0 )		! must have a name ;
+     then return( false );		!  so return false ;
+
+    bp_ point( 6,filespec[ S!Nam ],-1 );
+    ct_ 6;				! maximum of 6 characters ;
+    while ( length( Line ) and "." neq wp_ lop( Line ) )
+     do if ( 0 leq ct_ ct - 1 )		! if room left in string ;
+	 then if ( wp geq "a" )		!  then check case ;
+	       then idpb( wp-'100, bp )	!    lowercase to sixbit ;
+	       else idpb( wp-'40, bp );	!    uppercase to sixbit ;
+
+    bp_ point( 6,filespec[ S!Ext ],-1 );
+    ct_ 3;				! maximum of 3 characters ;
+    while ( length( Line ) and " " neq wp_ lop( Line ) )
+     do if ( 0 leq ct_ ct - 1 )		! if room left in string ;
+	 then if ( wp geq "a" )		!  then check case ;
+	       then idpb( wp-'100, bp )	!    lowercase to sixbit ;
+	       else idpb( wp-'40, bp );	!    uppercase to sixbit ;
+
+    return( true );
+
+end "VM Spec";
+
+
+Simple Integer Procedure VMSlot;
+! ----------------------------------------------------------------------;
+!									;
+!	Slot_ VMSlot							;
+!		Returns the next available file slot in the internal	;
+!		file table.  If no slots or channels are available,	;
+!		returns 0.  Array Files[slot] is setup with F:Chan,	;
+!		F:Page and F:Char.					;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Slot"
+    Own Integer Slot;
+
+    For Slot_ 1 upto MaxSlots		! check each legal slot ;
+     do if not( Files[ Slot ] )		! if it's free ;
+	 then begin "setup slot"	!  then make it available ;
+
+	    S_ Files[ Slot ]_ new!record( F );	! initialize record ;
+	    F:Chan[ S ]_ MaxChan - Slot + 1;	! file channel ;
+	    F:Page[ S ]_ VMPage  + Slot - 1;	! memory page ;
+	    F:File[ S ]_ F:Char[ S ]_ -1;	! file/char position ;
+
+	    S_ null!record;		! free up working pointer ;
+
+	    return( Slot );		! give caller a slot number ;
+
+	 end "setup slot";
+
+    return( 0 );
+
+end "VM Slot";
+
+
+Internal Simple Integer Procedure VMFLic( Integer Slot );
+! ----------------------------------------------------------------------;
+!									;
+!	License_ VMFLic							;
+!		Routine to return the license that was set on the 	;
+!		file open on the specified slot.			;
+!									;
+! ----------------------------------------------------------------------;
+begin  "VM File Lic"
+
+    If not( 1 leq Slot leq MaxSlots )	! only "my" Slots are ;
+     then return( false );		!  valid, else return ;
+
+    If not( S_ Files[ Slot ] )		! slot assigned? ;
+     then return( false );		!  not this time ;
+
+    return( F:FLic[ S ] );		! return the license ;
+
+end "VM File Lic";
+
+
+Internal Simple Integer Procedure VMGetC( Integer Slot );
+! ----------------------------------------------------------------------;
+!									;
+!	Position_ VMGetC( Slot )					;
+!		Read the character position within the file and return	;
+!		it to the caller.  If no file is open or an invalid	;
+!		slot is specified return a value of -2.  ( -1 may be	;
+!		returned if the file has been opened, but no reads	;
+!		have been requested. )					;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Get Character Pointer"
+
+    If not( 1 leq Slot leq MaxSlots )	! only "my" Slots are ;
+     then return( -2 );			!  valid, else return ;
+
+    If not( S_ Files[ Slot ] )		! slot assigned? ;
+     then return( -2 );			!  not this time ;
+
+    return( F:Char[ S ] );		! return character position ;
+
+end "VM Get Character Pointer";
+
+
+Internal Simple Integer Procedure VMSetC( Integer Slot, Position );
+! ----------------------------------------------------------------------;
+!									;
+!	NewPosition_ VMSetC( Slot, TrialPosition )			;
+!		Set the character position with the file open on the	;
+!		specified slot.  All further references to the slot	;
+!		will use the new file position.  If the specified	;
+!		position is outside the file, the position is set to	;
+!		-1.  The routine always returns the new position.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Set Character Pointer"
+
+    If not( 1 leq Slot leq MaxSlots )	! only "my" Slots are ;
+     then return( false );		!  valid, else return ;
+
+    If not( S_ Files[ Slot ] )		! slot assigned? ;
+     then return( false );		!  not this time ;
+
+    If ( 0 leq Position leq F:Size[S] )	! if position within range ;
+     then F:Char[S]_ Position		!  then set it up ;
+     else F:Char[S]_ Position_ -1;	!  else set to -1 ;
+
+    return( Position );			! return the new position ;
+
+end "VM Set Character Pointer";
+
+
+Internal Simple Boolean Procedure VMFree( Integer Slot );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMFree( Slot )						;
+!		Closes any open file for this slot and frees the	;
+!		slot for future use.  Returns true if the slot was	;
+!		in use.							;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Free"
+
+    If not( 1 leq Slot leq MaxSlots )	! only "my" Slots are ;
+     then return( false );		!  valid, else return ;
+
+    If not( S_ Files[ Slot ] )		! slot assigned? ;
+     then return( false );		!  not this time ;
+
+    If ( F:Char[ S ] neq -1 )		! file positioned? ;
+     then begin "unmap slot"
+
+	Calli( !Xwd( '2001, F:Page[ S ] ), calli!VCLEAR );
+
+     end "unmap slot";
+
+    Chniov( F:Chan[ S ], 0, !chREL );	! release Slot ;
+    Files[ Slot ]_ null!record;		! clear out tables ;
+
+    return( true );			! everything is ok ;
+
+end "VM Free";
+
+
+Internal Simple Boolean Procedure VMFile( String Spec );
+! ----------------------------------------------------------------------;
+!									;
+!	Slot_ VMFile( StringSpec )					;
+!		Opens a file for reading.  A slot number from 1-36	;
+!		is returned if the file is available for reading.	;
+!		0 means no slots or the file is not available.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM File"
+    Own Safe Integer Array File[ 0 : !RBLIC ];
+    Preset!with '17, cvsix("DSK   "), 0;
+    Own Safe Integer Array Dev[ 0 : 2 ];
+    Own Integer Slot;
+
+    If not( Slot_ VMSlot )		! If no Slots available ;
+     then return( false );		!  then no file opened ;
+
+    If not( S_ Files[ Slot ] )		! slot assigned? *Debug check* ;
+     then return( false );		!  not this time *huh why not* ;
+
+    If not( VMSpec( Spec ) )		! trouble with the spec? ;
+     then return( false );		!  then don't do anything ;
+
+    Dev[ 1 ]_ FileSpec[ S!Dev ];	! Setup device block ;
+    Chnior( F:Chan[S],Dev[0],!chOPN );	! OPEN [ '17, Dev, 0 ] ;
+    If not( !Skip! )			! If open-failure ;
+     then begin "open failure"		!  then no file opened ;
+	VMFree( Slot );			! Free the slot ;
+	return( !Xwd( -1,-1 ) );	!  and return ;
+     end "open failure";
+
+    File[ !RBCNT ]_ !RBLIC;		! Setup file lookup block ;
+    File[ !RBPPN ]_ location( FileSpec[ S!Usr ] );
+    File[ !RBNAM ]_ FileSpec[ S!Nam ];
+    File[ !RBEXT ]_ FileSpec[ S!Ext ] land (-1 lsh 18);
+
+    Chnior( F:Chan[ S ], File[ !RBCNT ], !chLK );
+    If not( !Skip! )			! If lookup-failure ;
+     then begin "no file"		!  then Free the slot ;
+	VMFree( Slot );			!  and return error code ;
+	return( !Xwd( -1,!rh(File[!RBEXT]) ) );
+     end "no file";
+
+    F:Size[ S ]_ File[ !RBSIZ ] * 5;	! File size in characters ;
+    F:FLic[ S ]_ !rh( File[ !RBLIC ] );	! File license ;
+
+    return( Slot );			! Return the slot number ;
+
+end "VM File";
+
+
+Internal String Procedure VMLine( Integer Slot; Reference Integer More;
+				  Integer Dir( 0 ) );
+! ----------------------------------------------------------------------;
+!									;
+!	Line_ VMLine( Slot, More, Dir(0) )				;
+!		Returns the next consecutive line from the file that	;
+!		is connected to the specified slot.  More is set to	;
+!		the line terminator ( LF, FF or VT) or to 0 when the	;
+!		end of the file is reached or the slot is inactive.	;
+!		Dir is the direction read the file (zero = forward,	;
+!		-1 or non-zero = backward).				;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Line"
+    Integer Page, Byte, Ch, Copy, Count, Len, LastBrk;
+    Boolean Eol;
+    String Str;
+
+    More_ 0;				! Initialize for bad exits ;
+
+    If not( 1 leq Slot leq MaxSlots )	! only "my" Slots are ;
+     then return( null );		!  valid, else return ;
+
+    If not( S_ Files[ Slot ] )		! slot assigned? ;
+     then return( null );		!  not this time ;
+
+    If ( Dir )				! verify proper usage of Dir ;
+     then Dir_ -1			!  non-zero = backward = -1 ;
+     else Dir_ +1;			!  was-zero = forward  = +1 ;
+
+    If ( F:Char[S] = -1 )		! we are mapped? ;
+     then If ( Dir < 0 )		! Forward or Backward? ;
+	   then F:Char[S]_ F:Size[S]	!   Set after last character ;
+	   else F:Char[S]_ 0;		!   Set before first character ;
+
+    If ( F:File[S] neq Page_ ( F:Char[S] div CharPerPage ) + 1 )
+     then MapPage( S, Page );		! Verify using right page ;
+
+    Count_ F:Char[S] mod CharPerPage;	! Character position in page ;
+    Copy_Byte_point(7,memory[(F:Page[S] lsh 9)+(Count div 5)],((Count mod 5)*7)-1);
+    If ( Dir < 0 )			! If backward direction ;
+     then Ibp( Copy );			!  then offset immediately by 1 ;
+
+    Str_ Null;				! Initial return string ;
+
+    If ( Dir geq 0 )			!   Fix count (# left) ;
+     then If ( ( F:File[S] * CharPerPage ) > F:Size[S] )
+	   then Count_ (F:Size[S] mod CharPerPage) - Count
+	   else Count_ CharPerPage - Count;
+
+    Len_ 0;				!   Initialize string length ;
+    LastBrk_ 0;				!   Initialize break var ;
+    Eol_ false;				!   Initialize line var ;
+    While not( Eol )			!   Read one line ;
+     do begin "one line"
+
+	If ( Count > 0 )		! Must have chars left ;
+	 then begin "more characters"	!  to even try to read ;
+
+	    If ( Dir < 0 )		! Forward or Backward? ;
+	     then Dbp( Copy )		!  position the character ;
+	     else Ibp( Copy );		!  pointer in the page ;
+
+	    F:Char[S]_ F:Char[S] + Dir;	! Increment count into file ;
+
+	    Case More_ Ldb( Copy ) of begin	! check for end of line ;
+		[#nul][#cr] begin "found eos break"
+		    If ( Len )			! length to concatenate? ;
+		     then if ( Dir < 0 )	! yes, use right direction ;
+			   then Str_ StMake( Copy, Len ) & Str
+			   else Str_ Str & StMake( Byte, Len );
+		    If ( Dir < 0 ) and		! Backing up? ;
+		       not( LastBrk or More )	! First time through? (nulls);
+		     then Dbp( Byte )		!  yes, keep it this way ;
+		     else Byte_ Copy;		!  no, update pointer ;
+		    Len_ 0;			! Reset string length ;
+		 end "found eos break";
+
+		[#lf][#vt][#ff] begin "found eol break"
+		    Eol_ true;			! looks like one? ;
+		    if ( Dir < 0 )		! were we going backward? ;
+		     then if ( Copy = Byte )	!  and the first character ;
+			   then begin "not eol"
+			      Eol_ false;	!  yes, not really eol ;
+			      Print( "<" );
+!			      LastBrk_ More;	!  remember this for later ;
+			   end "not eol"
+			   else begin "got eol"
+!			      F:Char[S]_ F:Char[S] + 1;
+			      Print( ">" );
+!			      More_ LastBrk;	! set count and eol-brk ;
+			   end "got eol";
+		    If ( Len )			! length to concatenate? ;
+		     then if ( Dir < 0 )	! yes, use right direction ;
+			   then Str_ StMake( Copy, Len ) & Str
+			   else Str_ Str & StMake( Byte, Len );
+		 end "found eol break";
+
+		[else] Len_ Len + 1		!  increment string length ;
+	    end;
+
+	    If ( memory[ !rh( copy ) ] land 1 )	! bit 35 set ;
+	     then begin "sequence numbers"	! in this word? ;
+
+		Count_ (Count - 5) max 0;	!  update counts by 5 chars ;
+		F:Char[S]_ (F:Char[S] + (5*Dir)) max 0;
+
+		If ( Dir < 0  and  Len > 2 )	! reverse read normal case ;
+		 then begin "normal reverse"	!  +1 for tab after seq # ;
+		    Ibp( Copy );		! make string skipping tab	    Str_ StMake( Copy, Len-2 ) & Str;
+		 end "normal reverse"
+		 else if ( Dir > 0  and  Len neq 1 )
+		       then Print( "*** Bad SEQ # in text file. ***"& Crlf );
+
+		Byte_ Copy_ Copy + Dir;		!  update 1 word ;
+		Len_ 0;				! Reset length ;
+
+	     end "sequence numbers";
+
+	    If ( 0 = Count_ (Count-1) max 0 )	! If now out of characters ;
+	     then begin "fake eos break"
+		If ( Len )			! length to concatenate? ;
+		 then if ( Dir < 0 )
+		       then Str_ StMake( Copy, Len ) & Str
+		       else Str_ Str & StMake( Byte, Len );
+		Len_ 0;				! Reset string length ;
+	     end "fake eos break";
+
+	 end "more characters"
+	 else begin "need next page"		! If no-more-characters ;
+
+	    If ( F:Char[S] geq F:Size[S] )	! Forwards at end or ;
+	       or ( F:Char[S] = 0 )		!  backwards at beginning ;
+	     then begin "end of file"		! At end-of-file? ;
+
+		Eol_ true;			! Set flags true ;
+!		If ( Dir < 0 )			! If backing up ;
+!		 then More_ LastBrk		!  use last break at end ;
+!		 else; More_ 0;			!  else set flag var to 0 ;
+		Done "one line";		! Finish loop ;
+
+	     end "end of file";			! Guess, read next page ;
+
+	    MapPage( S, Page_ ( F:Char[S] div CharPerPage ) + 1 );
+
+	    ! ** assume: here at the beginning of the page ** ;
+	    If ( Dir < 0 )			! Forward or Backward? ;
+	     then Copy_ Byte_ point( 7, memory[(F:Page[S]+1) lsh 9], -1 )
+	     else Copy_ Byte_ point( 7, memory[F:Page[S] lsh 9], -1 );
+
+	    If ( ( Page * CharPerPage ) > F:Size[S] )
+	     then Count_ F:Size[S] mod CharPerPage
+	     else Count_ CharPerPage;
+
+	 end "need next page";
+
+     end "one line";
+
+    return( Str );			! give 'em what they came for ;
+
+end "VM Line";
+
+
+Internal Boolean Procedure VMMove( Integer Slot, HowMany(1) );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMMove( Slot, HowMany(1) )					;
+!		Moves the position pointer forward or backward up to	;
+!		HowMany lines in the file.  Returns true if the slot is	;
+!		active and HowMany lines exist, otherwise it returns	;
+!		false and leaves the pointer positioned at logical end	;
+!		of file (at the beginning if direction is backward).	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Move"
+    Integer Page, Byte, Copy, Count, Dir;
+    Boolean Eol;
+
+    If not( 1 leq Slot leq MaxSlots )	! only "my" Slots are ;
+     then return( false );		!  valid, else return ;
+
+    If not( S_ Files[ Slot ] )		! slot assigned? ;
+     then return( false );		!  not this time ;
+
+    If not( HowMany )			! we can always move ;
+     then return( true );		!  a distance of 0 ;
+
+    If ( HowMany < 0 )			! verify proper direction ;
+     then Dir_ -1			!  negative = backward = -1 ;
+     else Dir_ +1;			!  positive = forward  = +1 ;
+
+    HowMany_ Dir * HowMany;		! always sign correct the count ;
+
+    If ( F:Char[S] = -1 )		! we are mapped? ;
+     then If ( Dir < 0 )		! Forward or Backward? ;
+	   then F:Char[S]_ F:Size[S]	!   Set after last character ;
+	   else F:Char[S]_ 0;		!   Set before first character ;
+
+    If ( Dir < 0  and  F:Char[S] = 0 ) or
+       ( Dir geq 0  and  F:Char[S] geq F:Size[S] )
+     then return( false );		! can't move if already at end ;
+
+    If ( F:File[S] neq Page_ ( F:Char[S] div CharPerPage ) + 1 )
+     then MapPage( S, Page );		! Verify using right page ;
+
+    Count_ F:Char[S] mod CharPerPage;	! Character position in page ;
+    Copy_Byte_point(7,memory[(F:Page[S] lsh 9)+(Count div 5)],((Count mod 5)*7)-1);
+    If ( Dir < 0 )			! Going backward? ;
+     then Ibp( Copy );			!  then offset by 1 ;
+
+    If ( Dir geq 0 )			! [F] Fix count (# left) ;
+     then If ( ( F:File[S] * CharPerPage ) > F:Size[S] )
+	   then Count_ (F:Size[S] mod CharPerPage) - Count
+	   else Count_ CharPerPage - Count;
+
+    Eol_ false;				!   Initialize line var ;
+    While ( 0 geq HowMany_ HowMany - 1 ) and not( Eol )
+     do begin "each line"		! Read one line ;
+
+	If ( Count > 0 )			! Must have chars left ;
+	 then begin "more characters"		!  to even try to read ;
+
+	    Count_ Count - 1;			! Decrement characters left ;
+	    F:Char[S]_ F:Char[S] + Dir;		! Update count into file ;
+
+	    If ( Dir < 0 )			! Which direction? ;
+	     then Dbp( Copy )			!  to move the pointer ;
+	     else Ibp( Copy );			!  forward or backward ;
+
+	    Case Ldb( Copy ) of begin		! Check character type ;
+		[#lf][#vt][#ff] begin "got eol"
+		    Eol_ true;			! looks like one? ;
+		    if ( Dir < 0 )		! were we going backward? ;
+		     then if ( Copy = Byte )	!  and the first character ;
+			   then Eol_ false	!  yes, not really eol ;
+			   else F:Char[S]_ F:Char[S] + 1;
+		 end "got eol";
+		[else]				!    else go on to the next ;
+	    end;
+
+	    If ( memory[!rh(copy)] land 1 )	! bit 35 set ;
+	     then begin "sequence numbers"	! in this word? ;
+
+		Count_ Count - 5;		! decrement left by 5 ;
+		Copy_ Copy + Dir;		! update word by 1 ;
+		F:Char[S]_ F:Char[S] + (5*Dir);	! update char by 5 ;
+
+	     end "sequence numbers";
+
+	 end "more characters"
+	 else begin "need next page"		! If no-more-characters ;
+
+	    If ( F:Char[S] geq F:Size[S] )	! * Forward * ;
+	       or ( F:Char[S] = 0 )		! * or backward * ;
+	     then begin "end of file"		! At end of file? ;
+
+		Eol_ true;			! Set flags true ;
+		If ( HowMany )			! If any lines to go ;
+		 then return( false )		!  this is bad ;
+		 else Done "each line";		!  else Finish loop ;
+
+	     end "end of file";			! Guess, read next page ;
+
+	    MapPage( S, Page_ ( F:Char[S] div CharPerPage ) + 1 );
+
+	    ! ** assume: here at the end/beginning of the page ** ;
+	    If ( Dir < 0 )
+	     then Copy_ point( 7, memory[(F:Page[S]+1) lsh 9], -1 )
+	     else Copy_ point( 7, memory[F:Page[S] lsh 9], -1 );
+
+	    If ( ( Page * CharPerPage ) > F:Size[S] )
+	     then Count_ F:Size[S] mod CharPerPage
+	     else Count_ CharPerPage;
+
+	 end "need next page";
+
+     end "each line";
+
+    return( true );			! give 'em what they came for ;
+
+end "VM Move";
+
+end "VM Package"; B@}8
