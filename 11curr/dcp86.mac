@@ -1,0 +1,1242 @@
+.SBTTL	KOD86 - Execution code for DCP
+.TITLE	KOD86 - Execution code for DCP
+.ASECT
+.NLIST	MEB, SYM
+
+;-----
+; Execution code for the DCP. Assembly instructions:
+;	MACRO	KOD86,KOD86=MAC86,XD,KOD86
+;	MACRO	KOD11,KOD11=XD,KOD11
+;	LINK	KOD=KOD86,KOD11
+;	RUN 2716CK		;This program converts SAV files to ROM files
+;	 Save file? KOD		; and calculates necessary checksums.
+;	RUN PB			;This program burns the ROM files into EPROM's
+;	...
+;
+; Leland G. Hoover May/80
+;-----
+
+;-----
+; DCP-PDP11 common register definitions
+;-----
+RXFUN=	40			;Recieve function register
+RXPORT=	41			;Recieve port number
+RXDATA=	42			;Recieve data register
+TXFUN=	50			;Transmit function register
+TXPORT=	51			;Transmit port number
+TXDATA=	52			;Transmit data register
+
+SDATA=	-4			;SIO CSR offset
+;-----
+; Memory utilization parameters
+;-----
+DDBASE=	60			;DDB's range from 60-1160
+DDBSIZ=	20			;Size of DDB
+STAKSZ=	100			;Size of stack in bytes
+STACK=	MAXPRT*DDBSIZ+STAKSZ	;Base of stack
+ORPUT=	STACK			;Output ring "puter" pointer
+ORTAKE=	STACK+2			;Output ring "taker" pointer
+ORBASE=	STACK+4			;Base of output ring
+ORSIZE=	400			;Output ring size (must be modulo 4)
+ORMAX=	ORBASE+ORSIZE		;End of output ring
+TXBFSZ=	10			;Transmit buffer size
+TXBUF=	ORMAX			;Transmit data buffer
+SCNPTR=	TXBUF+TXBFSZ		;SIO board scan loop pointer
+EXEC=	SCNPTR+2		;Execute flag 0=no scan, 1=scan SIO's
+LOPCNT=	SCNPTR+4		;Main loop counter for lights
+NXTENT=	SCNPTR+6		;RAM address of next SCANP entry
+SCANB=	NXTENT+2	;Base address of dynamicly built SIO SCAN routine
+.IIF LT RAMSIZ-1-SCANB-<<SCANPX-SCANP>*18.+5>	.ERROR	RAM overflow
+.PAGE
+;-----
+; DDB offset definitions. Perhaps a litle explanation is in order.
+; There is one DDB per port containing all relevant information concerning
+; this port. Some of this information is static such as SIO register
+; address while other fields are dynamic like the SIO write register
+; contents.  The DDB is initialized either durring normal initialization
+; or dynamicly durring operation.  These fields are defigned to be:
+;
+;   DBSADR =>	Base address for this ports SIO
+;   DBVECT =>	Interrupt vector used to interrupt the PDP11 for
+;		all Recieve functions durring normal operation.  This is
+;		a PDP11 address.
+;		  377 - Uninitialized port
+;		  0 -	Asynchronous port
+;   DBR1 =>	SIO write register 1
+;   DBR3 =>	SIO write register 3
+;   DBR4 =>	SIO write register 4
+;   DBR5 =>	SIO write register 5
+;-----
+DBSADR=	0			;SIO base address
+DBVECT=	2			;PDP11 interrupt vector
+DBSTAU=	4			;RX status bits
+DBRXST=	5			;Receiver state dispatch value for RXTAB
+DBERMS=	6			;RX error status mask
+DBR1=	7			;SIO current register contents
+DBR3=	10			; "
+DBR4=	11			; "
+DBR5=	12			; "
+DBRXC0=	13			;Receiver character buffer for sync CRC
+DBRXC1=	14			; " 2nd char for CRC hold off
+DBRXC2=	15			; " 3rd char for CRC hold off
+DBBITS=	16			;Some status bits such as:
+				;Synch mode bits
+.CRCT=	<^B00001000>		;Transmit CRC enable
+.CRCR=	<^B00000001>		;Receive CRC enable
+.MARK=	<^B00000010>		;Idle marks
+.2SYN=	<^B00000100>		;Double synch (16 bits)
+.BRK=	<^B00010000>		;Break just occurred and the SIO will
+				; send junk that must be eaten. A null
+				; character and a transmitter underrun/EOM
+.EOM0=	<^B00100000>		;End of message flag
+.EOM1=	<^B01000000>		;End of message flag (CRC)
+.EOM2=	<^B10000000>
+
+.PAGE
+;-----
+; Recieve function codes.  These codes are sent to the PDP11.
+;-----
+CARDET=	2			;Carrier detect
+CARLOS=	4			;Carrier loss
+DSRSET=	6			;Ring indicate
+DSRCLR=	10			;Ring indicate loss
+RXVDAT=	12			;Recieved data byte
+XMTDON=	14			;Transmit done
+DCPOK=	16			;DCP successfully passed internal diag
+PORTOK=	20			;Port initialized properly
+EOMDET=	22			;Transmit underrun/EOM detect
+
+DSPMEM=	40			;Display internal memory location
+REGDMP=	42			;Dump 8086 registers
+
+ROMERR=	376			;ROM checksum error
+MEMERR=	374			;Memory diagnostic failure
+FUNERR=	372			;Transmit function error
+PRTERR=	370			;Nonexistant port, no such hardware
+
+;-----
+; Receive character states - stored in DBRXST
+;-----
+RXASYN=	<^B00000000>		;Asynchronous data
+RXSYNC=	<^B00000000>		;Synchronous data without CRC
+RXCRC=	<^B00000010>		;Synchronous data CRC16 enable
+RXNWB0=	<^B00000100>		;Synchronous data new block
+RXNWB1=	<^B00001000>		; " 2nd char
+;-----
+; Miscellaneous definitions
+;-----
+MAXPRT=	18.			;Maximum number of ports
+MAXFUN=	TXTABZ-TXTAB		;Maximum legal TX function number
+$LJUMP=	352			;Jump instruction for 8086
+$NOP11=	240			;NOP inst used to start the 11
+CHANLB=	2			;SIO channel B DDB bit mask
+RXERR=	ZIOCFE!ZIORXO!ZIOPER	;RX error mask
+LITTMR=	20000			;Light time out (loop counts)
+ROMCKS=	ROMSIZ+ROMADR-1		;ROM checksum address
+;These values are assigned during initialization
+...CSR=	177777			;SIO CSR address
+...LAB=	177777			;Address of next SCANP entry
+...DDB=	177777			;DDB offset for this port
+
+.PAGE
+.SBTTL	Macros - smore
+
+;-----
+; IWAIT - Wait for node to accept the last function and free up the
+; node input registers.
+;-----
+	.MACRO	IWAIT	?LAB
+LAB:	CMPBI	M,	RXFUN,	0	;Has the node taken the last function?
+	JNZ	LAB			;Br till registers are free
+	.ENDM
+
+;-----
+; Break
+;-----
+	.MACRO	BREAKP	N
+	IWAIT				;Wait for last function to be eaten
+	MOVWI	M,	RXDATA,	N	;Output breakpoint number
+	MOVWI	M,	RXFUN,	360	;Output breakpoint function
+	IWAIT				; and wait for function to be seen
+	.ENDM
+.PAGE
+.SBTTL EXEC86 - Executable code for the 8086-DCP
+;-----
+; Boot entry for 8086
+;-----
+	$ORG	FUDGE+RSTADR		;.=boot entry address for 8086
+BOOT86:	LJUMP	ROMADR,	0		;Clr CS reg & br to loc 0
+
+	$ORG	FUDGE+ROMADR		;.=bottom of ROM
+	MOVWI	M,	RXFUN,	0	;Init recieve register
+	MOVWI	M,	TXFUN,	0	;Init transmit register
+ZAPALL:	MOVWIR	SP,	STACK		;Initialize stack
+	MOVWIR	SI,	VTAB-FUDGE	;Load address of vector table
+	MOVWIR	DI,	0		;Load address of vectors in RAM
+	MOVWIR	CX,	VTABX-VTAB/2	;Load table length in words
+	CLD				;Set direction bit
+	REP				; and
+	MOVSW				; load vector area
+	MOVWIR	BP,	DDBASE		;Init base of DDB table
+	MOVWI	M,	ORTAKE,	0	;Empty output ring buffer
+	MOVWI	M,	ORPUT,	0	; by reseting ring pointers
+	MOVBI	M,	EXEC,	0	;Disable SIO scanning
+	MOVWI	M,	NXTENT,	SCANB	;Load base address of SCAN table
+;-----
+; Initialize all DDB's with proper SIO addresses
+;	DI =>	DDB pointer
+;	SI =>	XTAB pointer
+;	BX =>	SIOTAB pointer
+;-----
+	CLRWR	DI
+	CLRWR	BX
+INIT01:	CLRWR	SI
+INIT02:	MOVWT	AX,	LBX,	SIOTAB-FUDGE ;Get base address for SIO board
+	ADDWT	AX,	LSI,	XTAB-FUDGE ;Calculate real address
+	MOVWF	AX,	IBPDI		;Store address into DDB
+	XCHGR	SI
+	MOVBI	ISI,	0,	ZIORST	;Reset this SIO channel
+	NOP				; Must wait 4 SIO clock cycles
+	NOP				; not 8086 clock cycles!!!!
+	NOP
+	MOVBI	ISI,	0,	ZIORST	; again to make sure this is CSR
+	XCHGR	SI
+	MOVBI	SBPDI,	DBR1,	ZIOSAV	;Enable Status-affects-vector
+	ADDWS	R,	DI,	DDBSIZ	;Increment DDB pointer
+	INCR2	SI			;Increment XTAB pointer
+	CMPWI	R,	SI,	6*2	;Done with this board?
+	JNE	INIT02			; jmp if not
+	INCR2	BX			;Increment SIOTAB pointer
+	CMPWI	R,	BX,	MAXPRT/3;Done with last board?
+	JNE	INIT01			; jmp if not
+
+
+.PAGE
+.SBTTL	SCHDLR - Task scheduler main loop
+LITOFF:	LIGHT1				;Turn off lights
+	JMP	MAIN01
+
+LITON:	MOVWI	M,	LOPCNT,	0	;Reset loop counter
+	LIGHT0				;Turn on lights
+	JMP	MAIN01
+
+;-----
+; Main scheduling loop. Here to schedule next task.
+;-----
+SCHDLR:	INCW	M,	LOPCNT		;Inc loop counter
+	CMPWI	M,	LOPCNT,	LITTMR	;Jmp if time to turn off ligght
+	JE	LITOFF
+	CMPWI	M,	LOPCNT,	LITTMR*2;Jmp if time to turn on lights
+	JE	LITON
+;-----
+; Empty output ring by sending function to the 11
+;-----
+MAIN01:	MOVWT	SI,	M,	ORTAKE	;Get output ring taker
+	CMPWT	SI,	M,	ORPUT	;Is there data in the output ring?
+	JE	EMDONE			;Br if there is nothing in the ring
+	CMPBI	M,	RXFUN,	0	;Has the last function been eaten?
+	JNZ	EMDONE			;Br if last function has not been eaten
+;-----
+; Work to do! Send msg to the 11
+;-----
+	MOVWT	AX,	LSI,	ORBASE+2 ;Get second word first
+	MOVWTM	RXDATA			;Send second word
+	MOVWT	AX,	LSI,	ORBASE	;Get function/port word
+	MOVWTM	RXFUN			;Send function
+	MOVBT	AL,	R,	AH	;Get function port number
+	CBW
+;-----
+; Update output ring pointers
+;-----
+	ADDWS	R,	SI,	4	;Add 4 to output ring taker
+	CMPWI	R,	SI,	ORSIZE	;Did ring wrap arround?
+	JL	10$			;Br if not
+	CLRWR	SI			;Reset output ring pointer
+10$:	MOVWF	SI,	M,	ORTAKE	;Restore ring pointer
+	TESTBI	M,	EXEC,	1	;Is execute mode set?
+	JZ	TXCK			; jmp if not
+	MOVBIR	CL,	4		;Calc DDB offset
+	SHLVW	R,	AX
+	MOVWT	DI,	R,	AX	;Load DDB pointers
+	MOVWT	AX,	SBPDI,	DBVECT	;Get PDP11 interrupt vector from DDB
+	MOVWTM	VCTADR			; and load into magik vector location
+	INT11				; and interrupt the 11!
+EMDONE:	TESTBI	M,	EXEC,	1	;Execution mode set?
+	JE	TXCK			; jmp if not
+	LJUMP	SCANB,	0		;Scan SIO's
+TXCK:	CMPBI	M,	TXFUN,	0	;Is there a msg from the node?
+	JZ	SCHDLR			;Br if there is nothing ready.
+.PAGE
+;-----
+; Here to process all TX functions
+;-----
+	MOVWFM	TXDATA+2		;Copy TX function to buffer
+	MOVWTM	TXBUF+4
+	MOVWFM	TXDATA
+	MOVWTM	TXBUF+2
+	MOVWFM	TXFUN
+	MOVWTM	TXBUF
+	MOVBI	M,	TXFUN,	0	;Eat function, no interrupting the 11
+	XCHGB	AL,	R,	AH	;Get port number into low byte
+	CBW				;Convert to word for indexing
+	CMPIB	MAXPRT			;Is this a reasonable port number?
+	JG	BADPRT			; Br if not
+	MOVBIR	CL,	4		;Convert port number to DDB offset
+	SHLVW	R,	AX		; "
+	MOVWT	DI,	R,	AX	; and store in DI
+	MOVBFM	TXBUF			;Get function byte
+	CBW				; convert to word and
+	CMPIW	MAXFUN			;Is this a reasonable function number?
+	JG	BADFUN			; Br if not
+	TESTIW	201			;No odd or negative functions!
+	JNE	BADFUN			; br if odd
+	MOVWT	SI,	R,	AX	;Load into index register for dispatch
+;-----
+; Dispatch on TX function. Each routine is supplied with:
+;	DI =>	DDB offset
+;	TXBUF => Function / Port number / 6 data bytes
+;-----
+	JMPI	LSI,	TXTAB-FUDGE-2	;Dispatch on function code
+
+.PAGE
+;-----
+; BADPRT - Bad port, nonexistant hardware
+;-----
+BADPRT:	IWAIT				;Wait for last function to be eaten
+	MOVBF	AL,	M,	RXPORT	;Return bad port number
+	MOVBI	M,	RXFUN,	PRTERR	;Load function type
+	JUMP	SCHDLR			;Back to main loop
+
+;-----
+; BADFUN - Invalid function. Here when the node has requested an invalid
+; function. Send node an FUNERR and copy offending function for node to read.
+;-----
+BADFUN:	IWAIT				;Wait for last function to be eaten
+	MOVBFM	TXBUF			;Get offending function
+	MOVBTM	RXDATA			; and output it
+	MOVBFM	TXBUF+1			;Get offending port
+	MOVBTM	RXPORT			; and output it
+	MOVBI	M,	RXFUN,	FUNERR	;Load msg type
+	JUMP	SCHDLR			;Back to main loop
+
+.PAGE
+.SBTTL	EXDIAG - Execute DCP ROM and RAM diagnostics
+;-----
+; EXDIAG - Calculate ROM checksum.
+; The ROM checksum is a word at a time additive checksum inclusive.
+;-----
+EXDIAG:	MOVWIR	SI,	ROMADR		;Load base address for ROM
+	MOVWIR	CX,	3776		;Load ROM size as loop counter
+	CLRBR	AL			;Clear checksum
+ROMCK:	XORBT	AL,	ISI		;Calc checksum
+	INCR	SI			;Point to next location
+	LOOP	ROMCK			;Loop till done
+	MOVBTM	RXDATA+4
+	CMPBT	AL,	ISI		;Is the checksum good?
+	JNE	BADCKS			;Br if bad checksum
+
+;-----
+; ROM checksum is good.
+; Memory diagnostic for DCP - Loads mem with several patterns and test
+; for same. RAM is locations 0-3777. A failure will cause a 1 function
+; to be written into CSR 0. CSR 1 contains the failing addr, CSR 2
+; contains the expected value and CSR 3 contains the offending value.
+;-----
+MEMD:	MOVWIR	SI,	3		;Load test pattern index
+NXTPAT:	MOVBT	AL,	LSI,	TSTPAT-FUDGE ;Get test pattern
+	MOVWIR	DI,	3777		;Point to highest RAM location
+LDMEM:	MOVBF	AL,	IDI		;Load mem with tst pattern
+	DECR	DI			;Dec addr
+	JGE	LDMEM			;Br till mem is fully patterned
+	MOVWIR	DI,	3777		;Back to top of mem
+CKMEM:	CMPBT	AL,	IDI		;Same?
+	JNE	BADMEM			;Br if memory failure!
+	DECR	DI			;Check previous location
+	JGE	CKMEM			;Br till all memory is verified
+	DECR	SI			;Do next pattern
+	JGE	NXTPAT			;Br till all patterns done
+	MOVWI	M,	RXFUN,	DCPOK	;Send all is well function
+ZAPALZ:	JUMP	ZAPALL			;Disable all ports
+
+;-----
+; Here on memory failure
+;-----
+BADMEM:	MOVWF	DI,	M,	RXDATA	;Load failing addr
+	MOVBF	AL,	M,	RXDATA+2 ;Load test pattern attempted
+	MOVBT	AL,	IDI		;Get offending data
+	MOVBF	AL,	M,	RXDATA+4 ;Load offending data
+	MOVBI	M,	RXFUN,	MEMERR	;Set fail flag
+	JMP	ZAPALZ
+
+;-----
+; Here on checksum fail on ROM. The ROM is sick, attempt to leave
+; error function in CSR's.
+;-----
+BADCKS:	MOVBT	AH,	ISI,	ROMCKS	;Get ROM's checksum
+	MOVWTM	RXDATA			;Dump calculated checksum
+	MOVWI	M,	RXFUN,	ROMERR	;Load fatal error function for bad ROM
+	JMP	ZAPALZ			;Back to scheduler
+					; so just give up.
+
+.PAGE
+.SBTTL	BOOT11 - Load bootstrap into node RAM
+;-----
+; Here to load bootstrap into 11's memory and begin it's execution.
+;-----
+BOOT11:	MOVWIR	SI,	BT11AD+ROMADR	;Load ROM address of node bootstrap
+	MOVWIR	CX,	BT11SZ		;Load CX with boot size in words
+	MOVWIR	DX,	1000		;Load output address for DMA write
+LDLOOP:	MOVWT	AX,	ISI		;Get data word from ROM
+	WRTDMA				;Write data into 11's memory
+	INCR2	SI			;inc pointer
+	INCR2	DX			;Inc output address
+	LOOP	LDLOOP			;Loop till done
+;-----
+; Second level bootstrap has now been loaded into node RAM,
+; so start the node bootstrap!
+;-----
+	MOVWIR	AX,	$NOP11		;Load inst to start the 11
+	MOVWIR	DX,	776
+	WRTDMA				;Node is now executing from it's
+					;very own RAM.
+	JUMP	SCHDLR			;Done, Back to scheduler
+.PAGE
+.SBTTL	Debug functions
+;-----
+; Here to deposit word into DCP memory
+;-----
+DEPMEM:	MOVWT	DI,	M,	TXBUF+2	;Get target address
+	MOVWFM	TXBUF+4			;Get data word to deposit
+	MOVWF	AX,	IDI		;Deposit data into target location
+	JUMP	SCHDLR			;Done, return to scheduler
+
+;-----
+; Examine DCP memory word
+;-----
+EXMMEM:	MOVWT	SI,	M,	TXBUF+2	;Get address of requested data
+	MOVWT	AX,	ISI		;Get requested data from memory
+	IWAIT				;Wait for node to finish with last msg
+	MOVWF	SI,	M,	RXDATA	;Load target address
+	MOVWF	AX,	M,	RXDATA+2 ;Load requested data
+	MOVWI	M,	RXFUN,	DSPMEM	;Load function
+	JMP	SCHDLX			;Done, return to scheduler
+
+;-----
+; Dump registers - this routine outputs 3 consecutive messages with the
+; contents of the accessable registers.
+;	1 =>	function, AX, BX, CX
+;	2 =>	function, DX, SP, BP
+;	3 =>	function, SI, DI, Flags
+;-----
+RDUMP:	IWAIT				;Wait for last function to be eaten
+	MOVWTM	RXDATA			;Dump AX
+	MOVWF	BX,	M,	RXDATA+2 ; "   BX
+	MOVWF	CX,	M,	RXDATA+4 ; "   CX
+	MOVWI	M,	RXFUN,	REGDMP	;Send function
+	IWAIT				;Wait for last function to be eaten
+	MOVWF	DX,	M,	RXDATA	;Dump DX
+	MOVWF	SP,	M,	RXDATA+2 ; "   SP
+	MOVWF	BP,	M,	RXDATA+4 ; "   BP
+	MOVWI	M,	RXFUN,	REGDMP	;Send function
+	IWAIT				;Wait for last function to be eaten
+	MOVWF	SI,	M,	RXDATA	;Dump SI
+	MOVWF	DI,	M,	RXDATA+2 ; "   DI
+	CLRWR	AX			;Clear AX
+	LAHF				;Get flag bits
+	MOVWTM	RXDATA+4		;Dump flags
+	MOVWI	M,	RXFUN,	REGDMP	;Send function
+	RET
+
+DMPREG:	CALL	RDUMP
+	JMP	SCHDLX
+
+.PAGE
+.SBTTL	Transmit functions
+;-----
+; EXECUT - Finish building SCAN routine in RAM and start scanning
+; the SIO's for something to do.
+;-----
+EXECUT:	MOVBI	M,	EXEC,	1	;Set flag to start scanning the SIO's
+	MOVWT	SI,	M,	NXTENT	;Get address of next entry in SCAN tbl
+	MOVBI	ISI,	0,	$LJUMP	;Load LJUMP op code
+	INCR	SI
+.LIST MEB
+	MOVWI	ISI,	0,	TXCK-FUDGE ;Load return address
+.NLIST MEB
+	INCR2	SI
+	MOVWI	ISI,	0,	0	;Load segment reg value
+SCHDLX:	JUMP	SCHDLR			;Return to scheduler
+
+;-----
+; SCANP - Scan port table. This table is used durring initialization
+; to build an entry in the Z80-SIO scanning table in RAM.
+;-----
+.LIST	MEB
+SCANP:
+..CSR0	=.-SCANPX+1			;Calc offset from end of code
+	MOVBFM	...CSR			;Get SIO CSR
+	TESTIB	ZIOIPD			;Does SIO still want attention?
+	JE	SCANPX			;Jmp if not
+;-----
+; Here if this Z80-SIO needs processing, set up registers and
+; jump to SIO dispatch routine. The next SCANP entry address is
+; saved in SCNPTR.
+;-----
+..LAB0	=.-SCANPX+4
+	MOVWI	M,	SCNPTR,	...LAB	;Save SIO scan pointer
+..DDB0	=.-SCANPX+1
+	MOVWIR	DI,	...DDB		;DI = DDB offset
+..CSR1	=.-SCANPX+1
+	MOVWIR	SI,	...CSR		;SI = Z80-SIO address
+	LJUMP	SCNDSP-FUDGE,	0	;Process SIO (back to ROM)
+
+SCANPX:					;Load address for next SCANP entry
+.NLIST	MEB
+.PAGE
+;-----
+; Port configuration - Checks for real hardware and sets vector in DDB
+;-----
+CFGPRT:	MOVWFM	TXBUF+2			;Get new vector address
+	MOVWF	AX,	SBPDI,	DBVECT	;Init vector address in DDB
+	MOVWT	SI,	IBPDI		;Get SIO address from DDB
+	PUSHR	DI
+	PUSHR	SI
+	MOVWT	BX,	R,	SI	;Copy SIO address
+	ORBI	R,	BX,	CHANLB	; and make this a channel B pointer
+	MOVBI	IBX,	0,	ZIOR1	;Disable status affects vector
+	MOVBI	IBX,	0,	0
+	MOVWIR	DI,	3		;Load bit pattern table index
+NXTBIT:	MOVBT	AL,	LDI, TSTPAT-FUDGE ;Get bit pattern
+	MOVBI	IBX,	0,	ZIOR2	;Write bit pattern into SIO
+	MOVBF	AL,	IBX	
+	MOVBI	IBX,	0,	ZIOR2	;Read bit pattern from SIO
+	CMPBT	AL,	IBX		;Same?
+	JNE	PTERR			;Fail if not
+	DECR	DI			;Point to next pattern
+	JGE	NXTBIT			; and try it
+;-----
+; If this is an even numbered port an entry must be made in
+; the SCAN table
+;-----
+	TESTBI	M,	TXBUF+1, 1	;Is this an even port?
+	JE	BLDTB			;Jmp if not, initialization is done!
+	POPR	AX
+	POPR	AX
+	JMP	SNDPOK
+
+;-----
+; Build an entry in the scan loop in RAM for this SIO chip.
+; An entry is only generated for an even port number since
+; there are two ports per SIO.
+;-----
+BLDTB:	MOVWT	DI,	M,	NXTENT	;Load destination address
+	MOVWIR	SI,	SCANP-FUDGE	;Load table address
+	MOVWIR	CX,	SCANPX-SCANP	;Get SCANP size in bytes
+	REP
+	MOVSB				;Copy SCANP instructions into RAM
+;-----
+; Fill in port dependant variables into this SCANP entry
+;	DI => Address of next available entry location into SCANP table.
+;-----
+	POPR	AX			;Get SIO CSR address
+	MOVWF	AX,	SDI,	<..CSR0&377>
+	MOVWF	AX,	SDI,	<..CSR1&377>
+	POPR	AX			;Get DDB offset
+	MOVWF	AX,	SDI,	<..DDB0&377>
+	MOVWF	DI,	SDI,	<..LAB0&377> ; and address of next entry
+	MOVWF	DI,	M,	NXTENT	;Update pointer
+;-----
+; Send port initialized function.
+;-----
+SNDPOK:	MOVBIR	BL,	PORTOK		;Load function code
+	MOVBT	BH,	M,	TXBUF+1	;Load port number
+	JUMP	PUTORX			;Stuff function into the ring
+
+;-----
+; Here when an SIO fails to return the proper bit pattern
+; during initialization (CFGPRT function). Either the Sesn't exist
+; or the hardware is broken.
+;-----
+PTERR:	MOVBIR	BL,	PRTERR		;Load function
+	MOVBT	BH,	M,	TXBUF+1	;Load port
+	JUMP	PUTORX
+
+.PAGE
+.SBTTL	Synchronous port initialization
+;-----
+; Initialize one synchronous port
+;-----
+SYNPAR:	MOVBI	SBPDI,	DBERMS,	60	;Initialize RX status error mask
+	MOVBI	SBPDI,	DBR1, ZIOSAV!ZIOTIE!ZIOEIE!ZIOIAC ;Init interrupt reg
+	MOVBFM	TXBUF+3			;Get mode bits
+	ORBF	AL,	SBPDI,	DBBITS	; and stuff into DDB
+;-----
+;Init sync mode and clock register
+;-----
+	MOVBIR	AL,	ZIOX1!ZIOS8!ZIOSME ;Load base value
+	TESTBI	M,	TXBUF+3, .2SYN	;Double synch mode?
+	JZ	10$			; jmp if not
+	ORIB	ZIOS16			;Set to double synch mode
+10$:	MOVBF	AL,	SBPDI,	DBR4	;Load values into DDB
+;-----
+; Init Receive character size, enable receiver and set strip synch,srch synch
+;-----
+	MOVBI	SBPDI,	DBR3,	ZIORC8!ZIORXE!ZIOEHP!ZIOSLI
+;-----
+; Init transmit character size, transmit enable and CRC enable
+;-----
+	MOVBIR	AL,	ZIOC16!ZIOTXE!ZIOTC8 ;Load base values
+	MOVBI	SBPDI,	DBRXST,	RXSYNC	;Init receiver state to no CRC
+	TESTBI	M,	TXBUF+3, .CRCR	;Enable CRC?
+	JZ	20$			; jmp if not
+	ORBI	SBPDI,	DBR3,	ZIORCE	;Enable CRC in receiver
+	MOVBI	SBPDI,	DBRXST,	RXCRC	;Init receiver state to use CRC
+20$:	TESTBI	M,	TXBUF+3, .CRCT	;Enable transmit CRC?
+	JZ	24$
+	ORIB	ZIOTCE			;Enable CRC in transmitter
+24$:	TESTBI	M,	TXBUF+3, .MARK	;Idle mark's?
+	JZ	30$			; jmp if not (idle sync)
+	ANDIB	<^CZIOTXE>		;Disable transmitter to idle marks
+30$:	MOVBF	AL,	SBPDI,	DBR5	;Load values into DDB
+	JMP	INITCM			;Do common initialization stuff
+
+.PAGE
+.SBTTL	Port initialization
+;-----
+; Here for Asynchronous port initialization
+; Parameters to be set include Parity options, number of stop bits,
+; character size and baud rate.
+;-----
+
+;-----
+; Init interrupt status bits. There are no interrupts from the SIO
+; but these bits must be set to enable the Interrupt Pending bit
+; in read reg 0
+;-----
+ASYPAR:	MOVBI	SBPDI,	DBERMS,	160	;Initialize RX status error mask
+	MOVBI	SBPDI,	DBRXST,	RXASYN	;Init receiver state
+	MOVBI	SBPDI,	DBR1,	ZIOIPV!ZIOSAV!ZIOTIE!ZIOEIE
+;-----
+; Init asynch mode, stop bits, parity
+;-----
+	MOVBFM	TXBUF+3			;Get wr4 parameters
+	ORIB	ZIOX16			;OR in clock multiplier
+	MOVBF	AL,	SBPDI,	DBR4	;Load DDB with wr4 values
+;-----
+; Init transmit character size and transmiter enable
+;-----
+	MOVBFM	TXBUF+2			;Get character size
+	SHRB	R,	AL		;Shift the character size to position
+	ORIB	ZIOTXE!ZIOICE		;Enable transmitter and internal clock
+	MOVBF	AL,	SBPDI,	DBR5	;Load DDB with values for wr5
+;-----
+; Init receive character size and receiver enable
+;-----
+	MOVBFM	TXBUF+2			;Get character size
+	ORIB	ZIORXE			;Enable receiver and inhibit sync char
+	MOVBF	AL,	SBPDI,	DBR3	;Load DDB with values for wr3
+.PAGE
+.SBTTL	INITCM - Common initialization routine
+;-----
+; Calculate SIO CSR address
+;-----
+INITCM:	MOVBFM	TXBUF+1			;Get port number
+	MOVBT	CL,	R,	AL	;Make a copy
+	MOVBIR	DH,	6		;There are 6 ports per SIO board
+	DIVB	R,	DH		;Calculate SIO board number
+	CBW
+	MOVWT	BX,	R,	AX	;BX = board number
+	SHLW	R,	BX		;Calculate table offset
+;-----
+; Calculate port number for this board (0-5)
+;-----
+	MULB	R,	DH		;Calculate base port # for this board
+	NEGB	R,	AL		;Change sign
+	ADDBT	AL,	R,	CL	; and calculate port offset for board
+	CBW
+	MOVWT	SI,	R,	AX	;SI = port / board offset
+	SHLW	R,	SI		;Calculate table offsets
+	MOVWT	BX,	LBX,	SIOTAB-FUDGE ;Get base address
+;-----
+; Initialize clock chip
+;-----
+	PUSHR	BX			; and make another copy for later
+	ADDWT	BX,	LSI,	YTAB-FUDGE ;Calculate clock chip mode reg addr
+	PUSHR	SI			;Save table offset
+	SHRW	R,	SI		;Convert to byte table offset
+	MOVBT	AL,	LSI,	WTAB-FUDGE ;Get mode register value from table
+	MOVBF	AL,	IBX		;Initialize clock mode register
+	POPR	SI			;Get table offset
+	POPR	BX			;Get base address for board
+	ADDWT	BX,	LSI,	ZTAB-FUDGE ;Calculate clk chip counter reg addr
+	MOVWFM	TXBUF+4			;Get counter value
+	MOVBF	AL,	IBX		;Initialize clock counter register
+	MOVBF	AH,	IBX		; low byte first, high byte last
+;-----
+; Clock chip is now initialized (baud rate set)!
+;-----
+.PAGE
+;-----
+; Initialize the current SIO.
+;	SI => Current SIO data address
+;	BP => Base address for DDB's
+;	DI => Current DDB pointer
+;-----
+	MOVWT	SI,	IBPDI		;Get current SIO data register address
+	MOVWT	BX,	R,	SI
+	ORWI	R,	BX,	CHANLB	;BX = Channel B CSR
+;-----
+;	SI =>	SIO address (may be A or B)
+;	BX =>	SIO channel B address
+;-----
+	MOVBI	ISI,	0,	ZIORST	;Reset port
+	NOP				;Wait for SIO to reset !!!
+	NOP				; must be 4 SIO clock cycles
+	NOP				; not 8086 cycles!!
+;-----
+; Initialize interrupt vector (channel B only!)
+;-----
+	MOVBI	ISI,	0,	ZIORTU	;Reset transmit underrun/EOM latch
+	MOVBI	IBX,	0,	ZIOR2	;Pointer 2
+	MOVBI	IBX,	0		;Init interrupt vector. Must be 0
+					; for proper indexing on SIO functions
+	MOVBI	ISI,	0, ZIOR4!ZIOREX ;Pointer 4, reset external status
+;-----
+; Initialize synch/asynch mode, clock multiplier and parity
+;-----
+	MOVBT	AL,	SBPDI,	DBR4	;Get asynch mode, parity, stop bits,
+					; & clock rate from DDB
+	MOVBF	AL,	ISI		; and stuff SIO
+;-----
+; Initialize synch registers
+;-----
+	MOVBFM	TXBUF+2			;Get synch char from parameter function
+	MOVBI	ISI,	0,	ZIOR6	;Pointer 6
+	MOVBF	AL,	ISI		; and stuff SIO
+	MOVBI	ISI,	0,	ZIOR7	;Pointer 7
+	MOVBF	AL,	ISI		; and stuff SIO
+;-----
+; Initialize receiver parameters
+;-----
+	MOVBI	ISI,	0,	ZIOR3	;Pointer 3
+	MOVBT	AL,	SBPDI,	DBR3	;Get receive enable, auto enable
+					; and recieve character length
+	MOVBF	AL,	ISI		; and stuff SIO
+;-----
+; Initialize transmiter parameters
+;-----
+	MOVBI	ISI,	0,	ZIOR5	;Pointer 5
+	MOVBT	AL,	SBPDI,	DBR5	;Get request to send, transmit enable,
+					; transmit character length and DTR
+	MOVBF	AL,	ISI		; and stuff SIO
+;-----
+; Initialize status affects vector (channel B only!)
+;-----
+	TESTWI	R,	SI,	CHANLB
+	JNZ	30$
+	MOVBT	AL,	SBPDI,	DBR1+DDBSIZ ;Get channel B's DBR1
+	JMP	40$
+
+30$:	MOVBT	AL,	SBPDI,	DBR1
+40$:	MOVBI	IBX,	0,	ZIOR1	;Pointer 1
+	MOVBF	AL,	IBX		;Enable status affects vector(chanl B)
+;-----
+; Initialize interrupt enable register
+;-----
+	MOVBI	ISI,	0, ZIOR1!ZIOREX ;Pointer 1, reset external status
+	MOVBT	AL,	SBPDI,	DBR1	;Get transmiter interrupt enable,
+					; status affects vector, interrupt on
+					; recieve, disable wait/ready and
+					; external interrupt enable
+	MOVBF	AL,	ISI		; and stuff SIO
+	MOVBI	ISI,	0,	ZIORTU	;Reset transmitter underrun
+	MOVBI	ISI,	0,	ZIORRC	;Reset RX CRC generator
+;-----
+; Initialization completed for this port!
+;-----
+	JUMP	SCHDLR			;Back to the scheduler
+.PAGE
+.SBTTL	Transmit character
+;-----
+; Transmit start of message (synchronous only).
+; This function resets the transmit CRC generator before sending the first
+; data character.
+;-----
+TXSOM:	MOVWT	SI,	IBPDI		;Get SIO address
+	MOVBFM	TXBUF+2			;Get data character
+	MOVBF	AL,	SSI,	SDATA	;Send data character
+	MOVBI	ISI,	0,	ZIOR5	;Select SIO register
+	MOVBT	AL,	SBPDI,	DBR5	;Get register value
+	ORIB	ZIOTXE			;Enable transmitter
+	TESTBI	SBPDI,	DBBITS,	.CRCT
+	JZ	10$
+	ORIB	ZIOTCE			;Enable CRC
+10$:	MOVBF	AL,	ISI		; and refresh SIO
+	JUMP	SCHDLR			;Done return to scheduler
+
+;-----
+; Transmit end of message. This function sends the last data character,
+; two CRC characters (if enabled), sets the line to idle marks or spaces
+; and will return a normal TXDON when finished.
+;-----
+TXEOM:	ORBI	SBPDI,	DBBITS,	.EOM0	;Set EOM flag
+	MOVWT	SI,	IBPDI		;Get SIO address
+	MOVBFM	TXBUF+2
+	MOVBF	AL,	SSI,	SDATA	;Send data char
+	JUMP	SCHDLR
+
+;-----
+; Transmit a data character
+;-----
+TXDAT:	MOVWT	SI,	IBPDI		;Get SIO address
+TXD001:	MOVBFM	TXBUF+2			;Get data character
+	MOVBF	AL,	SSI,	SDATA	;Send data character
+	JUMP	SCHDLR			;Done return to scheduler
+
+;-----
+; ENDBRK - End break
+;-----
+ENDBRK:	ANDBI	SBPDI,	DBR5,	<^CZIOSBK> ;Clear break bit in current DDB
+	JMP	BRK			;To common refresh routine
+
+;-----
+; SETDTR - Set data terminal ready
+;-----
+SETDTR:	ORBI	SBPDI,	DBR5,	ZIODTR	;Set data terminal ready bit in DDB
+	JMP	BRK			;To common refresh routine
+
+;-----
+; CLRDTR - Clear data terminal ready
+;-----
+CLRDTR:	ANDBI	SBPDI,	DBR5,	<^CZIODTR> ;Clear data terminal ready bit in DDB
+	JMP	BRK			;To common refresh routine
+
+;-----
+; BREAK - Initiate a break
+;-----
+BREAK:	ORBI	SBPDI,	DBR5,	ZIOSBK	;Set break bit in current DDB
+BRK:	MOVWT	SI,	IBPDI		;Get SIO address
+	MOVBT	AL,	SBPDI,	DBR5	;Get new register value from DDB
+	MOVBI	ISI,	0,	ZIOR5	;Select SIO register
+	MOVBF	AL,	ISI		;Refresh I/O register
+	JUMP	SCHDLR			;Bak to scheduler
+
+.PAGE
+.SBTTL	Synchronous functions
+;-----
+; SRCHS - search synch. Causes receiver to begin scanning for 1 or 2
+; synch characters as specified on port initialization. No data will
+; be sent to the node while in this mode.
+;-----
+SRCHS:	ANDBI	SBPDI,	DBRXST,	<^CRXNWB1>
+	ORBI	SBPDI,	DBRXST,	RXNWB0	;Set rx state to auto disable strip
+					; synch on start of new block
+	MOVWT	SI,	IBPDI		;Get SIO address
+	MOVBT	AL,	SBPDI,	DBR3	;Get current register value
+	ANDIB	<^CZIOSLI>		;Clear strip synch
+	TESTBI	M,	TXBUF+2, 1	;Strip synch enable set?
+	JZ	10$			; jmp if not
+	ORIB	ZIOSLI			;Set strip synch
+10$:	MOVBI	ISI,	0,	ZIOR3	;Select SIO register
+	MOVBF	AL,	ISI		;Update SIO register
+	JUMP	SCHDLR			;Jmp to common routine
+
+;-----
+; Strip synch - When enabled, this mode causes synch characters to be
+; eaten till disabled. That is the first character to be transmitted will
+; be the first non-synch character received.
+;-----
+STRPS:	MOVWT	SI,	IBPDI		;Get SIO address
+	MOVBT	AL,	SBPDI,	DBR3	;Get current register value
+	ANDIB	<^CZIOSLI>		;Clear strip synch
+	TESTBI	M,	TXBUF+2, 1	;Strip synch enable set?
+	JZ	10$			; jmp if not
+	ORIB	ZIOSLI			;Set strip synch
+10$:	MOVBI	ISI,	0,	ZIOR3	;Select SIO register
+	MOVBF	AL,	ISI		;Update SIO register
+	JUMP	SCHDLR			;Back to main
+
+.PAGE
+;-----
+; SCNDSP - Here to dispatch on SIO status.
+; Here from SIO scanning code in RAM when SIO needs serviced.
+;-----
+SCNDSP:	MOVBI	SSI,	CHANLB, ZIOR2	;Prepare to read status vector
+	CLRWR	BX			;Clear out word
+	MOVBT	BL,	SSI,	CHANLB	;Copy status from channel B
+	PUSHR	SI			;Save SIO channel A address for RTI
+	TESTWI	R,	BX,	177761	;Is this a reasonable value?
+	JNE	BADRED			; jmp if not
+	JMPI	LBX,	STATAB-FUDGE	;Dispatch on SIO status
+
+;-----
+; Here on attempt to dispatch on an unreasonable value read from
+; an SIO chip. this is a fatal hardware error.
+;-----
+BADRED:	POPR	SI			;Fix stack
+	JUMP	TXCK			; and abort
+
+.PAGE
+.SBTTL	SIO "interrupt" routines
+;-----
+; SIO interrupt service routines
+;	DI =>	DDB offset
+;	BP =>	DDB base
+;	SI =>	data register address
+;-----
+
+;-----
+; Here on external status change.
+;	CTS changed, DCD changed, transmitter underrun/EOM or break
+;	AL =>	SIO status byte
+;-----
+CHBESC:	ADDWS	R,	DI,	DDBSIZ	;Get channel B's DDB
+	ADDWS	R,	SI,	CHANLB	;Get channel B's data register address
+CHAESC:	MOVBI	ISI,	0,	ZIOREX	;Reset external status latches
+	MOVBT	AL,	ISI		;Get channel B's status flags
+	TESTIB	ZIOBRK			;Break detected?
+	JZ	10$			; jmp if not
+;-----
+; Break detected. The SIO sends an exteraneous null character and an
+; exteraneous Transmit underrun/EOM function. The node wants to see a null
+; with a framing error, the junk is eaten.
+;-----
+	ORBI	SBPDI,	DBBITS,	.BRK	;Set break junk flag
+	MOVWIR	AX,	140000		;Load null with framming error
+	MOVBIR	BL,	RXVDAT		;Load recieve data function
+	JMP	ESCCOM			;Stuff dummied null into ring
+
+10$:	TESTIB	ZIOEOM			;Transmitter underrun/EOM detected?
+	JZ	30$			; jmp if not
+;-----
+; Transmitter underrun / EOM detected
+; EOM's are filtered out during synch CRC transmition
+;-----
+	TESTBI	SBPDI,	DBBITS,	.EOM0	;Is this a CRC mode EOM?
+	JZ	NXFUN			;If so junk it
+	TESTBI	SBPDI,	DBBITS,	.CRCT	;Is transmit CRC enabled?
+	JZ	NXFUN			;Junk all normal transmit underuns
+	MOVBIR	BL,	XMTDON		;Xmit CRC requires a xmit done here
+	JMP	ESCCOM			;Clean up and send function to node
+
+30$:	XCHGB	AL,	SBPDI,	DBSTAU	;Save status bits
+	XORBT	AL,	SBPDI,	DBSTAU	;Find the bits that changed
+	TESTIB	ZIODCD			;Did DCD change?
+	JZ	40$			; jmp if not
+;-----
+; DCD changed
+;-----
+	MOVBIR	BL,	CARDET		;Carrier detect
+	TESTBI	SBPDI,	DBSTAU,	ZIODCD	;DCD set?
+	JZ	ESCCOM			; jmp if so
+	MOVBIR	BL,	CARLOS		;Carrier loss
+	JMP	ESCCOM			;Stuff into output ring
+
+40$:	TESTIB	ZIODSR			;Did DSR change?
+	JZ	NXFUN			; jmp if not
+;-----
+; DSR changed
+;-----
+	MOVBIR	BL,	DSRSET		;DSR has been set
+	TESTBI	SBPDI,	DBSTAU,	ZIODSR	;Has DSR been set?
+	JZ	ESCCOM			; jmp if so
+	MOVBIR	BL,	DSRCLR		;DSR has been cleared
+ESCCOM:	MOVBI	ISI,	0,	ZIOREX	;Reset external status latches
+PUTOR0:	JUMP	PUTOR			;Stuff function into output ring
+;-----
+; NXFUN - Junk this interrupt, no output function, just reset latches
+;-----
+NXFUN:	MOVBI	ISI,	0,	ZIOREX	;Reset external status
+	POPR	SI			;Get SIO channel A
+	MOVBI	ISI,	0,	ZIORTI	;Force	an RTI to SIO (channel A only)
+	JUMP	TXCK			;Back to main
+
+.PAGE
+;-----
+; Here on transmit buffer empty
+;-----
+CHBTBE:	ADDWS	R,	DI,	DDBSIZ	;Get channel B's DDB
+	ADDWS	R,	SI,	CHANLB	;Get channel B's data register address
+CHATBE:	MOVBIR	BL,	XMTDON		;Load function byte
+	MOVBI	ISI,	0,	ZIORTP	;Reset transmit interrupt latch
+	TESTBI	SBPDI,	DBBITS,	.EOM0	;Is EOM flag set?
+	JZ	PUTOR0			; jmp if not
+	TESTBI	SBPDI,	DBBITS,	.CRCT
+	JZ	10$
+	TESTBI	SBPDI,	DBBITS,	.EOM1
+	JNZ	10$
+	MOVBI	ISI,	0,	ZIORTU	;Force out CRC
+	ORBI	SBPDI,	DBBITS,	.EOM1
+	JUMP	NOPUT			;Eat TX done
+
+;-----
+; End of message flag set, refresh SIO register from DDB.
+; This will cause CRC to be disabled and/or marks to be idled if necessary.
+;-----
+10$:	ANDBI	SBPDI,	DBBITS,	<^C<.EOM0!.EOM1!.EOM2>> ;Reset EOM flags
+	MOVBT	AL,	SBPDI,	DBR5	;Get register value
+	MOVBI	ISI,	0,	ZIOR5	; point to register
+	MOVBF	AL,	ISI		; and update SIO
+	JUMP	PUTOR			;Put function into output ring
+
+.PAGE
+;-----
+; Here on receive character available and special receive condition
+; (parity error, receiver overun or framming error).
+;-----
+CHBSRC:
+CHBRCA:	ADDWS	R,	DI,	DDBSIZ	;Get channel B's DDB
+	ADDWS	R,	SI,	CHANLB	;Get channel B's data register address
+CHASRC:
+CHARCA:	MOVBI	ISI,	0,	ZIOR1	;Prepare to read RX status flags
+	MOVBT	AH,	ISI		;Copy status flags
+	ANDBI	R,	AH,	360	;Clr unused bits in status byte
+	MOVBT	AL,	SSI,	SDATA	;Read data char from SIO
+	MOVBI	ISI,	0,	ZIOEIR	;Enable interrupt on next char
+	MOVBI	ISI,	0,	ZIOERS	;Reset error latches
+	MOVBT	BL,	SBPDI,	DBRXST	;Get receiver state
+	MOVBIR	BH,	0		;Mask off junk before dispatching
+;-----
+; Dispatch on receiver state
+;	AL = Data character
+;	AH = Status byte
+;-----
+	JMPI	LBX,	RXTAB-FUDGE	;Dispatch on receiver state
+
+;-----
+; Here to receive first character in synch CRC mode. A two character
+; hold-off is implimented to put the CRC flag with the proper data byte
+; since the SIO chip sends the flag two characters late!
+;-----
+RCFCR0:	MOVBF	AL,	SBPDI,	DBRXC0	;Store first character
+	MOVBT	AL,	SBPDI,	DBR3	;Get SIO register base value and
+	ANDIB	<^C<ZIOSLI!ZIOEHP>>	; clear strip synch
+	MOVBI	ISI,	0,	ZIOR3!ZIORRC ;Reset RX CRC
+	MOVBF	AL,	ISI	
+	MOVBI	SBPDI,	DBRXST,	12	;Set receiver state
+	POPR	SI			;Dismis SIO interrupt
+	MOVBI	ISI,	0,	ZIORTI
+	JUMP	TXCK
+
+RCFCR1:	MOVBF	AL,	SBPDI,	DBRXC1	;Store second character
+	MOVBI	SBPDI,	DBRXST,	2	;Clear new block rx state
+	POPR	SI			;Dismis SIO interrupt
+	MOVBI	ISI,	0,	ZIORTI
+	JUMP	TXCK
+
+;-----
+; Here to process first character in non-CRC block. Strip synch is
+; auto disabled.
+;-----
+RCFCAR:	MOVBI	SBPDI,	DBRXST,	0	;Clear new block bit
+	MOVBT	BL,	SBPDI,	DBR3	;Get SIO register base value
+	ANDBI	R,	BL,	<^C<ZIOSLI!ZIOEHP>> ;Clear strip synch
+	MOVBI	ISI,	0,	ZIOR3
+	MOVBF	BL,	ISI	
+	JMP	CHAR02
+
+;-----
+; Here to receive non CRC synch and asynch characters
+;-----
+RCCHAR:	TESTBI	SBPDI,	DBBITS,	.BRK	;Is this junk following a break?
+	JZ	CHAR02			; jmp if good data
+	ANDBI	SBPDI,	DBBITS,	<^C.BRK> ;Clear "eat null" from break flag
+;-----
+; Here to dismis interrupt when there is nothing to put into the ring.
+;-----
+NOPUT:	POPR	SI			;Get channel A DDB
+	MOVBI	ISI,	0,	ZIORTI	;Dismis SIO interrupt
+	JUMP	TXCK
+
+;-----
+; Here to receive non-first characters in synch CRC mode.
+; This is done to keep the CRC status flags with the proper character
+; since the Z80-SIO gives the status one char late.
+;-----
+RCCRC:	MOVBT	BL,	SBPDI,	DBRXC0	;Get oldest char
+	MOVBT	BH,	SBPDI,	DBRXC1	;Shuffle down next char
+	MOVBF	BH,	SBPDI,	DBRXC0
+	MOVBF	AL,	SBPDI,	DBRXC1	;Save newest char
+	MOVBT	AL,	R,	BL
+;-----
+; Here to prepare a receive data message for the ring.
+;-----
+CHAR02:	TESTB	AH,	SBPDI,	DBERMS	;Have any errors occurred?
+	JZ	20$			; jmp if not
+	ORBI	R,	AH,	200	;Error has occurred, set the sign bit
+20$:	MOVBIR	BL,	RXVDAT		;Load function number
+;	JMP	PUTOR			;Fall into PUTOR
+.PAGE
+.SBTTL	PUTOR - Put recieve function into output ring
+;-----
+; Here to put a function into the receive ring buffer while scanning the SIO's
+; and the port number must be calculated.
+; Calling sequence:
+;	Stack = SIO channel A address
+;	BL =>	Function code
+;	AX =>	Data word
+;-----
+PUTOR:	POPR	SI			;Get SIO channel A address
+	MOVBI	ISI,	0,	ZIORTI	;Force an RTI to SIO (channel A only)
+	MOVBIR	CL,	4		;Convert DDB offset to port number
+	SHRVW	R,	DI
+	MOVWT	CX,	R,	DI	;Copy to byte register
+	MOVBT	BH,	R,	CL	;Copy port number into header word
+;-----
+; Entry point to insert a function into the output ring buffer while NOT
+; scanning the SIO's.
+;	BL =>	Function code
+;	BH =>	Port number
+;	AX =>	Data word (if needed)
+;-----
+PUTORX:	MOVWT	CX,	M,	ORPUT	;Get output ring pointer
+	MOVWT	SI,	R,	CX	;Copy for later
+	ADDWS	R,	CX,	4	;Increment output ring pointer
+	CMPWI	R,	CX,	ORSIZE	;Did pointer wrap arround?
+	JL	2$			; jmp if not
+	CLRWR	CX			;Wrapped arround, reset pointer
+2$:	CMPWT	CX,	M,	ORTAKE	;Is there free space in the output ring?
+	JE	JNKFUN			; jmp if not
+	MOVWF	AX,	LSI,	ORBASE+2;Copy data & status flags into function
+	MOVWF	BX,	LSI,	ORBASE	;Stuff function into output ring
+	MOVWF	CX,	M,	ORPUT	;Restore ring pointer
+JNKFUN:	JUMP	TXCK			;Done, return to SIO scan dispatcher
+.PAGE
+.SBTTL	Fatal error routine
+;-----
+; Here on a hardware vector that should not have occurred
+;-----
+DIE0:	MOVWIR	BX,	0		;Divide by zero
+	JMP	DIE
+
+DIE1:	MOVWIR	BX,	1		;Single step
+	JMP	DIE
+
+DIE2:	MOVWIR	BX,	2		;Non maskable interrupt
+	JMP	DIE
+
+DIE3:	MOVWIR	BX,	3		;One-byte interrupt instruction
+	JMP	DIE
+
+DIE4:	MOVWIR	BX,	4		;Interrupt on overflow
+DIE:	CMPBI	M,	RXFUN,	0	;Last function eaten?
+	JNZ	DIE			; loop till so
+	MOVWF	BX,	M,	RXDATA	;Output error code
+	MOVWI	M,	RXFUN,	366	; and error function
+	JUMP	SCHDLR
+
+.PAGE
+.SBTTL	Scheduling dispatch table
+TXTAB:	$WORD	MEMD-FUDGE		;2-Execute DCP diagnostics
+	$WORD	BOOT11-FUDGE		;4-Copy 11 boot from ROM to 11's RAM
+	$WORD	EXMMEM-FUDGE		;6-Examine DCP memory word
+	$WORD	DEPMEM-FUDGE		;10-Deposite word into DCP memory
+	$WORD	DMPREG-FUDGE		;12-Dump 8086 registers
+	$WORD	ZAPALL-FUDGE		;14-Zap all Ports, reinit all DDB's
+	$WORD	EXECUT-FUDGE		;16-Initialization done, execute main
+	$WORD	ASYPAR-FUDGE		;20-Init one asynchronous line
+	$WORD	TXDAT-FUDGE		;22-Transmit one character
+	$WORD	SETDTR-FUDGE		;24-Set data terminal ready
+	$WORD	CLRDTR-FUDGE		;26-Clear data terminal ready
+	$WORD	BREAK-FUDGE		;30-Start break
+	$WORD	ENDBRK-FUDGE		;32-End break
+	$WORD	CFGPRT-FUDGE		;34-Config port (sets vector)
+	$WORD	TXSOM-FUDGE		;36-Transmit start of message (synch)
+	$WORD	TXEOM-FUDGE		;40-Transmit end of message
+	$WORD	SYNPAR-FUDGE		;42-Init one synchronous port
+	$WORD	SRCHS-FUDGE		;44-Search synch
+	$WORD	STRPS-FUDGE		;46-Strip synch
+
+TXTABZ:	$WORD	BADFUN-FUDGE		;Invalid function
+
+;-----
+; RXTAB - Receiver state dispatch table
+;-----
+RXTAB:	$WORD	RCCHAR-FUDGE		;0 - asynch & synch with no CRC
+	$WORD	RCCRC-FUDGE		;2 - Synch CRC not start of message
+	$WORD	RCFCAR-FUDGE		;4 - Synch first char in non CRC block
+	$WORD	RCFCR0-FUDGE		;6 - Synch first char in CRC block
+	$WORD	RCCHAR-FUDGE		;10- not used
+	$WORD	RCFCR1-FUDGE		;12- Synch 2nd char
+;-----
+; SIO status dispatch table
+;-----
+STATAB:	$WORD	CHBTBE-FUDGE		;Channel B, transmit buffer empty
+	$WORD	CHBESC-FUDGE		;Channel B, external status change
+	$WORD	CHBRCA-FUDGE		;Channel B, receive character available
+	$WORD	CHBSRC-FUDGE		;Channel B, special receive condition
+	$WORD	CHATBE-FUDGE		;Channel A, transmit buffer empty
+	$WORD	CHAESC-FUDGE		;Channel A, external status change
+	$WORD	CHARCA-FUDGE		;Channel A, receive character available
+	$WORD	CHASRC-FUDGE		;Channel A, special receive condition
+
+;-----
+; Test patterns for memory diagnostic
+;-----
+TSTPAT:	$BYTE	<^B00000000>		;Memory diagnostic test patterns
+	$BYTE	<^B10101010>
+	$BYTE	<^B01010101>
+	$BYTE	<^B11111111>
+
+;-----
+; SIO board base address table. Used for Port initialization.
+;-----
+SIOTAB:	$WORD	SIO0			;SIO board 0  (ports 00-05)
+	$WORD	SIO1			;SIO board 1  (ports 06-13)
+	$WORD	SIO2			;SIO board 2  (ports 14-21)
+	$WORD	SIO3			;SIO board 3  (ports 22-27)
+	$WORD	SIO4			;SIO board 4  (ports 30-35)
+	$WORD	SIO5			;SIO board 5  (ports 36-43)
+
+.PAGE
+;-----
+; Vector table to be copied into low memory
+;-----
+VTAB:	$WORD	0			;Divide by zero
+	$WORD	DIE0-FUDGE
+	$WORD	0			;Single step
+	$WORD	DIE1-FUDGE
+	$WORD	0			;Non-maskable interrupt
+	$WORD	DIE2-FUDGE
+	$WORD	0			;One byte interrupt instruction
+	$WORD	DIE3-FUDGE
+	$WORD	0			;Interrupt on overflow
+	$WORD	DIE4-FUDGE
+VTABX:
+
+;-----
+; Clock chip mode register initialization values
+;-----
+WTAB:	$BYTE	TMDRLB!TMDMD3!TMDBIN!TMDSC0  ;Load 2 bytes,mode 3,binary,port #
+	$BYTE	TMDRLB!TMDMD3!TMDBIN!TMDSC1
+	$BYTE	TMDRLB!TMDMD3!TMDBIN!TMDSC2
+	$BYTE	TMDRLB!TMDMD3!TMDBIN!TMDSC0
+	$BYTE	TMDRLB!TMDMD3!TMDBIN!TMDSC1
+	$BYTE	TMDRLB!TMDMD3!TMDBIN!TMDSC2
+
+;-----
+; Offset value table to calculate register address on SIO board
+;-----
+XTAB:	$WORD	SIOCT0			;SIO CSR for Port 0
+	$WORD	SIOCT1			;SIO CSR for Port 1
+	$WORD	SIOCT2			;SIO CSR for Port 2
+	$WORD	SIOCT3			;SIO CSR for Port 3
+	$WORD	SIOCT4			;SIO CSR for Port 4
+	$WORD	SIOCT5			;SIO CSR for Port 5
+
+YTAB:	$WORD	SIOTM0			;Clock chip mode register
+	$WORD	SIOTM0
+	$WORD	SIOTM0
+	$WORD	SIOTM3			;Clock chip mode register
+	$WORD	SIOTM3
+	$WORD	SIOTM3
+
+ZTAB:	$WORD	SIOTC0			;Clock chip counter register 0
+	$WORD	SIOTC1			;Clock chip counter register 1
+	$WORD	SIOTC2			;Clock chip counter register 2
+	$WORD	SIOTC3			;Clock chip counter register 0
+	$WORD	SIOTC4			;Clock chip counter register 1
+	$WORD	SIOTC5			;Clock chip counter register 2
+
+	.END
+                                                                                                                                                                                                                                                                                                                                                                                                                                                            p S+
