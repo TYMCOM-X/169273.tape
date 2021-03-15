@@ -1,0 +1,272 @@
+begin	"LPR"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(WRS)AUXLIB.REQ" source!file;
+require "(WRS)MAILIB.REQ" source!file;
+require "(WRS)ARGS.REQ" source!file;
+require '14 version;
+
+external boolean RPGSW;
+define	TimeOut = 60;
+string User!Host;
+string User;
+string Host;
+integer PageCount;
+
+integer XIN;
+simple procedure XINini;
+begin
+    setbreak( XIN_getbreak, #eot& #lf& #ff& #ctrl("V"), null, "ISN" );
+end;
+require XINini initialization;
+
+simple boolean procedure IsLeft( string Text,Targ );
+begin
+    while Text=#cr do lop(Text);
+    return( kequ(Text[1 to length(Targ)],Targ) );
+end;
+
+simple boolean procedure IsRight( string Text,Targ );
+return( kequ(Text[inf-length(Targ)+1 to inf],Targ) );
+
+string procedure lower( string Text);
+begin
+    string NewText;
+    integer C;
+
+    NewText := "";
+    while C:=lop(Text) do
+	if C >= "A" and C <= "Z" then
+	    NewText := NewText & (C + "a" - "A")
+	else
+	    NewText := NewText & C;
+    return (NewText);
+end;
+
+string procedure NoParen( string FileName );
+begin
+    string NewFN;
+    integer C;
+
+    NewFN := FileName;
+    while C:=lop(NewFN) do
+	if C = ")" then
+	    return (NewFN);
+    return (FileName);
+end;
+procedure Parse;
+begin
+    string O;
+    integer I;
+    Args := " -C '"& User!Host& "'";
+    Args := " -U '"& lower(User)& "' -H '"& Host& "'";
+    for I := 1 upto ARGC-1 do 
+	if ARGV[i] = "-" then begin
+	    string S;
+	    S := ARGV[i][2 to inf];
+	    while length(S) do case O := lop(S) of begin
+		["#"]
+		    if length(S) then begin
+			Args := Args& " -#"& S;
+			S := null;
+		    end else begin
+			I := I + 1;
+			Args := Args& " -#"& ARGV[i];
+		    end;
+		["o"]["O"] case O := lop(S) of begin
+		    ["l"]["L"] Args := Args& " -ol";
+		    ["p"]["P"] Args := Args& " -op";
+		    [else] usererr(0,0,"Illegal option: -o"&O,"X")
+		end;
+		["i"]["I"] begin
+		    Args := Args& " -i";
+		    if cvd(ARGV[i+1]) then begin
+			I := I + 1;
+			Args := Args& " "& ARGV[i];
+			ARGV[i] := "-"& ARGV[i];
+		    end;
+		end;
+		["t"]["T"]
+		    AuxTrace := true;
+		["p"]["P"]
+		    Args := Args& " -p";
+		["f"]["F"]
+		    Args := Args& " -f";
+		["l"]["L"]
+		    Args := Args& " -l";
+		[else]
+		    usererr(0,0,"Illegal option: -"&O,"X")		    
+	    end;
+	end;
+end;
+
+procedure Login;
+begin
+    require "lpr.dat" source!file;
+    string Text;
+    integer Status;
+    boolean CopyFlag;
+    if 0 > Creaux( "netlpr" ) then usererr(0,0,"login: no circuit","X");
+    while true do case AuxRead( Text, TimeOut ) of begin
+	[aux!zap] usererr(0,0,"login: lost circuit","X");
+	[aux!line] begin
+	    if Status>2 and length(Text)>2 then print(Text);
+	    if IsLeft(Text,"Login incorrect") then usererr(0,0,
+		"login: netlpr not properly validated on netlpr","X");
+	    if IsLeft(Text,"host out of ports") then usererr(0,0,
+		"login: netlpr host out of network ports","X");
+	    if IsLeft(Text,"host down") then usererr(0,0,
+		"login: netlpr host down","X");
+	    if IsLeft(Text,"host shut") then usererr(0,0,
+		"login: netlpr host shut","X");
+	    if IsLeft(Text,"host not available") then usererr(0,0,
+		"login: netlpr host not available through network","X");
+	end;
+	[aux!prompt]
+	    if equ(Text,";") then
+	    else if IsLeft(Text,"login:") then begin
+		AuxOut( LoginName&#lf ); Status := 2 end
+	    else if IsLeft(Text,"password:") then begin
+		AuxOut( Password&#lf ); Status := 3 end
+	    else if IsLeft(Text,"TERM = (2621)") then begin
+		AuxOut( #lf ); Status := 3 end
+	    else if IsRight(Text,"% ") or IsRight(Text,"$ ") then 
+		done
+	    else usererr(0,0,"login: bad prompt "&Text,"X");
+	[aux!timeout] usererr(0,0,case Status of (
+	    [1] "login: timeout waiting for login: from netlpr",
+	    [2] "login: timeout waiting for password: from netlpr",
+	    [3] "login: timeout waiting for shell prompt from netlpr" ),"X")
+    end;
+end;
+
+procedure Shell( integer Tlim( TimeOut ));
+begin
+    string Text;
+    while true do case AuxRead( Text, Tlim ) of begin
+	[aux!zap] usererr(0,0,"Shell: lost circuit","X");
+	[aux!line] ;
+	[aux!prompt] if IsRight(Text,"% ") or IsRight(Text,"$ ")
+	    then done
+	    else usererr(0,0,"Shell: unexpected prompt "&Text,"X");
+	[aux!timeout] usererr(0,0,"Shell: timeout","X")
+    end;
+end;
+
+procedure stty;
+begin
+    AuxOut( "stty erase u kill u intr u quit u susp u dsusp u rprnt u flush u werase u nl -echo tandem"&#lf );
+    shell;
+    AuxEcho := AuxTrace;
+end;
+
+procedure SendFile( string FileName );
+begin
+    integer C,B,E,BT,LN;
+    if not AuxTrace then print( FileName );
+    open( C_getchan,"DSK",0,4,0,512,B,E );
+    lookup( C,FileName,E );
+    if E then print( "  ?lookup failure" );
+    PageCount := LN := 0;
+    while not E do begin
+	string S;
+	S := input( C, XIN );
+	AuxOut( S );
+	case B of begin
+	    [0] ;	! ignore break due to buffer full;
+	    [#ff] begin
+		AuxOut( #ff );
+		PageCount := PageCount + 1;
+		LN := 0;
+		if not AuxTrace then print( " ", PageCount );
+	    end;
+	    [#lf] begin
+		AuxOut( #lf );
+		LN := LN + 1;
+		if LN = 66 then begin
+		    PageCount := PageCount + 1;
+		    LN := 0;
+		    if not AuxTrace then print( " (", PageCount, ")" );
+		end;
+	    end;
+	    [else] AuxOut( #ctrl("V")& B )
+	end;
+    end;
+    if LN then PageCount := PageCount + 1;
+    if not AuxTrace then print( crlf );
+    release( C );
+end;
+
+procedure WriteLog( string FileName; integer PageCount );
+begin
+    AuxOut( "echo '" );
+    AuxOut( maiDate );
+    AuxOut( "; " );
+    AuxOut( User!Host );
+    AuxOut( " " );
+    AuxOut( FileName );
+    AuxOut( " " );
+    AuxOut( cvs(PageCount) );
+    AuxOut( "p' >> /usr/adm/netlpr.log"& #lf );
+end;
+
+procedure Lpr;
+begin
+    integer I;
+    for I := 1 upto ARGC-1 do if ARGV[i] neq "-" then begin
+	string Text;
+	AuxOut( "lpr -J '"& noparen(ARGV[i]) &
+	    "' -T '"& ARGV[i]& "'"& Args& " -"& #lf );
+	if auxRead( Text, 10 ) neq aux!timeout then begin
+	    print( "?lpr: ", Text );
+	    done;
+	end;
+	PageCount := 0;
+	SendFile( ARGV[i] );
+	AuxOut( #lf&#eot );
+	Shell(120);
+	WriteLog( ARGV[i], PageCount );
+	Shell(120);
+	AuxOut("lpq"& #lf);
+    end;
+end;
+
+procedure Logout;
+begin
+    AuxOut( "logout"& #lf );
+    AuxSync( "DROPPED BY HOST", TimeOut );
+end;
+
+!	M A I N
+;
+if ARGC=1
+    then print("lpr - off line print to net-lpr laser printer
+
+synopsis:
+  lpr -options file1 file2 ... filen
+  r(xexec)lpr; -options file1 file2 ... filen
+
+options:
+  -p	print with page headings
+  -#nn	print nn copies
+  -op	orientation: portrait
+  -i	indent text 8 columns
+  -i nn	indent text nn columns
+  -t	trace circuit traffic
+")  
+    else begin
+	r!p(adr) A;
+	User!Host := maiAMake( A:= maiMyAddress );
+	User := adr:User[A];
+	Host := adr:Host[A] & "." & adr:Net[A];
+	if length(adr:SubHost[A]) then
+	    Host := adr:SubHost[A] & "." & Host;
+	Parse;
+	login;
+	stty;
+	lpr;
+	logout;	
+    end;
+
+end $
+
