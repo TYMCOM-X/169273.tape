@@ -1,0 +1,394 @@
+entry;
+begin "transport layer"
+ 
+require "copypc.def" source!file;
+!**********************************************************************;
+!                                                                      ;
+!  TRANSPORT:  Transport Layer of COPYPC.X                             ;
+!                                                                      ;
+!  This layer reads the characters coming in the                       ;
+!  command port, decodes them if necessary, and hands "packets" to     ;
+!  the Binary Layer.  This layer also takes in a "packet" of chars     ;
+!  from the Binary Layer, and sends them out the command port,         ;
+!  encoding them if necessary.                                         ;
+!                                                                      ;
+!  Procedures:                                                         ;
+!     TR.get.decoded.packet                                            ;
+!        TR.read.byte                                                  ;
+!        TR.decode.bytes                                               ;
+!           TR.hex.decode                                              ;
+!     TR.send.byte                                                     ;
+!     TR.encode.and.send                                               ;
+!        TR.hex.encode.and.send                                        ;
+!           TR.encode.bytes                                            ;
+!     TR.send.reset                                                    ;
+!                                                                      ;
+!**********************************************************************;
+ 
+require "copypc.ext" source!file;
+ 
+external procedure BI.handle.timeout;
+ 
+external integer procedure BI.calculate.checksum (integer array pkt;
+                                                  integer pkt.size);
+internal procedure TR.get.decoded.packet;
+!**********************************************************************;
+!                                                                      ;
+!  Read bytes searching for the packet lead-in character.  When this   ;
+!  character is seen, collect bytes until the end-of-packet char is    ;
+!  seen.  Decode bytes as necessary, check for timeout if no char      ;
+!  is read.                                                            ;
+!                                                                      ;
+!**********************************************************************;
+begin "get decoded"
+ 
+boolean  searching.for.lead.in.character,
+         in.decode.mode,
+         first.char,
+         end.of.packet;
+integer  byte.read,
+         high.byte,
+         decoded.byte;
+ 
+ 
+! internal to TR.get.decoded.packet ;
+ 
+simple integer procedure TR.read.byte ( integer Time.Limit (0) );
+!  This is Bill Soley's read with input wait routine ;
+
+comment
+    Wait for up to Time.Limit seconds for a character to be received
+    on the command port.  If no character is received, return -1,
+    otherwise, return the character in the low order 8 bits.  If no
+    Time.Limit is specified, or a Time.Limit of 0 is specified, the
+    procedure will never time out.
+;
+begin	"TR.read.byte"
+    define
+	calli!HIBER	= '72,
+	hib!CHR		= '10000000,
+	hib!SEC(X)	= {('1000000 lor X)},
+	!axI8S		= '1;
+    integer Byte;
+    external boolean !SKIP!;
+    calli( hib!CHR+hib!SEC(Time.Limit), calli!HIBER );
+    Byte := auxclv( -1, 0, !axI8S );
+    return( if !SKIP! then Byte else -1 );
+end	"TR.read.byte";
+
+! internal to TR.get.decoded.packet ;
+integer procedure TR.decode.bytes (integer high.order.byte,
+                                           low.order.byte);
+!**********************************************************************;
+!                                                                      ;
+!  Check to be sure the input bytes are decodable.  If they are, use   ;
+!  the local procedure TR.hex.decode to decode them, otherwise         ;
+!  return -1.  Reconstruct the original value, and return it.          ;
+!                                                                      ;
+!**********************************************************************;
+ 
+begin "decode"
+ 
+integer new.byte;
+ 
+ 
+! internal to TR.decode.bytes ;
+ 
+integer procedure TR.hex.decode (integer decode.byte);
+!**********************************************************************;
+!                                                                      ;
+!  Takes in ASCII values and returns integer values.                   ;
+!  This procedure assumes the hex values for the characters "0" - "9"  ;
+!  and "A" - "F" are able to be sent unencoded.                        ;
+!                                                                      ;
+!**********************************************************************;
+begin "hex decode"
+ 
+case decode.byte of
+   begin
+   ['060] return (0);      ! "0" ;
+   ['061] return (1);      ! "1" ;
+   ['062] return (2);
+   ['063] return (3);
+   ['064] return (4);
+   ['065] return (5);
+   ['066] return (6);
+   ['067] return (7);
+   ['070] return (8);
+   ['071] return (9);
+   ['101] return (10);     ! "A" ;
+   ['102] return (11);
+   ['103] return (12);
+   ['104] return (13);
+   ['105] return (14);
+   ['106] return (15)      ! "F" ;
+   end;     ! case ;
+ 
+end "hex decode";
+ 
+ 
+! code for TR.decode.bytes ;
+ 
+! the hex.table has been initialized to true for the values "0".."9",
+  and "A".."F" - these are the only decodable values ;
+if hex.table[high.order.byte] AND hex.table[low.order.byte] then
+   begin
+   new.byte := TR.hex.decode (high.order.byte);
+   new.byte := new.byte LSH 4;
+   return (new.byte + TR.hex.decode(low.order.byte));
+   end
+else        ! drop packet - there's an error ;
+   begin
+   searching.for.lead.in.character := true;
+   in.decode.mode := false;
+   first.char := true;
+   return (-1);
+   end;
+ 
+end "decode";
+! code for TR.get.decoded.packet ;
+ 
+searching.for.lead.in.character := true;
+in.decode.mode := false;
+first.char := true;
+end.of.packet := false;
+ 
+while not end.of.packet do
+   begin
+   byte.read := TR.read.byte( number.of.seconds );
+   if byte.read = -1 then        ! timed out;
+      BI.handle.timeout
+   else
+      if searching.for.lead.in.character then
+         begin
+         if byte.read = lead.in.character then
+            begin
+            incoming.packet.size := 0;
+            arrclr (incoming.packet);
+            incoming.packet.ptr := point (8, incoming.packet[0], -1);
+            searching.for.lead.in.character := false;
+            end;
+         end
+      else        ! not searching , collecting ;
+         begin
+         incoming.packet.size := incoming.packet.size + 1;
+         if incoming.packet.size > max.incoming.packet.size then
+            begin
+            searching.for.lead.in.character := true;
+            in.decode.mode := false;
+            first.char := true;
+            end
+         else        ! size of packet is still okay ;
+            if byte.read = end.of.packet.char then
+               begin
+               end.of.packet := true;
+               incoming.packet.size := incoming.packet.size - 1;
+               end
+            else        ! not e.o.p ;
+               if in.decode.mode then
+                  if first.char then
+                     if byte.read NEQ shift.out then
+                        begin
+                        high.byte := byte.read;
+                        first.char := false;
+                        end
+                     else
+                        begin       ! shift out ;
+                        in.decode.mode := false;
+                        incoming.packet.size := incoming.packet.size - 1;
+                        first.char := true;
+                        end
+                  else        ! not first.char - assume second char ;
+                     begin
+                     decoded.byte := TR.decode.bytes (high.byte, byte.read);
+                     idpb (decoded.byte, incoming.packet.ptr);
+                     incoming.packet.size := incoming.packet.size - 1;
+                     first.char := true;
+                     end
+               else        ! not decoding ;
+                  if byte.read = shift.in then
+                     begin
+                     in.decode.mode := true;
+                     first.char := true;
+                     incoming.packet.size := incoming.packet.size - 1;
+                     end
+                  else        ! normal, non-encoded byte ;
+                     idpb (byte.read, incoming.packet.ptr);
+         end;
+   end;        ! while ;
+ 
+end "get decoded";
+
+ 
+simple procedure TR.send.byte (integer input.byte);
+!**********************************************************************;
+!                                                                      ;
+!  Send an 8-bit byte out the command port.                            ;
+!                                                                      ;
+!**********************************************************************;
+begin "send byte"
+ 
+start!code
+   move     1, input.byte;
+   hrroi    13, 3;
+   auxcal   13, 1;
+end;
+ 
+end "send byte";
+internal procedure TR.encode.and.send (integer array packet;
+                                       integer number.of.bytes);
+!**********************************************************************;
+!                                                                      ;
+!  Send number.of.bytes from packet out the command port using         ;
+!  TR.send.byte.  If the bytes must be encoded, send the shift-in      ;
+!  char, use local procedure TR.hex.encode.and.send to encode them.    ;
+!  When done encoding, send the shift-out char.                        ;
+!                                                                      ;
+!**********************************************************************;
+begin "encode and send"
+ 
+boolean  in.encode.mode;
+integer  packet.byte,
+         next.byte,
+         packet.ptr,
+         packet.counter;
+ 
+ 
+! internal to TR.encode.and.send ;
+ 
+procedure TR.hex.encode.and.send (integer input.byte);
+!**********************************************************************;
+!                                                                      ;
+!  Use local procedure TR.encode.bytes to get the encoded char after   ;
+!  splitting the character into its high order and low order nibbles.  ;
+!  Then send the encoded chars.                                        ;
+!                                                                      ;
+!**********************************************************************;
+begin "hex encode"
+ 
+integer  high.order,
+         low.order;
+ 
+ 
+! internal to TR.hex.encode.and.send ;
+ 
+integer procedure TR.encode.bytes (integer in.byte);
+!**********************************************************************;
+!                                                                      ;
+!  The value of the char is replaced by its ASCII code.                ;
+!                                                                      ;
+!**********************************************************************;
+begin "encode"
+ 
+case in.byte of
+   begin
+   [0] return ('060);      ! "0" ;
+   [1] return ('061);
+   [2] return ('062);
+   [3] return ('063);
+   [4] return ('064);
+   [5] return ('065);
+   [6] return ('066);
+   [7] return ('067);
+   [8] return ('070);
+   [9] return ('071);
+   [10] return ('101);     ! "A" ;
+   [11] return ('102);
+   [12] return ('103);
+   [13] return ('104);
+   [14] return ('105);
+   [15] return ('106)      ! "F" ;
+   end;     ! case ;
+ 
+end "encode";
+ 
+ 
+! code for TR.hex.encode.and.send ;
+ 
+low.order := input.byte LAND mask(4);
+high.order := input.byte LSH -4;
+ 
+TR.send.byte (TR.encode.bytes (high.order));
+TR.send.byte (TR.encode.bytes (low.order));
+ 
+end "hex encode";
+! code for TR.encode.and.send ;
+ 
+in.encode.mode := false;
+packet.counter := 0;
+packet.ptr := point(8, packet[0], -1);
+TR.send.byte(escape);         ! micro's lead-in-char ;
+ 
+packet.byte := ildb(packet.ptr);
+packet.counter := packet.counter + 1;
+ 
+ 
+while packet.counter LEQ number.of.bytes do
+   begin
+   if xlatetb[packet.byte] then     ! not transmittable byte ;
+      begin
+      if not in.encode.mode then
+         begin
+         in.encode.mode := true;
+         TR.send.byte (shift.in);
+         end;
+      TR.hex.encode.and.send (packet.byte);
+      end
+   else        ! byte is transmittable without encoding ;
+      if in.encode.mode then
+            begin
+            TR.send.byte (shift.out);
+            in.encode.mode := false;
+            TR.send.byte (packet.byte);
+            end
+      else              ! not encoding - your normal, run-of-the-mill byte;
+         TR.send.byte (packet.byte);
+   packet.byte := ildb (packet.ptr);
+   packet.counter := packet.counter + 1;
+ 
+   end;           ! while ;
+ 
+TR.send.byte (end.of.packet.char);
+ 
+end "encode and send";
+internal procedure TR.send.reset;
+!**********************************************************************;
+!                                                                      ;
+!  Send the micro an initial ACK so he can reset his PIDs.             ;
+!                                                                      ;
+!**********************************************************************;
+begin "reset"
+ 
+integer array initial.ACK[0:1];
+integer  a.ptr,
+         chksum,
+         high.chksum;
+ 
+ 
+! create initial ACK so micro can reset his PIDs ;
+ 
+arrclr (initial.ACK);
+a.ptr := point (8, initial.ACK[0], -1);
+ 
+idpb ('170, a.ptr);        ! "x" ;
+idpb ('040, a.ptr);        ! " " ;
+idpb ('040, a.ptr);        ! " " ;
+chksum := BI.calculate.checksum (initial.ACK, 3);
+ 
+a.ptr := point (8, initial.ACK[0], 23);
+high.chksum := chksum lsh -8;
+chksum := chksum lsh 28;
+chksum := chksum lsh -28;
+ 
+idpb (high.chksum, a.ptr);
+idpb (chksum, a.ptr);
+ 
+TR.encode.and.send (initial.ACK, 5);
+ 
+end "reset";
+ 
+ 
+ 
+end "transport layer";
+ 
+ 
