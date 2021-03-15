@@ -1,0 +1,516 @@
+begin "BIONIC"
+
+    require "(SAILIB)SAIL.DEF"   source!file;
+    require "(SAILIB)UUOSYM.DEF" source!file;
+
+    define
+	VER	= 1			! Version ;
+    ,	REL	= 0			! Release number ;
+    ,	EDIT	= 0			! Edits as of SAIL version ;
+    ;
+	
+    require (VER lsh 24) lor (REL lsh 18) lor EDIT version;
+
+
+Define
+	D2780    = '13			! 2780/3780 device code ;
+,	BufSiz   = 400			! Constant buffer size ;
+,	!chVMP   = '47			! chanio #47 virtual move page ;
+,	Cache    = 4			! 4 pages for now ;
+,	BasePage = '377			! highest page in cache ;
+;
+
+Define HelpMessage = {"
+Commands:
+    ASCII      Set data mode to ASCII. (default)
+    EXIT       Exit to EXEC level.
+    HELP or ?  Type this message.
+    KATAKANA   Set data mode to KATAKANA.
+    QUIT       Exit to EXEC level.
+    RUN        Begin reading data into disk file.
+
+"};
+
+  redefine !Block(Group, Name, Size) = {
+    Ifcr Length(Cvps(Size)) = 0 thenc assignc Size = 1; Endc
+    Define Group}&{Name = Group;
+    Redefine Group = Group + Size;};
+
+    Define S! = 0;			! ** Filespec block offsets ** ;
+    !Block( S!,Dev )			! Device ;
+    !Block( S!,Usr,2 )			! Username ;
+    !Block( S!,Nam )			! Name ;
+    !Block( S!,Ext )			! Extension ;
+
+!	Variables and data storage
+;
+
+Integer
+	RecCnt				! Records processed ;
+,	ByteCount			! Bytes of data put into file ;
+,	Parity				! Setting of device parity ;
+,	Status				! TTY file status holder ;
+,	BioDev				! Device type ;
+,	C				! Character read from buffer ;
+,	BufPtr				! Pointer into block i-o buffer ;
+,	FilePtr				! Pointer into file page ;
+,	FileCnt				! Bytes per page counter ;
+,	Mode				! File data mode ;
+,	Chan				! File channel ;
+,	Err				! uuo error flag ;
+,	Base				! virtual memory base ;
+,	Ring				! buffer page offset ;
+;
+
+Boolean
+	NeedLF				! Flag that a #CR was seen ;
+;
+
+String
+	CmdLine				! command string ;
+;
+
+  Safe integer array Put[ 0:1 ];	! To vmovpg next page ;
+  Safe integer array BioBuf[0:100];	! Data buffer for block input ;
+
+  Safe integer array FileSpec[ S!Dev : S!Ext ];
+
+
+Simple procedure Finish( String Msg );
+! ----------------------------------------------------------------------;
+!									;
+!	Finish( TextMessage )						;
+!		Print message, restore parity and exit to EXEC.		;
+!		Used primarily as an error exit.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "Finish"
+
+    Print( Msg );			! Print offending message ;
+    AuxClr( -1, Parity, !axEP );	! Reset parity state ;
+
+    start!code
+	uuo!EXIT  0,;			! Exit program ;
+    end;
+
+end "Finish";
+
+Internal Integer Procedure FndKey( String Key; String Array CMD.Names );
+! ----------------------------------------------------------------------;
+!									;
+!	Index_ FndKey( Key, TextArray )					;
+!		Returns an index into text array corresponding to	;
+!		the specified Key.  Index-1 specifies "not found"	;
+!		and index-2 is ambiguous.				;
+!									;
+! ----------------------------------------------------------------------;
+begin "Find Key"
+    Own Integer Low, High;		! for array size ;
+    Own Integer Cmd, Cmd.Index;
+
+    Low_  ArrInfo( CMD.Names, 1 );	! initialize low index   ;
+    High_ ArrInfo( CMD.Names, 2 );	! initialize high index  ;
+
+    CMD.Index_ Low - 1;			! setup default: invalid ;
+
+    For Cmd_ Low step 1 until High	! for each keyword;
+     do
+	If KEqu( Key, CMD.Names[ Cmd ][1 for length(Key)] )
+	 then if KEqu( Key, CMD.Names[ Cmd ] )
+	     then Return( Cmd )		!  -- exact match --;
+	     else if CMD.Index < Low	!  -check ambiguity-;
+		then CMD.Index_ Cmd	!  Ok, set instance ;
+		else Return( Low - 2 );	!  No, set error    ;
+
+    Return ( CMD.Index );		! return result;
+
+end "Find Key";
+
+
+Simple Integer procedure
+ GetText( Reference string Line; Integer Byte, Count; String Chars );
+! ----------------------------------------------------------------------;
+!									;
+!	GetText( Line, BytePointer, Count, BreakChars )			;
+!		Format an identifier token to fill a sixbit field	;
+!		via BytePointer for a maximum Count or one of the	;
+!		specified BreakChars is encountered.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "get text"
+    Own integer wp;
+    String Str;
+
+    while ( length( Line ) )
+     do begin "get data"
+
+	Str_ Chars;				! copy break chars ;
+	while ( length( Str ) )			! if any break chars ;
+	 do if ( Line = Lop( Str ) )		!  and match a brk ;
+	     then return( Line );		!  return that character ;
+
+	if ( 0 leq count_ count - 1 )		! if room left in string ;
+	 then if ( "a" leq wp_lop(Line) )	!  then check case ;
+	       then idpb( wp-'100, byte )	!    lowercase to sixbit ;
+	       else idpb( wp-'40, byte )	!    uppercase to sixbit ;
+	 else wp_ lop( Line );			!  throw away extras ;
+
+     end "get data";
+
+    return( 0 );				! no line left? ;
+
+end "get text";
+
+
+Simple Boolean Procedure VMSpec( String Line );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMSpec( FileSpecification )					;
+!		Routine to read a string file specification and build	;
+!		the special file block used by the VMFile routine.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Spec"
+
+    arrclr( filespec );				! clear out the array ;
+
+    GetText( Line, point( 6,filespec[S!Nam],-1 ), 6, ":(." );
+
+    if ( ":" = Line )				! it was a device, good! ;
+     then begin
+	lop( Line );				! throw away the colon and ;
+	filespec[S!Dev] swap filespec[S!Nam];	! swap data to right places ;
+     end
+     else filespec[S!Dev]_ cvsix( "DSK" );	!  and fill in the device ;
+
+    if ( "(" = Line )				! if it starts with "(" ;
+     then begin "get user"			!  then pick up username ;
+	lop( Line );				!    eat the "(" ;
+	GetText( Line, point( 6,filespec[ S!Usr ],-1 ), 12, ")" );
+	lop( Line );				!    eat the ")" ;
+     end "get user"
+     else begin "default user"			! set default if no user ;
+	filespec[ S!Usr   ]_ calli( '31, '41 );	! .GTNM1 (GFD user 1-6)  ;
+	filespec[ S!Usr+1 ]_ calli( '32, '41 );	! .GTNM2 (GFD user 7-12) ;
+	If not( !Skip! )			! set blank if GETTAB fails ;
+	 then filespec[ S!Usr ]_ filespec[ S!Usr+1 ]_ 0;
+     end "default user";
+
+    if not( length( Line ) or filespec[S!Nam] )	! must have a name ;
+     then return( false );			!  so return false ;
+
+    if not( "." = Line or filespec[S!Nam] )
+     then GetText( Line, point( 6,filespec[ S!Nam ],-1 ), 6, "." );
+
+    if not( filespec[S!Nam] )			! seen anyone ;
+     then return( false );			! no, go home ;
+
+    if ( "." = Line )				! if dot seen ;
+     then begin "get ext"
+	lop( Line );				!  then chop it off ;
+	GetText( Line, point( 6,filespec[ S!Ext ],-1 ), 3, " "&'11 );
+     end "get ext";
+
+!	*** Decide here whether to handle [ ppn ] *** ;
+
+    return( true );				! got here, return ok ;
+
+end "VM Spec";
+
+Simple procedure NextPage;
+begin "no place to go"
+
+    ! put the memory page at the end of the file ;
+
+    Chnior( Chan, Put[ 0 ]_ !Xwd( 1, Base-Ring ), !chVMP );
+    start!code MOVEM '3,Err; end;	! save error ac (if any) ;
+
+    ! clear page, create a new one and pre-reference for next time ;
+
+    Calli( !bit(7) lor !Xwd(1,Base-Ring), calli!VCLEAR );
+    Calli( !PRRW lor !Xwd(1,Base-Ring), calli!VCREAT );
+    Calli( Base-Ring, calli!PREREF );
+
+    ! set proper size buffer pointer and char-per-page count ;
+
+    Ring_ ( Ring + 1 ) mod Cache;	! 0, ... cache-1 ;
+
+    if ( Mode = !ioKAT )		! if KATAKANA mode ;
+     then begin "Katakana mode"		!  use JIS-8 katakana ;
+
+	FilePtr_ Point( 9, memory[(Base-Ring) lsh 9], -1 );
+	FileCnt_ (36 div 9) * 512;	! number of chars per page ;
+
+     end "Katakana mode"
+     else begin "Ascii mode"		! use (default) US-ASCII ;
+
+	FilePtr_ Point( 7, memory[(Base-Ring) lsh 9], -1 );
+	FileCnt_ (36 div 7) * 512;	! number of chars per page ;
+
+     end "Ascii mode";
+
+end "no place to go";
+
+
+Simple Procedure Deposit( Integer Char );
+! ----------------------------------------------------------------------;
+!									;
+!	Deposit( Character )						;
+!		Check for room in the current output buffer page and	;
+!		handle any mapping i-o necessary to make room for a	;
+!		character to be put into a buffer page.			;
+!									;
+!		Count bytes processed and records read.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "deposit"
+
+    start!code
+
+	Sosge	FileCnt;		! check count for more ;
+	  Pushj	'17,NextPage;		! no room -- make some more ;
+	Move	'1,Char;		! Get character from stack ;
+	Idpb	'1,FilePtr;		! do what we came here to do ;
+	Cain	'1,'12;			! check for #LF or end-of-rec ;
+	  Aos	RecCnt;			! count records processed ;
+	Aos	ByteCount;		! count characters processed ;
+
+    end;
+
+end "deposit";
+
+
+Simple Procedure Wait4YB;
+! ----------------------------------------------------------------------;
+!									;
+!	Wait4YB								;
+!		Wait for a yellow ball on any attached port.  We must	;
+!		assume that we only have a single command port and a	;
+!		yellow ball on any port is the one we're waiting for.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "wait for yellow ball"
+    Preset!with 2, 0, 0;
+    Own Integer Array Ports[ 0:2 ];
+
+    while not( calli( LXRYBS lor location(Ports[0]), calli!POLPRT ) )
+     do calli( !Xwd( 1,1 ), calli!HIBER );
+
+end "wait for yellow ball";
+
+Simple Procedure PrintStatus;
+begin
+    Integer B, K;
+
+    B_ !bit(32);
+    For K_ 0 step 1 until 13
+     do if ( Status land (B_ B lsh 1) )
+	 then Print( Case K of (
+		"UWC ","SYN ","FCS ","NEC ","NEE ","BK2 ","B25 ",
+		"B24 ","ACT ","EOF ","BKT ","DTE ","DER ","IMP "  ) );
+    Print( Case ( Status land '77 ) of (
+	[!ioASC] "Ascii",	[!ioASL] "Ascii-Line",
+	[!ioKAT] "Katakana",	[!ioIMG] "Image",
+	[!ioIBN] "Image-Binary",[!ioBIN] "Binary",
+	[!ioDPR] "Dump-Record",	[!ioDMP] "Dump",
+	  [else] "**Unknown**"   ), crlf );
+end;
+
+!	"RUN"  Command
+;
+
+Simple Procedure RunIt;
+begin "Run It"
+    Own Safe Integer Array File[ 0 : !RBLIC ];
+    Preset!with !ioASC, cvsix("DSK   "), 0;
+    Own Safe Integer Array Dev[ 0 : 2 ];
+
+    Base_ BasePage;			! base page address ;
+    Calli( !bit(7) lor !Xwd(Cache,Base-(Cache-1)), calli!VCLEAR );
+
+    Calli( !PRRW lor !Xwd(Cache,Base-(Cache-1)), calli!VCREAT );
+    For Ring_ Base-(Cache-1) step 1 until Base
+     do Calli( Ring, calli!PREREF );	! pre-reference each page ;
+
+    Ring_ '0;				! first ring page ;
+    Put[ 1 ]_ -1;			! always append to end of file ;
+
+    AuxClv( -1, if (BioDev = D2780) then !ioIBN else !ioIMG, !axCFS );
+
+    Chan_ '17;				! pick a channel out of the air ;
+
+    if ( Mode = !ioKAT )		! if KATAKANA mode ;
+     then begin "Katakana mode"		!  use JIS-8 katakana ;
+	FilePtr_ Point( 9, memory[Base lsh 9], -1 );
+	FileCnt_ (36 div 9) * 512;	! number of chars per page ;
+     end "Katakana mode"
+     else begin "Ascii mode"		! use (default) US-ASCII ;
+	FilePtr_ Point( 7, memory[Base lsh 9], -1 );
+	FileCnt_ (36 div 7) * 512;	! number of chars per page ;
+     end "Ascii mode";
+
+    Print( "OUTPUT TO FILE: " );	! Prompt for a filename ;
+    If not( VMSpec( Inchwl ) )		! trouble with the spec? ;
+     then Finish( "COULD NOT PARSE FILE NAME." );
+
+    Dev[ 0 ]_ Mode;			! Setup proper file mode ;
+    Dev[ 1 ]_ FileSpec[ S!Dev ];	! Setup device block ;
+    Chnior( Chan,Dev[0],!chOPN );	! OPEN [ !ioASC, Dev, 0 ] ;
+    If not( !Skip! )			! If open-failure ;
+     then Finish( "COULD NOT INITIALIZE DSK CHANNEL." );
+
+    arrclr( File );			! Clear out unused fields ;
+    File[ !RBCNT ]_ !RBLIC;		! Setup file lookup block ;
+    if ( FileSpec[ S!Usr ] )
+     then File[ !RBPPN ]_ location( FileSpec[ S!Usr ] );
+    File[ !RBNAM ]_ FileSpec[ S!Nam ];
+    File[ !RBEXT ]_ FileSpec[ S!Ext ] land (-1 lsh 18);
+    if ( Mode = !ioKAT )
+     then File[ !RBLIC ]_ !bit( 9 );	! Set program JIS-8 KAT bit ;
+
+    Chnior(Chan, File[!RBCNT], !chENT);	! Writing/Superseding only ;
+    if not (!Skip! )
+     then Finish( "COULD NOT WRITE TO OUTPUT FILE." );
+
+    if ( BioDev = D2780 )		! for HSA/2780 type ports ;
+     then begin "VS-2780 hack"
+
+	AuxClv( -1, 5, !axIBR );	! Set input baud rate to 1200 ;
+	Wait4YB;			! Wait for a yellow ball ;
+
+     end "VS-2780 hack"
+     else AuxClr( -1, memory['21], !axOCI );	! Initiate cassette (^Q) ;
+
+    RecCnt_ ByteCount_ C_ NeedLF_ 0;	! Clear counts and flags ;
+    AuxClr( -1, 0, !axEBM );		! Enter BLOCK-IO mode ;
+    if ( !Skip! )
+     then Print( "READY FOR INPUT" & Crlf )
+     else Finish( "COULD NOT SET BLOCK I/O MODE FOR PORT." );
+
+    Status_ calli( !xwd(-1,!gtMOD), calli!GETTAB );
+    PrintStatus;
+
+    if ( BioDev = D2780 )		! If device is 2780/3780 then ;
+     then Print( Crlf & Crlf & Crlf & Crlf );
+
+    BioBuf[0]_ BufSiz;			! Block I/O buffer 400 long ;
+    AuxClr( -1, BioBuf[0], !axIBS );	! Input block & skip (always fail) ;
+    calli( !xwd(1,10), calli!HIBER );	! 10 SEC DELAY HACK FOR J KOPF ;
+
+    if ( BioDev = D2780 )		! If device is 2780/3780 then ;
+     then AuxClv( -1, 1, !axEP );	! set Even Parity on the port ;
+
+    While ( true )
+     do begin "reading input"
+
+	BioBuf[0]_ BufSiz;		! Use the specified buffer size ;
+	AuxClr( -1,BioBuf[0],!axIBW );	! (35) input block and wait ;
+
+	if not( !Skip! )		! input failed?  Hmmmmmm! ;
+	 then begin "finish it"
+	     Print( "BLOCK INPUT ERROR." );
+	     Done "reading input";
+	 end "finish it";
+
+	Status_ calli( !xwd(-1,!gtMOD), calli!GETTAB );
+	PrintStatus;
+
+	if ( BioDev = D2780 )		! if image-binary mode ;
+	   and ( Status land io!EOF )	! look for end-of-file ;
+	 then done "reading input";	! it says no more data ;
+
+	BufPtr_ point( 8, BioBuf[1], -1 );	! 8-bit BIO buffer pointer ;
+	BioBuf[0]_ BioBuf[0] min BufSiz;	! Setup byte count ;
+
+	while ( 0 leq BioBuf[0]_ BioBuf[0] - 1 )
+	 do begin "reading characters"
+
+	    If ( C_ Ildb( BufPtr ) )		! Get next byte from buffer ;
+	     then begin "got char"
+
+		If ( NeedLF and C neq #LF )	! Need a #LF after #CR ;
+		 then Deposit( #LF );		! char isn't #LF, store #LF ;
+
+		If ( C = #LF and not NeedLF )	! #LF without a #CR? ;
+		 then Deposit( #CR );		! Yes, store #CR ;
+
+		NeedLF_ C = #CR;		! Set NeedLF after each #CR ;
+
+		Deposit( C );			! Store character away ;
+
+	     end "got char";
+
+	 end "reading characters";
+
+	if ( BioDev neq D2780 )		! if image mode ;
+	   and ( Status land io!BKT )	! look for io!BKT ;
+	 then done "reading input";	! it says timeout occurred ;
+
+     end "reading input";
+
+    If ( NeedLF )			! if last char was a #CR ;
+     then Deposit( #LF );		! we need a #LF to finish up ;
+
+    If ( Mode = !ioKAT )		! calculate words written ;
+     then ByteCount_ (ByteCount + 3) div 4	! 4 bytes - Katakana ;
+     else ByteCount_ (ByteCount + 4) div 5;	! 5 bytes - Ascii ;
+
+    Chnior( Chan, Put[ 0 ]_ !Xwd( 1, Base-Ring ), !chVMP );
+    start!code MOVEM '3,Err; end;	! save error ac (if any) ;
+
+    Calli( !bit(7) lor !Xwd(Cache,Base-(Cache-1)), calli!VCLEAR );
+
+    Chniov( Chan, ByteCount, !chFTR );	! chop file down to size ;
+
+    Chnior( Chan, memory[0], !chCLS );	! close output file ;
+    Chnior( Chan, 0, !chREL );		! release channel ;
+
+    AuxClv( -1, 0, !axLBM );		! Leave block mode ;
+
+    if ( BioDev = D2780 )		! If device is 2780/3780 ;
+     then AuxClr( -1, Parity, !axEP )	! Reset parity in the remote ;
+     else AuxClr( -1, memory['23], !axOCI );	! else output character (^S) ;
+
+    Print( Crlf, RecCnt, " RECORDS INPUT" );
+    calli( 0, calli!EXIT );
+
+end "Run It";
+
+
+!   *** Main-line code ***	SETUP
+;
+
+    BioDev_ calli( !xwd(-1,!gtLOG), calli!GETTAB ) lsh -24 land '77;
+    AuxClr( -1, Parity_ -1, !axEP );	! Read parity setting ;
+
+    Mode_ !ioASC;			! initialize mode to ASCII ;
+
+    while ( true )
+     do begin "process commands"
+	Preset!with "HELP","RUN","ASCII","KATAKANA","QUIT","EXIT";
+	Own String Array Commands[ 2 : 7 ];
+
+	Print( "*" );			! Print a prompt ;
+	CmdLine_ Inchwl;		! Read a command ;
+	While ( CmdLine = #SP or CmdLine = #HT )
+	 do Lop( CmdLine );		! Strip leading whitespace ;
+
+	If ( CmdLine = "?" )		! allow "?" for HELP ;
+	 then CmdLine_ "HELP";		! for more user friendlies ;
+
+	Case ( FndKey( CmdLine, Commands ) ) of begin
+	  [0] Print( "Ambigious command, please re-enter." & crlf );
+	  [1] Print( "Unrecognized command, enter ? for help." & crlf );
+	  [2] Print( HelpMessage );	! "HELP" ;
+	  [3] Runit;			! "RUN" ;
+	  [4] Mode_ !ioASC;		! "ASCII" ;
+	  [5] Mode_ !ioKAT;		! "KATAKANA" ;
+	  [6] Done "process commands";	! "QUIT" ;
+	  [7] Calli( 0, calli!EXIT );	! "EXIT" ;
+	  [else] Print( "Unimplemented command, enter ? for help." & crlf )
+	end;
+
+     end "process commands";
+
+End "BIONIC";
+   
