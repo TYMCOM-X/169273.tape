@@ -1,0 +1,369 @@
+begin "SHOVEL"
+
+require "(SAILIB)SAIL.DEF"   source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)VERSN.REQ"  source!file;
+
+require "(CARL)AUXINT.REQ" source!file;
+
+require (1 lsh 24) lor (0 lsh 18) lor 1 version;
+
+!
+!	*** Edit History ***
+!
+!  (0)	02-Feb-88 /Carl
+!	Started with BIONIC %1(6) as base for Shovel program.
+!
+! 1(1)	10-Aug-88 /Carl
+!	Clean up the version output using module VERSN and make the prior
+!	code assemble.
+!
+;
+
+
+Define
+	BufSiz   = 400			! Constant buffer size ;
+,	Cache    = 4			! 4 pages for now ;
+,	BasePage = '377			! highest page in cache ;
+;
+
+define
+	C$$PRV = !bit(0)	! privileged command ;
+,	C$$INV = !bit(1)	! invisible command ;
+;
+
+Define All.Commands = {
+
+!C!( Shovel, " [n]  Shovel [n] data buffers." )
+!C!( Connect, " str Build a circuit to str." )
+
+!C!( Help, " or ?   Reprint this message." )
+!C!( Debug, "       Allow developer to debug the program.", C$$PRV )
+!C!( Version, "     Display program version." )
+!C!( Exit, "        Exit program.", C$$INV )
+!C!( Quit, "        Exit program." )
+
+    };
+
+Redefine Len.Commands = 0;
+Redefine !C!(Nam,Hlp,Flg,AltC) = {
+    Ifcr Len.Commands > 0 thenc , endc CvPS(Nam)
+    Redefine Len.Commands = Len.Commands + 1;};
+Preset!with All.Commands;
+Own safe string array CmdName[1:Len.Commands];
+
+
+Redefine Len.Commands = 0;
+Redefine !C!(Nam,Hlp,Flg,AltC) = {
+    Ifcr Len.Commands > 0 thenc , endc
+    Ifcr Length(CvPS(Flg)) thenc Flg elsec 0 endc
+    Redefine Len.Commands = Len.Commands + 1;};
+Preset!with All.Commands;
+Own safe integer array CmdFlag[1:Len.Commands];
+
+
+Redefine Len.Commands = 0;
+Redefine !C!(Nam,Hlp,Flg,AltC) = {
+    Ifcr Len.Commands > 0 thenc , endc Cvps(Nam) & Hlp
+    Redefine Len.Commands = Len.Commands + 1;};
+Preset!with All.Commands;
+Own safe string array CmdText[1:Len.Commands];
+
+
+Redefine !C!(Nam,Hlp,Flg,AltC) = {
+    Ifcr Length(CvPS(AltC))
+     thenc AltC;
+     elsec C.}&{Nam}&{;
+    endc};
+
+!	Variables and data storage
+;
+
+Integer
+	Index				! Command index ;
+,	Parity				! Setting of device parity ;
+,	Status				! TTY status holder ;
+,	C				! Character read from buffer ;
+,	D				! Character without parity ;
+,	BufPtr				! Pointer into block i-o buffer ;
+,	ChkPtr				! Pointer into check i-o buffer ;
+,	Err				! uuo error flag ;
+,	Base				! virtual memory base ;
+,	Ring				! buffer page offset ;
+,	MyPort				! port connected to user ;
+,	AuxPort				! port connected to circuit? ;
+,	Aux				! port connected to circuit? ;
+;
+
+Boolean
+	SuperUser			! Flag for privileged commands ;
+;
+
+String
+	Command				! command string ;
+,	Line				! line from terminal ;
+,	MessageText			! place to store message ;
+;
+
+Safe integer array BioBuf[0:100];	! Data buffer for block input ;
+Safe integer array OutBuf[0:100];	! Data buffer for block output ;
+
+Safe integer array ChkBuf[0:100];	! Data buffer for input check ;
+
+
+Simple procedure Text( string s );
+! ----------------------------------------------------------------------;
+!									;
+!	Text( String )							;
+!		Output the STRING by executing an AUXCLV call using	;
+!		the sail string pointer function !AXPTR			;
+!									;
+! ----------------------------------------------------------------------;
+begin "Text"
+
+    begin!code				! simulate AUXCLV ;
+	Hrroi	'1,!axPTR;		! output sail string ;
+	uuo!AUXCAL '1,S;		! to my port ;
+    end;
+
+end "Text";
+
+
+
+simple boolean procedure CheckBuffer;
+! ----------------------------------------------------------------------;
+!									;
+!	CheckBuffer							;
+!		Routine to check the contents of the block-io buffer	;
+!		for consistancy using the rules outlined for this	;
+!		program.						;
+!									;
+! ----------------------------------------------------------------------;
+begin "check buffer"
+
+    if not( BioBuf[0] )			! must have some data ;
+     then return( true );		! lie, since no data is bad ;
+
+    ChkPtr_ point( 8, ChkBuf[1], -1 );	! setup check-buffer pointer ;
+    BufPtr_ point( 8, BioBuf[1], -1 );	! 8-bit BIO buffer pointer ;
+
+    while ( 0 leq BioBuf[0]_ BioBuf[0] - 1 )
+     do begin "reading characters"
+
+	if ( ildb( ChkPtr ) neq ildb( BufPtr ) )
+	 then return( false );
+
+     end "reading characters";
+
+    return( true );
+
+end "check buffer";
+
+Simple procedure StartCircuit;
+begin "start circuit"
+
+    if ( kequ( AuxDev, "TTY" ) )
+     then AuxPort_ Aux_ -1
+     else while not( NTQ! ) and ( 0 > Aux_ CreAux( AuxDev ) )
+	   do Calli( !Xwd( '201,30 ), calli!HIBER );
+
+    if Aux > 0 then begin
+      AuxFlg_ 0;			! only send balls on pages ;
+      IntAux( Aux );			! setup interrupts for circuit ;
+    end;
+
+end "start circuit";
+
+
+Simple procedure StopCircuit;
+begin "stop circuit"
+
+    AuxZap;				! zap the circuit ;
+    calli( 1, calli!SLEEP);		! wait for zap interrupt to come in ;
+    IntZap;				! clear interrupts ;
+
+end "stop circuit";
+
+!	"SHOVEL"  Command
+;
+
+simple string procedure C.Shovel;
+begin "Run It"
+    Preset!with !ioIMG, cvsix("TTY   "), 0;
+    Own Safe Integer Array Tty[ 0 : 2 ];	! TTY open block ;
+
+    Base_ BasePage;			! base page address ;
+    Calli( !bit(7) lor !Xwd(Cache,Base-(Cache-1)), calli!VCLEAR );
+
+    Calli( !PRRW lor !Xwd(Cache,Base-(Cache-1)), calli!VCREAT );
+    For Ring_ Base-(Cache-1) step 1 until Base
+     do Calli( Ring, calli!PREREF );	! pre-reference each page ;
+
+    Ring_ '0;				! first ring page ;
+
+    Chnior( '1, TTY[0]_ !ioIMG, !chOPN );
+
+    AuxClr( -1,memory[!ioIMG],!axCFS );	! set port mode ;
+    AuxClr( -1, memory['21], !axOCI );	! Initiate cassette (^Q) ;
+    AuxClr( -1, 0, !axEBM );		! Enter BLOCK-IO mode ;
+
+    if ( !Skip! )
+     then Text( "Ready for input" & Crlf )
+     else return( MessageText_ "Could not set block i/o mode for port." );
+
+    start!code
+	movei	'1,BufSiz;		! Block I/O buffer 400 long ;
+	movem	'1,BioBuf[0];		!  BioBuf[0]_ BufSiz;
+	hrroi	'1,!axIBS;		!  AuxClr( -1, BioBuf[0], !axIBS );
+	uuo!AUXCAL '1,BioBuf[0];	! (36) input block and skip ;
+	 jfcl;				! This is just a teaser ;
+    end;
+
+    While ( true )
+     do begin "reading input"
+
+    start!code
+	setom	!skip!;			! set for later ;
+	movei	'1,BufSiz;		! use the specified buffer size ;
+	movem	'1,BioBuf[0];		!  BioBuf[0]_ BufSiz;
+	Hrroi	'1,!axIBW;		!  AuxClr( -1,BioBuf[0],!axIBW );
+	uuo!AUXCAL '1,BioBuf[0];	! (35) input block and wait ;
+	 setzm	!skip!;			! did we skip? ;
+    end;
+
+	if not( !Skip! )		! input failed?  Hmmmmmm! ;
+	 then return( MessageText_ "Block input error." );
+
+	Status_ calli( !xwd(-1,!gtMOD), calli!GETTAB );
+	CheckBuffer;			! verify buffer ;
+	if ( Status land io!BKT )	! image mode, look for io!BKT ;
+	 then done "reading input";	! it says timeout occurred ;
+
+     end "reading input";
+
+    AuxClv( -1, 0, !axLBM );		! Leave block mode ;
+    AuxClr( -1, memory['23], !axOCI );	! else output character (^S) ;
+
+    return( null );
+
+end "Run It";
+
+
+simple string procedure C.Debug;
+if not( SuperUser )
+ then MessageText_ "?SHVPRV Invalid command."
+ else if ( memory[ !jbddt ] )
+       then quick!code
+		push	'17,'1;
+		hrrz	'1,!jbddt;
+		pushj	'17,@'1;
+		pop	'17,'1;
+       end
+       else MessageText_ "?SHVPRV DDT not loaded.";
+
+
+simple Procedure C.Quit;
+begin
+    calli( 0, calli!EXIT );
+    start!code uuo!EXIT end;
+end;
+
+
+simple Procedure C.Version;
+Text( Crlf &"Shovel %"& !VERSN( memory[!jbVER] ) & Crlf );
+
+
+simple Procedure C.Help;
+begin
+    C.Version;
+    Text( "Commands:" & Crlf );
+
+    for Index_ 1 upto Len.Commands
+     do if ( SuperUser  or  not( CmdFlag[ Index ] land C$$Prv ) )
+	 then if not( CmdFlag[ Index ] land C$$Inv )
+	       then begin
+		    Text( "  " );
+		    Text( CmdText[ Index ] );
+		    Text( Crlf );
+		end;
+    Text( Crlf );
+end;
+
+
+simple string procedure C.HelpMe;
+Text( crlf &"Please type HELP for help"& crlf );
+
+
+Simple Procedure C.Exit;
+C.Quit;
+
+Simple string procedure Perform!Command;
+! ----------------------------------------------------------------------;
+!									;
+!    Perform!Command	This is the CRUX of the main program.  This	;
+!			routine reads the user's command line and then	;
+!			dispatches to the proper routine to perform	;
+!			the specified command.  Initial data requests	;
+!			for each command are also read and verified	;
+!			by this routine before further processing is	;
+!			allowed.					;
+!									;
+! ----------------------------------------------------------------------;
+begin "perform command"
+    Integer Cmd, Cdx, C, P;
+    String Command;
+
+    Line_ inchwl;				! Get a command;
+    Command_ Token( Line );			! Get the first word;
+    if Length( Command ) = 0			! Ignore blank lines;
+     then return( Null );
+
+    if kequ(Command, "?") then Command_ "HELP";	! "?" means "HELP";
+
+    Cdx _ 0;
+    for Cmd _ 1 step 1 until Len.Commands
+     do if ( SuperUser  or  not( CmdFlag[ Cmd ] land C$$PRV ) )
+	 then if kequ( Command, CmdName[ Cmd ][1 for length(Command)] )
+	       then if Cdx neq 0
+		     then return( "Ambigious command." )
+		     else Cdx _ Cmd;
+
+    if 0 < Cdx leq Len.Commands
+     then begin "setup command defaults"
+
+	scan( Line, BrkWht, Brk );		! remove any whitespace;
+	if Line = "?"				! if first character is "?";
+	 then return( CmdText[ Cdx ] );		! give a help message ;
+
+	Command_ CmdName[ Cdx ];		! copy name for later;
+
+	MessageText_ null;			! default message is null ;
+	Case Cdx-1 of begin All.Commands end;	! perform command ;
+	return( MessageText );			! return null or message ;
+
+     end "setup command defaults"
+     else return( "?SHVINV Invalid command" );	! canned error message ;
+
+end;
+
+
+
+!   *** Main-line code ***	SETUP
+;
+
+MyPort_ -1;				! initially we have cmd port ;
+AxPort_  0;				!   and no aux port ;
+
+C.Version;
+
+while TRUE
+ do begin
+    String More;
+    Text( "Shovel> " );
+    Text( More_ Perform!Command );
+    if length( More )
+     then Text( Crlf );
+ end;
+
+End "SHOVEL";
+   
