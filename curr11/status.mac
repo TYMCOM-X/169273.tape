@@ -1,0 +1,886 @@
+	.TITLE	STATUS  STATUS DEVICE SERVICE
+	.SBTTL	STATUS - NEXILIS/JRG
+
+	XLPAR				;DON'T LIST PARAMETER FILE
+
+	CODE
+
+;THIS MODULE CONTAINS THE ROUTINES WHICH IMPLEMENT THE "NODE STATUS" DEVICE.
+;  THIS DEVICE MAY BE CONNECTED TO LIKE ANY OTHER DEVICE AND WILL PROVIDE
+;  INFORMATION ABOUT THE NODE IT IS RUNNING ON.  ALL CONNECTION REQUESTS
+;  SHOULD BE DIRECTED TO THE WILD SOCKET, S00NOD, WHERE NOD IS THE NODE NAME.
+
+;DEFINE STATUS BITS USED ONLY IN THIS MODULE.  BITS ARE FOR THE WORD SDSTSS.
+
+$SSINW=!040000		;WAITING FOR INPUT
+$SSGBF=!020000		;GREEN BALL FLAG (SEND GREEN BALL WHEN READY FOR INPUT)
+
+;DEFINE FLAG BITS FOR THE DSP MACRO
+
+SS=!100000			;SKIP SPACES
+LT=!040000			;CHECK FOR LETTER
+
+;Define macro for calling the in-line message output subroutine
+;	STSMES	<"Message to output">
+
+	.MACRO	STSMES  MESS
+	CALL	STSILM
+	.ASCIZ	MESS
+	.EVEN
+	.ENDM
+
+	.SBTTL	STATUS - INITIALIZATION ROUTINES
+
+;SUBROUTINE TO INITIALIZE DEVICE DEPENDENT PART OF DDB
+;	C(R4) = ADDRESS OF DDB
+;	CALL	STDDBI
+
+STDDBI::RETURN
+
+;SUBROUTINE TO INITIALIZE DEVICE DEPENDENT PART OF EACH SDB
+;	C(R4) = ADDRESS OF DDB
+;	C(SD) = ADDRESS OF SDB
+
+STSDBI::MOV	#SDSTCZ#,R2		;GET NUMBER OF WORDS TO CLEAR
+	MOV	#SDSTFC#,R1		;GET FIRST WORD TO CLEAR
+	ADD	SD,R1
+STSIN4:	CLR	(R1)+			;CLEAR DEVICE DEPENDENT PART
+	SOB	R2,STSIN4
+	BIS	#$S1AVL,SDSTS1#(SD)	;INDICATE THIS SOCKET IS AVAILABLE
+RTN001:	RETURN				;FINISHED
+	.PAGE
+	.SBTTL	STATUS - SUBROUTINES CALLED BY PACKET SERVICE
+
+;SUBROUTINE CALLED TO RESUME OUTPUT FROM STATUS DEVICE AFTER IT HAS BEEN
+;  STOPPED
+
+STRSUM::MOV	SDSTSR#(SD),R1		;GET SAVED ADDRESS
+	BEQ	RTN001			;FORGET IT IF NONE SAVED
+	CLR	SDSTSR#(SD)		;CLEAR ADDRESS
+	MOV	SDSTS3#(SD),R3		;Restore R3
+	MOVB	SDSTSC#(SD),R0		;Restore character we were storing
+	PUSH	R1			;Put address on the stack
+	JMP	STSCHR			;And go try to store the character again
+
+;SUBROUTINE CALLED TO START OUTPUT WHEN PACKET TRANSFERED TO EMPTY DST LIST
+;	C(R1) = ADDRESS OF PACKET
+;	C(R4) = ADDRESS OF DDB
+;	C(SD) = ADDRESS OF SDB
+;	CALL	STPOKE
+
+STPOKE::CALL	GETPKT#			;Get address of current packet
+	MOVB	PKTYPE(R1),R0		;GET PACKET TYPE
+STCNTL:	ASL	R0			;TIMES 2
+	JMP	@PKTDSP(R0)		;DISPATCH ON PACKET TYPE
+
+;PACKET TYPE DISPATCH TABLE
+
+	PURE
+
+PKTDSP:	.WORD	STDATA			;.PTDAT =  0 - DATA
+	.WORD	STCONC			;.PTCON =  1 - CONNECT
+	.WORD	STILPK			;.PTACK =  2 - CONNECT ACK
+	.WORD	STILPK			;.PTNAK =  3 - CONNECT NAK
+	.WORD	STFUNC			;.PTFUN =  4 - FUNCTION
+	.WORD	STFUNC			;.PTINT =  5 - INTERRUPT
+	.WORD	STFUNC			;.PTEAT =  6 - EAT
+	.WORD	STDISC			;.PTDIS =  7 - DISCONNECT
+	.WORD	STDISC			;.PTKIL = 10 - KILL CONNECTION
+	.WORD	STDACK			;.PTDAK = 11 - DISCONNECT ACK
+	.WORD	STCONC			;.PTRVR = 12 - RECOVER
+	.WORD	STDISC			;.PTRTY = 13 - RETRY
+	.WORD	STILPK			;.PTPAC = 14 - PACKET ACK
+
+	CODE
+
+;HERE FOR ILLEGAL PACKET TYPE
+
+STILPK:	FSTOP	IPT			;[ILLEGAL PACKET TYPE]
+	.PAGE
+;HERE FOR CONNECT PACKET
+
+STCONC:	MOV	#P.TYMS*400+111,R2	;GET TERMINAL PROFILE
+	TSTB	XRAYNM#			;Is one defined?
+	BEQ	1$			;No, skip asking for login string
+	ADD	#40,R2			;NE, ask for login string
+1$:	CALL	ACCEPT#			;ACCEPT THE CONNECTION
+	BCS	RTN001			;IF NOT ENOUGH PRIV.!
+	MOVB	R0,SDSTPL#(SD)		;OK-STORE PRIV. CLASS
+	CLR	SDSTSR#(SD)		;CLEAR OUTPUT DISPATCH ADDRESS
+	CLR	SDSTSS#(SD)		;CLEAR STATUS WORD
+	MOV	#.PTFUN,R0		;SEND A FUNCTION PACKET
+	CALL	CTLPKX#
+	BCS	CMDFI1			;IF NO MORE PACKETS
+	MOV	#.FNCLI,R0
+;	CALL	CTLSTR#			;STORE CLEAR LOGIN REQUEST
+;	MOV	#.TPIMI,R0
+;	CALL	CTLSTR#			;STORE INPUT IMAGE SET REQUEST
+;	MOV	#1,R0			;SET IMAGE MODE INPUT ON
+	CALL	CTLSTE#
+	TSTB	XRAYNM#			;Is one defined?
+	BEQ	CMDFI1			;No, skip name checking
+	MOV	#XRAYNM#,SDSTV1#(SD)	;Prepare to check user name
+	MOV	#STUSER,SDSTID#(SD)	;Set input dispatch routine
+RTN002:	RETURN
+
+
+;HERE FOR CHECKING LOGIN STRING WITH KERNAL HOST STRING
+
+STUSER:					;Entered only right after conn ack
+	CMPB	R0,@SDSTV1#(SD)		;Is this byte matched?
+	BNE	10$			;NE, No, check for graceful end
+	INC	SDSTV1#(SD)		;EQ, prepare for next one
+	BR	STDAT2			;Go get next character
+10$:	TSTB	@SDSTV1#(SD)		; Did we get to the end of the string
+	BNE	DISCM1			;No, ther we had an error
+	CMPB	R0,#CR			;Was it a carriage return?
+	BEQ	CMDFI1			;Yes, perfect match
+	CMPB	R0,#';			;Was it a semi-colon?
+	BNE	DISCM1			;No, not a good match
+CMDFI1:	JMP	CMDFIN			;EQ, THE CHECK IS OK
+DISCM1:	JMP	DISCMD			;just like in K command
+
+
+;HERE FOR DISCONNECT PACKET
+
+STDISC:	CLR	SDSTSR#(SD)		;INDICATE NOT BUSY NOW
+	CJMP	FINDIS#			;Finish disconnecting
+	CJMP	FRESOC#			;Free up the socket and return
+
+;Here for Disconnect ACK packet
+
+STDACK:	CLR	SDSTSR#(SD)		;Indicate not busy now
+	CALL	JNKCPK#			;Give up the packet
+	CJMP	FRESOC#			;Give up the socket and return
+	.PAGE
+;HERE FOR FUNCTION PACKET
+
+STFUNC:	TST	SDSTSR#(SD)		;Has our output been held off?
+	BNE	RTN001			;Yes-forget this for now
+	TSTB	PKCNT(R1)		;No-make sure have some data
+	BLE	FNCIGN			;IGNORE IT IF NONE THERE!
+	MOVB	PKDATA(R1),R0		;GET FUNCTION
+	CMPB	#.FNHIN,R0		;Hard interrupt function?
+	BEQ	FNCHIN			;Yes
+	CMPB	#.FNOPS,R0		;Output suppress function?
+	BEQ	FNCHIN			;Yes-just like hard interrupt
+	CMPB	#.FNRQC,R0		;Request buffer clear?
+	BEQ	FNCRQC			;Yes
+	CMPB	#.FNREQ,R0		;Request function?
+	BEQ	FNCREQ			;Yes
+;	CMPB	#.FNGRN,R0		;Green ball function?
+;	BEQ	FNCGRN			;Yes
+FNCIGN:	CALL	JNKCPK#			;GIVE UP THE PACKET
+FNCDON:	TST	SDSTSR#(SD)		;ARE WE ACTIVE?
+	BEQ	STDAT2			;No-go see if more input
+	RETURN				;Yes-finished for now
+
+;HERE FOR HARD BREAK OR OUTPUT SUPPRESS FUNCTIONS
+
+FNCHIN:	CALL	ACKOPS#			;ACK THE OUTPUT SUPPRESS FIRST
+	JMP	CMDFIN			;Continue
+
+;Here for request buffer clear function
+
+FNCRQC:	CALL	ACKOPS#			;Send back an "output suppress ACK"
+	BR	FNCDON			;Thats all
+
+;HERE FOR GREEN BALL FUNCTION
+
+FNCGRN:
+;	TBBN	$SSINW,SDSTSS#(SD),PKTR2T;SEND GREEN BALL BACK IF WAITING FOR INPUT
+;	BIS	#$SSGBF,SDSTSS#(SD)	;OTHERWISE REQUEST ONE LATER
+;	BR	FNCIGN			;THATS ALL
+
+
+;Here for request (yellow ball) function
+
+FNCREQ:	MOVB	#.FNRSP,PKDATA(R1)	;Change to response (orange ball)
+					;  function
+PKTR2T:	CALL	CPKRTN#			;And return it
+	BR	FNCDON			;Continue
+	.PAGE
+STDATA:	TST	SDSTSR#(SD)		;Has our output been held off?
+	BNE	RTN002			;Yes-forget it for now
+STDAT2:	CALL	GETBYT#			;GET DATA BYTE
+	BEQ	RTN002			;IF NOTHING AVAILABLE NOW
+	BCS	STCNTL			;IF CONTROL PACKET
+	BIC	#^C177,R0		;ONLY 7 BITS
+	JMP	@SDSTID#(SD)		;Dispatch
+
+;Here for initial command character
+
+STCMDL: CMP	#LF,R0			;Is this a LF?
+	BEQ	STDAT2			;YES-IGNORE IT
+	CMP	#CR,R0			;RETURN?
+	BNE	2$			;No
+	JMP	CMDFIN			;Yes-ignore it
+
+
+2$:	MOV	R0,R3			;Save over call
+	CALL	STSCHR			;Pump out the char
+	PUSH	R3
+	CALL	SNDDPK#			;Flush out all packets
+	POP	R0
+	CMP	#'a,R0			;Check for upper case
+	BGT	4$			;Not an upper case
+	BIC	#40,R0			;Convert to upper case
+4$:	MOVB	R0,SDSTCC#(SD)		;Save it for later
+	MOV	#STOCTN,SDSTID#(SD)	;Update input dispatch
+	SUB	#'0,R0			;Start checking for octal digit
+	BLT	STDAT2			;Not a digit
+	CMP	#7,R0			;Test at high end
+	BLT	STDAT2			;Not a octal digit
+	MOV	R0,SDSTV1#(SD)		;Use to start number accumulation
+	MOVB	#'0,SDSTCC#(SD)		;Save this type for later
+	BR	STDAT2			;Continue
+
+;Here when expecting octal digit
+
+STOCTN: CMP	#LF,R0			;Is this a LF?
+	BEQ	STDONE			;Yes
+	CMP	#CR,R0			;RETURN?
+	BEQ	STDONE			;YES-PROCESS COMMAND
+	CMP	#177,R0			;CHECK FOR ABORT COMMAND REQUEST
+	BEQ	ABTCMD
+	MOV	R0,R3			;Save over call
+	CALL	STSCHR			;Pump out the char
+	PUSH	R3
+	CALL	SNDDPK#			;Flush out all packets
+	POP	R0
+	CMP	#',,R0			;Is it a comma?
+	BEQ	NUMDON			;Yes
+	CMP	#'/,R0			;Check for DDT format
+	BEQ	DDTDON			;Yes do DDT stuff
+	CMP	#':,R0			;Check for DDT break
+	BEQ	DDTDON
+	CMP	#'[,R0			;Check for DDT mode
+	BEQ	DDTDON			;Yes, go to it
+	CMP	#'",R0			;Check for DDT string mode
+	BEQ	DDTDON			;Yes, go to it
+	CMP	#'0,R0			;Is it an octal digit?
+	BGT	SYNERR			;No-error
+	CMP	#'7,R0			;Maybe
+	BLT	SYNERR			;No
+	BIC	#^C7,R0			;Yes-get value of digit
+	MOVB	SDSTVP#(SD),R1		;Get value pointer
+	ADD	SD,R1
+	MOV	SDSTV1#(R1),R3		;Get current value
+	ASHI	3,R3			;Increase the value
+	ADD	R0,R3			;Add in next digit
+	MOV	R3,SDSTV1#(R1)		;Store new value
+	BR	STDAT2			;CONTINUE
+
+;Here on comma when inputting a number
+
+NUMDON:	CMPB	#4,SDSTVP#(SD)		;Can we take another value?
+	BLE	SYNERR			;No
+	ADD	#2,SDSTVP#(SD)		;Yes-bump value pointer
+	BR	STDAT2			;Continue
+
+DDTDON:	CMPB	#'0,SDSTCC#(SD)		;Check for true DDT command
+	BNE	BADCMD			;Tell user about his boo-boo
+	JMP	PRCDDT			;Go process DDT command
+
+ABTCMD:	CLRB	SDSTCC#(SD)		;Clear the command to make it bad
+	
+;Here on terminator when inputting a command
+
+STDONE: STSMES	<"%">			;output a new line
+	CALL	SNDDPK#			;Flush out all packets
+	MOVB	SDSTCC#(SD),R0		;Get command character
+	SUB	#'A,R0			; Valid command?
+	BLT	BADCMD			; No
+	CMP	R0,#CMDMAX		; Maybe - is it?
+	BGE	BADCMD			; No
+	ASL	R0			;Yes
+	JMP	@CMDDSP(R0)		; Dispatch on the command
+
+;Command dispatch table
+
+	PURE
+
+CMDDSP:	.WORD	BADCMD		; A - Illegal
+	.WORD	DBYCMD		; B - Deposit byte
+	.WORD	CFGCMD		; C - Configuration information
+	.WORD	DEPCMD		; D - Deposit word
+;	.WORD	EXMCMD		; E - Examine word
+	.WORD	EXRCMD		; E - Examine error info
+	.WORD	BADCMD		; F - Illegal
+	.WORD	BADCMD		; G - Illegal
+	.WORD	BADCMD		; H - Illegal
+	.WORD	BADCMD		; I - Illegal
+	.WORD	CONCMD		; J - Connection information
+	.WORD	DISCMD		; K - Disconnect
+	.WORD	LNKCMD		; L - Link error information
+	.WORD	MGRCMD		; M - Link management (limit connections)
+	.WORD	NODCMD		; N - Node information
+	.WORD	OFFCMD		; O - Switch links on/off
+	.WORD	BADCMD		; P - Illegal
+	.WORD	DISCMD		; Q - Quit
+	.WORD	BADCMD		; R - Illegal
+	.WORD	SNPCMD		; S - Snap register dump
+CMDMAX=!<.-CMDDSP>/2
+
+	CODE
+
+;Here for syntax error
+
+SYNERR:	MOVB	#'S,SDSTER#(SD)		;Save the error code
+	MOV	#EATLIN,SDSTID#(SD)	;Reset the input dispatch
+SYNER2:	JMP	STDAT2			;Continue
+
+;Here to eat rest of an input line after an error
+
+EATLIN:	CMP	#LF,R0			;End of the line?
+	BNE	SYNER2			;No-continue
+ERRDON:	MOV	#'?,R0			;Yes-output a "?"
+	CALL	STSCHR
+	MOVB	SDSTER#(SD),R0		;Get the error code
+	CALL	STSCHR			;Output it too
+	JMP	CMDFIN			;Finish up
+	.PAGE
+	.SBTTL	STATUS - * C *  Configuration information
+
+;Here for bad command
+
+BADCMD:	MOV	#'C,R0			;Get the error code
+ERRCOM:	MOVB	R0,SDSTER#(SD)		;Store the error code
+	BR	ERRDON			;Continue
+
+;HERE FOR CONFIGURATION INFORMATION COMMAND  * C *
+
+CFGCMD:	STSMES	<"V=">			;Output the version number
+	MOV	VERLOC#,R0
+	CALL	STSOCT
+	CALL	STSCMA
+	MOV	VERLOC#+2,R0
+	CALL	STSOCT
+	STSMES	<"%ST=">
+	MOV	#STKBGN#-2,R0		;Get address of stack
+	CALL	STSOCT			;Output the stack address
+	MOV	#DXTBL#,SDSTD3#(SD)	;Get pointer to DX table
+	MOV	#DXSIZE#,SDSTD4#(SD)	;Number of entries
+4$:	STSMES	<"%D">
+	MOV	#DXSIZE,R0
+	SUB	SDSTD4#(SD),R0		;Get device number
+	CALL	STSOCT			;Output the device number
+	STSMES	<"=">
+	MOV	@SDSTD3#(SD),R3		;Get address of DDB
+	MOVB	DDID#(R3),R0		;Get device I.D.
+	MOVB	DEVLTR#(R0),R0		;Get single letter specifier for device
+	CALL	STSCHR			;Output it
+	CALL	STSCMA
+	MOVB	DDSOC#(R3),R0		;Get number of sockets
+	CALL	STSOCT			;Output it
+	TBBE	$D0LNK!$D0HST!$D0GTW,(R3),20$;Go on if not link, host, or gateway
+	CALL	STSCMA
+	MOVB	DDLKTP#(R3),R0		;Get link type
+	CALL	STSCHR			;Output it
+	CALL	STSCMA
+	MOV	#'S,R0			;Assume secondary
+	TBBE	$D0PRI,(R3),6$		;Right?
+	MOV	#'P,R0			;Nope
+6$:	CALL	STSCHR			;Output character
+	CALL	STSCMA
+	MOV	#'L,R0			;Assume an internal link
+	TBBE	$D0HST!$D0GTW,(R3),10$	;Right?
+	MOV	#'H,R0			;No-assume host
+	TBBN	$D0HST,(R3),10$		;Right?
+	MOV	#'G,R0			;No-its a gateway
+10$:	CALL	STSCHR			;Output the character
+	CALL	STSCMA
+	MOV	#DDLKNA#,R1		;Get address of name of link, etc
+	ADD	R3,R1
+	CALL	STSSTR			;Output it
+20$:	ADD	#2,SDSTD3#(SD)		;Bump DX table pointer
+	DEC	SDSTD4#(SD)		;More to do here?
+	BGT	4$			;Yes-continue
+	STSMES	<"%%">
+;	BR	NODCMD			;Thats all
+
+.SBTTL	STATUS - * N *  Node information command
+
+;HERE FOR NODE COMMAND  * N *
+
+NODCMD:	STSMES	<"P=">			;TELL HIM ABOUT PACKETS FIRST
+	MOV	PKFCMN#,R0		;Get "low-water" value
+	CALL	STSOCT			;Output it
+	CALL	STSCMA
+	MOV	PKFCNT#,R0		;Get number currently free
+	CALL	STSOCT			;Output it
+	CALL	STSCMA
+	MOV	NUMPKT#,R0		;Get number available
+	CALL	STSOCT			;Output it
+	STSMES	<"%L=">			;Tell him about "Loops/Sec" next
+	MOV	LPSAVG#,R0		;Get current average
+	CALL	STSOCT			;Output it
+	STSMES	<"%CIN=">		;Tell them about characters input
+	MOV	CINLST#,R0
+	CALL	STSOCT
+	STSMES	<" COUT=">		;Characters output
+	MOV	COTLST#,R0
+	CALL	STSOCT
+	STSMES	<" CPS=">
+	MOV	CPSLST#,R0		;CPS weighted moving average
+	CALL	STSOCT
+	BR	CMDF2N			; Finish up
+	.PAGE
+	.SBTTL	STATUS - * B *  Deposit byte command
+
+;HERE FOR DEPOSIT BYTE COMMAND  * B *
+
+DBYCMD:	CMPB	DDSTDP#(R4),SDSTPL#(SD)	;Can he do this?
+	BHI	PRVBAD			;No!
+	MOVB	SDSTV2#(SD),@SDSTV1#(SD);Yes-store new value
+	NXMJMP	EXMBAD			;COMPLAIN IF BAD ADDRESS
+	BR	CMDF2N			;THATS ALL
+
+	.SBTTL	STATUS - * D *  Deposit word command
+
+;HERE FOR DEPOSIT COMMAND  * D *
+
+DEPCMD:	CMPB	DDSTDP#(R4),SDSTPL#(SD)	;Can he do this?
+	BHI	PRVBAD			;No
+	MOV	SDSTV2#(SD),@SDSTV1#(SD);Yes-store new value in memory
+	NXMJMP	EXMBAD			;COMPLAIN IF BAD ADDRESS
+	BR	CMDF2N
+
+	.SBTTL	STATUS - * E *  Examine crash register dump
+
+;HERE FOR EXAMINE CRASH REGISTER COMMAND  * E *
+
+EXRCMD:	STSMES<"ERR= ">
+	MOV	SD,R1			;ADDRESS OF BASE
+	ADD	#SDSTD3,R1		;FORM ADDRESS OF DESTINATION
+	PUSH	R1			;SAVE ADDRESS FOR LATER
+	MOV	#SAVEEC#,R4		;FORM ADDDRESS OF SOURCE
+	CALL	RD50XX#			;CONVERT TO RADIX 50
+	CLRB	(R1)			;TERMINATE STRING
+	POP	R1			;GET BEGINING OF STRING
+	CALL	STSSTR			;TYPE IT
+	STSMES<"%REGS= ">
+	MOV	#9.,SDSTD3#(SD)		;RESET COUNTER
+	MOV	#SAVER1#-2,SDSTD4#(SD)	;POINT TO REGISTER BLOCK
+60$:	MOV	@SDSTD4#(SD),R0		;GET REGISTER
+	CALL	STSOCT			;OUTPUT IT
+	STSMES<"  ">
+	ADD	#2,SDSTD4#(SD)		;INCREMENT ADDRESS POINTER
+	DEC	SDSTD3#(SD)		;DECREMENT COUNTER
+	BGT	60$
+	STSMES<"%STK= ">
+	MOV	#8.,SDSTD3#(SD)		;RESET COUNTER
+	MOV	#BUGBUF#+20,SDSTD4#(SD)	;POINT TO STACK BLOCK
+80$:	MOV	@SDSTD4#(SD),R0		;GET REGISTER
+	CALL	STSOCT			;OUTPUT IT
+	STSMES<"  ">
+	ADD	#2,SDSTD4#(SD)		;INCREMENT ADDRESS POINTER
+	DEC	SDSTD3#(SD)		;DECREMENT COUNTER
+	BGT	80$
+CMDF2N:	JMP	CMDFIN
+
+;HERE IF ADDRESS DOES NOT EXIST
+
+EXMBAD:	MOV	#'A,R0			;Get error code
+ERRC2M:	JMP	ERRCOM			;Continue
+
+;Here if his priviledge level is not high enough!
+
+PRVBAD:	MOV	#'P,R0			;Get error code
+	BR	ERRC2M			;Continue
+
+PRCDDT:	CMPB	DDSTEP#(R4),SDSTPL#(SD)	;Is the user valid for this
+	BHI	PRVBAD			;Too bad
+	MOV	#90$,SDSTID#(SD)	;Update input dispatch
+	MOVB	R0,SDSTCC#(SD)		;Save command type for later
+	MOV	#8.,SDSTD3#(SD)		;Setup counter	
+	BR	40$			;Skip typing out the location
+
+10$:	MOV	@SDSTV1#(SD),SDSTV1#(SD) ;Get contents of location
+20$:	STSMES	<"%">			;Go to next line
+	MOV	SDSTV1#(SD),R0		;Pick up the address
+	CALL	STSOCT			;Type it out
+	MOV	SDSTCC#(SD),R0		;Get back delimiter
+	CALL	STSCHR			;Put out the character
+40$:	STSMES	<"  ">
+	MOV	@SDSTV1#(SD),R0		;Get contents
+	NXMJMP	EXMBAD			;Handle error
+	MOVB	SDSTCC#(SD),R1		;Check type of function
+	CMP	#':,R1			;Check for byte output
+	BEQ	60$			;Perform byte output
+	CMP	#'",R1			;Check for string output
+	BEQ	70$			;Perform string output
+	CMP	#'[,R1			;Want a block output
+	BNE	50$			;No
+	CALL	STSOCT			;Put it out in octal
+	ADD	#2,SDSTV1#(SD)		;Point to  next location
+	DEC	SDSTD3#(SD)		;Count down
+	BGT	40$			;Continue with loop
+	MOV	#8.,SDSTD3#(SD)		;Reset counter	
+	SUB	#2,SDSTV1#(SD)		;Point to last location
+	BR	80$			;Finish up
+50$:	CALL	STSOCT			;Put it out in octal
+	BR	80$			;Go flush all packets
+60$:	MOV	R0,R3
+	CLRB	R0			;Clear lower half
+	XOR	R0,R3			;Clear upper half in R3
+	SWAB	R0			;Put byte in correct half of word
+	CALL	STSOCT			;Put out byte
+	CALL	STSCMA			;Separate bytes with comma
+	MOV	R3,R0			;Get back data byte
+;	BIC	#^C377,R0		;Clear unnecessary byte
+	CALL	STSOCT
+	BR	80$			;Flush packets
+70$:	CALL	STSCHR			;Output the character
+	SWAB	R0			;Swap the bytes
+	CALL	STSCHR
+80$:	CALL	SNDDPK#			;Flush out all packets
+	JMP	STDAT2			;Try to get more input
+
+90$:	ADD	#2,SDSTV1#(SD)		;Point to next location
+	CMP	#LF,R0			;Check for next location typeout
+	BEQ	20$			;Yes- go type it out
+	SUB	#4,SDSTV1#(SD)		;Point to last location
+	CMP	#'^,R0			;Check for last location function
+	BEQ	20$			;Yes- go type it out
+	CMP	#CR,R0			;Check for end of sequence
+	BEQ	CMDF2N			;Yes- finishup
+	ADD	#2,SDSTV1#(SD)		;Point to current location
+	CMP	#'.,R0			;Retype current location?
+	BEQ	20$
+	CMP	#'/,R0			;Chaining along?
+	BEQ	10$
+	STSMES	<" ?">
+	CALL	SNDDPK#			;Flush out all packets
+	JMP	STDAT2
+	.PAGE
+	.SBTTL	STATUS - * S * Snap register dump
+
+;Here for Snap register dump  * S *
+
+SNPCMD:	MOV	SDSTV1#(SD),TRCADD	;Save address to check for
+	MOV	SD,TRCSDB		;Save SD to get back in line
+	INC	TRCFLG			;Say trace is running
+	PUSH	#20			;Save T-bit on stack
+	PUSH	#CMDFIN			;Continue from this address
+	RTT				;And execute next instruction
+
+TRCCOD::BIC	#20,2(SP)		;Clear the trace bit
+	CLR	TRCADD			;Clear the trace address
+	PUSH	SD			;Save this important register
+	MOV	TRCSDB,SD
+	MOV	R0,SDSTD3#(SD)		;Save R0
+	MOV	R1,SDSTD4#(SD)
+	MOV	R2,SDSTD5#(SD)
+	MOV	R3,SDSTD6#(SD)
+	MOV	R4,SDSTD7#(SD)
+	MOV	(SP),SDSTD8#(SD)
+	MOV	R6,SDSTD9#(SD)
+	MOV	2(SP),SDSTDA#(SD)	;Save PC
+	MOV	4(SP),SDSTDB#(SD)	;Save PS
+	POP	SD
+	RTI				;Continue
+
+	ONCSEC	TRCDIS
+
+TRCDIS:	TST	TRCFLG			;Is a trace active
+	BEQ	RTN005			;No return
+	TST	TRCADD			;Have we hit it yet?
+	BNE	RTN005			;No, return
+	CLR	TRCFLG			;Yes, clear flag
+	MOV	TRCSDB,SD		;Get back SDB
+	STSMES	<"%REGS=">
+	MOV	SD,R0
+	ADD	#SDSTD3#,R0
+	MOV	R0,SDSTV3#(SD)		;Save address of saved block
+	MOV	#9.,SDSTV2#(SD)		;Save count
+10$:	STSMES	<"  ">
+	MOV	@SDSTV3(SD),R0		;Get next data item
+	CALL	STSOCT			;Display it
+	ADD	#2,SDSTV3#(SD)		;Increment address
+	DEC	SDSTV2#(SD)		;Decrement counter
+	BGT	10$			;Loop if not finished
+	STSMES	<"%">
+	CALL	SNDDPK#			;Flush out all packets
+RTN005:	RETURN
+	.PAGE
+	.SBTTL	STATUS - * J *  Connection information command
+
+;Here for Connection information command  * J *
+
+CONCMD:	MOV	SDSTV1#(SD),R0		;Get device index
+	CMP	#DXSIZE#,R0		l value?
+	BLOS	ERRORR			;No-go complain
+	ASL	R0
+	MOV	DXTBL#(R0),R3		;Get address of DDB
+	MOVB	DDSOC#(R3),SDSTD4#(SD)	;Get number of sockets
+	MOV	DDSX#(R3),SDSTD3#(SD)	;Get pointer to SX table
+	STSMES	<"J(">
+	MOV	@SDSTD3#(SD),R0		;Get first sdb address
+	CALL	STSOCT
+	STSMES	<")=">
+40$:	MOV	@SDSTD3#(SD),R3		;Get next SDB
+	TBBN	$S1AVL,SDSTS1#(R3),50$	;Is this SDB available?
+	MOV	#'X,R0			;No-output an "X"
+	BR	60$
+
+;Here if SDB is available
+
+50$:	TSTB	SDSTS1#(R3)		;Is this SDB disconnected?
+	BNE	70$			;No-go on
+	TBBE	$S1INU,SDSTS1#(R3),100$	;Yes-is it in use anyway?
+	MOV	#'*,R0			;Yes-output a "*"
+60$:	CALL	STSCHR			;And go on
+	BR	100$
+
+;Here if SDB is not disconnected
+
+70$:	MOV	(R3),R2			;No-get connected SDB
+	BEQ	80$			;If none
+	MOV	SDDDB#(R2),R2		;Get its DDB
+	MOVB	DDINDX#(R2),R0		;Get device index
+	CALL	STSOCT			;Output it
+80$:	MOVB	SDSTS1#(R3),R0		;Get socket state
+	ASR	R0
+	ADD	#<'A>-1,R0		;Change to funny letter!
+	CALL	STSCHR			;Output it
+	MOV	(R3),R2			;Get connected SDB again
+	BEQ	100$			;If none
+	CLR	R0			;Get socket number
+	BISB	SDSOC#(R2),R0
+	CALL	STSOCT			;Output it
+100$:	DECB	SDSTD4#(SD)		;More to do?
+	BEQ	CMDF3N			;No-finished
+	ADD	#2,SDSTD3#(SD)		;Yes-bump pointer
+	CALL	STSCMA			;Output a comma
+	BR	40$			;And continue
+CMDF3N:	JMP	CMDFIN
+
+;Here if argument is out of range
+
+ERRORR:	MOVB	#'R,R0			;Get error code
+	JMP	ERRCOM			;Continue
+	.PAGE
+	.SBTTL	STATUS - * L *  Link information command
+
+;HERE FOR LINK INFORMATION COMMAND  * L *
+
+LNKCMD:	MOV	SDSTV1#(SD),R0		;Get argument
+	CMP	#DXSIZE,R0		;Legal value?
+	BLOS	ERRORR			;No
+	ASL	R0			;Yes
+	MOV	DXTBL#(R0),R3		;Get address of DDB
+	TBBE	$D0LNK!$D0HST!$D0GTW,(R3),ERRORR;Must be a link-like device
+	STSMES	<"STATUS=">
+	MOV	#"NX,R0			;Unassume unavailable
+	TBBN	$D1UNV,DDSTS1#(R3),2$	;If right
+	MOV	#"OF,R0			; Assume link is turned off
+	TBBN	$D1OFF,DDSTS1#(R3),2$	; Branch if correct
+	MOV	#"UP,R0			;Assume link is up
+	TBBE	$D1DWN,DDSTS1#(R3),2$	;Right?
+	MOV	#"DN,R0			;No-its down
+2$:	MOV	R0,SDSTD1#(SD)		;Save both characters
+	CALL	STSCHR
+	MOVB	SDSTD1#+1(SD),R0	;Get other character
+	CALL	STSCHR
+	TBBE	$D1LCK,DDSTS1#(R3),3$	; Branch if link not locked
+	STSMES	<",LOCKED">		; Indicate no new connections
+3$:	CALL	STSCMA
+	MOV	R3,R0			;Put out DDB address
+	CALL	STSOCT
+	MOVB	DDLKEC#(R3),SDSTD4#(SD)	;Get number of error bytes
+	ADD	#DDLKER#,R3		;Point to first error byte
+	STSMES	<"%EC=">
+35$:	MOVB	#13.,SDSTD3#(SD)	;Set up errors per line counter
+4$:	MOV	(R3)+,R0		;Get error counter value
+	CALL	STSOCT			;Output it
+	DECB	SDSTD4#(SD)		;More to do?
+	BLE	CMDFIN			;No
+	DECB	SDSTD3#(SD)		;Check for second line
+	BGT	6$			;Not yet
+	STSMES	<"%   ">
+	BR	35$
+6$:	CALL	STSCMA			;Yes
+	BR	4$			;Continue
+.PAGE
+.SBTTL	STATUS - * M *  Link management command
+
+; Here for link management command  * M *
+
+MGRCMD:	MOV	#$D1LCK,R2		; Get bit we want to change
+	BR	OFFCM2			; Now go to common routine
+
+.SBTTL	STATUS - * O *  Link on/off command
+
+; Here for node command  * O *
+
+OFFCMD:	MOV	#$D1OFF,R2		; Set the correct bit
+OFFCM2:	CMPB	DDSTEP#(R4),SDSTPL#(SD)	; Privilege level adequate?
+	BLOS	5$			; Yes
+
+	JMP	PRVBAD			; No
+5$:	MOV	SDSTV1#(SD),R0		; Get first value
+	CMP	#DXSIZE,R0		; Legal value?
+	BLOS	10$			; No
+
+	ASL	R0			; Yes, times 2 now
+	MOV	DXTBL#(R0),R3		; Get address of DDB
+	TBBE	$D0LNK!$D0HST!$D0GTW,(R3),10$ ; Must be link-type device
+
+	MOV	SDSTV2#(SD),R0		; Get second value
+	CMP	R0,#1			; Zero or one?
+	BLO	15$			; Zero, so clear the bit
+	BEQ	20$			; One, so set bit
+
+	MOV	#'S,R0			; Set error code
+	BR	11$			; Now print error
+10$:	MOVB	#'R,R0			;Get error code
+11$:	JMP	ERRCOM			;Continue
+
+15$:	BIC	R2,DDSTS1#(R3)		; Clear the bit
+	BR	CMDFIN			; Now finish up
+
+20$:	BIS	R2,DDSTS1#(R3)		; Set the bit
+					; Fall into CMDFIN
+
+;Here when finished with a command
+
+CMDFIN:	MOV	#STCMDL,SDSTID#(SD)	;Reset input dispatch word
+	MOV	#SDSTCF#,R2		;Clear pointers and values
+	ADD	SD,R2
+	MOV	#SDSTCY#,R0
+2$:	CLR	(R2)+
+	SOB	R0,2$
+	STSMES	<"%#">			;OUTPUT A PROMPT
+	CALL	SNDDPK#			;FORCE OUT LAST PACKET
+	BIS	#$SSINW,SDSTSS#(SD)	;INDICATE WAITING FOR INPUT NOW
+	TBBE	$SSGBF,SDSTSS#(SD),4$	;NEED A GREEN BALL NOW?
+	BIC	#$SSGBF,SDSTSS#(SD)	;YES-BUT NOT ANY MORE!
+;	MOV	#.PTFUN,R0		;SEND A GREEN BALL
+;	CALL	CTLPKX#
+;	BCS	4$			;IF NO MORE PACKETS
+;	MOV	#.FNGRN,R0
+;	CALL	CTLSTE#
+4$:	JMP	STDAT2			;Go get some more input
+	.PAGE
+	.SBTTL	STATUS - * K *  Disconnect command
+
+;Here for Disconnect command  * K *  This command disconnects the connected
+;  device
+
+DISCMD:	CALL	SNDDPK			;Flush out any remaining data
+	MOV	#.ERREQ,R0		;Get reason
+	CALL	MAKKIL#			;Make a kill packet
+	BCS	CMDFIN			;Forget it if can't get a packet!!
+	CALL	SNDPKT#			;Do it
+	JMP	STDAT2			;Go check for Disconnect ACK packet
+	.PAGE
+	.SBTTL	STATUS - LOCAL SUBROUTINES
+;SUBROUTINE TO OUTPUT COMMA
+;*** WARNING ***  THIS SUBROUTINE MUST BE CALLED WITH NOTHING ON THE STACK!
+;	CALL	STSCMA
+
+STSCMA:	MOV	#',,R0			;Get a comma
+					;Fall into STSCHR
+
+;SUBROUTINE TO OUTPUT CHARACTER
+;*** WARNING ***  THIS SUBROUTINE MUST BE CALLED WITH NOTHING ON THE STACK!
+;	C(R0) = ASCII CHARACTER
+;	CALL	STSCHR
+
+STSCHR:	PUSH	R3			;Save R3
+	CALL	PUTBYT#			;OUTPUT THE CHARACTER
+	  BR	4$			;If error
+	POP	R3			;OK-restore r3
+	RETURN				;And return
+
+;Here if error return from PUTBYT
+
+4$:	POP	SDSTS3#(SD)		;Save R3
+	POP	SDSTSR#(SD)		;Save return address
+	MOVB	R0,SDSTSC#(SD)		;Save output character
+	BIS	#$S1STP,SDSTS1#(SD)	;Flag us as stopped
+	RETURN				;And exit the status module
+
+;SUBROUTINE TO OUTPUT INLINE TEXT STRING
+;*** WARNING ***  THIS SUBROUTINE MUST BE CALLED WITH NOTHING ON THE STACK!
+;	CALL	STSILM
+;	.ASCIZ	"STRING"
+;	.EVEN
+
+STSILM:	POP	SDSTR1#(SD)		;SAVE RETURN ADDRESS
+INLOU2:	MOVB	@SDSTR1#(SD),R0		;GET CHARACTER
+	BEQ	INLOU4			;IF FINISHED
+	INC	SDSTR1#(SD)		;BUMP POINTER
+	CMP	#'%,R0			;End of line?
+	BNE	10$			;No-go on
+	MOV	#CR,R0			;Output CR
+	CALL	STSCHR
+	MOV	#LF,R0			;Followed by LF
+10$:	CALL	STSCHR			;OUTPUT CHARACTER
+	BR	INLOU2			;CONTINUE
+
+;HERE WHEN FINISHED WITH INLINE STRING
+
+INLOU4:	MOV	SDSTR1#(SD),R0		;GET ADDRESS OF LAST CHARACTER
+	ROR	R0			;POINT TO NEXT WORD
+	INC	R0
+	ASL	R0
+	JMP	(R0)			;RETURN FROM STSILM
+
+;SUBROUTINE TO OUTPUT STRING
+;*** WARNING ***  THIS SUBROUTINE MUST BE CALLED WITH NOTHING ON THE STACK!
+;	C(R1) = ADDRESS OF STRING
+;	CALL	STSSTR
+
+STSSTR:	POP	SDSTR1#(SD)		;GET RETURN ADDRESS IN RIGHT PLACE
+	MOV	R1,SDSTD1#(SD)		;STORE ADDRESS OF STRING
+STROU2:	MOVB	@SDSTD1#(SD),R0		;GET CHARACTER
+	BEQ	OCTOU4			;IF FINISHED
+	INC	SDSTD1#(SD)		;BUMP POINTER
+	CALL	STSCHR			;OUTPUT CHARACTER
+	BR	STROU2			;CONTINUE
+	.PAGE
+;SUBROUTINE TO OUTPUT OCTAL NUMBER
+;*** WARNING ***  THIS SUBROUTINE MUST BE CALLED WITH NOTHING ON THE STACK!
+;	C(R0) = VALUE TO OUTPUT
+;	CALL	STSOCT
+
+STSOCT:	POP	SDSTR1#(SD)		;SAVE RETURN ADDRESS IN RIGHT PLACE
+	MOV	#5,SDSTD2#(SD)		;SET COUNTER
+	ROL	R0			;GET HIGH BIT, ADJUST VALUE
+	MOV	R0,SDSTD1#(SD)		;STORE VALUE
+	BIC	R0,R0			;GET FIRST BIT
+	ROL	R0
+	BNE	10$			;Go on if high bit not zero
+	MOV	SDSTD1#(SD),R1		;Get low 15 bits
+2$:	TBBN	160000,R1,12$		;Is next digit zero?
+	ASHI	3,R1			;Yes-discard it
+	DEC	SDSTD2#(SD)		;Last digit yet?
+	BGT	2$			;No-continue
+10$:	ADD	#'0,R0			;CHANGE TO ASCII
+	CALL	STSCHR			;OUTPUT CHARACTER
+	MOV	SDSTD1#(SD),R1		;GET NEXT 3 BITS
+12$:	CLR	R0
+.IF NE ..EIS
+	ASHC	#3,R0
+.IFF
+	ROL	R1
+	ROL	R0
+	ROL	R1
+	ROL	R0
+	ROL	R1
+	ROL	R0
+.ENDC
+	MOV	R1,SDSTD1#(SD)
+	DEC	SDSTD2#(SD)		;FINISHED?
+	BGE	10$			;NO-CONTINUE
+OCTOU4:	JMP	@SDSTR1#(SD)		;YES-RETURN
+
+	PSECT	PDATA,RW,D,LCL,REL,CON
+TRCADD::.WORD	0
+TRCSDB:	.WORD	0
+TRCFLG:	.WORD	0
+	.END
+
+\H@
