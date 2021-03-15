@@ -1,0 +1,2438 @@
+begin	"PCOM"
+
+Define PRELIMINARY = FALSE;		comment TRUE if not-released  ;
+Define LICENSEHACK = TRUE;		comment TRUE if poking JBTLIC ;
+
+					comment -- not implemented -- ;
+Define ROYALTYHACK = FALSE;		comment TRUE if poking JBTLOG ;
+
+Define PCOM!VERSION = (Ifcr PRELIMINARY
+			 thenc '101
+			 elsec '1 endc lsh 18)
+			lor '70;
+require PCOM!VERSION version;
+
+require "
+PCOM "&CVOS(PCOM!VERSION lsh -18)&"."&CVOS(PCOM!VERSION land '777777)&
+     " - TYMCOM-X interim PERP exec language
+
+Assembly: Load @PCOM.CMD
+Sources:  PCOM.SAI, UUOSYM.DEF, SWDEF.DEF
+Library:  PCOINT.DCL, PCOINT.SAI [REL]
+License:  ALL license bits!!! " message;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "UUOSYM.DEF" source!file;
+require "SWDEF.DEF"  source!file;
+require "PCOINT.DCL" source!file;
+
+require 25 polling!interval;
+require 1000 new!items,  pnames;
+
+Define Batch = {"DCOM"};	! monitor command for /DETACH;
+Define Tty   = {"PCOM"};	! monitor command for /NODETACH;
+
+Define	Int!TIM      = 10	! Timer interrupt;
+,	Int!CHR      = 11	! Character traffic interrupt;
+,	Int!ZAP      = 12	! Circuit zap interrupt;
+,	Int!ORG      = 13	! Orange Ball interrupt;
+,	Int!NTQ      = 14	! Notice to Quit interrupt;
+,	Int!ESC      = 15;	! User <esc> interrupt;
+
+Define	Status!ERROR = -1	! Some error occurred;
+,	Status!NEW   =  0	! Initial state;
+,	Status!BEGIN =  1	! PCOM started;
+,	Status!LOOK  =  2	! Input file can be read ok;
+,	Status!ENTER =  3	! Output file can be done properly;
+,	Status!PROC  =  4	! Doing actual processing;
+,	Status!DONE  =  5	! PCOM processing done;
+,	Status!MAIL  =  6	! Sending MAIL to user;
+,	Status!LOGOUT=  7	! Logout sent to child;
+,	Status!ZAP   =  8	! Awaiting Zapper;
+,	Status!EXIT  =  9	! PCOM normal termination;
+,	Status!WATCH = 10;	! PCOM termination running PEECOM;
+
+Define	Error!LIC = 1		! Not enough license;
+,	Error!CFM = Error!LIC+1	! Create Frame;
+,	Error!RFM = Error!CFM+1	! Run Frame;
+,	Error!LFM = Error!RFM+1	! Logout Frame;
+,	Error!RCF = Error!LFM+1	! Reading command file;
+,	Error!IDN = Error!RCF+1	! Input Device Name;
+,	Error!IFN = Error!IDN+1	! Input File Name;
+,	Error!IFE = Error!IFN+1	! Input File Error;
+,	Error!ODN = Error!IFE+1	! Output Device Name;
+,	Error!OFN = Error!ODN+1	! Output File Name;
+,	Error!OFE = Error!OFN+1	! Output File Error;
+,	Error!ISN = Error!OFE+1	! Illegal Switch Name;
+,	Error!ISA = Error!ISN+1	! Illegal Switch Argument;
+,	Error!FMT = Error!ISA+1	! Formatting error;
+,	Error!CMD = Error!FMT+1	! Command error;
+;
+
+Define Complete = {"completed"};! successful completion;
+Define Default!Ext = {".CTL"};	! default command file extension;
+Define Default!Log = {".LOG"};	! default log file extension;
+Define Uppercase(x) = {Scan(x, B!Up, Dummy)};
+Define White(x) = {Scan(x, B!Wht, Brk)};
+
+Define Obnoxious!Message = {"
+Warning!!! PERP users...
+    "":logfilename"" as the first line of your PCOM command file will
+    soon become OBSOLETE.  Please change your command files to use
+    the PCOM command "":LOGFILE  logfilename"" on the first line of
+    your file.  This NEW command will be legal ONLY on line 1 of the
+    command file.
+
+"};
+
+Define KQ(x,y) = 		     {	Kequ(x,CvPS(y))
+    ifcr length( CvPS(y) ) > 3 thenc or Kequ(x,CvPS(y)[1 for 3]) endc
+	};
+
+!	*** S W I T C H E S ***;
+
+Define	L$$NONE = 0,	L$$ON = 1,	L$$ERROR = 2,	L$$DELETE = 3;
+
+Ifcr PRELIMINARY thenc
+Define	P$$PAR = !bit(35),  P$$SWT = !bit(34),  P$$ITM = !bit(33)
+,	P$$SUB = !bit(32),  P$$CMD = !bit(31),  P$$FIL = !bit(30)
+,	P$$SND = !bit(29),  P$$INP = !bit(28)
+,	P$$ALL = P$$PAR lor P$$SWT lor P$$ITM lor P$$SUB
+	     lor P$$CMD lor P$$FIL lor P$$SND lor P$$INP;
+endc
+
+Declare!Switches([
+    SW!SN (APPEND,0)
+Ifcr PRELIMINARY thenc
+    SW!SN (BAIL,0)
+    SW!SN (CHARS,0)
+endc
+    SW!SN (DETACH,-1)
+    SW!SL (HELP,0,SW$NOS,[
+		SW!ARG(TEXT,1)
+		SW!ARG(SWITCHES,2)
+		    ])
+    SW!SL (LOG,-1,SW$NOS,[
+		SW!ARG(NONE,L$$NONE)
+		SW!ARG(ON,L$$ON)
+		SW!ARG(ERROR,L$$ERROR)
+		SW!ARG(DELETE,L$$DELETE)
+		    ])
+    SW!SN (LICENSE,1)
+    SW!SN (MAIL,-1)
+    SW!SN (NEWS,0)
+Ifcr PRELIMINARY thenc
+    SW!SL (PRINT,0,SW$OBV lor SW$VRQ lor SW$NOS,[
+		SW!ARG(ALL,P$$ALL)
+		SW!ARG(COMMANDS,P$$CMD)
+		SW!ARG(FILES,P$$FIL)
+		SW!ARG(INPUT,P$$INP)
+		SW!ARG(ITEMS,P$$ITM)
+		SW!ARG(PARAMETERS,P$$PAR)
+		SW!ARG(SEND,P$$SND)
+		SW!ARG(SUBSTITUTIONS,P$$SUB)
+		SW!ARG(SWITCHES,P$$SWT)
+		    ])
+endc
+Ifcr ROYALTYHACK thenc
+    SW!SS (ROYALTY,1)
+endc
+Ifcr PRELIMINARY thenc
+    SW!SS (SLEEP,-1,SW$VRQ)
+endc
+    SW!SN (SUPERSEDE,1)
+    SW!SS (TIME,60)
+Ifcr PRELIMINARY thenc
+    SW!SN (TMPCOR,0)
+endc
+    SW!SS (TRULIMIT,0)
+    SW!SN (WATCH,0)
+	])
+
+
+!	Variable definitions for outer block;
+
+external boolean
+	RPGSW			! true if run at start address plus one;
+,	TIM!, ZAP!, ORG!, NTQ!;	! true for interrupt causes;
+boolean DETACH!			! true if this frame IS detached;
+,	ERR!, STOP!, TRU!	! true when error occurrs or we stop;
+,	CCLSW, IACSW		! true if command-line, interactive;
+,	Normal			! true if normal ccl entry;
+,	Ext!Found, File!Error	! true if "." found or Error in filename;
+,	MakeLog			! true if making a log file;
+,	EOF			! true if at end of input file;
+,	Quoted			! true if parameter read is quoted;
+,	MaskWild;		! true if converting # & ? to frame number;
+
+own integer
+	Status			! current status of PCOM job;
+,	ErrorCondition		! current error indicator (if any);
+,	TimeLimit, TruLimit	! current timer, TRU expiration limits;
+,	FilePage, FileSize	! start of logfile, or starting length;
+,	FileLicense, MyLicense	! initial license - to protect against HF;
+,	Parent, Child		! frame numbers of parent & child;
+,	WildFrame		! frame number for wildcarding;
+,	Child!handle, FD	! frame handles to child;
+,	PORT			! port used for child i/o;
+,	OChan,S!Chan, LineNo	! I/O variables;
+,	Sleep!Time		! How long to sleep while waiting;
+,	Brk,	Dummy,	B!CR	! Break variable, dummy break, Break on CR;
+,	B!Lin,	B!Cmd,	B!Brk	! Break on line, command, brk-char;
+,	B!Nam,	B!Usr,	B!Ppn	! Break on Name, user, ppn;
+,	B!Quote,B!Sub,	B!Par	! Break on quotes, substitution, parameter;
+,	B!Num,	B!Wht,	B!Up;	! Break on numerics, whitespace, uppercase;
+
+Define FRMCNT=0,FRMPPN=1,FRMPRV=2,FRMAUN=3,FRMUNM=4,FRMUN1=5,FRMLIC=6;
+Own integer array frame!block[ FRMCNT : FRMLIC ]; ! new style !FOCFM block;
+
+Preset!with 0,3,3,6,1,4,6,2,5,0,3,5;
+Own integer array MonthOffset[0:11];
+
+Preset!with "-Jan-","-Feb-","-Mar-","-Apr-","-May-","-Jun-",
+	    "-Jul-","-Aug-","-Sep-","-Oct-","-Nov-","-Dec-";
+	    Own string array MonTab[0:11];
+Preset!with "January","February","March","April","May","June","July",
+	    "August","September","October","November","December";
+	    Own string array Month!names[0:11];
+Preset!with "Sunday","Monday","Tuesday","Wednesday",
+	    "Thursday","Friday","Saturday";
+	    Own string array Weekday[0:6];
+
+string	S, Disposition		! temp and completion variables;
+,	Error!Text		! reason for error;
+,	IChan			! stack of nested input files;
+,	IDevice, ODevice	! current devices;
+,	CmdFile,LogFileName	! current file names;
+,	CmdName			! Temporary CmdFile holder;
+,	MyName;			! this program's name;
+
+item	INTPRO;			! Item for interrupt processing;
+itemvar	Intvar;			! Itemvar for INTPRO calls to INTINI;
+list Par!!List, Par!!Set;	! Lists of ordered & named parameters;
+list itemvar Par!List;		! List of Ordered parameters;
+set  itemvar Par!Set;		! Set of Named parameters;
+
+!	System variable definitions - currently defined
+;
+
+string	Item
+	$Daytime		! Current time-of-day;
+,	$Hour,$Minute,$Second	! Current time-of-day pieces;
+,	$HH,$SS			! Current time-of-day pieces;
+,	$HHMMSS,$HHMM,$MMSS	! Current time-of-day combinations;
+,	$Date			! Current date dd-mmm-yy;
+,	$Day,$Month,$Year	! Current day(dd),month(month),year(yyyy);
+,	$Mon			! Current month(mmm);
+,	$DD,$MM,$YY		! Current day(dd),month(mm),year(yy);
+,	$Weekday		! Day of week, Sunday---Saturday;
+,	$Yesterday,$Tomorrow	! Day of week, Sunday---Saturday;
+,	$Delimiter;		! Delimiter variable;
+
+boolean	Item
+	$False			! FALSE value;
+,	$Logging		! Logging variable;
+,	$Substitution		! Substitution variable;
+,	$Mail			! Mail variable;
+,	$Numerics		! Numeric results variable;
+,	$True;			! TRUE value;
+
+integer	Item
+	$TimeLimit		! Current Timer Limit variable;
+,	$TruLimit;		! Current TRU limit variable;
+
+string	Delim!list		! Delimiter list;
+,	Del!Chr;		! Parameter delimiter ($Delimiter);
+
+boolean DoLog			! True if $Logging;
+,	DoParam			! True if $Substitutions;
+,	DoMail			! True if $Mail;
+,	DoNumerics;		! True if $Numerics;
+
+!	Initialization support routines;
+
+string procedure EXIT(Integer Msg(0) );	! string so it can be "printed" [ugh];
+begin
+    IntZAP;				! insure these are gone!!!!;
+    ErrorCondition _ Msg;		! set error condition and go home;
+    If (Msg) and			! if an error msg given;
+       not (( Msg = Status!EXIT ) or	!   and not just a legal Exit;
+	    ( Msg = Status!WATCH ))	!   i.e. WATCH or EXIT;
+     then begin
+	 Status _ Status!ERROR;		!  then set error flag;
+	 Usererr(0,0,"PCOM error: "&
+	      (case !lh(ErrorCondition) of (
+		[0] Cvs( ErrorCondition ),
+		[Error!LIC] "More License required",
+		[Error!CFM] "Create Frame Error # ("&Cvos(!rh(ErrorCondition))&")",
+		[Error!RFM] "Run Frame Error",
+		[Error!LFM] "Logout Frame Error",
+		[Error!RCF] "Command file read error ("&Cvos(!rh(ErrorCondition))&")",
+		[Error!IDN] "Illegal Input Device Name",
+		[Error!IFN] "Illegal Input File Name",
+		[Error!IFE] "Input File Error ("&Cvos(!rh(ErrorCondition))&")",
+		[Error!ODN] "Illegal Output Device Name",
+		[Error!OFN] "Illegal Output File Name",
+		[Error!OFE] "Output File Error ("&Cvos(!rh(ErrorCondition))&")",
+		[Error!ISN] "Illegal Switch Name Error",
+		[Error!ISA] "Illegal Switch Argument Error",
+		[Error!FMT] "Formatting error",
+		[Error!CMD] "Command error",
+		[else] Cvs( ErrorCondition )  ))&
+	      " -- PCOM Aborting! ",
+	    If Detach! then "" else "X");
+     end;
+    Calli( 0,If Detach! then calli!LOGOFF else calli!EXIT );
+end;
+
+Define PCOM!License = LC!WC lor LC!RC lor LC!SY;
+
+Simple Procedure IncLic;
+begin
+    Calli( MyLicense, calli!SETLIC );
+end;
+
+Simple Procedure DecLic;
+begin
+    Calli( !Xwd( !rh( MyLicense ), !rh( MyLicense ) )
+	   lor PCOM!License, calli!SETLIC );
+end;
+
+Simple Integer Procedure NewLic( Integer UserLic, FileLic(0) );
+begin
+    Integer Read, Write;
+    Write_ (UserLic land '3) max (FileLic land '3);
+    Read_ (UserLic land '14) max (FileLic land '14);
+    Return(((UserLic lor FileLic) land '777617777600) lor Read lor Write);
+end;
+
+!	Initialization routines;
+
+simple procedure LicenseCheck;
+begin
+    If ( '777617 neq !lh(calli(!xwd(-1,!GTLIC),calli!GETTAB)) )
+     then EXIT( Error!LIC lsh 18 );
+end;
+require LicenseCheck initialization;
+
+simple procedure InitUser;
+begin
+    Redefine CF!LIC = !bit(16);		! until UUOSYM.DEF is right;
+
+    Status _ Status!BEGIN;		! tell parent we've started;
+    Parent _ calli(0,calli!PJOB);	! remember who we are;
+
+    frame!block[ FrmCNT ]_ (CF!LIC lor 5);
+    frame!block[ FrmPPN ]_ calli( !Xwd( -1,!GTPPN ), calli!GETTAB );
+    frame!block[ FrmPRV ]_ calli( !Xwd( -1,!GTPRV ), calli!GETTAB );
+    frame!block[ FrmAUN ]_ calli( !Xwd( -1,!GTAUN ), calli!GETTAB );
+    frame!block[ FrmUNM ]_ calli( !Xwd( -1,!GTUNM ), calli!GETTAB );
+    frame!block[ FrmUN1 ]_ calli( !Xwd( -1,!GTUN1 ), calli!GETTAB );
+    frame!block[ FrmLIC ]_ calli( !Xwd( -1,!GTLIC ), calli!GETTAB );
+
+    MyName _ cv6str(frame!block[ FrmUNM ]) & cv6str(frame!block[ FrmUN1 ]);
+
+    MyLicense _ frame!block[ FrmLIC ];	! copy license;
+    DecLic;				! reduce license;
+end;
+require InitUser initialization;
+
+simple procedure SetDetach;
+begin
+    Detach! _ !lh(calli(!xwd(-1,!gtLIN),calli!GETTAB))=0;
+	! set detach flag if we are detached;
+    if Detach! then
+	calli(JP!NAT lor calli(!xwd(-1,!GTPRV),calli!GETTAB),calli!SETPRV);
+	! set NO ATTACH so we don't bother user when logging in;
+end;
+require SetDetach initialization;
+
+procedure BrkIni;
+begin
+    Define ##Cmd = {";=/ "&#ht}
+    ,      ##Wht = {" "&#ht&#cr}
+    ,      ##Brk = {" !@#%^&*()+=~`[]|\:;'<>,.?/" & '42 & '173 & '175}
+    ,      ##Sub = {"""',/= " & #ht & '177}
+    ,      #Upper = {"ABCDEFGHIJKLMNOPQRSTUVWXYZ"}
+    ,      #Lower = {"abcdefghijklmnopqrstuvwxyz"}
+    ,      #Alpha = {#Upper & #Lower}
+    ,      #Digit = {"0123456789"}
+    ,      #Chars = {#Alpha & #Digit}
+    ,      #Par   = {#Alpha & "$-_"};
+
+    setbreak(B!CR _Getbreak,#cr,         null, "AINF");	! carriage-return;
+    setbreak(B!Lin_Getbreak,#lf,         null, "SINF");	! line;
+    setbreak(B!Nam_Getbreak,#Chars&crlf, crlf, "RXNF");	! name or token;
+    setbreak(B!Usr_Getbreak, ")",        null, "SINK");	! end of username;
+    setbreak(B!Ppn_Getbreak,"01234567,", null, "SXNK");	! only allow these;
+    setbreak(B!Num_Getbreak,#Digit&"+-", null, "RXNK");	! skip digits;
+    setbreak(B!Wht_Getbreak,##Wht&crlf,  crlf, "RXNK");	! white space;
+    setbreak(B!Brk_Getbreak,#lf & ##Brk, #cr,  "RINK");	! all break chars;
+    setbreak(B!Par_Getbreak, #Par,       null, "RXNK");	! parameter variable;
+    setbreak(B!Sub_Getbreak, ##Sub,      #cr,  "SINF");	! substitutions;
+    setbreak(B!Cmd_Getbreak,#lf & ##Cmd, #cr,  "SINK");	! command;
+    setbreak(B!Up _Getbreak, null,       null, "SINK"); ! make uppercase;
+end;
+require BrkIni initialization;
+
+procedure Initialize!switches;		! Set to initial default (0,-1);
+For Dummy _ 1 step 1 until $Sw$Length Do
+    $Sw$Value[Dummy] _ If ($Sw$Flag[Dummy] Land SW$OBV) then 0 else -1;
+require Initialize!switches initialization;
+
+procedure ParIni;
+begin "parameter initialization"
+    DoParam _ False;			! Insure no substitution;
+    Delim!list _ Del!Chr _ "\";		! Default parameter escape;
+    Setbreak( B!Quote_Getbreak,		! Initial breaktable for the;
+	Del!Chr, null, "SINF");		!    parametization delimiter;
+    Par!!List _ NIL;			! Empty channel/file list;
+    Par!!Set  _ PHI;			! Empty parameter set;
+end;
+require ParIni initialization;
+
+string procedure CvNAME( integer AUN );
+begin
+    string Name;
+    integer CvnChan,CvnEof;
+    integer array Look[ 0 : !RBUNM+1 ];
+
+    IncLic;				! Increase license;
+    Look[ !RBCNT ]_ !RBUNM+1;		! PPN->USER;
+    Look[ !RBPPN ]_ !Xwd( 1,1 );	! (UFD)  ;
+    Look[ !RBNAM ]_ AUN;		! [user] ;
+    Look[ !RBEXT ]_ CVSIX("UFD   ");	! .UFD   ;
+    Open(CvnChan_getchan,"DSK",'17,0,0, 0,0, CvnEof_-1);
+    If not ( CvnEof )
+     then begin
+	Chnior(CvnChan,Look[!RBCNT],!CHLK);
+	CvnEof_ not ( !SKIP! );
+	Release(CvnChan);
+     end;
+    DecLic;				! Reduce license;
+    If ( CvnEof )
+     then Return( Cvos(!lh(Aun))&","&Cvos(!rh(Aun)) )
+     else Return( Cv6str(Look[!RBUNM])&Cv6str(Look[!RBUNM+1]) );
+end;
+
+internal simple procedure ABORT(reference integer WHY);
+EOF _ WHY _ true;
+
+simple string procedure DateString(Integer Type);
+begin
+    Own Integer array R[0:3];    Integer L,T;
+
+    T _ Calli(0,Calli!Date);		! Read current date;
+    R[0] _ T mod 31; T _ T Div 31;	! Day of month  0-30;
+    R[1] _ T mod 12;			! Month of year 0-11;
+    R[2] _ T div 12;			! Year less 1964;
+    L _ If R[2] land '3 neq 0 then 0 else If R[1] < 2 then 0 else 1;
+    R[3] _ (3 + R[0] + MonthOffset[ R[1] ] + L + R[2] + ((3+R[2]) lsh -2) )
+	    mod 7;
+    R[2] _ R[2] + 1964;			! Year expressed in 4 digits;
+    Return( Case Type of (
+	[0] Cvs(101+R[0])[2 for 2] & MonTab[ R[1] ] & Cvs(R[2])[3 for 2],
+	[1] Cvs(101+R[0])[2 for 2],
+	[2] Month!names[ R[1] ],
+	[3] Cvs(R[2]),
+	[4] Weekday[ R[3] ],
+	[5] Weekday[ (R[3]+1) mod 7 ],
+	[6] Weekday[ (R[3]+6) mod 7 ],
+	[7] Cvs(101+R[1])[2 for 2],
+	[else] Null
+	    )
+	);
+end;
+
+simple procedure Fatal(String Msg);
+begin
+    Print(crlf, "?", Msg,
+	If LineNo > 0 then " in line "&Cvs(LineNO) else "",crlf);
+    Error!Text _ Msg;
+    Abort(ERR!);
+end;
+
+simple integer procedure GetTRU;
+begin!code
+    protect!acs 1,2;		! protect from ACCESS;
+    HRL   1,access(Child);	! Child frame #;
+    HRRI  1,!GTTRU;		! Double word TRUs;
+    SETOM !skip!;		! Assume good;
+    uuo!GETTAB 1,;		! Get TRU's * 10^4;
+      SETZM !skip!;		! Error?;
+    DIVI  1,10000;		! Divide to get TRU's;
+end;
+
+procedure ReadTimer( Reference Integer HH, MM, SS );
+begin
+	SS _ Calli(0,calli!timer) div 60;
+	HH _ SS Div 3600;
+	SS _ SS Mod 3600;
+	MM _ SS Div 60;
+	SS _ SS Mod 60;
+end;
+
+
+procedure Set!Delimiter( String Character );
+begin
+    Del!Chr _ Character[1 for 1];		! one character width;
+    If Del!Chr = 0 then Del!Chr _ "\";		! default to "\";
+    Delim!list_Del!Chr&Delim!list[2 to INF];	! change the delimiter list;
+    Breakset(B!Quote, Del!Chr, "I");		! change the break table;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$ITM then print(
+	    " SetDelim(",Del!chr,")[",delim!list,"] ");
+    endc
+end;
+
+procedure SetTimeLimit( Integer Limit );
+begin
+    TimeLimit _ If Limit = 0 then 0 else Calli( 0,-'143 ) + (60 * Limit);
+    calli(!xwd(2,Limit),calli!SETTIM);	! set timer interrupt;
+end;
+
+simple procedure SYNC;
+begin					! synchronize with slave;
+    ORG! _ false;
+    auxclv(PORT,0,!axSYB);		! send yellow ball;
+    If TruLimit > 0 and GetTRU > TruLimit then Abort(TRU!);
+    While not ( ORG! or TIM! or ZAP! or NTQ! or ERR! or TRU! )
+     do begin
+	poll;				! process deferred interrupts;
+	If not ( ORG! or TIM! or ZAP! or NTQ! or ERR! )
+	 then Calli(Sleep!Time,Calli!HIBER);
+	If TruLimit > 0 and GetTRU > TruLimit then Abort(TRU!)
+     end
+end;
+
+simple procedure OutPtr (integer PORT; string S);
+begin while length(S) do auxclv(PORT,lop(S),!axO8); sync end;
+! begin!code	! could use this but it won't do image mode;
+!	MOVEI	1,!AXOPC;	! output SAIL string;
+!	HRL	1,PORT;
+!	AUXCAL	1,-1(SP);	! output through pointer;
+! end ;
+
+String Procedure BoolToStr( Boolean T );	! Boolean to String;
+Return( If T
+    then If DoNumerics then "1" else "TRUE"
+    else If DoNumerics then "0" else "FALSE"
+	);
+Boolean Procedure StrToBool( String S );	! String to Boolean;
+Return( Kequ(S,"1") or Kequ(S,"TRUE"[1 for length(S)]) );
+
+procedure RW!Item( String Itemvar W,R; Reference Boolean B);
+begin
+    If R neq any then B_ StrToBool( Datum(R) );	! Set from source if there;
+    If W neq ann Datum(W)_ BoolToStr( B );	! Return to dest if there;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$ITM then Print("RW!I ",
+		If R neq any then " R(" & Datum(R) & ")" else "",
+		If W neq any then " W(" & Datum(W) & ")" else "",crlf);
+    endc
+end;
+
+procedure Date$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 0 );
+
+procedure Day$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 1 );
+
+procedure Daytime$( String Itemvar W, R);	! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	ReadTimer( HH, MM, SS );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(HH) & ":" & CvS(MM) & ":" & Cvs(SS);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure Delimiter$(String Itemvar W, R);
+Begin
+    If R neq any then Set!Delimiter(Datum(R));	! change the delimiter;
+    If W neq any then Datum(W) _ Del!Chr;	! return the current setting;
+end;
+
+procedure False$( String Itemvar W, R);
+RW!Item( W, any, FALSE);			! return FALSE;
+
+procedure Hour$( String Itemvar W, R);		! Read-only * Time of day;
+begin
+    Integer HH,MM,SS;
+    If W neq any then begin
+	ReadTimer( HH, MM, SS );
+	Datum(W) _ CvS(HH);
+    end;
+end;
+
+procedure HH$( String Itemvar W, R);	! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	ReadTimer( HH, MM, SS );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(HH);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure HHMM$( String Itemvar W, R);		! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	ReadTimer( HH, MM, SS );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(HH) & CvS(MM);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure HHMMSS$( String Itemvar W, R);	! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	ReadTimer( HH, MM, SS );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(HH) & CvS(MM) & Cvs(SS);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure Logging$( String Itemvar W, R);
+If MakeLog					! log file output state;
+    then begin
+	IntCause( Int!CHR );			! input chars interrupt;
+	RW!Item( W, R, DoLog );			! if logfile R|W;
+	IntLog( DoLog )				! makes sure logger in sync;
+    end
+    else RW!Item( W, any, DoLog );		! if not logfile R-only;
+
+procedure Mail$( String Itemvar W, R);
+RW!Item( W, R, DoMail );			! sending mail;
+
+procedure Minute$( String Itemvar W, R);	! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	ReadTimer( HH, MM, SS );
+	Datum(W) _ CvS(MM);
+    end;
+end;
+
+procedure MMSS$( String Itemvar W, R);		! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	ReadTimer( HH, MM, SS );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(MM) & Cvs(SS);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure MM$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 7 );
+procedure Mon$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 2 )[1 for 3];
+procedure Month$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 2 );
+
+procedure Numerics$( String Itemvar W, R);
+RW!Item( W, R, DoNumerics );			! boolean representation;
+
+procedure Second$( String Itemvar W, R);	! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	ReadTimer( HH, MM, SS );
+	Datum(W) _ CvS(SS);
+    end;
+end;
+
+procedure SS$( String Itemvar W, R);		! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	ReadTimer( HH, MM, SS );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ Cvs(SS);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure Substitution$( String Itemvar W, R);
+RW!Item( W, R, DoParam );			! parameter substitution;
+
+procedure TimeLimit$(String Itemvar W, R);
+begin
+    If R neq any then SetTimeLimit( Cvd(Datum(R)) );
+    If W neq any then Datum( W ) _
+	CvS(If TimeLimit = 0 then 0 else (TimeLimit - Calli(0,-'143)) div 60);
+end;
+
+procedure True$( String Itemvar W, R);
+RW!Item( W, any, TRUE);				! return TRUE;
+
+procedure Trulimit$( String Itemvar W, R);
+begin
+    If R neq any then TruLimit _ If Cvd( Datum(R) ) = 0
+				    then 0
+				    else GetTru + Cvd( Datum(R) );
+    If W neq any then Datum( W ) _ Cvs( If TruLimit = 0
+					   then 0
+					   else TruLimit - GetTru );
+end;
+
+procedure Tomorrow$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 5 );
+procedure Weekday$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 4 );
+procedure Yesterday$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 6 );
+
+procedure Year$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 3 );
+procedure YY$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DateString( 3 )[3 for 2];
+
+procedure ItemIni;			! Alphabetical;
+begin "procedure item initialization"
+    Assign( $Date,       Date$);	! Current Date;
+    Assign( $Day,        Day$);		! Current Day of Month;
+    Assign( $Daytime,    Daytime$);	! Current Time of day;
+    Assign( $DD,         Day$);		! Current Day of Month;
+    Assign( $Delimiter,  Delimiter$);	! Delimiter value;
+    Assign( $False,      False$);	! FALSE;
+    Assign( $HH,         HH$);		! Current Hour of day 00-23;
+    Assign( $HHMM,       HHMM$);	! Current Hour-minutes hhmm;
+    Assign( $HHMMSS,     HHMMSS$);	! Current Hour-minutes-seconds;
+    Assign( $Hour,       Hour$);	! Current Hour of day 0-23;
+    Assign( $Logging,    Logging$);	! If logging to file;
+    Assign( $Mail,       Mail$);	! If mail wanted at end;
+    Assign( $Minute,     Minute$);	! Current Minutes of hour;
+    Assign( $Mon,        Mon$);		! Current Month as Mmm;
+    Assign( $Month,      Month$);	! Current Month of year;
+    Assign( $MM,         MM$);		! Current Month as numeric;
+    Assign( $MMSS,       MMSS$);	! Current Minutes-seconds;
+    Assign( $Numerics,   Numerics$);	! If booleans are 1/0 or TRUE/FALSE;
+    Assign( $Second,     Second$);	! Current seconds of minute;
+    Assign( $SS,         SS$);		! Current seconds of minute SS;
+    Assign($Substitution,Substitution$);! If parameter substitutions on;
+    Assign( $Timelimit,  Timelimit$);	! Time-limit remaining (Minutes);
+    Assign( $True,       True$);	! TRUE;
+    Assign( $Trulimit,   Trulimit$);	! TRU-limit remaining (TRUs);
+    Assign( $Weekday,    Weekday$);	! Day of Week;
+    Assign( $Year,       Year$);	! Current Year;
+    Assign( $YY,         YY$);		! Current Year as two digits;
+end;
+require ItemIni initialization;
+
+simple boolean procedure Numeric(String Str);
+begin
+    Scan( Str, B!Num, Dummy);
+    Return( Length( Str ) = 0 );
+end;
+
+
+string procedure TOK (reference string S);
+begin
+    string S1;
+    White( S );			! clear whitespace;
+    S1 _ scan(S, B!Brk, BRK);	! get the next word;
+    if length(S1) = 0		! null?;
+	then if length(S) = 0	!   null source also?;
+	    then return (null)	!    yes - return null;
+	    else S1 _ lop(S);	!    no  - get a character;
+    White( S );			! clear whitespace;
+    return(S1);			! return the token;
+end;
+
+simple string procedure WScan(  Reference String Str; Integer C;
+				Reference Integer B; Reference Boolean W);
+begin "Wild Scan"
+    Own Integer Wid,Dig,Count;  String Nam, F;
+    W _ False;
+    Nam _ Scan( Str, C, B );
+    While B = "#" or B = "?" do begin "going wild"
+	W _ True;
+	Count _ 0;
+	While Str = "#" or Str = "?" do begin "figure width"
+	    Lop( Str );
+	    If MaskWild
+	     then Count _ Count + 1
+	     else Nam _ Nam & "#";
+	end "figure width";
+	If MaskWild then begin "convert mask to frame number"
+	    GetFormat( Wid, Dig );
+	    SetFormat( -Count, 0 );
+	    F _ CvS( WildFrame );
+	    Nam _ Nam & F[Length(F)-Count to INF];
+	    SetFormat( Wid, Dig );
+	end "convert mask to frame number";
+	Nam _ Nam & Scan( Str, C, B )
+    end "going wild";
+    Return( Nam )
+end "Wild Scan";
+
+simple string procedure GetFil( Reference string Str, Dev;
+				Reference Boolean Dot, Err);
+begin "read a file name"
+    String Usr, Fil, Ext, Ppn;
+    Boolean Wild;
+    Dot _ Err _ False;					! Initially false;
+    Dev _ Usr _ Fil _ Ext _ Ppn _ Null;			! Initially empty;
+    Fil _ WScan(Str, B!Nam, Brk, Wild);			! Read name?;
+    If Brk = ":" then begin
+	If Wild then err _ True;			! wild device?;
+	Lop(Str);					! eat ":";
+	Dev _ Fil;					! set device;
+	Fil _ WScan(Str, B!Nam, Brk, Wild);		! Re-read name?;
+    end;
+    If Brk = "(" then begin
+	Lop(Str);					! eat "(";
+	Usr _ "(" & Scan(Str, B!Usr, Brk) & ")";	! get username;
+	If Brk neq ")" then err _ True;			! everything ok?;
+	Fil _ WScan(Str, B!Nam, Brk, Wild);		! then filename;
+    end;
+    If Brk = "." then begin
+	Lop(Str);					! eat ".";
+	Dot _ True;					! declare extension;
+	Ext _ "." & WScan(Str, B!Nam, Brk, Wild);	! and read it;
+    end;
+    If Brk = "[" then begin
+	Lop(Str);					! eat "[";
+	Ppn _ "[" & Scan(Str, B!Ppn, Brk) & "]";	! get PPN;
+	Lop(Str);					! eat "]";
+	If Brk neq "]" then err _ True;			! closed ok?;
+	If Length(Usr) then err _ True;			! (user) & [ppn] ?;
+    end;
+    White( Str );					! clear whitespace;
+    If Length(Dev) = 0 then Dev _ "DSK";		! Default to DSK;
+    Return ( Usr & Fil & Ext & Ppn );			! All done;
+end "read a file name";
+procedure MOV ( itemvar DST,SRC );
+begin
+    string item TMP;
+    own string itemvar SI;
+    own real itemvar RI;
+    own integer itemvar II;
+    own integer BRK;
+Ifcr PRELIMINARY thenc
+    If swPRINT land P$$ITM then print("Mov: SRC[",typeit(SRC),
+				"] ==> DST[",typeit(dst),"] ");
+endc
+    case typeit(SRC) of begin		! Convert ??? to string;
+	[3] "string   " datum(TMP)_ datum(SI_SRC);
+	[4] "real     " datum(TMP)_ cvf(datum(RI_SRC));
+	[5] "integer  " datum(TMP)_ cvs(datum(II_SRC));
+	[8] "procedure" apply( datum(SRC), arg!list(TMP,any) );
+	else usererr( typeit(SRC),2,"?MOV: can't coerce src type " )
+    end;
+    case typeit(DST) of begin		! Convert string to ???;
+	[3] "string   " datum(SI_DST)_ datum(TMP);
+	[4] "real     " datum(RI_DST)_ realscan(datum(TMP),BRK);
+	[5] "integer  " datum(II_DST)_ intscan(datum(TMP),BRK);
+	[8] "procedure" apply( datum(DST), arg!list(any,TMP) );
+	else usererr( typeit(DST),2,"?MOV: can't coerce dst type " )
+    end;
+end;
+
+String procedure Substitute(Integer Chan; String Key);
+begin
+    String Item SITM;    String Itemvar SI;    Boolean Not!Defined;
+
+    Key _ Uppercase(Key);			! make sure this works;
+    If Key neq "$" then Key _ Chan & Key;	! user keyword? ;
+    SI _ Cvsi(Key, Not!Defined);		! lookup variable;
+    If Not!Defined then Return( Null );		! return null if undefined;
+    MOV( SITM, SI );				! convert ITM _ SI;
+    Return( Datum(SITM) );			! return string;
+end;
+
+simple string procedure Get!Token(Reference string Par!Lst);
+begin "get a parameter"
+    String S, Old!Brk;
+    Integer InQuote, Save!Brk;
+
+    White( Par!Lst );					! Clear whitespace;
+    Quoted _ False;					! Initialize flag;
+    S _ Scan(Par!Lst, B!Sub, Brk);			! Get Token;
+    If Brk = '177 or Brk = '42 or BRK = "'"
+      then begin "in quote"				! We found a quote;
+        Quoted _ InQuote _ True;    Save!Brk _ Brk;	! For matching pair;
+	If Length(S) then begin				! not allowed yet;
+	    Fatal("parameter text """&S&""" discarded");
+	    S _ null;
+	end;
+	Old!Brk _ null;					! Start anew;
+	While InQuote do begin "Matching quote"		! Match quotes! ;
+	    S _ S & Old!Brk & Scan(Par!Lst, B!Sub, Brk);! Ignore other breaks;
+	    If Brk = '42 and Save!Brk = '42 or		! Check for pairs;
+	       Brk = "'" and Save!Brk = "'" or		!    of each type;
+	       Brk = '177 and Save!Brk = '177		!    "for child";
+		then If Brk = Par!Lst			! Match! Double?;
+		    then begin "quote quote"		!  Yes - handle "";
+			Old!Brk _ Null;			!   Clear break!char;
+			S _ S & Lop(Par!Lst);		!   Add to string;
+		    end "quote quote"			!  Continue;
+		    else begin "done quote"		!  Not double - ;
+			InQuote _ False;		! Set we are done;
+			White( Par!Lst );		! Clear Whitespace;
+			Scan(Par!Lst, B!Sub, Brk);	! Eat to next break*;
+		    end "done quote"
+		else Old!Brk _ If Brk = 0 then Null else Null & Brk;
+	    If length(Par!Lst) = 0 then Done;		! If missing quote?;
+	end "Matching quote";
+      end "in quote";
+
+
+!
+  * --	It would be nice at this point to allow some kind of combination
+	or other parameter tricks.  However... not so decided...  (YET)
+;
+    If Brk = "/" then Par!Lst _ "/" & Par!Lst;		! restore "/";
+    If Brk = " " or Brk = #ht then begin
+	White( Par!Lst );				! Clear whitespace;
+	If Brk = "=" or Brk = ","			! Eat certain breaks;
+	    then Brk _ Lop( Par!Lst );			!  so things work;
+    end;
+    Return(If Length( S ) then S else null);		! Return something;
+end "get a parameter";
+
+Procedure New!Parameter(Integer Chan; String Name, Initial!Value, New!Value);
+begin
+    String Itemvar SI;
+    String Item ITM;
+    Own Boolean Not!Defined;
+
+    Name _ Uppercase(Name);				! Force upper-case;
+    If Name neq "$" then Name _ Chan & Name;		! Maybe add channel;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land (P$$ITM lor P$$PAR) then
+	print("NewP: ",Name," (",initial!value,") N(",New!value,")");
+    endc
+    SI _ Cvsi( Name, Not!Defined);			! See if PNAME exists;
+    If Not!Defined then begin				! No, then;
+	If Name = "$" then begin "don't allow $ vars"	!   if system var?;
+	    Fatal("Illegal variable name """&Name&"""");!   illegal not found;
+	    Return;					!     so bug out.;
+	end;						!   else;
+	New!Pname(SI _ New(Initial!Value), Name);	!     define it;
+	Par!Set _ Lop(Par!!Set);			! Get current set;
+	Put SI in Datum( Par!Set );			! Put new item in set;
+	Put Par!Set in Par!!Set before 1;		! Put set away;
+    end;
+    If length(New!Value) then begin			! If something there;
+	Datum( ITM ) _ New!Value;			!   store as string;
+	MOV( SI, ITM );					!   mov SI _ ITM;
+    end;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land (P$$ITM lor P$$PAR) then
+	print(" Pname[ ",Cvis( SI, Not!defined )," ]",Crlf);
+    endc
+end;
+
+
+simple procedure Set!Parameter(Reference string Par!Lst);
+begin "build substitution table"
+    String Par!,Name;    String Itemvar SI;
+    Integer Par!Index;   Boolean Named!Parameters;
+
+    Par!Set  _ New(Phi);				! Empty set;
+    Put Par!Set  in Par!!Set  before 1;			! First item in list;
+    Par!List _ New(Nil);				! Empty list;
+    Named!Parameters _ False;				! None at first;
+    While Length(Par!Lst) and Brk neq "/" do begin "reading parameters"
+	Name _ null;					! Clear name;
+	Par! _ Get!Token( Par!Lst );			! Read a parameter;
+	If Brk = "=" then begin "named parameters"	! Assignment!;
+	    If Quoted then				! To a string?;
+		Fatal("Assignment to string """&Par!&"""");
+	    Named!Parameters _ True;			!   Set flag;
+	    Name _ Scan( Par!, B!Par, Brk );		!   Set name;
+	    If Length(Par!) then begin			!   Error if non-null;
+		Fatal("Illegal character """&Brk&	!     print message;
+			""" in parameter");
+		Name _ null;				!     clear name;
+	    end;
+	    Par! _ Get!Token( Par!Lst );		!   Set parameter;
+	end "named parameters";
+Ifcr PRELIMINARY thenc
+    If swPRINT land P$$PAR then
+    Print("List: {",Name,"}={",Par!,"}",Length(name),":",Length(par!),crlf);
+endc
+	If Length( Name ) then begin			! Named parameter;
+	    DoParam _ True;				! Set flag true;
+	    New!Parameter(S!Chan, Name, Null, Par! )	! Create parameter;
+	  end
+	  else begin					! Ordered parameter;
+	    If Named!parameters then Fatal(		!   ** ERROR **;
+	     "Ordered parameter after Named parameter ignored: """&Par!&"""")
+	    else begin
+		DoParam _ True;				! Set flag true;
+		SI _ New( Par! );			!   create item;
+		Put SI in Datum(Par!List) after INF;	! Put into list;
+	    end;
+	end;
+    end "reading parameters";
+    Put Par!List in Par!!List before 1;			! First item in list;
+end "build substitution table";
+
+Procedure Forget!substitutions;
+begin
+    String Itemvar SI;
+    Ifcr PRELIMINARY thenc
+	If Length( Par!!List ) or Length( Par!!Set ) then
+	    If swPRINT land (P$$ITM lor P$$PAR) then Print("Forget: ");
+    endc
+    If Length( Par!!List ) then begin "zap list by 1"
+	Par!List _ Lop( Par!!List );
+	While Length( Datum(Par!List) ) do begin "ordered"
+	    SI _ Lop( Datum(Par!List) );
+	    Ifcr PRELIMINARY thenc
+		if swPRINT land (P$$ITM lor P$$PAR) then
+		Print(" ${",Datum(SI),"}");
+	    endc
+	    Delete( SI );
+	end "ordered";
+	Delete( Par!List );
+    end "zap list by 1";
+    If Length( Par!!Set ) then begin "zap set by 1"
+	Par!Set _ Lop( Par!!Set );
+	While Length( Datum(Par!Set) ) do begin "named"
+	    SI _ Lop( Datum(Par!Set) );
+	    Ifcr PRELIMINARY thenc
+		if swPRINT land (P$$ITM lor P$$PAR) then begin
+		    String PN;
+		    PN _ Cvis( SI, dummy );
+		    If PN < " " then PN _ "<"&CVOS(LOP(PN))&">" & PN;
+		    Print(" ",PN,"{",Datum(SI),"}");
+		end;
+	    endc
+	    Del!Pname( SI );
+	    Delete( SI );
+	end "named";
+	Delete( Par!Set );
+    end "zap set by 1";
+    Ifcr PRELIMINARY thenc
+	If Length( Par!!List ) or Length( Par!!Set ) then
+	    If swPRINT land (P$$ITM lor P$$PAR) then Print(crlf);
+    endc
+end;
+
+
+string procedure Make!List(String Text!, L!Quote, R!Quote);
+begin "make parameter list"
+    String S;    String Itemvar SI;    Boolean X;    Integer C;
+
+    S _ null;					! Initial string values;
+    Par!List _ Cop( Par!!List );		! Current ordered list;
+    While Length( Datum(Par!List) ) do begin "ordered"
+	SI _ Lop( Datum(Par!List) );		! Ordered list to string;
+	S  _ S &","& L!Quote & Datum( SI ) & R!Quote;
+    end "ordered";
+    Par!Set  _ Cop( Par!!Set );			! Current set;
+    While Length( Datum(Par!Set) ) do begin "named"
+	SI _ Lop( Datum(Par!Set) );		! Named list to string;
+	S _ S &","& Cvis( SI, X )[2 for inf] &"="& !     , pname[2 to n] = ;
+	    L!Quote & Datum( SI ) & R!Quote;	!     quote string quote;
+    end "named";
+    Lop(S);					! Strip off first ",";
+
+    Return (Text! & S);				! Return string;
+end "make parameter list";
+
+String procedure parametize(Value String S);
+begin "parameter substitution"
+    String L, Key;    Integer Par!Chr;
+
+    Ifcr PRELIMINARY thenc
+	if swPRINT land P$$SUB then Print("R: ",S,crlf);
+    endc
+    L _ Null;					! Newline;
+    While Length(S) do begin
+      L _ L & Scan(S, B!Quote, Brk);		! Scan for a parameter;
+      If Brk = Del!Chr then begin "got one"	! Null?;
+	Par!Chr _ Lop(S);			! Get next char;
+	If Par!Chr = Del!Chr			! Do we have quote quote?;
+	  then L _ L & Par!chr			!  Yes, use a quote here;
+	  else begin				!  No. ;
+	    Key _ Par!Chr & Scan(S,B!Par,Brk);	!   Read keyword;
+	    If Brk = Del!Chr			! If followed by quote;
+	       then Par!Chr _ Lop(S);		!   eat the quote;
+	    L _ L & Substitute(S!Chan, Key);	!   Perform substitution;
+	    Ifcr PRELIMINARY thenc
+		If swPRINT land P$$PAR then
+		print("Par: Key(",key,") <= """,Substitute(s!chan,key),"""",crlf);
+	    endc
+	  end;
+      end "got one";				! Done parameter;
+    end;					! Done Line;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$SUB then Print("P: ",L,crlf);
+    endc
+    Return (L);					! So, Return it;
+End;
+	
+
+simple procedure HELP;
+Case swHELP of begin
+    [1] Print( "
+command syntax is:
+
+    [logfile =] commandfile [parameters] [/switches]
+
+where
+  logfile	- is the name of the output file (see note)
+  commandfile	- is the name of the input file
+  parameters	- is an optional parameter list (may be omitted)
+  switches	- is one or more of the following switches:
+
+    /APPEND	- When logging, append to the end of the specified file
+    /DETACH	- Run the job in DETACHED mode  (Default)
+    /HELP[:arg]	- Prints this message (same as ?)
+		  arg is one of: TEXT, SWITCHES
+    /LICENSE	- Pass user's current license to the processing frame
+    /LOG[:arg]	- Specify the log file creation and deletion criteria
+		  arg is one of: NONE, ON, ERROR, DELETE
+    /MAIL	- Send mail when the PCOM job completes
+    /NEWS	- Prints a message about any new enhancements
+    /SUPERSEDE	- Overwrite the existing logfile, if any  (Default)
+    /TIME:n	- Set the initial time limit  (Default = 60)
+    /TRULIMIT:n - Set a TRU limit  (Default is no limit set)
+    /WATCH      - Watch the progress of the detached PCOM process",
+Ifcr PRELIMINARY thenc  "
+  experimental switches (not in production version):
+    /BAIL	- Invoke the SAIL debugger at switch parse time
+    /CHARS	- Wake up PCOM each character instead of each line
+    /PRINT:arg	- Print various debugging messages
+    /SLEEP:n	- Set the SLEEP time in seconds between sync checks",
+endc  "
+
+NOTE: The first line of the command file should usually begin with
+      the PCOM command "":LOGFILE logfilename"" to designate a default
+      name for the users log-file.
+
+");
+    [2] Print("
+PCOM switches:
+    APPEND, DETACH, HELP, LICENSE, LOG, MAIL,
+    NEWS, SUPERSEDE, TIME, TRULIMIT, WATCH",
+Ifcr PRELIMINARY thenc ",
+experimental:
+    BAIL, CHARS, PRINT, SLEEP",
+endc  "
+HELP arguments:
+    TEXT, SWITCHES
+LOG arguments:
+    NONE, ON, ERROR, DELETE",
+Ifcr PRELIMINARY thenc "
+PRINT arguments:
+    COMMANDS, FILES, INPUT, ITEMS, PARAMETERS,
+    SEND, SUBSTITUTIONS, SWITCHES, ALL",
+endc  "
+
+") end;
+
+simple procedure NEWS;
+print("
+                -- New Features --
+
+ o Added /WATCH switch to automatically run the PEECOM
+   program to watch the progress of a detached PCOM job.
+
+ o Added /LICENSE switch which passes the current frame
+   license to the processing frame.  Use /NOLICENSE to
+   inhibit the passing of license to the child.
+
+Please refer to PCOM.DOC for further details.
+");
+
+simple procedure Apply!switch!defaults;
+For Dummy _ 1 step 1 until $Sw$Length Do
+    If  $Sw$Value[Dummy] = -1 then
+	$Sw$Value[Dummy] _ $Sw$Default[Dummy];
+
+
+simple string procedure print!switch(String Nam);
+begin
+    Integer V, C;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$SWT then Print(" PS:/",Nam);
+    endc
+    For C _ 1 step 1 until $Sw$Length do
+      If Kequ(Nam, $Sw$Name[C])
+	then begin V _ C; Done; End;
+    If V = 0 then Return( Null );
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$SWT then Print(":",Cvs($Sw$Value[V])," ");
+    endc
+    If $Sw$Flag[V] land SW$INT
+	then Return( Nam&":"&Cvs($Sw$Value[V]) );
+    If $Sw$Flag[V] land SW$NOS then begin
+	If $Sw$Value[V] = 0 then Return( "NO"&Nam );
+	If $Sw$Value[V] = 1 then Return( Nam );
+    end;
+    If $Sw$Flag[V] land SW$TXT then begin
+	For C _ $Sw$Offsets[V]+1 step 1 until $Sw$Offsets[V+1] do
+	begin
+	    Ifcr PRELIMINARY thenc
+		If swPRINT land P$$SWT then Print("{",$Sw$ArgValue[C],",",
+						      $Sw$ArgString[C],"}");
+	     endc
+	    If $Sw$ArgValue[C] = $Sw$Value[V]
+		then Return( Nam&":"&$Sw$ArgString[C] );
+	end;
+    end;
+    Return( Null );
+end;
+
+simple integer procedure checksw(String Txt, Val);
+begin
+    Integer C,V,No;
+    V _ 0;
+    For C _ 1 step 1 until $Sw$Length do begin
+	Ifcr PRELIMINARY thenc
+	  If swPRINT land P$$SWT then Print("<",C,">");	! follow checks;
+	endc
+	If Kequ( Txt, $Sw$Name[C] )			! exact match /XXX;
+	    then begin V _ C; No _ False; Done End;	! yes -- done;
+	If Kequ( Txt, "NO" & $Sw$Name[C] )		! exact match /noXXX;
+	    then begin V _ C; No _ True;  Done End;	! yes -- done;
+	If Kequ( Txt, $Sw$Name[C][1 for length(Txt)])	! partial match /XXX;
+	    then if V then Return( -$SwAMB )		! 2nd time -- error;
+		else begin V _ C; No _ False End;	! 1st time -- ok;
+	If Kequ(Txt,("NO" & $Sw$Name[C])[1 for length(Txt)])
+	    then if V then Return( -$SwAMB )		! 2nd time -- error;
+		else begin V _ C; No _ True  End;	! 1st time -- ok;
+    end;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$SWT then Print(" No= ",No,Crlf);
+    endc
+    If V = 0 then Return( -$SwUNK );			! switch not found?;
+    If No and not ($Sw$Value[V] land SW$NOS)		! typed /no on;
+			then Return( -$SwUNK );		!   wrong switch;
+    If -1 neq $Sw$Value[V] and not ($Sw$Flag[V] land SW$OBV)
+	then Return( -$SwDUP );				! duplicate switch?;
+    If Length(Val) then begin
+	If No and $Sw$Flag[V] land SW$OBV = 0		! typed /noXXX:value;
+		then Return( -$SwISV );			! illegal if not L'OR;
+	If $Sw$Flag[V] land SW$INT			! switch is numeric?;
+	    then If Numeric(Val)			! typed /XXX:nnn?;
+		then If $Sw$Flag[V] land SW$OBV		! yes -- does switch;
+		    then $Sw$Value[V] _ $Sw$Value[V]	!    L'OR;
+				    lor Cvd(Val)	!    Yes-- V_V|New;
+		    else $Sw$Value[V] _ Cvd(Val)	!    No -- set value;
+		else Return( -$SwISV );			! no  -- illegal;
+	If $Sw$Flag[V] Land SW$TXT then begin		! switch is textual?;
+	    Own Integer W;    W _ 0;			!   yes -- initialize;
+	    For C _ $Sw$Offsets[V]+1 step 1 until	!   loop in table;
+	      $Sw$Offsets[V+1] Do begin			!     for each entry;
+	        Ifcr PRELIMINARY thenc
+		    If swPRINT land P$$SWT then
+			Print(" :",$Sw$ArgString[C]);
+		endc
+		If Kequ(Val,$Sw$ArgString[C])		!   exact match?;
+		    then begin W _ C; Done; End;	!   yes -- done;
+		If Kequ(Val,($Sw$ArgString[C])[1 for length(Val)])
+		    then If W then Return( -$SwAMV )	!   ambig value;
+			    else W _ C;			!   set index;
+	    end;
+	    If W = 0 then Return( -$SwISV )		!   illegal value;
+		else If $Sw$Flag[V] land SW$OBV		!   else check L'OR;
+		  then If Not No			!     Yes.../No? ;
+		    then  $Sw$Value[V] _ $Sw$Value[V]	!	Right! (/X);
+				 lor  $Sw$ArgValue[W]	!         LOR value;
+		    else  $Sw$Value[V] _ $Sw$Value[V]	!	Wrong! (/noX);
+			    land lnot $Sw$ArgValue[W]	!         LAND value;
+		  else $Sw$Value[V] _ $Sw$ArgValue[W];	!     No.. set value;
+	end;
+    end
+    else begin						! value not typed;
+	If $Sw$Flag[V] land SW$VRQ			! if value required;
+	    then Return( -$SwVRQ );			! yes -- give error;
+	$Sw$Value[V] _ If $Sw$Flag[V] land SW$NOS	! if /XXX or /noXXX;
+	    then If No then 0 else 1			!   then set T or F;
+	    else 1;					!   else default =1;
+    end;
+    Return( V );					! Return index;
+end;
+
+boolean procedure legal!switch(Reference string S);
+begin
+    string SW,SwArg;    integer V,C,ArgBrk;
+    if Brk = "/" then begin "switch search"
+	Brk _ Lop(S);
+	SwArg  _ scan(S, B!Nam, BRK);
+	While Length(S) and Brk neq "/"
+	 do   SwArg _ SwArg & Lop(S) & Scan(S, B!Nam, Brk);
+	if length(SwArg)=0
+	 then begin Fatal("Null switch illegal"); return(false); end;
+	SW _ Scan(SwArg, B!Nam, ArgBrk);
+	While Length(SwArg) and ArgBrk neq ":"
+	 do   SW _ SW & Lop(SwArg) & Scan(SwArg, B!Nam, ArgBrk);
+	if ArgBrk = ":" then begin
+	    Lop(SwArg);
+	    if length(SwArg)=0 then begin
+		Fatal("Null switch argument illegal");
+		Return( False );
+	    end;
+	end;
+	V _ checksw(SW,SwArg);
+	If V < 1 then begin "switch error"
+	    case -V of begin
+		[$SwUNK] Fatal("unrecognized switch ""/"&SW&"""");
+		[$SwDUP] Fatal("duplicate switch ""/"&SW&"""");
+		[$SwAMB] Fatal("ambiguous switch ""/"&SW&"""");
+		[$SwVRQ] Fatal("value required for switch ""/"&SW&"""");
+		[$SwISV] Fatal("illegal switch value """&SwArg&
+			    """ for switch ""/"&SW&"""");
+		[$SwAMV] Fatal("ambiguous switch value """&SwArg&
+			    """ for switch ""/"&SW&"""");
+		else Fatal("unrecognized switch ""/"&SW&":"&SwArg&"""")
+	    end;
+	    Return (False);
+	end "switch error";
+	Ifcr PRELIMINARY thenc
+	  if swPRINT land P$$SWT then print("Sw:/",SW,":",SwArg," == ",V,
+	  ", ",$Sw$Value[V],"; (",$Sw$Default[V],"); ",Cvos($Sw$Flag[V]),Crlf);
+	endc
+    end "switch search";
+    Ifcr PRELIMINARY thenc
+      If swBAIL > 0 then begin swBAIL _ -1; usererr(v,3,"BAILing ","B"); end;
+    endc
+    If swHELP > 0 then HELP;
+    If swNEWS > 0 then NEWS;
+    Return ( True );
+end;
+integer procedure Create!Child;
+begin "birth procedure"
+    Integer loop!count, frame!index, frame!handle;
+
+    IncLic;				! use full license;
+    loop!count _ 0;			! set clock running;
+
+    Do begin "pregnancy"		!  we only get so many months;
+	begin!code
+	    protect!acs 1,2;
+	    label frmerr;
+
+
+	    SETOM !skip!;		! skip return;
+	    HRLI 1,!foCFM;		! function: create frame;
+	    uuo!FRMOP 1,Frame!Block[0];	! attempt to bear a child;
+	      Jrst frmerr;		!   unbearable!;
+	    MOVEM 1,frame!index;	! save the handle to the child;
+	    ANDI  1,'777;		! use an absolute handle;
+	    MOVE  2,['377777];		! 0b17,,3b20 77777b35;
+	    MOVEI 3,0;			! maximum access rights;
+	    HRLI  1,!foCFH;
+	    uuo!FRMOP 1,2;		! create frame handle;
+frmerr:	      SETZM !skip!;
+	    MOVEM 1,frame!handle;	! save new handle (or error);
+	end;
+
+	if not !skip! then begin "trial by ordeal"
+	    loop!count _ loop!count+1;	! count number of attempts;
+
+	    if loop!count land '101 then
+		print(If loop!count > 1	! Dont't tell if first time;
+		    then "attempting retry."&crlf else "",
+		  case !rh(frame!index) of (
+		    [0] "?not enough disk space",
+		    [1] "?frame capacity exceeded",
+		    [else] "?create frame error: "&Cvos(!rh(frame!index))
+		      ),
+		    If !rh(frame!index) < 2
+			then " - please wait..."
+			else EXIT( !Xwd(Error!CFM,!rh(frame!index) ) )
+		);
+
+	    Calli ( !Xwd(1,2), Calli!HIBER );  ! always sleep: 2 seconds;
+	end "trial by ordeal";
+
+	Child!Handle _ Frame!Handle;
+    end "pregnancy" until !skip! neq 0;
+
+    If loop!count > 0 then
+	print(crlf,"Problem corrected.  Continuing job.",crlf);
+
+    Ifcr LICENSEHACK thenc
+	require Crlf&"Is it time to take out the LICENSE hack yet?"&Crlf
+	    message;
+
+	If swLICENSE > 0
+	 then begin "LICSET"
+	    Integer array PassLicense[0:1];
+	    PassLicense[0]_ Calli( !Xwd(-1,!GTLIC), Calli!GETTAB );
+	    PassLicense[1]_ ( ( Calli( !Xwd(!GTLIC,!GTSLF), Calli!GETTAB )
+			      land '777777 ) + (frame!index land '777) )
+			    lor !bit(0); ! Virtual address + frame #;
+	    Calli( Location(PassLicense[0]), Calli!POKE );
+	 end "LICSET";
+    endc
+
+    DecLic;			! reduce license;
+    Return(frame!index);	! Don't forget this;
+end "birth procedure";
+
+procedure DoDETACH;
+begin "DETACH"
+    own integer C,B,E;		! stuff for writing .TMP file;
+    own integer FDX, FHX, JX;	! FD, handle and frame # of child;
+    own integer F.err;		! .fo-ERR;
+    own integer TmpChn, EoTmp;	! Tempfile channel, eof-flag;
+    own integer TmpSiz;		! size of file for PEECOM;
+    own integer array PC[0:5];	! run block for PEECOM (normal);
+    own integer array RB[0:3];	! run block for PCOM or LOGOUT;
+    own integer array HisStatus[0:1];
+    own integer array HLT[0:2];	! halt status block;
+
+    procedure Logout!Child;
+    begin "Logout Frame"
+	RB[0] _ !xwd(1,arrinfo(RB,2));
+	RB[1] _ CvSix("SYS");
+	RB[2] _ calli(!xwd(!ldSYS,!gtLVD),calli!GETTAB);
+	RB[3] _ CvSix("LOGOUT");
+	begin!code
+	    protect!acs 1; label FRMERR;
+	    MOVE 1,JX;		! use an absolute handle (requires WC);
+	    HRLI 1,!foHLT;	! first make sure frame is halted;
+	    uuo!FRMOP 1,;	! halt frame;
+	      JRST FRMERR;	!  yuck!
+	    MOVE 1,FDX;		!   restore frame # on error;
+	    HRLI 1,!foRUN;	! run LOGOUT to cleanup after myself;
+	    SETOM !skip!;
+	    uuo!FRMOP 1,access(RB[0]);
+FRMERR:	      SETZM !skip!;
+	    MOVEM 1,F.ERR;	! Save error status if any;
+	end;
+	if not !skip! then begin
+	    Fatal("can't run LOGOUT ("&Cvos(!rh(F.Err))&
+		    ").  Please logout frame "&Cvs(JX)&" manually.");
+	    EXIT( Error!LFM lsh 18 )
+	end
+    end "Logout Frame";
+
+
+    FDX _ Create!child;			! create a child frame;
+    FHX _ !rh(Child!Handle);		! copy global frame handle;
+    JX _ FDX land '777;			! shouldn't there be a uuo for this?;
+    RB[0] _ arrinfo(RB,2);		! our name so can run ourself;
+    RB[1] _ cvsix("DSK");
+    RB[2] _ calli(!xwd(-1,!gtFPN),calli!GETTAB);
+    RB[3] _ calli(!xwd(-1,!gtNAM),calli!GETTAB);
+    release(IChan);			! just close it for good form;
+    open(C_getchan,"DSK",0,0,4,0,0,E);
+    enter(C,cvs(1000+JX)[2 to 4]&"PCO.TMP",E);
+    cprint(C,if length(LogFilename)
+	      then LogFilename&"=" else "",		! Log file?;
+	CmdFile, " ", Make!List( null,'177,'177 ),	! file par...par;
+	"/NODETACH",					! for child frame;
+	"/",Print!switch("LICENSE"),			! pass user license;
+	"/",Print!switch("LOG"),			! Log file?;
+	"/",Print!switch("APPEND"),			! Append-mode logging;
+	"/",Print!switch("SUPERSEDE"),			! Supersede logfile;
+	"/",Print!switch("TIME"),			! set time limit;
+	"/",Print!switch("TRULIMIT"),			! set TRU limit;
+	Ifcr PRELIMINARY thenc
+	    "/",Print!switch("BAIL"),			! * debugging;
+	    "/",Print!switch("CHARS"),			! * intrpt every char;
+! *SW$OVB*  "/",Print!switch("PRINT"),			! * print debugging;
+	endc
+	"/",Print!switch("MAIL")			! Mail?;
+    );
+    close(C); release(C);
+    Ifcr PRELIMINARY thenc
+	If swTMPCOR > 0 then begin "don't bother with PCOM"
+	  Print(Cvs(JX+1000)[2 for 3],"PCO.TMP contains the command line.");
+	  Logout!Child;
+	  EXIT( Status!EXIT );
+	end;
+    endc
+
+    if ( swWATCH ) and ( swLOG )
+     then begin "Setup PEECOM info"
+	MaskWild _ True;    WildFrame _ JX;
+	LogFileName _ Getfil(S_Odevice&":"&LogFileName,
+			    Odevice, Ext!Found, File!Error);
+	if length( LogFileName )
+	 then begin
+	    if not Ext!Found
+	     then LogFileName_ LogFileName & Default!Log
+	 end
+	 else LogFileName_ Cvs(1000+JX)[2 to 4]&"PCO.LOG";
+
+	TmpSiz_ 1;			! default is the beginning;
+	If ( swAPPEND )
+	 then begin
+	    Open( TmpChn_getchan, "DSK", 0, 0,0, 0,0, EoTmp_-1 );
+	    Lookup( TmpChn, LogFileName, EoTmp_-1 );
+	    If not ( EoTmp )		! if we have a file ;
+	     then begin
+		FileInfo( PC );		!   ask SAIL for info ;
+		TmpSiz_ PC[5];		!   copy the size ;
+		ArrClr( PC )		!   reset the array ;
+	     end;
+	    Release( TmpChn )		! done with the channel ;
+	 end
+     end "Setup PEECOM info";
+
+    HLT[0]_ 2;
+    begin!code label frmerr,frwait;
+	protect!acs 1,2,3,4;
+	MOVE 1,FHX;
+	HRLI 1,!foHST;		! get halt status block;
+	MOVEI 2,access(HLT[0]);	! get address of block;
+	uuo!FRMOP 1,(2);
+	  JRST frmerr;
+	MOVE 3,2(2);		! get count;
+	HRLI 1,!foGET;		! get PCOM in child frame;
+	SETOM !skip!;
+	uuo!FRMOP 1,access(RB[0]);
+	  JRST frmerr;
+	MOVEI 4,100;		! argument for hiber;
+frwait:	uuo!HIBER 4,;		! sleep a bit to let GET finish;
+	  JFCL;
+	HRLI 1,!foHST;		! check halt status;
+	uuo!FRMOP 1,(2);
+	  JRST frmerr;
+	camn 3,2(2);		! compare with last status;
+	  Jrst frwait;		! if same, then wait until different;
+	MOVE 3,1(2);		! get the halt status;
+	came 3,[!Xwd(4,4)];	! make sure it's right - hc.exi,,ht.jsu;
+	  Jrst frmerr;		! boo hiss;
+	HRLI 1,!foSVA;		! start PCOM at vector address;
+	uuo!FRMOP 1,[-2];	! CCL start address (plus 1);
+frmerr:	  SETZM !skip!;
+	MOVEM 1,F.err;		! Save error if one happenned;
+    end;
+    if not !skip! then begin
+	Fatal("can't run " & cv6str(RB[3]) & " in child frame (" &
+		Cvos( !rh(F.err) )& ")" );
+	Logout!Child;			! Print exit messages;
+	EXIT( Error!RFM lsh 18 )
+    end;
+    HisStatus[ 0 ] _ Location( Status );
+    While TRUE Do begin "Watching child"
+	begin!code
+	    protect!acs 1;
+	    MOVE 1,JX;			! read virtual address;
+	    HRLI 1,!foRVA;		! of status from child PCOM;
+	    SETOM !skip!;
+	    uuo!FRMOP 1,access(HisStatus[0]);
+	      SETZM !skip!;		! Hmmmmm.;
+	    MOVEM 1,F.ERR;		! save if error;
+	end;
+	If not !skip! then begin
+	    Print("% ",cv6str(RB[3])," started in frame ",JX,
+		       " cannot read status information.  (",
+		       Cvos(F.ERR), ")" );
+	    EXIT( Status!Exit )	! we can't do anything;
+	end;
+	If HisStatus[ 1 ] geq Status!PROC then DONE;
+	If HisStatus[ 1 ]  =  Status!ERROR then begin "get error"
+	    HisStatus[ 0 ]_ Location( ErrorCondition );
+	    begin!code
+		protect!acs 1;
+		MOVE 1,JX;		! read virtual address;
+		HRLI 1,!foRVA;		! of error code in child PCOM;
+		SETOM !skip!;
+		uuo!FRMOP 1,access(HisStatus[0]);
+		  SETZM !skip!;
+		MOVEM 1,F.ERR;		! save error if it happens;
+	    end;
+	    Logout!Child;
+	    EXIT( HisStatus[1] )	! Logout child frame & exit;
+	end "get error";
+					! still in while TRUE -- until ready;
+	Calli( 100, Calli!HIBER )	! wait for 100 ms;
+
+    end "Watching child";
+	
+    begin!code		! Now, remove child frame from my tree;
+	protect!acs 1;	! Use absolute (frame handle) instead of FDX (family);
+	MOVE 1,JX;	!   here so disown doesn't ever fail;
+	HRLI 1,!foGFT;	! disown child now that were done;
+	SETOM !skip!;
+	uuo!FRMOP 1,[0];	
+	  SETZM !skip!;
+	Movem 1,F.err;
+    end;
+    if not !skip! then
+	Print("%can't disown child frame (",cvos(JX),") [",cvos(F.err),"]" );
+    Print("[",cv6str(RB[3])," in frame ",JX,"]");
+
+    If ( swWATCH ) and ( swLOG )
+     then begin "RUN PEECOM"
+
+	TMPOUT( "PEC", LogFilename & "/" & Cvs(TmpSiz), EoTmp );
+	If EoTmp
+	 then begin
+	    Open( TmpChn_getchan,"DSK",0, 0,1, 0, 0, EoTmp_-1 );
+	    Enter(TmpChn, Cvs(1000+Parent)[2 to 4]&"PEC.TMP",EoTmp_-1);
+	    If EoTmp
+	     then begin
+		Print("Unable to watch PCOM log file.", Crlf,
+			"Please run (SYS)PEECOM.", Crlf );
+		Exit( Status!Exit );
+	     end;
+	    Cprint( TmpChn, LogFileName & "/", TmpSiz );
+	    Close( TmpChn ); Release( TmpChn )
+	 end;
+	PC[0] _ cvsix("DSK");
+	PC[1] _ CvSix("PEECOM");
+	PC[4] _ calli(!xwd(-1,!gtFPN),calli!GETTAB);
+
+	Calli( !Xwd( 1,location(PC[0]) ), calli!RUN );
+     end "RUN PEECOM";
+    EXIT( Status!Exit )
+
+end "DETACH";
+
+
+simple boolean procedure Check!Command(String KW);
+Return( BRK = "=" or length( KW ) = 0 or
+       (Kq(KW,AFTER) or Kq(KW,COM) or Kq(KW,CONTINUE) or Kq(KW,DEFINE) or
+	Kq(KW,ESCAPE) or Kq(KW,FIND) or Kq(KW,GO) or Kequ(KW,"GOTO") or
+	Kq(KW,IF) or Kq(KW,LOOK) or Kq(KW,PAUSE) or Kq(KW,PARAMETERS) or
+	Kq(KW,QUIT) or Kq(KW,REMARK) or Kq(KW,RESTART) or Kq(KW,SEND) or
+	Kq(KW,STOP) or Kq(KW,TIME) or Kq(KW,UNLESS) or Kq(KW,WAIT)
+	)
+    );
+
+simple boolean procedure Check!Logfile(Reference string Filename);
+begin ":LOGFILE check"
+    String S, KW;
+    S _ null;					! Initially nothing there;
+    Do S _ input( IChan, B!Lin )		! Read first line of file;
+     until ( BRK = #lf ) or ( EOF );		!  up to first LF;
+    If EOF and Length(S)=0 then Return(False);	! Nothing there? Return;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$INP then Print("INPUT(",Cvs(IChan),"): ",S,crlf);
+    endc
+    if lop(S) neq ":" then begin "no command"	! Is it a command?;
+	Useti(Ichan,1);				! No, reset file pointer;
+	Return(False);				!     and Return;
+    end "no command";
+    If S = ":" then Return( False );		! Yes, special case label;
+    KW_ Get!Token(S);				!   get first token;
+    If Kq(KW,LOGFILE) then begin		!   see if :LOGFILE;
+	If Length( Filename ) = 0
+	 then begin
+	    MaskWild _ False;
+	    FileName _ GetFil(S,ODevice,Ext!Found,File!Error)
+	 end;
+	Return( True );				!     Yes! - Return;
+    end;
+    If Check!Command(KW)			!     No, a legal command?;
+	then Useti(IChan,1)			!       Yes, reset pointer;
+	else begin "Old style PERP header"	!       No, assume filename;
+	    S _ KW & Brk & S;			!	Restore line;
+	    If Length( Filename ) = 0
+	     then begin
+		MaskWild _ False;
+		Filename _ GetFil(S,ODevice,Ext!Found,File!Error)
+	     end;
+	    Ifcr PRELIMINARY thenc
+		If swPRINT land P$$FIL then
+		  print(":",Filename," used.",crlf);
+	    endc
+	    Print( Obnoxious!Message );		!         and print message;
+	end "Old style PERP header";
+    Return( False );				! Return FALSE;
+end ":LOGFILE check";
+
+!	FRONT!END
+
+#######################################################################
+#                                                                     #
+#   Obtain a command line, check it for errors, and return it in      #
+#   global variables.  The CMDFile and LOGFile are both opened and    #
+#   made ready.  If job is to be detached, take necessary action      #
+#   (does not return).  Due to problems dealing with error recovery,  #
+#   it is impossible to check the LOGFile for writability if /DET is  #
+#   specified and no LOGFile is given.  This is okay based on the     #
+#   assumption that jjjPCO.LOG will always be writable by frame jjj.  #
+#                                                                     #
+#   The command line may be obtained in one of three ways:            #
+#	1. from the command line (xxx logfile_cmdfile param/switch)   #
+#	2. interactively by prompting the user for the information    #
+#	3. by RPG where it is obtained from a jjjPCO.TMP file         #
+#                                                                     #
+#######################################################################
+;	
+
+procedure FRONT!END;
+begin
+    integer Array F[1:6], LongF[0:!RBLIC];
+    string S;			! a handy string;
+    label INPUT.PROMPT;		! goto here for purpose of reprompting;
+
+!	check for RPG type call - look for jjjPCO.TMP
+;
+    if RPGSW then begin "RPG"	! was our start address +1?;
+	integer C,B,E; string File; integer array T[0:1];
+	S _ TMPIN( "PCO", E );	comment SAIL function;
+	if E then begin
+	    File _ cvs( 1000+Parent )[2 to 4]&"PCO.TMP";
+	    open(C_getchan,"DSK",1,4,0,256,B,E);
+	    lookup(C,File,E);
+	    if E then print("?cant read ",File," error code '",E,
+				EXIT( !Xwd(Error!RCF,!rh(E)) )  );
+	    S _ null;		! make sure no ill side-effects;
+	    Do S _ S & input(C,0) until E;
+	    rename(C,null,0,E);
+	    release(C);
+	end
+	else begin
+	    T[0] _ Cvsix("PCO");
+	    T[1] _ 0;
+	    calli(!Xwd(!TCRDF,T[0]), calli!TMPCOR);	! Delete it;
+	end;
+    end "RPG";
+
+!	next try for CCL type call:
+	  o  look for semicolon in command line
+	  o  see if first token is the magic BATCH or TTY command
+;
+    Normal _ True;			! Initial default is BATCH;
+    if not RPGSW then begin
+	String IT;
+	backup;				! back up monitor TTY read pointer;
+	S _ inchsl(EOF);		! read monitor command line;
+	If length(S) then begin
+	    It _ Scan(S, B!Nam, Brk);	! Get first word on line;
+	    If Kequ(It,BATCH[1 for length(It)]) then CCLSW _ True
+		else if Kequ(It,TTY[1 for length(It)]) then begin
+		    CCLSW _ True;
+		    Normal _ False;	! TTY desired!;
+		end;
+	end;
+	while length(S) and not CCLSW do
+	    CCLSW _ ( ";" = Tok(S) );	! look for a semicolon;
+    end;
+    IACSW _ not (CCLSW or RPGSW);	! set interactive flag appropriately;
+    if IACSW then begin "prompt"
+	If Kequ(cv6str(calli(!xwd(-1,!gtnam),calli!GETTAB)),"PCOM")
+	    then print("PCOM version ",Cvos(!lh(Memory['137])),".",
+			Cvos(!rh(Memory['137]))  )
+	    else begin "security code"
+		Calli(cvsix("PCOM"),calli!PUTLSA);
+		Calli(cvsix("PCOM"),calli!SETNAM);
+	    end "security code";
+	print(crlf,"(Type ? for HELP)",crlf);
+    end "prompt";
+
+    INPUT.PROMPT: if IACSW then begin "prompt"
+    	Forget!Substitutions;
+	print("Command file: ");
+	S _ inchwl;
+    end "prompt";
+
+    Initialize!Switches;		! Set switches to initial state;
+
+    White( S );				! clear out whitespace (if any);
+    if equ(S,"?") then begin		! give help and re-prompt?;
+	swHELP _ 1; HELP;		!   Type help message;
+	If IACSW
+	   then go to INPUT.PROMPT	!   If interactive then ask again;
+	   else EXIT( Status!Exit )	!     else go away;
+    end;
+    MaskWild _ False;			! pass wildcards in filename;
+    CmdFile _ GetFil(S, IDevice, Ext!found, File!error);
+    Ifcr PRELIMINARY thenc
+      If swPRINT land P$$FIL then print("CMDFILE(",Idevice,":",CmdFile,")",crlf);
+    endc
+    If File!Error then begin
+	Print("?Error in filename """,CmdFile,"""",crlf);
+	If IACSW then go to INPUT.PROMPT else EXIT( Error!IFN lsh 18 );
+    end;
+    LogFileName _ null;			! set file name blank;
+    If BRK = "=" then begin		! check for LOG file name too;
+	Brk _ Lop(S);			! clear equal-sign;
+	White( S );			! clear out whitespace;
+	LogFileName _ CmdFile;		! set LogFilename;
+	ODevice _ IDevice;		!   and it's directory device;
+	CmdFile _ GetFil(S, IDevice, Ext!found, File!error);
+	Ifcr PRELIMINARY thenc
+	    If swPRINT land P$$FIL then print(
+		"Logfile=""",Odevice,":",LogFileName,"""",Crlf,
+		"CmdFile=""",Idevice,":",CmdFile,"""",Crlf);
+	endc
+	If File!Error then begin
+	    Print("?Error in filename """,CmdFile,"""",crlf);
+	    If IACSW then go to INPUT.PROMPT else EXIT( Error!OFN lsh 18 );
+	end;
+    end;
+
+!	Handle parameters here.
+	Note: Do this even if no parameters.  This will
+	      setup the necessary empty set and lists.
+;
+    Set!Parameter(S);			! look for "/" or EOL;
+
+!	Read off any switches and react to them
+;
+    while length(S) do
+	if not legal!switch(S) then
+	    if IACSW then go to INPUT.PROMPT else EXIT( Error!ISN lsh 18 );
+    if swHELP > -1 or swNEWS > -1 then
+	    if IACSW then go to INPUT.PROMPT else EXIT( Status!Exit );
+
+!	Initial non-command-line "DEFAULTS" (from switches)
+;
+    Apply!Switch!Defaults;				! from table;
+
+    If swDETACH < 0 then swDETACH _ Normal;		! /Det?;
+    If swLOG < 0 then swLOG _ If Normal then L$$ON else L$$DELETE;
+    MakeLog _ DoLog _ swLOG > 0;			! Logfile (by switch);
+    FilePage_ If swAPPEND > 0 then -1 else 0;		! initial file-page;
+    FileSize_ 0;					! assumed file size;
+    If swMAIL < 0 then swMAIL_ if Normal then 1 else 0;	! default mail;
+    DoMail _ swMail = 1;				! Mail;
+    DoNumerics _ True;					! Numerics;
+
+!	setup input file
+;
+    MaskWild _ True;			! convert wildcards in filename;
+    WildFrame _ Parent;			! use parent for wildcards;
+    CmdFile _ Getfil(S_Idevice&":"&CmdFile, Idevice, Ext!Found, File!Error);
+    open(IChan,IDevice,0,4,0, 256,BRK,EOF_-1);
+    Ifcr PRELIMINARY thenc
+	if swPRINT land P$$FIL then print("OPEN(",cvs(ichan),") ",Idevice," ",Eof,crlf);
+    endc
+    if EOF then begin "Illegal device"
+	print("?input device """,IDevice,""" unavailable.",Crlf);
+	release(IChan);
+	if IACSW then go to INPUT.PROMPT else EXIT( Error!IDN lsh 18 );
+    end "Illegal device";
+
+    lookup(IChan,CmdName_CmdFile,EOF_-1);	! input file;
+    FileInfo( F );				! Find the right file;
+    if EOF and not Ext!Found
+     then lookup(IChan,CmdFile&Default!Ext,EOF_-1); ! alternate?;
+
+    if EOF
+     then begin
+	print ("?input file """,CmdFile,""" ",case !rh( F[2] ) of (
+	    [0] "not found",
+	    [1] "invalid user",
+	    [2] "protection failure",
+	    [else] "LOOKUP error '"&cvos(!rh( F[2] )) ),crlf);
+	release(IChan);
+	if IACSW then go to INPUT.PROMPT
+		 else EXIT( !Xwd( Error!IFE,!rh( F[2] ) ) );
+     end
+     else FileInfo( F );
+
+    LongF[ !RBCNT ]_ !RBLIC;		! Size of long lookup block;
+    LongF[ !RBPPN ]_ F[ 4 ];		! User's PPN ;
+    LongF[ !RBNAM ]_ F[ 1 ];		! File Name  ;
+    LongF[ !RBEXT ]_ F[ 2 ];		! Extension  ;
+    Chnior( IChan, LongF[ !RBCNT ], !CHLK );
+    FileLicense_ If ( !SKIP! ) then !rh( LongF[!RBLIC] ) else 0;
+
+    CmdFile _ "(" & CvName(F[4]) & ")" & Cv6str(F[1]) &
+	      (if !lh(F[2]) neq 0
+	        then "." & cv6str(F[2] land (-1 lsh 18))
+		else "");		! Keep the name straight;
+    Status  _ Status!LOOK;		! Confirm file can be found;
+
+!	setup LOG file name
+;
+    MaskWild _ True;			! convert wildcards in filename;
+    Check!Logfile( LogFileName );	! Check for :LOGFILE filename;
+
+!	"detach" if necessary
+;
+    if  swDETACH then  DoDETACH;	! do detach stuff;
+
+
+!	open LOG file
+;
+    WildFrame _ Parent;			! set parent for wildcard name;
+    LogFileName _ Getfil(S_Odevice&":"&LogFileName,
+			    Odevice, Ext!Found, File!Error);
+    if length( LogFileName ) and not Ext!Found
+     then LogFileName_ LogFileName & Default!Log;
+    if MakeLog then begin "get log file"
+	ODevice _ "DSK";		!		*** DSK only ***;
+	Open( Ochan, ODevice, '10, 0,0, 0,0, Eof_-1);
+	Ifcr PRELIMINARY thenc
+	    If swPRINT land P$$FIL then
+		Print("OPEN(",Cvs(Ochan),"): ",Odevice," ",Eof,crlf);
+	endc
+	if EOF then begin "Illegal device"
+	    Fatal("?output device """&ODevice&""" unavailable.");
+	    release(OChan,CL!ACS lor CL!RST);	! don't supersede;
+	    EXIT( Error!ODN lsh 18 );
+	end "Illegal device";
+
+	if length( LogFilename ) = 0 then
+	    LogFilename _ CvS( 1000+Parent )[2 to 4]&"PCO.LOG";
+
+	If swAPPEND or swSUPERSEDE then begin	! have to play with file;
+	  Lookup(Ochan, LogFileName, Eof_-1);	! see if file exists;
+	  Ifcr PRELIMINARY thenc
+	   If swPRINT land P$$FIL then print(
+	      "Lookup ",Ochan,",",Logfilename," (",cvos(!rh(EOF)),")",crlf);
+	  endc
+	  If Eof or swAPPEND = 0 then begin	! no... or if just supersede;
+	    If swAPPEND = 0 then Close(Ochan);	!   supersede existing file;
+	    FileInfo(F);			! read file data;
+	    If swAPPEND then FileSize _ F[6];	! remember the wordsize;
+	    Chnior( Ochan, F[1], !chENT);	! enter (create or supersede);
+	    Eof_ If not !SKIP!			! if skip, all is good;
+		  then !rh(F[2]) else 0;
+	    If not EOF then begin "no errors"	! Otherwise -- we must stop;
+	      Close(Ochan);			! create-supersede file;
+	      Lookup(Ochan,LogFileName,Eof_-1);	! should be "new" there now!;
+	      Ifcr PRELIMINARY thenc
+	        If swPRINT land P$$FIL then print(
+		"Lookup ",Ochan,",",Logfilename," (",cvos(!rh(EOF)),")",crlf);
+	      endc
+	    end "no errors";
+	  end;
+	  If not EOF then begin "continue entry code"
+	    FileInfo(F);			! read file data;
+	    Ifcr PRELIMINARY thenc
+	      If swPRINT land P$$FIL then print(
+	        Cvxstr(F[1]),".",Cvxstr(!lh(F[2]) lsh 18),
+	        "[",Cvos(!rh(F[2])),"] ",
+	        "<",Cvos(F[3] lsh -27),"> ",
+	        "{",Cvos((F[3] lsh -23) land '17),"} ",
+	        "('",Cvos(F[6])," : ",Cvs(F[6]),".)",crlf);
+	    endc
+	    If swAPPEND then FileSize _ F[6];	! remember the wordsize;
+	    Chnior( Ochan, F[1], !chENT);	! enter;
+	    Eof_ If not !SKIP!			! if skip, all is good;
+		  then !rh(F[2]) else 0;
+	  end "continue entry code"
+	end
+	else Enter(Ochan, LogFileName, Eof_-1);	! else normal ENTER;
+
+	FileInfo( F );
+	LogFileName _ "(" & CvName(F[4]) & ")" & Cv6str(F[1]) &
+		      (if !lh(F[2]) neq 0
+			then "." & cv6str(F[2] land (-1 lsh 18))
+			else "");		! Keep the name straight;
+
+	Ifcr PRELIMINARY thenc
+	    If swPRINT land P$$FIL then Print("ENTER ",Logfilename," ",Eof,Crlf);
+	endc
+	if EOF then begin "do error cleanup"
+	    Print("output file """,LogFilename,""" ",case !rh(EOF) of (
+		[0] "illegal name",
+		[1] "invalid user",
+		[2] "protection failure",
+		[3] "being modified",
+		['14] "exceeds quota or disk full",
+		[else] "ENTER error '"&cvos(!rh(EOF)) ));
+	    release(OChan,CL!ACS lor CL!RST);	! don't supersede;
+	    EXIT( !Xwd( Error!OFE,!rh(EOF) ) )
+	end "do error cleanup";
+    end "get log file"
+    else begin "Release output channel"
+	Release( Ochan, CL!ACS lor CL!RST );
+	Ochan _ 0
+    end "Release output channel";
+    Status _ Status!ENTER;
+
+
+end "FRONT!END";
+
+
+simple procedure SPROUT;
+begin
+    integer P;
+
+    P _ calli(0,calli!CREPTY);	! create a PTY;
+    if not !SKIP! then usererr(P,2,"?CREPTY error: ","X");
+
+    PORT _ !lh(P);
+    auxcli(PORT,'214,!axCFS);	! we are in image no echo;
+    auxclv(PORT,1,!axSOX);	! expand tabs etc for output file;
+
+    if not swLICENSE then	! if user specified "/NOLICENSE";
+      frame!block[ FrmLIC ]_ 0;	!  then clear user license;
+    FD _ Create!child;		! create a child frame;
+    Child _ FD Land '777;	! remember child's name;
+
+    Ifcr ROYALTYHACK thenc
+	require Crlf&"IS it time to take out the JBTLOG hack?"&Crlf
+	    message;
+    endc
+
+    start!code
+	HRRO	1,FD;
+	HRLI	2,'200000;
+	HRR	2,P;
+	MOVEI	1;
+	SETOM 	!SKIP!;
+	uuo!RETACH;		! give it the PTY;
+	 SETZM	!SKIP!;
+    end;
+    if not !SKIP! then usererr(0,0,"?RETACH error","X");
+end;
+
+
+Simple Procedure LOGOUT!Frame;
+begin
+    Status _ Status!LOGOUT;			! Just mention LOGOUT;
+
+    OutPtr(Port,"LOGOUT"&#cr);
+    IntCause( Int!CHR );			! cause character interrupt;
+
+    Status _ Status!ZAP;			! now...;
+    SetTimeLimit( 5 );				! set 5 minute limit for zap;
+    while not (ZAP! or NTQ! or TIM!)		! wait for zapper;
+	do Calli ( Sleep!Time, Calli!Hiber );	! for however long it takes;
+
+end;
+
+
+procedure REASSIGN (string CMD);
+begin "DEFINE COMMAND"
+    string  Key, Val, Expr;
+
+    While Length(CMD) do begin "scanning parameters"
+	White( CMD );					! Clear whitespace;
+	Key _ Scan( CMD, B!Par, Brk);			! Get name;
+	Ifcr PRELIMINARY thenc
+	    If swPRINT land P$$PAR then Print(
+		" Key(",Key,") Break(",Brk&Null,")[",Brk,"] CMD: ",CMD,crlf);
+	endc
+	If Brk = " " or Brk = #HT then White( Cmd );	! Eat whitestuff;
+	If Brk = "=" then begin
+	    Lop( CMD );					! Eat = ;
+	    Expr _ Get!Token(CMD);			! Read next token;
+	    Ifcr PRELIMINARY thenc
+		If swPRINT land P$$PAR then Print(
+		" Expr(",Expr,") Break(",Brk&Null,")[",Brk,"] CMD: ",CMD,crlf);
+	    endc
+	    If not (quoted or Numeric(Expr) ) then begin
+		Val _ Scan(Expr,B!Par,Brk);
+		If length(Expr) then Fatal(
+		    "Illegal character """&Brk&""" in parameter name")
+		  else begin
+		    Expr _ Substitute( S!Chan, Val );
+		    New!Parameter(S!Chan, Key, Null, Expr )
+		  end;
+	    end
+	    else New!Parameter(S!Chan, Key, Null, Expr )
+	end
+	else begin
+	    Fatal("Illegal format in assignment """&Brk&Cmd&"""");
+	    Ifcr PRELIMINARY thenc
+		If swPRINT land P$$PAR then Print(
+		" Key(",Key,") Break(",Brk&Null,")[",Brk,"] CMD: ",CMD,crlf);
+	    endc
+	    Done;
+	end;
+    end "scanning parameters";
+end "DEFINE COMMAND";
+
+procedure COM (string CMD);
+begin "COM COMMAND"
+    String Name;
+
+    Name _ GetFil(CMD, IDevice, Ext!Found, File!Error);	! read off filename;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$FIL then Print("COM ",CMD,crlf,Name," ",Ext!found," ",File!error,Crlf);
+    endc
+    If File!Error
+     then begin					! If error...;
+	Fatal("COM Filename error """&Name&"""");
+     end
+     else begin
+	Delim!list _ Del!Chr & Delim!list;	! add delimiter to list;
+	S!Chan _ Getchan;			! declare new channel;
+	IChan _ S!Chan & IChan;			! add channel to list;
+	Set!Parameter(CMD);			! NOW setup parameters;
+	open(IChan,IDevice,1,4,0,1024,BRK,EOF_-1);
+	If ( EOF )				! abort if device is bad;
+	 then Fatal("COM Device error """&IDevice&""" - Aborting.");
+	lookup(IChan, Name, EOF_-1);		! open the file;
+	If EOF and not Ext!Found then		! if not there, then;
+	 lookup(IChan,Name&Default!Ext,EOF_-1);	!  try other extension;
+	If ( EOF )				! if still not there;
+	 then begin				!  print a message;
+	    Fatal("COM Filename error ("& Cvos(!rh(EOF))&
+		  ") for file """&Name&"""");
+	    S!Chan_ Lop(IChan);			!  clear channel table;
+	    Return;				!  and abort;
+	 end;
+	Check!Logfile( LogFileName );		! skip :LOGFILE if any;
+    end;
+end;
+
+procedure ESCAPE;
+begin!code
+    label HALTW,HALTX,CLRW,CLRX;
+	MOVS 1,FD;
+	TLZ 1,'770000;
+	HRRI 1,!gtSTS;
+	uuo!GETTAB 1,;		! get JBTSTS;
+	 JFCL;
+	JUMPG 1,CLRX;		! don't hassle if halted;
+	MOVE 1,FD;
+	TRZ 1,'770000;		! do absolute so license will help;
+	HRLI 1,!foHLT;
+	uuo!FRMOP 1,;		! return to monitor;
+	 JRST CLRX;		! assume already halted (oh well);
+HALTW:	MOVEI 1,1;
+	uuo!SLEEP 1,;
+	MOVS 1,FD;
+	TLZ 1,'770000;
+	HRRI 1,!gtSTS;
+	uuo!GETTAB 1,;		! get JBTSTS;
+	 SETZ 1,;
+	JUMPL 1,HALTW;		! sleep until child halts;
+HALTX:	MOVE 1,FD;
+	TRZ 1,'770000;
+	HRLI 1,!foCLR;
+	uuo!FRMOP 1,;		! clear frame;
+	 JFCL;
+CLRW:	MOVEI 1,1;
+	uuo!SLEEP 1,;
+	MOVS 1,FD;
+	TLZ 1,'770000;
+	HRRI 1,!gtSTS;
+	uuo!GETTAB 1,;		! get JBTSTS;
+	 SETZ 1,;
+	JUMPL 1,CLRW;		! sleep until child halts;
+	MOVE 1,FD;
+	uuo!SETOTF 1,;
+	 JRST CLRX;
+	MOVSI 1,'206001;	! 1 page at 0 R/W in other frame;
+	uuo!VCREAT 1,;
+	 JRST CLRX;
+	MOVE 1,FD;
+	HRLI 1,!foWVA;
+	SETZ 2,;		! address;
+	HRROI 3,!GTPRV;		
+	uuo!GETTAB 3,;		! data = JBTPRV for us;
+	 JRST CLRX;
+	uuo!FRMOP 1,2;		! write in AC0;
+	 JRST CLRX;
+	MOVEI 2,1;		! address;
+	MOVE 3,[uuo!SETPRV];	! data;
+	uuo!FRMOP 1,2;
+	 JRST CLRX;
+	MOVEI 2,1;		! address;
+	MOVE 3,[uuo!EXIT];	! data;
+	uuo!FRMOP 1,2;
+	 JRST CLRX;
+	HRLI 1,!foSAA;
+	MOVE 2,['400000000001];	! start address;
+	uuo!FRMOP 1,2;
+	 JFCL;
+CLRX:
+	PUSHJ P,SYNC;		! stay in sync with slave;
+end;
+
+procedure GOTO (string CMD);
+if IChan > 0 then begin "GOTO COMMAND"
+    string S, ST;
+    S _ "::" & Tok( CMD );			! Define label = ::name ;
+    useti(IChan,1); LineNo _ 0;			! Reset to beginning of file;
+    do begin
+	LineNo _ LineNo +1;			! Count source file lines;
+	ST _ null;				! Initially nothing there;
+	Do ST _ input( IChan, B!Lin )		! Read first line of file;
+	 until ( BRK = #lf ) or ( EOF );	!  up to first LF;
+	if Kequ( S, ST[1 to inf-1] )		! Compare S to ST - #cr;
+	 then return;				! If match, then "found";
+     end until EOF;
+    Fatal("EOF while scanning for label """&S&"""");
+end "GOTO COMMAND";
+
+procedure LOGFILE (string CMD);
+begin "LOGFILE COMMAND"
+    String Name;
+
+    Name _ GetFil(CMD, ODevice, Ext!Found, File!Error);	! read off filename;
+    If File!Error
+	then Fatal("LOGFILE Filename error """&Name&"""")
+	else begin
+	    if LineNo = 1 then begin ! Note: OCHAN = 0 means inactive!!!;
+		open(OChan,ODevice,1,0,4,1024,BRK,EOF_-1); ! open the file;
+		enter(OChan, Name, EOF_-1);		!   "   "   "  ;
+		If EOF and not Ext!Found then begin	! if not there, then;
+		    Fatal("Cannot enter file """&Name&"""");
+		    release(OChan);
+		end
+	    end
+	    else Fatal(":LOGFILE command not in line 1");
+	end;
+end "LOGFILE COMMAND";
+
+procedure PARAMETERS(String CMD);
+begin "PARAMETERS COMMAND"
+    string Key, Par!Default, Par!Value;    String Itemvar SI;
+
+    DoParam _ True;					! Means Go!Substitute;
+    Par!List _ Lop( Par!!List );			! Get ordered list;
+    While Length(CMD) do begin "scanning parameter names"
+	Key _ Get!Token(CMD);				! Name;
+	Par!Default _ If Brk = "=" or Brk = "_"		! Parameter or null;
+	    then Get!Token(CMD) else Null;
+	If Length( Datum(Par!List) ) then begin		! If any in list;
+	    SI _ Lop( Datum(Par!List) );		! Get Item;
+	    Par!Value _ Datum( SI );			! Get string value;
+	    Delete( SI );				! No longer needed;
+	end
+	else Par!Value _ Null;				! Get null value;
+	New!Parameter(S!Chan, Key, Par!Default, Par!Value );
+    end "scanning parameter names";
+    Put Par!List in Par!!List before 1;			! Restore list;
+end "PARAMETERS COMMAND";
+
+simple procedure QUIT;
+EOF _ true;
+
+procedure SEND (string CMD);
+begin	"SEND"
+    string KW;
+    KW _ Get!Token(CMD);
+    If quoted then KW _ Brk&KW&Brk;	! restore quoted string;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$SND then Print("SEND ",KW," ");
+    endc
+    If Kequ(KW,"CHARACTER") then begin
+	Ifcr PRELIMINARY thenc
+	    integer K;
+	    K _ Cvo(CMD);
+	    If swPRINT land P$$SND then Print("'",Cvos(K),crlf);
+	    auxclv(PORT,K,!axO8);
+	elsec
+	    auxclv(PORT,Cvo(CMD),!axO8);
+	endc
+	SYNC
+    end
+    else if Kequ(KW,"STRING") then begin
+	Ifcr PRELIMINARY thenc
+	    KW _ Get!Token(CMD);
+	    If swPRINT land P$$SND then Print("""",KW,"""",crlf);
+	    Outptr( Port, KW );
+	elsec
+	    Outptr( Port, Get!Token(CMD) );
+	endc
+    end
+    else if Kequ(KW,"FILE") then begin "SEND FILE"
+	String Name, Dev, L;  Integer LastBrk;
+	Name _ GetFil(CMD, Dev, Ext!Found, File!Error);
+	If File!Error
+	  then begin Fatal("SEND FILE Filename error """&Name&"""") end
+	  else begin "good filename"
+	    IChan _ Getchan & IChan;
+	    if IChan < 0
+	      then Fatal("SEND FILE - No free channels")
+	      else begin "got a channel"
+		Open(Ichan, Dev, 0, 4,0, 1024, Brk, EOF_-1);
+		If EOF
+		  then Fatal("SEND FILE - Cannot init device """&Dev&"""")
+		  else begin "device found"
+		    Lookup(IChan, Name, EOF_-1);
+		    If EOF
+		      then Fatal("SEND FILE - File """&Name&""" not found")
+		      else While not EOF do begin "transmit file"
+			  L _ Input(IChan,B!CR);
+			  If L = #lf and LastBrk = #cr then Lop(L);
+			  If Length(L) then Outptr( Port, L );
+			  LastBrk _ Brk;
+		      end  "transmit file"
+		  end "device found"
+	      end "got a channel"
+	  end "good filename"
+    end "SEND FILE"
+    else Fatal("illegal SEND command """&CMD&"""");
+end;
+
+simple procedure STOP;
+STOP! _ EOF _ true;
+
+procedure TIME (string CMD);
+SetTimeLimit( cvd( Tok(CMD) ) );	! Time in minutes;
+
+recursive procedure COMMAND (string CMD);
+begin	"COMMAND"
+    string KW;
+    lop(CMD);				! Eat colon at beginning of line;
+    KW _ Get!Token(CMD);		! Get first token;
+    Ifcr PRELIMINARY thenc
+	if swPRINT land P$$CMD then Print("Cmd: ",KW," >> ",CMD,crlf);
+    endc
+    if KW = ":" then		! ignore label here;	! Defer;
+    else if BRK = "=" then REASSIGN( KW&BRK&CMD )	! Defer;
+    else if Length(KW) = 0 then 			! Pcom only;
+    else if Kq(KW,COM) then COM (CMD)			! Pcom only;
+    else if Kq(KW,DEFINE) then REASSIGN(CMD)		! Defer;
+    else if Kq(KW,ESCAPE) then ESCAPE			! Defer;
+    else if Kq(KW,GO) or Kequ(KW,"GOTO") then GOTO(CMD)	! Defer;
+    else if Kq(KW,LOGFILE) then LOGFILE(CMD)		! Pcom only;
+    else if Kq(KW,PARAMETERS) then PARAMETERS(CMD)	! Pcom only;
+    else if Kq(KW,QUIT) then QUIT			! Defer;
+    else if Kq(KW,REMARK) then				! Pcom only;
+    else if Kq(KW,SEND) then SEND (CMD)			! Pcom only;
+    else if Kq(KW,STOP) then STOP			! Defer;
+    else if Kq(KW,TIME) then TIME (CMD)			! Defer;
+
+    else if Kq(KW,AFTER)   or Kq(KW,CONTINUE) or Kq(KW,FIND)  or
+	    Kq(KW,IF)      or Kq(KW,LOOK)     or Kq(KW,PAUSE) or
+	    Kq(KW,RESTART) or Kq(KW,UNLESS)   or Kq(KW,WAIT)
+	  then	! unimplemented DEFER commands;		! Defer;
+    else Fatal("illegal PCOM command "":"&KW&"""");
+end	"COMMAND";
+
+!	determine disposition and clean up;
+
+Simple Procedure Do!Cleanup;
+Begin
+    DISPOSITION _ Complete;
+    if TIM! then DISPOSITION _ "aborted - timeout at line "& cvs(LineNo);
+    if NTQ! then DISPOSITION _ "aborted - halted by operator at line "& cvs(LineNo);
+    if ZAP! then DISPOSITION _ "abended - lost circuit to slave at line "& cvs(LineNo);
+    if STOP! then DISPOSITION _ "aborted - :STOP at line "& cvs(LineNo);
+    if ERR! then DISPOSITION _ "aborted - ERROR( "& Error!Text &" ) at line "& cvs(LineNo);
+    if TRU! then DISPOSITION _ "aborted - TRU limit exceeded at line "& cvs(LineNo);
+
+    if ( DoMail ) and
+       ( ( (frame!block[ FrmPRV ] land JP!MOD) lsh -7 ) = !JPMXJ )
+     then begin
+	Logout!Frame;				! logout and set xexec mode;
+	frame!block[ FrmPRV ] _ ( !JPMXE lsh 7 ) lor
+		    ( frame!block[ FrmPrv ] land lnot JP!MOD );
+     end;
+
+
+!	send mail if indicated - inform user of disposition;
+
+    if DoMail then begin			! send mail ?;
+	if ZAP! then begin			! start a new frame;
+	    SPROUT;				!  and attach it to a PTY;
+	    IntIni (Intvar_INTPRO, PORT, OChan, FilePage, FileSize,
+			If detach! then 0 else !Xwd(-1,!AXOCI)   );
+	 end;
+	If MakeLog then IntLog( DoLog_ True );	! Force logging;
+	ESCAPE;					! force command level;
+	Status _ Status!MAIL;			! let parent know;
+	OutPtr(Port,"SEND "&MyName&#cr);
+	OutPtr(Port,"; " &cv6str(calli(!xwd(-1,!GTNAM),calli!GETTAB))&
+	    " v"&Cvos(!lh(memory['137]))&"."&Cvos(!Rh(memory['137]))&
+	    " - processed: "&
+	    (If MakeLog then LogFilename&" = " else "")&! Log file?;
+	    CmdFile& #cr);				! Command file?;
+	OutPtr(Port,"; Options: "&
+	    (If detach! then "" else "NO")&"DETACH  "&	! Detached?;
+	    Print!switch("LOG")&" "&			! Log switch;
+	    Print!switch("APPEND")&" "&			! Appending;
+	    Print!switch("SUPERSEDE")&" "&		! Superseding;
+	    (If swLICENSE < 0 then ""
+	      else Print!switch("LICENSE")&" ")&	! License set?;
+	    #cr);
+	OutPtr(Port,"; Limits: "&
+	    Print!switch("TIME")&" "&			! TimeLimit;
+	    Print!switch("TRULIMIT")&" "&		! TruLimit;
+	    #cr);
+	OutPtr(Port,"; Status: "&disposition&"."&#cr);
+	If MakeLog then OutPtr(Port, "; Output recorded in file "&
+		LogFilename&"."&
+		(If ( swLOG = L$$DELETE ) or
+		    ( swLOG = L$$ERROR and Kequ(Disposition,Complete) )
+		 then "  (Logfile Deleted.)" else "")&
+		#cr);
+	OutPtr(Port, #ctrl("D") );
+    end;
+
+    Logout!Frame;			! terminate the process;
+    IntZap;				! clear interrupts;
+    IntFin;				! dump character buffers;
+
+    If MakeLog and (
+	( swLOG = L$$DELETE ) or
+	( swLOG = L$$ERROR and Kequ(Disposition,Complete) ) )
+        then begin "File foolishness"
+	    Rename(OChan,null,0,EOF_-1);	! delete the log-file?;
+	end "File foolishness";
+    if MakeLog then release(OChan);		! the channel? - release it;
+
+    print(crlf,"[Job ",CmdFile," ",disposition,"]",crlf,
+	If MakeLog and (			! tell user, if a log file;
+	    ( swLOG = L$$ON ) or
+	    ( swLOG = L$$ERROR and not Kequ(Disposition,Complete) ) )
+	 then  "[Output recorded in file "&LogFilename&"]"
+	 else "");
+end;
+
+!	M A I N   program
+;
+IChan_S!Chan_Getchan;			! designate initial input channel;
+Open(IChan,"DSK",0,0,0,0,0,0);		! save channel;
+OChan_Getchan;				! designate initial output channel;
+Open(Ochan,"DSK",0,0,0,0,0,0);		! save channel;
+FRONT!END;				! parse command, open files, etc.;
+Ifcr PRELIMINARY thenc
+  If swPRINT land P$$FIL then print("In: ",Cvs(Ichan)," Out: ",Cvs(Ochan),crlf);
+endc
+Sleep!Time _ (If Detach!		! set sleep period;
+    then !Xwd(1,30)			! up to 30 seconds if detached;
+    else !Xwd(1,3) );			! or 3 seconds at the terminal;
+    Ifcr PRELIMINARY thenc
+      if swSLEEP > 0 then
+	Sleep!Time _ !Xwd( 1,swSLEEP );	! he asked for it;
+    endc
+
+If ( FileLicense )			! if file has license then use it;
+ then Frame!Block[ FrmLic ]_ NewLic( Frame!Block[FrmLic], FileLicense );
+
+SPROUT;					! create child frame and PTY to it;
+
+IntIni (Intvar_INTPRO, PORT,		! enable interrupts on port;
+	Ochan, FilePage, FileSize,	! LogChan, initial page & size;
+	If detach!			! how to type on parent terminal;
+	 then 0				!  (detached?) no printing;
+	 else !Xwd(-1,!AXOCI)   );	!  else char immediate;
+IntLog( DoLog );			! initialize logging on channel;
+SetTimeLimit( swTIME );			! set (default) timeout to 60 minutes;
+TruLimit _ If swTRULIMIT > 0		! if the user specified a limit;
+ then swTRULIMIT else 0;		!  then use the specified value;
+Status _ Status!PROC;			! let parent know we are processing;
+while length(IChan) do begin "main loop"
+  while not EOF do begin "one file"
+    string S;
+    S _ null;				! Initially nothing there;
+    Do S _ input( IChan, B!Lin )	! Read first line of file;
+     until ( BRK = #lf ) or ( EOF );	!  up to first LF;
+    if ( EOF ) and ( Length( S ) = 0 )	! End of File? Only if no line;
+     then done;				!  until done;
+    LineNo _ LineNo +1;			! count it;
+    Ifcr PRELIMINARY thenc
+	If swPRINT land P$$INP then Print("Input(",Cvs(Ichan),") line ",LineNo,crlf);
+    endc
+    If DoParam then S _ parametize(S);	! parameter-ize the line;
+    if S = ":"				! check for begin with colon;
+	then Command(S)			!	process PCOM command;
+	else OutPtr(Port,S);		!	send command to slave job;
+  end "one file";
+  Forget!Substitutions;			! clear current substitutions;
+  Ifcr PRELIMINARY thenc
+      if swPRINT land P$$FIL then print(crlf,"Release ",cvs(Ichan),crlf);
+  endc
+  release(lop(IChan));			! pop the channel stack;
+  S!Chan _ IChan[1 for 1];		! set new channel for substitutions;
+  Lop(Delim!list);			! lop off the last delimiter;
+  If ( Delim!list neq Del!Chr )		! if delimiter mangled then;
+   then Set!Delimiter( Delim!list );	!   use current top of stack;
+  EOF _ ERR!;				! if no errors, clear end of file;
+end "main loop";
+Status _ Status!DONE;			! let parent know we are done;
+Do!Cleanup;
+Status _ Status!EXIT;			! finished...exit;
+EXIT( Status!EXIT );			! log out if necessary;
+
+end 	"PCOM" $
+     @<Õ
