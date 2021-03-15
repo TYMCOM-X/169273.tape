@@ -1,0 +1,1295 @@
+
+begin "CARDS"
+
+require '3 lsh 24 lor '0 lsh 18 lor '213 version;
+
+require "(CARL)MySAIL.DEF" source!file;
+require "(CARL)RANDOM.REQ" source!file;
+require "(CARL)SYDISP.REQ" source!file;
+require "(SAILIB)VMFILE.REQ" source!file;
+
+redefine safe = {};		! turn off safe arrays ;
+define	MaxRow = 24;			! maximum row in screen array ;
+define	CmdRow = MaxRow;		! row to display commands ;
+define	MsgRow = MaxRow-1;		! row to display messages ;
+define	BidRow = 1;			! row to display bidding  ;
+define	TrkRow = 10;			! row to display tricks   ;
+
+define	BidWid = 6;			! how wide are the bids   ;
+define	BridgeTricks = 13;		! how many tricks in bridge ;
+define	BridgeHands  = 4;		! how many hands  in bridge ;
+define	BridgeSuits  = 4;		! how many suits  in bridge ;
+define	BridgeBids   = 5;		! how many bid suits ;
+
+define	AnyCard   = '77777;		! any card in a suit ;
+
+define	NoBid     = 0;			! no bid here ;
+define	PassBid   = 6;			! passing only ;
+define	DoubleBid = 7;			! double time ;
+
+define	DpyHand  = 0;			! screen for normal display ;
+define	DpyHelp  = DpyHand + 1;		! screen for help text ;
+define	DpyMax   = DpyHelp;		! maximum screen count ;
+
+define	DataFile = { "CARDS.DAT" };	! file for storing hands ;
+define	EntrySize = 5;			! lines in file per entry ;
+define	Msg(y,x,text) = {Install(BP_point(7,Buffer[y,x],-1),text)};
+
+
+boolean Bidding				! true while bidding not playing ;
+,	FixedDeal			! true while fixed dealer ;
+,	Invisible			! true if in invisible mode ;
+,	StillRunning			! true while we're still going ;
+;
+
+integer Row, Col			! current row, col within buffer ;
+,	BP, V, I			! byte pointer, value, index ;
+,	Tok				! breaktable for offline file ;
+,	ThisScreen			! which display screen ;
+,	LineCount			! counter for displayed lines ;
+,	StartRow			! row to start incrmental display ;
+,	CmdArg				! command argument value ;
+,	Double				! times the bidding was doubled ;
+,	Pass				! times the bidding was passed ;
+,	BidRank				! rank bid 1-7 ;
+,	BidSuit				! suit bid 1-5 (C-D-H-S-N) ;
+,	Trick				! current trick ;
+,	Hands				! current hand ;
+,	Bids				! current bid line ;
+,	Declarer, Dummy			! who is dummy, declarer ;
+,	Dealer, ThisHand		! what hand is dealing, playing ;
+;
+
+string DealString, We, They;		! pairs for a deal (for now) ;
+string S, CmdLine, MsgLine;		! text of cmd and msg lines ;
+
+safe integer array Buffer[ 1:MaxRow, 1:27 ];	! screen buffer for redisplay ;
+safe integer array BidLine[ 1:16, 1:BridgeHands ];
+
+preset!with "Ace","Two","Three","Four","Five","Six","Seven","Eight",
+	    "Nine","Ten","Jack","Queen","King","Ace","Joker";
+safe string array RankNames[1:15];
+preset!with "A","2","3","4","5","6","7","8","9","10","J","Q","K","A","*";
+safe string array RankName[1:15];
+
+preset!with "Club", "Diamond", "Heart", "Spade", "NoTrump";
+safe string array SuitName[1:BridgeBids];
+safe string array SuitBid[1:BridgeBids];	! match first bid suits ;
+
+preset!with "South","West","North","East";
+safe string array HandName[1:BridgeHands];
+
+safe integer array Cards, Play, Seen[ 1:BridgeSuits ];	! for checking ;
+safe integer array Deck, Pile, LastDeck[ 1:52 ];	! ordered cards ;
+safe integer array Winners[ 1:BridgeTricks ];		! winning hands ;
+
+safe integer array Hand[ 1:BridgeHands, 1:BridgeSuits ];
+
+preset!with '100000, '200000, '300000, '400000;
+safe integer array Suits[ 1:BridgeSuits ];	! Club,Diamond,Heart,Spade ;
+
+preset!with '1, '2, '4, '10, '20, '40, '100, '200, '400,
+	    '1000, '2000, '4000, '10000;
+safe integer array Ranks[ 2:BridgeTricks+1 ];	! types of cards ;
+
+safe integer array EachCard[ 1:BridgeSuits, 0:BridgeTricks+1 ];
+safe integer array Tricks[ 1:BridgeTricks, -1:BridgeHands ]; ! each trick ;
+! index 1-4 for each card, 0 for the lead card, -1 for the winning card ;
+
+! Utility routine to put a string into the buffer
+;
+
+simple integer procedure Install( integer BP; string S );
+begin "install string"
+
+    while ( length( S )) do idpb( lop( S ), BP );
+    return( BP );
+
+end "install string";
+
+!	routine to put a message into the message line on error
+;
+
+simple boolean procedure NeedHelp( string text(null) );
+begin "need help"
+
+    T!Bell;				! beep ;
+
+    CmdArg_ 0;				! clear command args ;
+
+    if ( length( text ) )		! if we supplied a text ;
+     then MsgLine_ text			!  then use it ;
+     else MsgLine_ "Type ? for Help";	!  else use default text ;
+
+    return( false );
+
+end "need help";
+
+! display initialization ;
+
+simple procedure InitDpy;
+begin "initialization"
+
+    T!Init;
+    R!Init;
+
+    StillRunning_ true;
+    CmdArg_ 0;
+
+    ThisScreen_ DpyHand;	! 0=game, 1=help ... ;
+    CmdLine_ NULL;
+    MsgLine_ "Type ? for Help";
+
+end "initialization";
+
+
+simple string procedure Cviss( integer iv; string str( "Unknown" ) );
+begin "cvis string"
+    own integer Rank, Suit;
+
+    Suit_ iv lsh -15;
+    for Rank_ 2 upto BridgeTricks+1
+     do if ( iv = EachCard[ Suit, Rank ] )
+	 then return( RankName[ Rank ] & SuitName[ Suit ][1 for 1] );
+
+    return( str );
+
+end "cvis string";
+
+
+
+simple string procedure TextSuit( integer iz );
+begin "text of suit"
+    integer ix;
+    string str;
+
+    str_ null;
+    for ix_ BridgeTricks+1 downto 2
+     do if ( Ranks[ ix ] land iz )
+	 then str_ str &" "& RankName[ ix ];
+
+    return( str );
+
+end "text of suit";
+
+
+
+simple procedure Shuffle( integer array D );
+begin "shuffle"
+    integer this, that;
+
+    for this_ arrinfo( D,2 ) downto 2		! for each card ;
+     do if ( this neq that_ ran( this ) + 1 )	! if not the same ;
+	 then D[ this ] swap D[ that ];		!  swap it ;
+
+end "shuffle";
+
+
+Simple Procedure DealCards;
+begin "deal the cards"
+    integer di, dx, ds;
+
+    dx_ arrinfo( Hand,2 );		! highest of first order index ;
+    arrClr( Hand );			! clear old hands ;
+    arrClr( Play );			! and those played ;
+
+    for di_ arrinfo( Deck,1 ) upto arrinfo( Deck,2 )
+     do begin "deal each hand"
+
+	LastDeck[ di ]_ Deck[ di ];	! make a copy of the deck ;
+
+	Dealer_ (Dealer mod dx) + 1;	! next hand ;
+	ds_ Deck[ di ] lsh -15;		! figure suit ;
+
+	Hand[ Dealer,ds ]_ Hand[ Dealer,ds ] lor Deck[ di ];
+
+     end "deal each hand";
+
+end "deal the cards";
+
+
+procedure BridgeDeck;
+begin "bridge deck"
+    integer si, ri, ci;
+
+    ci_ 0;				! start at the beginning ;
+    arrclr( EachCard );
+    arrclr( Deck );
+
+    for si_ BridgeSuits downto 1
+     do begin "suits and labels"
+
+	EachCard[ si,0 ]_ Suits[ si ];	! mark the suit indicator ;
+
+	for ri_ BridgeTricks+1 downto 2
+	 do begin "ranks and labels"
+
+	    EachCard[ si, ri ]_ Deck[ ci_ ci+1 ]_ Suits[ si ] lor Ranks[ ri ];
+	    EachCard[ si,  0 ]_ EachCard[ si,0 ] lor Ranks[ ri ];
+
+	 end "ranks and labels";
+
+     end "suits and labels";
+
+    arrclr( Play );
+    arrclr( Seen );
+
+end "bridge deck";
+
+
+simple integer procedure CardCount( integer Card );
+begin "card count"
+    integer count, ci;
+
+    count_ 0;				! initialize count ;
+
+    for ci_ 2 upto BridgeTricks+1	! for each rank ;
+     do if ( Card land Ranks[ ci ] )	!  if card matches ;
+	 then count_ count + 1;		! then count it ;
+
+    return( count );			! return total count ;
+
+end "card count";
+
+
+
+simple string procedure TextHand( integer MyHand );
+begin "text of hand"
+    integer si, Card;
+    string S;
+
+    S_ null;				! start with nothing ;
+    for si_ BridgeSuits downto 1	! for each matching suit ;
+     do if ( Hand[MyHand,si] land AnyCard )
+	 then S_ S &" "& SuitName[si][1 for 1] & TextSuit( Hand[MyHand,si] );
+
+    return( HandName[ MyHand ] & S );	! one hand in a string ;
+
+end "text of hand";
+
+
+simple string procedure TextBid( integer MyBid );
+begin "text bid"
+    integer MyR;
+
+    if ( MyBid )			! do we have a bid? ;
+     then begin "valid bid"
+
+	if ( MyR_ MyBid lsh -3 )	! a real bid? ;
+	 then return(
+			( cvs( MyR ) &
+			  SuitName[MyBid land '7][1 for 1] &
+			  "     "
+			 )[1 for BidWid]
+		     );
+
+	if ( MyBid = PassBid )		! pass is most likely ;
+	 then return( "Pass      "[1 for BidWid] )
+	 else return( "dbl       "[1 for BidWid] );
+
+     end "valid bid"
+     else return( "          "[1 for BidWid] );
+
+end "text bid";
+
+
+simple integer procedure PackBid( string BidText );
+begin "pack bid"
+    integer MyRank, MySuit;
+    string MyBid;
+
+    if ( length( MyBid_ Scan( BidText,Tok,MyRank ) ) )
+     then begin "numeralize"
+
+	case MyRank_ lop( MyBid )
+	 of begin
+	    ["1"]["2"]["3"]["4"]["5"]["6"]["7"]
+	    begin
+		BidRank_ MyRank_ MyRank - "0";
+		for MySuit_ 1 upto BridgeBids	! what suit was this ;
+		 do if ( MyBid = SuitName[ MySuit ] )
+		      then done;
+
+		if ( 1 leq MySuit leq BridgeBids )
+		 then return( MyRank lsh 3 + MySuit )
+		 else return( NoBid );
+	    end;
+	    ["P"]["p"] return( PassBid );
+	    ["D"]["d"]["R"]["r"] return( DoubleBid )
+	 end;
+
+     end "numeralize"
+     else return( NoBid );
+
+end "pack bid";
+
+
+simple procedure ShowHand( integer H, R, C );
+begin "show hands"
+    integer si, di, Card;
+    string S;
+    integer Dist, High, Line, Prop, Quick, Rank, Size;
+    own safe integer array MyProps[0:4];
+
+    High_ Dist_ Quick_ Rank_ 0;		! initially no points ;
+
+    Line_ 0;
+    for si_ BridgeSuits downto 1
+     do begin "show suit"		! show counts ;
+
+	Size_ 0;
+	S_ ( SuitName[ si ] &"        " )[1 for 8];
+
+	arrclr( MyProps );
+	for di_ BridgeTricks+1 downto 2
+	 do if ( AnyCard land Hand[ H,si ] land (Card_ EachCard[ si,di ]) )
+	     then begin "each card"
+		Size_ Size + 1;
+		S_ S &" "& Cviss( Card, "-" )[1 to inf-1];
+		Rank_ Rank + di;
+		if ( di > 10 )
+		 then begin "count face cards"
+		    High_ High + ( di - 10 );
+		    MyProps[ di-10 ]_ MyProps[ di-10 ] + 1;
+		 end "count face cards"
+	     end "each card";
+
+	if ( Size < 3 )			! few cards ;
+	 then Dist_ Dist + (3 - Size);
+!	if ( Size > 5 )			! many cards ;
+!	 then Dist_ Dist + (Size - 5);
+
+	if ( Size = 0 )			! if a void... ;
+	 then continue;			!  nothing to show ;
+
+	if ( MyProps[ 4 ] )
+	 then if ( MyProps[ 3 ] )
+	       then Quick_ Quick + 4		! A-K = 2.0 ;
+	       else if ( MyProps[ 2 ] )
+		     then Quick_ Quick + 3	! A-Q = 1.5 ;
+		     else Quick_ Quick + 2	! A   = 1.0 ;
+	 else if ( MyProps[ 3 ] )
+	       then if ( MyProps[ 2 ] )
+		     then Quick_ Quick + 2	! K-Q = 1.0 ;
+		     else Quick_ Quick + 1;	! K   = 0.5 ;
+
+	Line_ Line + 1;		! one suit per line ;
+	Msg( R + Line, C, S );
+
+     end "show suit";
+
+    Msg( R, C, HandName[ H ] &
+		(if ( Bidding )
+		  then	"  "&cvs(High)
+			&(if Dist
+			   then "  d "&cvs(Dist)
+			   else null)
+			&"  c "&cvs(Rank)
+			&(if Quick
+			   then "  q "&cvs( Quick div 2 )&
+			      (if Quick mod 2 then ".5" else null)
+			   else null)
+		  else null )  );
+
+end "show hands";
+
+
+! display each hand - in a diamond shape
+!	   N (2)
+!    W (1)       E (3)
+!	   S (4)
+!
+;
+
+procedure DisplayHand;
+begin "show of hands"
+    preset!with 17, 10, 3, 10;    own integer array rows[1:BridgeHands];
+    preset!with  7,  2, 7, 11;    own integer array cols[1:BridgeHands];
+    integer li, mi, mx, cx, hi, wcount, tcount;
+    string Name;
+
+    Msg( BidRow, 1, DealString );
+
+    mx_ Dealer;				! remember the dealer ;
+    for hi_ 1 max (Bids - 7) upto (Bids min 12)
+     do begin "show bidding"		! show 8 lines ;
+	Name_ null;
+	for li_ 1 upto BridgeHands
+	 do begin "set bids"
+	    Name_ Name & TextBid( BidLine[ hi,mx ] );
+	    mx_ (mx mod BridgeHands) + 1;
+	 end "set bids";
+	Msg( BidRow+hi, 1, Name );	! of the bidding ;
+     end "show bidding";
+
+    Msg( BidRow+1, 15, (if Bidding then "Bid" else "Play") );
+    if ( 1 leq BidSuit leq BridgeBids ) and ( 1 leq BidRank leq 7 )
+     then begin "show contract"
+	Msg( BidRow,   12, "Contract" );
+	Msg( BidRow+1, 12, cvs(BidRank) &"-"& SuitName[BidSuit] );
+     end "show contract";
+
+    if ( Bidding )
+     then for hi_ BridgeBids downto 1
+	   do begin "show bids"
+	      Name_ ( SuitName[ hi ] &"       " )[1 for 7];
+	      if length( SuitBid[ hi ] )
+	       then for li_ 1 upto length( SuitBid[ hi ] )
+		     do Name_ Name &" "&
+			      HandName[ SuitBid[ hi ][li for 1] ][1 for 1];
+	      Msg( BidRow+16+BridgeBids-hi, 14, Name );
+	   end "show bids"
+     else for hi_ BridgeHands downto 1
+	   do Msg( BidRow+17+BridgeSuits-hi, 14,
+		    ( SuitName[ hi ] &"       " )[1 for 7] &
+		    ( "   "& cvs( li_ CardCount(Play[hi]) ) )[inf-3 to inf] &
+		    ( "   "& cvs( 13-li ) )[inf-3 to inf]
+		 );
+
+    ! display the current hand ;
+
+    Msg( BidRow, 15, HandName[ Hands ] );	! put up the hand name ;
+
+    li_ TrkRow-1;
+    for hi_ 1 max (Trick-3) upto Trick min BridgeTricks
+     do begin "show tricks"			! display scrolling tricks ;
+
+	Name_ Null;
+	if ( Tricks[ hi,0 ] )
+	 then begin "trick in play"
+	    for mi_ 1 upto BridgeHands
+	     do if ( Tricks[ hi,0 ] = Tricks[ hi,mi ] )
+		 then done;
+	    for mx_ 1 upto BridgeHands
+	     do if ( Tricks[ hi,mi ] )
+		 then begin "play trick"
+		    Name_ Name &("  "& Cviss( Tricks[ hi,mi ] ))[inf-3 to inf];
+		    mi_ (mi mod BridgeHands) + 1;
+		 end "play trick";
+	 end "trick in play";
+
+	Msg( li_ li+1, 7, Name );		! show the four tricks ;
+     end "show tricks";
+
+    mx_ Dealer;
+    for hi_ 1 upto Bridgehands
+     do begin "each hand"
+	if not( invisible )			! if not invisible mode ;
+	   or ( mx = Hands )			!   or hand is my hand ;
+	   or ( not( Bidding )  and		!   playing and ;
+		( Tricks[1,0] ) and		!   initial trick lead ;
+		( mx = Dummy			!   dummy hand or declarer ;
+		or ( Hands = Dummy and mx = Declarer ) ) )
+	 then ShowHand( mx, rows[hi], cols[hi] );
+	mx_ ( mx mod Bridgehands ) + 1;		! cycle the hands ;
+     end "each hand";
+
+    wcount_ tcount_ 0;				! clear counts ;
+    for hi_ 1 upto Trick-1			! foreach winning hand ;
+     do begin "winning hands"
+
+	if ( 1 leq ( li_ Winners[ hi ] ) leq BridgeHands )
+	 then Msg( BidRow+2 + hi, 15, HandName[ li ] )
+	 else Msg( BidRow+2 + hi, 15,  cvs( Winners[ hi ] ) );
+	if ( li = We[1 for 1] )  or  ( li = We[2 for 1 ] )
+	 then wcount_ wcount + 1;
+	if ( li = They[1 for 1] )  or  ( li = They[2 for 1 ] )
+	 then tcount_ tcount + 1;
+
+	Name_ Cviss( Tricks[ hi,-1 ], "Unk" );
+	Msg( BidRow+2 + hi, 16,
+	     " "& SuitName[ Tricks[ hi,0 ] lsh -15 ][1 for 1] &
+	     (if Name[inf for 1] = SuitName[ Tricks[ hi,0 ] lsh -15 ]
+	       then " " else "*") & Name[1 to inf-1] );
+
+     end "winning hands";
+
+    if not( Bidding )
+     then begin "keep score"
+
+	Msg( MsgRow, 12, "We "&cvs( wcount ) );
+	Msg( MsgRow, 14, "They "&cvs( tcount ) );
+
+	if ( 0 geq hi_ BidRank + 6 - wcount )
+	 then Msg( BidRow+2, 12, "Made "& (if hi then "+"&cvs(-hi) else null) )
+	 else if ( Trick > li_ BridgeTricks+1 - hi )	! hand lost ;
+	       then Msg( BidRow+2, 12, "Down "&cvs(Trick-li) )
+	       else Msg( BidRow+2, 12, "Need "&cvs(hi) );
+
+	Name_ null;
+	for hi_ 1 upto length( We )
+	 do Name_ Name &" "& HandName[ We[hi for 1] ][1 for 1];
+	Msg( MsgRow-1, 12, Name );
+
+	Name_ null;
+	for hi_ 1 upto length( They )
+	 do Name_ Name &" "& HandName[ They[hi for 1] ][1 for 1];
+	Msg( MsgRow-1, 14, Name );
+
+     end "keep score";
+
+
+end "show of hands";
+
+
+! display a help message
+;
+
+procedure DisplayHelp;
+begin "help me"
+
+    Msg(  4,4, ["           Command Summary"] );
+    Msg(  6,4, [" 0-10,J-A  Set bid or card value"] );
+    Msg(  7,4, [" C S H D   Bid a suit or play a card"] );
+    Msg(  8,4, [" D or R    Without an argument, double or redouble"] );
+    Msg(  9,4, [" N         No Trump during bidding"] );
+    Msg( 10,4, [" P         Pass during bidding"] );
+    Msg( 11,4, [" B         Backup a play or bid"] );
+    Msg( 12,4, [" I         Toggle invisible mode"] );
+    Msg( 13,4, [" F         Toggle fixed-dealer mode"] );
+    Msg( 14,4, [" W         Write current hand to storage"] );
+    Msg( 15,4, [" - or n-   New Deal or Deal nth hand from storage"] );
+    Msg( 17,4, [" ?         Display this text"] );
+    Msg( 18,4, ["^Z         Exit to monitor level (also ^C)"] );
+
+end "help me";
+
+
+! Fill the buffer with text to be displayed
+;
+
+procedure SetupBuffer;
+begin "setup buffer"
+    integer BP;
+
+    arrclr( Buffer, cvasc("     ") );	! clear the display ;
+
+    Case ( ThisScreen )
+     of begin "do right screen"
+	[DpyHand]  DisplayHand;		! show of hands ;
+	[DpyHelp]  DisplayHelp;		! help message  ;
+	[Else]      begin
+		    end
+     end "do right screen";
+
+    Msg( MsgRow, 1, MsgLine );
+    Msg( CmdRow, 1, CmdLine );
+    
+end "setup buffer";
+
+
+simple procedure SetupDummy;
+begin "setup dummy"
+    integer di, hi;
+
+    Declarer_ 0;
+    hi_ SuitBid[ BidSuit ][inf for 1];	! Select winning bidder ;
+
+    for di_ 1 upto length( SuitBid[ BidSuit ] )
+     do if ( Declarer )
+	 then done
+	 else if not( (hi xor ( SuitBid[ BidSuit ][di for 1] )) land 1 )
+	 then Declarer_ SuitBid[ BidSuit ][di for 1];
+
+    Dummy_ if Declarer > 2		! need to split them so ;
+	    then Declarer - 2		!  we can flip low to high ;
+	    else Declarer + 2;		!  and high to low ;
+     
+    We_ Declarer & Dummy;		! setup our accounts ;
+    They_ if ( Declarer land 1 )
+	   then ( Declarer + 1 ) & ( Dummy + 1 )
+	   else if ( Declarer land 2 )
+	         then ( Declarer + 1 ) & ( Dummy - 3 )
+		 else ( Declarer - 3 ) & ( Dummy + 1 );
+
+    Hands_ (Declarer mod BridgeHands) + 1;
+
+end "setup dummy";
+
+
+simple procedure FigureBid;
+begin "figure bid"
+    integer li, hi, MySuit, MyRank, MyBid;
+    integer MyLine, Brk;
+    string S;
+
+    Arrclr( SuitBid );			! start over ;
+
+    BidSuit_ BidRank_ 0;		! nothing bid yet ;
+    Pass_ Double_ 0;			! none of this either ;
+
+    Hands_ Dealer;			! setup to start with dealer ;
+
+    DealString_ null;
+    for li_ 1 upto BridgeHands
+     do begin "show deal"
+	DealString_ DealString & ( HandName[ Dealer ]&"      " )[1 to BidWid];
+	Dealer_ ( Dealer mod BridgeHands ) + 1;
+     end "show deal";
+
+    for li_ 1 upto (Bids min 8)		! do each line ;
+     do for hi_ 1 upto BridgeHands	!  and each hand ;
+	 do begin "decipher bid"
+
+	    if not( MyBid_ BidLine[ li,Hands ] )
+	     then done;
+
+	    if ( MyRank_ MyBid lsh -3 )
+	     then begin "valid rank"
+
+		BidRank_ MyRank;
+		Pass_ Double_ 0;
+		BidSuit_ MyBid land '7;
+		SuitBidSuit ]_ SuitBid[ BidSuit ] & Hands;
+
+	     end "valid rank"
+	     else begin "pass or double"
+
+		if ( MyBid = PassBid )
+		 then Pass_ Pass + 1
+		 else Double_ Double + 1;
+
+	     end "pass or double";
+
+	    Hands_ (Hands mod BridgeHands) + 1;
+
+	 end "decipher bid";
+
+    Bidding_ if ( BidRank  and  BidSuit  )
+	      then ( 3 > Pass )
+	      else ( true );
+
+end "figure bid";
+
+
+boolean procedure NewHand( string S );
+begin "new hand"
+    integer Rank, Suit, li;
+    string Name, Card;
+
+    Name_ Scan( S, Tok, I );		! get hand name ;
+    for li_ 1 upto BridgeHands		! check it against the real names ;
+     do if kequ( HandName[ li ],Name )	! if we see a match ;
+	 then done;			!  we are done;
+
+    if not( 1 leq li leq BridgeHands )	! verify index is within range ;
+     then return( Needhelp( "bad hand name "& Name ) );
+
+    Name_ Scan( S, Tok, I );		! first suit name ;
+    while ( length( S ) )		! as long as we have something ;
+     do begin "each suit"
+
+	for Suit_ 1 upto BridgeSuits		! figure out what suit ;
+	 do if ( Name = SuitName[ Suit ] )
+	  then done;
+
+	if not( 1 leq Suit leq BridgeSuits )	! verify that we have a suit ;
+	 then return( NeedHelp( "bad suit name "& Name ) );
+
+	while ( length( S ) )
+	 do begin "each card"
+
+	    Card_ Scan( S, Tok, I );		! get a card ;
+	    for Rank_ 1 upto BridgeSuits	! check to see if a suit ;
+	     do if ( Card = SuitName[ Rank ] )
+		 then begin "change suits"
+		    Name_ Card;
+		    continue "each suit";
+		 end "change suits";
+
+	    for Rank_ 2 upto BridgeTricks+1
+	     do if ( Card = RankName[ Rank ] )
+		 then done;
+
+	    if not( 2 leq Rank leq BridgeTricks+1 )
+	     then return( NeedHelp( "bad card "& Card ) );
+
+	    Hand[ li,Suit ]_ Hand[ li,Suit ] lor EachCard[ Suit,Rank ];
+
+	 end "each card";
+
+     end "each suit";
+
+    return( true );			! made it!  so return ok ;
+
+end "new hand";
+
+
+simple boolean procedure OffLine( integer Arg, Cmd );
+begin
+    boolean flag;
+    integer chan, brk, count, li, hi, mx, MyBid;
+    string  S, Name;
+
+    case ( Cmd ) of begin
+    ["-"] if not( Arg )			! request new deal ;
+	   then return( false )		!  then use our deck ;
+	   else begin "read entry"	!  else attempt file read ;
+	      arrClr( Hand );		! clear hand values ;
+	      arrClr( Play );
+	      flag_ true;		! assume good at first ;
+	      if ( 0 < chan_ VMFile( DataFile, VM$Read, 1, '777 ) )
+	       then begin "reading file"
+		  if ( Arg > 1 )	! argument specified? - skip ;
+		   then flag_ VMMove( chan, (Arg-1)*EntrySize );
+		  if not( flag ) or ( VMGetC( chan ) = VMGetC(chan,VM$Size) )
+		   then MsgLine_ "not enough hands saved: "&cvs(Arg)
+		   else begin "get dealer"
+		      if ( flag_ length( S_ VMLine( chan,brk ) ) )
+		       then begin "first line"
+			  Name_ Scan( S,Tok,brk );
+			  for Dealer_ 1 upto BridgeHands
+			   do if kequ( HandName[ Dealer ],Name )
+			       then done;
+			  if not( 1 leq Dealer leq BridgeHands )
+			   then MsgLine_ "Bad file format, Dealer: "& Name & S;
+			  Name_ Scan( S,Tok,brk );
+			  for li_ 1 upto BridgeHands
+			   do if kequ( HandName[ li ],Name )
+			       then done;
+			  if not( 1 leq li leq BridgeHands )
+			   then MsgLine_ "Bad file format, Hand: "& Name & S;
+			  count_ 0;  Hands_ li;  Bids_ 1;
+			  arrClr( BidLine );
+			  while ( length( S ) )
+			   do begin "set bids"
+			      BidLine[ Bids,Hands ]_ PackBid( Scan( S,Tok,brk ) );
+			      if ( 0 = ( count_ ((count+1) mod BridgeHands ) ) )
+			       then Bids_ Bids + 1;
+			      Hands_ (Hands mod BridgeHands) + 1;
+			   end "set bids";
+			  FigureBid;
+			  if not( Bidding )	! must be playing ;
+			   then SetupDummy;	! setup so we can play ;
+			  Hands_ li;		! where were we? ;
+		       end "first line"
+		       else return( NeedHelp( "not enough hands saved: "&cvs(Arg) ) );
+		   end "get dealer";
+
+		  if ( flag )			! everything still ok? ;
+		   then for count_ 1 upto BridgeHands	! read 4 lines ;
+			 do begin "each hand"
+			    if ( Flag_ length( S_ VMLine( chan, brk ) ) )
+			     then Flag_ NewHand( S );
+			    if not( Flag )	! error? then stop ;
+			     then begin "bad format"
+				MsgLine_ "Bad file format, Hands: "& S;
+				done;		! no use to continue ;
+			     end "bad format";
+			 end "each hand";
+
+		  VMFree( chan );	! clear channel ;
+		  if ( Flag )		! if all went ok ;
+		   then return( true )	!  we are done ;
+		   else return( false );
+	       end "reading file"
+	       else return( NeedHelp( "no stored hands" ) );
+	      ThisHand_ Hands;		! setup hands in order ;
+	   end "read entry";
+
+    ["W"] if ( 0 < chan_ VMFile( DataFile, VM$Update, 1, '777 ) )
+	   then begin "writing entry"
+
+	      count_ 1;				! assume first hand. ;
+	      while ( VMMove(chan, EntrySize) )	! while able to move ;
+	       do count_ count + 1;		! increment count... ;
+
+	      VMText( chan, HandName[Dealer] );	! dealer ;
+	      VMText(chan," "&Handname[Hands]);	! bidder ;
+
+	      mx_ Dealer;			! starting with dealer ;
+	      for li_ 1 upto Bids		! also print any bid ;
+	       do for hi_ 1 upto BridgeHands
+		   do if ( MyBid_ BidLine[ li,mx ] )
+		       then begin
+			  VMText( chan, " "& TextBid( MyBid ) );
+			  mx_ (mx mod BridgeHands) + 1;
+		       end;
+
+	      VMText( chan, crlf );		! finish with a crlf ;
+
+	      mx_ Dealer;			! start with dealer ;
+	      for li_ 1 upto BridgeHands	! write each hand to file ;
+	       do begin "write hands"
+		  VMText( chan, TextHand( mx ) & crlf );
+		  mx_ (mx mod BridgeHands) + 1;
+	       end "write hands";
+
+	      VMFree( chan );
+	      MsgLine_ "Entry "& cvs( count ) &" written to file";
+
+	   end "writing entry"
+	   else return( NeedHelp( "cannot store hand, enter error" ) );
+
+    [else] return( NeedHelp( "illegal offline command" ) )
+
+    end;
+
+    return( true );
+end;
+
+
+simple procedure NewDeal( integer Arg( 0 ) );
+begin "new deal"
+    integer li;
+
+    CmdArg_ 0;				! reset bidding/play argument ;
+
+    arrClr( Tricks );			! clear tricks ;
+    Trick_ 1;				! reset hand ;
+
+    arrClr( Winners );			! no winners yet ;
+
+    MsgLine_ null;			! clear messages ;
+
+    if ( Arg = -1 )			! special redeal same deck ;
+     then begin "redeal"
+	for li _ 1 upto 52		! use last deck dealt ;
+	 do Deck[ li ]_ LastDeck[ li ];
+	DealCards;			!  deal the cards ;
+	Dealer_ Hands_ ThisHand;	!  reset order of hands ;
+	return;				!  and return ;
+     end "redeal";
+
+    Bidding_ true;			! initially bidding ;
+    Arrclr( BidLine );			! clear bid info ;
+    Bids_ 1;				! start bidding at line 1 ;
+    BidSuit_ BidRank_ Pass_ Double_ 0;	! initialize flags ;
+
+    We_ They_ null;			! clear both partnerships ;
+
+    if not( FixedDeal )			! if rotating deal, do so ;
+     then Dealer_ ( Dealer mod BridgeHands ) + 1;
+
+    FigureBid;				! this ought to work here ;
+
+    if not( OffLine( Arg, "-" ) )	! offline request or ;
+     then begin "use our deck"		! just a new deal? ;
+
+	for I_ 0 upto Ran( 7 )		! and shuffle it ;
+	 do Shuffle( Deck );		! a random amount ;
+
+	DealCards;			! deal out the cards ;
+
+     end "use our deck";
+
+end "new deal";
+
+
+simple integer procedure BestHand( integer Meld );
+begin "best hand"
+    own integer di, Winner;
+    integer MySuit, MyRank, Card;
+    integer MaxTrump, MaxLead, LeadSuit;
+
+    MaxTrump_ MaxLead_ 0;		! clear top cards ;
+    LeadSuit_ Tricks[ Meld,0 ] lsh -15;	! set lead suit ;
+
+    for di_ 1 upto BridgeHands
+     do begin "find winning trick"
+
+	MySuit_ ( Card_ Tricks[ Meld,di ] ) lsh -15;
+
+	for MyRank_ 2 upto BridgeTricks+1
+	 do if ( Card = EachCard[ MySuit, MyRank ] )
+	     then done;
+
+	if ( MySuit = LeadSuit ) and	! lead suit? - check for win ;
+	   ( MyRank = MaxLead_ MaxLead max MyRank )
+	   and not( MaxTrump )		! if any trump, not a winner ;
+	 then Winner_ di;
+
+	if ( MySuit = BidSuit ) and	! trump suit? - check for win ;
+	   ( MyRank = MaxTrump_ MaxTrump max MyRank )
+	 then Winner_ di;
+
+     end "find winning trick";
+
+    return( Winner );
+
+end "best hand";
+
+
+boolean procedure FixupBidding;
+begin "fix up the bid"
+
+    if ( Hands = Dealer )		! dealer goes first ;
+     then begin "backup a bid"
+
+	if ( Bids leq 1 )		! apparently no bids ;
+	 then return( false)		! at this time ;
+	 else Bids_ Bids - 1;		! backup to previous ;
+
+     end "backup a bid";
+
+    if not( Hands_ Hands - 1 )		! now backup the hand ;
+     then Hands_ BridgeHands;		! to the previous bidder ;
+
+    BidLine[ Bids,Hands ]_ 0;		! and remove the bid ;
+
+    FigureBid;				! figure out the current bid ;
+
+    return( true );
+
+end "fix up the bid";
+
+
+simple boolean Procedure TheBid( integer Arg, Suit );
+begin "the bid"
+    integer MySuit, card, hi;
+
+    if ( Arg > 7 )			! bid out of range ;
+     then return( NeedHelp( "bid too high: "& cvs( Arg ) ) );
+
+    MsgLine_ null;			! clear out previous msgs ;
+
+    if not( Arg )
+     then Case ( Suit ) of begin "single"
+
+	["B"] begin "backup hands"
+	    if ( FixupBidding )		! fixup the bidding ;
+	     then return( true )
+	     else return( NeedHelp( "no bids" ) );
+	 end "backup hands";
+
+	["D"]["R"] begin "re double"
+	    if not( 2 > Double )
+	     then return( NeedHelp( "cannot "&
+			    (if Suit = "R" then "re" else null) &
+			    "double a redouble" ) );
+	    if not( 1 leq BidRank leq 7 and 1 leq BidSuit leq BridgeBids )
+	     then return( NeedHelp( "cannot "&
+			    (if Suit = "R" then "re" else null) &
+			    "double without a bid" ) );
+	    Double_ Double + 1;
+	    Pass_ 0;
+	    BidLine[ Bids,Hands ]_ DoubleBid;
+	 end "re double";
+
+	["P"] begin "passing"
+	    Bidding_ if ( BidRank  and  BidSuit )
+		      then ( 3 > Pass_ Pass + 1 )
+		      else ( 4 > Pass_ Pass + 1 );
+	    BidLine[ Bids,Hands ]_ PassBid;
+	    if not( Bidding )		! on a pass-out ;
+	     then begin "new hand"
+		if ( Pass = 4 )			! low point hands ;
+		 then begin "need deal"
+		    NewDeal;			! setup new deck ;
+		    MsgLine_ "--New Deal--";	! let players know ;
+		    return( true );		! and return ;
+		 end "need deal";
+		Trick_ 1;			! initialize the play ;
+
+		SetupDummy;			! set declarer and dummy ;
+		return( true );			! and return ;
+
+	     end "new hand";
+	 end "passing";
+
+	 [else] return( NeedHelp( "illegal command: "& Suit ) )
+
+     end "single"
+     else begin "supplied"
+
+	if ( Suit = "B" )
+	 then begin "act like rubout"
+	    CmdArg_ CmdArg div 10;
+	    return( true );
+	 end "act like rubout";
+
+	if not( 1 leq Arg leq 7 )	! within legal bid range ;
+	 then return( NeedHelp( "bid out of range: " & cvs( Arg ) & Suit ) );
+
+	for MySuit_ 1 upto BridgeBids
+	 do if ( Suit = SuitName[ MySuit ] )
+	     then done;
+	if not( 1 leq MySuit leq BridgeBids )
+	 then return( NeedHelp( "bad suit: "& Suit ) );
+
+	if ( Arg > BidRank )		! next level? all ok ;
+	 then begin "new rank"
+	    BidRank_ Arg;		! set bid level ;
+	    BidSuit_ MySuit;		! set suit ;
+	 end "new rank"
+	 else if ( Arg = BidRank ) and ( MySuit > BidSuit )
+	       then BidSuit_ MySuit	! higher suit? ;
+	       else return( NeedHelp("bid not high enough: "&cvs(Arg)&Suit) );
+
+	Pass_ Double_ 0;		! reset passing and doubling ;
+	BidLine[ Bids,Hands ]_ Arg lsh 3 + MySuit;
+
+	SuitBid[ MySuit ]_ SuitBid[ MySuit ] & Hands;
+
+     end "supplied";
+    
+    Hands_ (Hands mod BridgeHands) + 1;
+
+    if ( Hands = Dealer )		! back to dealer? ;
+     then if ( 8 < Bids_ Bids + 1 )
+	   then return( NeedHelp( "Please increase the size of BidLine" ) );
+
+    return( true );
+
+end "the bid";
+
+
+boolean procedure ThePlay( integer Arg, Suit );
+begin "the play"
+    own integer TheHand, Winner;
+    integer MySuit, MyRank, index, li;
+    string card;
+
+    if ( Suit = "B" )			! want's to backup a play ;
+     then begin "oh all right"
+
+	if ( TheHand = 0 )		! if we are at the beginning ;
+	 then begin "set last trick"
+
+	    if ( 1 = Trick )		! backup past first trick ;
+	     then begin "backup bid"
+		FigureBid;		! figure bid first ;
+		TheBid( Arg, Suit );	! then act as backup ;
+		return( true );		! and away we go ;
+	     end "backup bid";
+
+	    if ( 1 = Trick_ Trick - 1 )	! backup to first trick ;
+	     then Hands_ (Declarer mod BridgeHands) + 1
+	     else Hands_ BestHand( Trick-1 );
+
+	    TheHand_ BridgeHands;	! position just after last hand ;
+	    Tricks[ Trick,-1 ]_ 0;	! forget that trick is won ;
+	    MsgLine_ null;		! forget any messages too ;
+
+	 end "set last trick";
+
+	TheHand_ 0 max ( TheHand - 1 );	! decrement hand count ;
+	if ( TheHand = 0 )		! if no play this trick ;
+	 then Tricks[ Trick,0 ]_ 0;	! then no lead suit ;
+
+	if not( Hands_ Hands - 1 )	! rotate hand backward ;
+	 then Hands_ Bridgehands;	! oops, go back to top ;
+
+	li_ Tricks[ Trick,Hands ];	! get card ;
+	Tricks[ Trick,Hands ]_ 0;	!  from the table ;
+
+	MySuit_ li lsh -15;		! remember suit ;
+	Hand[ Hands,MySuit ]_ Hand[ Hands,MySuit ] lor li;
+	Play[ MySuit ]_ Play[ MySuit ] land lnot li;
+
+	return( true );			! all done - backed up ;
+
+     end "oh all right";
+
+    for MySuit_ 1 upto BridgeSuits
+     do if ( Suit = SuitName[ MySuit ] )
+	 then done;
+
+    if not( 1 leq MySuit leq BridgeSuits )
+     then return( NeedHelp( "bad suit: "& Suit ) );
+
+    if ( Arg < 0 )			! Arg is a facecard? ;
+     then Arg_ -Arg;			!   make it readable ;
+
+    if ( 2 leq Arg leq 10 )		! within legal card range ;
+     then MyRank_ Arg			! yes, use integer value ;
+     else begin "calculate arg"
+	for MyRank_ 11 upto BridgeTricks+1
+	 do if ( Arg = RankName[ MyRank ] )
+	     then done;
+	if not( 11 leq MyRank leq BridgeTricks+1 )
+	 then return( NeedHelp( "illegal card: "& Arg & Suit ) );
+     end "calculate arg";
+
+    if not( 2 leq MyRank leq BridgeTricks+1 )
+     then return( NeedHelp( "illegal card: "& cvs(Arg) & Suit ) );
+
+    if ( Hand[ Hands,MySuit ] land Ranks[ MyRank ] )	! card in hand? ;
+     then begin "check lead"
+	if not( li_ Tricks[ Trick,0 ] lsh -15 )	! any lead suit? ;
+	 then Tricks[ Trick,0 ]_ EachCard[ MySuit,MyRank ]
+	 else if ( MySuit neq li )		! yes, same as mine? ;
+	       then if ( Hand[ Hands,li ] land AnyCard )
+		     then return( NeedHelp( "must follow suit" ) );
+	Hand[ Hands,MySuit ]_ Hand[ Hands,MySuit ] land lnot Ranks[ MyRank ];
+     end "check lead"
+     else return( NeedHelp( "card not in hand: " &
+			  RankName[ MyRank ] &" "& SuitName[ MySuit ] ) );
+
+    TheHand_ TheHand + 1;			! set from 1 to 4 ;
+
+    Tricks[ Trick,Hands ]_ EachCard[ MySuit,MyRank ];
+    Play[ MySuit ]_ Play[ MySuit ] lor Ranks[ MyRank ];
+
+    for li_ 1 upto BridgeHands			! for each hand ;
+     do if not( Tricks[ Trick,li ] )		! see if a card was played ;
+	 then done;				! if not, continue ;
+    if not( 1 leq li leq BridgeHands )		! check hand index ;
+     then begin "setup next trick"		! out of range, all played ;
+
+	Hands_ Winners[ Trick ]_ BestHand( Trick );	! Winning hand ;
+	Tricks[ Trick,-1 ]_ Tricks[ Trick,Hands ];	! Winning card ;
+
+	TheHand_ 0;				! clear backup hand-count ;
+
+	if ( ( Trick_ Trick + 1 ) > BridgeTricks )	! if still on regular tricks ;
+	 then MsgLine_ "Game over!   Type ""-"" to play again" &
+			    ", ""^C"" to quit.";
+
+     end "setup next trick"			! winner leads next hand ;
+     else Hands_ (Hands mod BridgeHands) + 1;	! else rotate to next hand ;
+
+    if ( Trick leq BridgeTricks )
+     then MsgLine_ Null;		! clear message line ;
+    return( true );			! and we are done ;
+
+end "the play";
+
+! Command Scanner
+;
+
+procedure CommandScan;
+begin "command scan"
+  integer C;
+
+  ThisScreen_ DpyHand;
+
+  while ( T!ChrP )
+   do begin "get a character"
+
+    C_ T!GetC;
+
+    Case ( C )
+     of begin "each character"
+
+	[" "]
+	    begin end;
+
+	["C"-'100]["Z"-'100]
+	    StillRunning_ false;
+	[#CR][#Esc] begin
+		MsgLine_ Null;
+		CmdArg_ 0;
+	     end;
+	[#FF] begin
+		arrclr( Buffer, cvasc( #sp&#sp&#sp&#sp&#sp ) );
+		R!Disp( Buffer, true, 1, 1 );
+	     end;
+
+	["?"]
+	    ThisScreen_ DpyHELP;
+
+	["1"]["2"]["3"]["4"]["5"]["6"]["7"]["8"]["9"]["0"]
+	    CmdArg_ (CmdArg * 10) + (C - "0");
+
+	["H"-'100]['177]
+	    if ( CmdArg > 0 )
+	     then CmdArg_ CmdArg div 10
+	     else CmdArg_ 0;
+
+	["A"]["a"]["K"]["k"]["Q"]["q"]["J"]["j"]
+	    if not( CmdArg ) and not( Bidding )
+	     then CmdArg_ -(C land '137)
+	     else NeedHelp( "illegal card value" );
+
+	["F"]["f"]
+	    FixedDeal_ not( FixedDeal );
+
+	["I"]["i"]
+	    Invisible _ not( Invisible );
+
+	["P"]["p"] begin
+	    if ( Bidding )
+	     then TheBid( CmdArg, C land '137 )
+	     else NeedHelp( "illegal command, type ? for help" );
+	    CmdArg_ 0;
+	 end;
+	["B"]["b"]["C"]["c"]["D"]["d"]["H"]["h"]
+	["N"]["n"]["S"]["s"]
+	 begin
+	    if ( Bidding )
+	     then TheBid( CmdArg, C land '137 )
+	     else ThePlay( CmdArg, C land '137 );
+	    CmdArg_ 0;
+	 end;
+	["R"]["r"]
+	 begin
+	    if ( Bidding )
+	     then TheBid( CmdArg, C land '137 )
+	     else NewDeal( -1 );
+	    CmdArg_ 0;
+	 end;
+	["-"] NewDeal( CmdArg );
+
+	["W"]["w"]["L"]["l"] 
+	    OffLine( CmdArg, C land '137 );
+
+	[else] NeedHelp
+
+	end "each character";
+
+     end "get a character";
+
+    if not( Bidding or BidRank or BidSuit )
+     then NewDeal;
+
+    if ( Trick > BridgeTricks )		! is game over? ;
+     then CmdLine_ null			!  yes, don't ask for card ;
+     else if ( Bidding )		! else, preset cmdline ;
+	   then CmdLine_ "Bid: "	!  with the proper prompt ;
+	   else CmdLine_ "Card: ";
+
+    if ( CmdArg )
+     then if ( CmdArg > 0 )
+	   then CmdLine_ CmdLine & Cvs( CmdArg )
+	   else CmdLine_ CmdLine & -CmdArg & null;
+
+  end "command scan";
+
+
+! Routine to sleep forever or until a character arrives
+;
+
+procedure Snooze;
+begin
+
+    calli( !xwd( '31, 0 ), '72 );	! hiber  till character ;
+
+end;
+
+
+!	***  M A I N   P R O G R A M  ***
+;
+
+    setbreak( Tok_ getbreak, " "&#HT, crlf&" "&#ht, "SNIFT" );
+    VMInit( 0, 0 );			! no cache ;
+
+    FixedDeal_ Invisible_ true;		! default "on" ;
+    BridgeDeck;				! initialize deck ;
+    Dealer_ 1;				! start with "south" as dealer ;
+    NewDeal;				! set everything straight ;
+
+    InitDpy;				! initialize display ;
+
+    while ( StillRunning )
+     do begin "main loop"
+
+	SetupBuffer;			! put display into buffer ;
+
+	R!Disp( Buffer, true, 1, 1 );	! re-display, abort on input ;
+	if ( length( CmdLine ) )	! if anything, then wait ;
+	 then T!Cpos( CmdRow, length( CmdLine ) + 1 );
+
+	if ( T!ChrP )			! if character received ;
+	 then CommandScan		!  process as a command ;
+	 else Snooze;			!  else sleep forever ;
+
+    end "main loop";
+
+  T!Fini;				! finish terminal i/o ;
+
+  call(0,"EXIT");			! exit to EXEC ;
+    
+
+end "CARDS";
+   H= ‰
