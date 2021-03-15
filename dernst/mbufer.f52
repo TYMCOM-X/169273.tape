@@ -1,0 +1,407 @@
+	SUBTTL	GCI/WCI Buffer Package - Microcode version
+
+:	HISTAB will contain 100 one word entries.  Each entry contains
+:	a one byte character, one byte of buffer number, and a halfword
+:	address of the caller of GCI/WCI.  The table is circular.
+
+:	the following parameters MUST be defined before assembly:
+:	NBUF	the number of buffers to create
+:	NBFLET	the number of bufferlets to create
+:
+:	may JAL R10,CRASH on certain conditions
+
+:	Each routine is called with:
+:	Link on R4
+:	R0 = argument
+:	R1 = buffer index (buffer number*4)
+
+:	routines:
+:	IZBF	link on R5, used to initialize buffers
+:	GCI	get a character from buffer
+:	WCI	write a character into buffer
+:	EMPTY	empty (flush) buffer
+
+:	buffer index may be used to index into the following arrays
+:	from external routines:
+:	BB	buffer start address
+:	BE	buffer end address
+:	BF	buffer flags
+:	BCT	buffer counts
+
+:	Note: The BCT array consists of halfwords stored on
+:		halfword boundaries.
+
+:	Note: The BF array consists of halfwords stored on
+:		fullword boundaries.
+
+:	The following should also be defined externally:
+:	FLAGS	a bit array of length corresponding to max buffer flag value
+:
+
+
+
+	GL	GCI,WCI,BPUTCH,PUTCH,GETCH
+	GL	FLAGS,CRASH
+	GL	BF,BCT,BB,BE,REBL
+	GL	IZBF,EMPTY,GCPEEK,GCSCAN,MCI
+	GL	NBUF,NBFLET,BUFTRC,LSTBFZ,LSTBSZ,BUFREG
+  IF	\BUFTRC
+  ELSE
+BUFTRC	EQ	0
+	REMARK	%*** Define BUFTRC EQ 1 if debug trace desired
+  EI
+
+:	THE DATA FOR THESE ROUTINES
+	SEG	A.DATA		:PLACE IN DATA AREA
+REBL	HC	0		:FREE LIST POINTER FOR RESERVE STORAGE LIST
+REBC1	HC	0		:COUNTS TIMES BUFFER STORAGE WAS MOVED TO MAIN FREE LIST
+REBC2	HC	0		:COUNTS TOTAL NUMBER OF BUFFER ZAPS
+BFZ	HC	-1		:LAST BUFFER ZAPPED
+BUFREG	WS	10		:REGISTER SAVE AREA
+LSTBFZ	HC	-1		:LAST BUFFER ZAPPED
+LSTBSZ	HC	0		:SIZE OF LAST BUFFER ZAPPED
+
+:THE FOLLOWING HAVE BEEN MOVED TO XCOMOP SINCE THE ARE BIG AND NEED TO GO
+: TO THE 1ST SEGMENT
+:BB	WS	NBUF		:BUFFER START ADDRESS
+:BE	WS	NBUF		:BUFFER END ADDRESS
+:BF	WS	NBUF		:BUFFER FLAGS
+:BCT	EQ	BF+2		:BUFFER COUNTS
+
+  IF	BUFTRC
+	SEG	A.WTBL
+	GL	HISX,HISTAB
+HISX	HC	0		:INDEX FOR HISTORY
+HISTAB	HS	200		:HISTORY DATA...400 BYTES...100 HISTORY ENTRIES
+  EI
+
+
+
+:	CODE SECTION
+	SEG	A.CODE		:PLACE IN CODE ARAEA
+
+
+
+:	Bufferlet Structure 
+:	===================
+: LINK (at end of each bufferlet with data) - points at end of next
+:				 bufferlet with data (ie. at next LINK)
+: Ci's - chars in 1st bufferlet
+: Di's - chars in 2nd bufferlet
+: BUFERS - contains a pointer to end of 1st bufferlet on free list
+:
+:
+:  BUFERS
+:-----------------------------------------------------------------------------
+:|  FREE  | C1 | C2 | C3 | C4 ...| CN |  LINK  | D1 | D2 | ... | DN |  LINK  |
+:-----------------------------------------------------------------------------
+
+
+:	INITIALIZE BUFFERS
+IZBF	LIS	R0,0		:SET A CONSTANT
+	LHI	R1,NBUF*4-4	:FOR ALL BUFFERS
+IZBF1	STH	R0,BCT,R1,	:SET EMPTY
+	ST	R0,BB,R1,	:CLEAR START POINTER
+	ST	R0,BE,R1,	:CLEAR END POINTER
+	LHL	R2,BF,R1,
+	RBT	R2,FLAGS	:TURN OFF FLAG BIT
+	SIS	R1,4
+	JGEBS	IZBF1
+	LHI	R2,NBFLET	:FOR ALL BUFFERLETS
+	LI	R1,NBFLET*10	:BUFFERLET POINTER ADDRESS
+	STH	R0,BUFERS,R1,	:TERMINATE LIST
+IZBF2	STH	R2,BUFERS-10,R1,	:LINK LAST TO THIS
+	ST	R0,BUFERS-0E,R1,	:CLEAR DATA AREA
+	ST	R0,BUFERS-0A,R1,
+	ST	R0,BUFERS-06,R1,
+	STH	R0,BUFERS-02,R1,
+	SI	R1,10
+	SIS	R2,1		:DECREMENT BUFFER #
+	JG	IZBF2		:REPEAT FOR ALL BUFFERLETS
+
+  IF	BUFTRC
+	STH	R0,HISX,,	:RESTART HISTORY INDEX
+  EI	BUFTRC
+
+	LCS	R0,1
+	STH	R0,LSTBFZ,,
+	JR	R5
+
+
+:	CHARACTER HANDLERS. THESE ROUTINES PASS BFR CHR IN R0,
+:	R1 FOR TWICE THE BUFFER NUMBER, R2,R3 FOR WORKING REGISTERS,
+:	R4 IS LINK REGISTER.
+
+:	GCI AND WCI HAVE BEEN MOVED TO XCOMBU.
+
+:	RAN OUT OF FREE STORAGE
+:	TRY TO ZAP THE LARGEST BUFFER TO GAIN MORE SPACE.
+:	(R2)=LINK
+WRE	STM	R0,BUFREG,,	:SAVE ALL REGISTERS
+	JAL	R8,FNDZAP,,	:FIND A PORT AND ZAP IT TO GAIN SPACE
+	SKIPAD(WRECSH)		:GO CRASH
+	LM	R0,BUFREG,,	:RESTORE REGISTERS
+	JR	R2
+WRECSH	TRAP(R1,06)		:COULD NOT FIND A BUFFER TO ZAP
+
+  IF	BUFTRC
+:	UPDATE HISTORY (TRACE) AFTER EVERY BUFFER OPERATION
+HIST	LH	R3,HISX,,		:GET HISTORY RING INDEX
+	AIS	R3,4		:BUMP TO NEXT ENTRY
+	NHI	R3,3FF		:ACCOUNT FOR FOLDING
+	STH	R3,HISX,,		:SAVE IT AGAIN
+	STB	R0,HISTAB,R3,	:ENTRY (0) = CHARACTER
+	LR	R2,R1
+	SRHLS	R2,2		:COMPUTE BUFFER #
+	STB	R2,HISTAB+1,R3,	:ENTRY (1) = PORT #
+	ADD1(4,2)		:ADD BIAS
+	STH	R4,HISTAB+2,R3,	:ENTRY (2, 3) = LOCATION WHERE CHAR PLACED
+	JR	R4
+  EI	(BUFTRC)
+
+
+:	PEEK AT FIRST CHAR OF BUFFER
+GCPCRA 	hs	0						:lsh-turbo
+  if	nad68-1	:skywalker					:lsh-turbo
+	trap(r4,06)						:lsh-turbo
+  else								:lsh-turbo
+	JAL	R10,CRASH,,
+	BC	0,0,4*R4,6	:CRASH TYPE 6
+  ei								:lsh-turbo
+GCPEEK	CLHI	R1,4*NBUF	:RANGE CHECK
+	JGEBS	GCPCRA
+	L	R2,BB,R1,	:GET POINTER TO START OF BUFFER DATA
+	CBCT(R3)		:GET COUNT OF CHARS THERE
+	JFS	GCS		:AND SKIP
+
+:	SCAN SUCESSIVE CHARACTERS IN BUFFER
+GCSCAN	CLHI	R1,4*NBUF	:RANGE CHECK
+	JGE	GCPCRA
+GCS	SIS	R3,1
+	JL	GCPCRA		:CRASH IF NO MORE CHARACTERS THERE
+	LB	R0,0,R2		:ELSE GET CHAR
+	AIS	R2,1		:BUMP POINTER FOR NEXT TIME
+	THI	R2,0F
+	JNR	R4		:EXIT IF NOT AT END OF BUFFERLET
+	LHL	R2,0,R2		:ELSE ADVANCE TO NEXT BUFFERLET
+	SLLS	R2,4		:CONVERT TO POINTER
+	AI	R2,BUFERS-0E	:COMPUTE ABSOLUTE ADDRESS OF START
+	JR	R4
+
+
+:	MCI - MOVE ALL CHARACTERS FROM SOURCE TO DESTINATION BUFFER
+:	R5 = SOURCE BUFFER INDEX
+:	R6 = DESTINATION BUFFER INDEX
+:	R7 = LINK
+MCICRA	hs	0						:lsh-turbo
+  if	nad68-1	:skywalker					:lsh-turbo
+	trap(r7,04)						:lsh-turbo
+  else								:lsh-turbo
+	JAL	R10,CRASH
+	BC	0,0,4*R7,4	:FLAG--LINK R7, TYPE 4
+  ei								:lsh-turbo
+MCI	CLHI	R5,4*NBUF
+	JGBS	MCICRA		:RANGE CHECK ON SOURCE
+	CLHI	R6,4*NBUF
+	JGBS	MCICRA		:RANGE CHECK ON DESTINATION
+	LHL	R0,BCT,R5,	:CHECK SOURCE
+	JER	R7		:EXIT IF EMPTY
+	LHL	R1,BF,R6,	:SET DESTINATION FLAG
+	JNFS	MCI1		:FLAG = 0 IS BIT BUCKET
+	LR	R1,R5		:THEN JUST EMPTY BUFFERS
+	LR	R4,R7
+	J	EMPTY
+MCI1	SBT	R1,FLAGS
+	JNFS	MCI2		:NOT EMPTY...GO APPEND
+	L	R0,BB,R5,	:EMPTY...COPY BUFFER START
+	ST	R0,BB,R6,
+	J	MCI4		:AND SKIP TO FINISH TRANSFER OF DATA
+MCI2	L	R1,BE,R6,	:CHECK DESTINATION
+	AIS	R1,1		:IS IT AT END OF BUFFERLET?
+	THI	R1,0F
+	JNFS	MCI3		:SKIP IF NOT
+	L	R2,BB,R5,	:YES...IS SOURCE ON BUFFERLET BOUNDARY?
+	AIS	R2,0E
+	THI	R2,0F
+	JNFS	MCI3		:SKIP IF NOT
+	SI	R2,BUFERS,	:CONVERT TO RELATIVE POINTER
+	SRLS	R2,4		:CONVERT TO BUFFERLET NUMBER
+	STH	R2,0,R1		:APPEND SOURCE TO DESTINATION
+	JFS	MCI4		:AND SKIP
+MCI3	LR	R1,R5		:MOVE A CHAR
+	JAL	R4,GCI
+	LR	R1,R6
+	JAL	R4,WCI
+	LHL	R0,BCT,R5,	:CHECK SOURCE
+	JG	MCI2		:LOOP IF NOT EMPTY
+	JR	R7		:ELSE RETURN
+MCI4	L	R0,BE,R5,
+	ST	R0,BE,R6,	:UPDATE BUFFER END
+	LHL	R0,BCT,R5,
+	LHL	R1,BCT,R6,
+	AR	R0,R1
+	STH	R0,BCT,R6,
+	LIS	R0,0
+	STH	R0,BCT,R5,	:CLEAR SOURCE BUFFER
+	ST	R0,BB,R5,
+	ST	R0,BE,R5,
+	LHL	R1,BF,R5,
+	RBT	R1,FLAGS	:TURN OFF SOURCE FLAG
+	JR	R7		:AND EXIT
+
+:	RETURN ALL THE SPACE USED BY THE BUFFER
+EMPTY	CLHI	R1,4*NBUF	:RANGE CHECK ON BUFFER NUMBER
+	JLFS	C1		:BFR ARGUMENT ACCEPTED
+  if	nad68-1	:skywalker					:lsh-turbo
+	trap(r4,0d)						:lsh-turbo
+  else								:lsh-turbo
+	JAL	R10,CRASH	:BFR ARG OUT OF RANGE
+	BC	0,0,4*R4,0D	:FLAG--LINK R4, TYPE 13d
+  ei								:lsh-turbo
+
+C1	LHL	R2,BCT,R1,	:CHECK CONTENTS
+	JER	R4		:EXIT...BUFFER EMPTY
+	L	R2,BB,R1,	:POINTER TO FIRST CHAR IN BUFFER
+	SI	R2,BUFERS-0E	:GET RELATIVE ADDR, INSURE ROUNDING UP
+	SRLS	R2,4		:CONVERT TO BUFFER #
+	LHL	R3,BUFERS,,	:GET POINTER TO FREE LIST
+	STH	R2,BUFERS,,	:PUT THE BUFFERS BUFFERLETS ONTO FREE LIST
+	L	R2,BE,R1,	:GET POINTER TO LAST CHARACTER IN BUFFER
+	AIS	R2,0E		:LOCATE THE POINTER IN THIS BUFFERLET
+	NHI	R2,-10
+	STH	R3,0,R2		:CHAIN PREVIOUS FREE LIST TO THIS BUFFERLET
+	LHL	R2,BF,R1,
+	RBT	R2,FLAGS	:SET FLAGS TO EMPTY BUFFER
+	LIS	R2,0
+	STH	R2,BCT,R1,	:SET COUNT = 0
+	IF	\DCTFLG
+	STH	R2,DCT,R1,
+	EI
+	ST	R2,BB,R1,	:CLEAR BB
+	ST	R2,BE,R1,	:AND BE
+	JR	R4		:AND RETURN
+
+:	Delete last character written by WCI
+:		R1=4*buffer number
+:		Link on R4
+:		DESTROYS	R0,R2,R3
+
+GCDCRA	TRAP(R1,03)			:invalid buffer #
+
+GCD	HS
+
+GCDALT	CLHI	R1,4*NBUF
+	JGE	GCDCRA			:if buffer # out of range...crash
+	LHL	R0,BCT,R1,
+	SIS	R0,1			:one less char in buffer
+	STH	R0,BCT,R1,
+	JLE	GCDLAS			:if was last char or buffer was empty
+	L	R3,BE,R1,
+	SIS	R3,1			:adjust ptr to last char
+	ST	R3,BE,R1,
+	AHI	R3,BFLTSZ-1
+	THI	R3,BFLTSZ-1
+	JNR	R4			:if did not delete last char in bufferlet
+:	Bufferlet emptied - Return to free list
+	LHL	R2,BUFERS,,		:1st available free buffer number
+	STH	R2,0,R3,		:...becomes 2nd free buffer number
+	SI	R3,BUFERS
+	SRLS	R3,4			:Buffer just emptied
+	STH	R3,BUFERS,,		:...becomes 1st free buffer
+:	Follow bufferlet trail to fixup BE
+	L	R2,BB,R1,		:ptr to 1st char in buffer
+	AHI	R2,BFLTSZ-2
+	NHI	R2,-BFLTSZ		:...is now ptr to link to next bufferlet
+GCDSRH	CLH	R3,0,R2,		:R3 points to link in buffer just emptied
+	JEFS	GCDFIX			:if this is last bufferlet with chars
+	LHL	R2,0,R2,		:  else point to next bufferlet in chain
+	SLLS	R2,4
+	AI	R2,BUFERS
+	JBS	GCDSRH			:...and see if it is the last
+
+GCDFIX	SIS	R2,1			:adjust to end of bufferlet
+	ST	R2,BE,R1,		:...which is last char in buffer
+  IF	BUFTRC
+	J	HIST
+  ELSE
+	JR	R4
+  EI
+
+GCDLAS	JL	GCDCRA			:if tried to get char from empty buffer
+	LHL	R2,BF,R1,
+	RBT	R2,FLAGS		:indicate buffer empty now
+	L	R3,BB,R1,
+	AHI	R3,BFLTSZ-2
+	NHI	R3,-BFLTSZ		:point at link to next free bufferlet
+	LHL	R2,BUFERS,,		:1st free buffer
+	STH	R2,0,R3,		:...becomes 2nd free buffer
+	SI	R3,BUFERS
+	SRLS	R3,4			:Buffer just emptied
+	STH	R3,BUFERS,,		:...becomes top of free list
+	LIS	R0,0
+	ST	R0,BB,R1,		:reset BB
+	ST	R0,BE,R1,		:reset BE
+  IF	BUFTRC
+	J	HIST
+  ELSE
+	JR	R4
+  EI
+
+
+:	WCD	- Write a character to beginning of buffer
+:		R1 - buffer index (4*buffer number)
+:		Link on R4
+:		DESTROYS R2,R6,R3
+WCDCRA	TRAP(R1,05)			:bad buffer number
+
+WCD	CLHI	R1,4*NBUF
+	JGEBS	WCDCRA
+	LHL	R2,BCT,R1,
+:	JE	WCIFRS			:if empty...start a new buffer
+	L	R3,BB,R1,
+	SIS	R3,1			:backup beginning of buffer
+	ST	R3,BB,R1,
+	AHI	R3,BFLTSZ-1
+	THI	R3,BFLTSZ-1
+	JEFS	WCD2			:if backed up over bufferlet boundary
+	SHI	R3,BFLTSZ-1		:  else correct start ptr
+	STB	R0,0,R3		:  and save character
+  IF	BUFTRC
+	J	HIST
+  ELSE
+	JR	R4
+  EI
+
+:	Crossed (backwards) over a bufferlet boundary 
+WCD2	LHL	R6,BUFERS,,		:use 1st free buflet (head of free list)
+	JGFS	WCD4			:if a free buflet exists
+	JAL	R2,WRE			:  else get 1 from reserve tank
+	LHL	R6,BUFERS,,		:use 1st free buflet (head of free list)
+	JGFS	WCD4			:if a free buflet exists
+	TRAP(R1,06)
+WCD4	SLLS	R6,4
+	AI	R6,BUFERS		:...and find succeeding 
+	LIS	R2,0E
+	AHM	R2,BCT,R1,		:add another char to buffer
+	LHL	R2,0,R6			:...free bufferlet
+	STH	R2,BUFERS,,		:...and make it new head of free list
+	SI	R3,BUFERS
+	SRLS	R3,4			:full buflet to...
+	STH	R3,0,R6			:link newly acquired buflet to
+	SIS	R6,1			:ptr to last char of buflet
+	ST	R6,BB,R1,		:...becomes new buffer beginning
+	STB	R0,0,R6		:...and this is where our char goes
+  IF	BUFTRC
+	J	HIST
+  ELSE
+	JR	R4
+  EI
+
+
+
+:	BUFFER SEGMENT
+	SEG	A.BUFF		:BUFFERLETS IN BUFFER AREA
+	BND	10		:Must start on a multiple of 16d bytes.
+BUFERS	HS	1		:Free list pointer
+	HS	8*NBFLET	:STORAGE FOR THE BUFFERLETS (16 bytes each.)
+
