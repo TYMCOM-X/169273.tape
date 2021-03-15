@@ -1,0 +1,610 @@
+entry;
+begin "vpl"
+ 
+  require "copypc.def" source!file;
+  require "copypc.ext" source!file;
+ 
+! *********************************************************************
+  *  VPL:  Valid Packet Layer of COPYPC.X                             *
+  *                                                                   *
+  *  Packets are built from data or commands received from the        *
+  *  application layer if direction of transfer is TOPC.  Bursting    *
+  *  of packets occurs if direction is TOHOST.                        *
+  *                                                                   *
+  *  Procedures include:    VA.create.pkt                             *
+  *                            VA.create.DCB                          *
+  *                            VA.create.DH                           *
+  *                            VA.add.buf.to.pkt                      *
+  *                            VA.pass.cmpl.pkt                       *
+  *                         VA.get.inc.appl.rec                       *
+  *                            VA.fill.data.buffer                    *
+  *                            VA.bld.appl.cmd                        *
+  *********************************************************************;
+ 
+  external procedure BI.get.incoming.pkt;
+ 
+  external procedure BI.finish.pkt;
+ 
+  external procedure SU.abort.transfer(integer abort.type);
+ 
+ 
+ 
+
+  internal procedure VA.create.pkt(integer array application.record;
+                                            integer record.type,
+                                                    link.type,
+                                                    who.sent,
+                                                    importance,
+                                                    cmd.type;
+                                  reference integer appl.rec.size;
+                                            boolean EOF.seen,
+                                                    EOR.seen);
+ 
+      begin "create.pkt"
+ 
+! *********************************************************************
+  *  VA.create.pkt:  Forms outgoing packets using data class bytes,   *
+  *                  data header bytes, and bytes of data or commands,*
+  *                  which are inserted using the outgoing.packet.ptr.*
+  *********************************************************************;
+ 
+      integer DH.type,
+              bytes.to.add,
+              a,
+              x,
+              i,
+              ptr,
+              char,
+              appl.record.ptr;
+ 
+      define dc.DH  = {0};
+      define EOR.DH = {1};
+      define EOF.DH = {2};
+      define EOD.DH = {3};
+ 
+
+          simple procedure VA.create.DCB;
+ 
+            begin "create.DCB"
+ 
+! *********************************************************************
+  *  VA.create.DCB:  Using application parameters supplied by the     *
+  *                  application layer, appropriate bits are placed   *
+  *                  in the data class byte using a bit pointer       *
+  *********************************************************************;
+ 
+            integer DCB.ptr, temp;
+            own integer array DCB[0:0];
+ 
+            DCB.ptr := point(1,DCB[0],-1);
+ 
+            case record.type of
+               begin
+               [data]       idpb(0,DCB.ptr);
+               [command]    idpb(1,DCB.ptr)
+               end;
+            DCB.ptr := point(2,DCB[0],0);
+            case link.type of
+               begin
+               [link]       idpb(00,DCB.ptr);
+               [prim.appl]  idpb(01,DCB.ptr)
+               end;
+            DCB.ptr := point(1,DCB[0],2);
+            case who.sent of
+               begin
+               [requestor]  idpb(0,DCB.ptr);
+               [server]     idpb(1,DCB.ptr)
+               end;
+            case importance of
+               begin
+               [advisory]   idpb(0,DCB.ptr);
+               [important]  idpb(1,DCB.ptr)
+               end;
+            DCB.ptr := point(3,DCB[0],4);
+            case cmd.type of
+               begin
+               [reply.opt]  idpb(0,DCB.ptr);
+               [reply.req]  idpb(1,DCB.ptr);
+               [pos.reply]  idpb(2,DCB.ptr);
+               [neg.reply]  idpb(3,DCB.ptr);
+               [exp.reply]  idpb(4,DCB.ptr);
+               [req.for.info]  idpb(5,DCB.ptr);
+               [not.a.command]  idpb(0,DCB.ptr)
+               end;
+ 
+            ! insert DCB in packet;
+            DCB.ptr := point(8,DCB[0],-1);
+            temp := ildb(DCB.ptr);
+            idpb(temp,outgoing.packet.ptr);
+            room.in.packet := room.in.packet - 1;
+ 
+            end "create.DCB";
+ 
+ 
+
+         simple procedure VA.create.DH;
+ 
+            begin "create.DH"
+ 
+! *********************************************************************
+  *  VA.create.DH:  Data header bytes (either data/command, end-of-   *
+  *                 record, end-of-file, or end-of-data-class) are    *
+  *                 created and added to the packet.  A data/command  *
+  *                 DH indicates how many bytes of data/command       *
+  *                 follow, with the maximum number of bytes allowed  *
+  *                 per DH being 31.                                  *
+  *********************************************************************;
+ 
+            integer DH;
+ 
+            case DH.type of
+               begin
+                  [dc.DH] begin                                ! data/cmd;
+                      if (room.in.packet >= appl.rec.size) and
+                       (appl.rec.size <= 31) then
+                            DH := appl.rec.size
+                      else if (room.in.packet >= appl.rec.size) or
+                       (room.in.packet > 31) then
+                            DH := 31
+                      else
+                        DH := room.in.packet;                    
+                      bytes.to.add := DH;
+                      DH := DH lor '040;
+                      end;
+ 
+                  [EOR.DH]  DH := '040;                                 
+ 
+                  [EOF.DH]  DH := '100;                                 
+ 
+                  [EOD.DH]  DH := '140
+               end;
+ 
+               ! insert DH in packet;
+               idpb(DH,outgoing.packet.ptr);
+               room.in.packet := room.in.packet - 1;
+ 
+            end "create.DH";
+ 
+
+         simple procedure VA.add.buf.to.pkt;
+ 
+            begin "add.buffer"
+ 
+! *********************************************************************
+  *  VA.add.buf.to.pkt:  Using the application record passed into     *
+  *                      this layer, bytes of data or command are     *
+  *                      added to the outgoing packet.                *
+  *********************************************************************;
+ 
+            integer temp;
+ 
+            for i := 1 step 1 until bytes.to.add do
+               begin
+               temp := ildb(appl.record.ptr);
+               idpb(temp,outgoing.packet.ptr);
+               end;
+ 
+            end "add.buffer";
+         simple procedure VA.pass.cmpl.pkt;
+ 
+            begin "pass.cmpl.pkt"
+ 
+! *********************************************************************
+  *  VA.pass.cmpl.pkt:  The outgoing packet is passed off to the      *
+  *                     Binary layer.  Then the packet is cleared     *
+  *                     for more data or commands.                    *
+  *********************************************************************;
+ 
+            outgoing.packet.size := max.outgoing.packet.size - room.in.packet;
+            BI.finish.pkt;
+            arrclr(outgoing.packet,0);
+            room.in.packet := max.outgoing.packet.size;
+            ! reset ptr, leaving room for PTC and PID bytes at beginning;
+            outgoing.packet.ptr := point(8,outgoing.packet[0],15);
+ 
+            end "pass.cmpl.pkt";
+
+ 
+! code for VA.create.pkt;
+ 
+      appl.record.ptr := point(8,application.record[0],-1);
+      while appl.rec.size > 0 do
+         begin
+         if (room.in.packet < 4) or ((record.type = 1) and
+               (room.in.packet - appl.rec.size < 0)) then    ! packet full or ;
+             VA.pass.cmpl.pkt;                               ! no room for cmd;
+         if ((max.outgoing.packet.size > room.in.packet) and
+               ((prev.record.type NEQ record.type) or        ! partial pkt and;
+                (prev.link.type   NEQ link.type)   or        ! params. diff   ;
+                (prev.who.sent    NEQ who.sent)    or        ! than last ones ;
+                (prev.importance  NEQ importance)  or
+                (prev.cmd.type    NEQ cmd.type)))  then
+            begin
+            DH.type := EOD.DH;                               ! insert EOD;
+            VA.create.DH;
+            VA.create.DCB;
+            end;
+         if room.in.packet = max.outgoing.packet.size then   ! pkt is empty;
+            VA.create.DCB;
+         DH.type := dc.DH;                                   ! data/cmd DH;
+         VA.create.DH;
+         VA.add.buf.to.pkt;
+         appl.rec.size := appl.rec.size - bytes.to.add;
+         room.in.packet := room.in.packet - bytes.to.add;
+         end;
+ 
+      if room.in.packet < 2 and EOR.seen then                ! not enough room;
+         begin                                               ! for EOR DH;
+         VA.pass.cmpl.pkt;
+         VA.create.DCB;
+         end;
+ 
+      if EOR.seen then
+         begin
+         DH.type := EOR.DH;                                  ! insert EOR;
+         VA.create.DH;
+         end;
+ 
+      if EOF.seen then
+         begin
+         DH.type := EOF.DH;                                  ! insert EOF;
+         VA.create.DH;
+         VA.pass.cmpl.pkt;
+         end;
+ 
+      prev.record.type := record.type;                       ! save parameters;
+      prev.link.type := link.type;
+      prev.who.sent := who.sent;
+      prev.importance := importance;
+      prev.cmd.type := cmd.type;
+ 
+ 
+      end "create.pkt";
+
+   internal procedure VA.get.inc.appl.rec(integer array application.record;
+                                          reference integer record.type,
+                                                            link.type,
+                                                            who.sent,
+                                                            importance,
+                                                            cmd.type,
+                                                            appl.rec.size;
+                                          reference boolean EOF.seen,
+                                                            EOR.seen);
+ 
+      begin "get.incoming.application.record"
+ 
+! *********************************************************************
+  *  VA.get.inc.appl.rec:  Incoming packets are broken down into      *
+  *                        individual commands or records (in the     *
+  *                        case of binary data, a stream of bytes)    *
+  *                        which are passed up to the application     *
+  *                        layer. If no end of record is found the    *
+  *                        maximum number of bytes returned to the    *
+  *                        Application Layer at a time is 144.        *
+  *********************************************************************;
+ 
+      integer array DCB.char[0:0];
+      integer DCB.ptr,
+              appl.record.ptr,
+              bitt,
+              check,
+              temp.ptr,
+              temp,
+              char,
+              i,
+              abort.type,
+              DH.fld1,
+              DH.fld2;
+ 
+ 
+
+      simple procedure VA.fill.data.buffer;
+ 
+         begin "fill data buffer"
+ 
+! *********************************************************************
+  *  VA.fill.data.buffer:  Data from the incoming packet is placed    *
+  *                        into the application record and the        *
+  *                        number of bytes it contains is set in      *
+  *                        appl.rec.size.  Compressed data is         *
+  *                        expanded, and other translation takes      *
+  *                        place including inserting binary zeros,    *
+  *                        ASCII blanks, and EBCDIC blanks.  Errors   *
+  *                        in packet format are detected and result   *
+  *                        in program abort.                          *
+  *********************************************************************;
+ 
+            abort.type := data.error;
+            DH.fld1 := ildb(incoming.packet.ptr);
+            incoming.packet.size := incoming.packet.size - 1;
+            ! divide DH byte into 2 fields: leftmost 3 bits, rightmost 5 bits;
+            DH.fld2 := DH.fld1 lsh 31;
+            DH.fld2 := DH.fld2 lsh -31;
+            DH.fld1 := DH.fld1 lsh -5;
+ 
+            case DH.fld1 of
+               begin "case"
+               [0]   SU.abort.transfer(abort.type);
+               [1]   if DH.fld2 = 0 then
+                        begin
+                        SU.abort.transfer(abort.type);
+                        ! EOR handled in calling procedure;
+                        end
+                     else           ! fill application record;
+                        begin
+                        for i := 1 step 1 until DH.fld2 do
+                           begin
+                           temp := ildb(incoming.packet.ptr);
+                           idpb(temp,appl.record.ptr);
+                           end;
+                        incoming.packet.size := incoming.packet.size - DH.fld2;
+                        appl.rec.size := appl.rec.size + DH.fld2;
+                        end;
+               [2]   if DH.fld2 = 0 then
+                        begin
+                        EOF.seen := true;
+                        end
+                     else           ! insert binary zeros into appl.record;
+                        begin
+                        for i := 1 step 1 until DH.fld2 do
+                           idpb(0,appl.record.ptr);
+                        appl.rec.size := appl.rec.size + DH.fld2;
+                        end;
+               [3]   if DH.fld2 = 0 then
+                        begin
+                        EOD := true;
+                        end
+                     else           ! insert Ascii blanks into appl. record;
+                        begin
+                        for i := 1 step 1 until DH.fld2 do
+                           idpb(32,appl.record.ptr);
+                        appl.rec.size := appl.rec.size + DH.fld2;
+                        end;
+
+               [4]   if DH.fld2 = 0 then
+                        SU.abort.transfer(abort.type)
+                     else           ! do expansion;
+                        begin
+                        char := ildb(incoming.packet.ptr);
+                        for i := 1 step 1 until DH.fld2 do
+                           idpb(char,appl.record.ptr);
+                        incoming.packet.size := incoming.packet.size - 1;
+                        appl.rec.size := appl.rec.size + DH.fld2;
+                        end;
+               [5]   if DH.fld2 = 0 then
+                        SU.abort.transfer(abort.type)
+                     else           ! insert Ebcdic blanks into appl.record;
+                        begin
+                        for i :=1 step 1 until DH.fld2 do
+                           idpb(64,appl.record.ptr);
+                        appl.rec.size := appl.rec.size + DH.fld2;
+                        end;
+           [6] [7]   SU.abort.transfer(abort.type)
+ 
+               end "case";
+ 
+      end "fill data buffer";
+   simple procedure VA.bld.appl.cmd;
+ 
+      begin "build application command"
+ 
+! *********************************************************************
+  *  VA.bld.appl.cmd:  A single command is taken from the incoming    *
+  *                    packet and placed in the application record.   *
+  *                    Compressed data is expanded. Other translations*
+  *                    occur (binary zeros, ASCII blanks, EBCDIC      *
+  *                    blanks).  Errors in packet format are caught.  *
+  *********************************************************************;
+ 
+      boolean have.cmd;
+ 
+      have.cmd := false;
+      abort.type := command.error;
+ 
+      DH.fld1 := ildb(incoming.packet.ptr);
+      incoming.packet.size := incoming.packet.size - 1;
+      ! divide DH into 2 fields (left 3 bits, right 5 bits);
+      DH.fld2 := DH.fld1 lsh 31;
+      DH.fld2 := DH.fld2 lsh -31;
+      DH.fld1 := DH.fld1 lsh -5;
+ 
+      case DH.fld1 of
+         begin "case2"
+         [0]   SU.abort.transfer(abort.type);
+         [1]   if DH.fld2 > 0 then          ! fill appl.record;
+                  begin
+                  for i := 1 step 1 until DH.fld2 do
+                     begin
+                     temp := ildb(incoming.packet.ptr);
+                     idpb(temp,appl.record.ptr);
+                     end;
+                  have.cmd := true;
+                  incoming.packet.size := incoming.packet.size - DH.fld2;
+                  appl.rec.size := appl.rec.size + DH.fld2;
+                  end
+               else
+                  begin
+                  SU.abort.transfer(abort.type);
+                  ! EOR handled in calling procedure;
+                  end;
+         [2]   if DH.fld2 = 0 then
+                  begin
+                  EOF.seen := true;
+                  end
+               else
+                  if have.cmd then          ! append binary zeros to appl.rec;
+                     begin
+                     for i := 1 step 1 until DH.fld2 do
+                        idpb(0,appl.record.ptr);
+                     appl.rec.size := appl.rec.size + DH.fld2;
+                     end
+                  else
+                     SU.abort.transfer(abort.type);
+
+         [3]   if DH.fld2 = 0 then
+                  begin
+                  EOD := true;
+                  end
+               else
+             if have.cmd then          ! append Ascii blanks to appl.rec;
+                     begin
+                     for i := 1 step 1 until DH.fld2 do
+                        idpb(32,appl.record.ptr);
+                     appl.rec.size := appl.rec.size + DH.fld2;
+                     end
+                  else
+                     SU.abort.transfer(abort.type);
+         [4]   if DH.fld2 = 0 then
+                  SU.abort.transfer(abort.type)
+               else
+                  if have.cmd then          ! do expansion & append to appl.rec;
+                     begin
+                     char := ildb(incoming.packet.ptr);
+                     for i := 1 step 1 until DH.fld2 do
+                        idpb(char,appl.record.ptr);
+                     incoming.packet.size := incoming.packet.size - 1;
+                     appl.rec.size := appl.rec.size + DH.fld2;
+                     end
+                  else
+                     SU.abort.transfer(abort.type);
+            [5]   if DH.fld2 = 0 then
+                     SU.abort.transfer(abort.type)
+                  else
+                     if have.cmd then       ! append Ebcdic blanks to appl.rec;
+                        begin
+                        for i := 1 step 1 until DH.fld2 do
+                           idpb(64,appl.record.ptr);
+                        appl.rec.size := appl.rec.size + DH.fld2;
+                        end
+                     else
+                        SU.abort.transfer(abort.type);
+           [6] [7]   SU.abort.transfer(abort.type)
+               end "case2";
+ 
+         end "build application command";
+
+      ! code for Get Incoming Application Record;
+ 
+      appl.rec.size := 0;
+      EOR.seen := false;
+      EOF.seen := false;
+      arrclr(application.record,0);
+      appl.record.ptr := point(8,application.record[0],-1);
+ 
+ 
+ 
+      do
+         begin "parse packet"
+         if incoming.packet.size = 0 then                  ! need new packet;
+            begin
+            BI.get.incoming.pkt;
+            incoming.packet.ptr := point(8,incoming.packet[0],15);
+            EOD := true;
+            end;
+ 
+         if EOD then
+            begin "if EOD"
+            DCB.char[0] := ildb(incoming.packet.ptr);      ! first char is DCB;
+            DCB.ptr := point(1,DCB.char[0],27);
+            bitt := ildb(DCB.ptr);
+            case bitt of                                   ! disassemble DCB;
+               begin
+               [0]   record.type := data;
+               [1]   record.type := command
+               end;
+            if record.type = command then
+               begin "cmd params"                          ! ignore rest of;
+               DCB.ptr := point(2,DCB.char[0],28);         ! params if data;
+               bitt := ildb(DCB.ptr);
+               case bitt of
+                  begin
+                  [0]   link.type := link;
+                  [1]   link.type := prim.appl
+                  end;
+               DCB.ptr := point(1,DCB.char[0],30);
+               bitt := ildb(DCB.ptr);
+               case bitt of
+                  begin
+                  [0]   who.sent := requestor;
+                  [1]   who.sent := server
+                  end;
+               bitt := ildb(DCB.ptr);
+               case bitt of
+                  begin
+                  [0]   importance := advisory;
+                  [1]   importance := important
+                  end;
+               DCB.ptr := point(3,DCB.char[0],32);
+               bitt := ildb(DCB.ptr);
+               case bitt of
+                  begin
+                  [0]   cmd.type := reply.opt;
+                  [1]   cmd.type := reply.req;
+                  [2]   cmd.type := pos.reply;
+                  [3]   cmd.type := neg.reply;
+                  [4]   cmd.type := exp.reply;
+                  [5]   cmd.type := req.for.info
+                  end;
+               end "cmd params";
+ 
+ 
+            incoming.packet.size := incoming.packet.size - 1;
+            EOD := false;
+            end "if EOD";
+
+         ! use temp.ptr since can't easily back up ptr if want to;
+         temp.ptr := incoming.packet.ptr;
+         check := ildb(temp.ptr);                      ! check DH for EOR;
+         if check NEQ '040 then                        ! indicating blank line;
+            if record.type = data then
+               VA.fill.data.buffer
+            else
+               VA.bld.appl.cmd;
+ 
+         if incoming.packet.size > 0 then
+            begin "EOR check"
+            temp.ptr := incoming.packet.ptr;
+            check := ildb(temp.ptr);
+            if check = '040 then
+               begin "hit EOR"
+               EOR.seen := true;
+               check := ildb(incoming.packet.ptr);         ! move ptr;
+               incoming.packet.size := incoming.packet.size - 1;
+               end "hit EOR";
+            end "EOR check";
+ 
+         if incoming.packet.size > 0 then
+            begin "EOF check"
+            temp.ptr := incoming.packet.ptr;
+            check := ildb(temp.ptr);
+            if check = '100 then
+               begin "hit EOF"
+               EOF.seen := true;
+               check := ildb(incoming.packet.ptr);         ! move ptr;
+               incoming.packet.size := incoming.packet.size - 1;
+               end "hit EOF";
+            end "EOF check";
+ 
+         if incoming.packet.size > 0 then
+            begin "EOD check"
+            temp.ptr := incoming.packet.ptr;
+            check := ildb(temp.ptr);
+            if check = '140 then
+               begin "hit EOD"
+               EOD := true;
+               check := ildb(incoming.packet.ptr);         ! move ptr;
+               incoming.packet.size := incoming.packet.size - 1;
+               end "hit EOD";
+            end "EOD check";
+ 
+         end "parse packet"
+ 
+      until EOR.seen or EOF.seen or (appl.rec.size GEQ 144);
+      ! (application record can hold 256 bytes but don't want next read
+         to put us over 256, so 144 is a safe breaking point);
+ 
+      end "get.incoming.application.record";
+ 
+end "vpl";
+
+    I (O
