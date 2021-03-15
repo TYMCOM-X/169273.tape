@@ -1,0 +1,1132 @@
+entry
+	VMInit, VMPMap,
+	VMFile, VMFree,
+	VMValF, VMRecF, VMIPEF, VMWait,
+	VMGetC, VMSetC,
+	VMPtrB, VMGetB, VMSetB,
+	VMPtrW, VMGetW, VMSetW,
+
+	VMLine, VMText, VMMove
+;
+
+begin "VM Package"
+
+  require "(SAILIB)SAIL.DEF"    source!file;
+  require "(SAILIB)UUOSYM.DEF"  source!file;
+  require "(SAILIB)VMFILE.DEF"  source!file;
+  require "(SAILIB)VMCHAN.REQ"  source!file;
+  require "(SAILIB)VMSPEC.REQ"  source!file;
+  require "(SAILIB)BITARY.REQ"  source!file;
+
+
+  define
+	MaxSlot = 47			! number of available slots ;
+  ,	CharPage = 512 * 5		! characters per page ;
+  ,	XPage   = CharPage - 1		! slop for page divide ;
+
+  ,	F.Base  = { !rh( Base[ Slot ] ) }
+  ,	F.Count = { !lh( Base[ Slot ] ) }
+  ,	F.Addr  = { !rh( Base[ Slot ] lsh 9 ) }
+
+  ,	F.File  = { A.File[ Slot ] }
+  ,	F.Chan  = { A.Chan[ Slot ] }
+  ,	F.Mode  = { A.Mode[ Slot ] }
+  ,	F.Name  = { A.Name[ Slot ] }
+  ,	F.FExt  = { ( A.FExt[ Slot ] land (-1 lsh 18) ) }
+  ,	F.FLic  = { !rh( A.FExt[ Slot ] ) }
+  ,	F.FPPN  = { A.FPPN[ Slot ] }
+  ,	F.Char  = { A.Char[ Slot ] }
+  ,	F.Line  = { A.Line[ Slot ] }
+  ,	F.PTxt  = { A.PTxt[ Slot ] }
+  ,	F.MTxt  = { A.MTxt[ Slot ] }
+  ,	F.Last  = { A.Last[ Slot ] }
+  ,	F.CRet  = { A.CRet[ Slot ] }
+  ,	F.Size  = { A.Size[ Slot ] }
+  ,	F.LSiz  = { A.LSiz[ Slot ] }
+  ,	F.PSiz  = { A.PSiz[ Slot ] }
+  ,	F.MSiz  = { A.MSiz[ Slot ] }
+  ,	F.Time  = { !rh( A.Date[ Slot ] ) }
+  ,	F.Date  = { !lh( A.Date[ Slot ] ) }
+  ,	F.Flag  = { A.Flag[ Slot ] }
+  ;
+
+
+Safe integer array Base[ 1:MaxSlot];	! keep track of base info ;
+
+Safe integer array A.File[ 1:MaxSlot ];	! file page in use ;
+Safe integer array A.Chan[ 1:MaxSlot ];	! channel for file open ;
+Safe integer array A.Mode[ 1:MaxSlot ];	! file access mode ;
+Safe integer array A.Name[ 1:MaxSlot ];	! file name in sixbit ;
+Safe integer array A.FExt[ 1:MaxSlot ];	! file extension in sixbit,,license ;
+Safe integer array A.FPPN[ 1:MaxSlot ];	! file ppn ;
+Safe integer array A.Char[ 1:MaxSlot ];	! character pointer in file ;
+Safe integer array A.Line[ 1:MaxSlot ];	! line pointer in file +/-;
+Safe integer array A.PTxt[ 1:MaxSlot ];	! text page pointer in file +/- ;
+Safe integer array A.MTxt[ 1:MaxSlot ];	! text message pointer in file +/- ;
+Safe integer array A.Last[ 1:MaxSlot ];	! last eol character ;
+Safe integer array A.CRet[ 1:MaxSlot ];	! carriage return on line ;
+Safe integer array A.Size[ 1:MaxSlot ];	! character size of file ;
+Safe integer array A.LSiz[ 1:MaxSlot ];	! lines in file (if known) ;
+Safe integer array A.PSiz[ 1:MaxSlot ];	! pages in file (if known) ;
+Safe integer array A.MSiz[ 1:MaxSlot ];	! messages in file (if known) ;
+Safe integer array A.Date[ 1:MaxSlot ];	! file creation date,,time in sec ;
+Safe integer array A.Flag[ 1:MaxSlot ];	! file access flags (VM$APPEND) ;
+
+Integer S;				! used everywhere ;
+
+Internal Boolean VMValF;		! flag: validating rib ;
+Internal Boolean VMIPEF;		! flag: ignoring page errors ;
+Internal Boolean VMWait;		! flag: wait, touch pages ;
+
+Integer VMMem, VMPage;			! virtual memory pointers  ;
+Integer MaxPages;			! and pages available ;
+
+Safe integer array PBits[ 0: 512 div 36 ];
+
+
+Simple Procedure InitVM;
+begin
+
+VMPage_ VMMem_ MaxPages_ 0;		! initialize limits ;
+arrClr( Base );				! count and base page info ;
+arrClr( PBits, -1 );			! initialize page map ;
+VMValF_ true;				! validate ribs ;
+
+end;
+require InitVM initialization;
+
+
+Internal Simple Procedure VMInit( Integer C(-1),P(-1));
+! ----------------------------------------------------------------------;
+!									;
+!	VMInit( Count, BasePage )					;
+!		Routine to set aside a cache of pages for the user.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Init"
+
+    if ( 0 = MaxPages_ C )		! count of pages ;
+     then return;			! if zero, don't map anything ;
+
+    if ( 0 geq VMPage_ P )		! base page ;
+     then begin "default range"
+
+	if ( MaxPages < 0 )		! if default pages specified ;
+	 then MaxPages_ MaxSlot;	!  use the default set ;
+	VMPage_ 512 - MaxPages;		! first memory page to use ;
+
+     end "default range";
+
+    if ( VMPage > 0 )			! default or specified ;
+     then begin "clear pages"
+
+	calli( !prro + !xwd( MaxPages, VMPage ), calli!VCLEAR );
+	BitWip( PBits, VMPage, VMPage+MaxPages-1, 0 );
+
+     end "clear pages";
+
+    VMMem_ VMPage lsh 9;		! base memory address ;
+    VMValF_ true;			! initially validate ribs ;
+    VMIPEF_ false;			! allow page errors to abort ;
+    VMWait_ false;			! do not WAIT for pages ;
+
+end "VM Init";
+
+
+Internal Simple Integer Procedure VMPMap( Integer Slot, NewPage );
+! ----------------------------------------------------------------------;
+!									;
+!	NewPage_ VMPMap( Slot, NewPage )				;
+!		Routine to map the specified new page into the map	;
+!		slot for this slot and return the new page on success.	;
+!		Returns 0 if any errors occur, including wrong page	;
+!		protection.						;
+!									;
+! ----------------------------------------------------------------------;
+begin  "VM Page Map"
+
+    Own safe integer array Arg[ 0:1 ];
+    Own integer Status, Err, Floor, ThePage;
+
+    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+     then return( 0 );			!  valid, else return ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( 0 );			!  not this time ;
+
+    Floor_ F.Base;			! get base memory page ;
+
+    if ( F.File = NewPage )		! if the same page ;
+     then begin "check protection"
+
+	if not( F.Mode )			! if no writing request ;
+	 then return( NewPage );		! then nothing special ;
+	Status_ calli( Floor, calli!PAGSTS );	! read page protection ;
+	if ( '3 = ( Status land '7 ) )		! if read/write? ;
+	 then return( NewPage );		!  then nothing to do ;
+	Err_ calli( !prrw + Base[ Slot ], calli!VPROT );
+	if ( !skip! )				! if no problems, return! ;
+	 then return( NewPage )			!  nothing else to do ;
+	 else begin				! otherwise complain and ;
+	    print( "Map error: ",cvos(Err)," pagsts: ",cvos(Status),crlf );
+	    return( F.File_ 0 );		! make believe un-mapped ;
+	 end;
+
+     end "check protection";
+
+    calli( Arg[0]_ !prro + Base[ Slot ], calli!VCLEAR );
+    if ( VM$Read neq F.Mode )		! if we're writing then ;
+     then Arg[0]_ !prrw + Base[ Slot ];	!  make it r/w not r/o ;
+    Arg[1]_ NewPage;			! point at file page ;
+    chnior( F.Chan, Arg[0], !chMFP );	! map the page ;
+    start!code MOVEM '3,ERR; end;	! remember any errors ;
+    if ( !Skip! )			! remember file page ;
+     then begin "map success"
+	if ( VMIPEF )			! if we are ignoring errors ;
+	 then calli( Arg[0]_ !bit(7) + Base[ Slot ], calli!PERSET );
+	F.File_ NewPage;		!  NewPage (if map ok) ;
+	if ( VMWait )			! if waiting, touch it ;
+	 then Err_ memory[Floor lsh 9];	!  by reading value ;
+     end "map success"
+     else begin "map failure"		! else check the fault ;
+	if ( F.Mode = VM$Read )   and	! if we were reading ;
+	   ( !rh(ERR) = FLPHP# )  and	!  and past highest page ;
+	   ( !rh(Base[Slot])<!lh(ERR) )	! and base < errorpage ;
+	 then begin "partial map"
+	    Base[ Slot ]_ !Xwd( !lh(ERR) - !rh(Base[ Slot ]), Base[ Slot ] );
+	    return( F.File_ NewPage );	! reduce pag cache ;
+	    if ( VMWait )		! if waiting, touch it ;
+	     then Err_ memory[Floor lsh 9];	!  by reading value ;
+	 end "partial map";
+
+	F.File_ 0;			! default (if map fails) ;
+
+	if ( F.Mode ) and		! if writing and past ;
+	   ( !rh(ERR)=FLPHP# )		!   highest page (FLPHP%) ;
+	 then begin "create page"	!  then try to create it ;
+
+	    chnior( F.Chan,ThePage_ NewPage+F.Count-1,!chCFP );
+	    if ( !Skip! )		! check success flag ;
+	     then begin "try map again"	! if ok, then try map ;
+		if ( VMValF )		! validate rib for page ;
+		 then chniov( F.Chan, 0, !chVRB );
+		chnior( F.Chan, Arg[0], !chMFP );
+		if ( !Skip! )		! any errors? ;
+		 then begin "no errors"
+		    if ( VMIPEF )	! if we are ignoring errors ;
+		     then calli( Arg[0]_ !bit(7)+Base[ Slot ], calli!PERSET );
+		    F.File_ NewPage;	! no, it's ok ;
+		    if ( VMWait )	! if waiting, touch it ;
+		     then Err_ memory[Floor lsh 9];
+		 end "no errors";
+	     end "try map again";
+
+	 end "create page";
+     end "map failure";
+
+    return( F.File );			! return current mapping ;
+
+end "VM Page Map";
+
+
+Simple Integer Procedure FindPage( Integer Count(1), Page(-1) );
+begin
+    Integer B, W, C, P;
+
+    if ( Page leq 0 )			! do not allow page 0, or less ;
+     then begin "guess page"
+
+	B_ BitPtr( C_ P_ VMPage ) + location( Pbits[0] );
+	W_ 0;
+
+	while ( C < 512 )
+	 do begin "scan for big hold"
+
+	    if ( ildb( B ) )    or	! find bit set? ;
+	       ( '3 land calli( C,calli!PAGSTS ) )
+	     then begin "page reset"
+		W_ 0;  P_ C + 1;	! yes, start over ;
+	     end "page reset"
+	     else W_ W + 1;		! no, increment count ;
+
+	    if ( W = Count )		! if hole big enough ;
+	     then return( P );		!  we return this page ;
+	    C_ C + 1;
+
+	 end "scan for big hold";
+
+	if ( Page < 0 )			! if really defaulted ;
+	 then begin "try memory"
+
+	    W_ 0;  C_ 512;		! start with fresh count ;
+
+	    while ( C_ C - 1 )		! check down to page 1 ;
+	     do begin "look for hole"
+
+		if ( '3 land calli( C,calli!PAGSTS ) )
+		 then W_ 0		! page here, so reset to 0 ;
+		 else W_ W + 1;		! no page here, count it ;
+
+		if ( W = Count )	! if hole big enough ;
+		 then return( C );	!  we return with this page ;
+
+	     end "look for hole";
+
+	 end "try memory";
+
+	! Here - we've run out of pages, suggest we return 0 ;
+
+     end "guess page"
+     else return( Page );
+
+    return( 0 );			! no page could be found ;
+
+end;
+
+
+Integer Procedure VMSlot( Integer Count(1), Page(-1) );
+! ----------------------------------------------------------------------;
+!									;
+!	Slot_ VMSlot( PageCount, BasePage )				;
+!		Returns the next available file slot in the internal	;
+!		file table.  If no slots or channels are available,	;
+!		returns 0.  Array Base contains the count and base	;
+!		memory page for file operations.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Slot"
+    Own Integer Slot, Chan;
+
+    for Slot_ 1 upto MaxSlot		! check each legal slot ;
+     do if not( Base[ Slot ] )		! if already assigned ;
+	 then begin "setup slot"	!  then make it available ;
+
+	    if ( 0 > Chan_ VMChan )	! legal channel available? ;
+	     then return( 0 );		!  nope. ;
+
+	    if not(Page_ FindPage(Count,Page))	! check page range ;
+	     then return( 0 );			!  not available ;
+
+	    Base[ Slot ]_ !xwd( Count,Page );	! and remember base info ;
+
+	    F.Chan_ Chan;		! copy the channel ;
+	    F.File_ F.Char_ -1;		! file/char position ;
+
+	    return( Slot );		! give caller a slot number ;
+
+	 end "setup slot";
+
+    return( 0 );
+
+end "VM Slot";
+
+
+Internal simple integer procedure VMPtrB( integer Slot, Pos );
+! ----------------------------------------------------------------------;
+!									;
+!	BytePointer_ VMPtrB( Slot, CharacterPosition )			;
+!		Return the byte pointer to the specified byte in the	;
+!		file.  Side effects are that the correct page is now	;
+!		mapped to memory (if it was not already mapped).	;
+!									;
+! ----------------------------------------------------------------------;
+begin "setup byte"
+    define BackByte = '430000000001;	! offset to backup a byte ;
+    Integer Page, Byte, Count, Offset;
+    define No$Byte = -1, No$Slot = -2, No$Page = -3;
+
+    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+     then return( No$Slot );		!  valid, else return ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( No$Slot );		!  not this time ;
+
+    if ( Pos leq 0 )			! default position? ;
+     then Pos_ F.Char;			! yes, set current position ;
+
+    if ( Pos leq 0 )			! still at default? ;
+     then return( No$Byte );		! yes, file not mapped ;
+
+    Page_ ((Pos+XPage) div CharPage);	! calculate page number ;
+
+    if ( F.File leq  0 )  or		! is correct page mapped? ;
+       ( F.File > Page )  or		! new page too low? ;
+       ( Page geq ( F.File+F.Count ) )	! new page too high? ;
+     then if not( VMPMap( Slot,Page ) )	!  no, so try to map it ;
+	   then return( No$Page );	!   cannot map page ;
+
+    Pos_ Pos - ((F.File-1) * CharPage);
+    Byte_ point( 7, memory[F.Addr+(Pos div 5)], ((Pos mod 5)*7)-1 );
+    if ( Byte < 0 )			! Means we have '440700,,x ;
+     then Byte_ Byte - BackByte;	! Point at an actual byte ;
+
+    return( Byte );
+
+end "setup byte";
+
+
+Internal simple integer procedure VMPtrW( integer Slot, Word );
+! ----------------------------------------------------------------------;
+!									;
+!	WordOffset_ VMPtrW( Slot, WordPosition )				;
+!		Return the memory address for specified word in the	;
+!		file.  Side effects are that the correct page is now	;
+!		mapped to memory (if it was not already mapped).	;
+!									;
+! ----------------------------------------------------------------------;
+begin "setup word"
+    Integer Page;
+    define No$Word = -1, No$Slot = -2, No$Page = -3;
+
+    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+     then return( No$Slot );		!  valid, else return ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( No$Slot );		!  not this time ;
+
+    if ( Word < 0 )			! default position? ;
+     then Word_ (F.Char-1) div 5;	! yes, set current position ;
+
+    if ( Word < 0 )			! still at default? ;
+     then return( No$Word );		! yes, file not mapped ;
+
+    Page_ ( Word div 512 ) + 1;		! calculate page number ;
+
+    if ( F.File leq  0 )  or		! is correct page mapped? ;
+       ( F.File > Page )  or		! new page too low? ;
+       ( Page geq ( F.File+F.Count ) )	! new page too high? ;
+     then if not( VMPMap( Slot,Page ) )	!  no, so try to map it ;
+	   then	return( No$Page );	!   cannot map page ;
+
+    Word_ Word - ((F.File-1) * 512);
+
+    return( F.Addr + Word );		! return base address + offset ;
+
+end "setup word";
+
+
+Internal Simple Integer Procedure VMGetB( Integer Slot, Pos(-1) );
+! ----------------------------------------------------------------------;
+!									;
+!	Character_ VMGetB( Slot, CharacterPosition )			;
+!		Read the specified byte from the file.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Byte"
+    integer Byte;
+    
+    if ( 0 > Byte_ VMPtrB( Slot,Pos ) )	! get pointer, check sign ;
+     then return( Byte )		!   give error report ;
+     else return( ldb( Byte ) );	!  what they came for ;
+
+end "VM Byte";
+
+
+
+Internal Simple Integer Procedure VMSetB( Integer Slot, Char, Pos(-1) );
+! ----------------------------------------------------------------------;
+!									;
+!	Character_ VMSetB( Slot, Char, Position )			;
+!		Deposit the specified byte in the proper position in	;
+!		the file.						;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Char"
+    integer Byte;
+    
+    if ( 0 > Byte_ VMPtrB( Slot,Pos ) )	! get pointer, check sign ;
+     then return( Byte );		! if error, give report ;
+
+    dpb( Char, Byte );			! deposit the character ;
+    return( ldb( Byte ) );		! what they came for ;
+
+end "VM Char";
+
+
+Internal Simple Integer Procedure VMGetW( Integer Slot, Word(-1) );
+! ----------------------------------------------------------------------;
+!									;
+!	Character_ VMGetB( Slot, CharacterPosition )			;
+!		Read the specified byte from the file.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Addr"
+    integer Addr;
+    
+    if ( 0 > Addr_ VMPtrW(Slot,Word) )	! get pointer, check sign ;
+     then return( Addr )		!   give error report ;
+     else return( memory[ Addr ] );	!  what they came for ;
+
+end "VM Addr";
+
+
+
+Internal Simple Integer Procedure VMSetW( Integer Slot, Data, Word(-1) );
+! ----------------------------------------------------------------------;
+!									;
+!	Data_ VMSetW( Slot, Data, Word )				;
+!		Deposit the specified word in the proper address in	;
+!		the file.						;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Data"
+    integer Addr;
+    
+    if ( 0 > Addr_ VMPtrW(Slot,Word) )	! get pointer, check sign ;
+     then return( Addr );		! if error, give report ;
+
+    return( memory[ Addr ]_ Data );	! deposit the character ;
+
+end "VM Data";
+
+
+Internal Simple Integer Procedure VMGetC( Integer Slot, Index(VM$Pos) );
+! ----------------------------------------------------------------------;
+!									;
+!	Position_ VMGetC( Slot, Index(VM$Pos) )				;
+!		Read the specified characteristic from the file table.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Get Character Pointer"
+
+    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+     then return( -2 );			!  valid, else return ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( -2 );			!  not this time ;
+
+    Case Index of begin
+	[VM$Pos]    return( F.Char );	! return character position ;
+	[VM$LPos]   return( F.Line );	! return line position ;
+	[VM$PPos]   return( F.PTxt );	! return page position ;
+	[VM$MPos]   return( F.MTxt );	! return message position ;
+	[VM$Eol]    return( F.Last );	! return last eol char ;
+	[VM$ECR]    return( F.CRet );	! return last cr on line ;
+	[VM$Size]   return( F.Size );	! return file size in chars ;
+	[VM$LSize]  return( F.LSiz );	! return file size in lines ;
+	[VM$PSize]  return( F.PSiz );	! return file size in pages ;
+	[VM$MSize]  return( F.MSiz );	! return file size in msgs ;
+	[VM$Lic]    return( F.FLic );	! return file license ;
+	[VM$Access] return( F.Mode );	! return file access mode ;
+	[VM$Time]   return( F.Time );	! return file creation time ;
+	[VM$Date]   return( F.Date );	! return file creation date ;
+	[VM$Base]   return( F.Base );	! return memory base page ;
+	[VM$Count]  return( F.Count );	! return map count for file ;
+	[VM$FPage]  return( F.File );	! return file page on dsk ;
+	[VM$Chan]   return( F.Chan );	! return physical channel ;
+	[VM$Flag]   return( F.Flag );	! return file access flags ;
+	[else]      return( -3 )	! illendex ;
+    end;
+
+end "VM Get Character Pointer";
+
+
+Internal Simple Integer Procedure VMSetC( Integer Slot, Position );
+! ----------------------------------------------------------------------;
+!									;
+!	NewPosition_ VMSetC( Slot, TrialPosition )			;
+!		Set the character position with the file open on the	;
+!		specified slot.  All further references to the slot	;
+!		will use the new file position.  If the specified	;
+!		position is outside the file, the position is set to	;
+!		-1.  The routine always returns the new position.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Set Character Pointer"
+
+    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+     then return( 0 );			!  valid, else return ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( 0 );			!  not this time ;
+
+    if ( 0 leq Position leq F.Size )	! if position within range ;
+     then F.Char_ Position		!  then set it up ;
+     else F.Char_ Position_ -1;		!  else set to -1 ;
+
+    return( Position );			! return the new position ;
+
+end "VM Set Character Pointer";
+
+
+Internal Simple Boolean Procedure VMFree( Integer Slot, Bits(0) );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMFree( Slot )						;
+!		Closes any open file for this slot and frees the	;
+!		slot for future use.  Returns true if the slot was	;
+!		in use.							;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Free"
+    preset!with 0,0,0,0;
+    Own integer array delete[0:3];
+    Own integer chan, page, count;
+
+    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+     then return( false );		!  valid, else return ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( false );		!  not this time ;
+
+    calli( !prro+Base[ Slot ], calli!VCLEAR );
+
+    Chan_ F.Chan;			! get a handy channel ;
+    if ( Bits or F.Mode )		! if any writes ;
+     then begin "some changes"		!  reset size & close file ;
+
+	if ( F.Size > 0 )		! if non-zero size ;
+	 then chniov( Chan, (F.Size+4) div 5, !chFTR );
+
+	if ( Bits = -1 )		! Special "RENAME" ;
+	 then begin "rename"
+	    chnior( Chan, Delete[0], !chREN );
+	    chnior( Chan, memory[0], !chCLS );
+	    chnior( Chan, memory[0], !chREL );
+	 end "rename"
+	 else begin "normal"
+	    chnior( Chan, memory[Bits], !chCLS );
+	    chnior( Chan, memory[Bits], !chREL );
+	 end "normal";
+
+     end "some changes"
+     else chnior( Chan, memory[0], !chREL );
+
+    Base[ Slot ]_ 0;			! clear entry tables ;
+
+    return( true );			! everything is ok ;
+
+end "VM Free";
+
+
+Internal Simple Boolean Procedure
+ VMFile( String Spec; Integer Mode(VM$Read), PageCount(1), MemPage(-1) );
+! ----------------------------------------------------------------------;
+!									;
+!	Slot_ VMFile( StringSpec, AccessMode, PageCount, MemoryPage )	;
+!		Opens a file for the specified access.  A positive	;
+!		slot number is returned if the file is available.  A 	;
+!		0 means no slots and a negative value means there was	;
+!		some file error or the file is not available.		;
+!									;
+!		Memory Page specifies the (first) page in memory to	;
+!		use for reading the file.  A -1 (default) value says	;
+!		to pick a free page from the top of memory.		;
+!									;
+!		Page Count specifies the number of pages to map for	;
+!		each slot.						;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM File"
+    Own Safe integer array FileSpec[ S!Dev : S!Ext ];
+    Own Safe integer array File[ 0 : !RBLIC ];
+    Preset!with '17, cvsix("DSK   "), 0;
+    Own Safe integer array Dev[ 0 : 2 ];
+    Own Integer Slot, Flag, Chan, Char, C;
+
+    if not( Slot_ VMSlot( PageCount, MemPage ) )
+     then return( false );		! no slots, so no file opened ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( false );		!  not this time ;
+
+    if not( VMSpec( Spec, FileSpec ) )	! trouble with the spec? ;
+     then return( Base[ Slot ]_false );	!  then don't do anything ;
+
+    Chan_ F.Chan;			! Save for local usage ;
+    Mode_ !rh( Flag_ Mode );		! Remember flags ;
+
+    if not( VM$Read leq Mode leq VM$Multi )	! if an invalid mode ;
+     then return( false );		! Read, Write, Update, Multi ;
+
+    Dev[ 0 ]_ ldb( point(6,Mode,17) );	! Set proper mode (!ioASC) ;
+    Dev[ 1 ]_ FileSpec[ S!Dev ];	! Setup device block ;
+    chnior( Chan, Dev[ 0 ], !chOPN );	! OPEN [ '17, Dev, 0 ] ;
+    if not( !Skip! )			! If open-failure ;
+     then begin "open failure"		!  then no file opened ;
+	VMFree( Slot );			! Free the slot ;
+	return( !Xwd( -1,-1 ) );	!  and return ;
+     end "open failure";
+
+    arrclr( File );			! Clear out unused fields ;
+    File[ !RBCNT ]_ !RBLIC;		! Setup file lookup block ;
+    if ( FileSpec[ S!Usr ] )
+     then File[ !RBPPN ]_ location( FileSpec[ S!Usr ] );
+    File[ !RBNAM ]_ FileSpec[ S!Nam ];
+    File[ !RBEXT ]_ FileSpec[ S!Ext ] land (-1 lsh 18);
+
+    If ( VM$Write neq Mode )		! if mode neq VM$Write ;
+     then begin "read update"		!   do lookup ;
+
+	chnior( Chan, File[ !RBCNT ], !chLK );
+	if not( !Skip! ) and ( 0 = !rh(File[!RBEXT]) )
+	 then begin "not found"		! no skip and file not found ;
+	    if ( VM$Read neq Mode )	! if mode neq VM$Read, do create ;
+	     then begin "update stuff"
+
+		chnior( Chan, File[ !RBCNT ], !chENT );
+		if ( !Skip! )		! enter ok, so close & lookup ;
+		 then begin "ok find it"
+		    chnior( Chan, memory[0], !chCLS );
+		    chnior( Chan, File[ !RBCNT ], !chLK );
+		 end "ok find it";
+
+	     end "update stuff";	! if !skip! found or created file ;
+	 end "not found";		!  else some other file error ;
+
+	if not( !Skip! )		! lookups failed - not ERFNF% ;
+	 then begin "huh what's up"	! unless happened 2nd time ;
+	    VMFree( Slot );		! so, clear out and return ;
+	    return( !Xwd( -1,!rh(File[!RBEXT]) ) );
+	 end "huh what's up";
+
+     end "read update";			! have old file, or new file ;
+
+    if ( VM$Read neq Mode )		! for VM$Write, VM$Update, VM$Multi ;
+     then chnior( Chan, File[ !RBCNT ],
+		   if (Mode = VM$Multi)	! if mode eql VM$Multi ;
+		     then !chMEN	!  then use multiple enter ;
+		     else !chENT );	!  else use normal enter ;
+
+    if not( !Skip! )			! if lookup-enter failure ;
+     then begin "no file or access"	!  then Free the slot ;
+	VMFree( Slot );			!  and return error code ;
+	return( !Xwd( -1,!rh(File[!RBEXT]) ) );
+     end "no file or access";
+
+    F.Mode_ Mode;			! Remember these things ;
+    F.Flag_ Flag;
+    F.FPPN_ File[!RBPPN];		! File directory ;
+    F.Name_ File[!RBNAM];		! File name ;
+    A.FExt[ Slot ]_ File[!RBEXT] land (-1 lsh 18) lor !rh( File[!RBLIC] );
+    F.Size_ File[!RBSIZ] * 5;		! File size in characters (Rounded) ;
+
+    A.Date[ Slot ]_
+	(((Ldb(Point(2,File[!RBEXT],21)) lsh 12)+(File[!RBPRV] land '7777)) lsh 18)+
+	(((File[!RBPRV] lsh -12) land '3777) * 60 )+((File[!RBLIC] lsh -18) land '77);
+
+    if ( Mode > VM$Read ) and		! are we writing and ;
+	( VM$Append land Flag )		! wanting to append ;	
+	and  ( F.Size )			! must have something ;
+     then begin "tack it on"
+	C_ F.Size;			! set counter to last full word ;
+	while ( #nul = Char_ VMGetB(Slot,C) )	! decrement counter until ;
+	 do C_ C - 1;			!  we're past all the nulls ;
+	if ( Char < 0 )			! nothing in file? ;
+	 then C_ 0;			!  then set to beginning ;
+	VMSetC( Slot, C );		! set to first free character ;
+     end "tack it on";
+	 
+    return( Slot );			! Return the slot number ;
+
+end "VM File";
+
+
+Simple Integer Procedure Dbp( Reference Integer Ptr );
+! ----------------------------------------------------------------------;
+!									;
+!	Dbp( AsciiBytePointer )						;
+!		Routine to decrement a 7-bit byte pointer.  Its only	;
+!		magic relies on the assumption that a negative pointer	;
+!		is setup as '440700 from the point/bbpp operation that	;
+!		creates a ildb pointer to the first byte of the word.	;
+!		This routine fixes this to point to the last byte of	;
+!		the previous word whenever this is seen.  In "this"	;
+!		initial case, this works so that the pointer is never	;
+!		decremented the WRONG way.				;
+!									;
+! ----------------------------------------------------------------------;
+begin "Decrement Byte Pointer"
+
+  define
+  	BackByte    = '430000000001	! offset to backup a byte ;
+  ,	AddaByte    = '070000000000	! offset to increment byte ;
+  ;
+
+    If ( Ptr < 0 )			! initially '440700,,addr ;
+     then Ptr_ Ptr - BackByte		! so set to prev-last byte ;
+     else Ptr_ Ptr + AddaByte;		! else decrement a byte ;
+
+    If ( Ptr < 0 )			! must now be '440700,,addr ;
+     then Ptr_ Ptr - BackByte;		! so set to prev-last byte ;
+
+    return( Ptr );			! so it can be an expression ;
+
+end "Decrement Byte Pointer";
+
+
+Internal String Procedure VMLine( Integer Slot; Reference Integer More;
+				  Integer Dir( 0 ) );
+! ----------------------------------------------------------------------;
+!									;
+!	Line_ VMLine( Slot, More, Dir(0) )				;
+!		Returns the next consecutive line from the file that	;
+!		is connected to the specified slot.  More is set to	;
+!		the line terminator (LF, FF, VT, CR or EOT) or to 0	;
+!		when the end of the file is reached or the slot is 	;
+!		inactive.  Dir is the direction to read the file ( 0	;
+!	 	indicates forward, -1 or non-zero for backward).	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Line"
+    Integer Page, Byte, Copy, Count, Len, Last;
+    Boolean Eol;
+    String Str;
+
+    define BackByte = '430000000001;	! offset to backup a byte ;
+
+    More_ 0;				! Initialize for bad exits ;
+
+    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+     then return( null );		!  valid, else return ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( null );		!  not this time ;
+
+    if ( Dir )				! verify proper usage of Dir ;
+     then Dir_ -1			!  non-zero = backward = -1 ;
+     else Dir_ +1;			!  was-zero = forward  = +1 ;
+
+    if ( F.Char = -1 )			! we are mapped? ;
+     then if ( Dir < 0 )		! Forward or Backward? ;
+	   then F.Char_ F.Size		!   Set after last character ;
+	   else F.Char_ 0;		!   Set before first character ;
+
+    Page_ ( F.Char div CharPage ) + 1;	! calculate new page ;
+    if ( F.File leq  0 )  or		! is correct page mapped? ;
+       ( F.File > Page )  or		! new page too low? ;
+       ( Page geq ( F.File+F.Count ) )	! new page too high? ;
+     then if not( VMPMap( Slot,Page ) )	!  no, so try to map it ;
+	   then return( null );		! did page gets mapped ;
+
+    Count_ F.Char mod CharPage;		! Character position in page ;
+    Copy_ Byte_ point( 7, memory[F.Addr+(Count div 5)], ((Count mod 5)*7)-1 );
+    if ( Byte < 0 )			! Means we have '440700,,x ;
+     then Copy_ Byte_ Byte - BackByte;	! Point at an actual byte ;
+    if ( Dir < 0 )			! If backward direction ;
+     then ibp( Copy );			!  then setup for Dbp by 1 ;
+
+    Str_ Null;				! Initial return string ;
+
+    if ( Dir geq 0 )			!   Fix count (# left) ;
+     then if ( ( F.File * CharPage ) > F.Size )
+	   then Count_ (F.Size mod CharPage) - Count
+	   else Count_ CharPage - Count;
+
+    Last_ -1;				! Last character seen ;
+    Len_ F.Last_ F.CRet_ 0;		! Initialize length, breaks ;
+    Eol_ false;				! Initialize line var ;
+    while not( Eol )			! Read one line ;
+     do begin "one line"
+
+	if ( Count > 0 )		! Must have chars left ;
+	 then begin "more characters"	!  to even try to read ;
+
+	    if ( Dir < 0 )		! Forward or Backward? ;
+	     then dbp( Copy )		!  position the character ;
+	     else ibp( Copy );		!  pointer in the page ;
+
+	    F.Char_ F.Char + Dir;	! Update file character count ;
+
+	    case More_ ldb( Copy ) of begin	! check for end of line ;
+		[#nul] begin "found eos break"
+		    if ( Len )			! length to concatenate? ;
+		     then if ( Dir < 0 )	! yes, use right direction ;
+			   then Str_ stMake( Copy, Len ) & Str
+			   else Str_ Str & stMake( Byte, Len );
+		    if ( Dir < 0 ) and		! Backing up? ;
+		       not( F.Last )		! First time through? ;
+		     then dbp( Byte )		!  yes, keep it this way ;
+		     else Byte_ Copy;		!  no, update pointer ;
+		    Len_ 0;			! Reset string length ;
+		 end "found eos break";
+
+		[#cr] begin "found return"
+		    if ( Dir < 0 )
+		     then if ( #LF leq Last leq #FF )
+			   then F.CRet_ #CR	! remember we saw this ;
+			   else begin "lone cr"
+			      if ( Copy = Byte )	! if first char ;
+			       then F.Last_ More	!  remember and go ;
+			       else begin "eol cr"	! else do eol stuff ;
+				 Eol_ true;		! set end of line ;
+				 More_ F.Last;		! and get last one ;
+				 F.Char_ F.Char+1	! bump pointer by 1 ;
+			       end "eol cr";
+			   end "lone cr";
+		    if ( ( Dir > 0 ) and ( #CR = Last ) )
+		     then Eol_ true;		! flag as end of line ;
+		    if ( Len )			! length to concatenate? ;
+		     then if ( Dir < 0 )	! yes, use right direction ;
+			   then Str_ stMake( Copy, Len ) & Str
+			   else Str_ Str & stMake( Byte, Len );
+		    Byte_ Copy;			! synchronize pointers ;
+		    Len_ 0;			! Reset string length ;
+		 end "found return";
+
+!		[#eot] ;
+		[#lf][#vt][#ff] begin "found eol break"
+		    Eol_ true;			! looks like one? ;
+		    if ( Dir < 0 )		! were we going backward? ;
+		     then if ( Copy = Byte )	!  and the first character ;
+			   then begin "not eol"
+			      Eol_ false;	!  yes, not really eol ;
+			      F.Last_ More;	!  remember this for later ;
+			      F.Line_ F.Line + Dir;	! each line ;
+			      if ( More = #FF )		! each FF ;
+			       then F.PTxt_ F.PTxt+Dir;	! text page ;
+			      if ( More = #EOT )	! each EOT ;
+			       then F.MTxt_ F.MTxt+Dir;	! message ;
+			   end "not eol"
+			   else begin "got eol"
+			      F.Char_ F.Char + 1;	! each char ;
+			      More_ F.Last;		! eol-brk ;
+			   end "got eol"
+		     else begin "forward eol"
+			if ( Last = #CR ) and ( #LF leq More leq #FF )
+			 then F.CRet_ Last;		! mark CR before Brk ;
+			if ( More = #FF )		! for each FF seen ;
+			 then F.PTxt_ F.PTxt+Dir;	!  count a text page ;
+			if ( More = #EOT )		! for each EOT seen ;
+			 then F.MTxt_ F.MTxt+Dir;	!  count a text message ;
+			F.Line_ F.Line + Dir;		! count each line ;
+		     end "forward eol";
+		    If ( Len )			! length to concatenate? ;
+		     then if ( Dir < 0 )	! yes, use right direction ;
+			   then Str_ StMake( Copy, Len ) & Str
+			   else Str_ Str & StMake( Byte, Len );
+		 end "found eol break";
+
+		[else] begin "normal character"
+		    if ( Last = #CR ) and ( Dir > 0 )
+		     then begin "lonely cr"	! else do eol stuff ;
+			Eol_ true;		! set end of line ;
+			F.Char_ F.Char-1;	! bump pointer by 1 ;
+			More_ #CR;		! set eol to CR ;
+			if ( Len )		! length to concatenate? ;
+			 then Str_ Str & stMake( Byte, Len );
+		     end "lonely cr"
+		     else Len_ Len + 1		!  increment string length ;
+		 end "normal character"
+	    end;
+
+	    if ( memory[ !rh( copy ) ] land 1 )	! bit 35 set ;
+	     then begin "sequence numbers"	! in this word? ;
+
+		if ( Dir < 0 )
+		 then begin "seq backward"
+		    F.Char_ F.Char - 4;		! tab already seen backwards ;
+		    Count_ Count - 4;		!  update counts by 4 chars ;
+		    if ( Len > 2 )
+		     then begin "add text"	!  +1 for tab after seq # ;
+			ibp( Copy );		! make string skipping tab ;
+			Str_ stMake( Copy, Len-2 ) & Str;
+		     end "add text"
+		 end "seq backward"
+		 else begin "seq forward"
+		    F.Char_ F.Char + 5;		! include tab in count here ;
+		    Count_ Count - 5;		!  update counts by 5 chars ;
+		    if ( Len neq 1 )
+		     then print( "*** Bad SEQ # in text file. ***"& Crlf );
+		 end "seq forward";
+
+		Byte_ Copy_ Copy + Dir;		!  update 1 word ;
+		Len_ 0;				! Reset length ;
+
+	     end "sequence numbers";
+
+	    if ( 0 = Count_ (Count-1) max 0 )	! If now out of characters ;
+	     then begin "fake eos break"
+		if ( Len )		! length to concatenate? ;
+		 then if ( Dir < 0 )
+		       then Str_ stMake( Dbp( Copy ), Len ) & Str
+		       else Str_ Str & stMake( Byte, Len );
+		Len_ 0;			! Reset string length ;
+	     end "fake eos break";
+
+	    if ( More )			! if this is not a null ;
+	     then Last_ More;		! last char for next time ;
+
+	 end "more characters"
+	 else begin "need next page"	! If no-more-characters ;
+
+	    if ( F.Char geq F.Size )	! Forwards at end or ;
+	       or ( F.Char leq 0 )	!  backwards at beginning ;
+	     then begin "end of file"	! At end-of-file? ;
+
+		Eol_ true;		! Set flags true ;
+		if ( Dir < 0 )		! If backing up ;
+		 then More_ F.Last	!  use last break at end ;
+		 else begin "save info"
+		    More_ 0;		!  set flag var to 0 ;
+		    F.LSiz_ F.Line;	!  save total size in lines ;
+		    F.PSiz_ F.PTxt;	!  save total size in pages ;
+		    F.MSiz_ F.MTxt;	!  save total size in pages ;
+		 end "save info";
+		Done "one line";	! Finish loop ;
+
+	     end "end of file";		! Guess, read next page ;
+
+	    if not( VMPMap( Slot, Page_ ( F.Char div CharPage ) + 1 ) )
+	     then return( null );	! error mapping! ;
+
+	    ! ** assume: here at the beginning of the page ** ;
+	    if ( Dir < 0 )		! Forward or Backward? ;
+	     then Copy_ Byte_ point( 7, memory[ F.Addr+'1000 ], -1 )
+	     else Copy_ Byte_ point( 7, memory[ F.Addr ], -1 );
+
+	    if ( ( Page * CharPage ) > F.Size )
+	     then Count_ F.Size mod CharPage
+	     else Count_ CharPage;
+
+	 end "need next page";
+
+     end "one line";
+
+    return( Str );			! give 'em what they came for ;
+
+end "VM Line";
+
+
+Internal Boolean Procedure VMText( Integer Slot; String Text );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMText( Slot, Text, Dir(0) )				;
+!		Writes the next consecutive line or lines to the file	;
+!		that is connected to the specified slot.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Text"
+    define BackByte = '430000000001;	! offset to backup a byte ;
+    Integer Page, Byte, Char, Count;
+
+    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+     then return( false );		!  valid, else return ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( false );		!  not this time ;
+
+    if not( F.Mode )			! were we writing? ;
+     then return( false );		! no, don't bother! ;
+
+    if ( F.Char = -1 )			! if unmapped, then ;
+     then F.Char_ 0;			!  start at the beginning ;
+
+    Page_ ( F.Char div CharPage ) + 1;	! calculate correct page ;
+    if ( F.File leq  0 )  or		! is correct page mapped? ;
+       ( F.File > Page )  or		! new page too low? ;
+       ( Page geq ( F.File+F.Count ) )	! new page too high? ;
+     then if not( VMPMap( Slot,Page ) )	!  no, so try to map it ;
+	   then begin
+	      print( "Page map error: p",page,"  c",F.Char,"  f",F.Chan,crlf );
+	      return( false );		! if no page, error return ;
+	   end;
+
+    Count_ F.Char mod CharPage;		! Character position in page ;
+    Byte_ point( 7, memory[F.Addr+(Count div 5)], ((Count mod 5)*7)-1 );
+
+    Count_ CharPage - Count;		! Fix count (# left) including this ;
+
+    while ( length( Text ) )		! Must have some text left ;
+     do begin "writing line"
+
+	if ( Count > 0 )		! Must have room left to ;
+	 then begin "more characters"	!  even try to write ;
+
+	    if not( Char_ lop( Text ) )	! if null then try next char ;
+	     then continue "writing line";
+
+	    idpb( Char, Byte );		! deposit byte at position ;
+!	    ibp( Byte );		! then incrment pointer ;
+	    F.Char_ F.Char + 1;		! Update file character count ;
+
+	    case ( Char ) of begin	! check for end of line ;
+		[#cr] F.CRet_ #CR;	! remember we saw this ;
+
+!		[#eot] ;
+		[#lf][#vt][#ff] begin "count lines"
+		  F.Last_ Char;			! remember eol char ;
+		  F.Line_ F.Line + 1;		! count lines seen ;
+		  if ( Char = #ff )		! for each FF seen ;
+		   then F.PTxt_ F.PTxt+1;	!  count a text page ;
+		  if ( Char = #eot )		! for each EOT seen ;
+		   then F.MTxt_ F.MTxt+1;	!  count a messge ;
+		 end "count lines";
+
+		[else] F.CRet_ 0	! forget we saw a cr ;
+	     end;
+
+	    Count_ (Count-1) max 0;	! keep character count ;
+
+	 end "more characters"
+	 else begin "need next page"	! If no-more-characters ;
+
+	    if not( VMPMap( Slot, Page_ ( F.Char div CharPage ) + 1 ) )
+	     then begin
+		Print( "Page(2) map error: ",page," ",F.Char,crlf );
+		return( false );	! if no page, error return ;
+	     end;
+
+	    Byte_ point( 7, memory[ F.Addr ], -1 );
+	    Count_ CharPage;		! always a full page to write in ;
+
+	 end "need next page";
+
+     end "writing line";
+
+    if ( F.Char geq F.Size )		! At or Past end of file? ;
+     then begin "end of file"
+
+	F.Size_ F.Char;			!  save size in characters ;
+	F.LSiz_ F.Line;			!  save total size in lines ;
+	F.PSiz_ F.PTxt;			!  save total size in pages ;
+	F.MSiz_ F.MTxt;			!  save total size in pages ;
+
+     end "end of file";			! Guess, read next page ;
+
+    return( true );			! give 'em what they came for ;
+
+end "VM Text";
+
+
+Internal Boolean Procedure VMMove( Integer Slot, HowMany(1) );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMMove( Slot, HowMany(1) )					;
+!		Moves the position pointer forward or backward up to	;
+!		HowMany lines in the file.  Returns true if the slot is	;
+!		active and HowMany lines exist, otherwise it returns	;
+!		false and leaves the pointer positioned at logical end	;
+!		of file (at the beginning if direction is backward).	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Move"
+    Own Integer Brk;
+
+    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+     then return( false );		!  valid, else return ;
+
+    if not( Base[ Slot ] )		! slot assigned? ;
+     then return( false );		!  not this time ;
+
+    if not( HowMany )			! we can always move ;
+     then return( true );		!  a distance of 0 ;
+
+    while ( HowMany )			! while lines to go read them ;
+     do begin "moving lines"
+
+	if not( length( VMLine( Slot, Brk, HowMany < 0 ) ) or Brk )
+	 then return( false );		!  then take the cows to town ;
+
+	if ( HowMany > 0 )		! decrement the right direction ;
+	 then HowMany_ HowMany - 1	!  down to zero  ;
+	 else HowMany_ HowMany + 1;	!  or up to zero ;
+
+     end "moving lines";
+
+    return( true );			! give 'em what they came for ;
+
+end "VM Move";
+
+end "VM Package";
+  f?+G¡
