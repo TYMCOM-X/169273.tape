@@ -1,0 +1,1861 @@
+	.TITLE	LNKEB - Link type E (LAPB on DUV-11/DUP-11/DPV-11)
+;--this file is only for ..SCCH(SCCHPR.mac) ks 7/30/85
+;--use LNKEB2.MAC for all devices, including SCCH
+	.SBTTL	- Definitions
+
+	XLPAR				; Don't list parameter file
+
+.IF NDF ..SCCH
+..SCCH=0
+..BG1=0
+.IFF
+..DPV=!1	;--KSB1, ..SCCH INCLUDES ..DPV IS JUST FOR CONVENIENCE TO
+		;	ADD CODES.
+.ENDC
+.IIF	NDF	..DPV,..DPV=0
+.IF	EQ	<..DPV-1>
+
+;-----
+; BIT DEFINITION IN DPV RECEIVE CNTRL AND STATUS REGISTER (RXCSR, BASE+0)
+;-----
+;		MODEM CONTROL BITS
+DSCHG	=	100000		;DATA SET CHANGE
+DSRING	=	040000		;RING INDICATOR
+DSCTS	=	020000		;CLEAR TO SEND
+DSCARY	=	010000		;CARRIER INDICATOR
+DSMODR	=	001000		;MODEM READY
+DSITEN	=	000040		;DATA SET INTERRUPT ENABLE
+DSLOOP	=	000010		;DATA SET LOOPBACK
+DSRTS	=	000004		;REQUEST TO SEND
+DSDTR	=	000002		;DATA TERMINAL READY
+DSSEL	=	000001		;SELECT FREQUENCY
+
+;		RECEIVER CONTROL BITS
+RXACT	=	004000		;RECEIVER ACTIVE
+RXSRDY	=	002000		;RECEIVER STATUS READY
+RXFLAG	=	000400		;RECEIVER FLAG DETECT
+RXDONE	=	000200		;RECEIVER DONE
+RXITEN	=	000100		;RECEIVER INTERRUPT ENABLE
+RXREN	=	000020		;RECEIVER ENABLE
+
+;-----
+; BIT DEFINITION OF DPV RECEIVE DATA AND STATUS REGISTER (RDSR, BASE+2, R/O)
+;-----
+RXABC	=	070000		;RECEIVER ASSEMBLED BIT COUNT
+RXABRT	=	002000		;RECEIVED ABORT
+.IF NE ..SCCH
+RXENDM	=	100000		;RECEIVED END OF MESSAGE, SEE RR1 OF SCC
+RXERR	=	 40000		;RECEIVER CRC ERROR
+RXOVRN	=	 20000		;RECEIVER DATA OVERRUN
+.IFF
+RXERR	=	100000		;RECEIVER CRC ERROR
+RXOVRN	=	004000		;RECEIVER DATA OVERRUN
+RXENDM	=	001000		;RECEIVED END OF MESSAGE
+.ENDC
+RXSTRM	=	000400		;RECEIVED START OF MESSAGE
+
+;-----
+; BIT DEFINITION OF DPV PARAMETER CNTRL SYNC/ADDRESS REG. (PCSAR, BASE+2, W/O)
+;-----
+DPAPA	=	100000		;ALL PARTY ADDRESSED
+DPPROT	=	040000		;PROTOCOL SELECTION
+DPLPMD	=	020000		;LOOP MODE
+DPSECS	=	010000		;SDLC/ADCCP SECONDARY STATION SELECT
+DPIDLE	=	004000		;IDLE MODE SELECT
+DPCRC	=	0*400		;CRC CCITT, BOTH CRC BYTES STARTS WITH ALL ONES
+
+;-----
+; BIT DEFINITION OF DPV PARAMETER CNTRL AND CHAR. LENGTH REG. (PCSCR, BASE+4)
+;-----
+TCLEN	=	160000		;TRANSMITTER CHARACTER LENGTH
+EXADD	=	010000		;EXTENDED ADDRESS FIELD
+EXCON	=	004000		;EXTENDED CONTROL FIELD
+RCLEN	=	003400		;RECEIVE CHARACTER LENGTH
+TXITEN	=	000100		;TRANSMITTER INTERRUPT ENABLE
+TXREN	=	000020		;TRANSMITTER ENABLE
+TXMAI	=	000010		;MAINTENANCE MODE SELECT
+TXDONE	=	000004		;TRANSMITTER DONE
+TXACT	=	000002		;TRANSMITTER ACTIVE
+TXRES	=	000001		;DEVICE RESET
+
+;-----
+; BIT DEFINITION OF DPV TRANSMIT DATA AND STATUS REG. (TDSR, BASE+6)
+;-----
+TXLATE	=	100000		;TRANSMITTER DATA LATE (UNDERRUN)
+TXGO	=	004000		;TRANSMIT GO AHEAD (NOT USED FOR HDLC)
+TXABRT	=	002000		;TRANSMITTER ABORT
+TXENDM	=	001000		;TRANSMIT END OF MESSAGE
+TXSTRM	=	000400		;TRANSMIT START OF MESSAGE
+
+.IFTF
+;-----
+; MACRO TO CHECK XMIT DATA LATE ON DPV-11
+;-----
+.MACRO	CHKLAT,?OK
+.IF EQ ..SCCH
+.IF	EQ	<..DPV-1>
+	MOV	DDLEXB#(R4),R0	;GET ADDRESS OF DPV TDSR REGISTER
+	TBBE	TXLATE,(R0),OK	;BRANCH IF NOT DATA LATE
+	JMP	OFRAM1		;GO CLEAR ERROR, SEND FLAG AND TRY AGAIN
+OK:
+.ENDC
+.ENDC
+.ENDM	CHKLAT
+.MACRO	OBYTE
+.IF NE ..SCCH	;IF USING ATC+X.25
+	JMP	OFRAM3
+.IFF
+.IF EQ <..DPV-1>
+	JMP	OFRAM3
+.IFF
+	JMP	OTRAN3
+.ENDC
+.ENDC
+.ENDM	OBYTE
+
+.IFF		;IF NOT USING DPV11
+
+.SHSYN	=! 3				; # synch bytes for short frame synch
+.LNSYN	=! 12.				; # synch bytes for long synch (init,
+					;   reset link)
+
+$RSTRP	=! $BIT08			; Receiver control strip synch bit
+$RSRCH	=! $BIT04			; Receiver control search for synch bit
+
+$XSMSG	=! $BIT08			; Transmitter data start of message bit
+$XMSTR	=! $BIT08			; Transmitter control master reset bit
+$XSEND	=! $BIT04			; Transmitter control send bit
+
+;-----
+; Constants - initialization values for the device registers
+;-----
+.PRDUV	=! <3*$BIT12>!<3*$BIT10>!SYN	; DUV-11 parameter reg initial value:
+					;   Intern synch, 8-bit, SYN synch
+.PRDUP	=! $BIT15!$BIT09!SYN		; DUP-11 parameter reg initial value:
+					;   DEC mode, CRC inhib, SYN synch
+.RINIT	=! $BIT08!$BIT06!$BIT04!$BIT02!$BIT01 ; Receiver cntl reg init value:
+					;   Strip synch, Rec int enable, Search
+					;   synch, Req to send, Data term rdy
+.XINIT	=! $BIT06			; Xmitter control reg initial value:
+					;   Xmit int enable
+.ENDC		; .IF ..DPV=1
+
+
+
+;-----
+; Macro to return from interrupt (RTI) after restoring R0 and R4
+;-----
+.MACRO	RTI04
+.IF NE ..SCCH
+	MOVB	#70,@DDLEXB#(R4)	;RESET INTERRUPT
+.ENDC
+.IF NE ..BG1
+	MOV	(SP)+,R0
+	MOV	(SP)+,R1
+	MOV	(SP)+,R2
+.IFF
+	MOV	(SP)+,R0
+.ENDC
+	MOV	(SP)+,R4
+	RTI
+.ENDM
+.MACRO PUSHR0
+.IF NE ..BG1
+	MOV	R2,-(SP)
+	MOV	R1,-(SP)
+	MOV	R0,-(SP)
+	MOV	DDLEIS#(R4),R1
+	MOV	DDLEOS#(R4),R2
+.IFF
+	MOV	R0,-(SP)
+.ENDC
+.ENDM
+
+.IF NE ..SCCH
+; Input states FOR ATC+HDLC ROUTINES
+IS.AF	=! 00 + IDISPH		;ADDRESS FIELD
+IS.CF	=! 02 + IDISPH		;CONTROL FIELD
+IS.D1	=! 04 + IDISPH		;FIRST BYTE AFTER CONTROL BYTE
+;				; UNNUMBERED FRAME MAY CONTAIN NO DATA,
+;				; IN THIS CASE, THIS BYTE WILL BE CRC
+IS.BDY	=! 06 + IDISPH		;DATA
+
+; Output statas for ATC+HDLC routines
+OS.IDL	=! 00			;OUTPUT ADDRESS FIELD (1ST BYTE AFTER IDLE)
+OS.CTL	=! 02			;OUTPUT THE CONTROL FIELD
+OS.INF	=! 04			;OUTPUT THE FIRST BYTE OF INFORMATION FIELD
+OS.CRC	=! 06			;OUTPUT CRC
+OS.SEQ	=! 10			;OUTPUT SEQUENCE NS AND NR
+OS.WHY	=! 12			;OUTPUT REASON WHY FRAME REJECT
+OS.END	=! 14			;START T3 TIMER AND SEND CRC
+OS.BDY  =! 16			;OUTPUT THE BODY OF INFO-FIELD
+OS.REJ  =! 20			;OUTPUT THE FIRST BYTE OF FRMR (BAD C-FIELD)
+.ENDC
+
+;-----
+; Flags (in DDLEFG field of DDB - link type E flag word)
+;-----
+$DLE	=! $BIT00			; DLE seen (for input DLE sequences)
+$CRC	=! $BIT01			; Reading the 2 CRC bytes
+$REJ	=! $BIT02	;(SR) state	; Input is in reject condition
+$FRMR	=! $BIT03	;(FR) state	; FRMR condition exists on this side
+$TIMER	=! $BIT04			; Time-out recovery is in progress
+; $TIMER is set in accompany with $REXMT only by XXINFO, means T1 expires
+;	 and LKEOSV shall go retransmit an I-frame.
+$IBUSY	=! $BIT05			; This side of link is busy (Who sets it?)
+$OBUSY	=! $BIT06	;(RB) state	; Other end of link is busy
+$ABORT	=! $BIT07			; Abort this output I-frame
+$ICPF	=! $BIT08			; Poll bit was set on input command
+$OCPF	=! $BIT09			; Final bit should be set in output cmd
+$FRXMT	=! $BIT10			; This output frame is retransmission
+$REXMT	=! $BIT11			; Retransmit 1st frame on transmit ring
+$RR	=! $BIT12			; Pending RR response for info frame
+$SYNCH	=! $BIT13			; Need to synchronize link
+$RSREJ	=! $BIT14			; Frame to be rejected is a response
+$RRCMD	=! $BIT15			; TIME TO SEND A RR CMD WITH P BIT
+; $SARM1=! $BIT14			; First SARM received
+; $DISC1=! $BIT15			; First DISC received
+
+;-----
+; Flags (in DDLEF2 field of DDB - link type E 2nd flag word
+;-----
+
+$D2EXPF =! $BIT04	;Expect Final bit set in next response frame
+$D21ST	=! $BIT09	;INDICATE 1ST BYTE SO AS TO RESET CRC GENERATOR
+$CMD	=! $BIT10			; FRAME RECEIVED WAS A COMMAND
+					;  USED IN MACKNR (FLOW CONTROL ROUTINES)
+$IRMA	=! $BIT11			; IRMA timer flag for output interrupt
+; $RUA	=! $BIT12			; Link needs to receive UA for SARM
+; $XUA	=! $BIT13			; Link needs to send UA to SARM
+$RESET	=! $BIT14			; Link has been reset after cold start
+; $RDISC=! $BIT15			; Resetting link with DISC (not SARM)
+
+;-----
+; Bit test and set values
+;-----
+$INFO	=! $BIT00			; Bit 0 of frame control byte
+$SUPV	=! $BIT01			; Bit 1 of frame control byte
+$PFBIT	=! $BIT04			; Bit 4 of frame control byte
+
+;-----
+; Constants - base for modulus arithmetic
+;-----
+.MODN	=! 10				; Modulus (base) for arithmetic on
+					;   V(R), V(S), N(R), N(S)
+;-----
+; Bit masks
+;-----
+$MASKN	=! ^C<.MODN-1>			; Bit clear mask for isolating (e.g.
+					;   performing modulus arithmetic on)
+					;   V(R), V(S), N(R), N(S)
+;-----
+; Constants - timer duration values
+;	Check output status once every ten seconds.  If output is idle, send
+;		an RR command with P bit set.
+;	Set down counter T6 to 60 every time a good frame is received.  Reset
+;		the link if this counter reaches zero.
+;-----
+
+.T3	=! 10.				; Idle output RR frame timer duration
+; .T4	=! 60.				; Reject condition timer duration
+; .T5	=! 60.				; Command Reject timer duration
+.T6	=! 60.				; Idle input take-down timer duration
+
+;-----
+; Constants - shift counts
+;-----
+.SHFNR	=! 5				; Shift count to right justify N(R)
+
+;-----
+; Constants - frame control byte values
+;-----
+.DM	=! 17				; Disconnect Mode response
+.SABM	=! 57				; Set Asynchronous Response Mode cmd
+.DISC	=! 103				; DISConnect command
+.UA	=! 143				; Unnumbered Acknowledge response
+.FRMR	=! 207				; FRaMe Reject response
+
+.RR	=! 1				; Receive Ready supervisory response
+.RNR	=! 5				; Receive Not Ready supv response
+.REJ	=! 11				; REJect supervisory response
+
+;-----
+; Constants - input detected error status values
+;-----
+ER.IGN	=! 0				; Return after discarding frame
+ER.OVF	=! 2				; Frame overflow
+ER.UND	=! 4				; Frame underflow
+ER.IVF	=! 6				; Invalid frame format
+ER.INR	=! 10				; Invalid N(R)
+ER.NIA	=! 12				; No info field allowed
+ER.STO	=! 14				; Start output after dicarding frame
+ER.RST	=! 16				; Reset link after discarding frame
+
+;-----
+; Constants - FRMR (FRaMe Reject response) reasons
+;-----
+.CRSNW	=! $BIT00			; CMDR reason W (invalid control byte)
+.CRSNX	=! $BIT01			; CMDR reason X (info fld not allowed)
+.CRSNY	=! $BIT02			; CMDR reason Y (frame overflow)
+.CRSNZ	=! $BIT03			; CMDR reason Z (invalid N(R))
+
+;-----
+; Constants - size parameters
+;-----
+.P1MAX	=! PKCMAX+3			; Maximum # bytes in 1st info field pkt
+
+.IIF NE ..SCCH,	..DPV=0		;WE ONLY SHARE PARAMETRS WITH DPV11, NOT CODE.
+	CODE
+
+.IF NE ..SCCH	;IF USING ATC+X.25
+	.SBTTL	LKEISV	- Input interrupt handler
+;-----
+; LKEISV - Processes input interrupts from the DUV-11/DUP-11 interface
+;
+; The following code has been executed to get here:
+;	<input ready interrupt>
+;	PUSH	R4			; Save R4
+;	MOV	<address of DDB>,R4	; R4 --> DDB of link needing service
+;	JMP	LKEISV			; Go to common input interrupt routine
+;-----
+LKEOSV::	;MAKE A FUNNY LABEL BECAUSE SCC INTERRUPTS ARE BACKWARDS
+	PUSHR0			; Save R0
+	CLR	R0			;CLEAR FOR BISB
+	MOVB	#21,@DDLEXB#(R4)	;RESET INTR AND SELECT RR1
+	BISB	@DDLEXS#(R4),R0		;GET RR1 RECEIVER STATUS
+	SWAB	R0			;HIGH BYTE = STATUS
+	BISB	@DDLERS#(R4),R0		;GET DATA BYTE
+	TBBE	RXOVRN,R0,10$		;IF NO OVERRUN ERROR
+	MOV	#60,@DDLEXB#(R4)	;ERROR RESET TO UNLOCK RECEIVER
+;IERRO:	; HERE AN OVERRUN ERROR OCCURRED
+	INC	DDEROR#(R4)		;COUNT IT AS OVERRUN ERROR
+	JMP	IABTSY		;GO RESYNC AND ABORT IMCOMPLETE DATA
+
+; NO ERROR INDICATION
+
+10$:
+	TBBE	RXENDM,R0,22$	;NOT EOM, GO DISPATCH DIRECTLY
+	ADD	#IDOFFS,DDLEIS#(R4)	;EOM, ADD OFFSET THEN DISPATCH
+22$:	MOV	@DDLEIS#(R4),PC		;;Dispatch on input state
+
+	PURE
+IDISPH:	IADDRE			;IS.AF = 00 - ADDRESS FIELD
+	ICNTL			;IS.CF = 02 - CONTROL FIELD
+	I1DAC			;IS.D1 = 04 - 1ST DATA BYTE AFTER CONTROL
+	IBODY			;IS.BDY= 06 - FRAME BODY
+IDOFFS=.-IDISPH
+	IIDLE			;IS.AF = 00 - ADDRESS FIELD WITH EOM SET
+	IIDLE			;IS.CF = 02 - CONTROL FIELD WITH EOM SET
+	IIDLE			;IS.D1 = 04 - 1ST DATA BYTE WITH EOM SET
+	ICRC			;IS.BDY= 06 - CRC
+
+	CODE
+;
+; HERE FOR FRAME ADDRESS BYTE INPUT
+;
+IADDRE:	MOVB	DDLEK3#(R4),DDLEIK#(R4)	;SET FRAME BYTE COUNT TO MAX
+	MOVB	#ER.UND,DDLEIZ#(R4)	;INIT INPUT STATUS TO UNDERFLOW (FRAME TOO SHORT)
+	MOVB	R0,DDLEIA#(R4)		;SAVE FRAME ADDRESS BYTE
+	MOV	#IS.CF,DDLEIS#(R4)	;NEXT STATE = GET FRAME CNTRL BYTE
+	RTI04				;
+
+IABTSY:		;HERE FOR INPUT ERROR, WE NEED RESYNC AND ABORT
+;-----
+; Here to establish character synchronization over the link
+;   IT IS NOT NECESSARY FOR DPV TO ESTABLISH SYNCHRONIZATION ON THE NORMAL
+;   COMPLETION OF A FRAME.
+;-----
+ISYNCH:
+	MOV	#23,@DDLEXB#(R4)	;RESET STATUS AND POINT TO RR3
+	MOV	#331,@DDLEXB#(R4)	;HUNT SYNC
+;-----
+; Here to abort input frame
+;-----
+IABORT:	TST	DDLEIF#(R4)		; Information field?
+	BEQ	RTI000			;NO, 
+	PUSH	R1			; Save R1
+	MOV	DDLEIF#(R4),R1		; Get 1st packet address
+	CLR	DDLEIF#(R4)		; Clear packet list header
+	CALL	FRELST			; FREE PACKETS
+	POP	R1			; Restore R1
+IIDLE:	MOV	#IS.AF,DDLEIS#(R4)		; Clear input state (go idle)
+RTI000:
+	RTI04				; Return from interrupt
+
+	.SBTTL	Protocol input states - frame address & control bytes
+;-----
+; Here on frame control byte input
+;-----
+ICNTL:
+	MOVB	R0,DDLEIX#(R4)		; Save control byte
+	CLRB	DDLEIZ#(R4)		; Frame format OK so far
+	BIS	#$CRC,DDLEFG#(R4)	;FLAG: WE DON'T HAVE I-FIELD YET.
+	MOV	#IS.D1,DDLEIS#(R4)	; Input state <-- 1st byte of info fld
+	RTI04				; Return from interrupt
+I1DAC:		;WAIT FOR NEXT BYTE AFTER "C"-FIELD
+	MOV	R0,DDLECI#(R4)		;SAVE 1ST HALF OF CRC
+	MOV	#IS.BDY,DDLEIS#(R4)	;WAIT FOR 2ND HALF OF CRC
+	RTI04
+ICRC:
+	TBBE	RXERR,R0,IMSEN1		;EOM+NO-CRC-ERROR, GO SEND FRAME
+IERRC:		;ABORT DUE TO CRC ERROR
+	INC	DDERCS#(R4)		;COUNT UP AS CRC ERROR
+	JMP	IABORT
+IBODY:
+IINFW:		;
+	PUSH	R0
+	MOV	DDLECI#(R4),R0
+	POP	DDLECI#(R4)
+	TBBE	$CRC,DDLEFG#(R4),IINFO	;$CRC=0, WE ALREADY GOT I=FIELD
+
+	.SBTTL	Protocol input states - frame information field
+;-----
+; Here on first byte of information field
+;-----
+IINF0:
+	BIC	#$CRC,DDLEFG#(R4)	;FLAG: WE HAVE I-FIELD
+	MOV	#DDLEIF#,DDLEIP#(R4)	; Let new packet code set 1st pkt ptr
+	ADD	R4,DDLEIP#(R4)		;   by setting "link" of current to 1st
+	MOV	#PKTYPE,DDLEIB#(R4)	; Start putting bytes into pkt type
+	MOVB	#.P1MAX,DDLEIC#(R4)	; 1st pkt has more bytes (incl. header)
+	BR	INEWP1			; Merge with new packet code
+
+;-----
+; Here to get a new packet for additional information field bytes
+;-----
+INEWPK:	MOV	#PKDATA,DDLEIB#(R4)	; Start putting bytes into pkt data
+	MOVB	#PKCMAX,DDLEIC#(R4)	; Init packet byte counter
+
+INEWP1:	PUSH	R1			; Save R1
+	MAKPKT	.PLSTP#			; Get a free packet
+	BCC	INEWP2			; Got a packet ==> go initialize it
+	POP	R1			; RESTORE R1
+;-----
+; No packets available for frame information field bytes
+;	***SHOULD MARK $IBUSY AND SEND RNR***
+;-----
+IERRP:		;ERROR DUE TO NO PACKET AVAILABLE
+IBUSY:	INC	DDERNP#(R4)		; Bump "No Packets Available" count
+	JMP	IABTSY			; Go  re-synch the interface & clean up
+
+;-----
+; Here to initialize new packet for information field bytes
+;-----
+INEWP2:	MOV	R1,@DDLEIP#(R4)		; Set link to new packet
+	MOV	R1,DDLEIP#(R4)		; Save link to new current packet
+	ADD	R1,DDLEIB#(R4)		; Init packet byte pointer
+	MOVB	#PKCMAX,PKCNT(R1)	; Set full packet count
+	CLRB	PKTYPE(R1)		; Clear packet type
+	CLRB	PKSOC(R1)		; Clear packet socket number
+	CLRB	PKSEQ(R1)		; Clear packet sequence number
+	POP	R1			; Restore R1
+
+;-----
+; Here to input a byte of the information field
+;-----
+IINFO:	TSTB	DDLEIK#(R4)		; Check frame byte count
+	BNE	1$			; Still room left - stuff byte
+
+	MOVB	#ER.OVF,DDLEIZ#(R4)	; Frame status <-- overflow
+					;WHO IS GOING TO SEE THIS ???
+;IERRL:	;FRAME LENGTH EXCEEDS THE LIMIT
+	JMP	IABTSY			; Go re-synch the interface & clean up
+
+1$:	TSTB	DDLEIC#(R4)		; Check packet byte count
+	BEQ	INEWPK			; Packet full ==> get new packet
+
+	MOVB	R0,@DDLEIB#(R4)		; Put byte into packet
+	INC	DDLEIB#(R4)		; Bump byte pointer
+	DECB	DDLEIK#(R4)		; Bump frame byte count
+	DECB	DDLEIC#(R4)		; Bump packet byte count
+	RTI04
+IMSEN1:	TBBN	$CRC,DDLEFG#(R4),IMSEND	;$CRC=1, FRAME WITH NO I-FIELD
+					;DON'T BOTHER CALCULATING PK-COUNT
+	PUSH	R0		;SAVE STATUS FOR CRC ERROR CHECKING
+	CLR	R0			; Clear residue in register
+	BISB	DDLEIC#(R4),R0		; Get # of bytes until packet full
+	NEG	R0			; Negate # bytes until full
+	ADD	#PKCMAX,R0		; PKCMAX-(#bytes until full)=#bytes
+	ADD	#PKCNT,DDLEIP#(R4)	; Point pkt ptr at PKCNT to store count
+	MOVB	R0,@DDLEIP#(R4)		; Store packet byte counter in packet
+	POP	R0			;RESTORE R0
+;	BR	IMSEND			;and send to mainloop
+
+	.SBTTL	Protocol input states - end frame & verify CRC
+;-----
+; Here to insert frame into input-to-main ring
+;	*****IF ADDR=1 OR 3, PASS THE FRAME AS A COMMAND OR RESPONSE
+;	*****OTHERWISE, DISCARD THE FRAME.
+;-----
+IMSEND:
+	CMPB	DDLEIA#(R4),DDLERC#(R4)	; Input addr.=rcvd cmd addr. ?
+	BEQ	10$			; Branch if yes
+	CMPB	DDLEIA#(R4),DDLERR#(R4) ; Input addr. = rcvd response addr. ?
+	BEQ	5$			; Branch if yes
+;IERRA:		;ERROR DUE TO BAD ADDRESS
+	INC	DDERPC#(R4)		; Count it as a protocol error
+	JMP	IABORT			; and ignore the frame
+5$:
+	BISB	#200,DDLEIZ#(R4)	; Input is a response, set the MSB of
+					; the input-to-main status 		
+					; If the input is a command, keep the
+					; MSB of the status byte cleared.
+10$:
+	MOV	DDLEQP#(R4),R0		; Get input-to-main ring putter
+	MOV	DDLEIF#(R4),(R0)+	; Store info field packet list header
+	MOVB	DDLEIX#(R4),(R0)+	; Store frame control byte
+	MOVB	DDLEIZ#(R4),(R0)+	; Store input to main status byte
+	CMP	R0,DDLEQE#(R4)		; End of ring?
+	BLO	1$			; No
+	MOV	DDLEQB#(R4),R0		; Yes - reset putter to start of ring
+1$:	CMP	R0,DDLEQT#(R4)		; Ring full?
+	BNE	2$			; No - GO IDLE, WAIT FOR NEXT FRAME
+;IERRF:		;ERROR DUE TO RING IS FULL
+	INC	DDEROR#(R4)		; Yes - bump overrun error count
+	JMP	IABORT			; Throw this frame away
+
+2$:	MOV	R0,DDLEQP#(R4)		; Update ring putter
+	CLR	DDLEIF#(R4)		; Clear packet list pointer
+	JMP	IIDLE			;GO WAIT FOR NEXT FRAME
+
+.ENDC	;.IF NE ..SCCH, IF USING ATC+X.25
+.IF NE ..SCCH	;IF USING ATC+X.25
+	.SBTTL	LKEOSV	- Output interrupt handler
+;-----
+; LKEOSV - Processes output interrupts from the DUV-11/DUP-11 interface
+;
+; The following code has been executed to get here:
+;	<output done interrupt>
+;	PUSH	R4
+;	MOV	<address of DDB>,R4
+;	JMP	LKEOSV
+;-----
+LKEISV::	;MAKE A FUNNY LABEL BECAUSE SCC INTERRUPTS ARE BACKWARDS
+	PUSHR0			; Save R0
+	BIS	#$IRMA,DDLEF2#(R4)	; Set IRMA timer flag
+	MOVB	@DDLEXS#(R4),R0		;;get RR0, SCC status
+	BIT	#100,R0			;;underrun?
+	BEQ	100$			;;EQ, no ERROR, GO DISPATCH
+	TST	DDLEOS#(R4)		;UNDERRUN IS NORMAL AT EOFRAME
+	BEQ	ONEXTF			;EQ, IDLE STATE, NORMAL
+;OERRU	;HERE UNDERRUN ERROR
+	INC	DDERRX#(R4)		;;Increment underrun counter
+;	MOV	DDLEIX#(R4),R0	;get back the frame pointer, which
+	JMP	OFRXMT		; just encounter an underrun
+100$:
+	MOV	DDLEOS#(R4),R0		; Get output state - output active?
+	JMP	@ODISP(R0)		; Yes - dispatch to output state
+
+	PURE
+ODISP:	.WORD	ONEXTF		;OS.IDL = 00 - IDLE
+	.WORD	OCNTL		;OS.CTL = 02 - OUTPUT CONTROL FIELD
+	.WORD	OINF0		;OS.INF = 04 - OUTPUT FIRST BYTE OF I-FIELD
+	.WORD	OCRC		;OS.CRC = 06 - OUTPUT CRC
+	.WORD	OCVRVS		;OS.SEQ = 10 - OUTS, NR
+	.WORD	OCRSN		;OS.WHY = 12 - OUTPUT CMD REJECT REASON
+	.WORD	OENDTR		;OS.END = 14 - START T3 TIMER AND OUTPUT CRC
+	.WORD	OBODY		;OS.BDY = 16 - OUTPUT THE BODY OF I-FIELD
+	.WORD	OINFCR		;OS.REJ = 20 - OUTPUT FIRST BYTE OF FRMR
+
+	CODE
+;-----
+; Here to find next frame to send (if there is one)
+;-----
+ONEXTF:	TBBN	$D1DWN,DDSTS1#(R4),ONEXT1 ; Bypass if not info xfr phase
+	BIC	#$ABORT,DDLEFG#(R4)	; Clear abort flag (not sending yet)
+	TBBN	$TIMER,DDLEFG#(R4),1$	; If timer recovery, don't send info
+	CMP	DDLELN#(R4),DDLELT#(R4)	; Info frames pending?
+	BNE	OFINFO			; Yes - send info frame
+	BR	2$			; Go check for pending RR frame
+
+1$:	TBBN	$REXMT,DDLEFG#(R4),OFRXMT ; If retransmit flag set, retransmit
+					;   1st frame on transmit ring
+2$:	TBBN	$RR,DDLEFG#(R4),OFRR	; If pending RR response for info frame
+					;   go send RR (or RNR if input busy)
+	TBBE	$RRCMD,DDLEFG#(R4),ONEXT1 ;BRANCH IF NO NEED TO SEND RR CMD YET
+	JMP	ORRCMD
+
+ONEXT1:	MOVB	DDLECM#(R4),DDLEOX#(R4)	; Get pending command - anything there?
+	BEQ	10$			; NO, GO ON
+	JMP	OFCMND			; Yes - send command frame
+10$:	MOVB	DDLEAK#(R4),DDLEOX#(R4)	; Get pending ACK - anything there?
+	BNE	OFRESP			; Yes - send response frame
+;-----
+; Here to go idle when there is no frame to output
+;-----
+OFIDLE:
+	MOVB	#50,@DDLEXB#(R4)	;RESET XMITTTER INTERRUPT
+	BIC	#$IRMA,DDLEF2#(R4)	;DON'T CHECK FOR LOST INTERRUPT
+1$:	CLR	DDLEOS#(R4)		; Clear output state (go inactive)
+RTI001:	RTI04				; Return from interrupt
+
+	.SBTTL	Set up for response frame (RR, RNR, REJ, UA, CMDR)
+;-----
+; Here to begin sending response frame
+;-----
+OFRESP:	CLRB	DDLEAK#(R4)		; Clear pending response function
+	CMPB	DDLEOX#(R4),#.UA	; Unnumbered Acknowledge response?
+	BEQ	OFRESX			; Yes
+	CMPB	DDLEOX#(R4),#.DM	; Disconnected Mode response?
+	BEQ	OFRESX			; Yes
+;-----
+; Make sure all is well before sending a supervisory response frame
+;-----
+	BIC	#$RR,DDLEFG#(R4)	; Clear RR pending flag
+	TBBN	$D1DWN,DDSTS1#(R4),OFIDLE ; Go idle if not info xfr phase
+	TBBE	$FRMR,DDLEFG#(R4),OFSUPV; If not FRMR state, send supervisory
+;-----
+; Begin sending FRMR frame
+;-----
+OFCMDR:	MOVB	#.FRMR,DDLEOX#(R4)	; Frame control byte <-- FRMR
+	MOV	#OS.REJ,DDLEOI#(R4)	; Info fld dispatch <-- FRMR info fld
+;	BR	OFRAME			; Start sending frame
+	BR	OFRESY
+
+;-----
+; Here when received frames to be ACK'd and no info frame to piggyback ACK
+;-----
+OFRR:	BIC	#$RR,DDLEFG#(R4)	; Clear RR pending flag
+	MOVB	#.RR,DDLEOX#(R4)	; Frame control byte <-- RR
+;	TBBE	$IBUSY,DDLEFG#(R4),OFSUPV ; Input busy?
+;	MOVB	#.RNR,DDLEOX#(R4)	; Yes - frame control byte <-- RNR
+
+;-----
+; Here to get N(R) for supervisory frame and finish setup
+;-----
+OFSUPV:
+	CLR	R0
+	BISB	DDLEVR#(R4),R0		; Get V(R) for supervisory frame
+	ASHI	.SHFNR,R0		; Shift into N(R) position
+	BISB	R0,DDLEOX#(R4)		; Put N(R) into control byte
+
+;-----
+; Here to set frame address and information field dispatch then start sending
+;-----
+OFRESX:	MOV	#OS.END,DDLEOI#(R4)	; Info fld dispatch <-- no info fld
+OFRESY:	MOVB	DDLEXR#(R4),DDLEOA#(R4)	; Frame address <-- outgoing response
+	TBBE	$ICPF,DDLEFG#(R4),OFRAME; Should Final bit be set?
+	BIC	#$ICPF,DDLEFG#(R4)	; Yes - clear input cmd Poll bit flag
+	BISB	#$PFBIT,DDLEOX#(R4)	; Set Final bit in response frame
+	BR	OFRAME			; Start sending frame
+
+
+	.SBTTL	Set up for command frame (SARM, DISC, information)
+;-----
+; Here to prepare to retransmit 1st info frame on transmit ring
+;-----
+OFRXMT:	BIC	#$REXMT,DDLEFG#(R4)	; Clear retransmit flag
+	BIS	#$FRXMT,DDLEFG#(R4)	; Flag this frame is retransmission
+	MOVB	DDLEK1#(R4),DDLET1#(R4)	; Reset timer T1
+	MOV	@DDLELH#(R4),DDLEOF#(R4); Get ptr to 1st frame on transmit ring
+	BNE	1$			; Ok if something is there
+	FSTOP	ZPR			; [Zero Packet list in Retransmission]
+
+1$:	MOVB	DDLENR#(R4),DDLEOX#(R4)	; Control byte N(S) <-- stored N(R)
+	BR	OFINF1			; Merge with info frame setup code
+
+;-----
+; Here for setup to send an information frame
+;-----
+OFINFO:	TBBE	$ICPF,DDLEFG#(R4),1$	; Was cmd frame read with Poll bit set?
+	TBBN	$RR,DDLEFG#(R4),OFRR	; Yes - if it was info, send RR w/F bit
+
+1$:	BIC	#$FRXMT,DDLEFG#(R4)	; Flag this frame not a retransmission
+	MOV	@DDLELN#(R4),DDLEOF#(R4); Get ptr to next frame to send
+	MOVB	DDLEVS#(R4),DDLEOX#(R4)	; Put V(S) into N(S) of control byte
+
+OFINF1:	ASLB	DDLEOX#(R4)		; Position N(S) in control byte
+	MOV	#OS.INF,DDLEOI#(R4)	; Info fld dispatch <-- info frame kind
+	CLR	R0
+	BISB	DDLEVR#(R4),R0		; Get V(R)
+	ASHI	.SHFNR,R0		; Position N(R) for control byte
+	BISB	R0,DDLEOX#(R4)		; Put N(R) into control byte
+	BR	OFCMN1			; Merge with end of command frame setup
+
+;-----
+; HERE TO SEND AN RR COMMAND WITH P BIT
+;-----
+ORRCMD:
+	BIC	#$RRCMD,DDLEFG#(R4)	;
+	MOVB	#.RR,DDLEOX#(R4)	;SETTING UP CNTL BYTE
+;	TBBE	$IBUSY,DDLEFG#(R4),10$	;BRANCH IF NOT BUSY
+;	MOVB	#.RNR,DDLEOX#(R4)	;SEND RNR IF THIS END BUSY
+10$:
+	CLR	R0
+	BISB	DDLEVR#(R4),R0		;GET RECEIVE VARIABLE
+	ASHI	.SHFNR,R0
+	BISB	R0,DDLEOX#(R4)		;COMPLETE CNTL BYTE
+;-----
+; Here to begin sending command frame
+;-----
+OFCMND:	CLRB	DDLECM#(R4)		; Clear pending command function
+	MOV	#OS.END,DDLEOI#(R4)	; Info fld dispatch <-- no info fld
+
+OFCMN1:	MOVB	DDLEXC#(R4),DDLEOA#(R4)	; Frame address <-- outgoing command
+	TBBE	$OCPF,DDLEFG#(R4),OFRAME; Send frame if P/F bit should be clear
+	BIC	#$OCPF,DDLEFG#(R4)	; Clear output cmd frame Poll bit flag
+	BISB	#$PFBIT,DDLEOX#(R4)	; Set Poll bit in frame control byte
+	BIS	#$D2EXPF,DDLEF2#(R4)	; TELL LKEMAI TO EXPECT F BIT
+;-----
+; Drop through into beginning of frame output code...
+;-----
+	.SBTTL	Protocol output states - start sending frame
+OFRAME:
+	BR	OFRAM2		;DON'T CHECK ERROR HERE
+;-----
+; WE MAY GET HERE BECAUSE THE 1ST BYTE OF A FRAME TO ABUT IS SUPPLIED TOO
+;  LATE TO THE XMITTER
+;-----
+OFRAM1:
+	INC	R0			;POINTS TO UPPER BYTE OF XMIT BUF REG
+	MOVB	#TXSTRM/400,(R0)	;TSOM=1, CLEAR THE DATA LATE ERROR
+	CLR	DDLEOS#(R4)		;CLEAR OUPUT STATE
+	RTI04				;ABORT HAS BEEN SENT BY DPV;
+					; HERE WE SEND A FLAG AND TRY TO 
+					; RESTART THE XMISSION
+OFRAM2:	
+	MOV	#OS.CTL,DDLEOS#(R4)	;NEXT STATE = OUTPUT CNTRL BYTE
+	CLR	R0
+	BISB	DDLEOA#(R4),R0		;GET FRAME ADDRESS FOR OUTPUT
+	BIS	#$D21ST,DDLEF2#(R4)	;--KS, set a flag indicates
+					;OBYTE 1st-SDLC-byte will be out.
+	MOV	#200,@DDLEXB#(R4)	;reset CRC generator
+;OBYTE:
+OFRAM3:
+	MOVB	R0,@DDLERB#(R4)		;;Send byte
+	TBBE	$D21ST,DDLEF2#(R4),2$	;is it first byte of a frame
+	BIC	#$D21ST,DDLEF2#(R4)	;YES, BUT not 1st byte any more
+	MOV	#312,@DDLEXB#(R4)	;reset Tx underrun/EOm latch, WR10
+	MOV	#204,@DDLEXB#(R4)	;abort on underrun
+2$:
+	RTI04
+;-----
+; Here to output frame control byte
+;-----
+OCNTL:
+	CHKLAT				;CHECK XMITER DATA LATE
+	MOV	DDLEOI#(R4),DDLEOS#(R4)	; Output state <-- info field (if any)
+	CLR	R0			; Clear residue
+	BISB	DDLEOX#(R4),R0		; Get frame control byte
+	OBYTE			;OUTPUT A BYTE AND RETURN
+;-----
+; **** NOTE ****
+;
+; Next output state is the beginning of the information field...  Only 2 frame
+; formats have information fields: information command frame and FRMR response
+; frame...  The other frame formats (SABM, DISC, UA, DM, RR, RNR, REJ) are not
+; allowed information fields...  When frame output is initialized at ONEXTF,
+; the frame information field dispatch location is placed in the DDB (DDLEOI)
+; depending on frame format...  This is one of: OINF0 (1st byte of information
+; command frame information field), OINFCR (1st byte of FRMR response frame
+; information field), or OENDTR (end transparency - i.e. no information field)
+;-----
+	.SBTTL	Protocol output states - information frame info field
+;-----
+; Here to begin output of information frame info field
+;-----
+OINF0:	MOV	#OS.BDY,DDLEOS#(R4)	; Output state <-- rest of info field
+	MOV	DDLEOF#(R4),R0		; Get 1st packet pointer
+	BNE	1$			; Ok if something is there
+	FSTOP	ZPL			; [Zero Packet List]
+
+1$:	MOV	R0,DDLEOP#(R4)		; Save current packet pointer
+	MOV	R0,DDLEOB#(R4)		; Init packet byte pointer
+	ADD	#PKTYPE,DDLEOB#(R4)	; Start taking bytes from packet type
+	CLR	R0
+	BISB	PKCNT(R0),R0		; Get packet byte count
+	ADD	#<PKDATA-PKTYPE>,R0	; 1st packet has more bytes
+	MOVB	R0,DDLEOC#(R4)		; Store length of 1st packet
+	BR	OINFO			; Go send 1st information field byte
+
+;-----
+; Here to get a new packet for additional information field bytes
+;-----
+ONEWPK:	MOV	@DDLEOP#(R4),R0		; Get link to new current packet
+	BEQ	OINFET			; Quit if end of packet list
+
+	MOV	R0,DDLEOP#(R4)		; Save current packet pointer
+	MOV	R0,DDLEOB#(R4)		; Init packet byte pointer
+	ADD	#PKDATA,DDLEOB#(R4)	; Start taking bytes from pkt data
+	MOVB	PKCNT(R0),DDLEOC#(R4)	; Get packet byte count
+
+;-----
+; Here to send an information field byte
+;-----
+OBODY:
+OINFO:	TBBN	$ABORT,DDLEFG#(R4),OABORT ; If time to abort, go do it
+	TSTB	DDLEOC#(R4)		; Any bytes left in packet?
+	BEQ	ONEWPK			; No - get next packet
+
+	CHKLAT			;CHECK XMITER DATA LATE
+	CLR	R0			; Clear residue
+	BISB	@DDLEOB#(R4),R0		; Get byte from packet
+	INC	DDLEOB#(R4)		; Bump byte pointer
+	DECB	DDLEOC#(R4)		; Bump packet byte count
+	OBYTE			;OUTPUT A BYTE AND RETURN
+
+;-----
+; Here to end info frame info field and update V(S)
+;-----
+OINFET:
+	CHKLAT			;CHECK XMITER DATA LATE
+	BIC	#$RR,DDLEFG#(R4)	; Clear RR pending flag
+	TSTB	DDLET1#(R4)		; Timer T1 set?
+	BNE	1$			; Yes - don't reset it
+	MOVB	DDLEK1#(R4),DDLET1#(R4)	; No - set it
+	MOV	#XXINFO,DDLETX#(R4)	; Timer expire state <-- sending info
+1$:	TBBE	$FRXMT,DDLEFG#(R4),2$	; If not retransmission, bump V(S)
+	BIC	#$FRXMT,DDLEFG#(R4)	; Retransmission - clear flag
+	BR	20$
+
+2$:	INCB	DDLEVS#(R4)		; Bump V(S)
+	BICB	#$MASKN,DDLEVS#(R4)	; Perform modulus addition
+	ADD	#2,DDLELN#(R4)		; Bump next-frame-to-send pointer
+	CMP	DDLELN#(R4),DDLELE#(R4)	; End of ring?
+	BLO	20$
+	MOV	DDLELB#(R4),DDLELN#(R4)	; Yes - reset next frame pointer
+20$:
+	JMP	OCRC
+
+;-----
+; Here to abort output frame
+;-----
+OABORT:
+	MOV	#OS.IDL,DDLEOS#(R4)	;
+	MOVB	#30,@DDLEXB#(R4)	;SEND ABORT COMMAND
+	BIC	#<$ABORT!$FRXMT>,DDLEFG(R4) ; Clear abort and retransmitted
+					;   frame flags
+	RTI04				; Return from interrupt
+
+	.SBTTL	Protocol output states - FRMR frame information field
+;-----
+; Here to begin information field of FRMR frame
+;-----
+OINFCR:
+	CHKLAT
+	MOV	#OS.SEQ,DDLEOS#(R4)	; Output state <-- send V(R) and V(S)
+	CLR	R0			; Clear residue
+	BISB	DDLECX#(R4),R0		; Get bad control byte
+	OBYTE			;OUTPUT A BYTE AND RETURN
+
+;-----
+; Here to send V(R) and V(S) in CMDR info field
+;-----
+OCVRVS:
+	CHKLAT
+	MOV	#OS.WHY,DDLEOS#(R4)	; Output state <-- send CMDR reason
+	CLR	R0			; Clear residue
+	BISB	DDLEVR#(R4),R0		; Get V(R)
+	ASHI	<.SHFNR-1>,R0		; Partially align V(R)
+	BISB	DDLEVS#(R4),R0		; Get V(S)
+	ASL	R0			; Align V(R) and V(S)
+	TBBE	$RSREJ,DDLEFG#(R4),10$	;BRANCH IF NOT REJECTING A RESPONSE
+	BIS	#$RSREJ,DDLEFG#(R4)	;RESET TO INITIAL VALUE
+	BIS	#20,R0			;INDICATE FRAME BEING REJECTED IS A 
+					; RESPONSE.
+10$:
+	OBYTE			;OUTPUT A BYTE AND RETURN
+
+;-----
+; Here to send CMDR reason in CMDR frame info field
+;-----
+OCRSN:
+	CHKLAT
+	MOV	#OS.END,DDLEOS#(R4)	; Output state <-- end transparency
+	CLR	R0			; Clear residue
+	BISB	DDLECR#(R4),R0		; Get CMDR reason
+	OBYTE			;OUTPUT A BYTE AND RETURN
+	.SBTTL	Protocol output states - <DLE><ETX>, CRC, pad byte
+;-----
+; Here to end transparency
+;-----
+OENDTR:
+	MOVB	#.T3,DDLET3#(R4)	;Start the idle output RR timer
+	CHKLAT
+OCRC:	MOV	#OS.IDL,DDLEOS#(R4) 	; NEXT STATE WHEN ABOVE SEQUENCE IS DONE
+	MOVB	#10.,@DDLEXB#(R4)	;SELECT WR10
+	MOVB	#200,@DDLEXB#(R4)	;XMIT CRC+FLAGS ON UNDERRUN
+	MOVB	#50,@DDLEXB#(R4)	;RESET XMIT INTERRUPT
+	RTI04
+
+.ENDC	;.IF NE ..SCCH, FROM LKEOSV::
+
+	.SBTTL	Main program level entry points
+;-----
+; LKEINI - Subroutine to initialize the DDB
+;
+; Linkage:
+;	C(R4) = address of DDB
+;	CALL	LKEINI
+;-----
+LKEINI::CLR	@DDLEXB#(R4)		; Does device exist?
+	NXMJMP	NOLINK#			; No - mark it so
+
+.IF EQ ..SCCH	;IF NOT USING ATC+X.25
+.IF	EQ	<..DPV-1>	;IF USING DPV
+	CLR	DDLEPX#(R4)	;DPV PCSAR INITIAL VALUE
+				;NO APA, BOP, NOT LOOP MODE, FLAG TO OPEN 
+				; AND CLOSE A FRAME( NOT GO AHEAD),
+				; NO SECONDARY ADDRESS CHECKING, SENDS ABORT
+				; IF DATA UNDERRUN, CRC CCITT STARTING WITH
+				; ALL ONES
+.IFF			;IF NOT USING DPV
+
+	TBBN	$XSMSG,@DDLEXB#(R4),1$	; This is DU-11 if bit not affected
+	MOV	#$XSMSG,@DDLEXB#(R4)	; DUP-11 or DUV-11?
+	TBBE	$XSMSG,@DDLEXB#(R4),1$	; DUV-11 if bit not accected
+
+	MOV	#.PRDUP,DDLEPX#(R4)	; DUP-11 - get parameter reg init val
+	BR	2$
+
+1$:	MOV	#.PRDUV,DDLEPX#(R4)	; DU-11/DUV-11 - get param reg init val
+2$:
+.ENDC
+.ENDC
+	MOV	#$D1DWN,DDSTS1#(R4)	; Indicate link down - once a second
+					;   will try to start link
+	MOV	#DDLECZ#,R1		; Get number of words to clear
+	MOV	#DDLEFC#,R2		; Set pointer to first word to clear
+	ADD	R4,R2			; Set pointer into DDB
+
+3$:	CLR	(R2)+			; Clear word
+	SOB	R1,3$			; Continue until all words clear
+
+	MOV	DDLEQB#(R4),DDLEQP#(R4)	; Init input to main ring putter
+	MOV	DDLEQB#(R4),DDLEQT#(R4)	; Init taker
+	MOV	DDLELB#(R4),DDLELH#(R4)	; Init transmit ring head pointer
+	MOV	DDLELB#(R4),DDLELN#(R4)	; Init Xmit ring next-to-send ptr
+	MOV	DDLELB#(R4),DDLELT#(R4)	; Init transmit ring tail pointer
+
+;	MOV	#$RDISC,DDLEF2#(R4)	; Start resetting link with DISC
+
+	RETURN				; Return to caller
+
+;-----
+; LKEINS - Subroutine to initialize device dependent part of SBD
+;
+; Linkage:
+;	C(SD) = address of SDB
+;	CALL	LKEINS
+;-----
+LKEINS::MOV	#SDLECZ#,R1		; Get number of words to clear
+	MOV	#SDLEFC#,R2		; Set pointer to first word to clear
+	ADD	SD,R2			; Set pointer into DDB
+
+1$:	CLR	(R2)+			; Clear word
+	SOB	R1,1$			; Continue until all words clear
+
+	RETURN				; Return to caller
+
+;-----
+; LKEMAI - main loop entry point to link type E protocol (SNAP)
+;-----
+	MAINXX	LKEMAI
+
+LKEMAI:	MOV	#LKEDDB#,R4		; Get 1st type E link DDB
+;-----
+; Check link for input activity
+;-----
+LKEMA1:	TBBN	$D1UNV,DDSTS1#(R4),LKEMA3 ; If link hardware not there, check
+					;   next type E link
+	CMP	DDLEQP#(R4),DDLEQT#(R4)	; Something in input done ring?
+	BEQ	LKEMA2			; No - check for new frames to send
+	MOVB	#.T6,DDLET6#(R4)	; Restart idle input take-down timer
+	CALL	MINPUT			; Yes - get input frame
+;-----
+; Check link for new frames to send
+;-----
+LKEMA2:	TBBE	$D1ACT,DDSTS1#(R4),LKEMA3 ; Check next link if device inactive
+	CMPB	DDLEVT#(R4),DDLEK0#(R4)	; Device active - room in Xmit ring?
+	BHIS	LKEMA3			; No - check output state
+	CALL	LKENXT#			; Yes - get next packet to send and
+					;   start output if idle
+;-----
+; Advance to next type E link
+;-----
+LKEMA3:	MOV	DDLKNS#(R4),R4		; Get next type E link DDB
+	BNE	LKEMA1			; If another link, check for activity
+
+	RETURN				; All done - return to caller
+	.SBTTL	Main level frame input verification and completion
+;-----
+; Here when activity detected on input side (frame has been read)
+;-----
+MINPUT:	MOV	DDLEQT#(R4),R0		; Get input done ring taker
+	MOV	(R0)+,DDLEMF#(R4)	; Get packet list header
+	MOVB	(R0)+,DDLEMX#(R4)	; Get frame control byte
+	MOVB	(R0)+,R2		; Get frame status byte, SIGN EXTENDED
+	BIC	#200,R2			;
+	CMP	R0,DDLEQE#(R4)		; Beyond end of ring?
+	BLO	1$			; No
+	MOV	DDLEQB#(R4),R0		; Yes - reset ring taker
+1$:	MOV	R0,DDLEQT#(R4)		; Update taker
+
+	TBBE	$D1DWN,DDSTS1#(R4),2$	;go 2$ if link up
+	JMP	LKELDS			;BRANCH IF LINK DOWN
+
+; HERE CHECK ANY FRAME ERROR DETECTED IN LKEISV
+2$:	TSTB	R2			; Error detected on frame input?
+	BEQ	MINPOK			; No - frame input ok
+
+	INC	DDERSZ#(R4)		; Size error detected at interrupt level
+
+MINBAD:	CALL	MABORT			; FREETHE FRAME LIST
+2$:
+	BIC	#177400,R2		; CLEAR HIGH ORDER BYTE
+	JMP	@MIERDT(R2)		; Dispatch to error code
+;-----
+; Input error dispatch table
+;-----
+;ACCORDING TO DLL STATE MATRIX, 9 KINDS OF ERROR SHALL BE PROCESSED
+; THEY ARE E1-E6 AND I2-I4
+; E6 IS IN ITSRSP AND I3 IS IN MIINFO
+; I2,I4 ARE FROM MIERNR
+; E1,E2 ARE FROM LKEISV
+	PURE
+	.EVEN
+MIERDT:	.WORD	RTN000			; ER.IGN =  0 ignore this frame
+	.WORD	ERROVF			; ER.OVF =  2 frame overflow
+				;E1, FRAME TOO LONG
+	.WORD	ERRIVF			; ER.UND =  4 frame underflow
+				;E2, I-FRAME W/O I-FIELD
+	.WORD	ERRIVF			; ER.IVF =  6 invalid frame
+				;E4,E5, UNKNOWN CMD/RESP FRAME
+	.WORD	ERRINR		;I2,I4; ER.INR = 10 invalid N(R)
+	.WORD	ERRNIA		;E3	; ER.NIA = 12 no info field allowed
+	.WORD	STARTO		;I3	; ER.STO = 14 start output
+	.WORD	LRESET			; ER.RST = 16 reset the link
+	CODE
+
+;-----
+; HERE TO REJECT A BAD RESPONSE FRAME
+;-----
+INVFFR:	TBBN	$CMD,DDLEF2#(R4),MINBAD	;FRMR A COMMAND FRAME
+	BIS	#$RSREJ,DDLEFG#(R4)	;GOING TO REJECT A RESPONSE
+	BR	MINBAD			
+BADRSP:
+;	TBBN	$FRMR,DDLEFG#(R4),BADRS1  ;BRANCH IF ALREADY IN FRAME REJ
+	BIS	#$RSREJ,DDLEFG#(R4)	;GOING TO REJECT A RESPONSE
+	BR	MINBAD
+BADRS1:
+	JMP	MABORT			;ALREADY IN FRAME REJECT CONDITION
+					; FREE THE PACKETS AND DONE
+
+;-----
+; HERE TO REJECT A BAD COMMAND FRAME
+;-----
+BADCMD:
+;	TBBN	$FRMR,DDLEFG#(R4),BADRS1
+	BIC	#$RSREJ,DDLEFG#(R4)
+	BR	MINBAD
+;-----
+; Here if no error status reported from input
+;-----
+MINPOK:	SWAB	R2			; GET CMD/RESP FLAGTO LOWER BYTE
+	BIC	#$CMD,DDLEF2#(R4)	; ASSUME A RESPONSE FOR FRMR NOW
+	JMP	LKEITS			; JUMP IF LINK IS UP.
+;-----
+; LKELDS -
+;	Procedures in the Logically Disconnected State
+;
+;-----
+LKELDS:
+	TST	DDLEMF#(R4)		;ANY INFO FIELD?
+	BNE	BADRS1			;YES, WE DON'T LIKE I-FIELD(EVEN FRMR)
+
+	TST	R2			;COMMAND/RESPONSE ?
+	BPL	LDSCMD			;BRANCH IF COMMAND
+;LDSRSP ; HERE FOR RESPONSE UFRAME IN LDS
+	MOVB	DDLEMX#(R4),R0		;GET FRAME CONTROL BYTE
+	BIC	#<177400!$PFBIT>,R0	;CLEAR P/F BIT, EITHER IS GOOD
+	CMPB	R0,#.UA			;IS THIS A UA?
+	BEQ	LDSUA			;BRANCH IF YES
+	CMPB	R0,#.DM			;IS THIS A DM?
+	BEQ	LDSDM			;BRANCH IF YES
+RTN000:	RETURN				;NONE OF ABOVE, IGNORE THE FRAME
+;-----
+; UA RCVD IN LDS AS THE RESPONSE FOR SABM - BRING THE LINK UP
+;-----
+LDSUA:
+;	TST	DDLEMF#(R4)		;ANY INFO FIELD?
+;	BEQ	LDSUA1			;BRANCH IF NO
+;	MOV	#ER.NIA,R2		;NO INFO ALLOWED
+;	JMP	BADRSP
+;	BNE	BADRS1			;IGNORE IT IS DISC STATE
+LDSUA1:
+	CALL	LNKRST			;RESET LINK LEVEL
+	CJMP	RSTX25#			;SEND RESTART ON CHANNEL 0
+
+LNKRST:	CLRB	DDLET1#(R4)		;STOP TIMER T1
+	MOVB	DDLEK2#(R4),DDLEN2#(R4) ;RESET REXMIT COUNT
+	CLRB	DDLEVS#(R4)		;CLEAR NEXT NS TO USE
+	CLRB	DDLENR#(R4)		;CLEAR LAST NR SEEN
+	BIC	#<$IBUSY!$OBUSY!$REJ!$TIMER!$REXMT!$FRMR>,DDLEFG#(R4) ;
+	CLRB	DDLEVR#(R4)		;CLEAR NEXT NR TO USE
+	RETURN
+
+;-----
+; DM RCVD IN L.D.S.
+;	IF P/F=0, IT IS AN INVITATION TO SET MODE
+;	IF P/F=1, IT IS A DENIAL TO SABM
+;	IN EITHER CASE, SEND SABM(P) AND START T1 TIIMER
+;-----
+LDSDM:
+	JMP	MOSABM
+;-----
+; LDSCMD -
+;	COMMAND RCVD IN L.D.S.
+;-----
+LDSCMD:
+	MOVB	DDLEMX#(R4),R0		;GET FRAME CONTROL BYTE
+	TBBE	$PFBIT,R0,10$		;BRANCH IF P BIT NOT SET
+	BIS	#$ICPF,DDLEFG#(R4)	;P BIT SEEN IN INPUT CMD
+	BIC	#<177400!$PFBIT>,R0	;CLEAR P BIT
+10$:
+	CMPB	#.SABM,R0		;SABM?
+	BEQ	LDSABM			;BRANCH IF YES
+	CMPB	#.DISC,R0		;DISC?
+	BEQ	LDSDIS			;BRANCH IF YES
+	BITB	#$PFBIT,DDLEMX#(R4)	;P BIT SET?
+	BNE	MODM			;YES, SEND A DM WITH F BIT
+LDSCM1:
+	RETURN
+;-----
+; LDSDIS -
+;	DISC RCVD IN L.D.S.
+;-----
+LDSDIS:
+;	CJMP	MODM			;SEND DM
+
+;-----
+; MODM -
+;	SEND A DM RESPONSE, AND START TIMER T1
+;-----
+MODM:
+	MOVB	#.DM,DDLEAK#(R4)	;PENDING RESPONSE = DM
+	MOVB	DDLEK1#(R4),DDLET1#(R4) ;START T1, SEND SABM ON TIMEOUT
+	CALL	STARTO
+	RETURN
+;-----
+; LDSABM -
+;	RCVD SABM IN L.D.S.
+;	SEND A UA RESPONSE AND COME UP
+;-----
+LDSABM:
+	CALL	MOUA			;SEND  A UA(F)
+;	JMP	LDSUA1			;BRING THE LINK UP
+	RETURN
+	.PAGE
+;-----
+; LKEITS -
+;	FRAME RCVD IN INFO TRANSFER STATE (I.T.S.)
+;-----
+LKEITS:
+	TSTB	R2			;COMMAND/RESPONSE ?
+	BEQ	10$			;BRANCH IF COMMAND
+	JMP	ITSRSP			;JUMP IF RESPONSE
+10$:;ITSCMD:
+	BIS	#$CMD,DDLEF2#(R4)	;MAKE NOTE OF COMMAND FRAME
+	TBBE	$PFBIT,DDLEMX#(R4),5$	;BRANCH IF P BIT NOT SET
+	BIS	#$ICPF,DDLEFG#(R4)	;SET ICPF FLAG
+5$:
+	BITB	#$INFO,DDLEMX#(R4)	;INFO FRAME ?
+	BEQ	MACKNR			;YES, BRANCH
+	BITB	#$SUPV,DDLEMX#(R4)	;SUPERVISORY FRAME?
+	BNE	MIUCMD			;NO, CHECK UNNUMBERED FRAME
+;ITSCS - ITS COMMAND SUPERVISER FRAME	
+	TST	DDLEMF#(R4)		;YES, ANY INFO FIELD?
+	BEQ	MACKNR			;NO, GO DO FLOW CONTROL
+	MOV	#ER.NIA,R2		;-E3
+	JMP	INVFFR			;ERROR. NO INFO ALLOWED.
+;-----
+; MIUCMD -
+;	UNNUMBERED COMMAND RCVD IN I.T.S.
+;-----
+;ITSCU- ITS COMMAND UNNUMBERED FRAME
+MIUCMD:
+	MOVB	DDLEMX#(R4),R0		;GET FRAME CTRL BYTE
+	BIC	#<177400!$PFBIT>,R0	;CLEAR P/F/BIT FOR COMPARISON
+	CMPB	R0,#.SABM		;SABM COMMAND ?
+	BNE	5$			;NO, GO ON
+;ITSABM:
+	CALL	LNKRST			;RESET THE LINK
+	CJMP	MOUA			;SEND A UA BACK
+5$:
+	CMPB	R0,#.DISC		;IS IT A DISC ?
+	BEQ	10$			;YES, BRANCH
+	CMP	R0,#.DM			;IS IT A DM
+	BEQ	15$			;YES, BRANCH
+	CMP	R0,#.FRMR		;IS IT A FRAME REJECT?
+	BEQ	15$			;YES, TREAT LIKE DM FOR THE MOMENT
+	CMP	R0,#.UA			;IS IT A UA?
+	BEQ	25$			;BRANCH IF UA FRAME
+	MOV	#ER.IVF,R2		;NO, UNRECOGNIZED COMMAND
+;	JMP	BADCMD
+	JMP	INVFFR		;E4,E5 CAUSE FRMR
+10$:
+;ITSDIS:
+	CALL	MOUA			;SEND A UA BACK
+20$:	CALL	LKEDWN
+	MOV	#XXSABM,DDLETX#(R4)	;T1 TIME OUT DISPATCH
+	MOVB	DDLEK1#(R4),DDLET1#(R4) ;START T1 TIMER
+	MOVB	DDLEK2#(R4),DDLEN2#(R4) ;RESET REXMIT COUNT
+	RETURN
+15$:
+;ITSDM:
+;ITSFR:
+	CALL	LNKRST
+	JMP	MOSAB1
+25$:
+;ITSUA:
+	CALL	LNKRST
+	JMP	ERRIVF		;GO SEND FRMR WITH REASON=W
+;-----
+; MOUA -
+;	SEND A UA RESPONSE
+;-----
+MOUA:
+	MOVB	#.UA,DDLEAK#(R4)	;PENDING RESPONSE = UA
+	CJMP	STARTO
+
+
+;-----
+; Here to free packets held by acknowledged frames on transmit ring
+;	R2 = 0, INPUT IS A COMMAND
+;	R2 <>0, INPUT IS A RESPONSE
+;-----
+MACKNR:
+	TBBE	$FRMR,DDLEFG#(R4),20$	;BRANCH IF NOT IN FRMR CONDITION
+	MOV	#ER.IVF,R2		;IGNORE THIS FRAME
+	JMP	INVFFR			;
+20$:
+	MOV	DDLELH#(R4),R0		; Get frame transmit ring header
+
+	MOVB	DDLEMX#(R4),R2		; Get frame control byte
+	ASHI	-.SHFNR,R2		; Right justify N(R)
+	BIC	#$MASKN,R2		; Isolate N(R)
+
+	CMPB	R2,DDLENR#(R4)		; Any frames to acknowledge?
+	BEQ	MACKN3			; No
+;-----
+; Here to free a frame from the frame transmit ring
+;-----
+MACKN1:	CMPB	DDLENR#(R4),DDLEVS#(R4)	; Trying to free unsent frame?
+	BEQ	MIERNR			; Yes - new N(R) is bad
+	MOV	(R0),R1			; Maybe - get info fld pkt list header
+	BEQ	MIERNR			; Yes - new N(R) is bad
+
+	BIC	#$REXMT,DDLEFG#(R4)	; New ACK - don't do retransmission
+	CLR	(R0)+			; Clear packet pointer from Xmit ring
+	CMP	R0,DDLELE#(R4)		; End of ring?
+	BLO	MACKN2			; No
+	MOV	DDLELB#(R4),R0		; Yes - reset ring pointer
+;-----
+; Here to free packets from frame transmit ring when frames acknowledged
+;-----
+MACKN2:	CALL	FRELST			;;Free the list of packets
+	DECB	DDLEVT#(R4)		; Decrement transmit ring frame count
+	INCB	DDLENR#(R4)		; Bump stored N(R)
+	BICB	#$MASKN,DDLENR#(R4)	; Perform modulus addition
+
+	MOV	R0,DDLELH#(R4)		; Update head pointer
+
+	CMPB	DDLENR#(R4),R2		; Stored N(R) == new N(R)?
+	BNE	MACKN1			; No - continue until all frames freed
+
+;-----
+; Newly ACK'd frames freed from output ring
+;-----
+	MOVB	DDLEK2#(R4),DDLEN2#(R4)	; Reset retransmission counter
+
+	MOVB	DDLEK1#(R4),DDLET1#(R4)	; Something ACK'd - reset timer T1
+	TSTB	DDLEVT#(R4)		; Anything left in ring?
+	BNE	MACKN3			; Yes
+
+	CLRB	DDLET1#(R4)		; No - clear timer T1
+	BIC	#$TIMER,DDLEFG#(R4)	; Clear timer state when nothing left
+;-----
+; Here after frames acknowledged and packets freed
+;-----
+MACKN3:	CLR	R3			; Clear residue
+	BISB	DDLEMX#(R4),R3		; Get frame control byte
+
+	TBBE	$INFO,R3,MIINFO		; Go process info frame
+	TBBE	$PFBIT,R3,MISUPV	; Go process SUPV w/P/F bit clear
+	TBBE	$CMD,DDLEF2#(R4),10$	; BRANCH IF INPUT IS A RESPONSE
+	BIS	#<$ICPF!$RR>,DDLEFG#(R4) ; NEED TO SEND RR OR RNR
+	CALL	STARTO			; START OUTPUT
+	BR	MISUPV			;
+10$:
+	BIC	#$TIMER,DDLEFG#(R4)	; Yes - clear timer recovery condition
+	MOVB	R2,DDLEVS#(R4)		; V(S) <-- N(R) of supervisory frame
+	MOV	R0,DDLELN#(R4)		; Next to send pointer <-- head of ring
+;-----
+; Here to complete supervisory frame input
+;-----
+MISUPV:
+	BIC	#$CMD,DDLEF2#(R4)	;
+	ASR	R3			; Make word index of SUPV function
+	BIC	#$MASKN,R3		; Isolate supervisory function
+	JMP	@MISUDT(R3)		; Dispatch on supervisory function
+;-----
+; Input supervisory function dispatch table
+;-----
+	PURE
+	.EVEN
+MISUDT:	.WORD	MIRR			; Receive Ready
+	.WORD	MIRNR			; Receive Not Ready
+	.WORD	MIREJ			; REJect
+	.WORD	MIERSU			; Undefined supervisory function
+	CODE
+;-----
+; Here on RNR supervisory frame
+;-----
+MIRNR:	BIS	#$OBUSY,DDLEFG#(R4)	; Indicate other side of link busy
+; (N),RB--->(RB)
+	MOVB	DDLEK2#(R4),DDLEN2#(R4)	; Reset retransmission counter
+	RETURN				; Return to caller
+;-----
+; Here on REJ supervisory frame
+;-----
+MIREJ:
+	TBBN	$PFBIT,DDLEMX#(R4),2$	;REJECT RJ-FRAME WITH P BIT SET
+	BIC	#$REJ,DDLEFG#(R4)	;BUT (SR)--->(N) IF NOT SET
+2$:	TBBN	$TIMER,DDLEFG#(R4),RTN111; Don't change V(S) if in timer state
+	BIS	#$ABORT,DDLEFG#(R4)	; Abort info frame if sending one
+	MOVB	R2,DDLEVS#(R4)		; V(S) <-- N(R) received
+	MOV	R0,DDLELN#(R4)		; Set next frame pointer to 1st frame
+;-----
+; Here on RR supervisory frame
+;-----
+MIRR:	BIC	#$OBUSY,DDLEFG#(R4)	; Indicate other side of link not busy
+; (RB),RR----->(N)
+	CMP	DDLELN#(R4),DDLELT#(R4)	; Frames waiting to be sent?
+	BEQ	RTN111			; No - return
+	CJMP	STARTO			; Yes - start output if idle
+
+RTN1111:	RETURN				; Return to caller
+
+;-----
+; Here on N(R) errors (trying to ACK unsent or already ACK'd frames)
+;-----
+MIERNR:	; I2,I4
+;	BITB	#$INFO,DDLEMX#(R4)	; Information frame?
+;	BNE	MIERSU			; No - SUPV with bad N(R) - reset link
+	INC	DDERPC#(R4)		; Bump protocol error count
+	MOV	#ER.INR,R2		; Declare N(R) error
+	JMP	INVFFR		;GO SEND FRMR FRAME
+;-----
+; Here on undefined supervisory function in control byte
+;-----
+MIERSU:
+	INC	DDERPC#(R4)		; Bump protocol error count
+	MOV	#ER.IVF,R2		; Declare link must be reset
+	JMP	INVFFR			; Discard frame
+
+;-----
+; Here to complete information frame input
+;-----
+MIINFO:
+	ASR	R3			; Right justify N(S)
+	BIC	#$MASKN,R3		; Isolate N(S)
+	CMPB	R3,DDLEVR#(R4)		; Is this the next expected frame?
+	BEQ	4$			; Yes
+;I3
+	MOV	#ER.STO,R2		; No - flag start output after frame
+					;   is discarded
+	TBBN	$REJ,DDLEFG#(R4),2$	; Skip if already in reject condition
+
+	BIS	#$REJ,DDLEFG#(R4)	; Set reject condition flag
+;	MOVB	#.T4,DDLET4#(R4)	; Start reject condition timer
+	MOVB	#.REJ,DDLEAK#(R4)	; Pending response <-- REJ
+	JMP	MINBAD			; Discard frame & send REJ frame
+
+2$:	TBBE	$ICPF,DDLEFG#(R4),3$	; Poll bit set in this frame?
+	BIS	#$RR,DDLEFG#(R4)	; Yes - send RR frame w/Final bit set
+	JMP	MINBAD			; Discard frame & send RR frame
+3$:	JMP	MABORT			; Discard frame
+
+
+4$:	BIC	#$REJ,DDLEFG#(R4)	; Clear reject condition
+; (SR),I1--->(N)
+	CLRB	DDLET4#(R4)		; Clear reject condition timer
+
+	MOVB	DDLEVR#(R4),R0		; Get V(R)
+	INC	R0			; Bump V(R)
+	BIC	#$MASKN,R0		; Perform modulus arithmetic
+	MOVB	R0,DDLEVR#(R4)		; Update V(R)
+
+	BIS	#$RR,DDLEFG#(R4)	; Indicate pending RR frame
+	CALL	STARTO			; Start output if idle
+
+	MOV	DDLEMF#(R4),R1		; Get packet list - anything there?
+	BEQ	5$			; No - must have been ignored or bad
+
+	CLR	DDLEMF#(R4)		; Yes - clear packet list pointer
+	CJMP	LKEMOV#			; Translate & send packets into node
+
+5$:	RETURN				; Return to main loop
+
+;-----
+; ITSRSP -
+;	Here to process response frame received in I.T.S.
+;-----
+ITSRSP:
+	TBBE	$PFBIT,DDLEMX#(R4),2$	;BRANCH IF F BIT NOT SET
+	TBBE	$D2EXPF,DDLEF2#(R4),4$	;F SET UNEXPECTEDLY, FRMR
+	BIC	$D2EXPF,DDLEF2#(R4)	;PERFECT, F CLEARS P
+2$:	BITB	#$INFO,DDLEMX#(R4)	;INFO AS A RESPONSE?
+	BNE	5$			;NO, GO ON
+4$: ;E5-UNSOLICITED F BIT, OR INVALID FRAME
+	MOV	#ER.IVF,R2		;YES, REJECT THE FRAME
+	BR	15$
+5$:
+	BITB	#$SUPV,DDLEMX#(R4)	;SUPERVISORY FRAME?
+	BNE	MIURSP			;NO, UNNUMBERED RESPONSE
+;ITSRS: RESPONSE SUPERVISOR FRAME
+	TST	DDLEMF#(R4)		;ANY INFO FIELD?
+	BNE	10$			;YES, BRANCH
+	JMP	MACKNR			;NO, GO DO FLOW CONTROL
+10$:
+	MOV	#ER.NIA,R2		;ERROR NO INFO ALLOWED--E3
+15$:	JMP	BADRSP			;FREE PACKETS AND REJECT THE FRAME
+;-----
+; MIURSP -
+;	Here to process unnumbered response frame
+;--
+MIURSP:	JMP	MIUCMD
+;NO USE, FOLLOWING CODE
+	MOVB	DDLEMX#(R4),R0		;GET FRAME CNTL BYTE
+	BIC	#<177400!$PFBIT>,R0	;CLEAR P/F BIT
+	
+	CMPB	R0,#.DM			;DM ?
+	BEQ	10$			;YES, BRANCH
+	CMPB	R0,#.FRMR		;FRMR?
+	BNE	20$			;NO, BRANCH
+10$:
+	MOV	#ER.RST,R2		;GO RESET THE LINK AFTER FREEING
+	JMP	MINBAD			;  PACKETS
+20$:
+	CMPB	R0,#.UA			;UA?
+	BNE	30$			;
+	RETURN				;YES, IGNORE UA IN I.T.S.
+30$:
+	MOV	#ER.IVF,R2		;INVALID FRAME
+	JMP	BADRSP
+;NO USE, ABOVE CODE
+
+	.SBTTL	Main level error states (causes for sending FRMR)
+;-----
+; Here if frame format error or unknown command/response in control byte
+;-----
+ERRIVF:	MOVB	#.CRSNW,DDLECR#(R4)	; Set FRMR reason W (invalid cntl byte)
+	BR	MOFRMR			; Go send FRMR frame
+
+;-----
+; Here if frame had information field when not allowed to have one
+;-----
+ERRNIA:	MOVB	#<.CRSNW!.CRSNX>,DDLECR#(R4) ; Set FRMR reasons W and X (bad
+					;   cntl byte, info field not allowed)
+	BR	MOFRMR			; Go send FRMR frame
+
+;-----
+; Here if frame overflowed (too many bytes)
+;-----
+ERROVF:	MOVB	#.CRSNY,DDLECR#(R4)	; Set FRMR reason Y (overflow)
+	BR	MOFRMR			; Go send FRMR frame
+
+;-----
+; Here if N(R) (frame receive number) was bad
+;-----
+ERRINR:	MOVB	#.CRSNZ,DDLECR#(R4)	; Set FRMR reason Z (invalid N(R))
+;	BR	MOFRMR			; Go send FRMR frame
+
+;-----
+; Here to send a FRMR frame
+;-----
+MOFRMR:	
+	BIC	#$TIMER,DDLEFG#(R4)	; Clear timer recovery flag
+
+	MOVB	DDLEMX#(R4),DDLECX#(R4)	; Save bad control byte
+	BIS	#<$FRMR!$ABORT>,DDLEFG#(R4) ; Abort current output frame and
+					;   set FRaMe Reject condition
+;	MOVB	#.T5,DDLET5#(R4)	; Set command reject condition timer
+	MOVB	#.FRMR,DDLEAK#(R4)	; Pending response <-- FRMR
+
+	MOVB	DDLEK1#(R4),DDLET1#(R4) ; START TIMER T1	
+	MOVB	DDLEK2#(R4),DDLEN2#(R4) ; SET REXMIT COUNT
+	MOV	#XXFRMR,DDLETX#(R4)	; T1 EXPIRE DISPATCH
+
+	.SBTTL	STARTO/LKESTO - Start output INTERRUPT SERVICE if idle
+;-----
+; Here to start output if output is idle
+;
+; **** WARNING ****
+;
+; This label MUST be entered with nothing added to the stack - it assumes
+; that the return address is on the top of the stack...
+;-----
+LKESTO::				; Global entry point for STARTO
+STARTO:	SETPSW	DDLELV#(R4)		; Raise processor level
+	PUSH	(SP)			; Duplicate return addr on stack
+	CLR	2(SP)			; Clear PSW on stack
+
+	TST	DDLEOS#(R4)		; Output in progress?
+	BEQ	1$			; No - fake an output done interrupt
+	RTI				; Yes - let output do it when finished
+
+1$:	PUSH	R4			; Push contents of R4 to simulate what
+					;   happens at device interrupt handler
+	PUSHR0			; Push contents of R0 to simulate what
+					;   happens at common interrupt handler
+	JMP	ONEXTF			; Transfer to output interrupt service
+					;   to start output frame
+	.SBTTL	Once a second routines (and reset link routine)
+;-----
+; LKESEC - Once a second entry point
+;-----
+	ONCSEC	LKESEC
+
+LKESEC:	MOV	#LKEDDB#,R4		; Get base DDB pointer
+
+LKESE1:	TBBN	$D1UNV,DDSTS1#(R4),LKESE2 ; If device not there, check next DDB
+	TBBE	$D1DWN,DDSTS1#(R4),1$	; If link UP, CHECK TIMERS
+	TBBE	$RESET,DDLEF2#(R4),47$	; If link down & needs reset, do it
+					;   after this, timers should do it
+;-----
+; Here to check IRMA timer for lost output interrupt
+;-----
+1$:	TBBE	$IRMA,DDLEF2#(R4),2$	; If IRMA clear, maybe lost interrupt
+
+	BIC	#$IRMA,DDLEF2#(R4)	; IRMA bit set - clear it
+	BR	3$			; Check next timer
+;-----
+; IRMA flag clear - non-zero output state means interrupt was lost for 1 sec
+;-----
+2$:	TST	DDLEOS#(R4)		; Output idle?
+	BEQ	3$			; Yes
+;-----
+; Interrupt lost for 1 second - fake an output done interrupt
+;-----
+	SETPSW	DDLELV#(R4)		; No - raise to interrupt level
+	CLR	-(SP)			; Push clear PSW
+	PUSH	#3$			; Push return address
+	PUSH	R4			; Simulate what happens at interrupt
+.IF NE ..SCCH	;IF USING ATC+X.25
+	CJMP	LKEISV			; Go process fake interrupt
+.IFF
+	CJMP	LKEOSV			; Go process fake interrupt
+.ENDC
+;-----
+; Check timer T1 (non-response timer)
+;-----
+3$:	TSTB	DDLET1#(R4)		; Timer T1 set for this link?
+	BEQ	4$			; No - check OTHER TIMERS
+	DECB	DDLET1#(R4)		; Yes - decrement timer count
+	BNE	4$			; If time left, check other timers
+;-----
+; Timer T1 expired for a link
+;-----
+	TST	DDLETX#(R4)		; Anyone want to recover this?
+	BEQ	4$			; No - check other timers
+;-----
+; Call one of the timer T1 recovery routines:
+;	XXSARM - unacknowledged SARM frame transmitted
+;	XXINFO - unacknowledged information frame(s) transmitted
+;	XXFRMR - unacknowledged FRMR frame transmitted
+;-----
+	CALL	@DDLETX#(R4)		; CALL timer recovery routine
+
+;-----
+; Here to check idle input take-down timer
+;-----
+4$:	TSTB	DDLET6#(R4)		; Timer set?
+	BEQ	5$			; No - check next timer
+	DECB	DDLET6#(R4)		; Yes - count down
+	BEQ	47$			; Reset link if timer expires
+
+;-----
+; Check information transfer state timers - start with idle link RR frame timer
+;-----
+5$:	TBBN	$D1DWN,DDSTS1#(R4),LKESE2 ; Check next link if not info
+					;   xfr phase
+	TSTB	DDLET3#(R4)		; Idle link RR frame timer set?
+	BEQ	6$			; No - check next timer
+	DECB	DDLET3#(R4)		; Yes - decrement timer count
+	BNE	6$			; If still time left, check next timer
+	BIS	#<$RRCMD!$OCPF>,DDLEFG#(R4) ;RR CMD WITH P BIT PENDING
+	CALL	STARTO			; Start output if idle
+6$:	BR	LKESE2
+;-----
+; Check reject condition timer
+;-----
+;6$:
+;	TSTB	DDLET4#(R4)		; Reject condition timer set?
+;	BEQ	7$			; No - check next timer
+;	DECB	DDLET4#(R4)		; Yes - decrement timer count
+;	BEQ	47$			; Timer expired - reset link
+;-----
+; Check command reject condition timer
+;-----
+;7$:	TSTB	DDLET5#(R4)		; Command reject condition timer set?
+;	BEQ	LKESE2			; No - check next link
+;	DECB	DDLET5#(R4)		; Yes - decrement timer count
+;	BNE	LKESE2			; If time left, check next link
+;-----
+; Reset the link and advance to next type E link
+;-----
+47$:	CALL	LRESET			; Timer expired - reset link
+
+;-----
+; Here to get next type E link DDB
+;-----
+LKESE2:	MOV	DDLKNS#(R4),R4		; Get next type E link DDB
+	BNE	LKESE1			; Continue if more links
+	RETURN				; Return to once-a-second processing
+
+;-----
+; Here to send SABM frame
+;-----
+MOSABM:
+	CALL	LKEDWN			; Declare link down
+MOSAB1:	MOVB	DDLEK2#(R4),DDLEN2#(R4)	; Init retransmission count
+	MOV	#XXSABM,DDLETX#(R4)	; Timer expire state <-- sending SABM
+
+;-----
+; Here to recover if timer T1 expires while waiting for UA after sending SABM
+;-----
+XXSABM:
+	DECB	DDLEN2#(R4)		; Bump retransmit count
+	BPL	1$			; Haven't sent SABM N2 times yet
+	BR	LRESET			; Reset link if transmitted N2 times
+
+1$:	MOVB	#.SABM,DDLECM#(R4)	; Output command pending <-- SABM
+	BIS	#$OCPF,DDLEFG#(R4)	; SET P BIT
+	MOVB	DDLEK1#(R4),DDLET1#(R4)	; Set timer T1
+	BR	STARTO			; Start output if possible and return
+
+;-----
+; Here to recover  if timer T1 expires while waiting for DISC, DM, or SABM
+; 	after sending FRMR.
+;-----
+XXFRMR:
+	DECB	DDLEN2#(R4)		;DECREMENT REXMIT COUNT
+	BLE	LRESET			;RESET THE LINK IF FRMR SENT N2 TIMES
+	MOVB	#.FRMR,DDLEAK#(R4)	;PENDING RESPONSE = FRMR
+	MOVB	DDLEK1#(R4),DDLET1#(R4) ;START TIMER AGAIN
+	JMP	STARTO			;START OUTPUT IF POSSIBLE
+
+;-----
+; Here to recover if timer T1 expires after sending information frame
+;-----
+XXINFO:	TSTB	DDLEVT#(R4)		; Anything in ring to retransmit?
+	BNE	1$			; Yes - go do it
+	INC	DDLEBX#(R4)		; No - bump bad retransmission count
+	BIC	#$TIMER,DDLEFG#(R4)	; Clear timer recovery state
+	RETURN				; Return to caller
+
+1$:	DECB	DDLEN2#(R4)		; Bump retransmit count
+	BLE	LRESET			; Reset link if transmitted N2 times
+
+	BIS	#<$ABORT!$REXMT!$OCPF!$TIMER>,DDLEFG#(R4)
+					;   Abort info frame output, retransmit
+					;   1st frame on Xmit ring w/ Poll bit,
+					;   timer recovery in progress
+	INC	DDERRX#(R4)		; Bump retransmission count
+	CJMP	STARTO			; Start output if possible and return
+
+;-----
+; Here to try to set up (or reset) the link for communication
+;-----
+LRESET:	BIS	#$RESET,DDLEF2#(R4)	; Flag link has been reset since start
+					;   (timers should do the resetting now)
+	SETPSW	DDLELV#(R4)		; Raise processor priority level
+	CLR	DDLEIS#(R4)		; Clear input state while waiting for
+					;   device to stabilize after reset
+	CLR	DDLEOS#(R4)		; Clear output state
+
+;-----
+; Reset device
+;-----
+
+.IF NE ..SCCH	;IF USING ATC+X.25
+	MOV	#IS.AF,DDLEIS#(R4) ;INPUT STATE=WAIT FOR FLAG+ADDRESS FIELD
+	CALL	INIT		;INITIALIZE SCC HARDWARE
+
+.IFF
+	CLR	@DDLEXS#(R4)		; Clear transmitter status/control reg
+
+.IF	EQ	<..DPV-1>	;USING DPV
+	MOV	#TXRES,@DDLEXS#(R4)	;MASTER RESET DEVICE
+	BIS	#TXREN,@DDLEXS(R4)	;ENABLE THE XMITTER
+	PUSH	R0
+	MOV	DDLEXB#(R4),R0		;GET THE ADDRESS OF TDSR ON DPV
+	INC	R0			;POINTS TO UPPER BYTE
+	MOVB	#TXSTRM/400,(R0)		;SET SOM TO SEND FLAGS
+	POP	R0
+	MOV	#RXITEN!RXREN!DSRTS!DSDTR,@DDLERS(R4) 
+	MOV	DDLEPX#(R4),@DDLEPR#(R4) ;INITIALIZE PCSAR TO ZERO
+
+.IFF	;NOT ATC+X.25, NOR DPV11
+	MOV	#$XMSTR,@DDLEXS#(R4)	; Master reset device
+	MOV	DDLEPX#(R4),@DDLEPR#(R4); Initialize device parameter register
+	MOV	#.RINIT,@DDLERS#(R4)	; Initialize receiver control/status
+	MOV	#.XINIT,@DDLEXS#(R4)	; Init transmitter control/status reg
+
+	TST	DDLEPX#(R4)		; DUP-11 or DU-11/DUV-11?
+	BPL	1$			; DU-11/DUV-11
+
+	BIS	#$XSEND,@DDLEXS#(R4)	; Set DUP-11 send bit
+	MOV	#<377!$XSMSG>,@DDLEXB#(R4) ; Init DUP-11 to send marks
+1$:
+	BIS	#$SYNCH,DDLEFG#(R4)	; Set long synch flag
+.ENDC	;.IF NE ..DPV
+.ENDC	;.IF NE ..SCCH
+	CLRPSW				; Lower processor priority level
+	BR	MOSABM			; Go send a SABM
+.IF NE 	..SCCH
+	.PAGE
+;	INIT	Routine to initialize the hardware
+
+INIT:	MOV	DDLEIF#(R4),R1		;;Get input frame pointer
+	BEQ	1$			;;Skip if not reading frame now
+	CLR	DDLEIF#(R4)		;;Make sure packet freed only here
+	CALL	FRELST			;;Free the list of packets
+
+1$:
+	TST	@DDLEXS#(R4)		;;Make sure we are pointing to zero
+	MOV	#100,R0			;;Set up a reset command for channel B
+	BIT	#10,DDLEXB#(R4)		;;Are we a A channel or a B channel
+	BNE	5$			;;We have an B channel
+	ASL	R0			;;Convert to a A channel reset command
+5$:	INC	R0			;;Turn on VIS bit
+	MOV	#SCCINI,R1		;;Point to sequence of SCC commands
+	MOVB	(R1)+,@DDLEXB#(R4)	;;Point to reset reg
+	MOV	R0,@DDLEXB#(R4)		;;Send command to SCC
+	MOVB	(R1)+,@DDLEXB#(R4)	;;Point to interrupt vector
+	MOVB	DDLEVC#(R4),@DDLEXB#(R4) ;;Set it up
+	MOV	#SCCLEN-2,R0		;;Set up length of initialization commands
+10$:	MOVB	(R1)+,@DDLEXB#(R4)	;;Send the data out
+	SOB	R0,10$			;;Send it all out
+	RETURN
+
+	PURE
+SCCINI:	.BYTE	9.			;;Point to reset register
+	.BYTE	2			;;Select int vector
+	.byte	3,310		;;Rx 8bps, CRC enable
+	.BYTE	5,343		;;Tx 8bps, DTR, RTS, CRC-SDLC, CRC enable
+	.BYTE	4,40		;;SDLC mode
+	.BYTE	7,176		;;SDLC flag char
+	.BYTE	10.,200		;;CRC preset=1
+	.BYTE	11.,10			;;Get clocks from xC pins
+	.BYTE	3,331		;;Rx enable, CRC enabler, SYNC HUNT
+	.BYTE	5,353		;;Tx enable
+	.BYTE	15.,0			;;Disable all status interrupts
+	.BYTE	20,21,22		;;Reset external status and enable interrupts
+	.BYTE	9.,11			;;Master interrupt enable
+SCCLEN=!.-SCCINI
+	.EVEN
+	CODE
+.ENDC
+
+	.SBTTL	LKEDWN - Subroutine to declare link down & clean up
+;-----
+; LKEDWN - Subroutine to reset link sockets (declare link down)
+;
+; Linkage:
+;	C(R4) = Address of DDB
+;	CALL	LKEDWN
+;
+; Unpreserved registers:
+;	R0, R2, SD
+;-----
+LKEDWN::CALL	LNKDWN#			; Declare link down
+	BIC	#$D1ACT,DDSTS1#(R4)	; Declare link inactive
+	MOVB	DDLEVS#(R4),DDLENR#(R4)	; Reset last N(R) received
+	BIC	#<$IBUSY!$REJ!$TIMER!$REXMT!$FRMR>,DDLEFG#(R4) ; Clear flags
+	CLRB	DDLET3#(R4)		; Clear idle output RR frame timer
+;	CLRB	DDLET4#(R4)		; Clear reject condition timer
+;	CLRB	DDLET5#(R4)		; Clear command reject condition timer
+	CLRB	DDLET6#(R4)		; Clear idle input take-down timer
+
+	MOV	DDSX#(R4),R0		; Get 1st SX table entry addr
+	TST	-(R0)			; Point to wild socket
+
+	CLR	R2			;
+	BISB	DDSOC#(R4),R2		; GET NUMBER OF SOCKET
+	INC	R2			; PLUS THE WILD SOCKETE
+1$:	MOV	(R0)+,SD		; Get SDB address
+	CLR	SDLES1#(SD)		; Clear packet level status word
+	CLRB	SDLEVR#(SD)		; Clear last P(R) received for socket
+	CLRB	SDLEPR#(SD)		; Clear P(R) for socket
+	CLRB	SDLEPS#(SD)		; Clear P(S) for socket
+	CLRB	SDACNT#(SD)		; Clear send ahead count for socket
+	CLRB	SDFCNT#(SD)		; Clear flag count (# RR pkts pending)
+	CLRB	SDLERR#(SD)		; Clear pending RR pkt count
+	MOV	SDLESP#(SD),R1		; GET ADDRESS OF SAVED PACKETS
+	BEQ	99$			; BRANCH IF NO PACKET
+	CALL	X25FRE#			; FREE THEM OTHERWISE
+99$:
+	SOB	R2,1$			; Continue until all sockets reset
+
+	TSTB	DDLEVT#(R4)		; Anything left in transmit ring?
+	BEQ	6$			; No - check send back list
+
+	SETPSW	DDLELV#(R4)		; Raise processor priority level
+	MOV	DDLELH#(R4),R0		; Get Xmit ring head pointer
+
+2$:	MOV	(R0),R1			; Get frame packet list pointer
+	BEQ	4$			; No packets on list (shouldn't happen)
+
+;3$:	PUSH	(R1)			; Store forward packet link
+;	FREPKT				; Free the packet
+;	POP	R1			; Retrieve forward pointer
+;	BNE	3$			; Continue until all packets freed
+	CALL	FRELST
+
+4$:	CLR	(R0)+			; Clear packet list head pointer
+	CMP	R0,DDLELE#(R4)		; End of ring?
+	BLO	5$			; No
+	MOV	DDLELB#(R4),R0		; Yes - reset ring pointer
+5$:	CMP	R0,DDLELT#(R4)		; Freed all lists from xmit ring?
+	BNE	2$			; No - continue until all lists freed
+
+	CLRB	DDLEVT#(R4)		; Clear transmit ring frame counter
+	CLRB	DDLET1#(R4)		; Clear timer (can't retransmit if link
+					;   down & nothing in ring)
+	MOV	R0,DDLELH#(R4)		; Update head pointer
+	MOV	R0,DDLELN#(R4)		; Update next-to-send pointer
+	BIS	#$ABORT,DDLEFG#(R4)	; Abort output frame is sending one
+	CLRPSW				; Lower processor priority level
+
+6$:	MOV	DDLEAH#(R4),R1		; Get send back list head
+	BEQ	8$			; Bypass if nothing there
+
+;7$:	PUSH	(R1)			; Save forward packet link
+;	FREPKT				; Free the packet
+;	POP	R1			; Retrieve forward packet link
+;	BNE	7$			; Continue until list freed
+	CALL	FRELST
+
+	CLR	DDLEAH#(R4)		; Clear send back list head
+	CLR	DDLEAT#(R4)		; Clear send back list tail
+
+8$:	RETURN				; Return to caller
+
+LKELOD:: SEC				;we don'T know how to load
+	RETURN
+
+; MABORT - Subroutine to free FLIST pointed by DDLEMF#(R4)
+; FRELST - Subroutine to free list of packets
+
+MABORT:	MOV	DDLEMF#(R4),R1		; Yes - get packet list ptr
+	BEQ	RTN112			; Nothing to free
+	CLR	DDLEMF#(R4)		; Clear packet list pointer
+FRELST:	PUSH	(R1)			; Save possible link to another packet
+	FREPKT				; Discard frame
+	POP	R1
+	BNE	FRELST			; Zap next one
+RTN112:	RETURN
+	.END
+  =m
