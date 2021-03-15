@@ -1,0 +1,356 @@
+begin "SysLog - System Message Logger"
+
+  require "(sailib)sail.def"   source!file;
+  require "(sailib)uuosym.def" source!file;
+  require "(carl)esctrp.req"   source!file;
+  require "(carl)logpkg.req"   source!file;
+  require "(sailib)vmfile.req" source!file;
+  require "(carl)daytim.req"   source!file;
+
+  require '1 lsh 25 lor ( "@"-"@" ) lsh 18 lor '0 version;
+
+define	PEEK(x) = { Calli( !bit(0) lor (x), calli!VPEEK ) }
+,	Gettab( idx, tbl ) = {( calli( !xwd( idx, tbl ), calli!GETTAB ) )}
+;
+
+define CtyDir = { (if memory[!jbDDT] then "(CARL)" else "(SYS)") }; ! { "(SRA)" };
+define MsgDir = { (if memory[!jbDDT] then "(CARL)" else "(SYS)") }; ! { "(SRA)" };
+
+define Addit( x ) = { quick!code Aos x end };
+define Subit( x ) = { quick!code Sos x end };
+
+! globals ;
+
+integer
+	V,				! value ;
+	OldZone,			! old time zone ;
+	CTYChan,			! channel for file ;
+	SaveCTY,			! saved CTY pointer value ;
+	MsgChan,			! channel for file ;
+	SaveMsg;			! saved Msg pointer value ;
+
+!  0: 400000,,000006	SYSDVF function to read a named buffer ;
+!  1: SIXBIT/MSGLG./	Name of buffer set to search for ;
+!  2:           2004	Expected combined size of both buffers ;
+!  3: SIXBIT/MSGLG./	Name of first buffer in set ;
+!  4:      4,,774000	Size ,, exec virtual address
+!  5: SIXBIT/MSGBUF/	1 of 4 = Name for consistency check ;
+!  6:          11747	2 of 4 = Size of MSGBUF in bytes = ^D5095 ;
+!  7:  input counter	3 of 4 = Count of bytes put into buffer by Monitor ;
+!  8: output counter	4 of 4 = Count of bytes we removed and logged ;
+!  9: SIXBIT/MSGBUF/	Name of second buffer in set ;
+! 10:   1774,,774004	Size ,, exec virtual address ;
+! 11:   ASCII text	Contents of the system message buffer ;
+
+define MSG.func = 0, MSG.set = 1, MSG.total = 2; ! Argument for uuo ;
+define MSG.nam1 = 3, MSG.adr1 = 4, MSG.nam2 = 9, MSG.adr2 = 10;
+define MSG.name = 5, MSG.size = 6, MSG.in = 7, MSG.out = 8, MSG.log = 11;
+define MSG.len = 3+2+'4+2+'1774+'1000;	! Big enough for 3 pages of msglog ;
+safe integer array MSG[ 0:MSG.len-1 ];
+own integer MsgP, MsgC, MsgH;
+
+define CtyPtr = 511+2+1;
+safe integer array CTY[ -5:CtyPtr ];
+own integer CtyP, CtyC, CtyH;
+
+own integer MyLen, MyPtr, MyChr;
+own integer LastCTY, LastMSG;		! last character seen ;
+string OldCty, OldMsg;
+
+define LineLen = (64 * 40);	! constant length = 2560(*) ;
+preset!with
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################" &
+    "################################################################";
+Own String array Line[0:0];
+
+
+!	Initialization support
+;
+
+simple procedure SetZone;		! set timezone to GMT ;
+begin
+    own integer Zone;
+
+    OldZone_ Zone_ Gettab( -1,!gtPRV );
+    dpb( '20, point( 6,Zone,7 ) );
+    calli( jp!nat lor Zone, calli!SETPRV );
+
+end;
+require SetZone initialization;
+
+simple procedure DateLine;
+begin "date line"
+    own string Time;
+
+    ! "hh:mm:ss<sp>"  ;
+    Time_ TymDay( GetTDT )[11 for 8] & #sp;
+
+    while length( Time )
+     do idpb( lop( Time ), MyPtr );
+
+    MyLen_ MyLen + 8+1;
+
+end "date line";
+
+
+! TymDay returns "DD-MMM-YY HH:MM:SS";
+
+simple string procedure CtyName;
+return( CtyDir & TymDay(GetTDT)[4 for 3] & TymDay(GetTDT)[8 for 2] & ".CTY");
+
+
+simple string procedure MsgName;
+return( MsgDir & TymDay(GetTDT)[4 for 3] & TymDay(GetTDT)[8 for 2] & ".MSG");
+
+
+simple procedure LogMessage( string File, Text );
+begin "log message"
+    string Str1,Str2;
+    integer LogChan;
+
+    if ( 0 > LogChan_ VMFile( File, VM$Update lor VM$Append, 1, '377 ) )
+     then return;
+
+    Str1_ (Str2_ TymDay( GetTDT ))[11 for 8];
+
+    VMText( LogChan,
+              Str1 & " -------------------------------------------------"&crlf&
+              Str1 & " " & Str2[1 for 9] & #ht & Text & crlf &
+	      Str1 & " -------------------------------------------------"&crlf&
+	      crlf
+	);
+
+    VMFree( LogChan );
+
+end "log message";
+
+simple procedure CTYrec;
+begin "log to CTY"
+
+    CTY[ -5 ]_ !bit(0) lor 6;		! SYSDVF function 6 ;
+    CTY[ -4 ]_ cvSIX( "CTYBUF" );	! return cty log ;
+
+    calli( !xwd( CtyPtr+1+5, location(CTY[-5]) ), calli!SYSDVF );
+    if  ( CTY[ -2 ]       neq cvSIX( "CTYBUF" ) ) or
+	( CTY[ CtyPtr-2 ] neq cvSIX( "CTYPTR" ) )
+     then return;
+
+    if ( SaveCTY = CtyH_ CTY[CtyPtr] )	! if they match ;
+     then return;			!  nothing to do for now ;
+
+    MyPtr_ !Xwd( '440700, memory[location(Line[0])] );
+    MyLen_ 0;				! length of constant ;
+
+    if not( V_ SaveCTY )		! any saved CTY pointer ;
+     then begin "new cycle"
+	if ( !rh( CtyH ) > '777 )	! no, have we wrapped? ;
+	 then V_ CtyH - '1000		! yes, use oldest byte ;
+	 else V_ point(7,memory[0],-1);	!  no, so init pointer ;
+     end "new cycle";
+
+    if not kequ(CtyName,OldCty) 	! Name changes at first of the month ;
+     then LogMessage( OldCty_CtyName, "*** Start of Log File ***" );
+
+    CtyC_ 0;				! start with a clean slate ;
+    CtyP_ V;				! make a working copy ;
+    while ( CtyP neq CtyH )
+     do start!code
+	IBP	CtyP;			! position cursor ;
+	Aos	CtyC;			! one char at a time ;
+     end;
+
+    if ( CtyC > '5000 )
+     then LogMessage( OldCty, "*** Lost CTY data - buffer overwriten ***" );
+
+    if ( 0 > CtyChan_ VMFile(CtyName,VM$Update lor VM$Append, 1, '377))
+     then return;
+
+    while ( V neq CtyH )		! look for a match ;
+     do begin "proc chars"
+
+	IBP( V );			! bump pointer for match ;
+	if not( CtyC_ ldb( CtyP_ (V land lnot '777000)+location(CTY[0]) ) )
+	 then continue;			! skip if null ;
+
+	if ( LastCTY = #lf )		! after lf, remember to ;
+	 then DateLine;			!  date-stamp each line ;
+
+	idpb( LastCTY_ CtyC, MyPtr );	! deposit byte ;
+
+	if ( (LineLen-30) geq MyLen_ MyLen + 1 )
+	 then begin "overflow"
+	    VMText( CtyChan, Line[0][1 for MyLen] );
+	    MyPtr_ !xwd( '440700, memory[location(Line[0])] );
+	    MyLen_ 0;			! reset counter ;
+	 end "overflow";
+
+     end "proc chars";
+
+    VMText( CtyChan, Line[0][1 for MyLen] );
+    VMFree( CtyChan );
+
+    SaveCTY_ CtyH;			! remember where we are ;
+
+end "log to CTY";
+simple procedure MSGrec;
+begin "log from CTY"
+
+    MSG[ MSG.func ]_ !bit(0) lor 6;	! SYSDVF function 6 ;
+    MSG[ MSG.set ]_ cvSIX( "MSGLG." );	! return set of msglog buffers ;
+
+    calli( !xwd( MSG.len, location(MSG[0]) ), calli!SYSDVF );
+    if  ( MSG[ MSG.nam1 ] neq cvSIX( "MSGLG." ) ) or
+	( MSG[ MSG.nam2 ] neq cvSIX( "MSGBUF" ) )
+     then return;
+
+    if ( SaveMSG = MsgH_ MSG[MSG.in] )	! if they match ;
+     then return;			!  nothing to do for now ;
+
+    if not kequ(MsgName,OldMsg) 	! Name changes at first of the month ;
+     then LogMessage( OldMsg_MsgName, "*** Start of Log File ***" );
+
+    MyPtr_ !Xwd( '440700, memory[location(Line[0])] );
+    MyLen_ 0;				! length of constant ;
+
+    if not( SaveMSG )			! any saved MSG pointer ;
+     then begin "first message"
+	SaveMSG_ -1;			! gets inc'ed to 0 at start of buffer ;
+	if not( memory[!jbDDT] )
+	  then SaveMSG_ MSG[MSG.out] ;	! start where previous log ended ;
+	if ( MSG[MSG.in]-SaveMSG > MSG[MSG.size] )
+	    then begin SaveMSG_ MSG[MSG.in] - MSG[MSG.size] ;
+		       LogMessage( OldMsg, "*** Lost MSG data - buffer overwritten ***" );
+		 end
+     end "first message";
+
+    if ( MSG[MSG.out] = -1 )
+     then LogMessage( OldMsg, "*** MSGBUF reset (power failure or interleaving) ***" );
+
+    if ( 0 > MsgChan_ VMFile(OldMsg, VM$Update lor VM$Append, 1, '377))
+     then return;
+
+    MsgC_ -1;				! ADJBP emulation ;
+    V_ SaveMSG MOD MSG[MSG.size];
+    MsgP_ !Xwd( '440700, location(MSG[MSG.log]) );
+    while ( Msgc neq V)
+     do start!code
+	IBP	MsgP;			! position cursor ;
+	Aos	MsgC;			! one char at a time ;
+     end;
+
+    while ( SaveMSG neq MSG[MSG.in] )	! look for a match ;
+     do begin "proc chars"
+     ! What we really want here is the equivalent of: ;
+     !   AOS T1,MSG.OUT                               ;
+     !   IDIV T1,MSG.SIZE                             ;
+     !   ADJBP T2,[POINT 7,MSG.LOG,6]                 ;
+	if not( (SaveMSG_ SaveMSG+1) MOD MSG[MSG.size])
+	 then MsgP_ !Xwd( '440700, location(MSG[MSG.log]) );
+
+	if not( MsgC_ ildb( MsgP) )
+	 then continue;                 ! ignore nulls in buffer ;
+
+	if ( LastMSG = #lf )		! after lf, remember to ;
+	 then DateLine;			!  date-stamp each line ;
+
+	idpb( LastMSG_ MsgC, MyPtr );	! deposit byte ;
+
+	if ( (LineLen-30) leq MyLen_ MyLen + 1 )
+	 then begin "overflow"
+	    VMText( MsgChan, Line[0][1 for MyLen] );
+	    MyPtr_ !xwd( '440700, memory[location(Line[0])] );
+	    MyLen_ 0;			! reset counter ;
+	 end "overflow";
+
+     end "proc chars";
+
+    VMText( MsgChan, Line[0][1 for MyLen] );
+    VMFree( MsgChan );
+
+    SaveMSG_ MsgH;			! remember where we are ;
+    if not(memory[!jbDDT]) then
+       Calli( !xwd( '16, location(SaveMSG)), calli!SETUUO );
+
+
+end "log from CTY";
+! Top level logic
+;
+
+    if ( ( Gettab( -1, !gtLIC ) land ( LC!SY lor LC!OP lor LC!RC ) )
+	 xor ( LC!SY lor LC!OP lor LC!RC )  )
+     then usererr( 0,0,"Requires RC OP SY and HF", "x" );
+
+    ExcIni;				! turn on escapes, time, ntq ;
+
+    SaveMSG_ 0;				! initialize pointer ;
+    LastMSG_ #lf;			! force timestamp on first char ;
+    LogMessage( OldMsg_MsgName, "*** Start of Crash Dump Log ***" );
+!   MSGupto( "Highest memory address" ); ! read previous crash message ;
+!   LogMessage( OldMsg, "*** End of Crash Dump Log ***" );
+!   CTYupto( "Highest memory address" ); ! read messages from ONCE dialog ;
+    MSGrec;				! read startup messages ;
+
+    SaveCTY_ 0;				! initialize pointer ;
+    LastCTY_ #lf;			! force timestamp on first char ;
+    LogMessage( OldCty_CtyName, "*** Begin Logging ***" );
+! [JMS] At this point, we want to read SYS:CTYLOG.TMP, append its data ;
+! (which COPYCR extracted from the crash), then delete SYS:CTYLOG.TMP. ;
+!   LogMessage( OldCty, "*** End of Crash Dump Log ***" );
+    CTYrec;				! log the startup messages ;
+
+    while ( true )			! while system still running ;
+     do begin "main loop"
+
+	calli( !xwd( 1, 10 ), '72 );	! hiber for 10 seconds ;
+	MSGrec;				! log any CTY activity ;
+	CTYrec;				! log any CTY activity ;
+
+	if ( NTQ! or ESC! )
+	 then done "main loop";
+
+     end "main loop";
+
+    calli( OldZone, calli!SETPRV );	! reset time zone ;
+    call(0,"EXIT");			! always exit, if NTQ! will LOGOUT ;
+
+end "SysLog - System Message Logger";
+  
