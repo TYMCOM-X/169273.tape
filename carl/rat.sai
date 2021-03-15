@@ -1,0 +1,341 @@
+begin "rat"
+
+require "(SAILIB)SAIL.DEF"   source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "(SAILIB)CVPPN.REQ"  source!file;
+require "(SAILIB)CVNAME.REQ" source!file;
+require "(SAILIB)ARGS.REQ"   source!file;
+require ( '1 lsh 24 ) lor ( ("@"-"@") lsh 18 ) lor '0 version;
+
+!
+!		** Revision History **
+!
+!  %1   (0)	18-May-89 /Carl
+!		Created rat to copy tar files from disk/tape to disk/tape.
+!
+;
+
+define BrkString =
+    {(If Brk="*" then "######" else if Brk="?" then "#" else null)};
+
+define !FILE = 2, !EXT = 3, !PRV = 4, !PPN = 1;	! lookup block offsets ;
+define Gettab(x,y) = { calli( !Xwd( (x),(y) ), calli!GETTAB ) };
+
+
+string  FileSpec, CopySpec;		! file spec strings ;
+string  TempFile;			! storage for temp file ;
+string  Text, UserName, User;		! text line and username ;
+string  tarfile, ratfile;
+
+integer c, i, ptr;
+integer Inbrk, InLst, Quest, Brk;	! various break table stuff ;
+integer File, Ext, UserPPN, LastPPN;	! file information ;
+integer tarchan, tarEof, tarfilestatus, ratchan, ratEof, ratfilestatus;
+integer itarfile, iratfile, iblocksize, blocksize;
+
+integer vma, vmp, vmc;			! address, page, count ;
+integer buf;				! pointer to buf ;
+
+
+simple boolean procedure ADot( string Str );
+begin "a dot"
+    boolean dot, user;
+
+    dot_ user_ false;
+    while length( Str )
+     do case lop( Str ) of begin	 
+	["("] user_ true;
+	[")"] user_ false;
+	["."] if not user then dot_ true;
+	else
+     end;
+
+    return( dot );
+
+end "a dot";
+
+
+boolean procedure WantFile( Reference Integer Filename, Extension );
+begin
+
+    return( not( kequ( "TMP",Extension ) );	! not = .tmp  ;
+
+end;
+
+
+procedure FileProc( Reference Integer Chan, Cnt, Brk, FileEof;
+		    Integer Array LKB );
+Begin "Each File"
+    Integer N;
+    String  Name;
+
+    Name_ "./" & User & "/" &
+		 cv6str( LKB[!File] ) &
+		 (if !lh( LKB[!Ext] )
+		   then "." & cv6str( !lh( LKB[!Ext] ) lsh 18 )
+		   else null);
+
+    print( " --> ", Name, crlf );
+
+    lookup( Chan, "("& User &")"&
+		    cv6str(LKB[!File]) &"."& cv6str(!lh(LKB[!Ext]) lsh 18),
+		    FileEof_ -1 );
+    while not( FileEof )
+     do "read and write files"
+	memory[ vma ]_ -1;		! not likely if a tar file ;
+	arryin( ratchan, memory[ vma ], vmc );
+	if ( memory[ vma ] neq -1 )
+	 then arryout( tarchan, memory[ vma ], vmc );
+     end "read and write files";
+	
+end "Each File";
+
+
+procedure process!file( string name );
+begin "normal files"
+
+    print( "file: ", name, crlf );
+
+    While Length( name )			! for each spec typed ;
+     do begin "line typed"
+	FileSpec_ Scan(name,inlst,brk);		! gobble one file-spec ;
+	if ( brk = "[" )			! handle [,] ;
+	 then FileSpec_ FileSpec & "[" &
+		Scan(name,inlst,brk) & brk
+		& Scan(name,inlst,brk);
+	if Length( FileSpec )			! if it has substance ;
+	 then begin "file typed"
+	    CopySpec_ Null;			! init copy variables ;
+	    Brk_ 0;
+	    While ( length( FileSpec ) )
+	     do CopySpec_ CopySpec & BrkString & Scan( FileSpec, quest, Brk );
+	    CopySpec_ CopySpec & BrkString;		! translate *,? to # ;
+	    File_ cvfil( CopySpec, Ext, UserPpn );	! dissect into parts ;
+	    if ( 0 neq (File lor Ext lor UserPpn) )	! any non-null ok ;
+	     then begin "use GFD ppn"
+		if UserPpn = 0				! handle null ppn ;
+		 then UserPpn_ LastPpn;			! previous username ;
+		if !lh( UserPpn ) = 0			! pointer to UNAME ;
+		 then UserPpn_ CvPPN( Cv6str( memory[ UserPpn   ] ) &
+				      Cv6str( memory[ UserPpn+1 ] ) );
+	     end "use GFD ppn";
+	    if File = 0 then File_ cvsix("*");		! handle null file ;
+	    if Ext = 0 and not( ADot( CopySpec ) )	! handle null ext ;
+	     then Ext_ cvsix("*");			! when no dot typed ;
+
+	    User_ CvName( UserPpn );			! username ;
+	    UfdScn( UserPpn, File, Ext, -1, WantFile, FileProc );
+	    LastPpn_ UserPpn;			! remember last user ;
+
+	 end "file typed"
+     end "line typed";
+
+end "normal files";
+
+
+simple integer procedure UGETF( integer chan);
+begin "UGETF"
+    own integer array UG[0:1];
+    UG[0]_ !ugSTS;
+    chnior( chan, UG[0], !chUGF );
+    return( UG[1] );
+end "UGETF";
+
+
+simple procedure close!tarfile( string file );
+begin "finish tarfile"
+
+    close( tarchan );
+    release( tarchan );
+
+    if ( verbose )
+     then print( " tarfile: ", file, " closed."& crlf );
+
+end "finish tarfile";
+
+
+simple procedure init!tarfile( string file );
+begin "use tarfile"
+
+    if ( length( file ) = 0 )
+     then file_ "FTA:";
+
+    print( " tarfile: ", file, crlf );
+
+    if ( file[inf for 1] = ":" )
+     then begin "device specified"
+
+	open( tarchan_ getchan, file[1 to inf-1], '17,
+		    0,0, 0,0, tarEof );
+	tarfilestatus_ calli( tarchan, calli!GETCHR );
+	if ( tarfilestatus land DV!MTA )
+	 then begin "physical magtape"
+	    mtape( tarchan, "I" );
+	    tarfilestatus_ UGETF( tarchan );
+	    if ( tarfilestatus land ( MT!PRO lor MT!EOT ) )
+	     then begin "error return"
+		if ( tarfilestatus land MT!EOT )
+		 then usererr( 0,0, "?device "&file&" at EOT", "X" );
+		if ( tarfilestatus land MT!PRO )
+		 then usererr( 0,0, "?device "&file&" write-protected", "X" );
+	     end "error return";
+	 end "physical magtape"
+	 else tarfilestatus_ 0;		! nothing if not a magtape ;
+
+     end "device specified"
+     else begin "filename specified"
+
+	if ( file = "-" )
+	 then file_ "stdout";
+
+	open( tarchan_ getchan, "DSK", '17, 0,0, 0,0, tarEof_ -1 );
+	enter( tarchan, file, tarEof_ -1 );
+	if ( tarEof )
+	 then usererr( 0,0, "?cannot access ("& cvos(tarEof) &") "& tarfile, "X" );
+
+     end "filename specified";
+
+end "use tarfile";
+
+
+procedure initVariables;
+begin "init variables"
+
+! static variables ;
+tarfile_ ratfile_ NULL;
+itarfile_ iblocksize_ iincludefile_ iusername_ -1;
+ignorechecksum_ ignoredate_ ignoreowner_ overridemode_ confirmwait_
+multiread_ errorexit_ errorlink_ symbolic_ verbose_ reverse_ test_ false;
+rewind_ true;
+
+vmp_ '700;
+buf_ vma_ vmp lsh 9;			! initial vm usage ;
+blocksize_ 20;				! default = 20 * 512 bytes ;
+omitlevel_ 0;				! default = omit nothing ;
+tarcommand_ "";				! default = --none-- ;
+
+! tables and functions ;
+setbreak(inbrk_getbreak,#LF&#FF,null,"INS");	! break on LF FF;
+setbreak(inlst_getbreak,",[ "," "&#HT,"KTINS");	! break on comma;
+setbreak(quest_getbreak,"?*",Null,"INS");	! break on qmark;
+MFDset( 0, 4, 0, 512 );				! ascii, in, out, count;
+
+! structures ;
+LastPpn_ Calli(!Xwd(-1,!GtPPN), Calli!GETTAB);	! initially self ;
+Users_ new!record( P );				! initialize...;
+P:Omit[ Omits_ new!record( P ) ]_ new!record( F );
+
+end "init variables";
+
+
+simple integer procedure readArglist;
+begin "read argument list"
+
+i_ 1;					! initial argument counter ;
+
+if ARGV[1] = "-"			! if optional "-" ;
+ then c_ lop( ARGV[1] );		!  eat it ;
+
+while ( length( ARGV[1] ) )		! first token specifies command ;
+ do case c_ lop( ARGV[1] ) of begin	!  with options and modifiers ;
+
+  ! tar commands ;
+    ["c"] tarcommand_ "c";		! command c = create ;
+    ["r"] tarcommand_ "r";		! command r = append at end ;
+    ["t"] tarcommand_ "t";		! command t = table of contents ;
+    ["u"] tarcommand_ "u";		! command u = update (if needed) ;
+    ["x"] tarcommand_ "x";		! command x = extract ;
+
+  ! tar options ;
+    ["b"] iblocksize_ i_ i + 1;		! blocksize token is ith+1 ;
+    ["B"] multiread_ true;		! force multiple reads on stream ;
+    ["e"] errorexit_ true;		! exit on errors immediately ;
+    ["f"] itarfile_   i_ i + 1;		! tarfile token is ith + 1 ;
+    ["F"] omitlevel_ omitlevel + 1;	! increment omition level ;
+    ["h"] symbolic_ true;		! follow symbolic links ;
+    ["i"] ignorechecksum_ true;		! enable ignore checksum errors ;
+    ["l"] errorlink_ true;		! for unresolved links to files ;
+    ["m"] ignoredate_ true;		! ignore modification date ;
+    ["o"] ignoreowner_ true;		! ignore owner/gid fields on extract ;
+    ["p"] overridemode_ true;		! override mode, use that from tape ;
+    ["v"] verbose_ true;		! enable verbose mode ;
+    ["w"] confirmwait_ true;		! wait for confirmation (y) = yes ;
+    ["X"] iexcludefile_			! Note: may want to process here! ;
+	    iexcludefile & (i_ i + 1);	! excludefile token is ith+1 ;
+
+  ! additions on TYMCOM-X ;
+    ["N"] rewind_ false;		! no rewind, like /dev/n... ;
+    ["R"] reverse_ true;		! sort in reverse order ;
+    ["T"] tarcommand_ test_ "T";	! command T = testing ;
+    ["U"] iusername_ i_ i + 1;		! username is ith token ;
+
+    [else] print( "%ignored bad option: -", c& crlf )
+    end;
+
+if ( iusername > 0 )
+ then begin "new username"
+    UserName_ ARGV[ iusername ];
+    if ( verbose )
+     then print( "username on tape: ", UserName, crlf );
+ end "new username"
+ else UserName_ CvName( Gettab( -1,!gtPPN ) );
+
+if ( iblocksize > 0 )
+ then begin "new blocksize"
+    blocksize_ cvd( ARGV[ iblocksize ] );
+    if ( verbose )
+     then print( "blocking: ", blocksize, crlf );
+ end "new blocksize";
+
+vmc_ blocksize * (512/4);		! 512 bytes/block 4 bytes/word ;
+if ( vmc > '100000 )
+ then usererr( 0,0, "?blocksize greater than 256 not available", "X" );
+c_ (vmc+'777) lsh -9;
+calli( !xwd( c,vmp ), calli!VCLEAR );	! make sure it's clear ;
+calli(!xwd('6000+c,vmp),calli!VCREAT);	! then load a new buffer ;
+
+if ( itarfile > 0 )
+ then tarfile_ ARGV[ itarfile ];
+
+while length( iexcludefile )
+ do process!exclude( excludefile_ ARGV[ c_ lop( iexcludefile ) ] );
+
+return( i );				! return current token pointer ;
+
+end "read argument list";
+
+
+!	***  M A I N   P R O G R A M   L O O P  ***
+;
+
+if ( ARGC = 1 )
+	or ( length( ARGV[1] ) = 0 )
+	or ( ARGC=2 and equ(ARGV[1],"?") )
+ then print(
+    "  rat [-][b blocksize] source-tarfile destination-tarfile"& crlf &
+    crlf, call(0,"EXIT") );
+
+if not( kequ( rat, ArgV[0] ) )
+ then Usererr( 0,0, "Illegal command: "&ArgV[0], "X" );
+
+initVariables;				! initialize flags and variables ;
+i_ readArglist;				! read unix-style command line ;
+
+init!tarfile( tarfile );		! init/open tarfile stream ;
+
+while( ARGC > i_ i + 1 )
+ do if ( ARGV[i] = "-" )
+     then case ( ARGV[i][2 for 1] ) of begin
+	["I"] process!include( ARGV[i_ i+1] );
+	["C"] process!directory( ARGV[i_ i+1], ARGV[i_ i+1] );
+	[else] print( "%ignored bad option: -", c&" ",ARGV[i_ i+1], crlf )
+        end
+     else process!file( ARGV[i] );
+
+close!tarfile( tarfile );		! finish up tarfile stream ;
+
+calli(0,calli!EXIT);			!  then we are done. ;
+start!code uuo!EXIT 0, end;		! really exit! on continue ;
+
+end
