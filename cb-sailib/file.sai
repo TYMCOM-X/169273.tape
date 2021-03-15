@@ -1,0 +1,687 @@
+entry WantRead, WantWrite, MustRead, MustWrite;
+
+BEGIN "FILE"
+    require "SAI:CSWIT.SAI" source!file;
+    define HISEGGING=ifcr COMPILER!SWITCH!H thenc +1 elsec -1 endc;
+    define !NOBAYSAILIB! = true;
+    REQUIRE "SAI:BAYSAI" SOURCE!FILE;
+
+!-------------------------------------------------
+!
+! ABSTRACT:
+!	Procedures to set up simple file I/O.
+!
+!--------------------------------------------------;
+! Submodule: FILE.SAI
+! Date: 11-Jan-79
+! Who: David Lamb logged in as SAIL Files
+! Allow default extension handling for MUSTREAD and MUSTWRITE.
+! The default parameters are still null, so anyone not trying to
+! use the facility wouldn't get it.
+! 
+! ;
+! Submodule: FILE.SAI
+! Date: 27-Oct-78
+! Who: SAIL Files
+! Just looking.
+! [MS30]
+! 
+! ;
+! Submodule: FILE.SAI
+! Date: 27-Sep-78
+! Who: SAIL Files
+! Cleaned up some Zilch misuses at Everhart's prompting.
+! [MS30]
+! 
+! ;
+! Submodule: FILE.SAI
+! Date: 27-Sep-78
+! Who: SAIL Files
+! Changed parameter lists for DoWrite, WantWrite and MustWrite to allow a
+! user supplied EOF variable.
+! [MS30]
+! 
+! ;
+!-------------------------------------------------
+! This is a null design section.
+!-------------------------------------------------;
+source!l(File);
+
+source!l(File2);				! GetDev and FilErr routines;
+simple boolean procedure DoRead(string Who; boolean Must; 	
+	reference integer Channel, Count, Brkchr, EOF;
+	reference string HisFile;
+	string UserPrompt; integer Mode;
+	string DefaultExtList; integer NumInBufs);
+!-------------------------------------------------
+!
+! ABSTRACT:
+!	Opens a file for input.
+!
+! PARAMETERS:
+!   Who: String used only for error messages, it identifies the calling
+!	routine.
+!
+!   Must: Boolean that if true requires DoRead to find the file
+!	that it first looks for and to quit on any error.
+!
+!   Channel: A reference integer that should be a channel number in the
+!	range 0 through 15.  If it is not in this range, the first free
+!	channel (if there is one) will be used.  Also see SIDE EFFECTS.
+!
+!   Count: Either an integer constant or a reference integer that specifies
+!	the maximum number of characters to be read by a single INPUT call.
+!
+!   Brkchr: A reference integer.  See SIDE EFFECTS.
+!
+!   EOF: A reference integer.  See SIDE EFFECTS.
+!
+!   HisFile: A reference string that is the file specification of the file
+!	to be opened for input.  If it initially has null value, the user
+!	will be requested to supply a file specification.
+!	Also see SIDE EFFECTS.
+!
+!   UserPrompt: String that will typed to the user as a prompt if it is
+!	necessary to ask for a file specification.
+!
+!   Mode: Integer specifying the mode in which to open the file.
+!
+!   DefaultExtList: String of default extensions to try if the file
+!	specification does not contain an explicit extension.  This
+!	list should be separated by either "," or "/", and may contain
+!	spaces and tabs (which will be ignored).
+!
+!   NumInBufs: An integer specifying the number of input buffers to use.
+!
+! RESULT:
+!	DoRead is FALSE if the file can be opened, TRUE otherwise.
+!
+! SIDE EFFECTS:
+!    1)	If DoRead needs to get a free channel because Channel was out of
+!	range, then Channel will be set to the new channel number.
+!    2)	Brkchr will be used as the break character parameter to the open
+!	call (see the SAIL manual).
+!    3)	EOF will be used as the end of file parameter to the open
+!	call (see the SAIL manual).
+!    4)	HisFile will be set to the file specification of the file that is
+!	successfully opened (or the last file that was tried, which will be
+!	null if user input was requested and the user did not want to
+!	give a file spec.).  Note that the string "DSK:" will be
+!	added to the start of a file specification that does not contain
+!	an explicit device if the file is successfully opened.
+!
+! ERRORS:
+!	All errors associated with OPEN and LOOKUP UUO's may occur, and
+!	are handled by the procedure, not SAIL, except for those
+!	using the Mode left halfword bits other than '20000.
+!
+! DESIGN:
+!    1)	It is vital that any channels and/or break tables that are used and
+!	not needed outside the routine be released before returning, thus
+!	the hacking with ReturnValue and done "INFILE".
+!    2)	Note that the default extension stuff will only be invoked if:
+!	a) The LOOKUP error is "Non-existent file"
+!	b) There is a list of default extensions
+!	c) There is no explicit extension in the file spec. (including
+!	   the extension ".").
+!	Also, if the last defaulted file cannot be looked up, the file
+!	name used in the error message should not include the last
+!	default extension.
+!
+!-------------------------------------------------;
+begin "DoRead"
+
+boolean NoDot;
+integer MyDum, ReturnValue, DotBreak, DefaultExtBreak, PPNBreak;
+string MySDum, MySDum2, FileName, FilePPN, ExtLeft, File, HisDevice;
+
+if NOT (0 LEQ Channel LEQ 15) then Channel_getchan;	! Get a free channel;
+if Channel < 0
+    then begin						! None. Tell user;
+    usererr(0,1,Who&": no channels available.");
+    return(True)
+    end;
+
+setbreak(DotBreak_getbreak,".",null,"IA");
+setbreak(DefaultExtBreak_getbreak,",/"," "&TAB,"IS");
+setbreak(PPNBreak_getbreak,"[",null,"IR");
+File _ HisFile;
+
+! Now cycle until a file is looked up or user quits;
+repeat begin "INFILE"
+    if fulstr(File)			! True if file name was passed in;
+	then begin
+	HisDevice _ GetDev(File);
+	open(Channel,HisDevice,Mode,NumInBufs,0,Count,Brkchr,EOF_true);
+	if EOF
+	    then begin "Bogus device"
+	    boolean DNA;
+	    DNA_call(cvsix(HisDevice),"DEVCHR");
+	    if Must
+		then begin "Quit"
+		ReturnValue_if DNA then xwd(-1,'11) else xwd(-1,'12);
+		done "INFILE"
+		end "Quit";
+	    print(crlf&"?",Who,": device """,HisDevice,""" ",
+		  (if DNA then "not available" else "does not exist"),
+		  "."&crlf);
+	    File_null;
+	    continue "INFILE"
+	    end "Bogus device";
+
+	! Do some initialization in case we end up cycling through the
+	   default extensions;
+	MySDum _ scan(MySDum2_File,DotBreak,MyDum);
+	NoDot _ (MyDum NEQ ".");
+	FileName _ scan(MySDum,PPNBreak,Zilch);
+	SZilch _ scan(FilePPN_File,PPNBreak,Zilch);
+	ExtLeft _ DefaultExtList;
+
+	repeat begin "Lookup file"
+	    lookup(Channel,File,ReturnValue);
+	    if ReturnValue
+		then if ((ReturnValue land '77777) = 0) AND NoDot
+			AND fulstr(ExtLeft)
+		    then begin "Try a default extension"
+		    MySDum _ scan(ExtLeft,DefaultExtBreak,Zilch);
+		    File _ FileName & "." & MySDum & FilePPN;
+		    continue "Lookup file"
+		    end
+		else begin
+		    if Must then begin
+			release(Channel);
+			done "INFILE"
+			end
+		    else begin
+			print(crlf&"?",Who,": cannot LOOKUP """,
+				(if NoDot then FileName&FilePPN else File),
+				""": ",FilErr(ReturnValue),crlf);
+			done "Lookup file"
+			end
+		end
+	    else begin				! Give him back what we used;
+		HisFile _ HisDevice & ":" &  File;
+		done "INFILE"
+	    end
+	end "Lookup file"
+    end;
+    print(UserPrompt);			! If LOOKUP failed or no file;
+    if nulstr(File_HisFile_inchwl)	!   passed in, get one;
+	then begin "User quits"
+	release(Channel);
+	ReturnValue _ True;
+	done "INFILE"
+	end "User quits"
+    end "INFILE";			! Keep on trying;
+
+! We must release all the break tables before returning;
+relbreak(DotBreak);
+relbreak(DefaultExtBreak);
+relbreak(PPNBreak);
+return(ReturnValue);
+end "DoRead";
+internal simple boolean procedure WantRead(
+	reference integer Channel, Count, Brkchr, EOF;
+	reference string HisFile;
+	integer Mode(ASCII); string UserPrompt("Input File: ");
+	string DefaultExtList("SAI,BLI,B11,MAC,FAI,M11,P11,MIC,"&
+			"SNO,PAS,LSP,SIM,MSS,PUB,XOF,RNO,TXT,DOC,HLP");
+	integer NumInBufs(2));
+!-------------------------------------------------
+!
+! ABSTRACT:
+!	Opens a file for input.  Many of the parameters are defaulted.
+!
+! PARAMETERS:
+!   Channel: A reference integer that should be a channel number in the
+!	range 0 through 15.  If it is not in this range, the first free
+!	channel (if there is one) will be used.  Also see SIDE EFFECTS.
+!
+!   Count: Either an integer constant or a reference integer that specifies
+!	the maximum number of characters to be read by a single INPUT call.
+!	300 is a good value to use generally.
+!
+!   Brkchr: A reference integer.  See SIDE EFFECTS.
+!
+!   EOF: A reference integer.  See SIDE EFFECTS.
+!
+!   HisFile: A reference string that is the file specification of the file
+!	to be opened for input.  If it initially has null value, the user
+!	will be requested to supply a file specification.
+!	Also see SIDE EFFECTS.
+!
+!   Mode: Integer specifying the mode in which to open the file.  It
+!	defaults to Ascii.
+!
+!   UserPrompt: String that will typed to the user as a prompt if it is
+!	necessary to ask for a file specification.  It is defaulted.
+!
+!   DefaultExtList: String of default extensions to try if the file
+!	specification does not contain an explicit extension.  This
+!	list should be separated by either "," or "/", and may contain
+!	spaces and tabs (which will be ignored).  It is defaulted to
+!	the SOS search sequence.
+!
+!   NumInBufs: An integer specifying the number of input buffers to
+!	use.  It defaults to 2.
+!
+! RESULT:
+!	WantRead is FALSE if the file can be opened, TRUE otherwise.
+!
+! SIDE EFFECTS:
+!    1)	If WantRead needs to get a free channel because Channel was out of
+!	range, then Channel will be set to the new channel number.
+!    2)	Brkchr will be used as the break character parameter to the open
+!	call (see the SAIL manual).
+!    3)	EOF will be used as the end of file parameter to the open
+!	call (see the SAIL manual).
+!    4)	HisFile will be set to the file specification of the file that is
+!	successfully opened (or the last file that was tried, which will be
+!	null if user input was requested and the user did not want to
+!	give a file spec.).  Note that the string "DSK:" will be
+!	added to the start of a file specification that does not contain
+!	an explicit device if the file is successfully opened.
+!
+! ERRORS:
+!	All errors associated with OPEN and LOOKUP UUO's may occur, and
+!	are handled by the procedure, not SAIL, except for those
+!	using the Mode left halfword bits other than '20000.
+!
+! DESIGN:
+!	Relax and let DoRead handle the work.
+!
+!-------------------------------------------------;
+begin "WantRead"
+return(DoRead("WANTREAD",false,Channel,Count,Brkchr,EOF,HisFile,
+		UserPrompt,Mode,DefaultExtList,NumInBufs))
+end "WantRead";
+internal simple boolean procedure MustRead(
+	reference integer Channel, Count, Brkchr, EOF;
+	reference string HisFile;
+	integer Mode(ASCII); string UserPrompt("Output file: ");
+	string DefaultExtList("");
+	integer NumInBufs(2));
+!-------------------------------------------------
+!
+! ABSTRACT:
+!	Opens a file for input.  Many of the parameters are defaulted.
+!
+! PARAMETERS:
+!   Channel: A reference integer that should be a channel number in the
+!	range 0 through 15.  If it is not in this range, the first free
+!	channel (if there is one) will be used.  Also see SIDE EFFECTS.
+!
+!   Count: Either an integer constant or a reference integer that specifies
+!	the maximum number of characters to be read by a single INPUT call.
+!	300 is a good value to use generally.
+!
+!   Brkchr: A reference integer.  See SIDE EFFECTS.
+!
+!   EOF: A reference integer.  See SIDE EFFECTS.
+!
+!   HisFile: A reference string that is the file specification of the file
+!	to be opened for input.  If it initially has null value, the user
+!	will be requested to supply a file specification.
+!	Also see SIDE EFFECTS.
+!
+!   Mode: Integer specifying the mode in which to open the file.  It
+!	defaults to Ascii.
+!
+!   UserPrompt: String that would typed to the user as a prompt if this
+!	were WANTREAD.  It is present simply to make the calling sequences
+!	of WANTREAD and MUSTREAD are identical.
+!
+!   DefaultExtList: String of default extensions to try if the file
+!	specification does not contain an explicit extension.  This
+!	list should be separated by either "," or "/", and may contain
+!	spaces and tabs (which will be ignored).  It is defaulted to
+!	nothing.
+!
+!   NumInBufs: An integer specifying the number of input buffers to
+!	use.  It defaults to 2.
+!
+! RESULT:
+!	MustRead is FALSE if the file can be opened, TRUE otherwise.
+!
+! SIDE EFFECTS:
+!    1)	If MustRead needs to get a free channel because Channel was out of
+!	range, then Channel will be set to the new channel number.
+!    2)	Brkchr will be used as the break character parameter to the open
+!	call (see the SAIL manual).
+!    3)	EOF will be used as the end of file parameter to the open
+!	call (see the SAIL manual).
+!    4)	HisFile will be set to the file specification of the file that is
+!	successfully opened (or the last file that was tried, which will be
+!	null if user input was requested and the user did not want to
+!	give a file spec.).  Note that the string "DSK:" will be
+!	added to the start of a file specification that does not contain
+!	an explicit device if the file is successfully opened.
+!
+! ERRORS:
+!	All errors associated with OPEN and LOOKUP UUO's may occur, and
+!	are handled by the procedure, not SAIL, except for those
+!	using the Mode left halfword bits other than '20000.
+!
+! DESIGN:
+!
+!-------------------------------------------------;
+begin "MustRead"
+return(DoRead("MUSTREAD",true,Channel,Count,Brkchr,EOF,HisFile,
+		UserPrompt,Mode,DefaultExtList,NumInBufs))
+end "MustRead";
+simple boolean procedure DoWrite(string Who; boolean Must; 	
+	reference integer Channel, EOF;
+	reference string HisFile;
+	string UserPrompt; boolean Warn;
+	integer Mode; string DefaultExt; integer NumOutBufs);
+!-------------------------------------------------
+!
+! ABSTRACT:
+!	Opens a file for output.
+!
+! PARAMETERS:
+!   Who: String used only for error messages, it identifies the calling
+!	routine.
+!
+!   Must: Boolean that if true requires DoWrite to enter the file
+!	that it first looks for and to quit on any error.
+!
+!   Channel: A reference integer that should be a channel number in the
+!	range 0 through 15.  If it is not in this range, the first free
+!	channel (if there is one) will be used.  Also see SIDE EFFECTS.
+!
+!   EOF: A reference integer that will be used as specified in the SAIL
+!	Manual's description for the EOF argument to OPEN.
+!
+!   HisFile: A reference string that is the file specification of the file
+!	to be opened for input.  If it initially has null value, the user
+!	will be requested to supply a file specification.
+!	Also see SIDE EFFECTS.
+!
+!   UserPrompt: String that will typed to the user as a prompt if it is
+!	necessary to ask for a file specification.
+!
+!   Warn: Boolean that if true causes the user to be queried as to whether
+!	an existing file should be overwritten.
+!
+!   Mode: Integer specifying the mode in which to open the file.
+!
+!   DefaultExt: String that is the extension to use if the file name
+!	has neither an extension nor a ".".
+!
+!   NumOutBufs: An integer specifying the number of output buffers to use.
+!
+! RESULT:
+!	DoWrite is FALSE if the file can be opened, TRUE otherwise.
+!
+! SIDE EFFECTS:
+!    1)	If DoWrite needs to get a free channel because Channel was out of
+!	range, then Channel will be set to the new channel number.
+!    2)	HisFile will be set to the file specification of the file that is
+!	successfully opened (or the last file that was tried, which will be
+!	null if user input was requested and the user did not want to
+!	give a file spec.).  Note that the string "DSK:" will be
+!	added to the start of a file specification that does not contain
+!	an explicit device if the file is successfully opened.
+!    3)	EOF may be modified both during the procedure's execution and
+!	later due to side-effects generated by the SAIL runtimes.
+!	In general EOF will be used as a global error condition flag.
+!	See the SAIL manual's description of TOPS-10 file I/O for further
+!	details.
+!
+! ERRORS:
+!	All errors associated with OPEN, ENTER, and LOOKUP UUO's may occur,
+!	and are handled by the procedure, not SAIL, except for those
+!	using the Mode left halfword bits.
+!
+! DESIGN:
+!    1)	It is vital that any channels and/or break tables that are used and
+!	not needed outside the routine be released before returning, thus
+!	the hacking with ReturnValue and done "File Enter".
+!
+!-------------------------------------------------;
+begin "DoWrite"
+
+integer MyDum, DotBreak, ReturnValue;
+string MySDum, File, HisDevice;
+
+if NOT (0 LEQ Channel LEQ 15) then Channel_getchan;	! Get a free channel;
+if Channel < 0
+    then begin						! None. Tell user;
+    usererr(0,1,Who&": no channels available.");
+    return(True)
+    end;
+
+setbreak(DotBreak_getbreak,".",null,"IA");
+File _ HisFile;
+if fulstr(DefaultExt)
+    then begin "Got default extension"
+    if DefaultExt NEQ "." then DefaultExt _ "." & DefaultExt;
+    DefaultExt _ DefaultExt[1 to 4];
+    end "Got default extension";
+
+! Now cycle until a file is entered or user quits;
+repeat begin "File Enter"
+    repeat begin "OUTFILE"
+	if fulstr(File)			! True if file name was passed in;
+	    then begin
+	    HisDevice _ GetDev(File);
+	    open(Channel,HisDevice,Mode,0,NumOutBufs,0,Zilch,EOF_true);
+	    if EOF
+		then begin "Bogus device"
+		boolean DNA;
+		DNA_call(cvsix(HisDevice),"DEVCHR");
+		if Must
+		    then begin "Quit"
+		    ReturnValue_if DNA then xwd(-1,'11) else xwd(-1,'12);
+		    done "File Enter"
+		    end "Quit";
+		print(crlf&"?",Who,": device """,HisDevice,""" ",
+			(if DNA then "not available" else "does not exist"),
+			"."&crlf);
+		File_null;
+		continue "File Enter"
+		end "Bogus device";
+    
+	    ! We are sure to need File, so make sure it is right.;
+	    if fulstr(DefaultExt)
+		then begin
+		MySDum _ scan(File,DotBreak,MyDum);
+		if MyDum = "."
+		    then File _ MySDum & File
+		else File _ MySDum & DefaultExt;
+		end;
+
+	    if NOT Warn then done "OUTFILE";
+
+	    ! If the device type bit 0 is 1, LOOKUP/ENTER is mandatory.
+	      Never warn about supersede on device NUL(L).  The LOOKUP
+	       always succeeds.;
+	    if call(cvsix(HisDevice),"DEVTYP") GEQ 0
+		OR equ(HisDevice,"NULL"[length(HisDevice)])
+		then done "OUTFILE";
+	    lookup(Channel,File,MyDum);
+	    if MyDum then done "OUTFILE";
+	    print(crlf&"%File """,File,
+		""" already exists.  Supersede old file? [n] ");
+	    if ((MyDum_inchwl) land '137) = "Y"
+		then begin
+		closin(Channel);
+		done "OUTFILE"
+		end
+	    end;
+
+	! If no file name was passed in, get one.;
+	print(UserPrompt);
+	if fulstr(DefaultExt) then print(" [",DefaultExt,"] ");
+	if nulstr(File_HisFile_inchwl)
+	    then begin "User quits"
+	    release(Channel);
+	    ReturnValue _ True;
+	    done "File Enter"
+	    end "User quits"
+	end "OUTFILE";			! Keep on trying;
+
+    enter(Channel,File,ReturnValue);
+    if ReturnValue
+	then if Must
+	    then begin
+	    release(Channel);
+	    done "File Enter"
+	    end
+	else begin
+	print(crlf&"?",Who,": cannot ENTER """,File,""": ",
+		FILERR(ReturnValue),crlf);
+	File _ null
+	end
+    else begin				! Give him back what we used;
+	HisFile _ HisDevice & ":" &  File;
+	done "File Enter"
+    end;
+end "File Enter";
+
+! We must release all the break tables before returning;
+relbreak(DotBreak);
+return(ReturnValue);
+end "DoWrite";
+internal simple boolean procedure WantWrite(
+	reference integer Channel, EOF;
+	reference string HisFile;
+	boolean Warn(true);
+	integer Mode(ASCII); string UserPrompt("Output File: ");
+	string DefaultExt(null); integer NumOutBufs(2));
+!-------------------------------------------------
+!
+! ABSTRACT:
+!	Opens a file for output.  Many of the parameters are defaulted.
+!
+! PARAMETERS:
+!   Channel: A reference integer that should be a channel number in the
+!	range 0 through 15.  If it is not in this range, the first free
+!	channel (if there is one) will be used.  Also see SIDE EFFECTS.
+!
+!   EOF: A reference integer that will be used as specified in the SAIL
+!	Manual's description for the EOF argument to OPEN.
+!
+!   HisFile: A reference string that is the file specification of the file
+!	to be opened for input.  If it initially has null value, the user
+!	will be requested to supply a file specification.
+!	Also see SIDE EFFECTS.
+!
+!   Warn: Boolean that if true causes the user to be queried as to whether
+!	an existing file should be overwritten.
+!
+!   Mode: Integer specifying the mode in which to open the file.
+!
+!   UserPrompt: String that will typed to the user as a prompt if it is
+!	necessary to ask for a file specification.
+!
+!   DefaultExt: String that is the extension to use if the file name
+!	has neither an extension nor a "." (defaults to null).
+!
+!   NumOutBufs: An integer specifying the number of output buffers to use.
+!
+! RESULT:
+!	WantWrite is FALSE if the file can be opened, TRUE otherwise.
+!
+! SIDE EFFECTS:
+!    1)	If WantWrite needs to get a free channel because Channel was out of
+!	range, then Channel will be set to the new channel number.
+!    2)	HisFile will be set to the file specification of the file that is
+!	successfully opened (or the last file that was tried, which will be
+!	null if user input was requested and the user did not want to
+!	give a file spec.).  Note that the string "DSK:" will be
+!	added to the start of a file specification that does not contain
+!	an explicit device if the file is successfully opened.
+!    3)	EOF may be modified both during the procedure's execution and
+!	later due to side-effects generated by the SAIL runtimes.
+!	In general EOF will be used as a global error condition flag.
+!	See the SAIL manual's description of TOPS-10 file I/O for further
+!	details.
+!
+! ERRORS:
+!	All errors associated with OPEN, ENTER, and LOOKUP UUO's may occur,
+!	and are handled by the procedure, not SAIL, except for those
+!	using the Mode left halfword bits.
+!
+! DESIGN:
+!	Relax and let DoWrite handle the work.
+!
+!-------------------------------------------------;
+begin "WantWrite"
+return(DoWrite("WANTWRITE",false,Channel,EOF,HisFile,UserPrompt,Warn,
+		Mode,DefaultExt,NumOutBufs))
+end "WantWrite";
+internal simple boolean procedure MustWrite(
+	reference integer Channel, EOF;
+	reference string HisFile;
+	boolean Warn(true);
+	integer Mode(ASCII); string UserPrompt("Output file: ");
+	string DefaultExt(null); integer NumOutBufs(2));
+!-------------------------------------------------
+!
+! ABSTRACT:
+!	Opens a file for output.  Many of the parameters are defaulted.
+!
+! PARAMETERS:
+!   Channel: A reference integer that should be a channel number in the
+!	range 0 through 15.  If it is not in this range, the first free
+!	channel (if there is one) will be used.  Also see SIDE EFFECTS.
+!
+!   EOF: A reference integer that will be used as specified in the SAIL
+!	Manual's description for the EOF argument to OPEN.
+!
+!   HisFile: A reference string that is the file specification of the file
+!	to be opened for input.  If it initially has null value, the user
+!	will be requested to supply a file specification.
+!	Also see SIDE EFFECTS.
+!
+!   Warn: Boolean that if true (the default) causes the user to be queried
+!	as to whether an existing file should be overwritten.
+!
+!   Mode: Integer specifying the mode in which to open the file.  This is
+!	defaulted to ASCII.
+!
+!   UserPrompt: String that would typed to the user as a prompt if this
+!	were WANTWRITE.  It is present to make the calling sequences of
+!	WANTWRITE and MUSTWRITE identical.
+!
+!   DefaultExt: String that is the extension to use if the file name
+!	has neither an extension nor a "." (defaults to null).
+!
+!   NumOutBufs: An integer specifying the number of output buffers to use.
+!
+! RESULT:
+!	MustWrite is FALSE if the file can be opened, TRUE otherwise.
+!
+! SIDE EFFECTS:
+!    1)	If MustWrite needs to get a free channel because Channel was out of
+!	range, then Channel will be set to the new channel number.
+!    2)	HisFile will be set to the file specification of the file that is
+!	successfully opened (or the last file that was tried, which will be
+!	null if user input was requested and the user did not want to
+!	give a file spec.).  Note that the string "DSK:" will be
+!	added to the start of a file specification that does not contain
+!	an explicit device if the file is successfully opened.
+!    3)	EOF may be modified both during the procedure's execution and
+!	later due to side-effects generated by the SAIL runtimes.
+!	In general EOF will be used as a global error condition flag.
+!	See the SAIL manual's description of TOPS-10 file I/O for further
+!	details.
+!
+! ERRORS:
+!	All errors associated with OPEN, ENTER, and LOOKUP UUO's may occur,
+!	and are handled by the procedure, not SAIL, except for those
+!	using the Mode left halfword bits.
+!
+! DESIGN:
+!	Relax and let DoWrite handle the work.
+!
+!-------------------------------------------------;
+begin "MustWrite"
+return(DoWrite("MUSTWRITE",true,Channel,EOF,HisFile,UserPrompt,Warn,
+		Mode,DefaultExt,NumOutBufs))
+end "MustWrite";
+
+end "FILE";
+   #@	47
