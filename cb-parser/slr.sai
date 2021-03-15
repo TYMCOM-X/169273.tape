@@ -1,0 +1,1123 @@
+begin
+
+  require "(sailib)sail.def" source!file;
+  require "parser.def" source!file;
+
+  !  Simple LR(1) parser generator with precedence & associativity.
+  !
+  !  Note:  This is a *hack*, and is not even close to bombproof.  Use
+  !	at your own risk.  Best to read Aho & Ullman (Dragon Book)
+  !	Chapter 6 first.
+  !
+  !  Dave W. Smith,  12/30/81 - 1/?/82 ;
+
+  require PARSERVERSION version;
+  require 10000 system!pdl;
+  require 10000 string!pdl;
+
+  ! v 1 - ?
+  ! v 2 - fold production number into the production table.
+  ! v 3 - shrink parsing tables.
+  ! ;
+
+define DEBUG = false;
+  integer B!Space, B!Dot, B!SRG, B!Paren, B!C;
+  integer KeyWord!Idx;
+  string BNF!File;
+  boolean MultiLine;
+
+  define SYMMAX = 200, PRODMAX = 250, STATEMAX = 1500;
+
+  ! symbol "records" ;
+
+  integer Sym!top;
+
+  integer array Sym!Typ[ 1 : SYMMAX ];
+    define Typ!Undef = 0, Typ!Term = 1, Typ!NonTerm = 2, Typ!Key = 3;
+  integer array Sym!Num[ 1 : SYMMAX ];
+  string  array Sym!Nam[ 1 : SYMMAX ];
+  integer array Sym!Ass[ 1 : SYMMAX ];
+    define Ass!None = 0, Ass!Right = 1, Ass!Left = 2;
+  integer array Sym!Pri[ 1 : SYMMAX ];
+  string  array Sym!Flw[ 1 : SYMMAX ];  ! follow set, if non-terminal ;
+  boolean array Sym!Flg[ 1 : SYMMAX ];  ! utility flag ;
+
+  ! production "records" ;
+
+  integer prod!top;
+
+  integer array Prod!Num[ 1 : PRODMAX ];
+  integer array Prod!Siz[ 1 : PRODMAX ];
+  string  array Prod!LHS[ 1 : PRODMAX ];
+  string  array Prod!RHS[ 1 : PRODMAX ];
+  integer array Prod!Pri[ 1 : PRODMAX ];
+
+  ! states of items ;
+
+  integer Item!Top;
+
+  string array Item!Set[ 1 : STATEMAX ];
+  string array Item!Act[ 1 : STATEMAX ];
+  integer array Item!Sz1[ 1 : STATEMAX ];
+  string array Item!Go2[ 1 : STATEMAX ];
+  integer array Item!Sz2[ 1 : STATEMAX ];
+! set this mess up. ;
+
+procedure Initialize;
+  begin
+    integer i;
+
+    Sym!top := prod!top := Item!Top := 0;
+    arrclr( Sym!Typ, Typ!UnDef );
+    arrclr( Sym!Nam, NULL );
+    arrclr( Sym!Num, -1 );
+    arrclr( Sym!Ass, Ass!None );
+    arrclr( Sym!Pri, -1 );
+
+    arrclr( Prod!Num, -1 );
+    arrclr( Prod!Siz, 0 );
+    arrclr( Prod!LHS, NULL );
+    arrclr( Prod!RHS, NULL );
+    arrclr( Prod!Pri, -1 );
+
+    arrclr( Item!Set, NULL );
+    arrclr( Item!Act, NULL );
+    MultiLine := false;
+
+    setbreak( B!Space := getbreak, '11&" ", NULL, "INS" );
+    setbreak( B!Dot := getbreak, ".", " ", "INS" );
+    setbreak( B!SRG := getbreak, "RSG", NULL, "INS" );
+    setbreak( B!Paren := getbreak, '11&"( ", NULL, "INS" );
+
+    KeyWord!Idx := KEYWORDOFFSET;
+
+    Sym!Top := 1;
+    Sym!Nam[ 1 ] := "eof";
+    Sym!Num[ 1 ] := 0;
+    Sym!Typ[ 1 ] := Typ!Term;
+
+    begin string F;
+      print( "Log File: " );  F := inchwl;
+      if ( F ) then
+	setprint( F, "B" );
+    end;
+
+  end;
+! Utility routine to trim leading whitespace from a string ;
+
+procedure Trim( reference string S );
+  begin
+    while (( S = '11 ) or ( S = " " )) do lop( S );
+  end;
+
+
+! Routine to return a pointer to a symbol.  Creates symbol if needed ;
+
+integer procedure GetSym( string S );
+  begin
+    integer i;
+    for i := 1 upto Sym!Top do
+      if ( kequ( Sym!Nam[ i ], S )) then return( i );
+    Sym!Top := Sym!Top + 1;
+    Sym!Nam[ Sym!Top ] := S;
+    return( Sym!Top );
+  end;
+
+! Routine to coerce a symbol to be of a given type.  Dies on error ;
+
+procedure CoerceSym( integer SymNum, SymTyp );
+  begin
+    if ( Sym!Typ[ SymNum ] = Typ!Undef ) then
+      Sym!Typ[ SymNum ] := SymTyp
+    else if ( Sym!Typ[ SymNum ] neq SymTyp ) then
+      usererr( 0,0, "can't redefine "&Sym!Nam[ SymNum ] );
+  end;
+! Make a terminal record from the string "L".  The word "TERMINAL" has
+! already been spotted and stripped off.  We expect to find a terminal
+! number, the terminal itself, and optional associativity and/or
+! priority numbers. ;
+
+procedure Define!Terminal( string L );
+  begin
+    string token; integer num, symidx;
+
+    Trim( L );
+    token := scan( L, B!Space, B!C );
+    if ( kequ( token, "keyword"[1 for length(token)] )) then
+      begin
+        num := KeyWord!Idx;  KeyWord!Idx := KeyWord!Idx + 1;
+	Trim( L );
+	token := scan( L, B!Space, B!C );
+	symidx := GetSym( token );
+	CoerceSym( symidx, Typ!Key );
+      end
+    else
+      begin
+	num := cvd( token );
+	Trim( L );
+	token := scan( L, B!Space, B!C );
+	symidx := GetSym( token );
+	CoerceSym( symidx, Typ!Term );
+      end;
+
+    Sym!Nam[ symidx ] := token;
+    Sym!Num[ symidx ] := num;
+
+    Trim( L );
+    if ( L = NULL ) then return;
+
+    token := scan( L, B!Space, B!C );
+    if ( kequ( token, "priority"[1 for length( token ) ] )) then
+      begin
+	Trim( L );
+	token := scan( L, B!Space, B!C );
+	Sym!Pri[ symidx ] := cvd( token );
+	Trim( L );
+	if ( L = NULL ) then return;
+	token := scan( L, B!Space, B!C );
+      end;
+
+    if ( kequ( token, "associates"[1 for length( token ) ] )) then
+      begin
+	Trim( L );
+	token := scan( L, B!Space, B!C );
+	if ( kequ( token, "right"[1 for length( token ) ] )) then
+	  Sym!Ass[ symidx ] := Ass!Right
+	else if ( kequ( token, "left"[1 for length( token ) ] )) then
+	  Sym!Ass[ symidx ] := Ass!Left
+	else usererr( 0,0,"bad associativity -> "&token );
+      end;
+    
+  end;
+! Define a production "record" from the line L.  The word "PRODUCTION" has
+! already been stripped from the line.  We expect to find a production
+! number, the production, and an optional priority designator. ;
+
+boolean procedure Define!Production( string L );
+  begin
+    string token; integer symnum;
+
+    prod!top := prod!top + 1;
+
+    Trim( L );
+    token := scan( L, B!Space, B!C );
+    Prod!Num[ prod!top ] := cvd( token );
+
+    Trim( L );
+    token := scan( L, B!Space, B!C );
+    if ( kequ( token, "priority"[1 for length(token)] )) then
+      begin
+	Trim( L );
+	token := scan( L, B!Space, B!C );
+	Prod!Pri[ prod!top ] := cvd( token );
+	Trim( L );
+	token := scan( L, B!Space, B!C );
+      end;
+
+    symnum := GetSym( token );
+    CoerceSym( symnum, Typ!NonTerm );
+    Prod!LHS[ prod!top ] := cvs( symnum );
+
+    Trim( L );
+    token := scan( L, B!Space, B!C );
+    if ( not equ( token, "::=" )) then
+      return( false );
+
+    while true do
+      begin
+	Trim( L );
+	if ( L = NULL ) then done;
+	token := scan( L, B!Space, B!C );
+	symnum := GetSym( token );
+	Prod!RHS[ prod!top ] := Prod!RHS[ prod!top ] & " " & cvs( symnum );
+	Prod!Siz[ prod!top ] := Prod!Siz[ prod!top ] + 1;
+      end;
+    Trim( Prod!RHS[ prod!top ] );
+    return( true );
+  end;
+! Top level routine to scan throught the BNF file. ;
+
+procedure Scan!BNF;
+  begin
+    string L, token;
+    integer Sym, BNF!chan, BNF!eof, BNF!BT, Cnt, Brk;
+    boolean File!Input;
+
+    recursive string procedure Read!Line;
+      begin
+	string L;
+	if ( File!Input ) then
+	  L := input( BNF!Chan, BNF!BT )
+	else
+	  begin
+	    print( ": " );
+	    L := inchwl;
+	  end;
+	if ( MultiLine and ( L[ inf for 1 ] = "&" )) then
+	  L := L[ 1 to inf - 1 ] & Read!Line;
+	return( L );
+      end;
+
+    print( "BNF file: " );  BNF!File := inchwl;
+    if ( BNF!File ) then
+      begin
+	File!Input := true;
+	Cnt := 200;
+	open( BNF!Chan := getchan, "DSK", 0,2,0, Cnt,Brk, BNF!eof );
+	lookup( BNF!Chan, BNF!File, BNF!eof );
+	if ( BNF!eof ) then
+	  begin
+	    print( "? Can't find ", BNF!File, crlf );
+	    begin!code calli 1,'12; end;
+	  end;
+	setbreak( BNF!BT := getbreak, '12, '15&NULL, "INS" );
+      end
+    else
+      File!Input := false;
+
+    MultiLine := true;
+    while ( true ) do
+      begin
+        if ( File!Input and BNF!eof ) then done;
+	L := Read!Line;
+	if ( L = "!" ) then continue;	! comments ;
+	if ( L = NULL ) then continue;
+	token := scan( L, B!Space, B!C );
+	if ( kequ( L, "quit"[ 1 for length( L )] )) then done;
+	if ( kequ( token, "terminal"[1 for length( token )])) then
+	  Define!Terminal( L )
+	else if ( kequ( token, "production"[1 for length( token )])) then
+	  Define!Production( L )
+	else
+	  print( "? ", token, crlf );
+      end;
+
+    if ( File!Input ) then release( BNF!Chan );
+
+    print( crlf );
+
+  end;
+! Check the tables for nasty lettle errors ;
+
+boolean procedure Check!Tables;
+  begin
+    integer Sym;  boolean Fatal;
+
+    Fatal := false;
+    for Sym := 1 upto sym!top do
+      begin
+	if ( Sym!Typ[ Sym ] = Typ!UnDef ) then
+	  begin
+	    print( "Undefined symbol: ", Sym!Nam[ Sym ], crlf );
+	    Fatal := true;
+	  end;
+      end;
+    return( not Fatal );
+  end;
+! Dump the productions and symbols ;
+
+procedure Dump!Tables;
+  begin
+    integer i; string s1, s2;
+
+    print( crlf );
+
+    if ( prod!top = 0 ) then
+      print( "No productions", crlf )
+    else
+      begin
+	print( "Productions:", crlf, crlf );
+	for i := 1 upto prod!top do
+	  begin
+	    print( cvs( Prod!Num[ i ] ), ".  " );
+	    print( Sym!Nam[ cvd( Prod!LHS[ i ] ) ], " ::=" );
+	    s1 := Prod!RHS[ i ];
+	    while( s1 ) do
+	      begin
+		s2 := scan( s1, B!Space, B!C );
+		print( " ", Sym!Nam[ cvd( s2 ) ] );
+	      end;
+	    if ( Prod!Pri[ i ] >= 0 ) then
+	      print( "   priority ", Prod!Pri[ i ] );
+	    print( crlf );
+	  end;
+      end;
+
+    print( crlf );
+
+    for i := 1 upto Sym!Top do
+      begin
+	print( "Symbol ", i ,":  ", Sym!Nam[ i ] );
+	if ( Sym!Ass[ i ] = Ass!Right ) then
+	  print( "   associates right" )
+	else if ( Sym!Ass[ i ] = Ass!Left ) then
+	  print( "   associates left" );
+	if ( Sym!Pri[ i ] >= 0 ) then
+	  print( "  priority ", Sym!Pri[ i ] );
+	print( crlf );
+      end;
+
+    print( crlf );
+
+  end;
+! --------------------  P A S S  2  -------------------- ;
+
+
+! routine to see if an item is in a set ;
+
+boolean procedure InSet( string ItemX, ItemSet );
+  begin
+    string subset;
+    while ( ItemSet ) do
+      begin
+	Trim( ItemSet );
+	subset := scan( ItemSet, B!Space, B!C );
+	if ( equ( ItemX, subset )) then return (true );
+      end;
+    return( false );
+  end;
+
+! Routine to build the follow sets for non-terminals ;
+
+procedure Build!Follow!Sets;
+  begin
+    integer Sym, Prod, i;  string FollowSet;
+
+    own boolean array Firsted[ 1 : SYMMAX ];
+    own boolean array Followed[ 1 : SYMMAX ];
+
+    forward recursive procedure FindFollow( integer Sym );
+
+    recursive procedure FindFirst( integer Sym );
+      begin "find first"
+	integer Prod;
+
+	if ( Firsted[ Sym ] ) then return;
+	Firsted[ Sym ] := true;
+
+        if (( Sym!Typ[ Sym ] = Typ!Term ) or
+	    ( Sym!Typ[ Sym ] = Typ!Key )) then
+	  begin
+	     ! Followed[ Sym ] := true ;
+	  end
+	else
+	  begin "non terminal"
+	    for Prod := 1 upto Prod!Top do
+	      begin
+		if ( cvd( Prod!LHS[ Prod ] ) = Sym ) then
+		  begin
+		    string T;
+		    T := Prod!RHS[ Prod ];
+		    if ( T neq NULL ) then
+		      FindFirst( cvd( scan( T, B!Space, B!C )))
+		    else
+		      begin "null production"
+			FindFollow( cvd( Prod!LHS[ Prod ] ));
+		      end "null production";
+		  end;
+	      end;
+	  end "non terminal" ;
+      end "find first" ;
+
+! continued ... ;
+! continued ... ;
+
+    recursive procedure FindFollow( integer Sym );
+      begin "find follow"
+	integer Prod; string S1, S2;
+
+	if ( Followed[ Sym ] ) then return;
+	Followed[ Sym ] := true;
+
+	! hack for eof as lookahead of goal symbol ;
+	if ( Sym = cvd( Prod!LHS[1] )) then
+	  Followed[ 1 ] := true;
+
+	for Prod := 1 upto Prod!Top do
+	  begin "each production"
+	    S1 := Prod!RHS[ Prod ];
+	    while ( S1 ) do
+	      begin
+		S2 := scan( S1, B!Space, B!C );
+		if ( cvd( S2 ) = Sym ) then
+		  begin
+		    if ( S1 = NULL ) then
+		      FindFollow( cvd( Prod!LHS[ Prod ] ))
+		    else
+		      FindFirst( cvd( scan( S1, B!Space, B!C )));
+		  end;
+	      end;
+	  end "each production" ;
+      end "find follow" ;
+
+! continued ... ;
+! continued ... ;
+
+    for Sym := 1 upto Sym!Top do
+      begin "each symbol"
+	FollowSet := NULL;
+	if ( Sym!Typ[ Sym ] = Typ!NonTerm ) then
+	  begin
+	    arrclr( Firsted, false );
+	    arrclr( Followed, false );
+
+	    FindFollow( Sym );
+	    for i := 1 upto Sym!Top do
+	      if ( (( Sym!Typ[ i ] = Typ!Term ) or
+		    ( Sym!Typ[ i ] = Typ!Key )) and
+		   ( Firsted[ i ] or Followed[ i ] )) then
+		FollowSet := FollowSet & " " & cvs( i );
+	    Trim( FollowSet );
+	    Sym!Flw[ Sym ] := FollowSet;
+	  end;
+	if ( FollowSet neq NULL ) then
+	  begin
+	    print( "Follow of ", Sym ,":  " );
+	    print( FollowSet, crlf );
+	  end;
+      end "each symbol";
+  end;
+! routine to pretty print an item set ;
+
+procedure PPItemSet( string ItemSet );
+  begin
+    string S1, S2, S3;
+    integer ProdNum, DotPosition, Position;
+
+    print( crlf );
+    while ( ItemSet ) do
+      begin
+	S1 := scan( ItemSet, B!Space, B!C );
+	S2 := scan( S1, B!Dot, B!C );
+	ProdNum := cvd( S2 );  DotPosition := cvd( S1 );
+	print( Sym!Nam[ cvd( Prod!LHS[ ProdNum ] ) ], " ::= " );
+	S1 := Prod!RHS[ ProdNum ];  Position := 0;
+	while ( S1 ) do
+	  begin
+	    S2 := scan( S1, B!Space, B!C );
+	    if ( Position = DotPosition ) then print( ". " );
+	    Position := Position + 1;
+	    print( Sym!Nam[ cvd( S2 ) ], " " );
+	  end;
+	if ( Position = DotPosition ) then print( "." );
+	print( crlf );
+      end;
+    print( crlf );
+  end;
+! Routine to find the closure of an item ;
+
+string procedure Closure( string ItemX );
+  begin
+    string I0, IX, Token, S1, S2, S3;
+    integer ProdNum, DotPosition, i;
+
+    I0 := IX := ItemX;
+    while ( I0 ) do
+      begin
+	Token := scan( I0, B!Space, B!C );
+	S1 := scan( Token, B!Dot, B!C );
+	ProdNum := cvd( S1 );  DotPosition := cvd( Token );
+	S1 := Prod!RHS[ ProdNum ];
+	while ( DotPosition > 0 ) do
+	  begin
+	    S2 := scan( S1, B!Space, B!C );
+	    DotPosition := DotPosition - 1;
+	  end;
+	if ( S1 = NULL ) then continue;
+	S2 := scan( S1, B!Space, B!C );
+	if ( not ( Sym!Typ[ cvd( S2 ) ] = Typ!NonTerm )) then continue;
+	for i := 1 upto Prod!Top do
+	  if ( equ( Prod!LHS[ i ], S2 )) then
+	    begin
+	      S3 := cvs( i ) & ".0";
+	      if ( not InSet( S3, IX )) then
+		begin
+		  I0 := I0 & " " & S3; Trim( I0 );
+		  IX := IX & " " & S3;
+		end;
+	    end;
+      end;
+    return( IX );
+  end;
+! Routine to compute GOTO( I, X )  (aho & ullman p. 207) ;
+
+string procedure GotoItem( string ItemSet, Sym );
+  begin
+    string IX, Token, S1, S2;
+    integer ProdNum, DotPosition, I;
+
+    IX := NULL;
+
+    while ( ItemSet ) do
+      begin
+	Token := scan( ItemSet, B!Space, B!C );
+	ProdNum := cvd( scan( Token, B!Dot, B!C ));
+	I := DotPosition := cvd( Token );
+	S1 := Prod!RHS[ ProdNum ];
+	while ( I > 0 ) do
+	  begin
+	    S2 := scan( S1, B!Space, B!C );
+	    I := I - 1;
+	  end;
+	if ( S1 = NULL ) then continue;
+	S2 := scan( S1, B!Space, B!C );
+	if ( equ( Sym!Nam[ cvd( S2 ) ], Sym )) then
+	  IX := IX & " " & cvs( ProdNum ) & "." & cvs( DotPosition + 1 );
+      end;
+    Trim( IX );
+    if ( IX ) then return( Closure( IX ) );
+    return( NULL );
+  end;
+! build the item sets ;
+
+procedure Build!Item!Sets;
+  begin
+    string C;  boolean AlreadyThere;
+    integer Current!Item, next!item, i, j;
+ifc DEBUG thenc
+    print( "[ building item sets ]", crlf );
+endc
+    Item!Top := 1;
+    Item!Set[ Item!Top ] := Closure( "1.0" );
+
+    Current!Item := 1;
+    do begin
+      for i := 1 upto Sym!Top do
+	begin
+	  C := GotoItem( Item!Set[ Current!Item ], Sym!Nam[ i ] );
+	  if ( C = NULL ) then continue;
+	  AlreadyThere := false;
+	  for j := 1 upto Item!Top do
+	    if ( kequ( C, Item!Set[ j ] )) then
+	      begin
+		AlreadyThere := true;
+		next!item := j;  done;
+	      end;
+	  if ( not AlreadyThere ) then
+	    begin
+	      Item!Top := Item!Top + 1;
+	      Item!Set[ Item!Top ] := C;
+ifc DEBUG thenc
+	      print( "  - build set ", item!top, crlf );
+endc
+	      next!item := item!top;
+	    end;
+	  if ( Sym!Typ[ i ] = Typ!NonTerm ) then
+	    Item!Act[ Current!Item ] := Item!Act[ Current!Item ] &
+		" " & cvs( I ) & "G" & cvs( next!item )
+	  else
+	    Item!Act[ Current!Item ] := Item!Act[ Current!Item ] &
+		" " & cvs( I ) & "S" & cvs( next!item );
+	end;
+      Current!Item := Current!Item + 1;
+    end until ( Current!Item > Item!Top );
+  end;
+! -------------------------  P A S S   3  ------------------------- ;	
+
+
+! Routine to dump all the parser states ;
+
+boolean procedure Build!Parsing!Tables;
+  begin
+    integer i, Prod, Sym, DotPosition;
+    string S1, S2, S3, S4, S5, S6;
+    own string array Action[ 1 : SYMMAX ];
+    own integer Conflict!RR, Conflict!SR, Conflict!Bad, Conflict!Err;
+
+    Conflict!RR := Conflict!SR := Conflict!Bad := Conflict!Err := 0;
+
+    for i := 1 upto Item!Top do
+      begin "each item"
+	print( "
+------------------------- State ", i, " -------------------------
+");
+	PPItemSet( Item!Set[ i ] );
+
+	S1 := Item!Set[ i ];
+	while( S1 ) do
+	  begin "each subitem"
+	    S2 := scan( S1, B!Space, B!C );
+	    Prod := cvd( scan( S2, B!Dot, B!C ));
+	    DotPosition := cvd( S2 );
+	    S3 := Prod!RHS[ Prod ];
+	    while ( DotPosition > 0 ) do
+	      begin
+		S4 := scan( S3, B!Space, B!C );
+		DotPosition := DotPosition - 1;
+	      end;
+	    if ( S3 = NULL ) then
+	      begin
+	        S5 := Sym!Flw[ cvd( Prod!LHS[ Prod ] ) ];
+		while ( S5 ) do
+		  begin
+		    S6 := scan( S5, B!Space, B!C );
+		    Item!Act[i] := Item!Act[i] & " " & S6 & "R" & cvs( Prod );
+		  end;
+	      end;
+	  end "each subitem" ;
+
+	Trim( Item!Act[ i ] );
+	if ( Item!Act[ i ] neq NULL ) then
+	  print( crlf, Item!Act[ i ], crlf )
+	else
+	  print( crlf );
+
+! continued ... ;
+! continued ... ;
+
+	! unroll Item!Act[] into the action and goto tables. ;
+
+	arrclr( Action, NULL );
+
+	S1 := Item!Act[ i ];
+	while ( S1 ) do
+	  begin
+	    S2 := scan( S1, B!Space, B!C );
+	    S3 := scan( S2, B!SRG, B!C );
+	    Sym := cvd( S3 );
+
+	    if ( Action[ Sym ] = NULL ) then
+	      Action[ Sym ] := B!C & S2
+
+	    else if ( Action[ Sym ] = "R" and B!C ="R" ) then
+	      begin "reduce/reduce conflict"
+		conflict!RR := conflict!RR + 1;
+		print( "Reduce/Reduce conflict on ", Sym );
+		S4 := Action[ Sym ]; lop( S4 );
+		if ( cvd( S2 ) < cvd( S4 )) then  ! who was defined first? ;
+		  Action[ Sym ] := "R"&S2;
+		print( "  resolved to ", Action[ Sym ] );
+		print( " by ordering of productions", crlf );
+	      reduce/reduce conflict"
+
+	    else if ( Action[ Sym ] = "S" and B!C = "S") then
+	      begin "shift/shift conflict"
+		print( "*** Shift/Shift conflict on ", Sym, " ***", crlf );
+		Conflict!Err := Conflict!Err + 1;
+	      end "shift/shift conflict"
+
+	    else if ( B!C = "G" ) then
+	      begin "goto conflict"
+		print( "*** Goto conflict on ", Sym, " ***", crlf );
+		Conflict!Err := Conflict!Err + 1;
+	      end "goto conflict"
+
+	    else if ( B!C = "R" ) then
+	      begin "shift/reduce conflict"
+	        Conflict!SR := Conflict!SR + 1;
+		print( "Shift/Reduce conflict on ", Sym );
+		if ( Sym!Pri[ Sym ] < Prod!Pri[ cvd( S2 ) ] ) then
+		  begin
+		    Action[ Sym ] := "R" & S2;
+		    print( ",  resolved to ", Action[ Sym ] );
+		    print( " by hierarchy", crlf );
+		  end
+		else if ( Sym!Pri[ Sym ] > Prod!Pri[ cvd( S2 ) ] ) then
+		  begin
+		    print( ",  resolved to ", Action[ Sym ] );
+		    print( " by hierarchy", crlf );
+		  end
+		else	! equal priorities ;
+		  begin
+		    if ( Sym!Ass[ Sym ] = Ass!None ) then
+		      begin
+			Conflict!Bad := Conflict!Bad + 1;
+			print( ", *** not enough info to resolve! (",
+				Action[ Sym ], ")", crlf );
+		      end
+		    else if ( Sym!Ass[ Sym ] = Ass!Left ) then
+		      begin
+		        Action[ Sym ] := "R" & S2;
+			print( ",  resolved to ", Action[ Sym ] );
+			print( " by left associativity", crlf );
+		      end
+		    else
+		      begin
+		        print( ",  resolved to ", Action[ Sym ] );
+			print( " by right associativity", crlf );
+		      end;
+		  end;
+	      end "shift/reduce conflict"
+
+	    else
+	      begin "reduce/shift conflict"
+		Conflict!SR := Conflict!SR + 1;
+		print( "Reduce/Shift conflict on ", Sym );
+		if ( Prod!Pri[ Sym ] < Sym!Pri[ cvd( S2 ) ] ) then
+		  begin
+		    Action[ Sym ] := "S" & S2;
+		    print( ",  resolved to ", Action[ Sym ] );
+		    print( " by hierarchy", crlf );
+		  end
+		else if ( Prod!Pri[ Sym ] > Sym!Pri[ cvd( S2 ) ] ) then
+		  begin
+		    print( ",  resolved to ", Action[ Sym ] );
+		    print( " by hierarchy", crlf );
+		  end
+		else	! equal priorities ;
+		  begin
+		    if ( Sym!Ass[ Sym ] = Ass!None ) then
+		      begin
+			Conflict!Bad := Conflict!Bad + 1;
+			print( ", *** not enough info to resolve!", crlf );
+		      end
+		    else if ( Sym!Ass[ Sym ] = Ass!Left ) then
+		      begin
+			print( ",  resolved to ", Action[ Sym ] );
+			print( " by left associativity", crlf );
+		      end
+		    else
+		      begin
+		        Action[ Sym ] := "R" & S2;
+		        print( ",  resolved to ", Action[ Sym ] );
+			print( " by right associativity", crlf );
+		      end;
+		  end;
+	      end "reduce/shift conflict" ;
+	  end;
+
+	Item!Act[ i ] := NULL;  Item!Sz1[ i ] := 0;
+	Item!Go2[ i ] := NULL;  Item!Sz2[ i ] := 0;
+	for sym := 1 upto Sym!Top do
+	  begin
+	    if ( Action[ sym ] = NULL ) then continue;
+	    if (( Sym!Typ[ Sym ] = Typ!Term ) or
+		( Sym!Typ[ Sym ] = Typ!Key )) then
+	      begin
+		Item!Act[ i ] := Item!Act[ i ] &" "& cvs( sym ) & Action[ sym ];
+		Item!Sz1[ i ] := Item!Sz1[ i ] + 1;
+	      end
+	    else
+	      begin
+		Item!Go2[ i ] := Item!Go2[ i ] &" "& cvs( sym ) & Action[ sym ];
+		Item!Sz2[ i ] := Item!Sz2[ i ] + 1;
+	      end;
+	  end;
+
+	Trim( Item!Act[ i ] );  Trim( Item!Go2[ i ] );
+
+	print( "Action : ", Item!Act[ i ], crlf );
+	print( "Goto   : ", Item!Go2[ i ], crlf );
+
+      end "each item" ;
+    print( crlf );
+    print( "Reduce/Reduce conflicts : ", Conflict!RR, crlf );
+    print( "Shift/Reduce conflicts  : ", Conflict!SR );
+    if ( Conflict!Bad ) then
+      print( "   (", Conflict!Bad, " not resolvable)", crlf )
+    else
+      print( crlf );
+    if ( Conflict!Err ) then
+      print( "    *** SS/GS/SG errors : ", Conflict!Err, " ***", crlf );
+
+    return( not( Conflict!Bad or Conflict!Err ));
+  end;
+! Condense the tables to something more manageable by sweeping through
+! them looking for duplicate entries. ;
+
+procedure Shrink!Tables;
+  begin
+    integer i,j;
+
+    if ( Item!Top > 1 ) then
+      begin "collapse duplicate states"
+
+	print( crlf, "[Shrinking Tables]", crlf, crlf );
+
+	for i := 2 upto Item!Top do
+	  begin "look at the next entry"
+
+	    for j := 1 upto i-1 do
+	      begin "look for duplicate action states"
+		if ( kequ( Item!Act[i], Item!Act[j] )) then
+		  begin
+		    print( "Action Entry for state ", i );
+		    print( " duplicates state ", j, ".", crlf );
+		    Item!Act[ i ] := "@" & cvs( j );
+		    done "look for duplicate action states" ;
+		  end;
+	      end "look for duplicate action states" ;
+
+	    for j := 1 upto i-1 do
+	      begin "look for duplicate goto states"
+		if (( Item!Go2[j] ) and
+		    kequ( Item!Go2[i], Item!Go2[j] )) then
+		  begin
+		    print( "Goto entry for state ", i );
+		    print( " duplicates state ", j, ".", crlf );
+		    done "look for duplicate goto states" ;
+		  end;
+	      end "look for duplicate goto states" ;
+
+	  end "look at the next entry" ;
+      end "collapse duplicate states" ;
+  end;
+! emit the parsing info to a SAIL "require" file. ;
+
+procedure Emit!Tables;
+  begin
+    integer Chan, Table!Err, i, sum, cnt;
+    string S1, S2, S3, FileName;
+
+    print( crlf, "Table File: " );
+    FileName := inchwl;
+    if ( FileName = NULL ) then return;
+
+    open( Chan := getchan, "DSK", 0,0,2,0,0,Table!Err );
+    enter( Chan, FileName, Table!Err );
+    if ( Table!Err ) then usererr( 0,0,"can't enter table file" );
+
+    out( Chan, "comment - parsing tables emitted by SLR v" );
+    out( Chan, cvos( memory[ '137 ] ) );
+    out( Chan, " from file: " & BNF!File & " ;" & crlf & crlf );
+
+    out( Chan, "define BNFVERSION = '" & cvos( PARSERVERSION ) & ";" &
+	  crlf & crlf );
+
+! continued ... ;
+! continued ... ;
+
+    ! emit the symbol table ;
+
+    out( Chan, "define NSYMBOLS = " & cvs( Sym!Top ) & ";" & crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    for i := 1 upto Sym!Top do
+      begin
+	out( Chan, "  """ & Sym!Nam[ i ] & """" );
+	if ( equ( Sym!Nam[ i ], """" )) then out( Chan, """" );
+	if ( i < Sym!Top ) then
+	  out( Chan, "," & crlf )
+	else
+	  out( Chan, ";" & crlf );
+      end;
+    out( Chan, "internal string array P!Sym[ 1 : NSYMBOLS ];" & crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    for i := 1 upto Sym!Top do
+      begin
+	out( Chan, " " & cvs( Sym!Num[ i ] ) );
+	if ( i < Sym!Top ) then
+	  out( Chan, "," & crlf )
+	else
+	  out( Chan, ";" & crlf );
+      end;
+    out( Chan, "internal integer array P!SMap[ 1 : NSYMBOLS ];" & crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    sum := 0;
+    for i := 1 upto Sym!Top do
+      if ( Sym!Typ[ i ] = Typ!Key ) then
+	begin
+	  out( Chan, "  """ & Sym!Nam[ i ] & """," & crlf );
+	  sum := sum + 1;
+	end;
+    out( Chan, " NULL;" & crlf );
+    out( Chan, "internal string array P!KeyW[ 0 : " & cvs( sum ) &  " ];"
+       & crlf & crlf );
+
+! continued ... ;
+! continued ... ;
+
+    ! emit the productions ;
+
+    out( Chan, "define NPRODUCTIONS = " & cvs( Prod!Top ) & ";" & crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    for i := 1 upto Prod!Top do
+      begin
+	out( Chan, " " & cvs( Prod!Siz[ i ] ));
+	if ( i < Prod!Top ) then
+	  out( Chan, "," & crlf )
+	else
+	  out( Chan, ";" & crlf );
+      end;
+    out( Chan, "internal integer array P!PLen[ 1 : NPRODUCTIONS ];" &
+		crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    sum := 1;
+    for i := 1 upto Prod!Top do
+      begin
+	out( Chan, " " & cvs( sum ) );
+	if ( i < Prod!Top ) then
+	  out( Chan, "," & crlf )
+	else
+	  out( Chan, ";" & crlf );
+	sum := sum + Prod!Siz[ i ] + 2;
+      end;
+    sum := sum - 1;
+    out( Chan, "internal integer array P!PIdx[ 1 : NPRODUCTIONS ];" &
+		crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    cnt := 0;
+    for i := 1 upto Prod!Top do
+      begin
+	out( Chan, " " & cvs( Prod!Num[ i ] ) & ", " );
+        out( Chan, Prod!LHS[ i ] );
+	cnt := cnt + 2;
+	if ( cnt < sum ) then
+	  out( Chan, "," & crlf )
+	else
+	  out( Chan, ";" & crlf );
+	S1 := Prod!RHS[ i ];
+	while ( S1 ) do
+	  begin
+	    S2 := scan( S1, B!Space, B!C );
+	    out( Chan, "  " & S2 );
+	    cnt := cnt + 1;
+	    if ( cnt < sum ) then
+	      out( Chan, "," & crlf )
+	    else
+	      out( Chan, ";" & crlf );
+	  end;
+      end;
+    out( Chan, "internal integer array P!PTab[ 1 : " & cvs(sum) & " ];"
+		& crlf&crlf );
+
+! continued ... ;
+! continued ... ;
+
+    ! emit the action tables ;
+
+    out( Chan, "define NSTATES = " & cvs( Item!Top ) & ";" & crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    for i := 1 upto Item!Top do
+      begin
+        out( Chan, " " & cvs( Item!Sz1[ i ] * 2 ) );
+	if ( i < Item!Top ) then
+	  out( Chan, "," & crlf )
+	else
+	  out( Chan, ";" & crlf );
+      end;
+    out( Chan, "integer array P!ALen[ 1 : NSTATES ];" & crlf&crlf );
+
+! continued ... ;
+! continued ... ;
+
+    out( Chan, "preload!with" & crlf );
+    sum := 1;
+    for i := 1 upto Item!Top do
+      begin
+	if ( Item!Act[ i ] = "@" ) then
+	  begin
+	    own integer temp;
+	    temp := Item!Sz1[ cvd( Item!Act[ i ][2 to inf] ) ];
+	    out( Chan, " " & cvs( temp ));
+	  end
+	else
+	  begin
+	    own integer temp;
+	    out( Chan, " " & cvs( sum ));
+	    temp := sum;
+	    sum := sum + Item!Sz1[ i ] * 2;
+	    Item!sz1[ i ] := temp;		! replace size w/ offset ;
+	  end;
+	if ( i < Item!Top ) then
+	  out( Chan, "," & crlf )
+	else
+	  out( Chan, ";" & crlf );
+      end;
+    sum := sum - 1;
+    out( Chan, "integer array P!AIdx[ 1 : NSTATES ];" & crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    cnt := 0;
+    for i := 1 upto Item!Top do
+      begin
+        S1 := Item!Act[ i ];
+	while ( S1 ) do
+	  begin
+	    if ( S1 = "@" ) then done;
+	    S2 := scan( S1, B!Space, B!C );
+	    S3 := scan( S2, B!SRG, B!C );
+	    out( Chan, " " & cvs( Sym!Num[ cvd( S3 ) ] ) & ", " );
+	    if ( B!C = "R" ) then out( Chan, "-" );
+	    out( Chan, S2 );
+	    cnt := cnt + 2;
+	    if ( cnt < sum ) then
+	      out( Chan, "," & crlf )
+	    else
+	      out( Chan, ";" & crlf );
+	  end;
+      end;
+    out( Chan, "integer array P!ATab[ 1 : " & cvs( sum ) & " ];" &
+    		crlf&crlf );
+
+! continued ... ;
+! continued ... ;
+
+    ! emit the Goto tables ;
+
+    out( Chan, "preload!with" & crlf );
+    for i := 1 upto Item!Top do
+      begin
+        out( Chan, cvs( Item!Sz2[ i ] * 2 ));
+	if ( i < Item!Top ) then
+	  out( Chan, "," & crlf )
+	else
+	  out( Chan, ";" & crlf );
+      end;
+    out( Chan, "integer array P!GLen[ 1 : NSTATES ];" & crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    sum := 1;
+    for i := 1 upto Item!Top do
+      begin
+	out( Chan, cvs( sum ) );
+	sum := sum + Item!Sz2[ i ] * 2;
+	if ( i < Item!Top ) then
+	  out( Chan, "," & crlf )
+	else
+	  out( Chan, ";" & crlf );
+      end;
+    sum := sum - 1;
+    out( Chan, "integer array P!GIdx[ 1 : NSTATES ];" & crlf&crlf );
+
+    out( Chan, "preload!with" & crlf );
+    cnt := 0;
+    for i := 1 upto Item!Top do
+      begin
+	S1 := Item!Go2[ i ];
+	while ( length( S1 ) ) do
+	  begin
+	    S2 := scan( S1, B!Space, B!C );
+	    S3 := scan( S2, B!SRG, B!C );
+	    out( Chan, " " & S3 & ", " & S2 );
+	    cnt := cnt + 2;
+	    if ( cnt < sum ) then
+	      out( Chan, "," & crlf )
+	    else
+	      out( Chan, ";" & crlf );
+	  end;
+      end;
+    out( Chan, "integer array P!GTab[ 1 : " & cvs( sum ) & " ];" &
+    		crlf&crlf );
+
+    close( Chan );
+
+  end;
+
+! And away we go ... ;
+
+  print( crlf,
+	 "SLR(1) generator v", cvos( memory[ '137 ] ),
+	 ",  Caveat User!", crlf, crlf );
+
+  Initialize;
+  Scan!BNF;
+  if ( Check!Tables ) then
+    begin
+      Dump!Tables;
+      Build!Follow!Sets;
+      Build!Item!Sets;
+      if ( Build!Parsing!Tables ) then
+	begin
+	  Shrink!Tables;
+	  Emit!Tables;
+	end;
+    end;
+end;
+    f98
