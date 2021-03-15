@@ -1,0 +1,904 @@
+	Title	RX2SER -- RX20 Floppy Diskette Service for KS10s V006
+
+	Subttl	Timothe Litt 11-NOV-85
+
+	Search	F,S
+
+	$RELOC
+	$HIGH
+
+	VRX2SR==:005		;For GLOB
+
+;THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY ONLY BE USED
+;  OR COPIED IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE.
+;
+.CPYRT<1982,1986>
+;COPYRIGHT (c) 1982,1983,1986 BY
+;DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.
+;ALL RIGHTS RESERVED.
+
+
+	ENTRY	RX2SER
+RX2SER::
+
+	;Device dependent bits in S
+
+	S.SID1==Z(1B6)		;Set if side 1 selected, clear if side 0
+	S.OPRA==Z(1B7)		;Set if OPR action requested at interrupt level
+
+	S.2SID==1B29		;Media is 2 sided
+	S.2DEN==1B28		;Double density mode
+	S.PHYS==1B27		;Use physical I/O (Inhibit interleaving)
+	S.DELD==1B26		;Write deleted data/deleted data detected
+	S.WPS==1B24		;Use WPS-8 interleave mode
+
+	;The RX02 has several funny attributes:
+	; - It supports 2 densitys, each with a different sector size
+	; - The sector size is non-standard
+	; - It is addressed in 2 ways -- Interleaved and Physical
+	; - The hardware numbers sectors starting with 1, not 0
+	; - Data is buffered in a silo (FIFO), then NPRed to memory
+	;
+	;In physical I/O mode, the RX02 has 77 tracks/side, 26 sectors/track.
+	;In interleaved-11 mode, the RX02 has 76 tracks/side, 26 sectors/track.
+	;In interleaved-8 mode, the RX02 has 74 tracks/side, 26 sectors/track.
+	;
+	;In single density mode, a sector is 128 (PDP-11) bytes
+	;In double density mode, a sector is 256 (PDP-11) bytes
+	;
+	;Interleaved mode is a software invention, not a hardware function.
+	;Because the RX02 is so slow, each track is divided into even and
+	;odd sectors.  LBNs are numbered so that for each track, the odd
+	;sectors are used first, then the even sectors on consecutive
+	;revolutions.  The skipped sectors allow time for the CPU to empty
+	;the silo, and request the next transfer to be the next higher LBN
+	;without wasting a whole revolution.  In addition, LBNs are skewed
+	;from 1 track to the next.  This skew is to allow for the time needed
+	;to seek 1 track, without losing a whole revolution.  The track-track
+	;skew is 6 sectors(11 mode), 0 sectors (8 mode).  
+	;Track 0 is reserved to ANSI standardization.
+	;
+	;These parameters should not be modified to ensure 11 compatibility.
+	SUBTTL	Table of contents
+
+;		TABLE OF CONTENTS FOR RX2SER -- RX20 Service for KS10s
+;
+;
+;			   SECTION			      PAGE
+;    1. Table of contents.....................................   2
+;    2. RX211 Hardware bit definitions........................   3
+;    3. RX20 Device dispatch table............................   4
+;    4. DDB Field definitions.................................   5
+;    5. UUOCON interface
+;         5.1   Device initialization.........................   6
+;         5.2   Obtain buffer size............................   7
+;         5.3   Buffered input................................   8
+;         5.4   Buffered output...............................   9
+;         5.5   USETI/USETO & RELEAS UUOs.....................  10
+;         5.6   DEVOP. UUO....................................  11
+;    6. Interrupt service.....................................  14
+;    7. Interrupt service
+;         7.1   Read complete.................................  15
+;         7.2   Silo empty....................................  16
+;         7.3   Silo full.....................................  17
+;         7.4   Write complete................................  18
+;         7.5   Read extended status complete.................  19
+;         7.6   Set density complete..........................  20
+;         7.7   Error processing..............................  21
+;    8. Queued I/O processing
+;         8.1   Enqueue DDB for Kontroller....................  23
+;         8.2   Advance queue and start I/O...................  24
+;    9. Utility routines
+;         9.1   Fill and empty buffer.........................  25
+;         9.2   Wait for TR...................................  26
+;         9.3   Setup for INPUT and OUTPUT....................  27
+;         9.4   Fixup IOWD for IO mode........................  28
+;         9.5   UBA mapping...................................  29
+;         9.6   Set up W and U................................  30
+;         9.7   Sector addressing.............................  31
+	SUBTTL	RX211 Hardware bit definitions
+
+	;CSR bits
+	RX2CS==0		;Offset of CSR
+	ERR==100000		;Error
+	INIT==40000		;Initialize ctl
+	EXAD==30000		;Extended bus address
+	 EADLSH==-4		;;Amount to shift address to get EXAD bits
+	RX02==04000		;RX02 (rather than RX01) controller
+	SIDE2==1000		;Use second side of floppy
+	DEN==000400		;Set for double density
+	TR==0000200		;Transfer -- RXDB needs data
+	INTENB==100		;Interrupt enable
+	DONE==00040		;Done
+	UNIT==00020		;Use unit 1, not 0
+	 FCNFIL==1		;;Fill buffer (all FCNs include GO)
+	 FCNMT==03		;;MT buffer
+	 FCNWR==05		;;Write sector
+	 FCNRD==07		;;Read sector
+	 FCNSD==11		;;Set media density (format)
+	 FCNES==13		;;Read Error Status
+	 FCNWD==15		;;Write sector with deleted data mark
+	 FCNXS==17		;;Read extended status
+
+	;RX2ES bits
+	RX2ES==2		;Offset of Error and Status A
+	NXM==04000		;NXM during NPR
+	WCOV==2000		;Word count overflow
+	USEL==400		;Unit 1 was selected
+	RDY==0200		;Drive ready
+	DEL==0100		;Deleted data was read
+	UDEN==040		;Unit double density selected
+	DENERR==020		;Density error
+	ACLOW==10		;Power failing
+	INTDON==4		;Init done
+	%2SIDE==2		;2 sided media
+	CRCERR==1		;CRC error
+
+	RX2SA==2		;Sector Address register offset
+	 ;;Values 1-32(8)
+	RX2TA==2		;Track Address register offset
+	 ;;Values 0-114(8)
+	RX2WC==2		;Word Count register offset
+	 ;;Values 0-100(8) Single density
+	 ;;Values 0-200(8) Double density
+	RX2BA==2		;Bus Address register offset
+	SUBTTL	RX20 Device dispatch table
+
+	JRST	RX2ONL		;(-5) See if on-line
+	JRST	RX2DVP		;(-4) DEVOP. UUO
+	JRST	RX2SIZ		;(-3) Get buffer size
+	JRST	RX2INI		;(-2) Once only
+	JRST	RX2HNG		;(-1) Hung timer expired
+RX2DSP::JRST	RX2REL		;(0) RELEASE - output
+	JRST	RX2CLS		;(1) CLOSE
+	JRST	RX2OUT		;(2) OUTPUT
+	JRST	RX2INP		;(3) INPUT
+	JRST	RX2ENT		;(4) ENTER
+	JRST	RX2LKP		;(5) LOOKUP
+	JRST	RX2DMO		;(6) Dump mode OUTPUT
+	JRST	RX2DMI		;(7) Dump mode INPUT
+	JRST	RX2USO		;(10) USETO
+	JRST	RX2USI		;(11) USETI
+	JRST	RX2GTF		;(12) UGETF
+	JRST	RX2REN		;(13) RENAME
+	JRST	RX2ICL		;(14) CLOSE input
+	JRST	RX2CLR		;(15) UTPCLR
+	JRST	RX2MTP		;(16) MTAPE
+
+	;Temp defns for null routines
+	RX2ONL==CPOPJ##
+	RX2HNG==CPOPJ##
+	RX2CLS==CPOPJ##
+	RX2ENT==CPOPJ1##
+	RX2LKP==CPOPJ1##
+	RX2DMO==CPOPJ##
+	RX2DMI==CPOPJ##
+	RX2GTF==CPOPJ##
+	RX2REN==CPOPJ##
+	RX2ICL==CPOPJ##
+	RX2CLR==CPOPJ##
+	RX2MTP==CPOPJ##
+	SUBTTL	DDB Field definitions
+
+	;Define symbolic offsets for DEVRXQ words
+	QLINK==DEVRXQ##+0	;LH - Next DDB in KON queue
+				;RH - Unibus address of start of buffer
+	QCSR==DEVRXQ##+1	;LH - CSR for transfer; RH - Data buffer # 1
+	QFCN==DEVRXQ##+2	;LH - Data buffer # 2; RH - function & retry
+	QMAP==DEVRXQ##+3	;LH - UBA Mapping register # 1; RH - #2
+
+	;Byte pointers into the DDB
+
+DEYFCN:	POINT	4,QFCN(F),21	;Function (state) of RX
+	 F..IDL==0		;;Idle
+	 F..RD== 1		;;Read
+	 F..WR== 2		;;Write & write deleted
+	 F..FIL==3		;;Fill buffer
+	 F..MT== 4		;;Empty buffer
+	 F..SMD==5		;;Set media density
+	 F..RES==6		;;Read error status
+	 F..RXS==7		;;Read extended status
+DEYTRY:	POINT	4,QFCN(F),25	;Retry counter
+DEYCSC:	POINT	2,QFCN(F),27	;Number of parameters to stuff in data CSR
+DEYSCT:	POINT	2,QFCN(F),29	;Number of sectors left in transfer - 1
+DEYUUO:	POINT	3,QFCN(F),32	;Type of UUO in progress
+	 U..IDL==0		;;Idle (none)
+	 U..BR== 1		;;Buffered input
+	 U..BW== 2		;;Buffered output
+	 U..SD== 3		;;Set density
+	 U..DR== 4		;;Dump input
+	 U..DW== 5		;;Dump output
+DEYUNT:	POINT	1,DEVRXS##(W),18 ;Active unit number
+	SUBTTL	UUOCON interface -- Device initialization
+
+RX2INI:	LDB	T2,PUNIT##	;Get unit number
+	JUMPN	T2,CPOPJ1##	;If not Kontroller, forget it
+	MOVE	T1,DEVRXC##(F)	;Get EXP address of control
+	PUSHJ	P,UBGOOD##	;Alive?
+	JRST	CPOPJ1##	;No, forget it
+	MOVE	T1,DEVRXC##(F)	;Get CSR address
+	RDIO	T1,RX2CS(T1)	;Read CSR
+	TRNN	T1,RX02		;Is it an RX02?
+	 JRST	CPOPJ1##	;No, don't set up a vector
+				;If device is used, CPU will halt with Illegal
+				;interrupt instruction.
+	HRRZ	T1,DEVRXV##(F)	;Get vector address
+	LSH	T1,-2		;Convert bytes to 10 words
+	HLRZ	T2,DEVRXC##(F)	;Get UBA number
+	ADD	T1,.EPVIT##-1(T2) ;Find address in table
+	MOVE	T2,DEVRXJ##(F)	;Get interrupt instruction
+	MOVEM	T2,(T1)		;Store in vector table
+	JRST	CPOPJ1##	;Return to SYSINI
+	SUBTTL	UUOCON interface -- Obtain buffer size
+
+	;Since UUOCON only calls us on OPEN, and remembers the result,
+	;a simple user error probably will be to expect WPS mode buffer
+	;size, but do OPEN with IO.WPS clear.
+
+RX2SIZ:	MOVEI	T1,<^D128/4>	;Start with size of single density sector
+	TRNE	M,S.2DEN	;If double density mode
+	 ASH	T1,1		; sector is twice as big
+	TRNE	M,S.WPS		;If in WPS mode
+	 JRST	[IMULI	T1,3	; we use three sectors of whatever size
+		 AOJA	T1,CPOPJ##] ;Account for buffer size word
+	TRNN	M,S.PHYS	;If logical IO (and not WPS)
+	 MOVEI	T1,200		; Must use full size buffer
+	AOJA	T1,CPOPJ##	;Done
+	SUBTTL	UUOCON interface -- Buffered input
+
+RX2INP:	TLZ	S,IO		;Of course, I think UUOCON should do this...
+	PUSHJ	P,STUWFZ	;Set up U & W and clear retry counter
+	MOVSI	T1,DVOFLN	;Off-line bit
+	TLZN	S,S.OPRA	;Opr action requested at interrupt level?
+	 TDNE	T1,DEVCHR(F)	; or off-line?
+	JRST	TELUSR		;Yes, go tell user
+RDNXBF:	MOVEI	T1,@DEVIAD(F)	;Get address of buffer
+	PUSHJ	P,IOWFIX	;Turn buffer address into real IOWD
+	PUSHJ	P,UBAMAP	;Compute UBA mapping
+	MOVEI	T1,U..BR	;Doing a buffered read
+	DPB	T1,DEYUUO	;Store for error recovery
+RDNXTB:	HRRZ	T1,DEVRXI##(F)	;Get next logical block for input
+	PUSHJ	P,TRSET		;Set up for transfer
+RDNXTS:	HRLM	T1,DEVRXI##(F)	;Save sector number for later
+	MOVEI	T2,F..RD	;Get read data function
+	MOVEI	T4,INTENB!FCNRD	;Set up read sector function
+WRSET:	DPB	T2,DEYFCN	;Store as current
+	PUSHJ	P,TRKSEC	;Get track and sector
+	 JRST	[TRO	S,IOBKTL;Set block too large error
+		 JRST	ERRXI1]	;and exit
+	HRLM	T1,QFCN(F)	;Save track
+	HRL	T2,T4		;Get function bits
+	LDB	T1,PUNIT##	;Get unit number
+	SKIPE	T1		;If not zero
+	 TLO	T2,UNIT		; set unit 1
+	TRNE	S,S.2DEN	;Double density?
+	 TLO	T2,DEN		;Yes
+	TLZE	S,S.SID1	;Use head 1 ?
+	 TLO	T2,SIDE2	;Yes, tell RX02
+	MOVEM	T2,QCSR(F)	;Set up RX2CS and RX2TA
+	MOVEI	T1,2		;Parameters to load
+	DPB	T1,DEYCSC	;Save for ENQDDB
+	TRO	S,IOACT		;Set IOACT (so we won't move)
+	MOVEM	S,DEVIOS(F)	; ...
+	PJRST	ENQDDB		;Queue DDB and return
+
+TELUSR:	MOVEM	S,DEVIOS(F)	;Update DDB
+	PUSHJ	P,HNGSTP##	;Bitch, bitch, bitch
+	TLNN	S,IO		;Doing input?
+	 JRST	RX2INP		;Yes, try again
+	JRST	RX2OUT		;No, try output
+	SUBTTL	UUOCON interface -- Buffered output
+
+RX2OUT:	TLO	S,IO		;Do UUOCON's work
+	PUSHJ	P,STUWFZ	;Set up U & W and clear retry counter
+	MOVSI	T1,DVOFLN	;Off-line bit
+	TLZN	S,S.OPRA	;Opr action requested at interrupt level?
+	 TDNE	T1,DEVCHR(F)	; or off-line?
+	JRST	TELUSR		;Yes, go tell user
+WRNXBF:	MOVEI	T1,@DEVOAD(F)	;Get address of buffer
+	PUSHJ	P,IOWFIX	;Turn buffer address into real IOWD
+	PUSHJ	P,UBAMAP	;Compute UBA mapping
+	MOVEI	T1,U..BW	;Doing a buffered write
+	DPB	T1,DEYUUO	;Store for error recovery
+	TRO	S,IOACT		;Set IOACT here
+	MOVEM	S,DEVIOS(F)	;So mapping sticks
+WRNXTB:	HRRZ	T1,DEVRXO##(F)	;Get LBN for transfer
+	PUSHJ	P,TRSET		;Set up for transfer
+WRNXTS:	HRLM	T1,DEVRXO##(F)	;Save sector number
+	HRRZ	T1,QLINK(F)	;Get 11 address
+	LSH	T1,EADLSH	;Shift for high bits
+	ANDI	T1,EXAD		;Only those
+	IORI	T1,INTENB!FCNFIL ;Add in the fill buffer
+	MOVEI	T2,F..FIL	;Get fill function
+	PJRST	SETFMT		;Go fill the silo
+	SUBTTL	UUOCON interface -- USETI/USETO & RELEAS UUOs
+
+RX2USI:	MOVEI	U,DEVRXI##(F)	;Point to input block number
+	TDZA	S,[XWD IOEND,IODEND] ;Zero the EOF bits
+RX2USO:	 MOVEI	U,DEVRXO##(F)	;Point to output block number
+	;PUSHJ	P,WAIT1##	;Wait for I/O to stop(UUOCON does this)
+	HRRM	M,0(U)		;Store arg as next block to read/write
+	PJRST	STOIOS##	;Store S in case USETI
+
+RX2REL:	;PUSHJ	P,WAIT1##	;Wait for I/O to stop(UUOCON does this)
+	TLZ	S,S.SID1!S.OPRA	;Clear our working bits
+	SETZM	DEVRXI##(F)	;Reset to block 0
+	SETZM	DEVRXO##(F)	;...
+	SETZM	DEVFIL(F)	;Clear any LOOKUP/ENTER info
+	HRRZS	DEVEXT(F)
+	SETZM	DEVPPN(F)
+	HLLZS	QFCN(F)		;Clear unit status
+	PJRST	STOIOS##	;Store S and return
+	SUBTTL	UUOCON interface -- DEVOP. UUO
+
+	;Here with F:= DDB, T1:= Function code
+
+RX2DVP:	MOVSI	T2,-RX2DVL	;Set up AOBJN pointer
+RX2DV1:	HLRZ	T3,RX2DVT(T2)	;Get function code
+	HRRZ	T4,RX2DVT(T2)	;and dispatch address
+	CAMN	T1,T3		;Do they match?
+	 PJRST	(T4)		;Yes, do the function
+	AOBJN	T2,RX2DV1	;No, check rest of table
+	PJRST	ECOD2##		;Illegal function for RX20
+
+	;DEVOP. dispatch table -- XWD Fcn,,Routine
+
+RX2DVT:	XWD	1,DVPRXS	;Read extended status
+	XWD	11,DVPFMT	;Format a disk (using load LP20 RAM fcn!)
+	RX2DVL==.-RX2DVT	;Size of table
+	;DEVOP. Read extended status function
+	;MOVE	ac,[Len,,addr]
+	;DEVOP.	ac,
+	; error return
+	;Normal return
+	;
+	;Addr:	EXP	.DFRXS (= 1)
+	;	SIXBIT	/Device/ (or channel # or UDX)
+	;	BLOCK	2		;8 bytes of status returned here
+	;
+	;The usual DEVOP. errors apply
+
+DVPRXS:	PUSHJ	P,STUWFZ	;Set up U & W and clear retry counter
+	TRNE	S,IOACT		;Is IO ACTive?
+	 JRST	ECOD1##		;Yes, silly user
+	TLZ	S,IO		;This is "input"
+	TRZ	S,IODERR!IODTER	;And errors haven't happened yet
+	HRRZ	T1,M		;Get address -1 of buffer
+	HRLI	T1,-^D<8/4>	;For 8 bytes of status
+	PUSHJ	P,UBAMAP	;Set up mapping for IO
+	HRLZ	T2,QLINK(F)	;Get 11 address of transfer
+	LSH	T2,EADLSH	;Position for CSR
+	TLZ	T2,^-EXAD	;Clear all but high 2 bits
+	TLO	T2,INTENB!FCNXS	;Set the function
+	HRR	T2,QLINK(F)	;First param is low 16 bits
+	MOVEI	T1,U..SD	;Pretend UUO is set density
+	MOVEI	T3,F..RXS	;Interrupt function is read status
+	JRST	DVDOI1		;Go do the IO
+	;DEVOP. Format function
+	;MOVE	ac,[Len,,addr]
+	;DEVOP.	ac,
+	; error return
+	;Normal return
+	;
+	;Addr:	EXP	.DFFMT (= 11)
+	;	SIXBIT	/Device/ (or channel # or UDX)
+	;	SIXBIT /SINGLE/ or SIXBIT /DOUBLE/
+	;
+	;The usual DEVOP. errors apply
+
+DVPFMT:	PUSHJ	P,STUWFZ	;Set up U & W and clear retry counter
+	MOVSI	T1,DVOFLN	;Off-line bit
+	TLNN	S,S.OPRA	;Opr action requested at interrupt level?
+	 TDNE	T1,DEVCHR(F)	; or off-line?
+	JRST	ECOD7##		;Yes, return off-line error
+	PUSHJ	P,GETWR1##	;Get next user word (type of format)
+	 PJRST	RTM1##		;Address check!
+	CAME	T1,[SIXBIT .SINGLE.] ;Want single density?
+	 CAMN	T1,[SIXBIT .DOUBLE.] ;Or double?
+	CAIA			;Good, continue
+	 PJRST	ECOD3##		;Value out of range error
+	TRNE	S,IOACT		;Is I/O active?
+	 JRST	ECOD1##		;Yes, return no privs.  (Very dumb user!)
+	TLO	S,IO		;This is output
+	TRZ	S,IODERR!IODTER	;No errors so far
+	CAME	T1,[SIXBIT .SINGLE.] ;Single density format?
+	 TROA	S,S.2DEN	;No, set double
+	TRZ	S,S.2DEN	;Yes, set single
+	MOVSI	T2,INTENB!FCNSD	;Get function bits
+	LDB	T1,PUNIT##	;Get unit number
+	SKIPE	T1		;If not zero
+	 TLO	T2,UNIT		; set unit 1
+	TRNE	S,S.2DEN	;Double density?
+	 TLO	T2,DEN		;Yes
+	TRO	T2,"I"		;Approve the "I"nitialization
+	SETZM	QMAP(F)		;No UBA mapping
+	MOVEI	T1,U..SD	;Get "Set density" state
+	MOVEI	T3,F..SMD	;Set Media Density function
+DVDOI1:	MOVEM	T2,QCSR(F)	;Set up RX2CS and RX2DB
+	DPB	T1,DEYUUO	;Store as current UUO
+	DPB	T3,DEYFCN	;Save as unit status
+	MOVEI	T1,1		;Parameter to load
+	DPB	T1,DEYCSC	;Save for ENQDDB
+DVDOIO:	TRO	S,IOACT		;Set IOACT so we know when its done
+	MOVEM	S,DEVIOS(F)	; ...
+	PUSHJ	P,ENQDDB	;Queue DDB
+	;Note that in 7.01 field image, the DEVOP. code doesn't ensure
+	;that this job has the device INITed.  If you don't, you will hang
+	;in IOW at the call to WAIT1 because SETIOD doesn't have PJOBN set up
+	PUSHJ	P,WAIT1##	;Wait for the I/O to complete
+	HRRZ	T1,S		;Copy the final status (Yes, WAIT1 updates it)
+	TRNE	T1,IODERR!IODTER ;Errors detected?
+	 PJRST	ECOD6##		;Yes, "Not initialized" error
+	PJRST	STOTC1##	;No, return S in AC
+	SUBTTL	Interrupt service
+
+RX2INT::MOVE	W,F		;Save KON pointer
+	HLRZ	F,DEVRXS##(W)	;Get DDB pointer
+	SKIPN	F		;Paranoia
+RX2STP:	STOPCD	CPOPJ##,STOP,RX2,;++RX2SER fouled up
+	LDB	T3,DEYFCN	;Get function in progress
+	JUMPE	T3,RX2STP	;If none, error
+	LDB	T1,DEYUNT	;Get Kontroller's unit number
+	LDB	T2,PUNIT##	;And that of the DDB
+	CAME	T1,T2		;They better match
+	 JSP	T1,RX2STP	;++ They don't, don't make things worse
+	MOVE	S,DEVIOS(F)	;Set up S
+	MOVE	U,DEVRXC##(W)	;Set up CSR
+	RDIO	T1,RX2CS(U)	;Read CSR
+	RDIO	T2,RX2ES(U)	;and Error register
+	HRL	T1,T2		;Combine
+	MOVEM	T1,DEVSTS(F)	;Save for analysis
+	PJRST	@[JRST	RD.INT	;Dispatch on state
+		  JRST	WR.INT
+		  JRST	FL.INT
+		  JRST	MT.INT
+		  JRST	SM.INT
+		  JRST	RS.INT
+		  JRST	RX.INT]-1(T3)	;As we know it
+
+	;**********Temp until use found for fcns
+	RS.INT==RX2STP		;Read status
+	SUBTTL	Interrupt service -- Read complete
+
+	;Here on a Read Complete interrupt
+
+RD.INT:	TRNE	T1,ERR		;Error detected?
+	 JRST	ERROR		;Yes, see if we should retry
+	TLNE	T1,DEL		;Deleted data present?
+	 TROA	S,S.DELD	;Yes, remember it
+	TRZ	S,S.DELD	;No, remember that
+	MOVEM	S,DEVIOS(F)	;Tell user
+	HRRZ	T1,QLINK(F)	;Get 11 address
+	LSH	T1,EADLSH	;Shift for high bits
+	ANDI	T1,EXAD		;Only those
+	IORI	T1,INTENB!FCNMT	;Add in Empty buffer
+	MOVEI	T2,F..MT	;Get empty function
+	PJRST	SETFMT		;Setup for empty buffer
+	SUBTTL	Interrupt service -- Silo empty
+
+MT.INT:	TRNE	T1,ERR		;Error detected?
+	 JRST	ERROR		;Yes, see if we can recover
+	LDB	T2,DEYSCT	;Get sectors to go
+	SOJL	T2,RDDONE	;1 fewer
+	DPB	T2,DEYSCT	;Update for next time
+	HRRZ	T1,QCSR(F)	;Get word count from this transfer
+	ASH	T1,1		;Make into a byte count
+	ADDM	T1,QLINK(F)	;Bump address for next transfer
+	HLRZ	T1,DEVRXI##(F)	;Get last sector transferred
+	AOJA	T1,RDNXTS	;Go read the next one
+
+	;Here when read is complete for all sectors of transfer
+
+RDDONE:	PUSHJ	P,FREKON	;Free the kontroller in case someone else waiting
+	AOS	DEVRXI##(F)	;Bump USETI counter to next block
+	PUSHJ	P,SVEUF##	;Make job addressable
+	MOVEI	T2,^D128/4	;Number of 10 words/single density sector
+	TRNE	S,S.2DEN	;Double density?
+	 ASH	T2,1		;Yes, double thwords
+	TRNE	S,S.PHYS	;If physical IO
+	 JRST	RDDON1		;Use size of a sector
+	TRNN	S,S.WPS		;If not WPS mode
+	 SKIPA	T2,[EXP	200]	; use standard logical block size
+	IMULI	T2,3		;WPS mode, use 3 sectors
+RDDON1:	MOVEI	T1,@DEVIAD(F)	;Get address of buffer control block
+	EXCTUU	<HRRM	T2,1(T1)> ;Save actual word count in buffer
+	PUSHJ	P,ADVBFF##	;Advance buffer ring
+	 JRST	ERRXI1		;No more buffers, shut down
+	PUSHJ	P,SETIOD##	;Signal buffer is available
+	JRST	RDNXBF		;And go read next buffer
+	SUBTTL	Interrupt service -- Silo full
+
+FL.INT:	TRNE	T1,ERR		;Error detected?
+	 JRST	ERROR		;Yes, see if we can recover
+	HLRZ	T1,DEVRXO##(F)	;Get sector for transfer
+	MOVEI	T4,INTENB!FCNWR	;Write sector function
+	TRNE	S,S.DELD	;Wants deleted data mark?
+	 MOVEI	T4,INTENB!FCNWD	;Yes, give correct command
+	MOVEI	T2,F..WR	;Get write data function
+	JRST	WRSET		;Go start the write
+	SUBTTL	Interrupt service -- Write complete
+
+WR.INT:	TRNE	T1,ERR		;Error detected?
+	 JRST	ERROR		;Yes, see if we can recover
+	LDB	T2,DEYSCT	;Get sectors to go
+	SOJL	T2,WRDONE	;1 fewer
+	DPB	T2,DEYSCT	;Update for next time
+	MOVEI	T1,^D128	;Get single density byte count
+	TRNE	S,S.2DEN	;Double density?
+	 ASH	T1,1		;Yes, double it
+	ADDM	T1,QLINK(F)	;Bump address for next transfer
+	HLRZ	T1,DEVRXO##(F)	;Get last sector transfered
+	AOJA	T1,WRNXTS	;Go do the next one
+
+	;Here when write is complete for all sectors of transfer
+
+WRDONE:	PUSHJ	P,FREKON	;Free kontroller in case of others
+	AOS	DEVRXO##(F)	;Bump USETO counter to next LBN
+	PUSHJ	P,SVEUF##	;Make the job addressable
+	PUSHJ	P,ADVBFE##	;Advance the buffer ring
+	 JRST	ERRXI1		;No more data, shut down
+	PUSHJ	P,SETIOD##	;Signal a buffer can be refilled
+	JRST	WRNXBF		;And go write the next one
+	SUBTTL	Interrupt service -- Read extended status complete
+
+	;Here when extended status interrupt happens
+
+RX.INT:	;PJRST	SM.INT		;Treat exactly as set density
+	SUBTTL	Interrupt service -- Set density complete
+
+	;Here when Format interrupt happens
+
+SM.INT:	TRNN	T1,ERR		;Any errors?
+	 PJRST	ERRXI1		;No, restart UUO level code
+	PUSHJ	P,ERRCHK	;Yes, see if retrys left
+	 JRST	ERROR2		;No, record the error
+	PJRST	STRTIO		;OK to retry, just restart I/O
+	SUBTTL	Interrupt service -- Error processing
+
+	;Here when the RX has detected an error
+	;Note that we may be either at interrupt or UUO level
+
+ERROR:	MOVE	T1,DEVSTS(F)	;Get error status back
+	PUSHJ	P,ERRCHK	;See if retrys left
+	 JRST	ERROR1		;None left, declare hard error
+	LDB	T4,DEYUUO	;Get function in progress
+	TLNN	T1,CRCERR	;CRC error?
+	 TLNN	T1,WCOV!DENERR	; No, not WC overflow or density error?
+	JRST	RETRY		;Yes, just retry function
+	TLNE	T1,UDEN		;Is diskette double density?
+	 TROA	S,S.2DEN	;Yes, retry that way (and tell user)
+	TRZ	S,S.2DEN	;No, retry in single density
+	TLNE	T1,%2SIDE	;Two sided diskette?
+	 TROA	S,S.2SID	;Yes, tell user
+	TRZ	S,S.2SID	;No, tell user
+	PUSHJ	P,SVEUF##	;Must make job addressable
+				;since buffer size changed
+	TLNE	S,IO		;If output
+	 JRST	WRNXBF		;Restart
+	JRST	RDNXBF		;Recompute transfer size & do it all over again
+ERROR1:	TLNE	T1,RDY		;Drive ready?
+	 TLNE	T1,ACLOW	;Yes, is subsystem ready?
+	JRST	SETOPR		;No, user ? OPR action requested
+ERROR2:	TLNE	T1,CRCERR	;CRC error?
+	 TROA	S,IODTER	;Yes, set data error
+ERRXIT:	TRO	S,IODERR	;No, set device error
+ERRXI1:	PUSHJ	P,SETIOD##	;Restart user
+	PUSHJ	P,CLRACT##	;and clear IOACTive
+	PJRST	FREKON		;Check Kontroller queue and dismiss
+
+SETOPR:	MOVSI	T1,DVOFLN	;Set offline status
+	IORM	T1,DEVCHR(F)	;for UUOCON
+	TRO	S,IODERR	;Set device error
+	TLO	S,S.OPRA	;and request OPR action
+	PUSHJ	P,DEVERR##	; ... later
+	PJRST	FREKON		;Release the Kontroller and dismiss
+	;Routine to increment the retry counter
+	;skips if any left, otherwise returns normally
+
+ERRCHK:	MOVEI	T2,DEPDER	;Get retry disabled bit
+	TDNE	T2,DEVSTA(F)	;Did user specify no retrys?
+	 POPJ	P,		;Yes, don't
+	LDB	T2,DEYTRY	;Get retry counter
+	SKIPN	T2		;First retry?
+	 AOS	DEVHCW(F)	;Yes, count a soft error
+	AOS	T2		;bump by one
+	CAILE	T2,^D10		;Done enough?
+	 SETZ	T2,		;yes, stop
+	DPB	T2,DEYTRY	;Store new count
+	JUMPN	T2,CPOPJ1##	;If still trying, skip
+	SOS	DEVHCW(F)	;Hard error, count down soft errors
+	MOVSI	T2,1		;Now, ...
+	ADDM	T2,DEVHCW(F)	;count up the hard ones
+	POPJ	P,		;Return hard error
+
+	;Routine to initiate a retry for error recovery
+
+RETRY:	LDB	T1,DEYUUO	;Get the UUO in progress
+	JRST	@[JRST	RX2STP	;;Nothing
+		  JRST	RT.BR	;;Buffered read
+		  JRST	RT.BW	;;Buffered write
+		  JRST	RX2STP	;;Set density
+		  JRST	RT.DR	;;Dump read
+		  JRST	RT.DW](T1) ;Dump write
+
+RT.BR:	HLRZ	T1,DEVRXI##(F)	;Get sector to read
+	JRST	RDNXTS		;Re-read it
+
+RT.BW:	HLRZ	T1,DEVRXO##(F)	;Get sector to write (Must refill silo since
+	JRST	WRNXTS		;power fail in RX could invalidate it)
+
+RT.DR:		;Should delete these 3 lines if not supporting dump io
+RT.DW:
+	STOPCD	CPOPJ,DEBUG,RXX	;Unimplimented error recovery
+	SUBTTL	Queued I/O processing -- Enqueue DDB for Kontroller
+
+
+;Routine to enqueue the current DDB for the Kontroller
+;Assumes that we are ready to start IO
+
+ENQDDB:	PIOFF			;Prevent races
+	PUSHJ	P,ENQDDI	;Now act as though at interrupt level
+	 JRST	ENQDD2		;Can't start IO now, some one else is there
+	PION			;Restore PI
+	PJRST	STRTIO		;and start IO
+
+ENQDD2:	PION			;Restore PI
+	POPJ	P,		;and return to caller
+
+ENQDDI:	HLRZ	T1,DEVRXS##(W)	;Get current queue header
+	CAIN	T1,0(F)		;Us?
+	 PJRST	CPOPJ1##	;Yes, don't foul the queue
+	HRRZS	QLINK(F)	;Clear previous link
+	JUMPE	T1,[HRLM  F,DEVRXS##(W)	;We're first
+		    PJRST CPOPJ1##]  ;So start IO now
+ENQDD1:	HLRZ	T2,QLINK(T1)	;Point to next DDB in queue
+	JUMPE	T2,[HRLM  F,QLINK(T1) ;Reached end, link this in
+		    POPJ  P,]	;I/O is now deferred
+	MOVE	T1,T2		;Point to next DDB
+	JRST	ENQDD1		;Loop for end
+	SUBTTL	Queued I/O processing -- Advance queue and start I/O
+
+	;Routine to free the Kontroller at end of unit I/O
+
+FREKON:	PUSH	P,F		;Save F for caller
+	PUSH	P,S
+	PUSHJ	P,QUECHK	;Free up the controller if we had it
+	POP	P,S
+	PJRST	FPOPJ##		; (any pending I/O for other units started)
+
+QUECHK:	HLRZ	T1,DEVRXS##(W)	;Get queue header
+	CAIE	T1,0(F)		;Are we it?
+	 POPJ	P,		;No, don't touch it
+	HLRZ	F,QLINK(F)	;Point to next DDB in queue
+	HRLM	F,DEVRXS##(W)	;It's now the first one
+	JUMPN	F,STRTI0	;If someone there, start I/O
+	WRIO	F,@DEVRXC##(W)	;Otherwise, disable interrupts
+	POPJ	P,		;and return
+
+	;Entry to start IO for current DDB
+	;requires current DDB to be first on Q
+
+STRTI0:	MOVE	S,DEVIOS(F)	;Get correct S
+STRTIO:	TRO	S,IOACT		;Set IOACT
+	PUSHJ	P,STOIOS##	; and start hung timer (SETACT clears IOW)
+	LDB	T1,PUNIT##	;Get unit number of this DDB
+	DPB	T1,DEYUNT	;Save as number of active unit
+	MOVE	T1,QMAP(F)	;Get UBA mapping register contents for this XFR
+	MOVE	T2,DEVRXM##(W)	;Get IO address of UBA map
+	WRIO	T1,1(T2)	;Setup map for second page
+	MOVSS	T1		;Get contents for first page
+	WRIO	T1,0(T2)	;Set it up
+	HLRZ	T1,QCSR(F)	;Get CSR contents for command
+	WRIO	T1,RX2CS(U)	;Give the command
+	MOVE	T4,[POINT 18,QCSR(F),17] ;Set up byte pointer to contents
+	LDB	T3,DEYCSC	;Get CSR count
+SETPAR:	JUMPE	T3,CPOPJ##	;Return if done with parameters
+	PUSHJ	P,TRWAIT	;Wait for signal to TRansfer
+	 JRST	[PUSHJ	P,ERRCHK ;Any retrys left?
+		  JRST	ERRXIT	;No, give up
+		 JRST	STRTIO]	;Yes, try again
+	ILDB	T1,T4		;Get parameter
+	WRIO	T1,RX2BA(U)	;Write it to RX02
+	SOJA	T3,SETPAR	;Loop till done
+	SUBTTL	Utility routines -- Fill and empty buffer
+
+	;Routine to do setup for Fill and Empty buffer functions
+	;Fills in CSR with DENSITY, UNIT bits
+	;Sets up command queue in DDB
+	;Starts IO
+	;expects EXAD bits and INTENB!xxFCN in T1
+	;expects interrupt dispatch code in T2
+
+SETFMT:	TRNE	S,S.2DEN	;Double density?
+	 TRO	T1,DEN		;Yes, tell RX02
+	DPB	T2,DEYFCN	;Set interrupt dispatch function
+	LDB	T2,PUNIT##	;Get unit number
+	SKIPE	T2		;If not unit zero
+	 TRO	T1,UNIT		; set unit 1
+	HRLZM	T1,QCSR(F)	;Save command in queue
+	MOVEI	T1,^D128/2	;Word count for single density
+	TRNE	S,S.2DEN	;Double density?
+	 ASH	T1,1		;Yes, double it
+	HRRM	T1,QCSR(F)	;Save WC in queue
+	HRRZ	T1,QLINK(F)	;Get low order 11 address
+	HRLM	T1,QFCN(F)	;Store it in queue too
+	MOVEI	T1,2		;Get number of parameters
+	DPB	T1,DEYCSC	;Set that in queue
+	JRST	ENQDDB		;Enqueue (for fill) and start the IO
+	SUBTTL	Utility routines -- Wait for TR
+
+;Routine to wait for TR or error
+;Call with W:=KON DDB; U:=CSR address
+;CPOPJ if error, CPOPJ1 if TR
+
+TRWAIT:	MOVEI	T2,2000		;Set timeout, just in case
+TRWAT1:	RDIO	T1,RX2CS(U)	;Read CSR
+	TRNE	T1,TR		;TR set yet?
+	 JRST	CPOPJ1##	;Yes, return success
+	TRNN	T1,ERR!DONE	;Error?
+	 SOJG	T2,TRWAT1	;No, keep looking
+	RDIO	T2,RX2ES(U)	;Get error status
+	HRL	T1,T2		;Combine
+	MOVEM	T1,DEVSTS(F)	;Save for analysis
+	POPJ	P,		;Error or timeout
+	SUBTTL	Utility routines -- Setup for INPUT and OUTPUT
+
+TRSET:	MOVEI	T2,3		;Assume 4 sectors/block
+	TRNE	S,S.2DEN	;Unless double density
+	 LSH	T2,-1		;In which case, 2 sectors/block
+	TRNE	S,S.WPS		;WPS uses three sectors/block
+	 MOVEI	T2,2		;Thus
+	TRNE	S,S.PHYS	;But physical I/O
+	 MOVEI	T2,0		;Provides only 1 sector/block
+	DPB	T2,DEYSCT	;Save number of sectors - 1 in transfer
+	PJRST	BLKCVT		;Convert LBN to sector
+	SUBTTL	Utility routines -- Fixup IOWD for IO mode
+
+	;Routine to turn a buffer address into an IOWD, allowing for IO mode
+
+IOWFIX:	HRLI	T1,-<^D128/4>	;Set word count for a single density sector
+	TRNE	S,S.2DEN	;Unless double density
+	 HRLI	T1,-<^D256/4>	; in which case use that (10) word count
+	TRNE	S,S.PHYS	;If physical IO, we got it right
+	 AOJA	T1,CPOPJ##	;So make real IOWD and return
+	HRLI	T1,-200		;Logical IO, assume normal size
+	TRNN	S,S.WPS		;WPS mode?
+	 AOJA	T1,CPOPJ##	;No, we got it right
+	HRLI	T1,-<^D128/4>*3	;Yes, assume single density 3 sectors
+	TRNE	S,S.2DEN	;Right?
+	 HRLI	T1,-<^D256/4>*3	;No, double density WPS (!)
+	AOJA	T1,CPOPJ##	;Done
+	SUBTTL	Utility routines -- UBA mapping
+
+	;Routine to compute UBA mapping for an IOWD
+
+UBAMAP:	HLRE	T2,T1		;Get word count
+	MOVNS	T2		;Make positive
+	HRRZI	T1,1(T1)	;Point to first address of buffer
+	PUSHJ	P,UADRCK##	;See if it's legal for IO (May call PFH)
+	EXCTUX	<MAP T3,@T1>	;Convert to a physical address
+	 TLNN	T3,(1B1)	;Error if hard page fail
+	TLNN	T3,(1B3!1B4)	;OK if modified or writable
+	 JRST	ADRERR##	;Not accessible or not writable or hard PF
+	TLZ	T3,777776	;Clear junk bits
+	ADDI	T1,-1(T2)	;Point T1 to last word in buffer
+	ROT	T3,-^D9		;Get page number of first page
+	TRO	T3,UNBD18!UNBVBT;Set 16 bit mode, valid
+	HRLZM	T3,QMAP(F)	;This will be the mapping
+	ROT	T3,^D9		;Get word number back
+	LSH	T3,2		;Make into byte address
+	ANDI	T3,777B33	;Byte offset into page only
+	ADD	T3,DEVRXE##(W)	;Compute start of transfer
+	HRRM	T3,QLINK(F)	;Save for STRTIO
+	PUSHJ	P,UADRCK##	;Be sure end of buffer is in low seg
+	EXCTUX	<MAP T1,@T1>	;Find address of end of buffer
+	 TLNN	T1,(1B1)	;Error if hard page fail
+	TLNN	T1,(1B3!1B4)	;OK if modified or writable
+	 JRST	ADRERR##	;Not accessible or not writable or hard PF
+	TLZ	T1,777776	;Clear junk
+	LSH	T1,-^D9		;Get page number
+	TRO	T1,UNBD18!UNBVBT;Set 16 bit mode, valid
+	HRRM	T1,QMAP(F)	;This is the other mapping
+	POPJ	P,		;Done
+	SUBTTL	Utility routines -- Set up W and U
+
+	;Coroutine to setup W and U from F
+
+STUWFZ:	SETZ	T1,		;Get a zero
+	DPB	T1,DEYTRY	;Clear the retry counter
+SETUWF:	EXCH	U,(P)		;Save U, get PC
+	PUSH	P,W		;Save W
+	MOVEM	U,1(P)		;Save PC of caller
+	MOVEI	W,RXADDB##	;Point to first RX02 DDB
+SETUW1:	MOVE	T1,DEVNAM(F)	;Get name of current DDB
+	XOR	T1,DEVNAM(W)	;Compare
+	TLNE	T1,777700	;At least RX?
+	 JSP	T1,RX2STP	;No, die
+	TLNE	T1,77		;Is controller right?
+	 JRST	[HLRZ	W,DEVSER(W) ;No, go to next
+		 JRST	SETUW1]	;and loop till find it
+	MOVE	U,DEVRXC##(W)	;Point to CSR
+	PUSHJ	P,@1(P)		;Call caller (again)
+	 JRST	.+2		;Pass non-skip along
+	AOS	-2(P)		;Skip
+	POP	P,W		;Restore W
+	PJRST	UPOPJ##		;and U
+	SUBTTL	Utility routines -- Sector addressing
+
+;Subroutine to convert LBNs to logical sector format
+;
+;Call:	T1/	LBN from user
+;	PUSHJ	P,BLKCVT	(To convert LBN)
+;	Only return		(T1/logical sector to start I/O with)
+
+BLKCVT:	TRNE	S,S.PHYS	;Physical I/O?
+	 POPJ	P,		;Yes, already a sector number
+	TRNE	S,S.WPS		;WPS mode?
+	 JRST	[IMULI	T1,3	;Yes, any sector = 1/3 block
+		 POPJ	P,]	;Done
+	ASH	T1,1		;Logical I/O - Double density sector = 1/2 block
+	TRNN	S,S.2DEN	;Double density?
+	 ASH	T1,1		;No, single density sector is 1/4 block
+	POPJ	P,		;Return first logical sector of block
+;Subroutine to convert logical sectors to track/sector format
+;
+;Call:	T1/	logical sector number (Sector # block)
+;	PUSHJ	P,TRKSEC	(To convert sector)
+;	 Illegal sector number
+;	Sector number ok
+;
+;On success, S has the head select bit set, T1/ Track
+;T2/ Sector
+;
+;Uses T1-3
+
+TRKSEC:	IDIVI	T1,^D26		;T1/ Track, T2/ Sector
+	TRNE	S,S.WPS		;If WPS mode
+	 JRST	TRKSCW		;This is all different
+	CAIGE	T1,^D76		;On side 2?
+	 JRST	TRKSC2		;No, must be ok
+	TRNN	S,S.PHYS	;Physical I/O?
+	 JRST	[SUBI	T1,^D76	;No, logical uses 76 tracks/side
+		 JRST	TRKSC1]	;See if legal
+	CAIN	T1,^D76		;Exactly 76?
+	 JRST	TRKSC2		;Yes, physical uses 77 tracks/side
+	SUBI	T1,^D77		;No, convert to side 2 address
+TRKSC1:	TRNN	S,S.2SID	;2 Sided media?
+	 POPJ	P,		;No, illegal sector number
+	TLOA	S,S.SID1	;Yes, use head 1
+TRKSC2:	 TLZ	S,S.SID1	;Here when address is on side 0
+	TRNE	S,S.PHYS	;Physical?
+	 JRST	TRKSC3		;Yes, skip interleave
+	ASH	T2,1		;Sector _ Sector * 2
+	CAIL	T2,^D<13*2>	;In second 1/2 track?
+	 AOJ	T2,		;Yes, use odd sector
+	MOVE	T3,T1		;Copy track number
+	IMULI	T3,6		;Compute track-track skew
+	ADD	T2,T3		;Offset
+	IDIVI	T2,^D26		;Modulo 26
+	MOVE	T2,T3		;Skewed and interleaved sector in T2
+	AOJ	T1,		;Logical tracks start with 1 (but not phys...)
+TRKSC3:	AOJ	T2,		;Sectors are always based on 1
+	CAIG	T1,^D77		;Track too big?
+	 CAILE	T2,^D26		;Or sector too big?
+	POPJ	P,		;Yes, error
+	JRST	CPOPJ1##	;No, all set
+	;Here for WPS mode conversion
+
+TRKSCW:	TRNE	S,S.PHYS	;Physical and WPS
+	 POPJ	P,		;Is illegal
+	CAIG	T1,^D74-1	;On side 2?
+	 JRST	TRKSW1		;No
+	SUBI	T1,^D74		;Yes, adjust for side 1
+	CAIG	T1,^D74-1	;Still too big?
+	 TRNN	S,S.2SID	;No, 2 sided media?
+	POPJ	P,		;Illegal track number
+	TLOA	S,S.SID1	;Legal, select head 1
+TRKSW1:	 TLZ	S,S.SID1	;Select head 0
+	IMULI	T2,3		;Interleave by 3 sectors
+	IDIVI	T2,^D26		;MOD 26
+	AOS	T2,T3		;Sectors start at one
+	AOJA	T1,CPOPJ1##	;Fix track and skip
+
+	END
+ 3pgï
