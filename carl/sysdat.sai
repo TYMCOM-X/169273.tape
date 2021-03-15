@@ -1,0 +1,266 @@
+begin "SysDAT - System Data Monitor"
+
+  require "(sailib)sail.def"   source!file;
+  require "(sailib)uuosym.def" source!file;
+  require "(carl)logpkg.req"   source!file;
+  require "(carl)daytim.req"   source!file;
+  require '1 lsh 24 lor ( "@"-"@" ) lsh 18 lor '0 version;
+
+define File.Page = '776;
+
+define	PEEK(x) = { Calli( !bit(0) lor (x), calli!VPEEK ) }
+,	Gettab( idx, tbl ) = {( calli( !xwd( idx, tbl ), calli!GETTAB ) )}
+;
+
+! globals ;
+
+integer
+	V, I,				! value, index ;
+	SysNum,				! system host number ;
+	SysSlot, SysSize,		! file slot and size for data ;
+	SleepTime,			! seconds to sleep between scans ;
+	Phy!Memory,			! size of physical memory ;
+	Mon!Memory,			! size of monitor memory ;
+	Mon!Ports,			! maximum # ports on system ;
+	Mon!Jobs,			! maximum # jobs for system ;
+	SerialNumber;			! serial number this cpu ;
+
+string  File.Name;
+
+define	r.SysId     =  1		! (8) #16K MEM (13) APRID (15) HOST ;
+,	r.Daytime   =  2		! (36) current UDT ;
+,	r.Uptime    =  3		! (36) tics since system startup ;
+,	r.Usage     =  4		! (9) Frames (9) Ports (18) Memory ;
+,	r.Mcy.h     =  5		! (36) high order Microcycles ;
+,	r.Mcy.l     =  6		! (36) low  order Microcycles ;
+,	r.Free      =  7		! (6) # units (5) 0 (25) pages free ;
+,	r.User.i    =  8		! (36) user mode blocks read ;
+,	r.User.o    =  9		! (36) user mode blocks written ;
+,	r.Monitor.i = 10		! (36) monitor mode blocks read ;
+,	r.Monitor.o = 11		! (36) monitor mode blocks written ;
+,	r.Paging.i  = 12		! (36) paging blocks read ;
+,	r.Paging.o  = 13		! (36) paging blocks written ;
+,	r.Base.i    = 14		! (36) base characters received ;
+,	r.Base.o    = 15		! (36) base characters sent ;
+,	r.Base.bio  = 16		! (36) base block-io characters ;
+;
+
+define DatSize = 16;
+safe integer array Data[ 1:DatSize ];	! data to be put into monitor file ;
+
+define UNINAM =  '0, UNILOG =  '1;
+define UNIBRC = '16, UNIBWC = '17, UNIDRC = '20, UNIDWC = '21,
+       UNIMRC = '22, UNIMWC = '23, UNIICT = '25, UNIOCT = '26,
+       UNIPPU = '41, UNICHR = '42, UNITAL = '47;
+
+safe integer array Unit[ -3:UNITAL ];
+safe integer array DDB[ -3:'1 ];
+
+safe integer array cmp,cmph[-3:127];
+safe integer array Blockio,CharsIn,CharsOut[-3:127];
+safe integer array JobStatus,JobCore[-3:127];
+
+
+!	Initialization support
+;
+
+simple procedure SetZone;		! set timezone to GMT ;
+begin
+    own integer Zone;
+
+    Zone_ Gettab( -1,!gtPRV );
+    dpb( '20, point( 6,Zone,7 ) );
+    calli( jp!nat lor Zone, calli!SETPRV );
+
+end;
+require SetZone initialization;
+
+
+simple procedure SetMyLog;
+begin "set log name"
+    own string Today;
+
+    Today_ TymDay( GetTDT );
+    Today_ Today[8 for 2] &
+	   ("0"&cvs( CMonth( Today[4 for 3] ) ))[inf-1 to inf] &
+	   Today[1 for 2];
+
+    SetLog( "(SRA)"& Today &".MON", true );
+
+end "set log name";
+require SetMyLog initialization;
+
+! System initialization ;
+
+simple procedure InitSystem;
+begin "initialization"
+
+!    Sys_ cvstr( Gettab( 0,!gtCNF )) & cvstr( Gettab( 1,!gtCNF )) &
+!	 cvstr( Gettab( 2,!gtCNF )) & cvstr( Gettab( 3,!gtCNF )) &
+!	 cvstr( Gettab( 4,!gtCNF ));
+!    while ( length( Sys ) and ( Sys[inf for 1] = 0 ) )
+!     do Sys_ Sys[1 to inf-1];
+
+    SerialNumber_ Gettab( !cnSER, !gtCNF );
+    SysNum_       Gettab( !cnSYS, !gtCNF );
+    Mon!Jobs_     Gettab( !cnNJB, !gtCNF );
+    Mon!Memory_   Gettab( !cnSIZ, !gtCNF ) div 512;
+    Phy!Memory_   Gettab( !nsMMS, !gtNSW ) div 512;
+
+    SleepTime_ 15;
+
+    arrClr( Blockio ); arrClr( CharsIn ); arrClr( CharsOut );
+    arrClr( cmph );    arrClr( cmp );
+    arrClr( DDB );     arrClr( Unit );
+
+    ! Initialize the function code to !sdSPY (or !sdMEM) function '10 ;
+    JobCore[-3]_ JobStatus[-3]_ Blockio[-3]_ CharsIn[-3]_ CharsOut[-3]_
+    cmph[-3]_ cmp[-3]_
+							     '10;
+
+    DDB[-3]_ !sdDDA;			! function to read DDBs ;
+    Unit[-3]_ !bit(0) lor !sdUNI;	! function to read UDB ;
+
+    ! Set the start address to the table address from !gtSLF ;
+
+    JobCore[-2]_   Gettab(   '100, !gtSLF );	! pages,,UPT address ;
+    JobStatus[-2]_ Gettab( !gtSTS, !gtSLF );	! job status ;
+    Blockio[-2]_   Gettab( !gtBIO, !gtSLF );	! block io characters ;
+    CharsIn[-2]_   Gettab( !gtCIN, !gtSLF );	! scnser chars in ;
+    CharsOut[-2]_  Gettab( !gtCOT, !gtSLF );	! scnser chars out ;
+
+    cmph[-2]_      Gettab( !gtMC2, !gtSLF );	! high microcycles ;
+    cmp[-2]_       Gettab( !gtMC1, !gtSLF );	! low  microcycles ;
+
+    Data[ r.SysId ]_
+	( (Phy!Memory - 1) lsh 23 ) lor	! physical memory in 16K increments ;
+	( SerialNumber     lsh 15 ) lor	! system APR serial number ;
+	( SysNum )			! TYMNET host number ;
+
+end "initialization";
+
+
+! Information about the system
+;
+
+simple procedure System;
+begin "system info"
+    own integer Job, AllJob, AllCore, AllTTY;
+
+    Data[ r.Daytime ]_ GetUDT;			! current day-time ;		! current time ;
+    Data[ r.Uptime  ]_ Gettab( !nsUPT,!gtNSW );	! system uptime ;
+
+    calli( !xwd( 128+3, location(cmph[-3]) ),      calli!SYSDVF );
+    calli( !xwd( 128+3, location( cmp[-3]) ),      calli!SYSDVF );
+
+    calli( !xwd( 128+3, location(JobStatus[-3]) ), calli!SYSDVF );
+    calli( !xwd( 128+3, location(  JobCore[-3]) ), calli!SYSDVF );
+
+    calli( !xwd( 128+3, location( Blockio[-3]) ),  calli!SYSDVF );
+    calli( !xwd( 128+3, location( CharsIn[-3]) ),  calli!SYSDVF );
+    calli( !xwd( 128+3, location(CharsOut[-3]) ),  calli!SYSDVF );
+
+    AllJob_ AllCore_ 0;
+
+    for Job_ 1 upto Mon!Jobs
+     do begin "each job slot"
+
+	if not( JobStatus[Job] land jb!jna )	! jna = 0 ? ;
+	 then continue "each job slot";
+
+	AllJob_ AllJob + 1;
+	AllCore_ AllCore + !lh(JobCore[Job]) land '777;
+
+     end "each job slot";
+
+    DDB[-2]_ AllTTY_ 0;			! start at the beginning ;
+    do begin
+	calli( !xwd( '1+1+3, location(DDB[-3]) ), calli!SYSDVF );
+	if ( DDB[ -2 ] ) and
+	    ( ( ( DDB[ 0 ] XOR cvSIX("TTY") ) lsh -18 ) = 0 ) and
+	    ( DDB[ 1 ] lsh -30 )
+	 then AllTTY_ AllTTY + 1;
+
+    end until DDB[ -2 ] = 0;
+
+    Data[ r.Usage   ]_ (AllJob lsh 27) lor (AllTTY lsh 18) lor AllCore;
+    Data[ r.Mcy.h   ]_ cmph[0];		! high-order * 2.0^35 ;
+    Data[ r.Mcy.l   ]_ cmp[0];		! remember ~400000 uCycles/Sec ;
+
+    Data[ r.Base.i  ]_ CharsIn[0];	! scnser base chars in  ;
+    Data[ r.Base.o  ]_ CharsOut[0];	! scnser base chars out ;
+    Data[ r.Base.bio]_ Blockio[0];	! block-io 80 chars/buffer ;
+
+
+  end "system info";
+
+! Disk info
+;
+
+simple procedure Disk;
+begin "install disk info"
+    integer Drive, BPT;
+    integer Free, Pages, URead, UWrite, MRead, MWrite, PRead, PWrite;
+
+    Unit[-2]_ 0;			! start at the beginning ;
+
+    Drive_ Free_ Pages_ URead_ UWrite_ MRead_ MWrite_ PRead_ PWrite_ 0;
+    while ( true )
+     do begin "every unit";
+
+	calli( !xwd( UNITAL+1+3, location(Unit[-3]) ), calli!SYSDVF );
+
+	if ( Unit[-2] = 0 )		! if this unit is blank ;
+	 then done;			!  we are finished ;
+
+	Free_   Free   + Unit[UNITAL];
+	Pages_  Pages  + Unit[UNIPPU];
+	URead_  URead  + Unit[UNIBRC]+Unit[UNIDRC];
+	UWrite_ UWrite + Unit[UNIBWC]+Unit[UNIDWC];
+	MRead_  MRead  + Unit[UNIMRC];
+	MWrite_ MWrite + Unit[UNIMWC];
+	PRead_  PRead  + Unit[UNIICT];
+	PWrite_ PWrite + Unit[UNIOCT];
+
+	BPT_ ldb( point( 8, Unit[UNICHR], 17 ) );
+	Drive_ Drive + 1;	! increment drive for storage array ;
+
+      end "every unit";
+
+    Data[ r.Free      ]_ (Drive lsh 30) lor (BPT lsh 25) lor Free;
+    Data[ r.User.i    ]_ URead;
+    Data[ r.User.o    ]_ UWrite;
+    Data[ r.Monitor.i ]_ MRead;
+    Data[ r.Monitor.o ]_ MWrite;
+    Data[ r.Paging.i  ]_ PRead;
+    Data[ r.Paging.o  ]_ PWrite;
+
+end "install disk info";
+
+
+! Top level logic
+;
+
+    if ( not( Gettab( -1, !gtLIC ) land LC!SY ))
+     then usererr( 0,0,"Requires SY", "x" );
+
+    InitSystem;
+
+    while ( true )
+     do begin "main loop"
+
+	System;				! gather system data ;
+	Disk;				! gather disk data ;
+
+	SetMyLog;			! set proper logfile ;
+	LogBin( Data );			! log binary data ;
+
+	if ( SleepTime )
+	 then calli( !xwd( '2, SleepTime ), '72 );	! hiber ;
+
+     end "main loop";
+
+  call(0,"EXIT");
+    
+end "SysDAT - System Data Monitor";
+ 
