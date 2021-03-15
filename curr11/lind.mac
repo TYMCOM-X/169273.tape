@@ -1,0 +1,918 @@
+	.TITLE	LIND   - LINE INTERFACE TYPE D - SUPERMUX (TL780)
+	.SBTTL	LIND   - Main entry point to service
+
+	XLPAR
+;	SYMBOL
+
+;+
+;The SUPERM driver is for the Infotron TL780 supermux.
+;This device is a statistical multiplexer for up to 96
+;full duplex asynch lines.  The mux sends out a sycnchronus
+;stream of coded packets which is decoded by this service
+;and made inteligable to the rest of the network.
+;The packets can be up to 256 characters in length, this
+;is a problem since our packet size is 58 characters.
+;This service uses the standard packet shell that is 64
+;characters in length and uses the first 2 characters as
+;a word pointer to the next packet in the chain.
+;The last packet has a pointer value of 0.
+;The character count is sent with the first packet address
+;in the circular buffer between the interrupt service and
+;the main program.
+;
+;The initial version of the service will not handle
+;control messages or statistics sent with the supervisory
+;messages. This may be added at a later date.
+;-
+
+;	Version 1.0
+;	Bruce Nevins
+;	19-NOV-78
+
+.IF	NDF	..DBUG
+..DBUG=!0
+.ENDC
+
+	.PAGE
+	.SBTTL	LIND   - Main entry point to service
+
+	PSECT	MAIN,RO,I,LCL,REL,CON
+	CALL	SUPERM
+	PSECT	CODE,RO,I,LCL,REL,CON
+
+SUPERM:	MOV	#ASDADB#,R4	;Get the first ADB
+	BR	NXT1		;
+SUPERN:	MOV	ADNEXT#(R4),R4	;Get the next D type ADB
+NXT1:	BNE	NXT2
+	RETURN
+
+NXT2:	CMP	ADDIMI#(R4),ADDIMO#(R4) ;Any packets waiting?
+	BEQ	SUPERN		;Check the next one
+;
+;Set up the packets and pointers for us to use
+;
+SUPER1:	MOV	ADDIMO#(R4),R2	;Get the address
+	MOV	(R2)+,R1	;Get the packet address out of the buffer
+	BNE	1$
+	FSTOP	ZPP		;[ZPP - Zero Packet Pointer]
+1$:
+	.IF	NE	..DBUG
+	MOV	R1,@ADDPRI#(R4)	;**DEBUG**
+	ADD	#2,ADDPRI#(R4)	;**DEBUG**
+	CMP	ADDPRI#(R4),ADDPRE#(R4);**DEBUG**
+	BNE	DBUG1		;**DEBUG**
+	MOV	ADDPRB#(R4),ADDPRI#(R4);**DEBUG**
+DBUG1:				;**DEBUG**
+	.ENDC
+	MOV	(R2),R0		;And the character count
+	SUB	#2,R0		;The CRC characters are on the list
+				;so we ignore them
+	CMP	#256.,R0	;If the count is over 256 we have garbage
+	BGE	2$
+	JMP	ABORT
+
+2$:	MOV	R1,ADDPIP#(R4)	;Store the Packet In Progress
+	ADD	#SPDATA,R1	;Point to the data
+	CMP	#SPPKSZ,R0	;Check the packet size
+	BLT	SUPER2		;Go to SUPER2 if more than 1 packet
+	MOV	R0,ADDLCT#(R4)	;The number of characters in this
+				;packet.
+	CLR	ADDCTT#(R4)	;Clear the total chracter count left
+				;in other packets
+	BR	SUPERX		;Go to the main loop
+
+SUPER2:	MOV	#SPPKSZ,ADDLCT#(R4) ;Set up the local packet size
+	SUB	#SPPKSZ,ADDCTT#(R4) ;Reduce the characters left by one
+				;packet count.
+; We fall into SUPERX. from here
+	.PAGE
+	.SBTTL	LIND   - SUPERX - Main loop for processing one message stream
+
+;+
+;	C(R1) - Current pointer into packet
+;	C(R4) - ADB pointer
+;-
+
+SUPERX:	MOVB	(R1)+,R0	;Get the first character
+	DEC	ADDLCT#(R4)	;Reduce the count
+	BGT	SUPRX1		;Last character?
+	CALL	SUPPKT		;Get the Next packet from the list
+	BCC	SUPRX1		;If carry is set we quit
+	JMP	FINISH
+
+SUPRX1:	CMPB	#377,R0		;Supervisory message?
+	BNE	SUPRX2		;Not an svc?
+	JMP	SVCMES		;Go do it.
+
+SUPRX2:	TBBN	$INITL,ADDFLG#(R4),ABORT;If we are in initialize we only
+					;  accept a supervisory message
+	CMPB	#376,R0		;Control message?
+	BEQ	CONMES		;Yes
+	TBBN	200,R0,MRKMES	;Marker message?
+
+;Must be an address data message
+
+	MOVB	R0,ADDCLN#(R4)	;Current line number
+	CMPB	ADMAXI#(R4),R0	;Is the line number too large?
+	BLE	ADRZAP		;If so zap the data
+	ADD	ADDLNX#(R4),R0
+	ASL	R0
+	MOV	TR0SX#(R0),SD
+	MOVB	(R1)+,R0	;Get the character
+	PUSH	R1		;Save the packet pointer
+	PUSH	R4
+	CALL	TRDATA#		;Send the character on its way
+	POP	R4
+	POP	R1		;Restore the packet pointer
+SUPRX3:	DEC	ADDLCT#(R4)	;Reduce char count
+	BGT	SUPERX		;Back up for more
+	TST	ADDCTT#(R4)	;Check the count of those left
+	BEQ	FINISH		;If zero then we are done
+	CALL	SUPPKT		;Get the next packet
+	BCC	SUPERX		;If ok go do more
+
+;Here if the line number was bad
+
+ADRZAP:	INC	R1		;Bump the pointer(and ignore the data)
+	INC	ADDBLN#(R4)	;Remember this happened
+	BR	SUPRX3
+	.PAGE
+	.SBTTL	LIND   - MRKMES - Marker message processing
+
+;+
+;	C(R0) - The marker message
+;	C(R1) - The packet pointer
+;	C(R4) - The ADB pointer
+;-
+
+MRKMES:	MOVB	#7,ADDCLC#(R4)	;Current line count
+	ROLB	R0		;Remove upper bit
+	BNE	MRKME1		;If not zero then do normal
+	INCB	ADDCLC#(R4)	;For the zero case we do one more
+				;Bit
+	INCB	R0		;Set the bit at the end of the word
+MRKME1:	MOVB	R0,ADDMRK#(R4)	;The marker message.
+MRKLOP:	ROLB	ADDMRK#(R4)	;Shift the bit into carry
+	BCC	MRKOUT		;Do a byte output
+	DECB	ADDCLN#(R4)	;Reduce the line number
+	BGE	1$		;If greater than zero go on
+	MOVB	ADMAXI#(R4),ADDCLN#(R4) ;Back up to the max number of lines
+	DECB	ADDCLN#(R4)	;And down by one
+1$:	DECB	ADDCLC#(R4)
+	BNE	MRKLOP
+	BR	MRKDON		;Do the done check
+
+MRKOUT:	MOVB	ADDCLN#(R4),SD	;Current line number
+	CMPB	ADMAXI#(R4),SD	;If out of range ignore data
+	BLE	MRKZAP
+	ADD	ADDLNX#(R4),SD
+	ASL	SD		;Make a word index
+	MOV	TR0SX#(SD),SD
+	MOVB	(R1)+,R0	;Get the character
+	PUSH	R1
+	PUSH	R4
+	CALL	TRDATA#
+	POP	R4
+	POP	R1
+MRKOU1:	DEC	ADDLCT#(R4)	;Reduce the count
+	BLE	MRKOU2		;
+	DECB	ADDCLC#(R4)	;
+	BNE	MRKLOP		;
+	BR	MRKDON		;
+
+MRKOU2:	TST	ADDCTT#(R4)	;Check if any more to do
+	BEQ	3$
+	CALL	SUPPKT		;Next packet
+	BCC	3$		;Go on if ok
+	TSTB	ADDCLC#(R4)	;Is this all of it?
+	BEQ	FINISH		;If so leave
+	CALL	LINCLR		;
+	JMP	FINISH		;
+
+3$:	DECB	ADDCLC#(R4)	;
+	BNE	MRKLOP		;
+MRKDON:	TST	ADDLCT#(R4)	;More to do?
+	BEQ	FINISH		;Totally done
+	JMP	SUPERX
+
+;Here if we have bad line number
+
+MRKZAP:	INC	R1		;Bump the pointer
+	INC	ADDBLN#(R4)	;Remember bad line numbers
+	BR	MRKOU1
+	.PAGE
+	.SBTTL	LIND   - ABORT  - IF WE GET A GARBAGE PACKET
+
+ABORT:	INC	ADDGLP#(R4)	;Garbage looking packet
+	BR	FINISH
+	.PAGE
+	.SBTTL	LIND   - CONMES - CONTROL MESSAGE (IGNORED FOR NOW)
+
+CONMES:	MOVB	(R1)+,R0	;The A byte
+	DEC	ADDLCT#(R4)	;Drop count
+	BGT	CON1
+	CALL	SUPPKT
+	BCS	FINISH
+CON1:	MOVB	(R1)+,R0	;The C Byte
+	DEC	ADDLCT#(R4)
+	BGT	CON2
+	CALL	SUPPKT
+	BCS	FINISH
+CON2:	MOVB	(R1)+,R0	;The T Byte
+	DEC	ADDLCT#(R4)	;
+	BLE	1$
+	JMP	SUPERX
+
+1$:	TST	ADDCTT#(R4)	;Check for more
+	BEQ	FINISH
+	CALL	SUPPKT
+	BCS	FINISH
+	JMP	SUPERX
+	.PAGE
+	.SBTTL	LIND   - FINISH - CLEAN UP ROUTINE
+
+;+
+;This routine removes the proccesed packets and does some
+;General housekeeping.
+;-
+
+FINISH:	MOV	@ADDIMO#(R4),R1	;Get the first packet
+	BEQ	FINI		;If zero then no packet to zap
+	CLR	@ADDIMO#(R4)	;Don't use the same pointer again
+1$:	MOV	(R1),R3		;Get the pointer to the next one
+	FREPKT			;Give it back
+	MOV	R3,R1
+	BNE	1$		;Go till zero
+FINI:	MOV	ADDIMO#(R4),R0	;Get the out pointer
+	ADD	#4,R0		;Remove from the circular buffer
+	CMP	R0,ADDIME#(R4)	;The end yet?
+	BNE	2$
+	MOV	ADDIMB#(R4),R0	;To the beginning
+2$:	MOV	R0,ADDIMO#(R4)	;New outpointer
+	JMP	SUPERN		;Next adb to do?
+	.PAGE
+	.SBTTL	LIND   - SUPPKT - GETS THE NEXT PACKET IN A STRING
+
+SUPPKT:	MOV	@ADDPIP#(R4),R1	;Get the packet in process
+	BNE	1$
+;
+;If we get here the mux sent us garbage
+;so we should quit here
+;
+
+	CLR	ADDCTT#(R4)	;
+	CLR	ADDLCT#(R4)	;
+	SEC
+	RETURN
+1$:	MOV	R1,ADDPIP#(R4)	;The new one
+	ADD	#SPDATA,R1	;Point to the data
+	CMP	#SPPKSZ,ADDCTT#(R4) ;More than the packet size left to do?
+	BGT	SUPPK1
+	MOV	ADDCTT#(R4),ADDLCT#(R4) ; Make remaining amount local count
+	CLR	ADDCTT#(R4)
+	CLC			;Good return
+	RETURN
+
+SUPPK1:	SUB	#SPPKSZ,ADDCTT#(R4) ;Reduce one packet
+	MOV	#SPPKSZ,ADDLCT#(R4) ;Initialize the local count
+	CLC			;EXIT HAPPY
+	RETURN
+	.PAGE
+	.SBTTL	LIND   - SVCMES - SUPERVISORY MESSAGE
+
+;+
+;	C(R1) - Packet pointer
+;	C(R4) - Adb pointer
+;-
+
+SVCMES:	CMP	#7,ADDLCT#(R4)	;Is the count 7 characters?
+	BEQ	1$
+	INC	ADDGLP#(R4)	;We have a garbage packet
+	JMP	RMVPKT		;Toss it.
+
+1$:	BIC	#$SYNLS,ADDFLG#(R4);INDICATE WE ARE "IN SYNC" NOW
+	MOVB	#2,ADDTSY#(R4)	;START THE "SYNC LOSS" TIMER
+	MOVB	(R1)+,R0	;Get the message type ('mbits')
+SVCME1:	TST	R0		;Routine message?
+	BEQ	RUTINE		;
+	BITB	#076,R0		;Initalize message from sender?
+	BNE	INITMS
+;Input buffer overflow?
+
+	BITB	#300,R0
+	BEQ	RESPNS		;A response?
+	BIT	#100,R0		;Retransmit request?
+	BEQ	LINEER
+
+;Retransmit request
+
+IOVFL:	TBBE	$INITL,ADDFLG#(R4),1$ ;If we are in initialize
+	JMP	RMVPKT
+
+1$:	INC	ADDIBO#(R4)	;Input buffer overflow
+	ROR	R0		;Did we get a response too?
+	BCS	2$
+	BIC	#$NAKF,ADDFLG#(R4) ;clear the flags..
+2$:	BR	RESETB		;Go reset the buffer to send
+
+LINEER:	TBBE	$INITL,ADDFLG#(R4),1$ ;Ininialize?
+	JMP	RMVPKT
+
+1$:	INC	ADDHLE#(R4)	;Highspeed line error
+	ROR	R0		;A response?
+	BCS	2$
+	BIC	#$NAKF,ADDFLG#(R4) ;
+2$:	BR	RESETB		;Reset buffer to send
+
+RUTINE:	TBBE	$INITL,ADDFLG#(R4),1$ ;Initialize?
+	JMP	RMVPKT
+
+1$:	JMP	FLSXMT		;Flush packets of transmited data
+				;That was received ok.
+
+RESPNS:	TBBE	$INITL,ADDFLG#(R4),1$
+	PUSH	R1
+	CALL	CONOUT
+	POP	R1
+	CLRB	ADDCLN#(R4)
+	BIC	#$INITL,ADDFLG#(R4) ;Clear flags
+1$:	JMP	FLSXMT		;Go flush the ACK'ed data
+
+;Initialize message service
+
+INITMS:
+	.IF NE HANG		;If we want lines to be hung up then a 1
+	PUSH	R1		;Save pointer
+	CALL HANGEM
+	POP	R1		;Restore pointer
+	.ENDC
+	CLRB	ADDCLN#(R4)	;Clear the current line number
+	SETPSW	ADDPSL#(R4)	;We are uniterruptable
+	MOV	#BBASE,ADDLBA#(R4)
+	MOV	#BBASE,ADDLPA#(R4)
+	MOV	#6,ADDTBL#(R4)	;So we send the SVC message train
+	MOV	(R1)+,ADDRBA#(R4) ;Get his buffer address
+
+;Here to zap the output and reset the world
+
+	TBBE	$OIP,ADDFLG#(R4),OK ;If no output then drop out
+	TBBN	$SVCP,ADDFLG#(R4),KILLEM ;If an SVC don't mess with him
+	BIS	#$ABT,ADDFLG#(R4) ;Abort all output and reset
+KILLEM:	MOV	ADDAHP#(R4),R1	;Get the ACK head pointer
+	BEQ	KILL2		;If zero try output list
+	CLR	ADDAHP#(R4)	;Just in case
+KILL1:	MOV	(R1),R3		;Get the next
+	FREPKT			;Bye
+	INC	ADDPTU#(R4)	;BUMP THE COUNT
+	MOV	R3,R1		;Set up
+	BNE	KILL1		;Back for more?
+KILL2:	MOV	ADDOHP#(R4),R1	;Get the output list head pointer
+	BEQ	OK		;If zero exit grace full
+	CLR	ADDOHP#(R4)	;Just in case
+KILL3:	MOV	(R1),R3		;Get the next to send
+	FREPKT			;Bye
+	INC	ADDPTU#(R4)	;KEEP A GOOD COUNT
+	MOV	R3,R1		;Set up
+	BNE	KILL3		;And some more?
+OK:	CLR	ADDATP#(R4)	;Clear the tail pointer
+	CLR	ADDOTP#(R4)	;For both
+	BIC	#$NAKF+$SYNLS+$FLSH+$ABT,ADDFLG#(R4) ;Make us normal now
+	BIS	#$SRINT+$SMINT,ADDNFG#(R4);ACK HIS AND SEND IT BACK
+	BIS	#$SVCR,ADDFLG#(R4) ;Request a SVC to go out
+	CLRPSW			;Back to normal
+	CALL	CONOUT		;Out with it
+	JMP	RMVPKT
+	.PAGE
+	.SBTTL	LIND   - RESETB - Reset buffer routine
+
+RESETB:	BIS	#$HOLD+$ABT,ADDFLG#(R4) ;Tell output service to stop
+	BIS	#$SRINT,ADDNFG#(R4);Set retransmit ack
+
+;Get the local address that is being ack'ed
+
+	MOV	(R1)+,R0	;Just the remote buffer address
+	PUSH	R1		;Save the pointer
+	PUSH	R0		;Save the new ADDLPA
+
+;Calculate the packet to resend
+
+	SUB	ADDLPA#(R4),R0	;Get the last packet ack'ed
+	BGT	RESET1		;If some to do go on.
+	BEQ	1$
+
+	BR	TOPHAS		;The end is here
+
+1$:	CALL	CONOUT		;If no data then send control message
+	MOV	ADDAHP#(R4),R3	;Get the ack head pointer
+	BEQ	INTSRT		;If zero then we have none
+	CLR	ADDAHP#(R4)	;Just in case
+	BR	BFRSE1
+
+RESET1:	MOV	ADDAHP#(R4),R1	;Get the ack head pointer
+	BEQ	TOPHAS		;If zero we have a phase error
+	CLR	ADDAHP#(R4)	;For our safety
+1$:	CLR	R2
+	BISB	SPCNT(R1),R2	;Get the character count
+	SUB	R2,R0		;Get the remainder
+	BLT	TOPHAS		;Go die
+	BEQ	BFRSET		;Go init the pointers
+	MOV	(R1),R3		;Get the packet address to zap
+	FREPKT
+	INC	ADDPTU#(R4)	;Bump the free packet count
+	MOV	R3,R1		;Next to do
+	BNE	1$
+TOPHAS:	TST	(SP)+		;Clean up the stack
+	TST	(SP)+		;"                "
+	BR	PHASE		;Do the phase error thing
+
+;	C(R1) - Address of last good packet
+
+BFRSET:	MOV	(R1),R3		;Get address of packet to re send
+	FREPKT
+	INC	ADDPTU#(R4)	;Bump the free packet count
+BFRSE1:	MOV	(SP),ADDLPA#(R4) ;The last packet ack'ed
+	MOV	(SP),ADDLBA#(R4);AND THE LOCAL BUFFER ADDRESS
+	TST	R3		;Is the ack head pointer zero?
+	BNE	1$		;If not go on
+	CLR	ADDATP#(R4)	;Zap the tail pointer
+	BR	INTSRT		;All done
+
+1$:	TST	ADDOHP#(R4)	;Is the output list active?
+	BEQ	SRTLST		;Make the list active
+	MOV	ADDOHP#(R4),@ADDATP#(R4) ;Link the old output head into the
+				;Old ack tail
+	MOV	R3,ADDOHP#(R4)	;New output head pointer
+	CLR	ADDATP#(R4)	;Clear ack list tail pointer
+	CLR	ADDAHP#(R4)	;Clear ack list head pointer
+	BR	INTSRT
+
+;Start the output list pointers up
+
+SRTLST:	MOV	ADDATP#(R4),ADDOTP#(R4)	;New output tail pointer
+	MOV	R3,ADDOHP#(R4)	;New output head pointer
+	CLR	ADDATP#(R4)	;Clear ack list tail pointer
+	CLR	ADDAHP#(R4)	;Clear ack list head pointer
+
+;Start the output interrupts going
+
+INTSRT:	TST	(SP)+			;Clean the stack up
+	POP	R1			;Restore the pointer into data
+	CMP	(R1)+,ADDRBA#(R4)	;Is all well?
+	BEQ	1$
+	BIS	#$LNER,ADDNFG#(R4) ;No we must have a line error
+	BIS	#$FLSH+$NAKF,ADDFLG#(R4) ;No data for now
+1$:	BIS	#$SVCR,ADDFLG#(R4)	;Request a SVC to be sent
+	BIC	#$ABT,ADDFLG#(R4)	;All is well now
+	CALL	STROUT		;Start output if need be.
+	JMP	PBITS
+
+	.PAGE
+	.SBTTL	LIND   - PHASE  - PHASE ERROR HANDLING (OUR BUFFER ADDRESS IS NOT HIS)
+
+;Here on a phase error (our buffer addresses don't match the other guy!)
+
+PHASE:	INC	ADDPHE#(R4)	;Count phase errors
+
+;Hang up everyone
+
+	.IF NE HANG		;If we want lines to be hungup then 1
+	CALL	HANGEM		;Hang up all the lines
+	.ENDC
+
+;Zap all the packets in use by us
+
+	CALL	LINCLR
+	JMP	RMVPKT		;Remove packet
+	.PAGE
+	.SBTTL	LIND	- LINCLR - Clear and initilaize mux
+
+LINCLR:	BIS	#$ABT,ADDFLG#(R4) ;Tell interrupt guy to abort
+	MOV	ADDAHP#(R4),R1	;Get the head pointer of the ack list
+	BEQ	OUTLST		;If zero then zap the output list
+	CLR	ADDAHP#(R4)	;Just in case
+	CLR	ADDATP#(R4)	;The tail pointer too
+ACKLST:	MOV	(R1),R3		;Get next in list
+	FREPKT			;Kill this one
+	INC	ADDPTU#(R4)	;Bump the free packet count
+	MOV	R3,R1		;Set up the next one
+	BNE	ACKLST		;If not zero do next one
+
+OUTLST:	MOV	ADDOHP#(R4),R1	;Get the output head pointer
+	BEQ	INITOT		;Go do init out if none
+	CLR	ADDOHP#(R4)	;Just in case
+	CLR	ADDOTP#(R4)	;This tail also..
+OUTLS1:	MOV	(R1),R3		;Get the next in the list
+	FREPKT			;Rid us of this curse
+	INC	ADDPTU#(R4)	;Bump the free packet count
+	MOV	R3,R1		;The next one in line
+	BNE	OUTLS1		;If not zero do next
+
+;Send an initialize out
+
+INITOT:	BIS	#$INITL,ADDFLG#(R4) ;Init request
+	BIS	#$SMINT,ADDNFG#(R4)	;Do an initialize
+	MOV	#BBASE,ADDRBA#(R4) ;Set remote buffer address base
+	MOV	#BBASE,ADDLBA#(R4) ;Set localbuffer address base
+	MOV	#BBASE,ADDLPA#(R4) ;Set last packet acked base
+	BIS	#$SVCR,ADDFLG#(R4) ;Set svc request
+	BIC	#$ABT,ADDFLG#(R4) ;End abort state
+	CLRB	ADDCLN#(R4)	;Clear out current line no.
+	CALL	STROUT		;Start output if need be
+	RETURN
+	.PAGE
+	.SBTTL	LIND   - FLSXMT - Flush the packets sent and ack'ed
+FLSXMT:	MOV	(R1)+,R0
+	PUSH	R1
+
+;Compute the packets to free up
+
+	CMP	ADDLPA#(R4),R0	;When we start we check on the state
+				; of things
+	BEQ	INTDO1		;If none to send leave
+	MOV	ADDAHP#(R4),R1	;Get the ack head pointer
+	CLR	ADDAHP#(R4)	;JUST IN CASE
+	MOV	R1,R3		;Set up R3 incase we fall out now
+	BEQ	FLDEAD		;Its all over now!
+FLSNXT:	CMP	ADDLPA#(R4),R0	;Check if there are any.
+	BEQ	INTDON		;If equal we are done before we start
+	MOV	(R1),R3		;Get the next packet to do
+	BEQ	INTZAP		;If last one we need to do at interrupt level
+FLSNX1:	CLR	R2
+	BISB	SPCNT(R1),R2	;Get the character count
+	ADD	R2,ADDLPA#(R4)	;Add into the total
+	BIC	#^C37777,ADDLPA#(R4) ;Down to 14 bits worth
+	CMP	#4096.,ADDLPA#(R4) ;Check on wrap around
+	BLE	1$		;If not skip next
+	ADD	#4096.,ADDLPA#(R4) ;Wrap it up
+1$:	FREPKT			;Zap this one
+	INC	ADDPTU#(R4)	;Bump the free packet count
+	MOV	R3,R1		;Get the next one
+	BR	FLSNXT		;Go do more
+
+;To remove the last packet we have to be uninterruptable by the routine
+;Sticking packets in our tail..
+
+INTZAP:	SETPSW	ADDPSL#(R4)	;Set us at interrupt level
+	MOV	(R1),R3		;Get next
+	BEQ	INTZA1		;If last then go on
+	CLRPSW			;Undo the interrupt disable
+	BR	FLSNX1		;Back up to the top folks
+
+INTZA1:	CLR	R2
+	BISB	SPCNT(R1),R2	;Get the character count
+	ADD	R2,ADDLPA#(R4)	;Add into the total
+	BIC	#^C37777,ADDLPA#(R4) ;Down to 14 bits worth
+	CMP	#4096.,ADDLPA#(R4) ;Check on wrap around
+	BLE	1$		;If not skip next
+	ADD	#4096.,ADDLPA#(R4) ;Wrap it up
+1$:	FREPKT			;Zap him
+	INC	ADDPTU#(R4)	;Bump the free packet count
+	CLR	ADDAHP#(R4)
+	CLR	ADDATP#(R4)
+	CMP	ADDLPA#(R4),R0
+	BEQ	INTDO1
+
+INTBAD:	CLRPSW			;Back to normal level
+	BR	FLDEAD		;The end is here
+
+INTDON:	MOV	R3,ADDAHP#(R4)	;New head pointer
+INTDO1:	CLRPSW			;End our interruption
+	POP	R1		;Get our old pointer
+	MOV	(R1)+,R0	;Get the address
+	CMP	ADDRBA#(R4),R0	;Check up on it
+	BEQ	PBITS
+	BIS	#$LNER,ADDNFG#(R4)	;Line error
+	BIS	#$FLSH+$SVCR,ADDFLG#(R4);Dump the data
+	CALL	STROUT		;Start output
+	BR	PBITS
+
+FLDEAD:	TST	(SP)+		;Clean up the stack
+FLDEA1:	JMP	PHASE		;Do the phase error thing
+	.PAGE
+	.SBTTL	LIND   - PBITS  - STATUS INFORMATION(IGNORED FOR NOW)
+
+PBITS:	MOVB	(R1)+,R0
+	CMPB	#EVENT,R0	;An event message?
+	BNE	RBITS		;No just go on
+	MOVB	(R1)+,R0	;Get the reason
+	TBBE	$MSGER,R0,RMVPKT ;If its not set forget it
+	CALL	CONOUT		;Send out a control message
+	BR	RMVPKT		;And then go on
+RBITS:	MOVB	(R1)+,R0	;Rbits too
+
+;Fall into remove packet routine
+
+	.SBTTL	LIND   - RMVPKT - REMOVE A SUPERVISORY PACKET
+
+RMVPKT:	MOV	@ADDIMO#(R4),R1	;Get the address of the packet
+	BNE	1$		;It better not be zero
+	FSTOP	ZPP		;[ZPP - Zero Packet Pointer]
+1$:	CLR	@ADDIMO#(R4)	;Clear it just in case we try to use it
+	FREPKT			;Give it back
+
+;Remove the data from the circular buffer
+
+	JMP	FINI		;Clean up after us
+	.PAGE
+	.SBTTL	LIND   - CONOUT - Output a control message
+
+CONOUT:	TST	ADDPTU#(R4)	;If not allowed more
+	BLE	RTN047		;Then go
+	MAKPKT	.PLSTP#		;Make a packet for us
+	BCS	RTN047		;IF NO ROOM THEN JUST QUIT
+	DEC	ADDPTU#(R4)	;Less again
+	MOV	R1,ADDFCP#(R4)	;Save the first control packet
+	MOVB	ADMAXI#(R4),R2	;Get the maximum number of lines
+	MOV	#15.,R3		;The maximum per packet
+	ADD	#SPDATA,R1	;Point to the data area of the packet
+	CLR	R0		;Clear the starting line to do
+1$:	MOVB	#376,(R1)+	;The control mmessage byte
+	MOVB	R0,(R1)+	;The line number
+	MOVB	#CONDAT,(R1)+	;The control data
+	CLRB	(	;Seconds to wait (none)
+	INC	R0		;Bump the line number
+	DEC	R3		;Messages left
+	BEQ	MORCON		;More to come
+	SOB	R2,1$		;Back for more
+	MOV	#15.,R0		;Starting value
+	SUB	R3,R0		;Get the real count
+	ASL	R0		;Times 4 for the
+	ASL	R0		;Number of characters we did
+ONWARD:	MOV	ADDFCP#(R4),R1	;The first packet
+	CLR	ADDFCP#(R4)	;So we leave no way to zap us
+	MOVB	R0,SPCNT(R1)	;Save the count
+	SETPSW	ADDPSL#(R4)	;We don't want to be interrupted
+	MOV	ADDOTP#(R4),R0	;Get theoutput tail pointer
+	BEQ	2$		;If zero then set it up
+	MOV	R1,(R0)		;Link into the tail
+	BR	3$
+2$:	MOV	R1,ADDOHP#(R4)	;Make new head pointer
+3$:	MOV	R1,ADDOTP#(R4)	;New tail pointer
+
+	CLRPSW			;Back to normal
+	CALL	STROUT		;Start output
+
+RTN047:	RETURN
+
+MORCON:	FSTOP	NIY		;Maybe later
+	.PAGE
+	.SBTTL	LIND   - ASDOUT - Terminal output service. driven by TR
+
+;Enter with C(SD) set up
+
+ASDOUT::BIC	#$T1ACX,SDTRS1#(SD)	;Fix irma
+	MOV	SDTRAD#(SD),R4	;Get adb
+	TBBE	$INITL!$SYNLS,ADDFLG#(R4),2$ ;If we are in initial hold it
+	JMP	NEEDWT
+
+2$:	TBBE	$NAKF,ADDFLG#(R4),3$	;If nak set then sleep
+	JMP	NEEDWT		;For one second
+3$:	DECB	SDDCCT#(SD)	;Room for more?
+	BGE	ASDOU4		;If so do it
+
+;If the count is done check the timers
+
+	TBBN	$CHRW,SDDFLG#(SD),4$  ;If a char waiting skip this
+	BIS	#$CHRW,SDDFLG#(SD) ;We have a good character
+	MOVB	R0,SDDCHR#(SD)	;NO! then save tha character for now
+4$:	MOV	UPTIME#,R0	;Get the low order
+	MOV	<UPTIME#+2>,R2	;Get high order
+	SUB	SDDUT1#(SD),R0
+	SBC	R2
+	SUB	SDDUT2#(SD),R2
+	BNE	ASDOU2		;If not zero we have timed out
+	MOV	SDTRS3#(SD),R1	;The baud code
+	BIC	#^C$T3ORT,R1	;Save only the rate bits
+	ASL	R1		;Make a word index
+	MOV	DELAYT(R1),R1	;Get the delay time
+	SUB	R0,R1
+	BCS	ASDOU2		;If minus no wait
+	MOV	R1,R0		;
+	MOV	#ASDOU2,R1	;
+	BIS	#$TWAIT,SDDFLG#(SD) ;We are waiting on time
+	CJMP	TIMREQ#		;Do a time request
+
+;Here on timer done
+
+ASDOU2:	MOV	SDTRAD#(SD),R4	;Get adb
+	BIC	#$TWAIT,SDDFLG#(SD) ;Our time has come
+	MOVB	SDDCHR#(SD),R0	;Restore the character
+	MOV	#30.,SDDCCT#(SD);Set up the count for the next packet
+	MOV	UPTIME#,SDDUT1#(SD) ;Reset the time counters
+	MOV	UPTIME#+2,SDDUT2#(SD) ;
+ASDOU4:	MOV	SDDCPP#(SD),R1	;Get the place to put the character
+	BEQ	NEEDPK		;If zero then we need another free packet
+	TST	SDDBTW#(SD)	;Check the bit word
+	BEQ	ADRSOT		;Put the address message out
+	TBBE	MKBIT,SDDBTW#(SD),OUTSR1 ;Is this the first marker message?
+;Place a marker message in the packet and a pointer to it
+;in the SDB called SDBMOP
+	MOV	@SDDPCT#(SD),R2	;Get the character count
+	INC	R2		;Bump one
+	CMPB	#PKMAX,R2	;Is there room?
+	BEQ	SENDIT		;If not send this packet
+	MOV	R1,SDDMOP#(SD)	;Set up the pointer
+	MOVB	#MRKSHL,(R1)+	;The marker shell
+	INCB	@SDDPCT#(SD)	;Bump the character count in the packet
+
+OUTSR1:	MOVB	R0,(R1)+	;Stuff the character in the packet
+	BIC	#$CHRW,SDDFLG#(SD) ;We have the char so clear flag
+	BICB	SDDBTW#(SD),@SDDMOP#(SD) ;Clear the appropriate bit
+	ASR	SDDBTW#(SD)	;Set up for the next bit
+	INCB	@SDDPCT#(SD)	;Bump the character count
+	CMPB	#PKMAX,@SDDPCT#(SD) ;Full?
+	BEQ	SENDIT
+OUTSR2:	MOV	R1,SDDCPP#(SD)	;Save the packet pointer
+TIMEOT:	CALL	OUTRD1#		;More?
+	MOV	SDTRAD#(SD),R4	;Get the ADB pointer back
+	TST	SDDCPP#(SD)	;Was it sent out?
+	BNE	SENDIT		;If not then send it
+	RETURN			;All is well
+
+;
+; Send a proccesed packet on to the Mux
+;
+SENDIT:	MOV	SDDPAD#(SD),R1	;Get the packet address to send
+	SETPSW	ADDPSL#(R4)	;Make us un interruptable
+	MOV	ADDOTP#(R4),R0	;Get tail pointer
+	BEQ	2$
+	MOV	R1,(R0)	;Make link into the tail
+	BR	3$
+2$:	MOV	R1,ADDOHP#(R4)	;Make the head for first
+3$:	MOV	R1,ADDOTP#(R4)	;Do for the tail
+
+	CLRPSW			;Back to normal
+	CLR	SDDCPP#(SD)	;Clear current packet pointer
+
+;Start output service going
+
+	CALL	STROUT		;Start output if need be.
+	TBBE	$TWAIT,SDDFLG#(SD),1$ ;If we are waiting then wait
+	RETURN			;BYE
+1$:	TBBE	$CHRW,SDDFLG#(SD),4$ ;If we have no waiting character
+	MOVB	SDDCHR#(SD),R0	;Restore the character
+	JMP	ASDOUT		;If a character is waiting
+				; send it on its way
+4$:	JMP	TIMEOT
+
+NEEDPK:	TST	ADDPTU#(R4)	;Is there room?
+	BGT	1$		;If ok go on
+	BR	NEEDWT		;Go wait
+1$:	MAKPKT	.PLSTP#		;Get a free packet
+	BCS	NEEDWT		;Go wait for a packet
+	DEC	ADDPTU#(R4)	;DROP THE COUNT
+	MOV	R1,SDDPAD#(SD)	;Save packet pointer
+	CLRB	SPCNT(R1)	;Clear the character count
+	CLR	(R1)		;Clear the link word
+	MOV	R1,R2		;Copy packet address
+	ADD	#SPDATA,R1	;Point to data area
+	ADD	#SPCNT,R2	;Point to counter byte
+	MOV	R2,SDDPCT#(SD)	;Save the pointer
+
+;Do the address data message to start the packet
+
+ADRSOT:	BIS	#$CHRW,SDDFLG#(SD) ;Set the character waiting flag
+	MOV	@SDDPCT#(SD),R2	;Get the character count
+	INC	R2
+	CMPB	#PKMAX,R2	;Are we short the space?
+	BEQ	SENDIT		;If so make room
+	MOVB	SDDLIN#(SD),R2
+	MOVB	R2,(R1)+	;This is the address data message
+	MOVB	R0,(R1)+	;And the character too go out
+	BIC	#$CHRW,SDDFLG#(SD) ;We have it so clear the flag
+	INCB	@SDDPCT#(SD)	;Bump the count
+	INCB	@SDDPCT#(SD)	;Once for each character
+	CMPB	#PKMAX,@SDDPCT#(SD) ;Full yet?
+	BEQ	SENDIT		;If so send it out
+	MOV	#MKBIT,SDDBTW#(SD) ;Set up the marker word
+	BR	OUTSR2		;Check for more
+
+;If there were no free packets we go here and sleep on it
+
+NEEDWT:	MOVB	R0,SDDCHR#(SD)	;Save the character
+	MOV	#WAITVL,R0	;How long do we wait
+	MOV	#NEEDDN,R1	;
+	BIS	#$TWAIT,SDDFLG#(SD) ;We are waiting
+	CJMP	TIMREQ#		;Bye bye
+
+;Here when the NFP timer has gone off.  We will now see if we can get
+;a packet to send our stuff on its way.
+
+NEEDDN:	MOV	SDTRAD#(SD),R4	;Get adb
+	MOVB	SDDCHR#(SD),R0	;Restore the character
+	JMP	ASDOUT		;One more time!!
+	.PAGE
+	.IF NE HANG		;If the world is to go away a 1
+	.SBTTL	LIND   - HANGEM - HANG UP EVERYONE
+
+;+
+;Destroys C(R0) and C(R1)
+;-
+
+HANGEM:	MOV	ADDLNX#(R4),R0	;Get the line index
+	ASL	R0		;Make a word index
+	ADD	#TR0SX#,R0	;
+	MOVB	ADMAXI#(R4),R1	;Number of lines to zap
+1$:	MOV	(R0)+,SD	;Socket to kill
+	PUSH	R0
+	PUSH	R1
+	CALL	HUNGUP#		;Hang up the line
+	POP	R1
+	POP	R0
+	SOB	R1,1$
+	MOV	SDTRAD#(SD),R4	;Restore the ADB pointer
+	RETURN			;Done
+	.ENDC
+	.PAGE
+	.SBTTL	LIND   - STROUT - Start output interrupts (If need be)
+
+STROUT:	TBBN	$A1AVL,ADSTS1#(R4),1$ ;If available then go
+	RETURN			;Not available so return
+1$:	MOV	(SP),-(SP)	;Move return address for RTI
+	CLR	2(SP)		;The old PSW
+	SETPSW	ADDPSL#(R4)	;Fake an interrupt
+	TBBN	$OIP,ADDFLG#(R4),2$ ;If going just leave
+	CJMP	@ADDOSR#(R4)	;Bye
+
+2$:	RTI			;No need to start output so we
+				; Return from our fake interrupt
+	.PAGE
+	.SBTTL	LIND   - ASDFCN - FUNCTION SERVICE
+
+ASDFNC::RETURN			;Do nothing now
+	.PAGE
+	.SBTTL	LIND   - SVCSEC - Once a second service
+
+	ONCSEC	SVCSEC
+
+	PSECT	CODE,RO,I,LCL,REL,CON
+
+SVCSEC:	MOV	#ASDADB#,R4	;Get the first ADB
+
+SEC2:	TBBE	$INITL,ADDFLG#(R4),SEC3 ;If not initial skip
+	BIS	#$SMINT,ADDNFG#(R4)	;Send an intialize message
+	BIS	#$SVCR,ADDFLG#(R4)	;Set the request bit
+	TBBN	$INITL,ADDFLG#(R4),SEC4;If set end all further checks
+SEC3:	TBBE	$NAKF,ADDFLG#(R4),1$	;If a nak is set send another
+					;line error message
+	BIS	#$LNER,ADDNFG#(R4)	;
+
+1$:	BIS	#$SVCR,ADDFLG#(R4) ;Set SVC request
+	CALL	STROUT		;Start output if need be.
+	TSTB	ADDTSY#(R4)	;IS THE "SYNC LOSS" TIMER ACTIVE?
+	BEQ	SEC4		;NO-GO ON
+	DECB	ADDTSY#(R4)	;YES-COUNT IT DOWN
+	BGT	SEC4		;CONTINUE IF DID NOT RUN OUT
+	BIS	#$SYNLS+$NAKF+$FLSH,ADDFLG#(R4);RAN OUT-INDICATE "SYNC LOSS"
+	BIS	#$LNER,ADDNFG#(R4)	;We have a line error?
+SEC4:	MOV	ADNEXT#(R4),R4	;Get the next ADB
+	BNE	SEC2		;If not zero go on
+	RETURN			;No more to do
+	.PAGE
+	.SBTTL	LIND	- SVCTNH - Once a Tenth service
+
+	TNHSEC	SVCTNH
+
+	PSECT	CODE,RO,I,LCL,REL,CON
+
+SVCTNH:	MOV	#ASDADB#,R4	;Get first ADB
+TNH2:	BIC	#$CKLS,ADDFLG#(R4)  ;Clear the clock loss flag..
+	TBBN	$RCLK,ADDFLG#(R4),TNH3  ;If theClock is running go on
+	BIS	#$LNER,ADDNFG#(R4)	;We have line error
+	BIS	#$NAKF+$FLSH+$SVCR+$CKLS,ADDFLG#(R4) ;Set the unhappy bits
+	INC	ADDRCL#(R4)	;Recieve clock loss counter
+TNH3:	TBBN	$TCLK,ADDFLG#(R4),TNH4	;If the clock is going ..ok
+	BIS	#$LNER,ADDNFG#(R4)	;A line error?
+	BIS	#$NAKF+$FLSH+$SVCR+$CKLS,ADDFLG#(R4)	;We are unhappy
+	INC	ADDTCL#(R4)	;Count transmit clock loss errors
+TNH4:	BIC	#$RCLK+$TCLK,ADDFLG#(R4)	;Clear for next time
+	MOV	ADNEXT#(R4),R4		;Next ADB?
+	BNE	TNH2
+	RETURN
+	.PAGE
+	.SBTTL	LIND   - DELAYT - Table of delay values
+	PSECT	PURE,RO,D,LCL,REL,CON
+
+;Table of delay values in 1/60 of a second for each baud rate
+DELAYT:	.WORD	0
+	.WORD	278.	;50
+	.WORD	185.	;75
+	.WORD	185.	;110
+	.WORD	111.	;134.5
+	.WORD	124.	;150
+	.WORD	93.	;200
+	.WORD	62.	;300
+	.WORD	62.	;300
+	.WORD	47.	;400
+	.WORD	31.	;600
+	.WORD	16.	;1200
+	.WORD	11.	;1800
+	.WORD	10.	;2000
+	.WORD	9.	;2400
+	.WORD	6.	;3600
+	.WORD	5.	;4800
+	.WORD	4.	;7200
+	.WORD	3.	;9600
+	.WORD	2.	;19200
+	.END
+ 9ufs›
