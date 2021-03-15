@@ -1,0 +1,308 @@
+entry
+	AtLine,		comment Line by Line read from file;
+	CToken,		comment Token by Token read from string;
+	CmdScn,		comment Main command scan loop;
+	CmdLin,		comment Single command scanner;
+	CmdEOL,		comment EOL character (or best guess);
+	FndCmd,		comment Find legal keyword/command;
+	FndKey,		comment Find matching keyword;
+	ReScan		comment Re-Scan command line;
+;
+Begin "Command Scan Module"
+
+
+require "MYSAIL.DEF" source!file;
+require "BRKINI.REQ" source!file;
+
+Define Space = {'40}, Tab = {'11};
+
+External Integer RPGSW;			! start offset     ;
+Internal Own Integer CmdEOL;		! EOL character    ;
+
+Own Boolean Interactive;		! what type of run ;
+Own Integer AChan, EndOfFile, AtBrk;	! input file vars  ;
+Own Integer Low, High, Dummy;		! array indicies   ;
+Own Integer Cmd, Cmd.Index;		! command indicies ;
+Own String  AtChan, AtText;		! stacked channels ;
+Own String  Command, Line, Tok, More;	! various strings  ;
+Own String  RescanLine, RescanText;	! rescan line text ;
+
+Preset!with	"R", "RUN", "START", "CONTINUE", "EXECUTE",
+		"COMPILE", "DEBUG", "TRY", "PERFORM", "DO";
+Own Safe String Array MonitorNames[ 1 : 10 ];
+
+
+Internal Simple String Procedure ReScan;
+! ----------------------------------------------------------------------;
+!									;
+!	ReScan		Routine to query the monitor to determine if	;
+!			a rescan line is avaliable, and to return that	;
+!			line.  The variable !SKIP! can be checked to	;
+!			obtain the line-termination character.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "rescan command line"
+
+    Own Integer Flag;
+    Label EndRescan;
+
+    start!code
+	setom	Flag;			! setup for self ;
+	ttcall	'6,Flag;		! getlch ;
+	movsi	'100000;		! get rescan-line bit;
+	andb	Flag;			! mask result;
+	jumpe	EndRescan;		! no line, jump;
+	ttcall	'10,;			! rescan ;
+	ttcall	'14,;			! skpinl ;
+	setzm	Flag;			!  no input ;
+EndRescan:
+
+    end;
+
+    Return( If ( Flag ) then inchwl else NULL );
+
+
+end "rescan command line";
+
+
+simple procedure Fatal( String Reason );
+! ----------------------------------------------------------------------;
+!									;
+!	Fatal		Routine for AtLine for printing error messages.	;
+!									;
+! ----------------------------------------------------------------------;
+Print(	Crlf, "Unable to open file: ", AtText,
+	"(", Reason, ").", Crlf, "Please RE-ENTER line: " );
+
+
+Internal simple string procedure CToken (reference string S);
+! ----------------------------------------------------------------------;
+!									;
+!	CToken		Scan the string S and return the first word	;
+!			or punctuation character to the caller.		;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Scan( S, BrkWht, Brk );	! clear whitespace;
+    Tok _ scan(S, BrkBrk, Brk);	! get the next word;
+    If length(Tok) = 0		! null?;
+	then if length(S) = 0	!   null source also?;
+	    then return (null)	!    yes - return null;
+	    else Tok _ lop(S);	!    no  - get a character;
+    Return(Tok);		! return the token;
+end;
+
+internal recursive string procedure AtLine( Boolean Typeit (False) );
+! ----------------------------------------------------------------------;
+!									;
+!	AtLine		Routine to allow input from either the TTY or	;
+!			any level of indirect files until SAIL runs	;
+!			out of channels one line at a time.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "AtLine"
+
+    If ( Length( AtChan ) = 0 )				! Check for channel;
+     then begin "read from terminal"
+	AtText_ Inchwl;					! default to inchwl;
+	AtBrk_ !Skip!;					!  remember the eol;
+     end "read from terminal"
+     else begin "read from file"			! else use a file;
+
+	AtText_ Input( AtChan, BrkLin );		! read initial line;
+	While ( AtBrk = 0 and not EndOfFile )		! ? eof, ? crlf;
+	 do AtText_ AtText & Input( AtChan, BrkLin );	!  then read more;
+
+	If ( Typeit and not EndOfFile )			! ? wants it printed;
+	 then Print( AtText, Crlf );
+
+	If ( EndOfFile )				! if this was a read;
+	 then begin "end of reading"			!   past end of file;
+	    Release( Dummy_ Lop(AtChan) );		! forget chan;
+	    Return( AtLine( Typeit ) );			! and return self;
+	 end "end of reading"
+     end "read from file";
+
+    If ( AtText = "@" )					! If first char = "@";
+     then begin "nest command files"			! ? command file;
+
+	Dummy_ Lop( AtText );				! remove "@" char;
+
+	If ( 0 geq AChan_ GetChan )			! If any channels ;
+	 then begin "no channels available"
+	    Fatal( "no channels" );			! No, none left ;
+	    Return( AtLine( Typeit ) );			! Try again ;
+	 end;	    
+
+	Open( AtChan_ AChan & AtChan,
+	      "DSK", 1, 1,0, 512,AtBrk, EndOfFile_-1);	! get channel;
+
+	If Not ( EndOfFile )
+	 then Lookup( AtChan, AtText, EndOfFile_ -1);	! ? file found;
+
+	If ( EndOfFile )
+	 then begin "cant find file"
+	    Release( Dummy_ Lop(AtChan) );		! chop channel list;
+	    Fatal( "open error" );			! complain about file;
+	 end "cant find file"
+	 else If ( Typeit )
+	       then Print( "(Reading from file """,AtText,""")  " );
+
+	Return( AtLine( Typeit ) );			! try file-line;
+     end "nest command files";
+
+    Return( AtText );					! Return text read ;
+end "AtLine";
+
+Internal Integer Procedure FndKey(
+			String Key;
+			String Array CMD.Names );
+begin "Find Key"
+    Low_  ArrInfo( CMD.Names, 1 );	! initialize low index   ;
+    High_ ArrInfo( CMD.Names, 2 );	! initialize high index  ;
+
+    CMD.Index_ Low - 1;			! setup default: invalid ;
+
+    For Cmd_ Low step 1 until High	! for each keyword;
+     do
+	If KEqu( Key, CMD.Names[ Cmd ][1 for length(Key)] )
+	 then if KEqu( Key, CMD.Names[ Cmd ] )
+	     then Return( Cmd )		!  -- exact match --;
+	     else if CMD.Index < Low	!  -check ambiguity-;
+		then CMD.Index_ Cmd	!  Ok, set instance ;
+		else Return( Low - 2 );	!  No, set error    ;
+
+    Return ( CMD.Index );		! return result;
+end "Find Key";
+
+
+Internal Integer Procedure FndCmd(
+			String Key;
+			String Array CMD.Names;
+			Boolean Procedure CMD.Legal );
+begin "Find Key"
+    Low_  ArrInfo( CMD.Names, 1 );		! initialize low index   ;
+    High_ ArrInfo( CMD.Names, 2 );		! initialize high index  ;
+
+    CMD.Index_ Low - 1;				! setup default: invalid ;
+
+    For Cmd_ Low step 1 until High		! for each keyword;
+     do
+	If KEqu( Key, CMD.Names[ Cmd ][1 for length(Key)] )
+	 then If CMD.Legal( Cmd )		!  match?  and legal;
+	     then if KEqu( Key, CMD.Names[ Cmd ] )
+		 then Return( Cmd )		!  -- exact match --;
+		 else if CMD.Index < Low	!  -check ambiguity-;
+		    then CMD.Index_ Cmd		!  Ok, set instance ;
+		    else Return( Low - 2 );	!  No, set error    ;
+
+    Return ( CMD.Index );			! return result;
+end "Find Key";
+
+
+Internal String Procedure CmdLin(
+			String Array CMD.Names;
+			Boolean Procedure CMD.Legal;
+			Procedure CMD.Action;
+			Boolean CMD.FileLine (True) );
+begin "perform command"
+
+    Low_ ArrInfo( CMD.Names, 1 );		! initialize low index ;
+
+    If ( Length( RescanLine ) )			! Do we have an initial ;
+     then begin
+	Line_ RescanLine;			! Copy command line ;
+	RescanLine_ Null;			! Forget this happenned ;
+						! CmdEOL already setup ;
+     end
+     else begin
+	Line_ AtLine( CMD.FileLine );		! Get a command;
+	CmdEOL_ AtBrk;				! Remember the EOL;
+     end;
+
+    If Length( Line ) = 0			! Ignore blank lines;
+     then Return( Null );
+
+    Command_ CToken( Line );			! Get the first word;
+    If KEqu(Command, "?")			! "?" means "HELP";
+     then Command_ "HELP";
+
+    If Low leq CMD.Index_ FndCmd( Command, CMD.Names, CMD.Legal )
+     then begin "setup command"			! If legal command;
+
+	If ((Line = Space) or (Line = Tab))	!   then strip any;
+	 then Scan( Line, BrkWht, Brk );	!      whitespace and;
+
+	CMD.Action( CMD.Index, Line, Brk );	!      call dispatch;
+	Return( Null );				!      and return;
+
+     end "setup command"
+     else If CMD.Index = Low - 1		!  else complain;
+	   then Return( "Invalid command." )	!    invalid or ;
+	   else Return( "Ambigious command." );	!    ambigious ;
+
+end "perform command";
+
+Internal Procedure CmdScn(
+			String CMD.Heading;
+			String CMD.Prompt;
+			String Array CMD.Names;
+			Boolean Procedure CMD.Legal;
+			Procedure CMD.Action;
+			Boolean CMD.FileLine (True) );
+
+begin "command scan"
+
+    RescanLine_ Rescan;			! check for vestigial cmds ;
+
+    If ( Length( RescanLine ) )		! if non-null, then do check ;
+     then begin "check out line"
+
+	CmdEOL_ !Skip!;			! save EOL character ;
+	RescanText_ RescanLine;		! save text of line ;
+
+	If ( FndKey( CToken( RescanLine ), MonitorNames ) )
+	 then				! read 'til valid brk or eol ;
+	    Do Scan( RescanLine, BrkCmd, Brk )
+	     until (Brk = ";") or (Brk = 0)
+	 else
+	    RescanLine_ RescanText;	! reset line for below ;
+
+     end "check out line";
+
+    Interactive_ (not RPGSW) and ( Length( RescanLine ) = 0 );
+
+    If ( Interactive )			! if interactive, print msgs ;
+     then begin
+	If ( CmdEOL = #Esc )		! start cmd ended with ESC? ;
+	 then begin
+	    Print( Crlf );		!  then print a CRLF ;
+	    CmdEOL_ 0;			!       and clear it ;
+	 end;
+	Print( Crlf, CMD.Heading, Crlf&Crlf );
+     end;
+
+    While TRUE				! loop for eternity ;
+     do begin "command loop"
+
+	If ( Interactive )		! do we have a real user here? ;
+	 then begin
+	    If ( CmdEOL = #Esc )	! last terminated with escape? ;
+	     then Print( Crlf );	!  then make sure at beginning ;
+	    Print(CMD.Prompt);		! print the supplied prompt ;
+	 end;
+
+	Print(More_ CmdLin( CMD.Names, CMD.Legal, CMD.Action, CMD.FileLine ));
+
+	If Length(More)			! was something printed? ;
+	 then Print( Crlf );		! yes, so finish up with CRLF ;
+
+	If ( not Interactive )		! was this a real user? ;
+	 then Call( 0, "EXIT" );	! no, so say bye-bye ;
+
+       end "command loop";
+   end "command scan";
+
+end "Command Scan Module";
+
+   
