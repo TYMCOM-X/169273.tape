@@ -1,0 +1,1139 @@
+	.TITLE	NXMXV - MXV 11 BOOTSTRAP
+	.ASECT
+	.NLIST	ME,MEB
+	.ENABL	LC
+
+
+
+;This bootstrap is designed to run on an LSI 11. Features include Tymnet
+; format down line loading as well as Nexilis format loading.
+; Automatic line scanning is implimented for both. This is done by
+; alternately listening to devices in both formats, timing out
+; if no valid data has been received whithin aprox. 5 sec.
+; If valid data stops for more than 60 sec then the scan restarts.
+;	Leland G Hoover - Jan/80
+;	Dennis Ernst	- April/82
+; An optional prefix file can be used to change the device CSR
+; and vector addresses. This file might look like:
+;
+;	DR0CSR=	170000		;Assign device CSR addr
+;	DR1CSR=	170010
+;	DR2CSR=	170020
+;	DR3CSR=	170030
+;	DU0CSR=	170040
+;	DU1CSR=	170050
+;	DU2CSR=	170060
+;	DU3CSR=	170070
+;	DR0VEC=	300		;Assign device vector addresses
+;	DR1VEC=	310
+;	etc.
+
+
+	.MACRO	PUSH	REG
+		MOV	REG,-(SP)
+	.ENDM
+
+	.MACRO	POP	REG
+		MOV	(SP)+,REG
+	.ENDM
+
+.SBTTL	RELOCATION DEFINITIONS
+
+BASE=	20000
+
+.IF NDF RAMTST
+RAMTST=	0
+RELOC=	0
+.=	0
+.ENDC
+
+.IF EQ RAMTST-1
+RELOC=	1004	;Relocation offset for RAM testing
+.=	1000
+.ENDC
+.PAGE
+.SBTTL	HARD VECTOR TABLE
+
+
+; These vectors point to the lowest portion of real mem (20000).
+; That is vectors 0-777 are mapped to 20002-20777. PSW is
+; always set to 340. JMP instructions in real mem will make vectors
+; accessable.  Vector 0 is special.
+
+
+HVT:
+.IIF EQ RAMTST-1,	JMP	COPY	;Copy prog down to low mem
+
+HVTAB:	TRAP	1			;RSTOP
+	.RAD50	/BRZ/
+
+ADDR=	20004
+COND=	1
+	.REPT	4
+	.WORD	ADDR
+	.WORD	340+COND
+ADDR=	!ADDR+4
+COND=	!<COND+1>&17
+	.ENDR
+
+	.WORD	PWRDWN			;Power down/up vector
+	.WORD	340
+
+ADDR=	!ADDR+4
+COND=	!<COND+1>&17
+	.REPT	152
+
+	.WORD	ADDR
+	.WORD	340+COND
+ADDR=	!ADDR+4
+COND=	!<COND+1>&17
+	.ENDR
+COPNOT:	.ASCIZ	/COPYRIGHT 1985, McDonnell-Douglas Tymnet Inc., Cupertino Ca./
+.PAGE
+.SBTTL	DEFINITIONS
+
+
+;Device definitions
+
+
+.IIF NDF WATDOG		WATDOG=	176506	;Watch dog timer
+
+.IIF NDF DR0CSR		DR0CSR=	167770	;Defalt device addresses
+.IIF NDF DR1CSR		DR1CSR= 167760
+.IIF NDF DR2CSR		DR2CSR=	167750
+.IIF NDF DR3CSR		DR3CSR=	167740
+
+.IIF NDF DU0CSR		DU0CSR=	160010
+.IIF NDF DU1CSR		DU1CSR=	160020
+.IIF NDF DU2CSR		DU2CSR=	160030
+.IIF NDF DU3CSR		DU3CSR=	160040
+
+.IIF NDF DR0VEC		DR0VEC=	BASE+330	;Default device vectors
+.IIF NDF DR1VEC		DR1VEC=	BASE+40
+.IIF NDF DR2VEC		DR2VEC=	BASE+50
+.IIF NDF DR3VEC		DR3VEC=	BASE+70
+
+.IIF NDF DU0VEC		DU0VEC=	BASE+400
+.IIF NDF DU1VEC		DU1VEC=	BASE+410
+.IIF NDF DU2VEC		DU2VEC=	BASE+420
+.IIF NDF DU3VEC		DU3VEC=	BASE+430
+
+DROBUF=	2				;DR output buffer
+DRIBUF=	4				;DR input buffer
+
+RXDBUF=	2				;DUV receive buffer (read only)
+PARCSR=	2				;DUV parameter csr (write only)
+TXCSR=	4				;DUV Transmit csr
+TXDBUF=	6				;DUV transmit buffer
+
+
+;Impure storage
+
+FMTOGL=	BASE+10				;Format toggle. This location is saved
+					; through the entire boot process.
+TIMER=	BASE+12				;Timer variable. Used for all formats
+TIMERW=	BASE+14				;Watch dog timer
+TIMEC=	BASE+16				;Time out constant
+TYSTAT=	BASE+20				;TYMNET format DUV line scan state table
+					; This is 4 consec words!
+LODTOP=	BASE+30				;Max address to load
+
+;Misc definitions
+
+TIMEC0=	300.				;Time out constant (5 sec)
+TIMEC1=	1800.				;  "  (30 sec)
+TIMEC2=	5400.				;  "  (90 sec)
+STACK=	BASE+770			;Stack starts below program
+JMPIMM=	137				;Jump immediate instruction
+TRANAD=	BASE+1000			;Transfer address
+.PAGE
+.SBTTL	INITIALIZE MACHINE
+
+
+;Initialize machine - Boot entry point.
+;	PSW => 340 (interrupts have been turned off)
+
+.=	1000+RELOC			; Absolute start
+.IIF EQ RAMTST-1,	HALT		;ODT breakpoint
+
+	RESET				;Reset bus
+	MTPS	#340			;Stop those damn clock interrupts
+	JMP	START			;Go get um
+
+PWRDWN=	.-RELOC
+
+.IIF EQ	RAMTST-1,	HALT		;Slow things down when testing
+
+	RESET				;Clear the i/o devices
+	MTPS	#340			;Stop those damn clock interrupts
+	TST	@#21020			;Test node status word
+	BMI	START			;Don't check checksum if we wern't when running
+	MOV	@#21012,R2		;Get "PUREND"
+	CMP	#21040,R2		;Make check for reasonableness
+	BHI	START			;Too low - skip to reload
+	CMP	#157700,R2		;Make check for reasonableness
+	BLO	START			;Too high _ Skip these checks
+	CLR	R0			;Clear checksum accumulator
+	CLR	R1			;Clear data address pointer
+CHKLOP:	CMP	R1,#21020		;Are we pointed to volatile data
+	BNE	CHKLO1			;No
+	MOV	#21024,R1		;Yes - skip  over it
+CHKLO1:	ADD	(R1)+,R0		;Add in the next chunk of data
+	CMP	R2,R1			;Are we at the end?
+	BHI	CHKLOP			;No
+	MOV	@#21010,R1		;Yes - Get address of checksum
+	CMP	(R1),R0			;Do the check sums match?
+	BNE	START			;No - do other start up
+	JMP	@#21000
+
+START:	MOV	#STACK, SP		;Init stack
+
+; Size memory
+
+	MOV	#JMPIMM, @#20004
+	MOV	#GOTSIZ, @#20006	;Return vector
+	MOV	#10, R0			;Loop cnt for max mem siz
+	CLR	R1
+MEMSIZ:	ADD	#20000, R1		;Inc memory addr
+	MOV	R1, (R1)		;Test for real mem
+	SOB	R0, MEMSIZ		;Real mem, br if not in device space
+GOTSIZ=	.-RELOC
+	MOV	R1, R2			;Store max load addr
+	.PAGE
+	.SBTTL	MEMORY VERIFICATION ROUTINE
+
+; Memory verification routine
+;	Halts on bad memory location
+;	R0 = Test data table offset
+;	R1 = Current memory address
+
+
+MEMBOT=	BASE+0
+
+MEM:	MOV	R2, R1			;Init to first real mem location
+	CLR	R0
+
+NXTPAT:
+MEM1:	MOV	TSTDAT(R0), -(R1)	;Write all of mem, top down
+	CMP	#MEMBOT, R1		;Done
+	BNE	MEM1			; Br if not
+	MOV	#'M, @#WATDOG		;Poke watchdog timer
+RMEM:	CMP	TSTDAT(R0), (R1)+	;Is this what should be there?
+	BEQ	OK			; Br if so
+
+NOK:	MOV	#MERMSG, R3		;Point to error string
+10$:	TSTB	@#177564		;Test the transmit CSR
+	BPL	10$
+	MOVB	(R3)+,@#177566		;Output the char
+	BNE	10$
+	HALT
+MERMSG=	.-RELOC
+	.ASCIZ	<15><12>/    MEM ERROR AT (R1)/
+
+OK:	CMP	R2, R1			;Done with this pattern?
+	BNE	RMEM
+	TST	(R0)+			;Do next pattern
+	CMP	#TSTDAL+2, R0		;Done?
+	BNE	NXTPAT			; Br if so
+10$:	MOV	R1, R0
+	MOV	R0, -(R1)		;Store address in address
+	CMP	#MEMBOT, R1		;Done?
+	BNE	10$			;Not yet
+	MOV	R2, R1			;Get back top address
+20$:	MOV	R1, R0
+	CMP	R0, -(R1)		;Check for address in address
+	BNE	NOK			;Not there
+	CMP	#MEMBOT, R1		;Done?
+	BNE	20$			;Not yet
+	MOV	R2, @#LODTOP		;Save away max load address
+.PAGE
+RSTRT=	.-RELOC
+	MOV	#STACK, SP
+	MOV	#'S, @#WATDOG		;Poke watchdog timer
+	CLR	@#TIMERW		;Init watch dog timer
+	CLR	@#TIMER			;Init timer
+	MOV	#TIMEC0, @#TIMEC	;Init timer for scanning mode
+	INC	@#FMTOGL		;Togle boot format
+
+
+;Set up soft vectors for scan
+
+
+	MOV	#VTAB, R2		;Point to vector table
+	MOV	#NPCTAB, R3		;Pointer to new PC table
+SETVEC:	MOV	(R2), R5		;Get vector from table
+	BEQ	2$			;Br if done
+	MOV	#JMPIMM, (R5)		;Store JMP instr
+	MOV	(R3)+, 2(R5)		;Store imm addr operand
+	TST	(R2)+			;Inc table pointer
+	BR	SETVEC
+
+2$:
+.PAGE
+.SBTTL	INIT DEVICES FOR AUTO SCAN
+
+
+;Initialize devices for automatic line scanning. They are
+;	set up alternatly in NEXNET format and TYMNET format till boot
+;	is completed.
+
+
+	MOV	#DTAB, R1		;Point to device addr table
+	MOV	#7, R2			;Loop counter and device type (bit 2)
+	MOV	#'I, @#WATDOG		;Poke watchdog timer
+INITDV:	MOV	(R1)+, R4		;Get device addr
+	BIT	#4, R2			;Which device type?
+	BEQ	2$			;Br if DUV
+	MOV	#100, (R4)		;Init DR
+	BR	4$			;Do next device
+
+2$:	BIT	#1, @#FMTOGL		;Test load format
+	BNE	3$			;Br if TYMNET format
+	CALL	NXDUV			;Init DUV
+	BR	4$
+
+3$:	CALL	TYDUV			;Init DUV
+4$:	SOB	R2, INITDV		;Br till all dev are initialized
+
+;Init TYMNET format state table
+
+	MOV	#TYSTAT, R3
+	CLR	(R3)+
+	CLR	(R3)+
+	CLR	(R3)+
+	CLR	(R3)
+	CLR	R3
+
+
+;Initialization for line scanning is done! Fake an RTI and wait for
+;	someone to speak.
+
+
+	CLR	-(SP)			;Set PSW to 0
+	JSR	PC, RTIZ
+SCAN:	BR	SCAN			;Wait here for first device to interrupt
+.PAGE
+.SBTTL	CHECK FOR VALID LOAD HEADER
+
+
+; Entry here is from interrupting device.  This routine makes
+; free use of regesters because main program level does not
+; use them.
+;	DR header check routine.  If data is a valid prefix
+; lock onto one DR, point soft vector to NXINPT, set state to
+; 2 and initialize mem for NX boot.
+
+
+DR3:	INC	R3			;Calc device address table offset
+DR2:	INC	R3
+DR1:	INC	R3
+	ASL	R3
+DR0:	MOV	DTAB(R3), R4		;Load device CSR address
+HDRCHK:	CMP	#PREFIX, DRIBUF(R4)	;Check for valid prefix word
+	BEQ	20$			;Br if valid
+	CLR	R3			;Must be set for DU's
+	TST	DRIBUF(R4)		;check for zero word
+	BNE	10$			;Not one don't accept the data
+	BIC	#2,(R4)			;Clear input accepted bit
+	BIS	#2,(R4)			;Declare input accepted
+10$:	RTI				;Not header, try again
+
+20$:
+
+;Lock onto DR
+
+	RESET				;Turn rest of devices off
+	BIS	#100, (R4)		;Turn interrupts back on for this DR
+	BIC	#2, (R4)		;Clr input done bit
+	BIS	#2, (R4)		;Set input done bit
+	MOV	VTAB(R3), R3		;Get vector addr
+	MOV	#NXINPT, 2(R3)		;Point vector to NX input routine
+	CLR	R3			;R3 => device type
+	CLR	@#20004			;Halt on all further nxm
+	MOV	#2, R5			;Fix state (just got prefix)
+	BR	NXINIX			;Br to NX common initialization
+.PAGE
+.SBTTL	CHECK DUV FOR VALID HEADER
+
+
+; Entry here from DUx interrupt.
+
+
+DU3:	INC	R3			;Calc device addr table offset
+DU2:	INC	R3
+DU1:	INC	R3
+	ASL	R3
+DU0:	MOV	DUTAB(R3), R4		;Load device addr
+	BIC	#400, (R4)		;Turn off strip sync
+	MOV	RXDBUF(R4), R1		;Copy data reg
+	BPL	RDGOOD			;Br if no read errors
+DISRTI:	BIC	#20,(R4)		;Clear search sync
+	MOV	#526,(R4)		;Search sync
+	CLR	TYSTAT(R3)		;Dismis interrupt, not locked yet
+DISRTT:	CLR	R3			;Reset device index
+	RTI				;Read err, no good
+
+RDGOOD:	BIT	#1, @#FMTOGL		;Check load format
+	BEQ	NXHDR			;Br if NX format
+
+;TYMNET format header check
+
+	ADD	TYSTAT(R3), PC		;Disp on device state
+	BR	BY1			;Skip over the word count
+
+BY2:	TST	R1			;Is the upper byte of WC zero?
+	BNE	DISRTI			;No
+	JMP	TYLOCK			;Yes
+
+BY1:	ADD	#2, TYSTAT(R3)
+	BR	DISRTT
+
+
+;NEXNET format header check
+
+NXHDR:	CMPB	#307, R1		;Check for valid header
+	BEQ	NXDULK			;Br if valid
+	CALL	NXDUV			;Reset device since this may be
+					; a false sync
+	BR	DISRTI			;Not header, try again
+
+NXDULK:	RESET				;Turn off all interrupts
+	CALL	NXDUV			;Init DUV
+	MOV	SVDTAB(R3), R3		;Get soft vector addr
+	MOV	#NXINPT, 2(R3)		;Load vector for NX input
+	CLR	@#20004			;Halt on all further nxm
+	MOV	#1, R3			;Save device type
+.PAGE
+.SBTTL	DEVICE INDEPENDANT INITIALIZATION
+
+
+;Regester assignments:
+;R0=Temporary for data received
+;R1=Nak/ack code
+;R2=Word count for data
+;R3=Device type		DR=0	DU>0
+;R4=Address of device
+;R5=State
+
+
+;state:
+; 0 wait for prefix
+; 2 wait for count and packet type
+; 4 wait for data
+
+
+MAXDR=	300.				;maximum word count per DR11 data blk
+MAXSIZ=	36				;Maximum word count per data block
+ACK=	100307				;ack code
+NAK=	140307				;nak code
+SYNC=	26				;Sync charactor
+PREFIX=	2307				;prefix code for start of a block
+
+CHKSM=	BASE+104			;block checksum
+
+FLAGS=	BASE+106
+LDADR=	BASE+110
+TOGLE=	BASE+112			;Bit 0 is used as togle in acks
+LSTRSP=	BASE+114			;Last response is an ACK or NAK
+BYTEHI=	BASE+116			;Input byte selector
+WRDRDY=	BASE+120			;Word ready for processing
+RDERR=	BASE+122			;Read error flag
+NEWWRD=	BASE+124			;New data word returned by NXINPT
+TBUF=	BASE+576			;Tymnet transmit buffer
+
+
+; Bit definitions and protocal information
+
+
+$RXMIT=	10000		;bit to set for rexmit response
+			;setting this bit combines the ACK for the
+			;rexmit request with the last response requested
+$TOGLE=	400		;Sync bit for ACK responses. Bit is set for
+			;initial ACK and is toggled on each ACK there after.
+.PAGE
+
+
+;Device independant initialization
+;
+;	R3 => Device type (0=DR, 1=DUV)
+;	R4 => Device address
+
+
+NXINIT=	.-RELOC
+	CLR	R5			;Set state to zero
+NXINIX:	CLR	@#TIMER			;Reset timer
+	MOV	#TIMEC1, @#TIMEC	;Set timeout
+	MOV	#STACK, SP		;Reinit stack
+	MOV	SP,@#FLAGS		;Make flags > 0
+	CLR	@#TOGLE			;set togle to zero
+	CLR	@#RDERR
+	CLR	@#BYTEHI		;Init high byte pointer
+	MOV	#NAK,@#LSTRSP		;initialize last response
+	CLR	@#WRDRDY		;Init word ready flag
+	MOV	#1000,@#LDADR		;initial load addr is 1000
+	CLR	-(SP)			;Set processor priority to 0
+	JSR	PC,RTIZ
+.PAGE
+
+; Main program - loops till a word is ready
+
+
+NXMAIN:	TST	@#WRDRDY		;Is a word ready?
+	BEQ	NXMAIN			;Br if not
+	TST	@#RDERR			;Check for read error
+	BEQ	2$			;Br if err
+
+
+; Read err, abort this block
+
+	CLR	@#RDERR			;Dismis read err
+	BR	NEWBLC			;Abort this block
+
+2$:	CLR	@#WRDRDY
+	TST	R3
+	BEQ	4$
+	MOV	@#NEWWRD, R0		;Get new data word
+	BR	6$
+
+4$:	MOV	4(R4), R0		;Copy DR data reg
+	BIS	#2, (R4)		;Set Input done
+
+
+; Dispatch on state
+
+
+6$:	ADD	R5,PC			;update PC for jmp to required state
+	BR	GETPRF			;0
+	BR	GETCNT			;2
+;	BR	GETDAT			;4
+
+.PAGE
+; Input n bytes of data
+
+
+GETDAT:	DEC	R2			;Decrement word count
+	BLT	HADBCS			;Count<0, data done. got bcs
+	ADD	R0,@#CHKSM		;Accumulate block checksum
+	CMP	R1,#STACK+2		;Check for low address
+	BLOS	10$			;Skip the store if low memory
+	MOV	R0,(R1)			;Count>=0, got data . store in mem
+10$:	TST	(R1)+			;Increment R1
+	BR	NXMAIN			;Wait for next word
+.PAGE
+
+; Start program just loaded after waiting about 2 sec
+
+
+STRTPR:	MTPS	#340			;Turn off all interrupts
+	MOV	#40,R1
+1$:	SOB	R0,.			;Wait for about 2 sec
+	SOB	R1,1$
+	JMP	@#TRANAD		;start the new program
+
+
+; Get prefix - Sync on prefix word
+
+
+GETPRF:	CMP	#PREFIX,R0		;Is it the prefix?
+	BNE	NEWBLC			;No. wait for it again.
+INCSTA:	TST	(R5)+			;Increment state
+	BR	NXMAIN			;Wait for next word
+
+
+; Get word count and check for reasonable value
+
+
+GETCNT:	CLR	@#CHKSM			;Clear block checksum
+	TST	R3			;If dr we dont check for blk size
+	BEQ	1$			;
+	MOV	R0,R2			;save word count
+	BLE	SETFLG			;If not data block BR to set flags
+	CMP	#MAXSIZ,R0		;If oversize block
+	BR	2$
+
+1$:	BIC	#1,(R4)			;Improve timing; clear output ready bit
+	MOV	R0,R2			;save word count
+	BLE	SETFLG			;If not data block BR to set flags
+	CMP	#MAXDR,R0		;test for over size blk
+2$:	BLT	SNAK			; br to snak
+	MOV	@#LDADR,R1		;Update block load address
+	BR	INCSTA			;Advance state
+
+SETFLG:	MOV	R0,@#FLAGS		;Save flags and get checksum
+	BR	INCSTA			;Advance state
+
+
+
+; compare checksums
+
+
+HADBCS:	CMP	R0,@#CHKSM		;Compare block cs's
+	BNE	SNAK			;No match: send nak
+	CLR	@#TIMER			;Good block, reset timer
+
+
+; block is good, check for REXMIT_LAST_RESPONSE msg
+
+
+	CMP	#-2,@#FLAGS		;Check for a retransmit request
+	BNE	NRXMIT			;No, br to response code
+
+
+; REXMIT_LAST_RESPONSE with rexmit bit set
+
+
+	NEG	@#FLAGS			;Clr message flags
+	MOV	@#LSTRSP,R1		;restore last response
+	BIS	#$RXMIT,R1		;set retransmit bit in previous
+					; response to indicate rexmit blk good
+	BR	RXMIT			;send that last response again
+
+
+; send ACK response
+
+
+NRXMIT:	MOV	R1,@#LDADR		;update load address for next block
+	MOV	#ACK,R1			;Put ack code in R1
+
+
+; toggle sync bit in response.
+;	note:	Bit is set for first msg. This bit is toggled
+;		only for each block ACKed.
+
+
+	INC	@#TOGLE
+	BIT	#1,@#TOGLE
+	BNE	1$			;br if toggle bit is clr
+	BIS	#$TOGLE,R1		;set toggle bit
+
+
+; Send ACK
+
+
+1$:	CALL	SNDBAK			;send ack
+
+; check for LAST_BLOCK msg and RESET msg
+
+	TST	@#FLAGS			;Is last block flag set?
+	BEQ	STRTPR			;Last one! lets start it.
+	BLT	RESET
+
+
+;new block - reset state and device if necessary
+
+
+NEWBLC:	CLR	R5			;Reset state to 0 for new block
+	TST	R3			;If DR we
+	BEQ	NXMAIN			; wait for next word
+BITWID:	CALL	NXDUV
+	BR	NXMAIN			;Wait for next word
+
+
+; NAK response
+
+
+SNAK:	MOV	#NAK,R1			;No match:  put nak code in R1
+RXMIT:	CALL	SNDBAK			;Send nak
+	BR	NEWBLC
+
+
+; RESET bootstrap.
+
+
+RESET:	MTPS	#340			;Turn off interrupts for reset
+	CLR	R5			;Reset state to 0
+	TST	R3			;Is this a DR interface?
+	BEQ	2$			;Br if so
+	CALL	NXDUV			;Reset interface
+2$:	JMP	@#NXINIT		;restart boot
+.PAGE
+
+
+; SNDBAK - Send response back and output routines.
+
+
+SNDBAK:	TST	R3			;If DR we
+	BEQ	DRSND			; BR to DR code
+	MOV	#12,R0			;Set up to send 12 sync char
+SNDSYN:	BIS	#20, TXCSR(R4)		;Set send bit
+	CALL	XWAIT			;Wait till last xmition done and
+	MOV	#SYNC,TXDBUF(R4)	; send sync
+	DEC	R0			; till done
+	BGE	SNDSYN			;
+	MOV	R1,@#LSTRSP		;Save last response for possible rxmit
+	CALL	SENDU			;Send data twice, as data and checksum
+	CALL	SENDU			;
+	CALL	XWAIT			;wait till done
+	MOV	#SYNC,TXDBUF(R4)	;flush buffer
+	CALL	XWAIT
+	BIC	#20, TXCSR(R4)		;Turn off xmitter
+	RETURN
+
+XWAIT:	TSTB	TXCSR(R4)		;Wait for xmit done bit for DUx
+	BPL	XWAIT
+	RETURN
+
+
+
+;SENDU - DUV output routine
+
+
+SENDU:	CALL	XWAIT			;Wait till last xmition done
+	MOVB	R1,TXDBUF(R4)		; send first byte
+	SWAB	R1			;Swap to get second byte
+	CALL	XWAIT			;When ready we
+	MOVB	R1,TXDBUF(R4)		; send second byte
+	SWAB	R1			;leave set for next entry
+	RETURN				; and return
+
+
+;DRSND - DR output routine
+
+
+DRSND:	BIC	#1,(R4)			;Clear output ready bit
+	MOV	R1,2(R4)	; Put ack or nak code in DRV output register
+	BIS	#1,(R4)			;Set input ready bit in csr
+	RETURN
+.PAGE
+.SBTTL	SUBROUTINES
+
+
+;Nexilis format DUV initializer.
+;	R4 => Device addr
+
+
+NXDUV:	MOV	#400, TXCSR(R4)		;Hit master reset on DUV
+	CMP	(PC), (PC)		; long nop while DUV resets
+	MOV	#36026, PARCSR(R4)	;Init parameter csr
+	MOV	#526, (R4)		;Init receive csr
+	MOV	#SYNC, TXDBUF(R4)
+	RETURN
+.PAGE
+.SBTTL	TYMNET FORMAT INITIALIZATION
+
+
+;	MXV11 boot - tymnet format
+;
+;	register definition:
+;	r0=	input data shift reg 0
+;	r1=	input data shift reg 1
+;	r2=	small loop counter
+;	r3=	decoded data buffer pointer
+;	r4=	device address
+;	r5=	inverted data buffer pointer
+
+
+SYNCHR=	114				;inverted sync chr
+SYNWRD=	46114				;double sync chr
+
+;	data buffers:
+;	SYNC -> inverted data buffer for retransmission
+;	DATCNT -> data buffer pending checksum verification
+
+
+CHKSMV=	BASE+104			;computed vertical checksum
+CHKSMD=	BASE+106			;computed diagonal checksum
+SYNC=	BASE+110
+INVDAT=	BASE+112
+INVCKV=	BASE+206
+INVCKD=	BASE+210
+INVPAD=	BASE+212
+INVEND=	BASE+214
+DATCNT=	TBUF
+DATADR=	TBUF+2
+DATA=	TBUF+4
+CHKV=	TBUF+74				;vertical checksum
+CHKD=	TBUF+76				;diagonal checksum
+.PAGE
+.SBTTL	TYMNET FORMAT DEVICE LOCK & INITIALIZATON
+
+
+;TYMNET format device lock
+
+
+TYLOCK:	RESET				;Turn off all interrupts
+	CLR	@#TIMER			;Reset timer
+	MOV	#TIMEC1, @#TIMEC	;Timeout = 30 sec
+	CALL	TYDUV			;Init load device
+	MOV	#26, (R4)		; OV	#SYNWRD, @#SYNC		;store sync word for retransmit
+	MOV	#-1, @#INVPAD		;Store pad word for retransmission
+	CLR	@#20004			;Halt on further nxm
+.PAGE
+.SBTTL	TYMNET FORMAT MAIN LOOP
+
+; Initialize for new data block
+TYINIT:	MTPS	#0			;Turn on interrupts (clk only)
+	MOV	#INVEND,R2		;Set flag for no data to send
+NEWBLK:	BIC	#20,(R4)		;clear SEARCH sync
+	MOV	#26,(R4)		;set up receive csr
+	CLR	@#CHKSMV		;clr checksums
+	CLR	@#CHKSMD		;
+	MOV	#INVDAT,R5		;init inverted data buffer pointer
+	MOV	#DATCNT,R3		;init decoded data buffer pointer
+
+; Input data from DUx
+
+2$:	CALL	SNDCON			;See if we have any data to send
+	TSTB	(R4)
+	BPL	2$			;wait for data word
+	MOV	RXDBUF(R4),R1		;COPY DATA AND ERR BITS FROM DEVICE
+	BMI	NEWBLK			;BR ON READ ERR
+	CMPB	#114,R1			;TEST FOR SYNC CHR
+	BNE	NEWBLK			;BR IF NOT SYNC CHR
+INPUT:	CALL	SNDCON			;See if we have anything to send
+	TSTB	(R4)			;wait for receiver done
+	BPL	INPUT
+	MOV	RXDBUF(R4),R1		;copy data and err bits from device
+	BMI	NEWBLK			;br on read err
+	MOVB	R1,(R5)+		;save inverted byte
+	SWAB	R1			;save first byte in upper half
+4$:	CALL	SNDCON			;See if we have anything to send
+	TSTB	(R4)			;wait for next byte
+	BPL	4$			;
+	MOV	RXDBUF(R4),R0		;copy data and err bits from device
+	BMI	NEWBLK			;br on read err
+	MOVB	R0,(R5)+		;save inverted byte
+	BISB	R0,R1			;assemble word (bits are still inverted
+	SWAB	R1			;bits now read 0-16 (inverted bitwise)
+	CALL	INVRT$			;inverT bits end to end
+
+;here the corrected word is stored in input buffer pending completion of frame
+;and verification of checksums
+
+	MOV	R0,(R3)+		;store word
+	CMP	#CHKD+2,R3		;check for end of block
+	BEQ	CHKSUM			;br when frame complete
+	CLC				;calculate diagonal checksum
+	ROL	@#CHKSMD
+	ADC	@#CHKSMD
+	XOR	R0,@#CHKSMD
+	CMP	#CHKD,R3		;skip vertical checksum on last word
+	BEQ	INPUT
+	XOR	R0,@#CHKSMV		;calculate vertical checksum
+	BR	INPUT			;wait for more data
+.PAGE
+.SBTTL	TYMNET FORMAT CHECKSUM
+
+
+;block is now complete! lets see if the checksums match
+
+CHKSUM:	CMP	@#CHKSMV,@#CHKV		;check vertical checksum
+	BNE	NEWBLK			;br if no match
+	CMP	@#CHKSMD,@#CHKD		;check diagonal checksum
+	BNE	NEWBLK			;br if no match
+	CALL	SNDEND			;See if we have anything left
+	CLR	@#TIMER			;Reset timer
+	MOV	#TIMEC2, @#TIMEC	;Timeout = 90 sec
+
+;block is good, process it
+
+	MOVB	@#DATCNT+1,R2		;test for boot block
+	BEQ	SNDBLK			;br if boot block
+	MOV	@#DATADR,R1		;get load addr starting with left byte
+	MOV	#1,R0			;Set up for XOR
+	XOR	R0,R1			;Toggle low bit
+	MOV	#DATA+1,R0		;get data block addr
+	CMP	#TRANAD,R1		;do not allow data to be loaded in buff
+	BHI	FIXCKS			;skip data loading if < 21000
+	CMP	@#LODTOP,R1
+	BLO	FIXCKS			;skip data loading if above memory
+	BR	STORD$			;br to entry point in stor data
+.PAGE
+.SBTTL	TYMNET FORMAT DATA STORAGE
+
+
+; load data in core with data decompression.
+;	204=	initiate zero fill of n bytes
+;	205=	initiate formfeed fill of n bytes
+;	200=	load next chr as a literal
+;	n=	byte following flag byte
+
+
+STORDA:	DECB	R2			;dec byte count
+	BLE	FIXCKS			;br if done with this block
+STORD$:	CMPB	#200,(R0)		;test for literal flag
+	BNE	TSTZFL			;br if not
+	DECB	R2
+	CALL	INCR0			;Move R0 to next byte
+NORMDA:	MOVB	(R0),(R1)		;MOVE DATA BYTE
+	CALL	INCR0			;Point R0 to next byte
+	CALL	INCR1
+	BR	STORDA			;br and check for more data
+
+TSTZFL:	CMPB	#204,(R0)		;test for zero fill
+	BNE	TSTFFL			;br if not
+	CLRB	R5			;clr fill chr
+	BR	FILL$			;br to fill entry point
+
+TSTFFL:	CMPB	#205,(R0)		;test for formfeed fill
+	BNE	NORMDA			;br if normal data
+	MOV	#377,R5			;load fill char
+FILL$:	CALL	INCR0
+	DECB	R2			;dec byte count
+	CLR	R3
+	BISB	(R0),R3			;GET BYTES TO FILL
+	CALL	INCR0
+FILL:	MOVB	R5,(R1)		;load fill char
+	CALL	INCR1
+	DEC	R3			;dec fill byte count
+	BGT	FILL			;br if more to fill
+	BR	STORDA			;br and check for more data
+
+INCR0:	BIT	#1,R0			;skip magic byte
+	BNE	2$
+	ADD	#4,R0
+2$:	DEC	R0
+	RETURN
+
+INCR1:	BIT	#1,R1
+	BNE	4$
+	ADD	#4,R1
+4$:	DEC	R1
+	RETURN
+.PAGE
+.SBTTL	TYMNET FORMAT RESPONSE
+
+
+;here the inverted checksum is corrected for rexmit
+
+FIXCKS:	CLRB	@#INVDAT		;clr data count for retransmittion
+	CLR	@#INVCKD
+	CLR	@#INVCKV
+	MOV	#INVDAT,R0
+CALCKS:	CMP	#INVCKD,R0		;test for end of block
+	BEQ	SNDBLK			;br if done
+	MOV	(R0)+,R1		;get data
+	CLC
+	ROR	@#INVCKD
+	BCC	2$
+	BIS	#100000,@#INVCKD
+2$:	XOR	R1,@#INVCKD		;calc diagonal checksum
+	CMP	#INVCKD,R0
+	BEQ	CALCKS
+	XOR	R1,@#INVCKV		;calc vertical checksum
+	BR	CALCKS
+
+SNDBLK:	MOV	#SYNC,R2		;point to beginning of data buffer
+	CALL	SRTBLK			;Start sending data block
+	TSTB	@#DATCNT+1		;test for boot block
+	BEQ	LSTBLK			;br if boot block
+	JMP	NEWBLK			;do next block
+.PAGE
+LSTBLK:	CALL	SNDEND			;Finish it off
+BOOTND:	MTPS	#340
+	JMP	@#TRANAD		;Boot node!
+
+SRTBLK:	MOV	#20,TXCSR(R4)		;set send bit in DUx
+	MOV	#577,TXDBUF(R4)		;set tsom bit for DUP
+SNDBCK:	MOVB	(R2)+,TXDBUF(R4)	;send byte
+	RETURN
+
+SNDCON:	TSTB	TXCSR(R4)		;Check for xmit done from duv
+	BPL	3$
+	CMP	#INVEND,R2		;check for end of block
+	BNE	SNDBCK			;br if not done
+	BR	SNDDON			;Go finish up
+3$:	RETURN	
+
+SNDEND:	TSTB	TXCSR(R4)		;wait till last chr sent
+	BPL	SNDEND
+	CMP	#INVEND,R2		;check for end of block
+	BEQ	SNDDON			;br if done
+	MOVB	(R2)+,TXDBUF(R4)	;send byte
+	BR	SNDEND			;Br if not done
+
+SNDDON:	CLR	TXCSR(R4)
+	RETURN
+
+
+;here the bits are flopped end to end since the T201 sends them backwards
+
+INVRT$:	PUSH	#16.			;set up for invert bits loop
+INVERT:	ROR	R1			;shift one bit into carry
+	ROL	R0			;shift one bit from carry
+	DEC	(SP)			;loop till all 16. bits are done
+	BNE	INVERT
+	TST	(SP)+			;Clear stack
+	RETURN
+.PAGE
+.SBTTL	SUBROUTINES
+
+TYDUV:	MOV	#400, TXCSR(R4)		;Reset device
+	CMP	(PC), (PC)		; Long nop
+	MOV	#36114, PARCSR(R4)	;Init PARCSR
+	BIC	#20, (R4)		;Clr search sync
+	MOV	#526, (R4)		;Init RXVCSR
+	RETURN
+.PAGE
+.SBTTL	TIMEOUT CHECKER
+
+
+;Timeout checker - this routine is called once a second to
+;	make sure loading is working. If not, restart line scanning.
+
+
+TMRCHK:	INC	@#TIMER
+	INC	@#TIMERW
+	CMP	#60., @#TIMERW		;See if watch dog timer needs poked
+	BNE	2$			;Br if not
+
+
+;Poke watchdog timer
+
+	CLR	@#TIMERW		;Reset timer
+	MOV	#'%, @#WATDOG		;Poke timer
+2$:	CMP	@#TIMEC, @#TIMER	;Have we timed out?
+	BNE	RTIZ			;Br if not
+
+
+;Timed out!
+
+	JMP	@#RSTRT			;Restart line scanning
+
+RTIZ:	RTI				;Back to main
+.PAGE
+
+;Interrupt routine:
+
+NXINPT=	.-RELOC
+	TST	@#WRDRDY		;Check to see if word has been read
+	BNE	RERR			;Br if so
+	TST	R3			;If DR input
+	BEQ	READDR			; BR to DR inputr
+
+;DUV input
+
+	PUSH	R1
+	TST	@#BYTEHI		;Test for high byte
+	BNE	BYT2			;Br if byte 1
+
+;First byte for DUV
+
+	INC	@#BYTEHI		;Set high byte bit
+	BIC	#400,(R4)		;Turn off strip sync
+	MOV	RXDBUF(R4),R1		;Get data and error flags
+	BMI	RERRR			;BR on read error
+	MOVB	R1, @#NEWWRD		;Save first byte
+	BR	RTIXX
+
+
+;Second byte for DUV
+
+BYT2:	CLR	@#BYTEHI		;Set for next word
+	MOV	RXDBUF(R4), R1		;Copy data and flags
+	BMI	RERRR			;Br if err
+	MOVB	R1, @#NEWWRD+1		;Assemble data word
+	INC	@#WRDRDY		;Set word ready flag
+RTIXX:	POP	R1
+	RTI
+
+
+; Read error on DUV input, set read err flag
+
+RERRR:	POP	R1
+RERR:	INC	@#RDERR			;Set error bit
+	RTI
+
+
+;DR input
+
+
+READDR:	BIC	#2, (R4)		;Clear input done bit
+	INC	@#WRDRDY		;Set word ready flag
+	RTI
+.PAGE
+.SBTTL	DEVICE ADDRESS TABLE
+
+
+;Device address table for all format boots
+
+
+DTAB=	.-RELOC
+	.WORD	DR0CSR			;DR0
+	.WORD	DR1CSR			;DR1
+	.WORD	DR2CSR			;DR2
+	.WORD	DR3CSR			;DR3
+DUTAB=	.-RELOC
+	.WORD	DU0CSR			;DU0
+	.WORD	DU1CSR			;DU1
+	.WORD	DU2CSR			;DU2
+	.WORD	DU3CSR			;DU3
+
+
+;Soft vector addresses
+;	This table must be arranged with the devices first and
+;	in this order.  Others must follow
+
+
+VTAB=	.-RELOC
+	.WORD	DR0VEC			;DR0
+	.WORD	DR1VEC			;DR1
+	.WORD	DR2VEC			;DR2
+	.WORD	DR3VEC			;DR3
+SVDTAB=	.-RELOC
+	.WORD	DU0VEC			;DU0
+	.WORD	DU1VEC			;DU1
+	.WORD	DU2VEC			;DU2
+	.WORD	DU3VEC			;DU3
+	.WORD	BASE+4			;Nxm
+	.WORD	BASE+100		;Clk
+	.WORD	0			;This must be here!
+
+
+;New PC table for soft vectors for line scanning.
+;	The number of items in this table must equal
+;	the number of items in vtab
+
+
+NPCTAB=	.-RELOC
+	.WORD	DR0-RELOC
+	.WORD	DR1-RELOC
+	.WORD	DR2-RELOC
+	.WORD	DR3-RELOC
+	.WORD	DU0-RELOC
+	.WORD	DU1-RELOC
+	.WORD	DU2-RELOC
+	.WORD	DU3-RELOC
+	.WORD	RTIZ-RELOC		;nxm
+	.WORD	TMRCHK-RELOC		;clk
+.PAGE
+
+; Test patterns for memory diagnostic
+
+TSTDAT=	.-RELOC
+	.WORD	^B1111111111111111
+	.WORD	^B1010101010101010
+	.WORD	^B0101010101010101
+	.WORD	^B0000000000000000
+	.WORD	^B1101101101101101
+	.WORD	^B0110110110110110
+	.WORD	^B1011011011011011
+	.WORD	^B0010010010010010
+	.WORD	^B1001001001001001
+	.WORD	^B0100100100100100
+	.WORD	^B0101001001000100
+	.WORD	^B0010000101000101
+TSTDAL=	.-RELOC-TSTDAT
+ENDCOD:
+.IF EQ RAMTST-1
+
+.SBTTL	COPY TO LOW MEM (RAM ONLY)
+
+
+;Copy program to low mem to simulate PROM version in RAM.
+;	Program is relocated to 0.  This is for testing only!
+
+
+COPY:	CLR	R1			;Init destination pointer
+	MOV	#HVTAB, R0		;Init source pointer
+2$:	CMP	R0, #ENDCOD		;Are we done?
+	BEQ	JSTART			;Br if done
+	MOV	(R0)+, (R1)+		;Copy program
+	BR	2$
+
+JSTART:	JMP	@#PWRUP			;Start normal boot
+
+.ENDC
+
+	.END	HVT
+   R@5í
