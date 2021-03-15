@@ -1,0 +1,533 @@
+	.TITLE	LNKB - Link protocol module - type B(serial DDCMP)
+	.SBTTL	LNKB - High level service routines dirven by polling
+	.SBTTL	INTRODUCTION
+	XLPAR			;Don't list the XP parameter file
+;-----
+; Version 1.0
+;
+;No AC's are preserved by calling routine nor are they expected
+;to be saved.
+;This module is the non-interrupt portion of the DDCMP service.
+;The only interrupt code referenced is when a transmitter is idle.
+;This module will fake an interrupt to start the
+;transmitter going.
+;
+;	First Edit:	 7-Sep-78
+;	Last Edit:	 29-Dec-80
+;	Author:		 Bruce R. Nevins
+;-----
+	CODE
+	.PAGE
+	.SBTTL	DDCMP  entry point non-interrupt level (Called from MAIN)
+;-----
+; Main program routine called once each time through main program
+; loop if there is a need.
+;	CALL	LKBMAI#
+;-----
+
+	MAIN				;Make this code go into the main loop
+	MOV	#LKBDDB#,R4		;Get the first B DDB
+10$:	CMP	DDCIMI#(R4),DDCIMO#(R4)	;Is there a message?
+	BEQ	20$			;No
+	CALL	LKBMAI			;Call LNKB service
+20$:	MOV	DDLKNS#(R4),R4		;Get the next DDB
+	BNE	10$			;More
+
+
+	CODE
+
+LKBMAI::MOV	DDCIMO#(R4),R2		;Get the outpointer
+	MOV	R2,R0
+	ADD	#IMSIZ,R0
+	CMP	R0,DDCIME#(R4)		;Wrap around?
+	BNE	INC1
+	MOV	DDCIMB#(R4),R0		;Yes
+INC1:	MOV	(R2)+,R1		;Get type
+	ASL	R1			;Make a word index
+	JMP	@DISPAT(R1)		;Go to the appropriate service
+
+BOMB:	RSTOP	IFI			;[IFI - Invalid message From Interrupt level]
+
+	PURE
+DISPAT:	DATASV
+	ACKSV
+	NAKSV
+	REPSV
+	BOMB
+	BOMB
+	STRTSV
+	STCKSV
+	LKBLDM
+	.PAGE
+	.SBTTL	DATASV	- Data service (Send on the packet into the node)
+
+	CODE
+DATASV:	MOV	(R2),R1			;Get the packet address
+	BNE	DATSV1			;If not zero ok
+	FSTOP	ZPP			;Die!
+
+DATSV1:	CLR	(R2)			;Just in case
+	MOV	R0,DDCIMO#(R4)		;Remove the frame
+	CALL	MOVPKT#			;Send on the data packet
+	BR	ACKSVV			;Go ack any messages piggy-backed
+
+	.PAGE
+	.SBTTL	ACKSV	- Acknowledgement received service
+
+ACKSV:	MOV	R0,DDCIMO#(R4)		;Remove the frame from the CB
+ACKSVV:	MOVB	DDACK#(R4),R3		;The number to ack?
+
+	MOV	DDPKTH#(R4),R1		;Pick up the first one
+	BEQ	ACKSV4			;Empty?
+	CLR	DDPKTH#(R4)		;Clear the pointer!
+
+ACKSV1:	CMPB	R3,DDCACK#(R4)		;Is this the last?
+	BNE	10$			;If not do normal checks
+	MOV	R1,DDPKTH#(R4)		;Put back the list head
+	BEQ	ACKSV5			;Clear out the pointers
+	BR	ACKEXT			;Start output
+
+10$:	MOV	(R1),R2			;Get the next one to do
+	MOVB	PKSOC(R1),R0		;Get the socket number
+	BNE	20$			;If not zero compute SDB address
+	CLR	SD			;If socket zero clear the SDB
+	BR	40$			;Proceed on
+
+20$:	CMPB	DDSOC#(R4),R0		;Check for a valid socket
+	BHIS	30$
+	INC	DDERIS#(R4)		;Count the bad socket
+	FREPKT				;Dump the packet
+	BR	50$			;On to the next packet
+
+30$:	ASL	R0			;Make a word index
+	ADD	DDSX#(R4),R0		;Add the socket index
+	MOV	-(R0),SD		;The new SDB pointer
+
+40$:	CALL	GIVPKT#			;Done with this one
+50$:	INCB	DDSCNT#(R4)		;Raise the send count
+	INCB	DDCACK#(R4)		;Bump the ack number
+	MOV	R2,R1			;Get the address in R1
+	BNE	ACKSV1			;If not zero check the next one
+
+ACKSV4:	CMPB	R3,DDCACK#(R4)		;Really the last one?
+	BEQ	ACKSV5			;If ok go on
+	INC	DDLBAE#(R4)		;Count the ack error
+ACKSV5:	CLR	DDPKTH#(R4)		;Clear the head pointer
+	CLR	DDPKTT#(R4)		;And the tail pointer
+ACKEXT:	JMP	DOUTSV			;All done
+
+	.PAGE
+	.SBTTL	NAKSV	- Negative acknowledgement received service
+
+NAKSV:	MOVB	DDACK#(R4),R3		;The number to ack?
+	MOV	R0,DDCIMO#(R4)		;Remove the frame
+	MOV	DDPKTH#(R4),R1		;The first to check
+	BEQ	NAKSV4			;Empty?
+	CLR	DDPKTH#(R4)		;Leave no trail
+
+NAKSV1:	CMPB	R3,DDCACK#(R4)		;Current one
+	BNE	10$			;Free up the acked packets
+	MOV	R1,DDPKTH#(R4)		;Restore the head pointer
+	BEQ	NAKSV5			;If zero we quit
+	BR	NAKEX1
+
+10$:	SETPSW	DDPSLV#(R4)		;No interrupts
+	CMP	R1,DDLBOH#(R4)		;Is this the output head pointer
+	BNE	20$			;No
+	CLR	DDLBOH#(R4)		;Yes
+20$:	CLRPSW				;Turn on interrupts
+	MOV	(R1),R2			;The next to do.
+	MOVB	PKSOC(R1),R0		;Get the socket no.
+	BNE	30$			;If not socket 0 get SDB
+	CLR	SD			;Make the SDB pointer 0
+	BR	50$
+
+30$:	CMPB	DDSOC#(R4),R0		;A valid socket?
+	BHIS	40$			;If so go on
+	INC	DDERIS#(R4)		;Bad socket, count it
+	FREPKT				;Free up this packet
+	BR	60$			;And try the next one
+
+40$:	ASL	R0			;Make word index
+	ADD	DDSX#(R4),R0		;Add the socket index
+	MOV	-(R0),SD		;The new SDB pointer
+50$:	CALL	GIVPKT#			;Give it back
+60$:	INCB	DDSCNT#(R4)		;Bump the send count
+	INCB	DDCACK#(R4)		;Bump the ack no.
+	MOV	R2,R1			;Get the next in R1
+	BNE	NAKSV1			;Back for more?
+NAKSV4:	CMPB	R3,DDCACK#(R4)		;Really the last one?
+	BEQ	NAKSV5			;If ok go on
+	INC	DDLBAE#(R4)		;Count our ack error
+NAKSV5:	CLR	DDPKTH#(R4)		;Clear the head pointer
+	CLR	DDPKTT#(R4)		;And the tail pointer
+	BR	DOUTSV
+
+NAKEX1:	MOV	R1,DDLBOH#(R4)		;Reset the head pointer for output
+	SETPSW	DDPSLV#(R4)		;Turn off interrupts for this level
+	TBBN	$OIP,DDFLAG#(R4),10$ 	;If output going then don't start it
+
+;Fake up an interrupt for output to get started
+
+	CLR	-(SP)			;Push a zero old PSW
+	CALL	@DDHNDR#(R4)		;Go into the handler entry
+	BR	DOUTSV			;Check the output list
+
+10$:	CLRPSW				;Enable interrupts
+	BR	DOUTSV			;Check output list
+	.PAGE
+	.SBTTL	REPSV	- Send ack or nak after a rep has been received
+
+REPSV:	MOV	R0,DDCIMO#(R4)		;Remove the frame
+	BR	DOUTSV
+
+
+	.SBTTL	STRTSV	- Start message received service
+
+STRTSV:	MOV	R0,DDCIMO#(R4)		;Remove this item from buffer
+	CALL	LNKDWN#			;Make the link down
+	CALL	STINT			;Start initialize
+	MOVB	#TIMVAL,DDTIMR#(R4)	;Reset the timer
+	MOVB	#THRSH,DDREPT#(R4)	;And the down threshold
+	MOV	DDCMOI#(R4),R2
+	MOV	R2,R0
+	ADD	#MOSIZ,R0
+	MOV	#STCKTY,(R2)+		;Tell output we have a stack
+	MOV	R0,DDCMOI#(R4)		;Show to interrupt service
+	BR	STRTOT			;Make interrupt if need be
+	.PAGE
+	.SBTTL	STCKSV	- Start message acknowledgement service routine
+
+STCKSV:	MOV	R0,DDCIMO#(R4)		;Remove this item from the buffer
+	CALL	STINT			;start initialize
+	CALL	LNKUP#
+	MOVB	#TIMVAL,DDTIMR#(R4)	;Reset the timer
+	MOVB	#THRSH,DDREPT#(R4)	;And the down threshold
+	MOV	DDCMOI#(R4),R2
+	MOV	R2,R0
+	ADD	#MOSIZ,R0
+	MOV	#ACKTYP,(R2)+		;Tell output we have a stack
+	MOV	R0,DDCMOI#(R4)		;Show to interrupt service
+STRTOT:	SETPSW	DDPSLV#(R4)		;No interrupts
+	TBBN	$OIP,DDFLAG#(R4),20$	;If going just quit
+	PUSH				;THE RETURN PSW
+	CALL	@DDHNDR#(R4)		;Fake interrupt
+20$:	CLRPSW				;allow interrupts
+	RETURN
+	.PAGE
+	.SBTTL	STINT	- Start initialization routine
+
+STINT:	SETPSW	DDPSLV#(R4)		;Make us uninterruptable
+	MOV	DDCMOB#(R4),DDCMOI#(R4) ;Clear output ring
+	MOV	DDCMOB#(R4),DDCMOO#(R4) ;
+	CLRPSW				;All done
+	MOV	DDPKTH#(R4),R1		;Get the pointer
+	BEQ	STRTS3			;Is it zero yet?
+STRTS1:	PUSH	(R1)			;Save the next packet
+	MOVB	PKSOC(R1),R0		;The socket to do
+	BNE	STRTNM			;If not socket zero go get The SDB
+	CLR	SD			;A zero SDB pointer
+	BR	STRTZP			;Ok zap the packet
+
+STRTNM:	CMPB	DDSOC#(R4),R0		;Is this a valid socket?
+	BHIS	1$			;If so go on
+	INC	DDERIS#(R4)		;Count the bad socket number
+	BR	STRTZ1			;Get the next one
+
+1$:	ASL	R0			;Make a word index
+	ADD	DDSX#(R4),R0		;Add the socket index
+	MOV	-(R0),SD		;The SDB pointer
+STRTZP:	FREPKT
+STRTZ1:	INCB	DDSCNT#(R4)		;Bump the send ahead count
+	POP	R1			;Get packet back
+	BNE	STRTS1			;And again
+
+STRTS2:	CLR	DDPKTH#(R4)
+STRTS3:	CLR	DDPKTT#(R4)
+	MOVB	#1,DDLBSN#(R4)		;Clear the sequence number
+	RETURN
+	.PAGE
+	.SBTTL	DOUTSV - Data output service
+
+;
+; Enter here when checking on output to do on this link
+; Enter with R4 set to the DDB to check.
+;
+
+DOUTSV:	TSTB	DDSCNT#(R4)		;Is the send ahead count zero?
+	BLE	DOUTXT			;If so exit here
+	TBBE	$D1ACT,DDSTS1#(R4),DOUTXT ;If no packets to send, leave
+	CALL	NXTPKT#			;Get next one to send
+	BCS	DOUTFL
+	BNE	1$			;Skip if not wild socket
+	CALL	LKBSTR			;Start output
+	BR	DOUTXT			;Done
+
+1$:	CALL	DECPCN#			;Drop packet count
+	CALL	REMOVE#			;Remove packet from dst list
+2$:	CALL	LKBSTR			;Start output now
+	CMPB	SDPMAX#(SD),SDACNT#(SD) ;Should we send any more packes for
+					; This SDB?
+	BLO	DOUTXT			;NO
+	TST	SDPKDH#(SD)		;Yes is there any more to send?
+	BEQ	DOUTXT			;NO
+	CALL	LKPOK0#			;Yes-Put the SDB back in the send list
+DOUTXT:	SETPSW	DDPSLV#(R4)		;Make us uninterruptable
+	TBBN	$OIP,DDFLAG#(R4),2$	;Is there output going?
+	TSTB	DDSACK#(R4)		;Yes-Is there an ACK to send?
+	BNE	1$			;Yes
+	TSTB	DDSNAK#(R4)		;Is there a NAK to send
+	BEQ	2$			;No
+;
+;Here we fake an interrupt to send the ack that is waiting..
+;We do this because we can wait a little before sending acks
+;so the can go out with data
+;
+1$:	CLR	-(SP)			;A dummy PSW
+	SETPSW	DDPSLV#(R4)		;We are now at interrupt level
+	CALL	@DDHNDR#(R4)		;Call the output service routine
+	RETURN
+
+2$:	CLRPSW				;Allow interrupts
+	RETURN
+
+DOUTFL:	BIC	#$D1ACT,DDSTS1#(R4)	;No packets going out
+	BR	DOUTXT
+	.PAGE
+	.SBTTL	LKBSTR - Start link output routine
+
+;
+; Subroutine called when a packet is ready for a link which
+; has been stopped by a no packet return from NXTPKT.
+;	C(R1) = Address of packet
+;	C(R4) = Address of DDB
+;	C(SD) = Address of SDB
+;	CALL	LKBSTR
+;
+
+LKBSTR::DECB	DDSCNT#(R4)		;Drop the send ahead count
+	BGT	1$
+	BIS	#$D1ACT,DDSTS1#(R4)	;We are full up now
+1$:	CLR	(R1)			;So we don't get tied in a knot
+	MOVB	SDSOC#(SD),PKSOC(R1)	;Put the socket number in the packet
+	MOVB	DDLBSN#(R4),PKSEQ(R1)	;Init the packets sequence number
+	INCB	DDLBSN#(R4)		;Set for the next one
+	MOV	DDPKTT#(R4),R2		;Get the old tail
+	BNE	4$			;If real address skip set up
+	MOV	R1,DDPKTH#(R4)		;Set up the head pointer
+	MOV	R1,DDLBOH#(R4)		;Update the output head pointer
+	BR	5$
+
+4$:	MOV	R1,(R2)			;Link into the list
+5$:	MOV	R1,DDPKTT#(R4)		;Set up the tail pointer
+	SETPSW	DDPSLV#(R4)		;Turn off interrupts
+	TST	DDLBOH#(R4)		;Is the output active?
+	BNE	7$			;Yes
+	MOV	R1,DDLBOH#(R4)		;Set the pointer
+7$:	CLRPSW				;Turn on interrupts
+	TSTB	SDSOC#(SD)		;Wild socket?
+	BEQ	10$			;Yes just send it
+	INCB	SDACNT#(SD)		;Bump the send ahead count
+10$:	SETPSW	DDPSLV#(R4)		;Turn off interrupts for this level
+	TBBN	$OIP,DDFLAG#(R4),20$ 	;If output going then leave
+;
+; Fake up the interrupt
+;
+	CLR	-(SP)			;Dummy PSW
+	CALL	@DDHNDR#(R4)		;Go to the service routine
+	RETURN
+
+20$:	CLRPSW				;Enable interrupts
+	RETURN
+	.PAGE
+	.SBTTL	LNKBSC	- Link type B tenth a second and once a secondproccessing
+	ONCSEC	LKBOSC
+
+LKBOSC:	MOV	#LKBDDB#,R4
+10$:	BIS	#$TMSEC,DDFLG2#(R4)	;Set flag so that tenth sec stuff will work
+	MOV	DDLKNS#(R4),R4
+	BNE	10$
+	RETURN
+
+	TNHSEC	LNKBSC			;Put us in the tenth a second queue
+
+SEC:	MOV	DDLKNS#(R4),R4		;Get the next DDB
+	BNE	SEC1
+	RETURN				;Done. no more DDB's
+
+LNKBSC:	MOV	#LKBDDB#,R4		;Get the first DDB
+SEC1:	TBBN	$D1UNV,DDSTS1#(R4),SEC	;If no hardware do next
+	TBBE	$TMSEC,DDFLG2#(R4),SEC2	;Second timer? - No got to count down
+	BIC	#$TMSEC,DDFLG2#(R4)	;Yes - Clear flag
+	SETPSW	DDPSLV#(R4)		;No interrupt
+	TBBE	$OIP,DDFLAG#(R4),100$	;If output not going just skip test
+	TBBN	$IRMA,DDFLAG#(R4),FAKINT ;If set then fake interrupt
+
+90$:	BIS	#$IRMA,DDFLAG#(R4)	;Set lost interrupt test bit
+	CLRPSW
+	BR	SEC			;Exit
+
+100$:	CLRPSW				;Allow interrupts
+	TBBN	$NSNOT,NODSTS#,SEC	;If no timers just skip this
+	TBBE	$LOAD,DDFLAG#(R4),3$	;If not load mode go on
+	TBBE	$ELOAD,DDFLAG#(R4),SEC	;Wait until end of block for these tests
+	TBBN	$WAKE2,DDFLAG#(R4),2$
+	BIS	#$WAKE2,DDFLAG#(R4)
+	BR	SEC
+
+2$:	BIS	#$ENQIR+$ENQWT,DDFLAG#(R4) ;Set for next time
+	BIC	#$ELOAD+$WAKE2,DDFLAG#(R4) ;Set up for transmission
+	BR	INTCHK
+
+3$:	TBBE	$D1DWN,DDSTS1#(R4),SEC2	;If the link is down start it
+	INC	DDCDWN#(R4)		;Bump the current down time
+	ADD	#1,DDTDW1#(R4)		;INC the low order total down time
+	ADC	DDTDW2#(R4)		; and the high order time
+	TBBE	$ISTRT+$ASTRT,DDFLAG#(R4),START
+SEC2:	TBBN	$LOAD,DDFLAG#(R4),SEC	;If load mode skip this stuff
+	TSTB	DDTIMR#(R4)		;Timer run out?
+	BEQ	SEC
+	DECB	DDTIMR#(R4)		;Reduce the count
+	BNE	SEC			;Not zero yet?, then do next
+
+;If the timer has expired, then we send a REP
+
+	INC	DDERRC#(R4)		;Bump the REP error counter
+	DECB	DDREPT#(R4)		;Drop the threshold count
+	BEQ	SLKDWN			;If zero then the link is down
+	MOVB	#TIMVAL,DDTIMR#(R4)	;And try again
+	MOV	DDCMOI#(R4),R2		;Get the Main to output in pointer
+	MOV	R2,R0
+	ADD	#MOSIZ,R0		;Check for room for a frame
+	CMP	R0,DDCMOE#(R4)		;At the end?
+	BNE	3$
+	MOV	DDCMOB#(R4),R0		;Set to the begininng
+3$:	CMP	R0,DDCMOO#(R4)		;Full?
+	BEQ	INTCHK			;Yes set for retry
+
+; If we are in $istrt we send a start not a rep on a timer
+;expireing
+
+	TBBE	$ISTRT,DDFLAG#(R4),4$	;If not check $ASTRT
+	MOV	#STRTYP,(R2)+
+	BR	FAKE
+
+4$:	TBBN	$ASTRT,DDFLAG#(R4),5$	;If not send the rep
+	INCB	DDSREP#(R4)		;Send a rep
+	BR	INTCHK			;Make it go!
+
+5$:	MOV	#STCKTY,(R2)+
+
+FAKE:	CLR	(R2)
+	MOV	R0,DDCMOI#(R4)		;Reset the in pointer
+INTCHK:	SETPSW	DDPSLV#(R4)		;We don't want to mess up int level
+	TBBN	$OIP,DDFLAG#(R4),RETRY1	;If output in progress, we are done
+
+;Fake an interrupt
+
+FAKINT:	CLR	-(SP)			;Fake the old state
+	CALL	@DDHNDR#(R4)		;Jump to the handler
+	JMP	SEC			;Do the next one
+
+RETRY1:	CLRPSW				;Allow interupts
+	JMP	SEC			;Loop on the next DDB
+
+
+;Link down. tell the system
+
+SLKDWN:	SETPSW	DDPSLV#(R4)		;No interrupts
+	CALL	LKBRST#			;Reset the hardware
+	MOV	#$ISTRT,DDFLAG#(R4)	;If we dropped an interrupt this will
+					; Fix us up
+	CLRPSW				;Allow interrupts
+	CALL	STINT			;Clean up our pointers
+	CALL	LNKDWN#			;This one died
+	MOVB	#TIMVAL,DDTIMR#(R4)	;Reset the timer
+	MOVB	#THRSH,DDREPT#(R4)	;And the down threshold
+START:	MOV	DDCMOI#(R4),R2
+	MOV	R2,R0
+	ADD	#MOSIZ,R0
+	CMP	R0,DDCMOE#(R4)
+	BNE	4$
+	MOV	DDCMOB#(R4),R0
+4$:	CMP	R0,DDCMOO#(R4)
+	BNE	5$
+	JMP	SEC
+
+5$:	MOV	#STRTYP,(R2)+		;Tell output we have a start
+	BR	FAKE
+	.PAGE
+	.SBTTL	LKBLDM - Link main loop load check
+
+LKBLDM:	MOV	R0,DDCIMO#(R4)		;Remove item from ring
+	TST	DDLBPO#(R4)		;Pointer to current packet
+	BEQ	1$			;If zero send another
+	RETURN				;Not now
+
+1$:	CALL	NXTLOD#			;Get next to send
+;	BR	LKBLOD			;Fall into load routine
+	.PAGE
+	.SBTTL	LKBLOD - Load entry for remote loading
+
+;
+;	C(R0) = Call index
+;		Where 0 - Nothing available
+;		      2 - Data packet ready
+;		      4 - Switch to load mode
+;		      6 - Terminate load mode
+;		     10 - Poke load routine
+;
+;
+;	C(R1) = The packet to send, When R0 = 2
+;	C(R4) = DDB
+;
+
+LKBLOD::JMP	@DISP(R0)		;Do the right thing for the mode
+
+	PURE
+DISP:	.WORD	RTN002			;Do nothing
+	.WORD	LKBDAT			;Send the data
+	.WORD	LKBELM			;Enter load mode
+	.WORD	LKBTLM			;Terminate load mode
+	.WORD	LKBLDP			;Load poke entry
+	CODE
+
+	.SBTTL	LKBELM - Enter load mode routine
+
+LKBELM:	BIS	#$LOAD,DDFLAG#(R4)	;Set flag that we are in load mode
+	MOV	#1,DDLBPO#(R4)		;Send a reboot message
+	BR	OUTCK			;Check pending output
+
+	.SBTTL	LKBTLM - Terminate load mode
+
+LKBTLM:	SETPSW	DDPSLV#(R4)		;No interrupts
+	MOV	DDLBPO#(R4),R1		;Get the old packet pointer
+	BEQ	1$			;If zero never mind
+
+;	CLR	DDLBPO#(R4)		;Clean up
+	CMP	#255,R1			;Is this a real packet?
+	BHIS	1$			;nope
+	FREPKT
+1$:	CLRPSW				;Back to normal
+	MOV	#2,R1			;Terminate load mode
+	BIC	#$ENQIR+$ELOAD,DDFLAG#(R4) ;So we will see it
+	.PAGE
+	.SBTTL	LKBDAT - Process the data packet for load
+
+LKBDAT:	MOV	R1,DDLBPO#(R4)		;Send the packet on
+OUTCK:	SETPSW	DDPSLV#(R4)		;Turn off interrupts for this level
+	TBBE	$OIP,DDFLAG#(R4),10$
+	CLRPSW				;Turn on interrupts
+	RETURN
+
+10$:	CLR	-(SP)			;Fake PSW
+	CALL	@DDHNDR#(R4)		;Fake the interrupt
+RTN002:	CLC
+	RETURN
+
+LKBLDP:	TST	DDLBPO#(R4)		;Are we still busy?
+	BNE	RTN002			;Yes
+	CALL	NXTLOD#			;Check on more
+	BR	LKBLOD			;Do standard checks
+	.END
+   
