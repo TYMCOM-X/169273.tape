@@ -1,0 +1,3 @@
+FINDIT
+*.BAK,*.VUE,*.CAB,*.OLD
+
