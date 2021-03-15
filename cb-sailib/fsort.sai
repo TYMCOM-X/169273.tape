@@ -1,0 +1,831 @@
+begin "fsort"
+require 3000 string!space;
+require "SAI:BAYSAI" source!file;
+source!l(STRFIL);
+source!l(FILE);
+source!l(TMPFIL);
+require "{}##" delimiters;
+
+comment
+    File Sort program.
+
+    Written by Richard K. Johnsson
+    Attempts at commenting by David Alex Lamb
+
+    17 Jul 76	Command scanner, RPG interface replace question-
+		asking.  DL10
+    30 Jul 76	Allow command scanner to take "@file" indirect file.
+		Assumes default extension ".cmd".  DL10
+    10 Oct 76	Caused automatic printing of version number.  DL10
+    22 Jul 77	Added composite fields for key when doing
+		ASORT.  MS30
+     1 Aug 77	Added tab-to-spaces conversion, and /L to turn
+		off forced upper case conversion. Both options
+		only in ASORT mode.  MS30
+     4 Aug 77	Incorporated PK01's corrections for these bugs:
+		1) If the last line did not end in CRLF, it was
+		   discarded in ASORT.
+		2) Binary sort hopelessly screwed up by incorrect
+		   argument parsing for /P.
+		3) Bad switch did not bomb the command loop.
+		MS30
+     9 Mar 78	Added /Break:<char> switch for multiline records. CP01
+     5 Feb 79	Converted to A709 library from A710 library. DL10.
+;
+
+define
+	HELPMSG = {"
+OUTPUT _ INPUT / SWITCHES
+or
+@FILENAME
+
+/B:n	break records on ASCII n, octal
+/D	sort down
+/H	this message
+/K:f,l	first and last character position of a key field, 1-origin
+/L	preserve lower case
+/P:o<p,s> binary byte pointer key
+/Q	quiet
+/R:n	binary record size
+/S:n	internal sort size
+/T	convert tabs assuming tab stops every 8 spaces
+/U	sort up
+/V	verbose
+
+See DOC:FSORT.DOC for more information.
+"},
+	DEBUG=true,
+	BYNAME(X)={TAB&"X="&cvs(X)};
+ifcr DEBUG thenc
+    integer DEBCHAN,DEBCTR,DEBFLG;
+    string DEBFILE;
+endc
+define
+    SORTMERGE(A,B,C)={if ASORT then ASCII!SORT(A,B,C) else BINARY!SORT(A,B,C)};
+define
+    MERGEFACTOR=14;        ! How many way merge;
+
+external integer RPGSW,		! TRUE iff entered via CCL linkage;
+	!JBVER;			! Job version number;
+integer
+    LINEBRK,	! line break table;
+    RECORDBRK,	! record delimiter break;
+    TABBREAK,	! tab break;
+    LFTANGLBRK,	! < break;
+    RGHTANGLBRK,	! > break;
+    COMMABRK,	! , break;
+    INCHAN,
+    RUNCHAN,
+    KEYNUM,	! number of key fields for composite key;
+    KEYPTR,	! byte pointer for binary key: O<P,S>;
+    KEYOFF,	!     O portion of binary key position: O<P,S>;
+    KEYPOS,	!     P portion of binary key position;
+    KEYSIZE,	!     S portion of binary key position;
+    UPPER,	! break table for converting to upper case;
+    RecordBrChar,	! -1 for CRLF delimiter,
+			 else ASCII code of delimiter char;
+    RecBrChr,	! like RecordBrChar, but LF if RecordBrChar is -1;
+    SIZE,
+    RUNIX,
+    INIX,
+    OUTCHAN,
+    I,
+    NUMRUNS,
+    JOBPPN,
+    RECSIZE,	! binary record size;
+    FILESIZE,
+    FILEMODE,
+    SLASHBRK,	! break table for /;
+    ARROWBRK,	! break table for =_;
+    COLONBRK;	! break table for :;
+
+boolean
+   UPSORT, ASORT, CONTINUING, VERBOSE, KNOWMODE, UCCONVERT, TABCONVERT;
+string INFILE, OUTFILE, SJOBNUM, ALLUNITS, USEABLEUNITS, SEARCHLIST,
+	RPGCMD, CMDLINE, BLANKS;
+safe integer array CHAN,BRCHAR,EOF,
+    KEYSTART[1:10],	! character index of start of key, 1-origin;
+    KEYEND[1:10];	!     character index of end of key;
+
+! calli definitions;
+define
+	SYSPHY='51,
+	DSKCHR='45,
+	JOBSTR='47;
+simple string procedure UPCASE(string S);
+	return(scan(S,UPPER,ZILCH));
+
+simple string procedure TABTOSPACES(string S);
+	begin								"TABTOSPACES"
+	string SCONVERTED;
+	SCONVERTED_null;
+	while length(S) do
+		begin "CONVERT"
+		SCONVERTED _ SCONVERTED & scan(S,TABBREAK,DUM);
+		if DUM = TAB then
+		    SCONVERTED _ SCONVERTED & BLANKS[1 to (8 - length(SCONVERTED) mod 8)]
+		end "CONVERT";
+	return(SCONVERTED)
+	end "TABTOSPACES";
+
+
+simple string procedure FILENAME(integer NUM);
+	begin								"FILENAME"
+	define DIGIT(R,V)={
+			movei R,"0"(R);
+			caile R,"9";
+			  movei R,"A"-"9"-1(R);
+			movem R,V};
+	integer D1,D2,D3;
+	start!code
+	  move 1,NUM;
+	  idivi 1,36*36;
+	  idivi 2,36;
+	  DIGIT (1,D1);
+	  DIGIT (2,D2);
+	  DIGIT (3,D3);
+	end;
+	return(SJOBNUM&D1&D2&D3&".TMP");
+	end "FILENAME";
+
+forward simple procedure VALIDATEUNITS;
+simple string procedure DEVNAME;
+	begin								"DEVNAME"
+	if nulstr(USEABLEUNITS) then VALIDATEUNITS;
+	SDUM_scan(USEABLEUNITS,LINEBRK,ZILCH);
+	return(SDUM&":");
+	end "DEVNAME";
+
+
+simple string procedure READLONGINPUT(integer CHAN; integer BRKTAB);
+    begin "readlonginput"
+    ! Prevents premature termination of text lines by exhaustion of
+	the COUNT parameter from OPEN;
+    string S, T;
+
+    T_S_INPUT(CHAN,BRKTAB);
+    while not EOF[CHAN] and BRCHAR[CHAN]=0 and length(T)>0 do
+	begin "readmore"
+	S_S&(T_INPUT(CHAN,BRKTAB));
+	end "readmore";
+    return(S);
+    end "readlonginput";
+simple procedure WRITEON(integer num);
+	begin								"WRITEON"
+	string s;
+	S_DEVNAME&FILENAME(NUM);
+	ifcr DEBUG thenc
+		out(DEBCHAN,"WRITEON: "&S&CRLF);
+	endc
+	WANTWRITE(RUNCHAN_getchan,Zilch,S,true,FILEMODE);
+	end "WRITEON";
+
+comment
+
+    Get a line from the terminal or a command file;
+
+procedure GETCOMMANDLINE;
+    repeat
+	begin "loop to ignore null lines"
+	if fulstr(RPGCMD)
+	    then
+		begin "CCL mode"
+		CMDLINE _ scan(RPGCMD, LINEBRK, ZILCH);
+		if CMDLINE[inf FOR 1] = "!"
+		    then
+			begin "Run program"
+			RUNPROG(CMDLINE[1 to inf-1], 1);
+			callexit
+			end   "Run program";
+		if VERBOSE then outstr("**" & CMDLINE & crlf)
+		end   "CCL mode"
+	    else
+		begin "terminal input"
+		if RPGSW then callexit;
+		quick!code  TTCALL '13,0; SKIP end;	! turn off ^O ;
+		outchr("*"); CMDLINE _ inchwl;
+		CMDLINE _ scan(CMDLINE, LINEBRK, ZILCH);
+		if CMDLINE = "@"
+		    then
+			begin "read command file"
+			integer EOF, CHAN, BRK;
+
+			ZILCH _ lop(CMDLINE);
+			if WANTREAD(CHAN_-1, 300, BRK, EOF, CMDLINE,
+				ascii, "Command file: ", "CMD")
+			    then
+				continue "loop to ignore null lines";
+			do
+			    begin
+			    RPGCMD _ RPGCMD & input(CHAN, LINEBRK); 
+			    if BRK then RPGCMD _ RPGCMD & BRK
+			    end
+			until EOF;
+			continue "loop to ignore null lines"
+			end   "read command file"
+		end   "terminal input";
+	if fulstr(CMDLINE) then return
+	end   "loop to ignore null lines";
+
+
+simple integer procedure READIN(integer TMPNUM);
+	begin								"READIN"
+	integer C;
+	string S;
+	S_FILENAME(TMPNUM);
+	ifcr DEBUG thenc
+		out(DEBCHAN,"READIN: "&S&CRLF);
+	endc
+	if (C_getchan) < 0 then usererr(0,0,"READIN: No more channels");
+	MUSTREAD(C, 300, BRCHAR[C], EOF[C], S, FILEMODE);
+	return(C);
+	end "READIN";
+
+simple procedure NEXTRUNFILE;
+	begin
+	release(RUNCHAN);
+	WRITEON(RUNIX_RUNIX+1);
+	if VERBOSE then outchr("#");
+	end;
+
+simple integer procedure CI(integer REGVAL,CALLINUM);
+	start!code							"CI"
+	  move 1,REGVAL;
+	  move 2,CALLINUM;
+	  setom !SKIP!;
+	  calli 1,0(2);
+	    setzm !SKIP!;
+	end "CI";
+simple boolean procedure UFDEXISTS(integer STRUCTURE);
+	begin								"UFDEXISTS"
+	own safe integer array B[0:3];
+	integer C;
+	open(C_getchan,cv6str(STRUCTURE),'17,0,0,ZILCH,ZILCH,DUM);
+	if DUM then return(false);
+	B[0]_JOBPPN;
+	B[1]_cvsix("UFD");
+	B[2]_0;
+	B[3]_'1000001;
+	start!code
+	  hrlz 2,C;
+	  lsh 2,5;
+	  hrr 2,B;
+	  tlo 2,'076000;	! lookup;
+	  setom DUM;
+	  xct 2;
+	    setzm DUM;
+	end;
+	release(C);
+	return(DUM);
+	end "UFDEXISTS";
+
+simple procedure GETSEARCHLIST;
+	begin								"GETSEARCHLIST"
+	integer STRUCT;
+	SEARCHLIST_null;
+	STRUCT_-1;
+	while true do
+	    begin
+	    CI(xwd(1,location(STRUCT)),JOBSTR);
+	    if STRUCT=0 then done;
+	    if UFDEXISTS(STRUCT) then SEARCHLIST_SEARCHLIST&cv6str(STRUCT)&CRLF;
+	    end;
+	ifcr DEBUG thenc out(DEBCHAN,"Search list:"&CRLF&SEARCHLIST); endc
+	end "GETSEARCHLIST";
+
+string procedure GETUNITS;
+	begin								"GETUNITS"
+	own safe integer array BLK[0:'20];
+	integer UNIT,CHR;
+	UNIT_0;
+	while (UNIT_CI(UNIT,SYSPHY)) neq 0 do
+	    begin "unit loop";
+	    BLK[0]_UNIT;
+	    CHR_CI(xwd('20,location(BLK[0])),DSKCHR);
+	    if (not !SKIP!) or
+	       (CHR land (3 lsh 27)) neq 0 or
+	       (not INDEX2(SEARCHLIST,cv6str(BLK[4]))) then
+			continue "unit loop";
+	    ALLUNITS_ALLUNITS&cv6str(UNIT)&CRLF;
+	    end "unit loop";
+	ifcr DEBUG thenc out(DEBCHAN,"All units:"&CRLF&ALLUNITS); endc
+	end "GETUNITS";
+
+simple procedure VALIDATEUNITS;
+	begin								"VALIDATEUNITS"
+	own safe integer array BLK[0:4];
+	integer UNIT,CHR;
+	string S;
+	S_ALLUNITS;
+	USEABLEUNITS_null;
+	do begin
+	    BLK[0]_UNIT_cvsix(scan(S,LINEBRK,ZILCH));
+	    CI(xwd(4,location(BLK[0])),DSKCHR);
+	    if BLK[3] > 199 then USEABLEUNITS_USEABLEUNITS&cv6str(UNIT)&CRLF;
+	    end until nulstr(S);
+	ifcr DEBUG thenc out(DEBCHAN,"Useable units:"&CRLF&USEABLEUNITS); endc
+	end "VALIDATEUNITS";
+integer procedure ASCII!SORT(integer P; boolean MERGING,FINAL);
+	begin								"ASCII!SORT"
+	define BEFORE(A,B)={(if UPSORT then LESTR(A,B) else LESTR(B,A))};
+	safe integer array LOSER,RN,POINTERS[0:P-1];
+	integer RC,RQ,T,Q,RMAX,J;
+	string INFINITY;
+	boolean EXHAUSTED;
+	string LASTKEY;
+	safe string array RECORD,KEY[0:P-1];
+	define
+		FE(X)={(POINTERS[X] lsh -18)},
+		FI(X)={(POINTERS[X] land '777777)};
+	define
+		OUTREC(X)={
+			begin "OUTREC"
+			if MERGING then if length(RECORD[X])=0 then return(RMAX);
+			if (not MERGING) or (not FINAL) then
+			    begin
+			    out(RUNCHAN,KEY[X]);
+			    out(RUNCHAN,RecBrChr)
+			    end;
+			out(RUNCHAN,RECORD[X]);
+			out(RUNCHAN,if RecordBrChar=-1
+					then CRLF else RecordBrChar);
+			LASTKEY_KEY[X];
+			end "OUTREC"},
+		INREC(X)={
+			begin "INREC"
+			if MERGING then
+			    begin INCHAN_CHAN[X]; KEY[X]_ReadLongInput(INCHAN,RECORDBRK) end;
+			RECORD[X]_null;
+			while nulstr(RECORD[X]) and (not EOF[INCHAN]) do
+			    RECORD[X]_ReadLongInput(INCHAN,RECORDBRK);
+			if not MERGING then
+			    begin "Build composite key"
+			    string RECORDTEMP;
+			    RECORDTEMP_if UCCONVERT
+				then UPCASE(RECORD[X])
+				else RECORD[X];
+			    if TABCONVERT
+				then RECORDTEMP_TABTOSPACES(RECORDTEMP);
+			    KEY[X] _ "";
+			    for I _ 1 thru KEYNUM do
+				KEY[X] _ KEY[X] & RECORDTEMP[KEYSTART[I] to KEYEND[I]]
+			    end "Build composite key";
+			if EOF[INCHAN] and length(RECORD[X]) = 0 then
+			    begin
+			    KEY[X]_INFINITY;
+			    if MERGING
+				then rename(INCHAN,null,0,0)
+				else EXHAUSTED_true;
+			    release(INCHAN);
+			    end;
+			end "INREC"};
+
+	RMAX_RC_RQ_Q_0;
+	EXHAUSTED_false;
+	LASTKEY_INFINITY_(if UPSORT then ('177&'177&'177&'177&'177) else (0&0&0&0&0));
+	ARRCLR(RN,0);
+	T_point(18,POINTERS[0],-1);
+	for J_0 thru P-1 do
+	    begin "init pointers"
+	    LOSER[J]_J;
+	    idpb((P+J) div 2,T);	! FE field;
+	    idpb(J div 2,T);		! FI field;
+	    end "init pointers";
+
+	while true do
+	    begin "move up"
+	    ifcr DEBUG thenc
+	      if DEBFLG then
+		out(DEBCHAN,CRLF&CRLF&BYNAME(RMAX)&BYNAME(RQ)&BYNAME(RC)&BYNAME(Q)&CRLF);
+	      if DEBFLG then
+		for DEBCTR_0 thru P-1 do
+		    begin
+		    out(DEBCHAN,cvs(LOSER[DEBCTR])&TAB&cvs(RN[DEBCTR])&TAB&KEY[DEBCTR]&CRLF);
+		    end;
+		if equ(DEBFILE,"PAUSE") then begin outchr("*"); inchwl end;
+	    endc
+	    if RQ neq RC then
+		if RQ>RMAX
+		    then return(RMAX)
+		    else begin RC_RQ; if RQ>1 then NEXTRUNFILE end;
+	    if RQ neq 0 then OUTREC(Q);
+	    if EXHAUSTED
+		then RQ_RMAX+1
+		else
+		    begin
+		    INREC(Q);
+		    if EXHAUSTED
+			then RQ_RMAX+1
+			else
+			    if BEFORE(KEY[Q],LASTKEY) then
+				if (RQ_RQ+1)>RMAX then RMAX_RQ;
+		    end;
+	    T_FE(Q);
+	    while true do
+		begin "set new loser"
+		if RN[T]<RQ or (RN[T]=RQ and BEFORE(KEY[LOSER[T]],KEY[Q])) then
+		    begin LOSER[T] swap Q; RN[T] swap RQ end;
+		if T=1 then continue "move up";
+		T_FI(T);
+		end "set new loser";
+	    end "move up";
+	end "ASCII!SORT";
+integer procedure BINARY!SORT(integer P; boolean MERGING,FINAL);
+	begin								"BINARY!SORT"
+	define BEFORE(A,B)={(if UPSORT then (A<B) else (B<A))};
+	safe integer array LOSER,RN,POINTERS[0:P-1];
+	integer RC,RQ,T,Q,RMAX,J;
+	integer INFINITY;
+	boolean EXHAUSTED;
+	integer LASTKEY;
+	safe integer array RECORD[0:P-1,0:RECSIZE-1],KEY[0:P-1];
+	define
+		FE(X)={(POINTERS[X] lsh -18)},
+		FI(X)={(POINTERS[X] land '777777)};
+	define
+		OUTREC(X)={
+			begin "OUTREC"
+			if MERGING then if KEY[X]=INFINITY then return(RMAX);
+			if (not MERGING) or (not FINAL) then
+			    begin wordout(RUNCHAN,KEY[X]) end;
+			arryout(RUNCHAN,RECORD[X,0],RECSIZE);
+			LASTKEY_KEY[X];
+			end "OUTREC"},
+		INREC(X)={
+			begin "INREC"
+			if MERGING then
+			    begin INCHAN_CHAN[X]; KEY[X]_wordin(INCHAN) end;
+			if (not EOF[INCHAN]) then
+			    arryin(INCHAN,RECORD[X,0],RECSIZE);
+			if not MERGING then
+			    start!code "load key"
+			    move 1,X;
+			    move 2,1;
+			    imul 1,RECSIZE;
+			    add 1,RECORD;
+			    ldb 3,KEYPTR;
+			    add 2,KEY;
+			    movem 3,0(2);
+			    end "load key";
+			if EOF[INCHAN] then
+			    begin
+			    KEY[X]_INFINITY;
+			    if MERGING
+				then rename(INCHAN,null,0,0)
+				else EXHAUSTED_true;
+			    release(INCHAN);
+			    end;
+			end "INREC"};
+
+	RMAX_RC_RQ_Q_0;
+	EXHAUSTED_false;
+	LASTKEY_INFINITY_(if UPSORT then '377777777777 else '400000000000);
+	ARRCLR(RN,0);
+	T_point(18,POINTERS[0],-1);
+	for J_0 thru P-1 do
+	    begin "init pointers"
+	    LOSER[J]_J;
+	    idpb((P+J) div 2,T);	! FE field;
+	    idpb(J div 2,T);		! FI field;
+	    end "init pointers";
+
+	while true do
+	    begin "move up"
+	    ifcr DEBUG thenc
+	      if DEBFLG then
+		out(DEBCHAN,CRLF&CRLF&BYNAME(RMAX)&BYNAME(RQ)&BYNAME(RC)&BYNAME(Q)&CRLF);
+	      if DEBFLG then
+		for DEBCTR_0 thru P-1 do
+		    begin
+		    out(DEBCHAN,cvs(LOSER[DEBCTR])&TAB&cvs(RN[DEBCTR])&TAB&cvs(KEY[DEBCTR])&CRLF);
+		    end;
+		if equ(DEBFILE,"PAUSE") then begin outchr("*"); inchwl end;
+	    endc
+	    if RQ neq RC then
+		if RQ>RMAX
+		    then return(RMAX)
+		    else begin RC_RQ; if RQ>1 then NEXTRUNFILE end;
+	    if RQ neq 0 then OUTREC(Q);
+	    if EXHAUSTED
+		then RQ_RMAX+1
+		else
+		    begin
+		    INREC(Q);
+		    if EXHAUSTED
+			then RQ_RMAX+1
+			else
+			    if BEFORE(KEY[Q],LASTKEY) then
+				if (RQ_RQ+1)>RMAX then RMAX_RQ;
+		    end;
+	    T_FE(Q);
+	    while true do
+		begin "set new loser"
+		if RN[T]<RQ or (RN[T]=RQ and BEFORE(KEY[LOSER[T]],KEY[Q])) then
+		    begin LOSER[T] swap Q; RN[T] swap RQ end;
+		if T=1 then continue "move up";
+		T_FI(T);
+		end "set new loser";
+	    end "move up";
+	end "BINARY!SORT";
+simple procedure FINALCOPY;
+	begin								"FINALCOPY"
+	integer W,I,RecCopyBrk,KeyBreak;
+	string S;
+	INCHAN_READIN(INIX_INIX+1);
+	mustwrite(RUNCHAN_getchan,zilch,OUTFILE,true,FILEMODE);
+	if ASORT
+	    then
+		begin
+		RecCopyBrk_getbreak;
+		setbreak(KeyBreak_getbreak,LF,null,"IA");
+!		breakset(RecCopyBrk,null,"O");
+		setbreak(RecCopyBrk,RecBrChr,null,"IA");
+		while true do
+		    begin"asc copy"
+		    SZILCH_ReadLongInput(INCHAN,KeyBreak);
+		    if nulstr(#S_ReadLongInput(INCHAN,RecCopyBrk)#) then done "asc copy";
+		    out(RUNCHAN,S);
+		    end "asc copy";
+		relbreak(RecCopyBrk);
+		relbreak(KeyBreak)
+		end
+	    else
+		while true do
+		    begin "bin copy"
+		    ZILCH_wordin(INCHAN);
+		    if EOF[INCHAN] then done "bin copy";
+		    for I_1 thru RECSIZE do
+			begin
+			W_wordin(INCHAN);
+			if EOF[INCHAN] then
+			    begin outstr("Unexpected EOF during final copy"&CRLF); done "bin copy" end;
+			wordout(RUNCHAN,W);
+			end;
+		    end "bin copy";
+	rename(INCHAN,null,0,0);
+	release(INCHAN); release(RUNCHAN);
+	end "FINALCOPY";
+simple integer procedure CV36(string S);
+	begin
+	integer V;
+	V_0;
+	while length(S)>0 do
+	    begin
+	    DUM_lop(S);
+	    IF DUM>"9"
+		then DUM_(DUM land '137)-"A"+10
+		else DUM_DUM-"0";
+	    V_V*36+DUM;
+	    end;
+	return(V);
+	end;
+simple procedure INIT;
+    begin								"INIT"
+    integer JNUM;
+
+    VERBOSE _ false;  UCCONVERT _ true;
+    TABCONVERT _ false;  UPSORT _ true;
+    if RPGSW
+        then
+	begin
+	if  RTMPFILE("SRT", RPGCMD, true, true)
+	    then RPGSW _ false
+	end;
+    if  RPGSW
+	then
+	print("FSORT Version ",cvos((!jbver lsh -24) land '777)&
+	     (if (Dum_(!jbver lsh -18) land '77)=0 then null else (Dum+'100)),
+		crlf&"/H for help"&crlf);
+!   CONTINUING_ASK("Continuing? ","Y","N");
+    CONTINUING_false;
+    if CONTINUING then
+        begin
+        outstr("Job number: ");
+        JNUM_cvd(inchwl);
+        if JNUM=0 then JNUM_call(0,"PJOB");
+	SJOBNUM_("000"&cvs(JNUM))[inf-2 to inf];
+        outstr("First file number: ");
+        INIX_CV36(inchwl)-1;
+        outstr("Last number: ");
+        RUNIX_CV36(inchwl);
+        end
+    else SJOBNUM_JOBNUM;
+    JOBPPN_CALL(0,"GETPPN");
+    setbreak(LINEBRK_getbreak,LF&FORMFEED,CR,"INS");
+    setbreak(TABBREAK_getbreak,TAB,null,"IS");
+    setbreak(UPPER_getbreak,null,null,"IK");
+    setbreak(SLASHBRK_getbreak,"/",null,"ISK");
+    setbreak(COLONBRK_getbreak,":",null,"ISK");
+    setbreak(ARROWBRK_getbreak,"_=",null,"ISK");
+    setbreak(LFTANGLBRK_getbreak,"<",null,"IS");
+    setbreak(RGHTANGLBRK_getbreak,">",null,"IS");
+    setbreak(COMMABRK_getbreak,",",null,"IS");
+
+    RecordBrChar_-1;	! Indicates use of CRLF;
+    BLANKS_"        ";
+
+    ifcr DEBUG thenc
+	outstr("Debug file: ");
+	wantwrite(DEBCHAN_0,zilch,DEBFILE_UPCASE(inchwl));
+    endc
+
+    end "INIT";
+! execution;
+
+INIT;
+repeat
+    begin "Command loop"
+    GETCOMMANDLINE;
+    KNOWMODE _ false;  OUTFILE _ null;
+
+    comment  Set default parameters;
+
+    ASORT _ true;
+    KEYNUM _ 1;  KEYSTART[1] _ 1;  KEYEND[1] _ 10000;
+    KEYOFF _ KEYPOS _ 0;  KEYSIZE _ 36;  RECSIZE _ 1;
+    SIZE _ 64;
+
+    comment Parse command line;
+
+    OUTFILE _ scan(CMDLINE, ARROWBRK, DUM);
+    if DUM  "_"  AND  DUM  "="
+	then
+	    begin CMDLINE _ OUTFILE; OUTFILE _ null end;
+    INFILE _ scan(CMDLINE, SLASHBRK, DUM);
+
+
+    while DUM = "/" do
+	begin "Parse switches"
+	string SWITCH, SWVAL;
+
+	SWVAL _ scan(CMDLINE, SLASHBRK, DUM);
+	SWITCH _ scan(SWVAL, COLONBRK, ZILCH);
+
+	if SWITCH = "H"
+	    then
+		begin "/HELP"
+		outstr(HELPMSG); continue "Command loop"
+		end;
+	if SWITCH = "L"
+	    then
+		begin "/LCPRESERVE"
+		UCCONVERT _ false
+		end "/LCPRESERVE"
+	else if SWITCH = "T"
+	    then
+		begin "/TABCONVERT"
+		TABCONVERT _ true
+		end "/TABCONVERT"
+	else if SWITCH 
+	    then
+		begin "/UP"
+		UPSORT _ true
+		end   "/UP"
+	else if SWITCH = "D"
+	    then
+		begin "/DOWN"
+		UPSORT _ false
+		end   "/DOWN"
+	else if SWITCH = "V"
+	    then
+		begin "/VERBOSE"
+		VERBOSE _ true
+		end   "/VERBOSE"
+	else if SWITCH = "Q"
+	    then
+		begin "/QUIET"
+		VERBOSE _ false
+		end   "/QUIET"
+	else if SWITCH = "S"
+	    then
+		begin "/SIZE (internal sort size)"
+		SIZE _ 32 max cvd(SWVAL) min 1024
+		end   "/SIZE (internal sort size)"
+	else if SWITCH = "K"
+	    then
+		begin "/KEY:start-finish"
+		ASORT _ true;
+		if KEYNUM > 10 then
+		    begin
+		    outstr("Maximum of 10 keys. Will ignore more."&crlf);
+		    continue "Parse switches"
+		    end;
+		KEYSTART[KEYNUM] _ 1 max intscan(SWVAL,ZILCH);
+		ZILCH _ lop(SWVAL);
+		KEYEND[KEYNUM] _ intscan(SWVAL, ZILCH);
+		if KEYEND[KEYNUM]  0 then KEYEND[KEYNUM] _ 10000;
+		KEYNUM _ KEYNUM + 1
+		end   "/KEY:start-finish"
+	else if SWITCH = "P"
+	    then
+		begin "/POSITION:offset<position,size>"
+		ASORT _ false;
+		KEYOFF _ cvd(scan(SWVAL,LFTANGLBRK,ZILCH));
+		KEYPOS _ 35 min (cvd(scan(SWVAL,COMMABRK,ZILCH)) max 0);
+		KEYSIZE _ 1 max
+		    (cvd(scan(SWVAL,RGHTANGLBRK,ZILCH)) min (36-KEYPOS))
+		end   "/POSITION:offset<position,size>"
+	else if SWITCH = "R"
+	    then
+		begin "/RECORDSIZE:number"
+		ASORT _ false;
+		RECSIZE _ 1 max cvd(SWVAL)
+		end   "/RECORDSIZE:number"
+	else if SWITCH = "B"
+	    then
+		RecordBrChar_cvo(SWVAL)	! Indicate special record delimiter;
+	    else
+		begin "Bogus Switch"
+		outstr("Bad switch """ & SWITCH & ":" & SWVAL & ("""" &crlf));
+		continue "Command loop"
+		end "Bogus Switch"
+
+	end   "Parse switches";
+
+    RecordBrk_getbreak;	! Set up record delimiter table
+			 or special CRLF table;
+    if RecordBrChar=-1
+	then setbreak(RecordBrk,LF&FormFeed,CR,"INS")
+	else setbreak(RecordBrk,RecordBrChar,null,"INS");
+    RecBrChr_if RecordBrChar=-1 then LF else RecordBrChar;
+
+    comment   consistency checks;
+
+    if ASORT
+	then
+	    begin
+	    if KEYNUM > 1 then		! KEYNUM = 1 => no user entered key;
+		KEYNUM _ KEYNUM - 1;
+	    for I _ 1 thru KEYNUM do
+		KEYEND[I] _ KEYEND[I] max KEYSTART[I]
+	    end
+	else
+	    begin
+	    KEYOFF _ 0 max KEYOFF min RECSIZE-1;
+	    KEYPTR _ (KEYPOS lsh 30) + ((KEYSIZE land '77) lsh 24) +
+		(1 lsh 18) + KEYOFF;
+	    end;
+    INCHAN _ getchan;
+    WANTREAD(INCHAN, 300, BRCHAR[INCHAN], EOF[INCHAN], INFILE, FILEMODE _ if ASORT then ASCII else Image);
+    begin
+	own safe integer array F[0:5];
+	FILEINFO(F); FILESIZE_F[3] ash -18
+    end;
+    if FILESIZE<0 then FILESIZE_((-FILESIZE) + '177) div '200;
+    if nulstr(OUTFILE) then OUTFILE _ INFILE;
+    comment  Begin processing;
+
+    GETSEARCHLIST;
+    GETUNITS;
+    VALIDATEUNITS;
+    IF NOT CONTINUING THEN 
+	BEGIN
+	if VERBOSE then outstr("Initial sort..."&CRLF&"#");
+	
+	RUNCHAN_getchan;
+	WRITEON(RUNIX_1);
+	
+	NUMRUNS_SORTMERGE(SIZE,false,false);
+	release(RUNCHAN);
+	if VERBOSE then
+	    begin
+	    outstr(CRLF&cvs(NUMRUNS)&" intermediate files written"&CRLF);
+	    if NUMRUNS>MERGEFACTOR then
+		outstr(cvs((NUMRUNS-2) div (MERGEFACTOR-1)+1) &
+			" merge passes required"&CRLF)
+	    end;
+	
+	INIX_0;
+	END;
+    while true do
+	begin "merge loop"
+	if RUNIX-INIX leq MERGEFACTOR then
+	    begin "final merge"
+	    integer T;
+	    if VERBOSE then outstr("Final merge..."&CRLF);
+	    T_RUNIX-INIX;
+	    if T=1 then
+		begin "recopy"
+		FINALCOPY;
+		done "merge loop";
+		end;
+	    for I_0 thru T-1 do
+		CHAN[I]_READIN(INIX_INIX+1);
+	    WANTWRITE(RUNCHAN_getchan,zilch,OUTFILE,true,FILEMODE);
+	    SORTMERGE(T,true,true);
+	    release(RUNCHAN);
+	    done "merge loop";
+	    end "final merge";
+	for I_0 thru MERGEFACTOR-1 do
+	    CHAN[I]_READIN(INIX_INIX+1);
+	VALIDATEUNITS;
+	WRITEON(RUNIX_RUNIX+1);
+	if VERBOSE then
+	    outstr("Merge "&cvs(INIX div MERGEFACTOR)&"..."&CRLF);
+	SORTMERGE(MERGEFACTOR,true,false);
+	release(RUNCHAN);
+	end "merge loop";
+    end   "Command loop"
+end "fsort"
+5  g@
+]
