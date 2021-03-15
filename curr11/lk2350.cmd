@@ -1,0 +1,11 @@
+sv2350/img
+/b:1000:lowmem:sx:inidat:inibyt:main:second:tenths:init:.xdt.:once:vectbl
+/b:10000:falcbt/b:10040
+/T:167400:pdata:ddb:ldb:adb:sdb:impure,
+MP2350=cg2350.nbj,ru2350.nbj,
+exec.nbj,errrom.nbj,pkt1.nbj,pkt2.nbj,pkt3d.nbj,
+cmdx28.nbj,cmdt28.nbj,cmds.nbj,trm.nbj,trmf.nbj,trmp.nbj,
+trmt.nbj,xltcrs.nbj,xltebc.nbj,zapbuf.nbj,
+lnk1.nbj,lnkebp.nbj,lkepkt.nbj,lnk2.nbj,x25q.nbj,
+tyma.nbj,ling.nbj,padmgr.nbj,
+auto11.nbj,oncrom.nbj,end.nbj
