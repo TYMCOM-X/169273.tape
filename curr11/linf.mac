@@ -1,0 +1,413 @@
+	.TITLE	LINF   - Async line driver type F (Nexilis 8086 IO processor)
+	.SBTTL	LINF   - Nexilis/JRG/Leland
+
+	XLPAR				;DON'T LIST PARAMETER FILE
+	CODE
+
+.IF NDF ..SAT
+  ..SAT=!0
+.ENDC
+
+	.PAGE
+	.SBTTL	LINF   - Reset routine
+
+;This routine is called when the node is started or restarted
+;	C(R4) = address of ADB
+;	CALL	ASFINT
+
+ASFINT::CLR	SDTXFP#(SD)		;Clear packet pointer
+	CLR	R0			;Start counter
+1$:	TSTB	@ADFXFR#(R4)		;Is the IOP ready for a function?
+	NXMJMP	ASFIN6			;If no IOP!
+	BEQ	2$			;Yes
+	SOB	R0,1$			;No-wait for a while!
+	BR	ASFIN6			;Say its not there if its not ready yet!
+
+2$:	TSTB	SDTRXA#(SD)		;Is this the first line on the IOP?
+	BNE	10$			;No just handle the socket stuff
+	MOV	ADFXFR#(R4),R0		;Get address of transmit register
+	CALL	DCPINI#			;Init this DCP
+	BCS	ASFIN6			;Mark no interface available
+	BISB	#$A1AVL,ADSTS1#(R4)	;Indicate interface is available
+10$:	TBBE	$A1AVL,ADSTS1#(R4),RTN002;Is this interface avaiable?
+	BIS	#$S1AVL,SDSTS1#(SD)	;Yes-so is the socket
+	CLR	R1			;Wait for the dumm DCP
+12$:	TSTB	@ADFXFR#(R4)		;Is it ready yet?
+	BEQ	14$			;Yes
+	SOB	R1,12$
+	RSTOP	IOP
+
+14$:	MOV	ADFVEC#(R4),@ADFXDR#(R4);Store vector as data
+	MOV	#.XFCPT*400,R0		;Function = configure port
+	BISB	SDTRXA#(SD),R0
+	SWAB	R0
+	MOV	R0,@ADFXFR#(R4)		;Store function
+	CLR	R0			;Start counter
+20$:	CMPB	#.RFCDN, @ADFRFR#(R4)	;Is he finished?
+	BEQ	30$			;Yes
+	SOB	R0,20$			;No-wait for a while
+	RSTOP	IOP			;DCP failed to respond after diagnostics
+
+30$:	CLRB	@ADFRFR#(R4)		;Eat function
+	RETURN
+
+;Here if interface hardware does not exist
+
+ASFIN6:	BICB	#$A1AVL,ADSTS1#(R4)	;Indicate hardware does not exist
+RTN002:	RETURN
+	.PAGE
+	.SBTTL	LINF   - Interrupt level routines
+
+;Here on interrupt (the only one!) from the IO processor
+;Before getting here the following code has been executed:
+;	ASnXI:	PUSH	R4		;Save R4
+;		MOV	#ADBn$,R4	;Get address of ADB
+;		JMP	ASFXXI		;Go to common routine
+
+ASFXXI::PUSH	R0			;Save R0 too
+	PUSH	R1			;Also R1
+	PUSH	R2			;And R2!!
+	MOV	@ADFRDR#(R4),R2		;Get the data
+	MOV	@ADFRFR#(R4),R0		;And the function and line number
+	CLRB	@ADFRFR#(R4)		;Clear out the function
+	MOVB	R0,R1			;Get just the function
+	BMI	ERROR			;Jmp on error or junk
+	CMP	#.RFMAX, R1		;Is this a reasonable function?
+	BLO	ERROR			; jmp if not
+	JMP	@DSPTBL(R1)		;Dispatch on the function
+
+;Receive function dispatch table
+
+	PURE
+
+;	.WORD	ERROR		;.RFFER = -6 - Function error
+;	.WORD	ERROR		;.RFMER = -4 - Memory error
+;	.WORD	ERROR		;.RFRER = -2 - ROM error
+DSPTBL:	.WORD	DISMIS		;.RFERR =  0 - Error (spurious interrupt)
+	.WORD	CARDET		;.RFDSD =  2 - Carrier detect (Data set ready)
+	.WORD	CARLOS		;.RFDSL =  4 - Carrier loss (Data set ready)
+	.WORD	DSRDET		;.RFCRD =  6 - Data set ready detect
+	.WORD	DISMIS		;.RFCRL = 10 - Data set ready loss
+	.WORD	RCVDAT		;.RFDAT = 12 - Receive data
+	.WORD	XMTDON		;.RFDON = 14 - Xmit done
+	.WORD	ERROR		;.RFPOK = 16 - Passed diagnositics
+	.WORD	ERROR		;.RFCDN = 20 - Parameter setup done
+	.WORD	ERROR		;.RFEOM = 22 - Transmitter underrun/EOM
+DSPTBX:
+	CODE
+	.PAGE
+;Here on error from the IO processor
+
+ERROR:	RSTOP	IOP			;[IO Processor error]
+
+;Here for receive data
+
+RCVDAT:	TST	R2			;Check for error
+	BPL	12$			;Go on if no error
+	TBBE	040000,R2,12$		;Framing error?
+10$:	MOV	#.LFBRK,R1		;Yes-get function
+	BR	14$			;Go call terminal service
+
+;Here for normal data
+
+12$:	MOV	#.LFDAT,R1		;Indicate data
+14$:	BIC	#377,R0
+	BISB	R2,R0
+CALLTR:	ADD	ADINDX#(R4),R0		;Add in offset for first line
+CALLT2:	CALL	TRINTR#			;Call terminal service
+DISMIS:	POP	R2			;Restore R2
+	POP	R1			;And R1
+	POP	R0			;And R0
+	POP	R4			;And R4
+	RTI				;Dismiss interrupt
+
+;Here for xmit done function
+
+XMTDON:	CLRPSW				;Allow other interrupts
+	ADD	ADINDX#(R4),R0		;Add in offset for first line
+	MOV	R0,R1			;Find SDB for this line
+	CLRB	R1			;Clear unused byte
+	SWAB	R1
+;	MOVB	R1,R1
+	ASL	R1
+	MOV	T0SX#(R1),R1
+	MOV	SDTXFP#(R1),R2		;Get packet address
+	BEQ	34$			;If no output packet
+	TSTB	PKCNT(R2)		;Anything in the packet?
+	BEQ	34$			;No
+	PUSH	R0			;Yes-free up R0 (sav for TRINTR)
+.IF EQ ..SAT
+	MOVB	SDTRLW#(R1),R0		;Get line width
+	BEQ	2$			;Go on if none given
+	CMPB	SDTRHP#(R1),R0		;At end of line yet?
+	BHIS	30$			;Yes-must stop output now
+.ENDC
+2$:	MOVB	PKPNT(R2),R0		;Calculate address of next character
+	ADD	R2,R0
+;	MOVB	PKDATA-1(R0),R0		;Get next character
+	BITB	#140,PKDATA-1(R0)	;Test for printing character
+	BEQ	30$			;Stop if not printing character
+	INCB	PKPNT(R2)		;Update pointers and counters
+.IF EQ	..SAT
+	INCB	SDTRHP#(R1)
+.ENDC
+	DECB	PKCNT(R2)
+	BEQ	10$			;Handle last character of packet
+	BITB	#140,PKDATA(R0)		;Is the next char printable
+	BEQ	10$			;Do single character stuff if one printing char
+	INCB	PKPNT(R2)		;Update pointers and counters
+.IF EQ	..SAT
+	INCB	SDTRHP#(R1)
+.ENDC
+	DECB	PKCNT(R2)
+.IF NE	..SAT
+	BEQ	8$			;Handle last character of packet
+	BITB	#140,PKDATA+1(R0)	;Do we have three printable chars
+	BEQ	8$			;Do double character stuff if two printing character
+	ADD	#PKDATA-1,R0		;Point to start of string
+	PUSH	R0			;Save start of string address
+	ADD	#3,R0			;Point past last character tested
+4$:	INCB	PKPNT(R2)		;Advance packet pointer
+	DECB	PKCNT(R2)		;Decrement remaining bytes in packet
+	BEQ	6$			;Handle last one
+	BITB	#140,(R0)+		;Printable character?
+	BNE	4$			;Continue if print character
+6$:	SUB	(SP),R0			;Get count of characters
+	MOV	R0,R2			;Save count as data
+	MOVB	SDTRXA#(R1),R0		;Get index on interface
+	SWAB	R0
+	BIS	#.XFTDM,R0		;Merge in the function to send via DMA
+	POP	R1			;Restore starting address
+	BR	14$			;Go send it
+.ENDC
+8$:	MOVB	PKDATA(R0),R2		;Get 2nd byte of data
+	SWAB	R2			;Put in correct half
+	CLRB	R2			;Make room for first byte
+	BISB	PKDATA-1(R0),R2		;Put it in
+	MOVB	SDTRXA#(R1),R0		;Get index on interface
+	SWAB	R0
+	BIS	#.XFTX2,R0		;Merge in the function to send two bytes
+	BR	14$			;Go send it
+10$:	MOVB	PKDATA-1(R0),R2		;Get next character
+	MOVB	SDTRXA#(R1),R0		;Get index on interface
+	SWAB	R0
+	BIS	#.XFDAT,R0		;Merge in the function
+14$:	SETPSW	#240			;Turn interrupts back off again
+	PUSH	R1			;Save DMA data
+	CLR	R1			;Wait for device
+20$:	TSTB	@ADFXFR#(R4)
+	BEQ	24$			;If ready
+	SOB	R1,20$			;Not ready-wait for a while
+24$:	MOV	R2,@ADFXDR#(R4)		;Store data
+	POP	@ADFXDA#(R4)		;Store possible DMA address
+	MOV	R0,@ADFXFR#(R4)		;Store port and function
+	POP	R0			;Restore R0
+	BR	DISMIS			;Finished
+
+;Here if must stop output now
+
+30$:	POP	R0			;Restore R0
+34$:	CLR	R1			;Get function = output done
+	BR	CALLT2			;Go tell main program level
+
+;Here for carrier detect
+
+CARDET:	MOV	#.LFCDT,R1		;Get function
+	BR	CALLTR			;Continue
+
+;Here for carrier loss
+
+CARLOS:	MOV	#.LFCLS,R1		;Get function
+	BR	CALLTR			;Continue
+
+;Here for data set ready (ring) detect
+
+DSRDET:	MOV	#.LFRNG,R1		;Get function
+	BR	CALLTR			;Continue
+	.PAGE
+	.SBTTL	LINF   - Output routines
+
+;Subroutine to output data character
+;	C(R0) = character to output
+;	C(R4) = address of ADB
+;	CALL	ASFOUT
+
+ASFOUT::MOV	R1,SDTXFP#(SD)		;Store address of output packet
+	MOVB	SDTRXA#(SD),R1		;Get index on interface
+	SWAB	R1			;In the right place
+	BIS	#.XFDAT,R1		;Add the function
+	CLR	R2			;Start a counter
+	SETPSW	#340			;No interrupts now
+2$:	TSTB	@ADFXFR#(R4)		;Is the IO processor ready for this?
+	BEQ	4$			;Yes-go on
+	SOB	R2,2$			;No-wait until it is!
+4$:	MOV	R0,@ADFXDR#(R4)		;Store data
+	MOV	R1,@ADFXFR#(R4)		;And store port and function
+	CLRPSW				;Interrupts OK now
+	RETURN				;And return
+
+;Subroutine to perform output function
+;	C(R0) = function code
+;	C(R4) = address of ADB
+;	CALL	ASFFNC
+
+ASFFNC::ADD	R0,PC			;DISPATCH ON THE FUNCTION
+	BR	SNDBRK			; 0 = .LFSBK	Send break sequence
+	BR	SETLIN			; 2 = .LFSET	Setup hardware
+	BR	ANSWER			; 4 = .LFANS	Answer line
+	BR	HANGUP			; 6 = .LFFHG	Force hang up
+	BR	STPOUT			;10 = .LFSTP	Stop output
+	BR	ENDBRK			;12 = .LFEBK	End break sequence
+	BR	XOFENB			;14 = .LFXOF	Set up for XOFFXON
+;	BR	XOFDIS			;16 = .LFXDI	Disable XOFFXON
+XOFDIS:
+XOFENB:	RETURN
+
+ENDBRK:	MOV	#.XFEBK*400,R0		;Set up end break function
+	BR	SNDFNC
+
+;Here to start break sequence
+
+SNDBRK:	MOV	#.XFSBK*400,R0		;Set up start break function
+	BR	SNDFNC
+
+;Here to stop output immediately
+
+STPOUT:	CLR	SDTXFP#(SD)		;Clear the output packet pointer
+	RETURN				;Thats all
+
+;Here to force a line to hang-up
+
+HANGUP:	MOV	#.XFCDR*400,R0		;Get function
+	BR	SNDFNC			;Continue
+
+;Here to answer line
+
+ANSWER:	MOV	#.XFSDR*400,R0		;Get function
+SNDFNC:	BISB	SDTRXA#(SD),R0		;Add port number
+	SWAB	R0
+	CLR	R3			;Start counter
+	SETPSW	#340			;No interrupts here
+10$:	TSTB	@ADFXFR#(R4)		;Is the DCP ready for another function?
+	BEQ	20$			; jmp if so
+	SOB	R3,10$			;No-wait for a while
+	RSTOP	IOP			;DCP is not eating properly! (functions)
+20$:	MOV	R0,@ADFXFR#(R4)		;Give the function to the IO processor
+	CLRPSW				;Interrupts OK now
+	RETURN
+
+;Here to setup the line parameters
+
+SETLIN:	MOVB	SDTRS3#(SD),R0		;Get output baud rate
+	BIC	#^C$T3ORT,R0
+	ASL	R0			;For word indexing
+	MOV	ADFXDR#(R4),R1		;Get address of data register
+	MOV	SIZTBL(R0),R2		;Get first data word (number of stop
+					;  bits plus character size)
+	BEQ	RTN004			;If not legal baud rate
+	TBBE	$T4PAR,SDTRS4#(SD),2$	;Does he want parity?
+	ADD	#000300,R2		;Yes-correct the character size and set
+					;  the parity bit!
+	TBBN	$T4ODD,SDTRS4#(SD),2$	;Should it be odd?
+	BIS	#1000,R2		;No-indicate even
+2$:	PUSH	BRTTBL(R0)		;Save baud rate count value
+	MOV	#.XFPAR*400,R0		;Get function = set port parameters
+	BISB	SDTRXA#(SD),R0		;Add port number
+	SWAB	R0
+	CLR	R3			;Start counter
+	SETPSW	#340			;No interrupts here
+10$:	TSTB	@ADFXFR#(R4)		;Is the DCP ready for another function?
+	BEQ	12$			; jmp if so
+	SOB	R3,10$			;No-wait for a while
+	RSTOP	IOP			;DCP is not eating properly! (functions)
+
+12$:	MOV	R2,(R1)+		;Store status bits
+	POP	(R1)			;And baud rate count
+SNDFN2:	MOV	R0,@ADFXFR#(R4)		;Give the function to the IO processor
+	CLRPSW				;Interrupts OK now
+	BR	ANSWER			;Necessary to turn dtr back on
+RTN004:	RETURN				;Finished
+	.PAGE
+	.SBTTL	LINF	- Pure data
+
+	PURE
+
+;Define values for the size and rate tables
+
+	.MACRO	TT
+	T	 ,   ,   0.	; 0 =  Auto-detect
+	T	5,1.5,2304.	; 1 =    50   Baud, 5 Bits, 1.5 Stop Bits
+	T	5,1.5,1536.	; 2 =    75   Baud, 5 Bits, 1.5 Stop Bits
+	T	8,2  ,1047.	; 3 =   110   Baud, 8 Bits, 2   Stop Bits
+	T	7,1  , 857.	; 4 =   134.5 Baud, 7 Bits, 1   Stop Bit
+	T	8,1  , 768.	; 5 =   150   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  , 576.	; 6 =   200   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  , 384.	; 7 =   300   Baud, 8 Bits, 1   Stop Bit
+	T	7,1  , 384.	;10 =   300   Baud, 7 Bits, 1   Stop Bit
+	T	8,1  , 288.	;11 =   400   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  , 192.	;12 =   600   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,  96.	;13 =  1200   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,  64.	;14 =  1800   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,  58.	;15 =  2000   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,  48.	;16 =  2400   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,  32.	;17 =  3600   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,  24.	;20 =  4800   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,  16.	;21 =  7200   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,  12.	;22 =  9600   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,   6.	;23 = 19200   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,1152.	;24 =   100   Baud, 8 Bits, 1   Stop Bit
+	T	8,1  ,   3.	;235= 38400   Baud, 8 Bits, 1   Stop Bit
+	.ENDM
+
+;Generate the size table - this table contains the character size and number
+;  of stop bits in the positions where the IO processor wants them as follows:
+;	bits 15-12:	not used here
+;	bits 11-10:	01 = 1 stop bit
+;			10 = 1.5 stop bits
+;			11 = 2 stop bits
+;	bits  9- 8:	00 = no parity
+;			01 = odd parity
+;			11 = even parity
+;	bits  7- 6:	00 = 5 bit character size
+;			01 = 6 bit character size
+;			10 = 7 bit character size
+;			11 = 8 bit character size
+;	bits  5- 0:	not used here
+
+	.MACRO	T  SIZE,STOP,RATE
+$Z=!0
+.IF IDN <SIZE><6>
+  $Z=!000100
+.ENDC
+.IF IDN <SIZE><7>
+  $Z=!000200
+.ENDC
+.IF IDN <SIZE><8>
+  $Z=!000300
+.ENDC
+.IF IDN <STOP><1>
+  $Z=!$Z!002000
+.ENDC
+.IF IDN <STOP><1.5>
+  $Z=!$Z!004000
+.ENDC
+.IF IDN <STOP><2>
+  $Z=!$Z!006000
+.ENDC
+	.WORD	$Z
+	.ENDM
+
+SIZTBL:	TT
+
+;Generate the baud table - this table contains the baud rate multiplier to
+;  send to the IO processor
+
+
+	.MACRO	T  SIZE,STOP,RATE
+	.WORD	RATE
+	.ENDM
+
+BRTTBL:	TT
+
+	.END
+    
