@@ -1,0 +1,319 @@
+
+begin "PACK"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "(SAILIB)ATFILE.REQ" source!file;
+require "(SAILIB)CVPPN.REQ" source!file;
+require "ARGS.REQ" source!file;
+
+Define BrkString =
+    {(If Brk="*" then "######" else if Brk="?" then "#" else null)};
+
+Define MemMax = '2000;
+
+Define !FILE = 0, !EXT = 1;
+
+Define printx(x) = {print( cvps(x)&" (",props(x),")  ",datum(x),crlf ) };
+
+  redefine !Block(Group, Name, Size) = {
+    Ifcr Length(Cvps(Size)) = 0 thenc assignc Size = 1; Endc
+    Define Group}&{Name = Group;
+    Redefine Group = Group + Size;};
+
+    Define S! = 0;			! ** Filespec block offsets ** ;
+    !Block( S!,Dev )			! Device ;
+    !Block( S!,Usr,2 )			! Username ;
+    !Block( S!,Nam )			! Name ;
+    !Block( S!,Ext )			! Extension ;
+
+
+String  FileLine, FileSpec, CopySpec, Text;
+Integer Inbrk, InLst, Quest, Brk;	! various break table stuff ;
+Integer File, Ext, UserPPN, LastPPN;	! file information ;
+Integer VMBase, VMPage;			! virtual memory pointers  ;
+Boolean Interactive;			! determine how run ;
+
+Record!Class E( Integer Ext; r!p (E) Next );
+Record!Class F( Integer File; r!p (E) Ext; r!p (F) Next );
+Record!Class P( Integer Ppn; r!p (F) File; r!p (P) Next );
+
+r!p (P) Users, ThisUser, ThatUser;
+r!p (F) Files, That, Name;
+r!p (E) Last, This;
+
+Own Safe Integer Array Spec[ S!Dev : S!Ext ];
+
+Preset!with [ MemMax + 512 ] 0;		! expect to use 1 : MemMax ;
+Own Safe Integer Array VM[ 1 : MemMax+512 ];	!  entries minus page slop ;
+
+string item OutputFiles;		! output file(s) ;
+string item InputFiles;			! list of input files ;
+
+item Sticky;				! controls "sticky" username ;
+item Reverse;				! controls sorting order ;
+
+
+Simple Procedure InitStuff;
+! ----------------------------------------------------------------------;
+!									;
+!	InitStuff							;
+!		Routine to initialize data structures and calculate	;
+!		where to put the initial cache of pages to use for	;
+!		this venture.						;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Init"
+
+    VMPage_ (location( VM[1] ) + '777) lsh -9;
+    VMBase_ VMPage lsh 9;		! base memory address ;
+
+end "VM Init";
+require InitStuff initialization;
+
+
+Simple Integer procedure GetText( Reference string Line;
+				  Integer Byte, Count; String Chars );
+begin "get text"
+    Own integer wp;
+    String Str;
+
+    while ( length( Line ) )
+     do begin "get data"
+
+	Str_ Chars;				! copy break chars ;
+	while ( length( Str ) )			! if any break chars ;
+	 do if ( Line = Lop( Str ) )		!  and match a brk ;
+	     then return( Line );		!  return that character ;
+
+	if ( 0 leq count_ count - 1 )		! if room left in string ;
+	 then if ( "a" leq wp_lop(Line) )	!  then check case ;
+	       then idpb( wp-'100, byte )	!    lowercase to sixbit ;
+	       else idpb( wp-'40, byte )	!    uppercase to sixbit ;
+	 else wp_ lop( Line );			!  throw away extras ;
+
+     end "get data";
+
+    return( 0 );				! no line left? ;
+
+end "get text";
+
+
+Simple Boolean Procedure VMSpec( String Line );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMSpec( FileSpecification )					;
+!		Routine to read a string file specification and build	;
+!		the special file block used by the VMFile routine.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Spec"
+
+    arrclr( spec );				! clear out the array ;
+
+    GetText( Line, point( 6,spec[S!Nam],-1 ), 6, ":(." );
+
+    if ( ":" = Line )				! it was a device, good! ;
+     then begin
+	lop( Line );				! throw away the colon and ;
+	spec[S!Dev] swap spec[S!Nam];		! swap data to right places ;
+     end
+     else spec[S!Dev]_ cvsix("DSK");		!  and fill in the device ;
+
+    if ( "(" = Line )				! if it starts with "(" ;
+     then begin "get user"			!  then pick up username ;
+	lop( Line );				!    eat the "(" ;
+	GetText( Line, point( 6,spec[ S!Usr ],-1 ), 12, ")" );
+	lop( Line );				!    eat the ")" ;
+     end "get user"
+     else begin "default user"			! set default if no user ;
+	spec[ S!Usr   ]_ calli( '31, '41 );	! .GTNM1 (GFD user 1-6)  ;
+	spec[ S!Usr+1 ]_ calli( '32, '41 );	! .GTNM2 (GFD user 7-12) ;
+	If not( !Skip! )			! set blank if GETTAB fails ;
+	 then spec[ S!Usr ]_ spec[ S!Usr+1 ]_ 0;
+     end "default user";
+
+    if not( length( Line ) or spec[S!Nam] )	! must have a name ;
+     then return( false );			!  so return false ;
+
+    if not( "." = Line or spec[S!Nam] )
+     then GetText( Line, point( 6,spec[ S!Nam ],-1 ), 6, "." );
+
+    if not( spec[S!Nam] )			! seen anyone ;
+     then return( false );			! no, go home ;
+
+    if ( "." = Line )				! if dot seen ;
+     then begin "get ext"
+	lop( Line );				!  then chop it off ;
+	GetText( Line, point( 6,spec[ S!Ext ],-1 ), 3, " "&'11 );
+     end "get ext";
+
+    return( true );				! got here, return ok ;
+
+end "VM Spec";
+
+
+boolean procedure WantFile( Reference Integer Filename, Extension );
+begin
+    Return( Extension neq CvSix("TMP") );
+end;
+
+procedure FileProc( Reference Integer Chan, Cnt, Brk, FileEof;
+		    Integer Array LKB );
+Begin "Each File"
+    Integer N;
+
+    Name_ P:File[ ThisUser ];			! Head of list   ;
+
+    While ( That_ F:Next[ Name ] )		! While ( more ) ;
+     do If ( LKB[!File] = N_ F:File[ That ] )	!  do if same    ;
+	 then begin "New extension"		!   then add ext ;
+	    Last_ F:Ext[ That ];		!   : first one  ;
+	    While ( This_ E:Next[ Last ] )	!   : scan list  ;
+	     do If ( !lh( LKB[!Ext] ) < !lh( E:Ext[This] ) )
+		 then if not( props(Reverse) )	! test direction ;
+		       then done		!   : insert it  ;
+		       else Last_ This		!  loop for more ;
+		 else if not( props(Reverse) )	! test direction ;
+		       then Last_ This		!   : make ext!  ;
+		       else If ( !lh( LKB[!Ext] ) > !lh( E:Ext[This] ) )
+			     then done		!   : insert it  ;
+			     else Last_ This;	!   : make ext!  ;
+	    If ( !lh(LKB[!Ext]) = !lh(E:Ext[Last]) )
+	     then return;			! skip identical ;
+	    E:Next[ Last_ E:Next[ Last ]_ new!record( E ) ]_ This;
+	    E:Ext[ Last ]_ LKB[!Ext];		!   : in place   ;
+	    Return;				! then return.   ;
+	 end "New extension"
+	 else If ( LKB[!File] < N )		!  else insert?  ;
+	       then if not( props(Reverse) )	! test direction ;
+		     then done			!    yes, skip!  ;
+		     else Name_ That		! no, re do scan ;
+	       else if not( props(Reverse) )	! test direction ;
+		     then Name_ That		! no, re do scan ;
+		     else If ( LKB[!File] > N )	!  else insert?  ;
+			   then done		!    yes, skip!	 ;
+			   else Name_ That;	! no, re do scan ;
+
+    F:Next[ Name_ F:Next[ Name ]_ new!record( F ) ]_ That;
+    F:File[ Name ]_ LKB[!File];
+    This_ F:Ext[ Name ]_ new!record( E );
+    E:Ext[ E:Next[ This ]_ new!record( E ) ]_ LKB[!Ext];
+
+end "Each File";
+
+!	***  M A I N   P R O G R A M   L O O P  ***
+;
+
+setbreak(inbrk_getbreak,#LF&#FF,null,"INS");	! break on LF FF;
+setbreak(inlst_getbreak,", "," "&#HT,"KTINS");	! break on comma;
+setbreak(quest_getbreak,"?*",Null,"INS");	! break on qmark;
+MFDset( 0, 4, 0, 132 );				! ascii, in, out, count;
+
+if not( Kequ(ARGV[0],"PACK") )
+ then Usererr( 0,0, "Illegal command: "&ArgV[0], "X" );
+
+ArgParse( any, InputFiles, {Sticky,Reverse}, ARGS );
+
+LastPpn_ Calli(!Xwd(-1,!GtPPN), Calli!GETTAB);	! initially self ;
+Interactive_ true;			! default to interactive mode ;
+
+while ( true )
+ do begin "!TRUE!"
+
+    if ( props(InputFiles) )		! if something specified ;
+     then begin "command line"		!  then ;
+	Interactive_ false;		!   become non-interactive ;
+	FileLine_ datum(InputFiles);	!   and simulate input line ;
+     end "command line";
+
+    If ( Interactive )			! non command line data ;
+     then begin "real session"
+	Print( "Spec(s): " );		! prompt for an input line ;
+	FileLine_ AtFile( True );	! then read it. ;
+	If Length( FileLine ) = 0	! on a blank line from user ;
+	 then Calli(0,Calli!EXIT);	!  simply terminate session ;
+     end "real session";
+
+    Users_ new!record( P );			! initialize...;
+
+    While Length( FileLine )			! for each spec typed ;
+     do begin "line typed"
+	FileSpec_ Scan(FileLine,inlst,brk);	! gobble one file-spec ;
+	If Length( FileSpec )			! if it has substance ;
+	 then begin "file typed"
+	    CopySpec_ Null;			! init copy variables ;
+	    Brk_ 0;
+	    While ( length( FileSpec ) )
+	     do CopySpec_ CopySpec & BrkString & Scan( FileSpec, quest, Brk );
+	    CopySpec_ CopySpec & BrkString;		! translate *,? to # ;
+	    File_ cvfil( CopySpec, Ext, UserPpn );	! dissect into parts ;
+	    If ( 0 neq (File lor Ext lor UserPpn) )	! any non-null ok ;
+	     then begin "use GFD ppn"
+		If UserPpn = 0				! handle null ppn ;
+		 then if ( props(STICKY) )		! use /STICKY here ;
+		       then UserPpn_ LastPpn		! previous username ;
+		       else UserPpn_ Calli( !Xwd(-1,!GtPPN), Calli!GETTAB );
+		If !lh( UserPpn ) = 0			! pointer to UNAME ;
+		 then UserPpn_ CvPPN( Cv6str( memory[ UserPpn   ] ) &
+				      Cv6str( memory[ UserPpn+1 ] ) );
+	     end "use GFD ppn";
+	    If File = 0 then File_ cvsix("*");		! handle null file ;
+	    If Ext = 0 then Ext_ cvsix("*");		! handle null ext ;
+
+	    ThatUser_ Users;				! Start at top   ;
+	    While ( ThisUser_ P:Next[ ThatUser ] )	! While ( more ) ;
+	     do If ( UserPpn = P:Ppn[ ThisUser ] )	!  do if same    ;
+		 then done;				!   have a match ;
+	    If not( ThisUser )				! Got one?       ;
+	     then begin "first time"			! No, set one up ;
+		ThisUser_ P:Next[ ThatUser ]_ new!record( P );
+		P:Ppn[ ThisUser ]_ UserPpn;		! store username ;
+		P:File[ ThisUser ]_ new!record( F );	! init file area ;
+	     end "first time";
+
+	    UfdScn( UserPpn, File, Ext, 1, WantFile, FileProc );
+	    LastPpn_ UserPpn;			! remember last user ;
+
+	 end "file typed"
+     end "line typed";
+
+!	fall through from above -- scanner sorting code.
+!	***  I N T E R E S T I N G   P A R T  ***
+;
+    ThatUser_ Users;				! one user at a time ;
+    while( ThisUser_ P:Next[ ThatUser ] )	! if any at all      ;
+     do begin "each user"			!  P:Ppn[ ThisUser ] ;
+
+	Name_ P:File[ ThisUser ];		! get name pointer   ;
+	While ( That_ F:Next[ Name ] )		! look one at a time ;
+	 do begin "each name"			!  F:File[ That ]    ;
+
+	    This_ F:Ext[ That ];		! get ext pointer    ;
+	    While ( This_ E:Next[ This ] )	! one at a time      ;
+	     do begin "each ext"		!  E:Ext[ This ]     ;
+
+		Print( CvXstr( F:File[ That ] ) );
+		Print( (" " & CvXstr( E:Ext[This] ))[1 for 4] );
+
+	     end "each ext";			! ran of end of list ;
+	    Print( Crlf );
+	    Name_ That;				! setup for next "F" ;
+
+	 end "each name";
+	ThatUser_ ThisUser;			! setup for next "P" ;
+
+     end "each user";
+
+    if not( Interactive )		! if we were a command line ;
+     then calli(0,calli!EXIT);		!  then we are done. ;
+
+    Interactive_ true;			! in case user says continue ;
+
+ end "!TRUE!";
+
+start!code uuo!EXIT 0, end;		! really exit! ;
+
+end "PACK" $
+    
