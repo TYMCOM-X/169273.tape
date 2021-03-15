@@ -1,0 +1,791 @@
+entry
+	GetRec, ModRec, ClsQue, OpnQue
+,	Queue,  QueMsg, QueRun, QueAct
+,	QError, InQue
+;
+Begin "JQUE"
+
+require "(SAILIB)SAIL.DEF"   source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(CARL)JQUE.DEF"     source!file;
+require "(CARL)JQUEUE.DEF"   source!file;
+
+!	Variable storage
+;
+
+Internal Boolean InQue;
+Internal Integer QError, Queue, QueMsg, QueRun, QueAct;
+
+Own Boolean Eof, Err, MapLock, Lockey, AllOk;
+Own Integer BasePage, Base, QuePage, MsgPage, RunPage, ActPage;
+Own Integer Chan, MyPage, MyRecord, RecBase;
+Own Integer NewPage, NewRecord, NewBase;
+Own Integer Reading, Writing, Modify;
+
+Own Safe Integer Array File[ 1 : 6 ];
+Own Safe Integer Array Hold[ 0 : E!Length-1 ];
+
+Preload!with [E!Length]0;
+Own Safe Integer Array Zeros[ 0 : E!Length-1 ];
+
+Preload!with [(QueueData+1)*'1000]0;	! Ent, Map, Msg, Run, Act, Act ;
+Own Safe Integer Array VirtualStorage[ 0 : ((QueueData+1)*'1000)-1 ];
+
+simple procedure SetupBasePage;
+! ----------------------------------------------------------------------;
+!									;
+!	SetupBasePage	Initialize the page variables and setup for	;
+!			normal queue-file manipulation.			;
+!									;
+! ----------------------------------------------------------------------;
+begin
+
+    BasePage_ (Location(VirtualStorage[0]) +'777) lsh -9;
+    Base_ BasePage lsh 9;		! set base offsets into array;
+    QuePage_ BasePage + 1;		! use next page for status;
+    Queue_ QuePage lsh 9;		! easy access queue addess;
+    MsgPage_ QuePage + 1;		! use next page for messages;
+    QueMsg_ MsgPage lsh 9;		! easy access msg address;
+    RunPage_ MsgPage + 1;		! use next page for messages;
+    QueRun_ RunPage lsh 9;		! easy access msg address;
+    ActPage_ RunPage + 1;		! use next 2 pages for active;
+    QueAct_ ActPage lsh 9;		! easy access active address;
+
+    Calli( !Xwd(QueueData,BasePage), calli!VCLEAR );
+
+    If ( Chan and InQue land que$Open )	! if non-zero channel open;
+      then Release( Chan );		! clear any file usage;
+    Chan_ MyPage_ MyRecord_ RecBase_ 0;	! clear entry information;
+
+    MapLock_ InQue_ 0;			! clear lock & status;
+
+end;
+require SetupBasePage initialization;
+
+
+Simple Procedure GetLock;
+! ----------------------------------------------------------------------;
+!									;
+!	GetLock		Routine to lock the queue for single-access. 	;
+!			If the lock is in use, the routine will wait	;
+!			indefinately until the lock is free.		;
+!									;
+! ----------------------------------------------------------------------;
+begin!code
+    label Retry, GWait, GReady;
+
+	Skipe	MapLock;		! do we already have it?;
+	  Jrst	GReady;			! yes, count one more;
+	Push	P,'1;			! don't clobber ac;
+	Movei	'1,50;			! 5 * 10 * 200ms = 10 seconds ;
+	Movem	'1,Lockey;		! The skeleton key ;
+	Move	'1,Queue;		! get base address of map;
+	Push	P,'3;			! make this a painless sleep;
+Retry:	Sosl	'3,Q!Lock('1);		! get lock counter;
+	  Jrst	GWait;			! nope, sleep it off;
+	Camn	'3,[ -1 ];		! if we're lucky, we got it;
+	 Skipa;				! got it!
+	Sosg	Lockey;			! have we timed out waiting ;
+	 Skipa;				! got it!
+	  Jrst	GWait;			! nope, sleep it off;
+	Setom	Q!Lock('1);		! force the lock ;
+	Pop	P,'3;			! back to the real world;
+	Pop	P,'1;			! restore ac;
+	Jrst	GReady;			! set internal lock and return;
+
+GWait:	Movei	'3,'200;		! get hibernation counter;
+	Calli	'3,calli!hiber;		! sleep for a bit;
+	  Jfcl;				! ignore error return;
+	Skipn	Q!Lock('1);		! is there still a lock;
+	  Jrst	Retry;			!   no -- try to get it now;
+	 Jrst	GWait;			! well... back to sleep;
+
+GReady:	Sos	MapLock;		! mark that we have the lock;
+					! one or more times ;
+end;
+
+
+simple procedure UnLock;
+! ----------------------------------------------------------------------;
+!									;
+!	UnLock		Routine to release the global lock on the	;
+!			queue.  This action reenables multiple access.	;
+!									;
+! ----------------------------------------------------------------------;
+begin!code
+    Label UReady;
+
+	Aosge	MapLock;		! release one level of locks;
+	  Jrst	UReady;			! and simply return if more;
+	Push	P,'1;			! don't clobber ac;
+	Move	'1,Queue;		! get queue address offset;
+	Setzm	Q!Lock('1);		! release the global lock;
+	Pop	P,'1;			! restore ac;
+	Setzm	MapLock;		! insure this is given away;
+UReady:
+
+end;
+
+
+simple integer procedure MapQuePage;
+! ----------------------------------------------------------------------;
+!									;
+!	MapQuePage	Map the queue status page into memory at	;
+!			BasePage after insuring the page is clear.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Map Status Page"
+    own safe integer array arg[0:1];
+
+    Calli(!Xwd('2001,QuePage),-'66);	! unmap any previous page ;
+    InQue_ InQue land lnot que$Map;	!  and clear page flag ;
+
+    Arg[ 0 ]_ !Xwd( '6001,QuePage );	! <.prrw>b7 + 1b17,,queue;
+    Arg[ 1 ]_ QueueMap;			! use specified file-page;
+
+    Chnior( Chan, Arg[0], !chMFP );	! map file page ;
+    If not( !skip! )			!  ?error? ;
+     then begin "cannot get status"
+	QError_ err$CMS;		!   set error flag ;
+	Return( 0 );			!   and return 0 ;
+     end "cannot get status";
+
+    InQue_ InQue lor que$Map;		! set status page flag ;
+
+    Return( QQ( Open )_ QQ( Open ) + 1 );
+
+end "Map Status Page";
+
+
+simple boolean procedure MapRecord( Integer r );
+! ----------------------------------------------------------------------;
+!									;
+!	MapRecord	Map a queue record into memory and set all	;
+!			the associated offset variables: RecBase and	;
+!			MyRecord.					;
+!									;
+! ----------------------------------------------------------------------;
+begin "Map Record"
+    own safe integer array arg[0:1];
+
+    GetLock;					! lock queue;
+
+    If not( r )					! no record specified;
+     then If ( r_ QQ( Hole ) )			! set any "known" hole;
+	   then QQ( Hole )_ 0;			!   if found, clear it;
+
+    If not( r )					! no "known" specified;
+     then If ( QQ( High ) leq QQ( Count ) )
+	   then begin "no holes"
+	      r_ QQ( Count ) + 1;		! setup high record + 1;
+	   end "no holes";
+
+    If ( not( r ) and ( MyPage ) )		! still nothing shown;
+     then for NewRecord_ 1 step 1		! look for an empty entry;
+	   until E!RPPage			!  on the current page;
+	   do begin "check my page"
+	      If not( memory[RecBase_ Base + (NewRecord-1) * E!Length] )
+	       then begin "got page"
+		  UnLock;			! unlock the queue;
+		  MyRecord_ ((MyPage-QueueData-1) * E!RPPage) + NewRecord;
+		  Return( true );		! return to the caller;
+	       end "got page";
+	   end "check my page";
+
+    If not( r )					! still nothing shown;
+     then begin "Find Hole"			!  then find a hole;
+
+	For NewPage_ QueueData step 1
+	 until QueueData + ((QQ( High )-1) div E!RPPage)
+	 do begin "check each page"
+
+	    Calli( !Xwd('2001,BasePage), -'66);	! unmap any previous page;
+	    InQue_ InQue land lnot que$Entry;	! turn off entry page bit;
+	    Arg[ 0 ]_ !Xwd( '6001, BasePage );	! <.prrw>b7 + 1b17,,base;
+	    Arg[ 1 ]_ MyPage_ NewPage;		! setup new file page;
+	    Chnior( Chan, Arg[0], !chMFP );	! map file page;
+	    If not( !skip! )			!  oops...later;
+	     then begin "cannot map record"
+		UnLock;				! unlock the queue;
+		MyPage_ MyRecord_ RecBase_ 0;	! clear current data;
+		QError_ err$CMR;		! cannot map record;
+		Return( false );		! error return;
+	     end "cannot map record";
+
+	    InQue_ InQue lor que$Entry;		! turn on entry page bit;
+
+	    For NewRecord_ 1 step 1		! look for an empty entry;
+	       until E!RPPage			!  on the current page;
+	       do begin "check this page"
+		  If not( memory[RecBase_ Base + (NewRecord-1) * E!Length] )
+		   then begin "got page"
+		      UnLock;			! unlock the queue;
+		      MyRecord_ ((MyPage-QueueData-1) * E!RPPage) + NewRecord;
+		      Return( true );
+		   end "got page";
+	       end "check this page";
+
+	   end "check each page";
+     end "Find Hole";
+
+    NewPage_ QueueData + ( (r-1) div E!RPPage );
+    If ( MyPage neq NewPage )
+     then begin "map new page"
+
+	Calli( !Xwd('2001, BasePage), -'66);	! unmap any previous page;
+	InQue_ InQue land lnot que$Entry;	! clear entry page bit;
+	Arg[ 0 ]_ !Xwd( '6001, BasePage );	! <.prrw>b7 + 1b17,,base;
+	Arg[ 1 ]_ MyPage_ NewPage;		! setup new file page;
+	Chnior( Chan, Arg[0], !chMFP );		! map file page;
+	If not( !skip! )			!  oops...later;
+	 then begin "cannot map record"
+
+	    Chniov( Chan, MyPage, !chCFP );	! create page in file;
+	    If ( !skip! )
+	     then begin "validate and map"
+		Chnior( Chan, 0, !chVRB );	! validate rib;
+		Chnior( Chan, Arg[0], !chMFP );	! map file page;
+	     end "validate and map";
+
+	    If not( !skip! )
+	     then begin "cannot map page"
+		UnLock;				! unlock the queue;
+		MyRecord_ MyPage_ RecBase_ 0;	! clear data fields;
+		QError_ err$CMR;		! error flag;
+		Return( false );
+	     end "cannot map page";
+
+	 end "cannot map record";
+	InQue_ InQue lor que$Entry;		! indicate entry page ;
+
+     end "map new page";
+
+    UnLock;					! unlock the queue;
+    MyRecord_ r;				! store record number;
+    RecBase_ Base + ( ( (r-1) * E!Length ) land '777 );
+
+    Return( true );
+
+end;
+
+
+simple boolean procedure ArrCMP(reference integer LOC1, LOC2; integer Count);
+! ----------------------------------------------------------------------;
+!									;
+!	ArrCMP		Compare the contents of two arrays beginning	;
+!			at LOC1 for array 1 and LOC2 for array 2 for	;
+!			a total of COUNT words.  Return false [0] if	;
+!			any of the compared words do not match.		;
+!			Return true [-1] otherwise.			;
+!									;
+! ----------------------------------------------------------------------;
+start!code "ARRCMP"
+    Define C='0, T1='1, CH1='2, CH2='3, P='17;
+    Label Loop, OK, NoGood;
+
+	SETZ	T1,;			! assume .false. at first ;
+	MOVE	C,-1(P);		! get the count ;
+	JUMPE	C,OK;			! zero count? must all match ;
+	HRRI	CH1,'444400;		! (point 36,0,-1) ;
+	HRLM	CH1,-3(P);		! build pointer to LOC1 ;
+	HRLM	CH1,-2(P);		! build pointer to LOC2 ;
+Loop:	ILDB	CH1,-3(P);		! get item to compare ;
+	ILDB	CH2,-2(P);		! get item to compare ;
+	CAME	CH1,CH2;		! match ? ;
+	  JRST	NoGood;			! No... return .false. ;
+	SOJG	C,Loop;			! Loop till out of words ;
+OK:	SETO	T1,;			! Set to .true. ;
+NoGood:
+
+end "ARRCMP";
+
+
+Simple procedure Wrap;
+! ----------------------------------------------------------------------;
+!									;
+!	Wrap		Routine to resequence the queue and return to	;
+!			NextSequence with the next sequence number.	;
+!									;
+! ----------------------------------------------------------------------;
+Return;
+
+Simple integer procedure NextSequence;
+! ----------------------------------------------------------------------;
+!									;
+!	NextSequence	Routine to generate the next logical sequence	;
+!			number for the queue.  The values range from	;
+!			1 to 131071  (or '1 to '377777).		;
+!									;
+! ----------------------------------------------------------------------;
+begin!code
+	Label NoWrap;
+
+	Pushj	P,GetLock;		! Lock the queue;
+	Push	P,'2;			! Save register;
+	Move	'1,Queue;		! Setup status page offset;
+	Aos	'2,Q!Next('1);		! Increment sequence number;
+	Trnn	'2,'400000;		! Wrap around?;
+	 Jrst	NoWrap;			! Nope, all is ok;
+	Setzm	Q!Next('1);		! Yep, reset to 0;
+	Pushj	P,Wrap;			!  and do all the work;
+	Aos	'2,Q!Next('1);		! Now get new sequence number;
+NoWrap:	Pushj	P,UnLock;		! all done;
+	Exch	'1,'2;			! put result in ac 1;
+	Pop	P,'2;			! restore register;
+
+end;
+
+
+Internal simple procedure ClsQue;
+! ----------------------------------------------------------------------;
+!									;
+!	ClsQue		Routine to close out the queue.  Unmap data	;
+!			pages and close the files.			;
+!									;
+! ----------------------------------------------------------------------;
+begin
+
+    If ( InQue )			! if queue is open ;
+     then begin "close queue"		!  we need to clear these ;
+
+	QQ( Open )_ ( 0 max ( QQ( Open )-1 ) );		! minimum of 0 ;
+
+	Calli( !Xwd('2001,BasePage),calli!VCLEAR );	! record data  ;
+	Calli( !Xwd('2001,QuePage), calli!VCLEAR );	! queue status ;
+	Calli( !Xwd('2001,MsgPage), calli!VCLEAR );	! message area ;
+	Calli( !Xwd('2001,RunPage), calli!VCLEAR );	! run-que area ;
+	Calli( !Xwd('2002,ActPage), calli!VCLEAR );	! active data  ;
+
+	Close( Chan );			! close the file;
+	Release( Chan );		!  and release the channel;
+
+     end "close queue";
+
+    Chan_ InQue_ 0;			! reset all variables;
+    MyPage_ MyRecord_ RecBase_ 0;
+
+end;
+
+
+simple boolean procedure OpenQueue;
+! ----------------------------------------------------------------------;
+!									;
+!	OpenQueue	Routine to read the queue status page into	;
+!			memory and allow the caller to access the	;
+!			the queue.  Returns the number of users that	;
+!			are accessing the queue.			;
+!									;
+! ----------------------------------------------------------------------;
+begin
+
+    Open(Chan_getchan,"DSK",'17,0,0,0,0,Eof_-1);
+    Lookup( Chan, QueueFile, Eof_-1);
+
+    If ( Eof and !rh(Eof) = 0 )			! if Eof and %ERFNF ;
+     then begin "queue error"
+
+	FileInfo( FILE );
+	Chnior( Chan, FILE[1], !chENT);		! create file;
+
+	Eof_ If not( !SKIP! )			! if skip, all is good;
+	      then !rh( FILE[2] ) else 0;
+
+	If not( EOF )				! Otherwise -- we must stop;
+	 then begin "no errors"
+
+	    Chnior( Chan, QueueMap,   !chCFP );	! Create page  [1]   Map;
+	    Chnior( Chan, QueueMsg,   !chCFP );	! Create page  [2]   Msg;
+	    Chnior( Chan, QueueRun,   !chCFP );	! Create page  [3]   Run;
+	    Chnior( Chan, QueueAct+1, !chCFP );	! Create pages [4,5] Act;
+
+	    InQue_ InQue lor que$Open;		! mark it open ;
+	    If ( MapQuePage )
+	     then begin "init queue"
+		QQ( RSlot )_ E!RunMax;		! number of run slots ;
+		QQ( RJobs )_ E!RunMax;		! number of runs available ;
+		QQ( ISlot )_ E!JobMax;		! number of slots to use ;
+		QQ( IJobs )_ E!JobMax;		! number of slots available ;
+		QQ( LogLim )_ E!DefLogLim;	! no page limit, 60 minutes ;
+		QQ( Action )_ E!DefAction;	! action parameters ;
+		QQ( New )_ -1;			! indicate something changed ;
+		ClsQue;				! close and reset ;
+		Open(Chan_getchan,"DSK",'17,0,0,0,0,Eof_-1);
+	     end "init queue"
+	     else begin
+		Release( Chan );		! *** error, free channel ;
+		QError_ err$COQ;		! *** set error flag ;
+		return( InQue_ Chan_ false );	! *** and return false ;
+	     end;
+
+	    Lookup( Chan, QueueFile, Eof_-1);	! then re-open file ;
+	    if not( !skip! )
+	     then begin "we have a problem"
+		QError_ err$COQ;		! can't open created queue ;
+		release( Chan );		! so, clear out channel ;
+		return( InQue_ Chan_ false );	! and just give up. ;
+	     end "we have a problem";
+
+	end "no errors";
+
+    end "queue error";
+
+    If not( EOF )
+     then begin "continue entry code"
+
+	InQue_ InQue lor que$Open;		! indicate file is open ;
+
+	FileInfo( FILE );			! read file data;
+	Chnior( Chan, FILE[1], !chMEN);		! multiple enter;
+	Eof_ If not( !SKIP! )			! if skip, all is good;
+	      then !rh(FILE[2]) else 0;
+	if not( Eof )
+	 then InQue_ InQue lor que$Write;
+
+     end "continue entry code"
+     else begin "must not continue"
+
+!	Print( "File error ",Cvos(EOF)," on ",QueueFile,crlf);
+	QError_ err$COQ;			! set error flag ;
+	Release( Chan );			! release channel ;
+	Return( InQue_ Chan_ false );		! and go ;
+
+     end "must not continue";
+
+    Return( MapQuePage );
+
+end;
+
+
+Simple boolean procedure GetArea( Integer Mem, Dsk, Bit, Size(1) );
+begin "get area"
+    own safe integer array arg[0:1];
+
+    Calli(!Xwd('2000+Size,Mem),-'66);	! unmap any previous page(s) ;
+    InQue_ InQue land lnot Bit;		! indicate area cleared ;
+    Arg[ 0 ]_ !Xwd( '6000+Size,Mem );	! <.prrw>b7 + nb17,,active ;
+    Arg[ 1 ]_ Dsk;			! use specified file-page ;
+
+    Chnior( Chan, Arg[0], !chMFP );	! map file page;
+    If not( !skip! )
+     then begin "cannot open area"
+	ClsQue;				! close queue first ;
+	QError_ err$CMA;		! store code ;
+	Return( false );		! then report error ;
+     end "cannot open area";
+
+    InQue_ InQue lor Bit;		! set active pages mapped ;
+
+    Return( true );
+
+end "get area";
+
+
+internal simple boolean procedure OpnQue( integer Bits );
+! ----------------------------------------------------------------------;
+!									;
+!	OpnQue		Open the queue and map the status and active	;
+!			pages into memory for queue manipulation.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "OpnQue"
+
+    If not( InQue land que$Open )	! if initial entry;
+     then If not( OpenQueue )		!  then open things up;
+	   then return( InQue_ false );	!  oops! queue error;
+
+! *** Should we check here for QM license?
+;
+
+    if ( Bits land que$Msg )		! requesting message area ;
+     then if not( GetArea( MsgPage, QueueMsg, que$Msg ) )
+	   then return( false );
+
+    if ( Bits land que$Run )		! requesting running entries ;
+     then if not( GetArea( RunPage, QueueRun, que$Run ) )
+	   then return( false );
+
+    if ( Bits land que$Act )		! requesting active ;
+     then if not( GetArea( ActPage, QueueAct, que$Act, 2 ) )
+	   then return( false );
+
+    return( QQ( Open ) );		! number open in queue ;
+
+end "OpnQue";
+
+
+simple boolean procedure FindRecord( integer A );
+! ----------------------------------------------------------------------;
+!									;
+!	FindRecord	Routine to scan through the queue for the	;
+!			specified record.  Return true if found,	;
+!			otherwise return false and set QError to	;
+!			the proper error code.				;
+!									;
+! ----------------------------------------------------------------------;
+begin "Find Record"
+
+    For NewRecord_ 1 step 1 until QQ( High  )
+     do begin "check record"
+
+	AllOk_ MapRecord( NewRecord );	! get a record ;
+	If ( ( AllOk )  and
+	     ( memory[ RecBase + E!Runtime ] ) and
+	     ( LPSeq( memory[ RecBase + E!Status ] ) = 
+	       LPSeq( memory[ A + E!Status ] ) )
+	   )
+	 then return( true );
+
+     end "check record";
+
+    QError_ err$CFR;			! cannot find record ;
+    Return( false );			! notify the authorities ;
+
+end "Find Record";
+
+
+simple boolean procedure NextRecord( integer A );
+! -----------------------------------------------------------------;
+!									;
+!	NextRecord	Routine to scan through the queue for the next	;
+!			record which matches the specified criteria.	;
+!			If no fields are specified, the next record is	;
+!			returned.  Match fields include: AUN, USER,	;
+!			PPN, PROJECT and JOBNAME (control file name).	;
+!			If a record exists return true, otherwise set	; 
+!			QError to the proper code and return false.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Next Record"
+
+Define Chk(x,op) = {
+    If ( memory[A+(x)] )
+     then If (memory[A+(x)] op memory[RecBase+(x)])
+	   then continue "check record"
+};
+
+    If ( LPSeq( memory[A+E!Status] ) )	! non-zero, reset file pointers;
+     then MyPage_ MyRecord_ RecBase_ 0;	! clear record field information;
+    If ( LPSeq( memory[A+E!Status] ) land '400000 )	! negative, so ;
+     then Dpb( 0, PSeq(memory[A+E!Status]) );		! reset sequence ;
+
+    For NewRecord_ MyRecord+1 step 1 until QQ( High )
+     do begin "check record"
+
+	AllOk_ MapRecord( NewRecord );	! get a record ;
+	If ( AllOk  and  memory[ RecBase + E!Runtime ] )
+	 then begin "good record"
+
+	    If ( LPSeq( memory[A+E!Status] ) )
+	     then If (  LPSeq(memory[A+E!Status])  neq
+			LPSeq(memory[RecBase+E!Status])  )
+		   then continue "check record";
+
+	    If ( !rh( memory[A+E!AUN] ) )
+	     then If ( !rh(memory[A+E!AUN]) neq !rh(memory[RecBase+E!AUN]) )
+		   then continue "check record";
+
+	    If ( !lh( memory[A+E!AUN] ) )
+	     then If ( !lh(memory[A+E!AUN]) neq !lh(memory[RecBase+E!AUN]) )
+		   then continue "check record";
+
+	    Chk( E!PPN, neq );
+	    Chk( E!Username, neq );
+	    Chk( E!Username+1, neq );
+	    Chk( E!Project, neq );
+	    Chk( E!Project+1, neq );
+	    Chk( E!Project+2, neq );
+	    Chk( E!CmdFile+F!Name, neq );
+	    Chk( E!Runtime, [<] );
+
+	    Return( true );
+
+	 end "good record";
+
+     end "check record";
+
+    QError_ err$CFR;			! cannot find any records ;
+    Return( false );			! notify the authorities ;
+
+end "Next Record";
+
+
+simple procedure DeleteRecord;
+! ----------------------------------------------------------------------;
+!									;
+!	DeleteRecord	Routine to clear the current record entry	;
+!			and reset the appropriate queue data fields	;
+!			concerning highest records and counts.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "delete record"
+
+    ArrBlt( memory[RecBase], Zeros[0], E!Length );
+    QQ( Count )_ QQ( Count ) - 1;
+
+    If ( MyRecord geq QQ( High ) )
+     then begin "decrement high"
+
+	while ( ( RecBase geq Base ) and not( memory[Recbase] ) )
+	 do begin "backup on current page"
+
+	    RecBase_ RecBase - E!Length;
+	    MyRecord_ QQ( High )_ QQ( High ) - 1;
+
+	    If ( RecBase < Base )
+	     then begin "backup a page"
+
+		Chnior( Chan, MyPage,         !chDFP );	! delete page;
+		Chniov( Chan, (MyPage-1)*512, !chFTR );	! truncate file;
+		Chnior( Chan, 0,              !chVRB );	! validate RIB;
+
+		If not( MapRecord( MyRecord ) )
+		 then RecBase_ MyPage_ 0;
+
+	     end "backup a page";		
+	 end "backup on current page";
+
+	If ( QQ( Hole ) geq QQ( High ) )
+	 then QQ( Hole )_ 0;
+
+     end "decrement high"
+     else begin "check hole"
+
+	If ( MyRecord < NewRecord_ QQ( Hole ) )
+	   or not( NewRecord )
+	 then QQ( Hole )_ MyRecord;
+
+     end "check hole";
+
+end "delete record";
+
+
+
+internal simple boolean procedure GetRec( integer A; integer Force(0) );
+! ----------------------------------------------------------------------;
+!									;
+!	GetREC		Routine to scan the job queue and return one	;
+!			of the following:				;
+!			  (a) the first record of the requested type	;
+!			  (b) the next record of the requested type	;
+!			  (c) a specific record				;
+!									;
+!			The contents of the specified sequence, gan,	;
+!			username, aun, ppn, jobname, project and	;
+!			runtime fields affect which records are to	;
+!			considered.					;
+!									;
+! ----------------------------------------------------------------------;
+begin "GETREC"
+    integer ThisBase;
+
+    If not( InQue land que$Open )	! if initial entry;
+     then if not( Force )		!  then open things up;
+	   then if not( OpnQue( que$run lor que$act ) )
+		 then return( false )	!  oops! queue error;
+		 else
+	   else if not( OpenQueue )	!  else open just a little ;
+		 then return( false );	!  oops! queue error;
+
+!    GetLock;				! lock the queue during fetch;
+    If ( AllOk_ NextRecord( A ) )	! if any more, copy the entry;
+     then begin "use proper entry"
+
+	ThisBase_ RecBase;		! initialize to record ;
+	if not( Force )			! if not using force ;
+	 then begin "check active"	!  see if in active memory ;
+	    integer index;
+
+	    if ( InQue land que$Run )
+	     then For index_ 1 step 1 until E!RunMax
+	     do if ( LPSeq(memory[RecBase+E!Status]) = LPSeq(QRS(index)) )
+		 then begin "set base"
+		    ThisBase_ QueRun + E!Length * (index-1);
+		    Done;
+		 end "set base";
+
+	    if ( InQue land que$Act )
+	     then For index_ E!RunMax+1 step 1 until E!RunMax+E!JobMax
+	     do if ( LPSeq(memory[RecBase+E!Status]) = LPSeq(QRS(index)) )
+		 then begin "set base"
+		    ThisBase_ QueRun + E!Length * (index-1);
+		    Done;
+		 end "set base";
+
+	 end "check active";
+
+	ArrBlt( memory[A], memory[ThisBase], E!Length );
+
+	if ( ThisBase neq RecBase )	! did we use active data? ;
+	 then memory[A+E!Status]_ QRS(((ThisBase-QueRun) div E!Length) + 1);
+
+     end "use proper entry";
+
+!    UnLock;				! and release the queue-lock;
+
+    Return( AllOk );
+
+end "GETREC";
+
+
+internal simple boolean procedure ModRec( integer A, S );
+! ----------------------------------------------------------------------;
+!									;
+!	ModRec		Routine to modify an existing record in the	;
+!			queue or insert a new record into the queue.	;
+!			The determination is made by examining the	;
+!			value of the sequence number: if zero it is	;
+!			a new insert, otherwise it is a modification.	;
+!			On modificiation, if the next runtime is zero	;
+!			the record is deleted from the queue.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "MODREC"
+
+    If not( InQue land que$Open )	! if initial entry;
+     then If not( OpenQueue )		!  then open things up;
+	   then return( false );	!  oops! queue error;
+
+    If ( LPSeq( memory[A+E!Status] ) )	! modify requested;
+     then begin "specific record"
+
+	GetLock;			! Lock the queue first;
+	AllOk_ FindRecord( S );		! YES, see if the record is there;
+
+	If ( AllOk )			! Ok, is it the same record;
+	 then if not( AllOk_ ArrCMP( memory[S], memory[RecBase], E!Length ) )
+	       then QError_ err$MRM;	! modify record mismatch ;
+
+	If ( AllOk )			! same, then process it;
+	 then If (memory[A+E!Runtime])	! if Runtime non-zero modify it;
+	       then ArrBlt( memory[RecBase], memory[A], E!Length )
+	       else DeleteRecord;	!  else delete it;
+	UnLock;				! unlock the queue;
+
+     end "specific record"
+     else begin "insert record"
+
+	Dpb( NextSequence, PSeq( memory[A+E!Status] ) );
+
+	GetLock;
+	if ( AllOk_ MapRecord( QQ( Hole ) ) )
+	 then begin "create entry"
+	    ArrBlt( memory[RecBase], memory[A], E!Length );
+	    QQ( Count )_ QQ( Count ) + 1;
+	    If ( QQ( High ) < MyRecord )
+	     then QQ( High )_ MyRecord;
+	    QQ( Hole )_ 0;
+	 end "create entry";
+	UnLock;
+
+     end "insert record";
+
+    if ( AllOk )
+     then QQ( New )_ -1;		! indicate something changed ;
+
+    return( AllOk );
+
+end "MODREC";
+
+end $
+  U@
+@h
