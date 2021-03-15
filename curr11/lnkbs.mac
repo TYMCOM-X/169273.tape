@@ -1,0 +1,658 @@
+	.TITLE	LNKBS - Protocol module
+	.SBTTL	LNKBS - Provide common processing for characters received
+	.SBTTL		 by the interrupt routines
+	.SBTTL	INTRODUCTION
+	XLPAR				;DON'T LIST PARAMETER FILE
+;-----
+;
+;	VERSION 1.0
+;
+;	This is an implimentation of the Version 4.0 spec
+;	 of DDCMP.
+;
+;	First Edit:	 9-AUG-78
+;	Last Edit:	10-Jan-81
+;	Author:		Bruce R. Nevins
+;
+; DDCMP - Purpose
+; This module drives the Digital Data Communications Message Protocol
+; (DDCMP).  It's function is to provide an envelope for message
+; transmition between computer systems.
+;-----
+	CODE
+	.PAGE
+	.SBTTL	LNKBPS  - Main entry point to service received data
+
+;-----
+;	CALL LNKBPS
+;LNKBPS is the main entry point to the DDCMP service
+;	R0 - The character to be proccessed
+;	R4 - The device data block (DDB)
+;-----
+LNKBPS::MOVB	DDSTAT#(R4),R3		;GET CURRENT STATE NUMBER
+	ASL	R3			;Make into a word index
+	JMP	@DISPAT(R3)		;JUMP INDEXED OFF DISPATCH TABLE
+
+	PURE
+DISPAT:	STHDR				;Header wait
+	HDREAD				;Header read
+	HDCRC1				;Header CRC byte 1
+	HDCRC2				;Header CRC byte 2
+	DATRD				;Data read state
+	DATCR1				;First data CRC-16 character
+	DATCR2				;Second data CRC-16 character
+					; And end of data proccessing
+	CODE
+	.PAGE
+	.SBTTL	STHDR  - Start of header check
+;-----
+;STHDR
+; R0 - First character in header
+; R2 - scratch
+; R3 - scratch
+; R4 - Device Data Block (DDB) pointer
+;
+; This routine checks if we received a SYN(26) which means
+; we need to resync the receiver, This is because some devices
+; are not nice about finishing up (Like the DCP).
+; We also check for junk messages caused by line hits.
+;-----
+
+STHDR:	CMPB	#SOH,R0			;Check for valid header
+	BEQ	10$			;Got one
+	CMPB	#ENQ,R0			;Check for other type of valid header
+	BEQ	10$			;All ok
+2$:	BIS	#$RSYNC,DDFLAG#(R4)	;Resync the receiver
+	RETURN
+
+10$:	MOV	DDLBBP#(R4),R2		;GET THE STARTING ADDRESS OF THE HEADER
+					; BUFFER.
+	MOVB	R0,(R2)+		;SAVE THE HEADER CHARACTER
+	MOV	R2,DDLBIP#(R4)		;THE IN POINTER FOR THE BUFFER
+	INCB	DDSTAT#(R4)		;Set the state for header read
+	RETURN				;Return to handler
+
+
+
+	.SBTTL	HDREAD - HEADER READ ROUTINE
+HDREAD:	MOV	DDLBIP#(R4),R2		;Pick up pointer
+	MOVB	R0,(R2)+		;Store character
+	CMP	DDLBEP#(R4),R2		;Check if last character
+	BEQ	HDCRC1			;Yes
+	MOV	R2,DDLBIP#(R4)		;Return pointer
+	RETURN				;Return to handler
+
+;10$:	INCB	DDSTAT#(R4)		;Set the state for CRC 1
+;	RETURN				;Return to handler
+
+	.PAGE
+	.SBTTL	HDCRC1 - HEADER CRC-16 CHECK ROUTINES
+
+HDCRC1:	INCB	DDSTAT#(R4)		;Set the state for second CRC char
+	RETURN				;Return to handler
+
+	.SBTTL	HDCRC2 - Check CRC-16 and dispatch on proper header character
+
+HDCRC2:	TBBE	$RCRCZ,R0,HDCRBD	;If the bit is not set
+					;we have a CRC error
+	MOV	DDLBBP#(R4),R3		;Get the header ponter
+	MOVB	C.HDR(R3),R0		;Get the header character
+	TBBN	$ISTRT!$ASTRT,DDFLAG#(R4),HDCRIS ;Test for ISTART
+	CMP	#ENQ,R0			;Is this an ENQ?
+	BEQ	ENQSRV
+	JMP	SOHSRV
+;-----
+;This is the ISTART service
+;-----
+HDCRIS:	TBBE	$ISTRT,DDFLAG#(R4),HDCRAS ;Test for ASTART
+	CMP	#ENQ,R0			;Only ENQ is  valid in ISTART
+	BNE	HDQUIT			;If not a ENQ send a START
+	MOVB	C.TYPE(R3),R0		;Get the type
+	CMP	#STRTYP,R0		;A start?
+	BEQ	ENQSRV
+	CMP	#STCKTY,R0		;A stack?
+	BEQ	ENQSRV
+	BR	HDQUIT			;Send a start
+;-----
+;This is the ASTART service
+;-----
+HDCRAS:	CMP	#SOH,R0			;
+	BNE	1$			;A data message?
+;-----
+;Here on a data message, it is valid if the response is 0
+;-----
+	TSTB	D.RESP(R3)
+	BNE	HDQUIT			;If not a resp=0 send a stack
+	JMP	SOHSRV			;Go do the data message
+
+1$:	MOVB	C.TYPE(R3),R0		;Get the type
+	CMP	#ACKTYP,R0		;Ack is valid in ASTART
+	BEQ	ENQSRV
+	CMP	#STRTYP,R0		;A start?
+	BEQ	ENQSRV
+	CMP	#STCKTY,R0		;A stack?
+	BEQ	ENQSRV
+;	BR	HDQUIT
+
+HDQUIT:	CLRB	DDSTAT#(R4)
+	BIS	#$RSYNC,DDFLAG#(R4)
+	RETURN
+
+;-----
+;We do different things with bad CRC-16's when we are in ASTART or
+;ISTART.
+;-----
+HDCRBD:	TBBN	$ISTRT!$ASTRT,DDFLAG#(R4),HDQUIT ;If so then send a stack
+;	BR	BADCRC			;When in normal mode do this
+	.PAGE
+	.SBTTL	BADCRC - Bad CRC16 handling routine
+
+;-----
+;Send NAK with error number 1 (Header CRC-16 error)
+;-----
+BADCRC:	BIS	#$RSYNC,DDFLAG#(R4)	;We need to re synch
+	TBBE	$ISTRT+$ASTRT,DDFLAG#(R4),BADCR1
+	RETURN
+
+BADCR1:	MOVB	#1,DDSNAK#(R4)		;Header CRC error
+	TBBN	$SYNCQ,DDFLG2#(R4),10$	;Was this header concatenated to last message
+	INC	DDERHE#(R4)		;Count the header CRC error
+	RETURN
+10$:	INC	DDERH2#(R4)		;Count as different kind of CRC error
+	RETURN
+	.PAGE
+	.SBTTL	ENQSRV - (ACK,NAK,REP,STRT,STACK) Dispatch
+ENQSRV:	MOVB	C.TYPE(R3),R0		;Get the type
+	BLE	BADHDR			;Less than an ACK
+	CMP	R0,#STCKTY		;Greater than the STACK ?
+	BGT	BADHDR			;Yes... not valid
+	ASL	R0			;Make a word offset
+	JMP	@ENQTBL(R0)		;Jump off to the appropriate service
+
+
+	.SBTTL	ENQTBL - ENQ message dispatch table
+
+	PURE
+ENQTBL:	BADHDR				;Non valid
+	ACKSRV				;ACK
+	NAKSRV				;NAK
+	REPSRV				;REP
+	BADHDR				;Old RESET. non valid
+	BADHDR				;Old RSACK. non valid
+	STRTSV				;STRT
+	STCKSV				;STACK
+	CODE
+	.PAGE
+	.SBTTL	BADHDR - Bad header format (error 17)
+
+;-----
+;Send NAK with error number 17 (Header format error)
+;-----
+BADHDR:	BIS	#$RSYNC,DDFLAG#(R4)	;Resynch on garbage!
+	TBBE	$ISTRT+$ASTRT,DDFLAG#(R4),BADHD1 ;IF NOT IN START SEND NAK
+	RETURN
+
+BADHD1:	MOVB	#17.,DDSNAK#(R4)
+	TBBN	$SYNCQ,DDFLG2#(R4),10$	;Was this header concatenated to last message
+	INC	DDERHF#(R4)		;Count the header format error
+	RETURN
+10$:	INC	DDERF2#(R4)		;Count as different kind of CRC error
+	RETURN
+	.PAGE
+	.SBTTL	ACKSRV - Acknowledgement received service
+
+ACKSRV:
+.IF NE	..BUG
+	MOVB	C.STYP(R3),R0		;Get the subtype
+	BIC	#$LST6,R0		;LEAVE LOWER 6 BITS(SUB TYPE)
+	BNE	BADHDR			;IF NOT 0 IT'S A BAD HEADER
+	TSTB	C.SNDR(R3)		;Test the fill field
+	BNE	BADHDR			;NOT ZERO BAD HEADER
+	CMPB	#1,C.ADDR(R3)		;ALWAYS STATION 1
+	BNE	BADHDR			;BAD HEADER
+.ENDC
+	BITB	#$QSYNC,C.FLAG(R3)	;Branch if QSYNCH not set
+	BEQ	ACKSV1
+	BIS	#$RSYNC,DDFLAG#(R4)	; Set quick synch
+;-----
+; ALL SEEMS OK SO WE WILL SAVE THE RESPONSE NUMBER
+;-----
+ACKSV1:	BIS	#$EOM,DDFLAG#(R4)	;Set end of message
+;	CLR	R0
+;	BISB	C.RESP(R3),R0		;Get the respose field
+	MOVB	C.RESP(R3),R0		;Get the respose field
+	BNE	ACKSVN			;If not do normal checks
+	TBBN	$ASTRT,DDFLAG#(R4),ACKSTK ;If in ASTART fake up a stack
+ACKSVN:	CALL	CHKRSP			;Check the response field
+	 BR	 ACKEXT			;Something was wrong
+	INCB	R0			;The next one to check
+	CMPB	DDLBSN#(R4),R0		;are there any outstanding messages?
+	BNE	ACKNXT
+
+1$:	CLRB	DDTIMR#(R4)		;All is quiet stop the timer
+	BR	ACKNXT
+;-----
+;Here we send a stack to bring up the link
+;-----
+ACKSTK:	MOV	#STCKTY,R2		;Inform main of the start 
+;	CLR	R3
+	CALL	INRING			;Put the data in the ring
+	 BR	 ACKEXT
+	BIC	#$ASTRT+$ISTRT,DDFLAG#(R4)
+ACKNXT:;	DECB	R0			;UPDATE TO CURRENT VALUE
+	MOVB	#THRSH,DDREPT#(R4)	;RESET THE THRESHOLD COUNTER
+	MOV	#ACKTYP,R2		;Send an ACK TYPE message
+;	MOV	R0,R3			;Send the ACK field
+	CALL	INRING			;Put it into the ring
+	 NOP
+ACKEXT:	CLRB	DDSTAT#(R4)		;Set state to wait on header
+	RETURN				;Return to handler
+	.PAGE
+	.SBTTL	NAKSRV - Negative acknowledgement message received service
+
+NAKSRV:
+.IF NE	..BUG
+	TSTB	C.SNDR(R3)		;Test the fill character (for 0)
+	BNE	NAKBAD			;NOT 0? BAD HEADER
+	CMPB	#1,C.ADDR(R3)		;Test the station field
+	BNE	NAKBAD			;NOT 1 ITS A BAD HEADER
+.ENDC
+	BITB	#$QSYNC,C.FLAG(R3)	;Test for quick synch set
+	BEQ	NAKSV1			;Branch if not set
+	BIS	#$RSYNC,DDFLAG#(R4)
+NAKSV1:	BIS	#$EOM,DDFLAG#(R4)	;Set end of message
+
+	CALL	CHKRSP			;Check the response field
+	 BR	 NAKEXT			;An error seems to have occured
+	MOVB	C.RSON(R3),R0		;Get the NAK reason
+	BIC	#$LST6,R0		;JUST THE 6 BIT NAK REASON
+	BEQ	NAKBAD			;A 0?? MUST BE BAD HEADER
+	CMP	#1,R0			;Is this a header BC error?
+	BNE	10$			;No
+	INC	DDERHB#(R4)		;Yes
+	BR	300$			;
+
+10$:	CMP	#2,R0			;Is this a data BC error?
+	BNE	20$			;No
+	INC	DDERDB#(R4)		;Yes
+	BR	300$			;
+
+20$:	CMP	#3,R0			;Is this a rep response?
+	BNE	30$			;No
+	INC	DDERRR#(R4)		;Yes
+	BR	300$			;
+
+30$:	CMP	#8.,R0			;Is this no buffer available?
+	BNE	40$			;No
+	INC	DDERNP#(R4)		;Yes
+	BR	300$			;
+
+40$:	CMP	#9.,R0			;Is this a receive overrun?
+	BNE	50$			;no
+	INC	DDEROR#(R4)		;Yes
+	BR	300$			;
+
+50$:	CMP	#16.,R0			;Is the message too long?
+	BNE	60$			;No
+	INC	DDERSZ#(R4)		;Yes
+	BR	300$			;
+
+60$:	CMP	#17.,R0			;Check if header format error
+	BEQ	70$			;Yes
+	INC	DDERHF#(R4)		;Local header error
+	BR	300$			;
+
+70$:	INC	DDERFH#(R4)		;This is a header format error
+	BR	300$			;
+
+300$:;	CLR	R0
+;	BISB	C.RESP(R3),R0		;Pick up the response byte
+					;I.E. the last good packet
+;-----
+;Tell main we have a NAK. and that we have stopped sending.
+;-----
+
+	MOV	#NAKTYP,R2		;Send a NAK type message
+;	MOV	R0,R3			;Send the number of the bad message
+	CALL	INRING			;Put the message in the ring
+	 BR	 NAKEXT
+	MOVB	#THRSH,DDREPT#(R4)	;Reset the threshold timer
+NAKEXT:	CLRB	DDSTAT#(R4)		;Set the state to header wait
+	MOVB	#QCOUNT,DDLBSS#(R4)	;Set up the sync counter
+	RETURN				;Return to handler
+;-----
+;Leave on bad header
+;-----
+NAKBAD:	JMP	BADHDR
+	.PAGE
+	.SBTTL	REPSRV - Response message received service
+
+REPSRV:
+.IF NE	..BUG
+	MOVB	C.STYP(R3),R0		;Get subtype field
+	BIC	#$LST6,R0		;SAVE THE 6 BIT SUBTYPE
+	BNE	REPOUT			;NOT 0 ? A BAD HEADER
+	TSTB	C.RCVR(R3)		;Is fill field 0 ?
+	BNE	REPOUT			;NO
+	CMPB	#1,C.ADDR(R3)		;Is the station 1?
+	BNE	REPOUT			;NO
+.ENDC
+	BITB	#$QSYNC,C.FLAG(R3)	;Test for quick synch set
+	BEQ	REPSV1			;Branch if not set
+	BIS	#$RSYNC,DDFLAG#(R4)
+REPSV1:	BIS	#$EOM,DDFLAG#(R4)	;Set the end of message flag
+	CLRB	DDSTAT#(R4)		;Set the state to header wait
+	CMPB	C.SNDR(R3),DDRESP#(R4)	;Is NUM = R
+	BNE	REPNAK			;No issue a NAK
+;-----
+;Here we send an ACK to the sender
+;-----
+	INCB	DDSACK#(R4)		;Set the SACK flag
+	MOVB	#THRSH,DDREPT#(R4)	;RESET OUR THRESHOLD TIMER
+	MOV	#REPTYP,R2		;SEND A REP TYPE MESSAGE TO MAIN
+	CALL	INRING
+	 NOP
+	RETURN
+;-----
+; Send a NAK to the sender
+;-----
+REPNAK:	MOVB	#3,DDSNAK#(R4)
+	INC	DDERRC#(R4)		;Rep counter
+	RETURN
+
+REPOUT:	JMP	BADHDR			;Bad header.  quit
+	.PAGE
+	.SBTTL	STRTSV - Start message received service
+
+STRTSV:	MOVB	C.STYP(R3),R0		;Get the subtype
+	BIC	#$LST6,R0		;just the 6 bit type field
+	BNE	STHBAD			;We have no 0 type. bad header
+	COMB	C.FLAG(R3)		;Compliment to test the bits
+	BITB	#$QSYNC+$SELEC,C.FLAG(R3) ;Both should be set
+	BNE	STHBAD			;Bad header
+;	CLR	R0
+	TSTB	C.RCVR(R3)		;Test the filler field
+	BNE	STHBAD			;not zero bad header
+	TSTB	C.SNDR(R3)		;Test the second filler field
+	BNE	STHBAD			;Bad header
+	CMPB	#1,C.ADDR(R3)		;Test the station field
+	BNE	STHBAD			;Not a 1, bad header
+	CLRB	DDACK#(R4)		;Init counters
+	CLRB	DDCACK#(R4)
+	CLRB	DDRESP#(R4)
+;-----
+;Notify main we have a start
+;-----
+
+	MOV	#STRTYP,R2		;Set up the start message
+;	CLR	R3
+	CALL	INRING			;Send message to main
+	 BR	 STHEXT			 ;Skip this stuff on an error
+	TBBE	$ISTRT,DDFLAG#(R4),STHEXT ;Are we in ISTART?
+	BIC	#$ISTRT,DDFLAG#(R4)	;We will now leave ISTART
+STHEXT:	BIS	#$ASTRT+$RSYNC,DDFLAG#(R4) ;And enter ASTART
+	CLRB	DDSTAT#(R4)
+;	JMP	HDQUIT			;Send the stack
+;-----
+;If we get a bad header then send a start
+;-----
+STHBAD:	JMP	HDQUIT			;Send a start
+	.PAGE
+	.SBTTL	STCKSV - Start acknowledgement received service
+
+STCKSV:	MOVB	C.STYP(R3),R0		;Get subtype
+	BIC	#$LST6,R0		;get the 6 bit subtype field
+	BNE	STHBAD			;Subtype must be 0, bad header
+	COMB	C.FLAG(R3)		;Compliment the flags to test
+	BITB	#$QSYNC+$SELEC,C.FLAG(R3) ;Both should be set
+	BNE	STKBAD			;Bad header
+	TSTB	C.RCVR(R3)		;Test the first fill field
+	BNE	STKBAD			;No bad header
+	TSTB	C.SNDR(R3)		;Test the second filler field
+	BNE	STKBAD			;Bad
+	CMPB	#1,C.ADDR(R3)		;Test the station field for 1
+	BNE	STKBAD			;Nope a bad header
+;-----
+; All is ok we have a good start we just
+; need to initialize the world now.
+;-----
+	CLRB	DDACK#(R4)		;
+	CLRB	DDCACK#(R4)		;
+	CLRB	DDRESP#(R4)		;
+	CLRB	DDSTAT#(R4)		;Set state for header wait
+;	TBBE	$ISTRT,DDFLAG#(R4),1$	;If not ISTART try ASTRT
+	TBBE	$ISTRT!$ASTRT,DDFLAG#(R4),3$ ;Skip this if not running
+	BIC	#$ISTRT+$ASTRT,DDFLAG#(R4) ;We are now running
+;	BR	2$
+;1$:	TBBE	$ASTRT,DDFLAG#(R4),3$	;If not ASTRT we are running
+;	BIC	#$ASTRT+$ISTRT,DDFLAG#(R4) ;Clear the ASTRT flag
+2$:	CLRB	DDTIMR#(R4)		;Stop the REP timer
+	MOVB	#THRSH,DDREPT#(R4)	;RESET OUR THRESHOLD TIMER
+;-----
+; Queue an ACK for output
+;-----
+3$:	BIS	#$RSYNC,DDFLAG#(R4)	;Re synch now
+	MOV	#STCKTY,R2		;Send a stack
+;	CLR	R3
+	CALL	INRING			;Send the message to main
+	 BR	 STKBAD
+	RETURN				;Done
+
+STKBAD:	JMP	HDQUIT			;This is to save some memory
+					; and to keep the code clean looking.
+	.PAGE
+	.SBTTL	SOHSRV - Start of header received service
+;-----
+;SOHSRV
+; This routine Proccesses the SOH header and does error checking
+; Input:
+; R0 <- Scratch
+; R2 <- Scratch
+; R3 <- Current header pointer
+; R4 <- Device table address
+;-----
+
+SOHSRV:	MOVB	D.CNT2(R3),R0		;Upper byte of count
+	BIC	#$LST6,R0		;Remove all but lower 6 bits
+	SWAB	R0			;Move to upper half of word
+	BISB	D.CNT1(R3),R0		;Lower byte of count
+	MOV	R0,DDCNTI#(R4)		;Save the input byte count
+.IF NE	..BUG
+	BEQ	SOHBAD			;A zero count is invalid
+	CMP	#MAXSIZ,R0		;The largest message the network can
+					; handle.
+	BLT	SOHNRM			;No room
+	CMPB	#1,D.ADDR(R3)		;Check station number
+	BNE	SOHFLH			;Wrong station number. ignore
+.ENDC
+	CALL	CHKRSP			;Check th response field
+	 BR	 SOHNOK			;Ignore the ack, but get the data
+
+SOHNOK:	MOVB	DDRESP#(R4),R0		;Response byte
+	INCB	R0
+	CMPB	R0,D.NUM(R3)		;Is NUM = R+1
+	BNE	SOHFLH			;No.  Ignore the data
+	MOV	DDPKTC#(R4),R1		;WELL THEN GET IT
+	BNE	SOHOK2			;Skip this if we already have a packet from before
+	MAKPKT	.PLSTP#			;Get us a packet
+	BCS	SOHNFP			;No free packets!
+	MOV	R1,DDPKTC#(R4)		;The current packet
+SOHOK2:	ADD	#2,R1			;Point pask PKLINK
+	MOV	R1,DDPKTI#(R4)		;The address pointer for characters
+SOHOUT:	INCB	DDSTAT#(R4)
+	TSTB	D.RESP(R3)		;If this is zero we may have an ASTART
+	BNE	SOHEXT			;Can't be an ASTART
+	TBBE	$ASTRT,DDFLAG#(R4),SOHEXT
+	MOV	#STCKTY,R2		;Tell main we are up
+;	CLR	R3
+	CALL	INRING			;Send to main
+	 BR	 SOHEXT			 ;Wait  for next chance
+	BIC	#$ASTRT+$ISTRT,DDFLAG#(R4) ;We are now up
+SOHEXT:	RETURN
+
+SOHBAD:	MOVB	#17.,DDSNAK#(R4)
+	BIS	#$RSYNC,DDFLAG#(R4)	;We need to resynch now
+	TBBN	$SYNCQ,DDFLG2#(R4),10$	;Was this header concatenated to last message
+	INC	DDERHF#(R4)		;Count the header format error
+	RETURN
+10$:	INC	DDERF2#(R4)		;Count as different kind of CRC error
+	RETURN
+
+;-----
+;Set flush mode and exit normaly.
+;-----
+SOHFLH:	BIS	#$FLUSH,DDFLAG#(R4)	;Set the flush mode bit
+	BR	SOHOUT
+;-----
+; We have no room for this big a message. so tell sender
+;-----
+SOHNRM:	MOVB	#16.,DDSNAK#(R4)
+	INC	DDERML#(R4)		;Message too large
+	BR	SOHFLH
+;-----
+;We go here when there are no free packets
+;-----
+SOHNFP:	MOVB	#8.,DDSNAK#(R4)
+	INC	DDERBU#(R4)		;Buffer unvailable
+	BR	SOHFLH
+	.PAGE
+	.SBTTL	DATRD  - Read a character and save in a packet
+
+DATRD:	TBBN	$FLUSH,DDFLAG#(R4),DATRD1 ;Ignore the data?
+	MOVB	R0,@DDPKTI#(R4)		;Store the character
+	INC	DDPKTI#(R4)		;Increment the pointer 1 byte
+DATRD1:	DEC	DDCNTI#(R4)		;Reduce the char count
+	BNE	DATOUT			;If count not expired continue.
+	INCB	DDSTAT#(R4)		;The count has expired. next state.
+DATOUT:	RETURN
+	.PAGE
+	.SBTTL	DATCR1 - CRC-16 byte one
+
+DATCR1:	INCB	DDSTAT#(R4)
+	RETURN
+
+
+	.SBTTL	DATCR2 - CRC-16 byte number two and cleanup
+
+DATCR2:	TBBE	$RCRCZ,R0,DATBAD	;If the bit is a zero we have CRC error
+	TBBN	$FLUSH,DDFLAG#(R4),DATIGN ;Ignore the data?
+
+	.IF NE ..BUG
+	MOV	DDPKTC#(R4),R1		;Get the pointer to the packet
+	MOVB	DDRESP#(R4),R0		;Get the last message
+	INCB	R0			;point tothe next one
+	CMPB	R0,PKSEQ(R1)		;check if proper
+	BEQ	10$			;Ok
+	RSTOP	BSN			;[Bad Sequence Number]
+
+10$:
+	.ENDC
+
+;-----
+;Inform main we have a good packet.
+;-----
+3$:	CLR	R2			;Send a DATA type message
+	MOV	DDPKTC#(R4),R3		;Put in the address of the packet
+	CALL	INRING			;Send the message to main
+	 BR	 DATFUL			;Give up 
+	CLR	DDPKTC#(R4)		;Clear out the old pointer
+;-----
+;Send the message ACK
+;-----
+	INCB	DDRESP#(R4)		;Bump the received number
+	INCB	DDSACK#(R4)
+	MOVB	DDACK#(R4),R0		;Get the ack no
+	INCB	R0			;
+	CMPB	DDLBSN#(R4),R0		;Stop the timer?
+	BNE	DATFUL			;No
+
+1$:	CLRB	DDTIMR#(R4)		;Stop the clock!
+DATFUL:	MOVB	#THRSH,DDREPT#(R4) 	;RESET OUR THRESHOLD TIMER
+	CLRB	DDSTAT#(R4)		;Set the state for wait on header
+	MOV	DDLBBP#(R4),R3		;The header pointer
+	BIS	#$SYNCQ,DDFLG2#(R4)	;Tell next pass that no syncs
+	BITB	#$QSYNC,D.CNT2(R3) 	;Is quick synch set?
+	BEQ	DATFU1			;Branch if not set
+	BIS	#$RSYNC,DDFLAG#(R4)
+	BIC	#$SYNCQ,DDFLG2#(R4)	;Tell next pass that no syncs
+DATFU1:	BIS	#$EOM,DDFLAG#(R4)	;Set end of message
+	BIC	#$FLUSH,DDFLAG#(R4) 	;If we were in flush, we now clear it
+	RETURN
+
+DATIGN:	MOV	#ACKTYP,R2		;Treat an outof order message like an ACK
+	CALL	INRING			;Put it into the ring
+	 BR	 DATFUL
+	BR	DATFUL
+	.PAGE
+	.SBTTL	DATBAD - Bad data send a NAK reason 2 (data CRC error)
+
+;-----
+;DATBAD
+;We have a bad data CRC-16 send a NAK reason 2.
+;-----
+
+DATBAD:	MOVB	#2,DDSNAK#(R4)
+	TBBN	$SYNCQ,DDFLG2#(R4),10$	;Was this header concatenated to last message
+	INC	DDERDE#(R4)		;Count the data CRC error
+	BR	20$
+10$:	INC	DDERD2#(R4)		;Count as different kind of CRC error
+20$:	BIS	#$RSYNC,DDFLAG#(R4)	;We need to resynch now
+;	MOV	DDPKTC#(R4),R1		;Get the packet we made
+;	BEQ	30$			;WE WERE FLUSHING AND NEVER MADE ONE
+;	FREPKT				;Give it back
+;	CLR	DDPKTC#(R4)		;CLEAR OUT THE OLD POINTER
+30$:	MOV	#ACKTYP,R2		;Make main look at the ACK field
+	CALL	INRING			;Put it into the ring
+	 BR	 DATFU1
+	BR	DATFU1
+	.PAGE
+	.SBTTL	INRING	- INSERT TWO WORDS INTO LINKB INPUT RING
+
+;--	CALLING SEQUENCE
+;	MOV	OPCODE,R2
+;	MOV	OPTIONAL DATA (0 IF NONE),R3
+;	CALL	INRING
+;	 BR	 ERROREXIT
+;	NORMAL	RETURN
+
+INRING:	PUSH	R3			;Save second item
+	PUSH	R2			;Save first item
+	MOV	DDCIMI#(R4),R2		;Input to main inpointer
+	MOV	R2,R3
+	ADD	#IMSIZ,R2		;Input to Main frame size
+	CMP	R2,DDCIME#(R4)
+	BNE	10$
+	MOV	DDCIMB#(R4),R2
+10$:	CMP	DDCIMO#(R4),R2		;Is the buffer full
+	BEQ	20$			;Yes. Leave
+	MOV	R2,I#(R4)		;New pointer
+	POP	(R3)+			;Get first item
+	POP	(R3)			;Get second item
+	ADD	#2,(SP)			;Skip return
+	RETURN
+20$:	CMP	(SP)+,(SP)+		;Clean up stack
+	RETURN
+
+;	CHKRSP	SUBROUTINE TO CHECK ACKNOWLEGEMENTS AND UPDATE DDACK
+;
+;	CALL	CHKRSP
+;	 BR	 ERROR_RETURN
+;	NORMAL_RETURN	R0 = VALID ACK
+
+CHKRSP:	MOVB	D.RESP(R3),R0		;Get the response number
+	CMPB	R0,DDACK#(R4)		;Is RESP < last acknowledgement
+	BLO	CHKRS2			;Wraped around?
+	BEQ	CHKRS4			;Equal is ok
+	CMPB	R0,DDLBSN#(R4)		;Check for ack in range of numbers outstanding
+	BLO	CHKRS4			;In range
+CHKRS2:	CMPB	DDLBSN#(R4),DDACK#(R4)	;In range?
+;	BHI	CHKRS6			;No
+	BLOS	CHKRS4			;Within window - update ACK
+	INC	DDLBAE#(R4)		;Count this ACK error
+	BR	CHKRS6
+
+CHKRS4:	ADD	#2,(SP)			;Set up normal return
+	MOVB	R0,DDACK#(R4)		;Update ACK
+CHKRS6:	RETURN
+	.END
+   Z<P)Ó
