@@ -1,0 +1,579 @@
+	.TITLE	TRMP  SPECIAL PACKET ROUTINES FOR TERMINAL SERVICE
+	.SBTTL	TRMP   - NEXILIS/JRG
+
+	XLPAR				;DON'T LIST PARAMETER FILE
+
+	CODE
+
+.IF NDF ..SAT
+  ..SAT=!0
+.ENDC
+.IF NDF ..TPC
+  ..TPC=!0
+.ENDC
+
+	.SBTTL	TRMP   - PUTCHR - PLACE CHARACTER INTO PACKET
+
+;THIS SUBROUTINE DOES MUCH THE SAME THING AS PUTBYT EXCEPT THAT IT HANDLES
+;  ALL OF THE EXTRA DETAILS NEEDED FOR LINE BUFFERING.  IT KNOWS ABOUT THE
+;  TERMINAL SERVICE STATUS BITS SO IT CAN DETERMINE IF LINE BUFFERING IS IN
+;  EFFECT OR NOT.
+;	C(R0) = character
+;	CALL	PUTCHR
+;	  failure return, character discarded
+;	normal return, character accepted (may have caused warning)
+
+PUTCHR::BIC	#$T2ICH,SDTRS2#(SD)	;INDICATE NOT HARD INTERRUPT CHARACTER
+	CMP	PKFCNT#,#.PLTRM#+7	;Do we have enough packets?
+	BGT	10$			;Yes
+	CMPB	#37,R0			;Check for control character
+	BLO	30$			;Throw it away if not control
+10$:	MOV	SDPKSP#(SD),R1		;Get pointer to last packet
+	BNE	PUTCH3			;Go on if have a packet
+	CMPB	#TRPMAX#,SDPCNT#(SD)	;Are we over the limit?
+	BHI	20$			;No, continue normally
+	CMPB	#TRPMAX#+2,SDPCNT(SD)	;Are we way over the limit?
+	BLO	30$			;Yes, just give up
+	CMPB	#37,R0			;No, check for control char
+	BLO	30$			;Not a control, give up
+	TBBE	$S1STP,SDSTS1#(SD),20$	;Have we been stopped before?
+	BIS	#$T2QON!$T2QOF,SDTRS2#(SD) ;Yes, do XON and XOFF
+	BISB	#.OSBEL,SDTROS#(SD)	;Tell output routine about it
+20$:	CALL	TRMPKT			;Get a packet
+30$:	  RETURN			;If can't get one now!
+	MOV	R1,(R1)			;Make into one packet ring
+	BR	PUTCH5			;Handle pointer, counts etc for new packet
+
+;Here for existing packet
+
+PUTCH3:	CMPB	#TRPMAX#,SDPCNT#(SD)	;Are we over the limit?
+	BHI	10$			;No, continue normally
+	CMPB	#TRPMAX#+2,SDPCNT#(SD)	;Are we way over the limit?
+	BLO	30$			;Yes, just give up
+	CMPB	#37,R0			;No, check for control char
+	BLO	30$			;Not a control, give up
+10$:	MOVB	PKCNT(R1),R2		;Get character position
+	CMP	#PKCMAX,R2		;Is this packet full?
+	BGT	PUTCH8			;No-go on
+	CALL	TRMPKT			;Get a packet
+30$:	  RETURN			;If can't get one now
+	MOV	@SDPKSP#(SD),(R1)	;Link the new packet into the SRC ring
+	MOV	R1,@SDPKSP#(SD)
+PUTCH5:	MOV	R1,SDPKSP#(SD)		;Store pointer in the SDB
+	CLR	PKCNT(R1)		;Clear count and packet type (PKTYPE =
+					;  PKCNT + 1)
+	CLRB	PKPNT(R1)		;Clear pointer byte (needed since this
+					;  byte will be used by the input hold
+					;  routines if the user types the input
+					;  retype character)
+	CLR	R2			;Clear pointer to character
+
+
+
+;Here with a packet which has space for the character
+
+	CMPB	#TRPWRN#,SDPCNT#(SD)	;DO WE HAVE TOO MANY PACKETS NOW?
+	BHI	PUTCH8			;NO-GO ON
+	TBBN	$T5TAP,SDTRS5#(SD),50$	;TAPE MODE?
+	TBBE	$T4HIE,SDTRS4#(SD),70$	;NO- HOLD INPUT ENABLE?
+50$:	TBBN	$S1STP,SDSTS1#(SD),PUTCH8 ;FIRST TIME HE WENT OVER?
+	BIS	#$T2QOF,SDTRS2#(SD)	;YES-REQUEST X-OFF
+	BISB	#.OSBEL,SDTROS#(SD)
+	BIS	#$S1STP,SDSTS1#(SD)	;INDICATE WE HAVE BEEN STOPPED
+	BR	PUTCH8			;CONTINUE
+70$:
+.IF EQ ..SAT
+	CALL	RNGBEL			;NO-Ring his bell
+.ENDC
+PUTCH8:	ADD	#2,(SP)			;Give normal return
+	ADD	R1,R2			;ADD IN BASE OF PACKET
+	MOVB	R0,PKDATA(R2)		;STORE CHARACTER
+	INCB	PKCNT(R1)		;INCREMENT CHARACTER COUNT
+.IF EQ ..SAT
+	CMPB	#200,SDTRBS#(SD)	;CHECK FOR TYMSHR BREAK SET
+	BEQ	20$			;WAIT FOR POLL THEN
+	PUSH	R0			;SAVE THE CHARACTER
+	BIC	#^C177,R0		;GET JUST 7 BITS
+
+	BITB	SDTRBS#(SD),BRKTBL#(R0)	;IS THIS A BREAK CHARACTER?
+	BNE	14$			;Yes
+	INCB	SDTRIC#(SD)		;No-count this character
+	TSTB	SDTRIL#(SD)		;Is an input buffer limit in effect?
+	BEQ	16$			;No-finished
+	TBBN	$T1CMD,SDTRS1#(SD),16$	;Yes, unless in command mode
+	CMPB	SDTRIC#(SD),SDTRIL#(SD)	;Too many now?
+	BLO	16$			;No-finished
+14$:	CALL	SNDTRP			;Send the packet(s)
+16$:	POP	R0			;Restore character
+.ENDC
+20$:	RETURN
+	.PAGE
+	.SBTTL	TRMP   - TRMPKT - Get packet for terminal
+
+;Subroutine to get a packet for the terminal - limits are checked and updated,
+;  right things are done if cannot get one!
+;	CALL	TRMPKT
+;	  error return, cannot get packet
+;	normal return, C(R1) = address of packet
+
+TRMPKT:	MAKPKT	.PLTRM#			;No-get a packet
+	BCS	TRFAIL			;If can't get one now
+	ADD	#2,(SP)			;Got one-give good return
+	INCB	SDPCNT#(SD)		;Charge him for it
+	RETURN				;Thats all
+
+;Here if cannot get a packet
+
+TRFAIL:	CALL	ZAPBUF#			;ZAP A BUFFER IF WE WANT TO
+	  BR	TRFAI2			;IF COULDN'T (OR DIDN'T WANT TO) DO IT!
+	BR	TRMPKT			;OK-GO TRY AGAIN
+
+TRFAI2:
+.IF NE ..TPC
+	TBBE	$D0TRM,@SDDDB#(SD),ECHBEL;Really a terminal?
+.ENDC
+	BIS	#$S1STP,SDSTS1#(SD)	;Yes-indicate he has been stopped
+	BIS	#$T2QOF,SDTRS2#(SD)	;Request X-OFF
+					;Fall into RNGBEL
+
+;SUBROUTINE TO RING THE BELL ON THE USER'S TERMINAL
+;	CALL	RNGBEL
+
+RNGBEL::
+.IF NE ..TPC
+	TBBE	$D0TRM,@SDDDB#(SD),ECHBEL;Really a terminal?
+.ENDC
+	INCB	SDTRBL#(SD)		;Yes-bump bell count
+	BNE	2$			;TOO MANY BELLS?
+	DECB	SDTRBL#(SD)		;YES-FIX UP THE COUNT
+2$:	BISB	#.OSBEL,SDTROS#(SD)	;SET OUTPUT STATE BIT
+RTN003:	RETURN
+
+	.PAGE
+	.SBTTL	TRMP   - CHKTWO - CHECK FOR SPACE FOR 2 CHARACTERS
+
+;THIS SUBROUTINE CHECKS FOR SPACE TO STORE 2 CHARACTERS - CALLED BEFORE STORING
+;  A CR-LF PAIR TO MAKE SURE THAT BOTH WILL FIT!
+;	CALL	CHKTWO
+;	  return if not enough space
+;	nornal return - 2 more characters will fit
+
+CHKTWO::
+.IF EQ ..SAT
+	MOV	SDPKSP#(SD),R1		;Do we have a packet now?
+	BEQ	2$			;No
+	CMPB	#PKCMAX-2,PKCNT(R1)	;Yes-room for 2 more in the packet?
+	BGE	4$			;Yes-its OK
+
+;****	the following line changed form "PKFLST#" to "PKFCNT#" by 
+;****	DRE 12/08/80
+2$:	CMP	#.PLTRM#,PKFCNT#	;No-any more packets available?
+	BHIS	10$			;No-fail!
+
+;*******the following two lines were deleted because of block mode
+;*******terminals - DRE  11/17/80
+;	CMPB	#TRPMAX#,SDPCNT#(SD)	;Yes-can we have one?
+;	BLOS	TRFAI2			;No-fail!
+
+4$:	ADD	#2,(SP)			;Yes-give good return
+	RETURN
+
+;Here if cannot get another packet
+
+10$:	CALL	ZAPBUF#			;Try to zap a buffer
+	  BR	TRFAI2			;Fail if can't do it
+	BR	CHKTWO			;Go try again
+.IFF
+	ADD	#2,(SP)			;If Tymsat, this always give the good
+	RETURN				;  return!
+.ENDC
+	.PAGE
+	.SBTTL	TRMP   - ECHBEL - Echo bell by sending it back in a packet
+
+.IF NE ..TPC
+;Subroutine to echo bell by sending it back to the terminal in a data packet -
+;  only used by the Tymnet terminal protocol converter!
+;	CALL	ECHBEL
+
+ECHBEL:	MOV	#BEL,R0			;Get a bell character
+.ENDC					;Fall into ECHSLF
+
+	.SBTTL	TRMP   - ECHSLF - Echo character by sending it back in a packet
+
+;Subroutine to echo a character by sending back to the terminal device in a
+;  data packet - this is needed when the input hold buffer is not being used
+;  and is also used by the type H link terminal protocol converter
+;	C(R0) = character to echo
+;	CALL	ECHSLF
+;  R1 is destroyed
+
+.IF EQ	..SAT ;DRE
+
+ECHSLF::MAKPKT	.PLTRM#			;Get a packet
+	BCS	RTN002			;Forget it if can't get one!
+	MOV	#<.PTDAT*400+1>,PKCNT(R1);Make this a single character data
+	MOVB	R0,PKDATA(R1)		;  packet (This is not as bad as it
+					;  seems at first since it will be
+					;  merged with any packets already
+					;  buffered!)
+.endc	;---KS501
+
+;Routines which have constructed other than single character data packets may
+;  enter at this point to send the packet back
+;	C(R1) = address of packet to send
+
+PKTSLF::INCB	SDXCNT#(SD)		;Bump the excess packet counter
+	PUSH	SD			;Save address of our SDB
+	MOV	(SD),SD			;Get linked SDB
+	BEQ	PKTSL2			;If none (must be a disconnect buffered)
+	CALL	SNDPKT#			;Send the packet
+	POP	SD			;Restore our SDB
+RTN002:	RETURN				;Thats all
+
+;Here if no SDB is linked - this should only happen when a disconnect has
+;  been sent to use but is still buffered on our DST list.  In this case
+;  our state should be disconnect pending (.SSDTP) and we should just junk
+;  this packet!
+
+PKTSL2: POP     SD                      ;This is added as a patch from Cytrol.
+                                        ;*******PATCH***Patch***jwr**10-15-80
+       	CMPB	#.SSDTP,SDSTS1#(SD)	;Make sure the socket state is right!
+	BEQ	12$			;OK
+	RSTOP	BSS			;[Bad Socket State]
+
+12$:	FREPKT				;Just give up the packet
+	DECB	SDXCNT#(SD)		;Fix up the count
+	RETURN				;And return
+	.PAGE
+	.SBTTL	TRMP   - DELCHR - REMOVE CHARACTER FROM PACKET
+
+;THIS SUBROUTINE REMOVES A CHARACTER FROM A PACKET IN LINE MODE ONLY
+;	CALL	DELCHR
+;	  return if nothing to delete
+;	normal return, C(R0) = character just deleted
+
+.IF EQ ..SAT
+DELCHR::MOV	SDPKSP#(SD),R1		;Get address of last SRC packet
+	BEQ	RTN007			;NOTHING TO DO IF NOTHING THERE!
+	ADD	#2,(SP)			;Give skip return since something there
+	MOVB	PKCNT(R1),R2		;Anything in current packet?
+	BNE	2$			;Yes-all is OK
+	RSTOP	EPK			;No - [EMPTY PACKET]
+
+;HERE WITH SOMETHING TO DELETE
+
+2$:	TSTB	SDTRIL#(SD)		;Is an input buffer limit in effect?
+	BEQ	4$			;No
+	DECB	SDTRIC#(SD)		;Yes-fix up the character count
+4$:	ADD	R1,R2			;Calculate address of character
+	MOVB	PKDATA-1(R2),R0		;Get character
+	DECB	PKCNT(R1)		;Anything left in the packet?
+	BGT	RTN007			;Yes-finished
+	MOV	(R1),R2			;No-get first SRC packet
+	CMP	R2,R1			;THIS PACKET?
+	BNE	10$			;NO
+	CLR	SDPKSP#(SD)		;Yes-nothing left-clear pointer
+	BR	14$			;CONTINUE
+
+;HERE IF CURRENT PACKET IS NOT FIRST IN SOURCE LIST
+
+10$:	CMP	(R2),R1			;IS CURRENT PACKET NEXT?
+	BEQ	12$			;YES
+	MOV	(R2),R2			;NO-ADVANCE POINTER
+	BNE	10$			;CONTINUE IF ANOTHER
+	RSTOP	CFP			;[CAN'T FIND PACKET]
+
+;HERE WITH C(R2) = POINTER TO PACKET BEFORE CURRENT PACKET
+
+12$:	MOV	(R1),(R2)		;Remove this packet from the ring
+	MOV	R2,SDPKSP#(SD)		;Update pointer
+14$:	FREPKT				;GIVE UP THE LAST PACKET
+	CALL	DECCNT			;REDUCE SRC'S PACKET COUNT
+RTN007:	RETURN				;AND RETURN
+.ENDC
+	.PAGE
+	.SBTTL	TRMP   - GETIHB - GET CHAR FROM INPUT HOLD BUFFER
+
+;Subroutine to get character from input hold buffer
+;	CALL	GETIHB
+;	  return if buffer empty
+;	normal return, C(R0) = character
+
+.IF EQ ..SAT
+GETIHB::MOV	SDTRIP#(SD),R0		;Get last packet in list
+	BEQ	RTN004			;If nothing there
+	ADD	#2,(SP)			;Give skip return
+	MOV	(R0),R1			;Get first packet in list
+	MOVB	PKPNT(R1),R2		;Get taker pointer
+	INCB	PKPNT(R1)		;Bump taker pointer
+	ADD	R1,R2			;Point to character
+	MOVB	PKDATA(R2),R0		;Get character
+	CMPB	PKPNT(R1),PKCNT(R1)	;Is this packet empty now?
+	BNE	RTN004			;No-finished
+	CMP	SDTRIP#(SD),R1		;Is this the last packet?
+	BNE	6$			;No
+	CLR	SDTRIP#(SD)		;Yes-clear the pointer
+	BR	10$			;Continue
+
+6$:	MOV	(R1),@SDTRIP#(SD)	;Remove this packet from the ring
+10$:	FREPKT				;Give up the packet
+	CBR	DECCNT			;Reduce packet count and return
+.ENDC
+	.PAGE
+	.SBTTL	TRMP   - PUTIHB - STORE CHAR IN THE INPUT HOLD BUFFER
+
+;	C(R0) = CHARACTER
+;	CALL	PUTIHB
+;	C:SET = ERROR, CHARACTER NOT STORED
+
+.IF EQ ..SAT
+
+PUTIHB::MOV	SDTRIP#(SD),R1		;Get last packet in buffer
+	BNE	4$			;Go on if have at least one
+	CALL	TRMPKT			;None buffered now-get a packet
+	  RETURN			;If none available
+	MOV	R1,(R1)			;Link into one packet ring
+2$:	MOV	R1,SDTRIP#(SD)		;Set pointer
+	CLRB	PKCNT(R1)		;Init putter pointer
+	CLRB	PKPNT(R1)		;Init taker pointer
+4$:	MOVB	PKCNT(R1),R2		;Get putter pointer
+	CMP	#PKCMAX,R2		;Is this packet full now?
+	BGT	10$			;No
+	MOV	R1,R3			;Yes-copy packet address
+	CALL	TRMPKT			;Get another packet
+	  RETURN			;If no more available
+	MOV	(R3),(R1)		;Link in the new packet
+	MOV	R1,(R3)
+	BR	2$			;Continue
+
+;Here with packet for character
+
+10$:	ADD	R1,R2			;Point to character position
+	MOVB	R0,PKDATA(R2)		;Store character
+	INCB	PKCNT(R1)		;Bump putter pointer
+.ENDC
+SKPRTN:	ADD	#2,(SP)			;Give good return
+	RETURN				;Thats all
+;.ENDC
+	.PAGE
+	.SBTTL	TRMP   - GETCMC - FETCH CHARACTER FOR COMMAND PROCESSOR
+
+;	CALL	GETCMC
+;	  return if no character available
+;	normal return, C(R0) = character (only 7 bits)
+
+
+;.IF EQ ..SAT
+GETCMC::TBBN	$T3ECL,SDTRS3#(SD),14$	;At end of line now?
+	MOV	SDTRCP#(SD),R3		;No-get address of last packet
+	BEQ	12$			;If no packets now
+	MOV	(R3),R1			;Get address of first packet
+	MOVB	PKPNT(R1),R2		;Get character pointer
+	INCB	PKPNT(R1)		;Bump pointer
+	ADD	R1,R2			;Point to the character
+	MOVB	PKDATA(R2),R0		;Get character
+	BIC	#^C177,R0		;Only 7 bits
+	DECB	PKCNT(R1)		;Is this packet empty now?
+	BNE	10$			;No-just return with character
+	CMP	R1,R3			;Is this the only packet?
+	BNE	4$			;No
+	CLR	SDTRCP#(SD)		;Yes-clear pointer in SDB
+	BR	6$			;And continue
+
+4$:	MOV	(R1),R2			;Remove this packet from the ring
+	MOV	R2,(R3)
+	CLRB	PKPNT(R2)		;Clear pointer in next packet
+6$:	FREPKT				;GIVE UP THIS PACKET
+	CALL	DECCNT			;DECREMENT SOURCE PACKET COUNT
+10$:	CMP	#CR,R0			;IS IT A RETURN?
+	BEQ	GETCMC			;YES-IGNORE IT
+	CMP	#LF,R0			;IS IT A LINE FEED?
+	BNE	SKPRTN			;No-just give good return
+	RETURN
+12$:	BIS	#$T3ECL,SDTRS3#(SD)	;YES-INDICATE END OF LINE SEEN
+14$:	CLR	R0			;RETURN A NULL
+RTN004:	RETURN				;AND RETURN
+;.ENDC
+	.PAGE
+	.SBTTL	TRMP   - DECCNT - DECREMENT SOURCE PACKET COUNT
+
+;CALLED ONLY BY TERMINAL (SRC) AND COMMAND ROUTINES
+;	CALL	DECCNT
+
+DECCNT::DECB	SDPCNT#(SD)		;DECREMENT PACKET COUNT
+	BGE	2$			;ERROR?
+	CLRB	SDPCNT#(SD)		;YES-FIX IT UP
+2$:	TBBE	$S1STP,SDSTS1#(SD),RTN008;FINISHED IF DEVICE NOT STOPPED
+	CMPB	#TRPWRX#,SDPCNT#(SD)	;STOPPED-CAN WE PROCEED NOW?
+	BGT	RTN008			;NO
+	BIC	#$S1STP,SDSTS1#(SD)	;YES-CLEAR FLAG
+	CJMP	TRRSUM#			;POKE THE TERMINAL SERVICE AND RETURN
+	.PAGE
+	.SBTTL	TRMP   - SNDTRP - SEND PACKET FOR TERMINAL SERVICE
+
+;	CALL	SNDTRP
+
+SNDTRP::
+.IF EQ ..SAT
+	CLRB	SDTRIC#(SD)		;Clear input buffer count
+.ENDC
+	MOV	SDPKSP#(SD),R2		;Get last packet in SRC list
+	BEQ	RTN008			;If list is empty
+	MOV	(R2),R1			;Get first packet in SRC list
+.if NE ..BUG
+	BIT	#77,R1
+	BNE	10$
+	CMP	R1,#PKTBGN#
+	BHIS	20$
+10$:	RSTOP	BPA
+20$:
+.ENDC
+	CLR	SDPKSP#(SD)		;Clear pointer to the list
+	TBBN	$T1CMD,SDTRS1#(SD),SNDTR6;IF IN COMMAND MODE
+	CLR	(R2)			;Clear end-around pointer
+4$:	PUSH	(R1)			;Save address of next packet
+	CALL	SNDPKT#			;Send this packet
+	POP	R1			;Get address of next packet
+	BNE	4$			;Continue if more there
+RTN008:	RETURN				;FINISHED
+
+;HERE IF IN COMMAND MODE
+
+SNDTR6:	MOV	SDTRCP#(SD),R3		;GET LAST COMMAND PACKET
+	BNE	SNDTR7			;GO IF HAVE SOME COMMAND PACKETS NOW
+	MOV	R2,SDTRCP#(SD)		;None now-point to the SRC ring
+	CLR	PKPNT(R1)		;Clear pointer byte in first packet
+	MOV	#.CXECL#,R2		;Go process command
+	JMP	CMDENT#
+
+;HERE IF ALREADY HAVE ONE OR MORE COMMAND PACKETS
+
+SNDTR7:	MOV	(R3),(R2)		;Link SRC ring into CMD ring
+	MOV	R1,(R3)
+	MOV	R2,SDTRCP#(SD)		;Update pointer in SDB
+	RETURN				;Thats all for now
+	.PAGE
+	.SBTTL	TRMP   - DELSRC - Delete all SRC packets
+
+;Subroutine to delete all SRC packets
+;	CALL	DELSRC
+;	  return if SRC list is empty
+;	normal return
+
+DELSRC::
+.IF EQ ..SAT
+	CLRB	SDTRIC#(SD)		;Clear buffer limit counter
+.ENDC
+	MOV	SDPKSP#(SD),R2		;Get address of last packet in list
+	BEQ	RTN009			;If list is empty now
+	CLR	SDPKSP#(SD)		;Clear pointer in the SDB
+	ADD	#2,(SP)			;Not empty-give skip return
+	BR	CLRLST			;Continue
+.IF EQ ..SAT
+	.SBTTL	TRMP   - CLRIHB - Clear input hold buffer
+
+;Subroutine to delete all packets from the input hold buffer
+;	CALL	CLRIHB
+
+CLRIHB::MOV	SDTRIP#(SD),R2		;Get last packet
+	BEQ	RTN009			;If none there
+	CLR	SDTRIP#(SD)		;Clear pointer in the SDB
+	BR	CLRLST			;Continue
+.ENDC
+	.SBTTL	TRMP   - CLRCMD - Remove all command packets
+
+;Subroutine to delete all command input packets
+;	CALL	CLRCMC
+
+CLRCMC::MOV	SDTRCP#(SD),R2		;Get last packet
+	BEQ	RTN009			;If list is empty
+	CLR	SDTRCP#(SD)		;Clear pointer in SDB
+CLRLST:	MOV	(R2),R1			;Get address of first packet in list
+.if NE ..BUG
+	BIT	#77,R1
+	BNE	10$
+	CMP	R1,#PKTBGN#
+	BHIS	20$
+10$:	RSTOP	BPA
+20$:
+.ENDC
+	CLR	(R2)			;Clear last pointer
+2$:	PUSH	(R1)			;Save link to next packet
+	FREPKT				;Give up the packet
+	CALL	DECCNT			;Reduce packet count
+	POP	R1			;Get next packet
+	BNE	2$			;Continue if more there
+RTN009:	RETURN				;Finished
+	.PAGE
+	.SBTTL	TRMP   - REECHO - Re-echo current input line
+
+;Subroutine to re-echo the current line
+;	CALL	REECHO
+;  R0 is preserved
+;  This subroutine simply moves the current SRC list to the input hold
+;    list!  The formats of the packets in these two lists and the use
+;    of the associated pointers and counts is such that this all works
+;    right!!
+;
+;  It is possible that the input hold list is not used but line editing 
+;    is being used (e.g. X.28 PAD).  In that case, packets on the
+;    SRC list is duplicated and sent back to itself.
+;
+.IF EQ ..SAT
+
+REECHO::
+	TBBE	$T1HIA!$T1CMD,SDTRS1#(SD),20$ ;Branch if input hold list not used.
+	CLRB	SDTRIC#(SD)		;Clear buffer limit counter
+	MOV	SDPKSP#(SD),R1		;Get pointer to SRC list
+	BEQ	RTN009			;Nothing to do if no SRC list
+	CLR	SDPKSP#(SD)		;Clear the pointer
+	MOV	SDTRIP#(SD),R2		;Get pointer to the input hold list
+	BEQ	4$			;This is easy if no input hold list!
+	MOV	(R2),R3			;Not empty-link the old SRC list to
+	MOV	(R1),(R2)		;  the front of the input hold list
+	MOV	R3,(R1)
+	RETURN				;Thats all
+
+;Here if input hold list was empty
+
+4$:	MOV	R1,SDTRIP#(SD)		;Make the old SRC list the current
+					;  input list
+	RETURN				;Finished
+
+;Here input list not used
+
+20$:
+	MOV	SDPKSP#(SD),R1		;GET PTR TO END OF SRC LIST
+	BEQ	RTN010			;NOTHING THERE
+	PUSH	R0			;SAVE THE INPUT CHARACTER
+	PUSH	R1			;SAVE THE ADDRESS FOR LATER 
+	MOV	(R1),R2			;GET TO HEAD OF SRC LIST
+22$:
+	MAKPKT	.PLOPT#			;TRY TO GET A PACKET
+	BCS	30$			;QUIT IF CAN NOT GET ONE
+	MOV	#PKTWDS,R3		;INITIALIZE COUNTER
+25$:
+	MOV	(R2)+,(R1)+		;MAKE A COPY
+	SOB	R3,25$			;
+
+	MOV	#100,R3
+	SUB	R3,R2			;SET PTR BACK TO BEGINNING OF PACKET
+	SUB	R3,R1			;
+	CLR	(R1)			;CLEAR LINK FIELD OF PACKET 
+	PUSH	R2			;
+	CALL	PKTSLF			;SEND PACKET TO SELF
+	POP	R2	
+	CMP	R2,(SP)			;IS THIS THE LAST PACKET ON SRC LIST
+	BEQ	30$			;YES, BRANCH
+	MOV	(R2),R2			;GET NEXT PACKET
+	BNE	22$			;BRANCH IF THERE IS ONE
+	FSTOP	BSL			;<BAD SOURCE LIST>
+30$:
+	POP				;
+	POP	R0			;RESTORE INPUT CHARACTER
+RTN010:	RETURN
+.ENDC
+
+	.END
+
+  
