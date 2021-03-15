@@ -1,0 +1,315 @@
+	.TITLE	LPA	- Line printer type A interface
+	.SBTTL	LPA	- Constants and flags
+
+	XLPAR				; Don't list parameter file
+	CODE				; .PSECT CODE
+
+$LPACT=!1				; Printer is active
+
+$LPOFL=!100000				; Printer off-line (error status reg)
+
+	.SBTTL	LPACMI -  Common interrupt routine
+
+;-----
+; Common interrupt routine...  The following code has been executed to get
+; here:
+;	PUSH	SD
+;	MOV	<address of this socket's SDB>,SD
+;	JMP	LPACMI#
+;-----
+
+LPACMI::CLR	@SDPAOR#(SD)		; Disable interrupts on device
+	MOV	SD,@LPRNGP#		; Put SDB address into ring
+	ADD	#2,LPRNGP#		; Bump ring putter pointer
+	CMP	LPRNGP#,#LPRNGE#	; Past end of ring?
+	BLO	LPCOM1			; No
+	  MOV	#LPRING#,LPRNGP#	; Yes - reset pointer
+;-----
+; Here if putter not at end of ring
+;-----
+LPCOM1:	POP	SD			; Restore SDB address
+	RTI				; Return from interrupt
+	.PAGE
+	.SBTTL	Main program routines
+;-----
+; Here to initialize device dependent part of DDB
+;-----
+LPDDBI::MOV	#LPRING#,LPRNGP#	; Set interrupt request ring pointers
+	MOV	#LPRING#,LPRNGT#	;   (both putter and taker)
+	RETURN				; Nothing else to initialize
+
+;-----
+; Here to initialize device dependent part of SDB
+;-----
+LPSDBI::CLR	@SDPAER#(SD)		; Clear error status register
+	NXMJMP	LPRTN			; Return if hardware not there
+	CLR	@SDPAOR#(SD)		; Clear output status register
+	CLR	@SDPAOB#(SD)		; Clear output buffer
+	MOV	#SDPALC#,R1		; Get # words to clear
+	SUB	#SDPAFC#,R1
+	ASR	R1
+	MOV	#SDPAFC#,R2		; Get first word address
+	ADD	SD,R2			; Get SDB offset address
+LPSDB1:	CLR	(R2)+			; Clear word
+	SOB	R1,LPSDB1		; Continue until area cleared
+	BIS	#$S1AVL,SDSTS1#(SD)	; Indicate socket available
+LPRTN:	RETURN				; Common return point
+
+
+;-----
+; Main loop entry point
+;-----
+
+	MAINXX	LPMAIN
+
+LPMAIN:	CMP	LPRNGP#,LPRNGT#		; Interrupt request pending?
+	BEQ	LPRTN			; Return if none pending
+	MOV	LPRNGT#,R1		; Get ring taker
+	MOV	(R1)+,SD		; Get SDB address from ring
+	CMP	R1,#LPRNGE#		; End of ring?
+	BLO	LPMAI1			; No
+	MOV	#LPRING#,R1		; Yes - reset ring taker pointer
+LPMAI1:	MOV	R1,LPRNGT#		; Update ring taker
+	TBBN	$LPACT!$D0ERR,SDPASR#(SD),LPDATA ; Try to do output if printer active
+	INC	SDPASI#(SD)		; Increment spurious interrupt count
+	RETURN				; Return if not active
+
+;-----
+; Here if printer active (poke entry, data packet, processing packet, etc.)
+;-----
+LPPOKE::TBBN	$LPACT,SDPASR#(SD),LPRTN ; Return if printer active at poke
+	CALL	GETPKT#			;Get next packet
+
+;-----
+; Here if printer active
+;-----
+LPDATA:	TBBE	$D0ERR,SDPASR#(SD),10$	; Was the printer offline
+	MOVB	SDPASR#+1(SD),R0	; Yes, recover the last char
+	BR	LPDAT2			; Continue
+10$:	TST	SDPASP#(SD)		; Left over spaces to output?
+	BGT	LPSPAC			; Yes - output one
+
+LPDAT1:	CALL	GETBYT#			; Get byte from packet service
+	BEQ	LPDONE			; Go inactive if nothing to do
+	BCC	LPDAT2			; Branch unless control packet
+	ASL	R0			; Convert packet type to word offset
+	JMP	@LPPDSP(R0)		; Dispatch on packet type
+;-----
+; Line printer packet dispatch table (indexed by packet type)
+;-----
+	PURE
+
+LPPDSP:	.WORD	LPDATA			; 0 - Data
+	.WORD	LPCONC			; 1 - Connect
+	.WORD	LPILPK			; 2 - Connect ACK
+	.WORD	LPILPK			; 3 - Connect NAK
+	.WORD	LPFUNC			; 4 - Function
+	.WORD	LPFUNC			; 5 - Interrupt
+	.WORD	LPFUNC			; 6 - Eat
+	.WORD	LPDISC			; 7 - Disconnect
+	.WORD	LPDISC			; 10 - Kill connection
+	.WORD	LPILPK			; 11 - Disconnect ACK
+	.WORD	LPCONC			; 12 - Recover
+	.WORD	LPDISC			; 13 - Retry
+	.WORD	LPILPK			; 14 - Packet ACK
+
+	CODE
+;-----
+; Here if really inside data packet
+;-----
+LPDAT2:	BIC	#^C177,R0		;REMOVE JUNK
+	BEQ	LPDAT1			;IGNORE NULLS
+	CMP	R0,#SPA			; Printable character?
+	BGE	LPOUT			; Yes - go print it
+	CMP	R0,#CR			; Carriage return?
+	BNE	LPDAT3			; No
+	CLR	SDPAHZ#(SD)		; Yes - clear horiz. carr. pos.
+	BR	LPOUT1			; Output char w/o updating carr. pos.
+;-----
+; Here if not carriage return
+;-----
+LPDAT3:	CMP	R0,#BS			; Backspace?
+	BNE	LPDAT4			; No
+	DEC	SDPAHZ#(SD)		; Yes - decrement horiz. carr. pos.
+	BGE	LPOUT1			; Output char if pos was > 0
+	CLR	SDPAHZ#(SD)		; Hold carr. pos. at 0
+	BR	LPDAT1			; Ignore <BS> at carr. pos. 0
+;-----
+; Here if not backspace
+;-----
+LPDAT4:	CMP	R0,#HT			; Horizontal tab?
+	BNE	LPOUT1			; No - go output w/o horiz. advance
+	MOV	SDPAHZ#(SD),R0		; Yes - get old carr. pos.
+	BIC	#^C7,R0			; Get rightmost 3 bits only
+	MOV	#10,SDPASP#(SD)		; 8 is max # spaces to output
+	SUB	R0,SDPASP#(SD)		; Subtract old pos. to get # spaces
+
+LPSPAC:	DEC	SDPASP#(SD)		; Decrement spaces count
+	BLT	LPDAT1			; If no more, get next char
+	MOV	#SPA,R0			; Char to output is space
+
+LPOUT:	INC	SDPAHZ#(SD)		; Bump horizontal carriage position
+
+LPOUT1:	TBBN	$LPOFL,@SDPAER#(SD),LPERR ; Branch on printer off-line
+	MOVB	R0,@SDPAOB#(SD)		; Send char to printer
+
+	MOV	#100,@SDPAOR#(SD)	; Enable output done interrupt
+	MOV	#$LPACT,SDPASR#(SD)	; Indicate active, no error, on-line
+	RETURN				; Return to caller
+
+;-----
+; Here if printer off-line
+;-----
+LPERR:	MOVB	R0,SDPASR#+1(SD)	; Save the character
+	TBBN	$D0ERR,SDPASR#(SD),LPERR2 ; Forget yellow ball if error status
+					;     already sent
+;	CLR	SDPASP#(SD)		; Clear pending spaces count
+;	CALL	JNKCPX#			; Throw away the packet
+	MOV	#.PTFUN,R0		; Set function packet type
+	CALL	CTLPKT#			; Construct a control packet
+	BNE	LPERR1			; If got a packet, branch
+	FSTOP	NPA			; (No Packets Available)
+LPERR1:	MOV	#.FNREQ,R0		; Request function
+;	CALL	CTLSTR#			; Store in control packet
+;	MOV	#<$D0ERR+$D0OFL>,R0	; Device error and off-line status
+;	MOVB	R0,SDPASR#(SD)		; Set device status in SDB
+;	CALL	CTLSTR#			; Store in control packet
+;	CLR	R0			; Second byte is NULL
+	CALL	CTLSTE#			; Store in packet and send packet
+LPERR2:	MOVB	#<$D0ERR+$D0OFL+$LPACT>,SDPASR#(SD); Set device status in SDB
+	MOV	#100,@SDPAOR#(SD)	; Enable output done interrupt
+	RETURN
+
+;-----
+; Here when GETBYT fails to get a byte (return with carry bit set)
+;-----
+LPDONE:	BIC	#$LPACT,SDPASR#(SD)	; Indicate printer inactive
+	BIC	#100,@SDPAOR#(SD)	; Disable interrupts (just in case)
+	RETURN				; Return to caller
+
+;-----
+; Here on illegal packet type (in control packet)
+;-----
+LPILPK:	FSTOP	IPT			; (Illegal Packet Type)
+
+;-----
+; Here on connection-like packets
+;-----
+LPCONC:	TBBN	$LPOFL,@SDPAER#(SD),10$	; Branch on printer off-line
+	CLR	R2			;No profile needed
+	CALL	ACCEPT#			; Accept all connections
+;	MAKPKT	.PLSTP#			;GET A PACKET
+;	BCS	4$			;WE TRIED!
+;	INCB	SDPCNT#(SD)		;COUNT IT
+;	MOV	R1,R2			;MAKE POINTERS
+;	ADD	#PKCNT,R2
+;	MOV	#TYPMES,R3
+;	MOV	#TYPSIZ,R0		;GET COUNT
+;2$:	MOV	(R3)+,(R2)+		;COPY DATA INTO PACKET
+;	SOB	R0,2$			;UNTIL FINISHED
+;	CALL	SNDPKT#			;SEND THE PACKET
+4$:	JMP	LPDAT1			; See if there is anything to do
+
+10$:	MOV	#.ERHNA,R0		;Set up host not available
+	CALL	REFUSE#
+	RETURN
+
+;DATA FOR DEVICE PARAMETERS PACKET
+
+;	PURE
+
+;TYPMES:	.BYTE	3,.PTFUN,0,0		;HEADER
+;	.BYTE	.FNRDP,.TPWID,132.	;DATA
+;TYPSIZ=!<.-TYPMES+1>/2
+;	.EVEN
+
+;	CODE
+
+;-----
+; Here on function packets
+;-----
+LPFUNC:	TSTB	PKCNT(R1)		; Anything in packet?
+	BLE	LPFIGN			; No - ignore it
+	MOVB	PKDATA(R1),R0		; Yes - get function
+	ASL	R0			; Make function type word offset
+	CMP	R0,#LPFMAX		; Valid function?
+	BHIS	LPFIGN			; No - ignore it
+	JMP	@LPFDSP(R0)		; Yes - dispatch on function type
+;-----
+; Function dispatch table (indexed by function type in function packet)
+;-----
+	PURE
+
+LPFDSP:	.WORD	LPFIGN			; 0 - Illegal
+	.WORD	LPFOPS			; 1 - Hard interrupt
+	.WORD	LPFIGN			; 2 - Soft break
+	.WORD	LPFIGN			; 3 - Output suppress ACK
+	.WORD	LPFOPS			; 4 - Output suppress
+	.WORD	LPFIGN			; 5 - Output hold
+	.WORD	LPFIGN			; 6 - Output allow
+	.WORD	LPFIGN			; 7 - Change device parameters
+	.WORD	LPFIGN			; 10 - Set device parameters
+	.WORD	LPFIGN			; 11 - Access device parameters
+	.WORD	LPFIGN			; 12 - Reply with device parameters
+	.WORD	LPFIGN			; 13 - Device control
+	.WORD	LPFIGN			; 14 - Device status
+	.WORD	LPFADS			; 15 - Access device status
+	.WORD	LPFIGN			; 16 - Continue output (^Q)
+	.WORD	LPFIGN			; 17 - Force hard interrupt
+	.WORD	LPFIGN			; 20 - Deferred echo mode control
+	.WORD	LPFIGN			; 21 - Request disconnect
+	.WORD	LPFIGN			; 22 - Request buffer clear
+	.WORD	LPFREQ			; 23 - Request (yellow ball)
+LPFMAX=!.-LPFDSP
+
+	CODE
+
+;-----
+; Here to ignore function packet
+;-----
+LPFIGN:	CALL	JNKCPX#			; Give up packet
+	BR	LPDA1T			; See if anything else to do
+
+;-----
+; Here to acknowledge output suppress or interrupt
+;-----
+LPFOPS:	CALL	ACKOPS#			; Acknowledge output suppress
+	BR	LPDA1T			; See if anything else to do
+
+;-----
+; Here to process access device status
+;-----
+LPFADS:	TBBE	$LPOFL,@SDPAER#(SD),LPFAD1 ; Branch if printer on-line
+	BISB	$D0OFL,SDPASR#(SD)	; Set off-line status in SDB
+	BR	LPFAD2			; Go send device status
+LPFAD1:	BICB	$D0OFL,SDPASR#(SD)	; Set device on-line status in SDB
+LPFAD2:	MOVB	#.PTINT,PKTYPE(R1)	; Set interrupt packet type
+	MOVB	#3,PKCNT(R1)		; Data == function, 2 bytes of status
+	MOVB	#.FNDST,PKDATA(R1)	; Device status function
+	MOVB	SDPASR#(SD),PKDATA+1(R1); Put device status into packet
+	CLRB	PKDATA+2(R1)		; Second status byte is NULL
+	CALL	PKTRTX#			; Return packet to sender
+LPDA1T:	JMP	LPDAT1			; See if anything else to do
+
+;Here for request (yellow ball) function
+
+LPFREQ:	MOVB	#.FNRSP,PKDATA(R1)	;Change it to a response (orange ball)
+					;  function
+	CALL	PKTRTX#			;Send it back
+	BR	LPDA1T			;Continue
+
+;-----
+; Here to resume after warning return from packet service
+;-----
+LPRSUM::RETURN			; Return to caller
+
+
+;-----
+; Here to disconnect
+;-----
+LPDISC:	CLR	@SDPAOR#(SD)		; Disable interrupts
+	CLR	SDPASR#(SD)		; Indicate not active, no char sent
+	CJMP	FINDIS#			;Finish disconnecting
+
+	.END
+    
