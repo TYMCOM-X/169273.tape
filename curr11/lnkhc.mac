@@ -1,0 +1,1453 @@
+	.TITLE	LNKHA	- TYMNET direct interface (T.201) frame level
+	.SBTTL	LNKHA	- Definitions
+
+	XLPAR				; Don't list parameter file
+
+;-----
+; Determine which device support to include (DU/DUV-11 or DUP-11/DPV11)
+;-----
+.IF NDF ..DUP
+  ..DUP =! 0
+.ENDC
+.IF NDF ..DPV
+  ..DPV =! 0
+.ENDC
+
+;-----
+; Macro to return from interrupt (RTI) after restoring R0 and R3
+;-----
+.MACRO	RTI03
+	MOV	(SP)+,R0
+	MOV	(SP)+,R3
+	RTI
+.ENDM
+
+;-----
+; Pure status bits - in LDHST0 word of LDB
+;-----
+$L0DIR	=! $BIT15			; Input from neighbor direction
+$L0SAT	=! $BIT07			; Satellite header instead of normal
+
+;-----
+; Impure status bits - in LDHST1 word of LDB
+;-----
+$L1BSY	=! $BIT15			; Line is busy
+$L1FLW	=! $BIT14			; Packet level should send flow control
+$L1UNV	=! $BIT13			; Line is unavailable
+
+$L1DWN	=! $BIT07			; Line is down
+
+;-----
+; Flags - in LDHAFG word of LDB
+;-----
+$ILOW	=! $BIT15			; Receiving low order byte of word
+$IRMA	=! $BIT14			; Output interrupt IRMA timer bit
+$OACTV	=! $BIT13			; Output of byte is in progress
+$IGNOR	=! $BIT12			; Ignore incoming reset pattern
+$BYTE1	=! $BIT11			; Waiting for 1st byte of input frame
+$ABUTT	=! $BIT10			; Next message abutts this one
+
+$RESET	=! $BIT07			; Sending reset pattern
+
+;-----
+; Device register bit values
+;-----
+$RSTRP	=! $BIT08			; Receiver control strip synch bit
+$RSRCH	=! $BIT04			; Receiver control search for synch bit
+
+$XSMSG	=! $BIT08			; Transmitter data start of message bit
+$XMSTR	=! $BIT08			; Transmitter control master reset bit
+$XSEND	=! $BIT04			; Transmitter control send bit
+
+;-----
+; Initialization values for the device registers
+;-----
+.RINIT	=! $BIT08!$BIT06!$BIT04!$BIT02!$BIT01 ; Receiver cntl reg init value:
+					;   Strip synch, Rec int enable, Search
+					;   synch, Req to send, Data term rdy.
+					;   Works for DPV, bit08 is ignored.
+
+.IF EQ ..DUP
+;---------------------------------------;   DU-11/DUV-11 reg initial values
+  .PINIT =! <3*$BIT12>!<3*$BIT10>!177	; DUV-11 parameter reg initial value:
+					;   Intern synch, 8-bit, synch on 177
+  .XINIT =! $BIT06			; Xmitter control reg initial value:
+					;   Xmit int enable
+;---------------------------------------;
+.IFF
+ .IF EQ ..DPV
+ ;--------------------------------------;   DUP-11 reg initial values
+  .PINIT =! $BIT15!$BIT09!377		; DUP-11 parameter reg initial value:
+					;   DEC mode, CRC inhib, 377 synch
+  .XINIT =! $BIT06!$BIT04		; Xmitter control reg initial value:
+					;   Xmit int enable, Send
+ ;--------------------------------------;
+ .IFF
+ ;--------------------------------------;   DPV-11 reg initial values
+  .PINIT =! $BIT14!$BIT10!$BIT09!$BIT08!377; BYTE mode, CRC inhib, 377 sync
+  .XINIT =! $BIT06!$BIT04		;  Xmit int enable, Xmit enable
+  $XMSTR =! $BIT00			; Transmitter control master reset bit
+  $RSTRP =! $BIT13			; Receiver control strip synch bit
+ ;--------------------------------------;
+ .ENDC
+.ENDC
+
+;-----
+; Input states
+;-----
+IS.IDL	=! 00				; Waiting for header
+IS.BDY	=! 02				; Reading frame body
+IS.DCS	=! 04				; Diagonal checksum word
+IS.RST	=! 06				; Node number originating reset pattern
+
+;-----
+; Output states
+;-----
+OS.LOW	=! 02				; Sending low order byte of word
+
+OS.TMR	=! 00				; 31 mark word ACK timer
+OS.BDY	=! 04				; Frame body word
+OS.DCS	=! 10				; Diagonal checksum word
+OS.NXT	=! 14				; Next frame to send
+OS.RST	=! 20				; Reset pattern
+OS.RND	=! 24				; Reset originating node number
+OS.RIF	=! 30				; Reset pattern inter-frame mark word
+OS.IDL	=! 34				; Going idle
+
+;-----
+; Timer duration values
+;-----
+TIME.D	=! 20.				; Non-acknowledgement take-down timer
+TIME.I	=! 10.				; Non-input master reset timer
+TIME.R	=! 4.				; Ignore reset on input timer
+
+;-----
+; Constants
+;-----
+.RESET	=! 5253				; TYMNET reset pattern header word
+
+;-----
+; Bit order inversion table for T.201 bytes
+;-----
+	PURE
+T201BI:
+	.DSABL	CRF
+.N=!0
+.REPT	400
+  .NN=!<<.N&1>*200>!<<.N&2>*40>!<<.N&4>*10>!<<.N&10>*2>
+  .NN=!.NN!<<.N&20>/2>!<<.N&40>/10>!<<.N&100>/40>!<<.N&200>/200>
+	.BYTE	.NN
+  .N=!.N+1
+.ENDR
+	.ENABL	CRF
+
+;-----
+; Debug rings - frame header and tick timer - packet pointer
+;---------------------------------------;
+.IF NE ..BUG				;
+	IMPURE				;
+LHAPUT::.WORD	0			; Debug frame header ring putter
+LHARNG::.BLKW	100			; Ring for frame header words
+LHAEND::				; End of ring + 2
+					;
+LHAPKP::.WORD	0			; Debug packet header ring putter
+LHAPKR::.BLKW	14			; Ring for packet pointers
+LHAPKE::				; End of ring + 2
+.ENDC					;
+;---------------------------------------;
+
+	CODE
+	.PAGE
+	.SBTTL	LHAISV	- Input interrupt handler
+;-----
+; LHAISV - Processes input interrupts from the DUV-11/DUP-11 interface
+;
+; The following code has been executed to get here:
+;	<input ready interrupt>
+;	PUSH	R3			;;Save R3
+;	MOV	<address of LDB>,R3	;;Get LDB ptr of line needing service
+;	JMP	LHAISV			;;Go to common input interrupt routine
+;-----
+LHAISV::PUSH	R0			;;Save R0
+	MOV	@LDHARB#(R3),R0		;;Get byte from interface
+	BPL	1$			;;If no error, process  byte
+	INC	LDHAEO#(R3)		;;Bump overrun error count
+47$:	JMP	IABORT			;;Might as well abort this input frame
+
+1$:	BIC	#$RSTRP,@LDHARS#(R3)	;;Clear receiver strip synch bit
+	MOVB	T201BI(R0),R0		;;Get byte in correct bit order
+
+
+.IF EQ ..DUP
+;---------------------------------------;;  DUV-11 / DU-11 support code
+	TBBN	$ILOW,LDHAFG#(R3),2$	;;If this is low byte, construct word
+;-----
+; Store high byte until low byte received
+;-----
+	BIS	#$ILOW,LDHAFG#(R3)	;;High byte - next byte will be low byte
+	MOVB	R0,LDHAIB#(R3)		;;Save high byte
+	RTI03				;;Return from interrupt (pop R0, R3)
+;-----
+; Here on low-order byte of input word
+;-----
+2$:	BIC	#$ILOW,LDHAFG#(R3)	;;Next byte is high byte
+	SWAB	R0			;;Temporarily store low byte in high
+	CLRB	R0			;;Clear low byte
+	BISB	LDHAIB#(R3),R0		;;Get high byte
+	SWAB	R0			;;Put bytes in correct halfwords
+
+	RORB	LDHAIX#(R3)		;;Get left-over bit from last word
+	ROR	R0			;;Put last word's left-over bit in this
+					;;  word, adjust off-by-one-bit word
+					;;  alignment, get new left-over bit
+	ROLB	LDHAIX#(R3)		;;Save left-over bit from this word
+;---------------------------------------;;
+.IFF
+;---------------------------------------;;  DUP-11 support code
+	TBBE	$BYTE1,LDHAFG#(R3),4$	;;Skip unless 1st byte after synch
+	CMPB	R0,#-1			;;Interrupt on synch byte?
+	BEQ	47$			;;Yes - ignore spurious interrupt
+
+;-----
+; Got 1st byte of new frame - determine shift count to synch bytes
+;-----
+	BIC	#$BYTE1,LDHAFG#(R3)	;;Clear waiting for 1st byte flag
+
+	MOV	#16,LDHASC#(R3)		;;Init shift bypass counter
+	MOVB	R0,LDHAIX#(R3)		;;Store 1st byte
+	BPL	3$			;;Skip if high bit == 0
+
+2$:	SUB	#2,LDHASC#(R3)		;;Decrease shift bypass count (increase
+					;;  shift count)
+	ROLB	R0			;;Shift one bit position
+	BMI	2$			;;Continue until high bit == 0
+
+3$:	RTI03				;;Dismiss interrupt (pop R0, R3)
+
+;-----
+; Here on bytes after 1st byte of frame
+;-----
+4$:	SWAB	R0			;;Temp store byte in high byte
+	CLRB	R0			;;Clear low byte
+	BISB	LDHAIX#(R3),R0		;;Pick up previous byte
+	SWAB	R0			;;Get bytes in proper order
+	MOVB	R0,LDHAIX#(R3)		;;Save new byte
+
+	ADD	LDHASC#(R3),PC		;;Perform correct number of shifts
+.REPT	7
+	ROL	R0
+.ENDR
+
+	TBBN	$ILOW,LDHAFG#(R3),5$	;;Skip if constructing low byte
+
+;-----
+; Store high byte until low byte constructed
+;-----
+	BIS	#$ILOW,LDHAFG#(R3)	;;Indicate low byte will be next
+
+	SWAB	R0			;;Get constructed byte in low byte
+	MOVB	R0,LDHAIB#(R3)		;;Save high byte for now
+	RTI03				;;Dismiss interrupt (pop R0, R3)
+
+;-----
+; Here on low-order byte (to complete construction of input word)
+;-----
+5$:	BIC	#<$ILOW!$ABUTT>,LDHAFG#(R3) ;;Clear flags: getting low byte,
+					;;  next frame abutts
+	TSTB	R0			;;Does next frame abutt?
+	BMI	6$			;;No
+
+	BIS	#$ABUTT,LDHAFG#(R3)	;;Yes - indicate frame abutts
+
+6$:	CLRB	R0			;;Clear low byte
+	BISB	LDHAIB#(R3),R0		;;Get high byte
+	SWAB	R0			;;Get word in correct byte order
+;---------------------------------------;;
+.ENDC	; .IF EQ ..DUP
+
+
+	ADD	LDHAIS#(R3),PC		;;Dispatch on input state
+
+	BR	IHEADR			;;IS.IDL =  0 - Waiting for header
+	BR	IBODY			;;IS.BDY =  2 - Reading frame body
+	BR	77$			;;IS.DCS =  4 - Diagonal checksum word
+	BR	IRESET			;;IS.RST =  6 - Resetting node number
+
+77$:	JMP	IDCKSM
+
+;-----
+; Here on originating node number following reset pattern
+;-----
+IRESET:	CMP	R0,LDHNBR#(R3)		;;Reset from expected neighbor?
+	BEQ	2$			;;Yes
+
+	PUSH	R4			;;Save register
+	MOV	LDHDDB#(R3),R4		;;Get DDB pointer
+	CMP	R0,DDLHNN#(R4)		;;Reset from self (loopback)?
+	BNE	1$			;;No
+	INC	LDHERB#(R3)		;;Yes - bump loopback reset count
+1$:	POP	R4			;;Restore register
+
+	INC	LDHAEN#(R3)		;;No - bump bad neighbor count
+	JMP	ISYNCH			;;Go synch device
+
+;-----
+; Here on reset from neighbor
+;-----
+2$:	MOVB	#-1,LDHAIA#(R3)		;;Flag that reset was seen on input
+	JMP	INXTHD			;;Go see if next message abutts
+
+;-----
+; Here on header word
+;-----
+IHEADR:	CMP	R0,#.RESET		;;Is this the reset pattern?
+	BNE	1$			;;No
+
+	MOV	#IS.RST,LDHAIS#(R3)	;;Input state <-- resetting node #
+	RTI03				;;Return from interrupt (pop R0, R3)
+;-----
+; Here on header other than reset pattern
+;-----
+1$:	MOV	R0,LDHAIL#(R3)		;;Init longitudinal checksum word
+	CLC				;;Clear carry so 0 rotated in
+	ROL	R0			;;Rotate header word
+	MOV	R0,LDHAID#(R3)		;;Init diagonal checksum word
+	BMI	2$			;;Direction bit = 1, check it
+
+	TBBN	$L0DIR,LDHST0#(R3),3$	;;Direction matches direction bit - ok
+	BR	ISYNCH			;;Direction mismatch - discard frame
+
+2$:	TBBN	$L0DIR,LDHST0#(R3),ISYNCH ;;Direction mismatch - discard frame
+
+;-----
+; Header direction bit checks out - get word count from header
+;-----
+3$:	ROL	R0			;;Rotate word
+	BPL	4$			;;Normal header - decode header
+
+	TBBE	$L0SAT,LDHST0#(R3),ISYNCH ;;This end not satellite - discard
+	ASHI	-2,R0			;;Satellite header - right adjust word
+
+4$:	SWAB	R0			;;Right justify count field
+	BIC	#^C37,R0		;;Isolate count
+
+	MOVB	R0,LDHAIC#(R3)		;;Store word count
+	BEQ	ISYNCH			;;Count MUST be > 0, else error
+
+	MOV	#IS.BDY,LDHAIS#(R3)	;;Input state <-- body of frame
+	MOV	LDHAIL#(R3),R0		;;Get header word
+
+5$:	PUSH	R1			;;Save R1
+	MAKPKT	.PLSTP#			;;Get packet for frame
+	BCC	6$			;;Ok if got packet
+
+	POP	R1			;;No packets - restore R1
+	MOVB	#10.,ZAPCNT#		;;Start the zap counter
+	BR	ISYNCH			;;Go resynch line
+
+6$:	MOV	R1,LDHAIF#(R3)		;;Store frame pointer
+	MOV	R0,(R1)+		;;Store header word in frame
+	MOV	R1,LDHAIW#(R3)		;;Store input word pointer
+
+	POP	R1			;;Restore R1
+	RTI03				;;Return from interrupt (pop R0, R3)
+
+;-----
+; Here on body of frame
+;-----
+IBODY:	DECB	LDHAIC#(R3)		;;Decrement word count
+	BEQ	ILCKSM			;;All done - this is long. checksum
+
+	XOR	R0,LDHAIL#(R3)		;;Compute longitudinal checksum
+	XOR	R0,LDHAID#(R3)		;;Compute diagonal checksum
+	CLC				;;Clear residue
+	ROL	LDHAID#(R3)		;;Left rotate diag checksum 1 bit
+	ADC	LDHAID#(R3)		;;Complete rotation
+
+	SWAB	R0			;;Reorder bytes (due to char strings)
+	MOV	R0,@LDHAIW#(R3)		;;Store word in frame
+	ADD	#2,LDHAIW#(R3)		;;Update word pointer
+	RTI03				;;Return from interrupt (pop R0, R3)
+
+;-----
+; Here on longitudinal checksum word
+;-----
+ILCKSM:	XOR	R0,LDHAIL#(R3)		;;Compute longitudinal checksum diff.
+	XOR	R0,LDHAID#(R3)		;;Compute diagonal checksum
+	MOV	#IS.DCS,LDHAIS#(R3)	;;Input state <-- diag checksum
+	RTI03				;;Return from interrupt (pop R0, R3)
+
+;-----
+; Here on diagonal checksum word
+;-----
+IDCKSM:	TST	LDHAIL#(R3)		;;Was longitudinal checksum ok?
+	BNE	IBADCS			;;No
+
+	CMP	R0,LDHAID#(R3)		;;Diagonal checksum ok?
+	BEQ	ISEND			;;Yes - send frame to main
+
+;-----
+; Here on bad checksum
+;-----
+IBADCS:	INC	LDHERC#(R3)		;;Bump bad checksum count
+;	BR	IABORT			;;Discard frame
+
+;-----
+; Here to abort input frame
+;-----
+IABORT:	TST	LDHAIF#(R3)		;;Input frame in progress?
+	BEQ	ISYNCH			;;If no info field, search for synch
+
+IABOR1:	PUSH	R1			;;Input frame being stored - save R1
+	MOV	LDHAIF#(R3),R1		;;Get packet address
+	CLR	LDHAIF#(R3)		;;Clear packet list header
+	FREPKT				;;Free the packet
+	POP	R1			;;Restore R1
+
+;-----
+; Here to establish byte synchronization over the link
+;-----
+ISYNCH:
+
+.IF EQ ..DUP
+;---------------------------------------;;  DUV-11 / DU-11 support code
+	BIC	#$RSRCH,@LDHARS#(R3)	;;Clear receiver search synch bit
+	BIS	#<$RSRCH!$RSTRP>,@LDHARS#(R3) ;;Set synch search & strip synch
+;---------------------------------------;;
+.IFF
+;---------------------------------------;;  DUP-11 support code
+	BIC	#$RSRCH,@LDHARS#(R3)	;;Clear receiver enable
+	BIS	#$RSTRP,@LDHAPR#(R3)	;;Set strip synch to ignore marks
+	BIS	#$RSRCH,@LDHARS#(R3)	;;Start search synch by enabling rcvr
+	BIS	#$BYTE1,LDHAFG#(R3)	;;Set find 1st byte of next frame flag
+;---------------------------------------;;
+.ENDC	; .IF EQ ..DUP
+
+	CLR	LDHAIS#(R3)		;;Clear input state (go idle & search
+					;;  for header)
+	CLRB	LDHAIX#(R3)		;;Clear saved bit for next header
+;-----
+; Here to return from interrupt level
+;-----
+RTI000:	RTI03				;;Return from interrupt (pop R0, R3)
+
+;-----
+; Frame checksum good - send frame to main
+;-----
+ISEND:
+
+;---------------------------------------;;
+.IF NE ..BUG				;;
+	MOV	LHAPUT,R0		;;Get debug ring putter
+	MOV	@LDHAIF#(R3),(R0)+	;;Store input header
+	MOV	UPTIME#,(R0)+		;;Store low word of up time
+	CMP	R0,#LHAEND		;;End of ring?
+	BLO	47$			;;No
+	MOV	#LHARNG,R0		;;Yes
+47$:	MOV	R0,LHAPUT		;;Update putter
+.ENDC					;;
+;---------------------------------------;;
+
+;-----
+; Make sure good ACK gets to main program level if frame is discarded
+;-----
+	MOVB	@LDHAIF#(R3),LDHAIA#(R3);;Store good ACK number
+	BICB	LDHAMD#(R3),LDHAIA#(R3)	;;Isolate new ACK number
+
+	MOV	#TIME.I,LDHATI#(R3)	;;Start input timeout
+
+;-----
+; Store new frame pointer in interrupt ring
+;-----
+	MOV	LDHAKP#(R3),R0		;;Get input interrupt ring putter
+	MOV	LDHAIF#(R3),(R0)+	;;Store new frame in interrupt ring
+
+	CMP	R0,LDHAKE#(R3)		;;End of ring?
+	BLO	1$			;;No
+	MOV	LDHAKB#(R3),R0		;;Yes - reset pointer
+1$:	CMP	R0,LDHAKT#(R3)		;;Ring full?
+	BEQ	IABOR1			;;Yes - drop this frame
+
+	MOV	R0,LDHAKP#(R3)		;;Update interrupt ring putter
+	CLR	LDHAIF#(R3)		;;Clear frame pointer
+
+;-----
+; Clean up and re-synch device before dismissing interrupt
+;-----
+INXTHD:
+
+.IF EQ ..DUP
+;---------------------------------------;;  DU-11/DUV-11 support code
+	TSTB	LDHAIX#(R3)		;;Saved bit == 0 (next frame abutted)?
+	BNE	ISYNCH			;;No - re-synch device
+;---------------------------------------;;
+.IFF
+;---------------------------------------;;  DUP-11 support code
+	TBBE	$ABUTT,LDHAFG#(R3),ISYNCH ;;Re-synch unless next frame abutts
+;---------------------------------------;;
+.ENDC	; .IF EQ ..DUP
+
+	CLR	LDHAIS#(R3)		;;Yes - input state <-- wait for header
+	RTI03				;;Return from interrupt (pop R0, R3)
+	.PAGE
+	.SBTTL	LHAOSV	- Output interrupt handler
+;-----
+; LHAOSV - Output done interrupt handler
+;
+; The following code has been executed to get here:
+;	<output done interrupt>
+;	PUSH	R3			;;Save LDB pointer
+;	MOV	#<address of LDB>,R3	;;Get LDB for line needing service
+;	JMP	LHAOSV			;;Jump to common interrupt handler
+;-----
+LHAOSV::PUSH	R0			;;Save R0
+	MOV	LDHAOS#(R3),R0		;;Get output state
+	JMP	@OSTDSP(R0)		;;Dispatch on output state
+
+	PURE
+
+OSTDSP:	.WORD	OTIMER			;;OS.TMR =  0 - 33 mark word ACK timer
+	.WORD	OLBYTE			;;OS.LOW =  2 - Low byte
+	.WORD	OBODY			;;OS.BDY =  4 - Frame body word
+	.WORD	OLBYTE			;;OS.LOW =  6 - Low byte
+	.WORD	ODCKSM			;;OS.DCS = 10 - Diagonal checksum word
+	.WORD	OLBYTE			;;OS.LOW = 12 - Low byte
+	.WORD	ONEXTF			;;OS.NXT = 14 - Next frame to send
+	.WORD	OLBYTE			;;OS.LOW = 16 - Low byte
+	.WORD	ORESET			;;OS.RST = 20 - Reset pattern
+	.WORD	OLBYTE			;;OS.LOW = 22 - Low byte
+	.WORD	ORSNOD			;;OS.RND = 24 - Resetting node number
+	.WORD	OLBYTE			;;OS.LOW = 26 - Low byte
+	.WORD	ORSMRK			;;OS.RIF = 30 - Reset inter-frame mark
+	.WORD	OLBYTE			;;OS.LOW = 32 - Low byte
+	.WORD	OIDLE1			;;OS.IDL = 34 - Going idle
+	.WORD	OLBYTE			;;OS.LOW = 36 - Low byte
+
+	CODE
+	.PAGE
+;-----
+; Here to send reset pattern word
+;-----
+ORESET:	MOV	#OS.RND,LDHAOS#(R3)	;;Output state <-- resetting node #
+	MOV	#.RESET,R0		;;Get TYMNET reset pattern word
+	TBBN	$L1DWN,LDHST1#(R3),OWORD;;Send reset word when line down
+	BIC	#$RESET,LDHAFG#(R3)	;;Stop sending reset after this one if
+					;;  line now up
+	BR	OWORD			;;Send reset word
+
+;-----
+; Here to send originating node number word for reset pattern
+;-----
+ORSNOD:	MOV	#OS.RIF,LDHAOS#(R3)	;;Output state <-- inter-frame word
+	MOV	LDHDDB#(R3),R0		;;Get DDB pointer
+	MOV	DDLHNN#(R0),R0		;;Get TYMNET node number for this node
+	BR	OWORD			;;Send originating node number
+
+;-----
+; Here to force from 1 to 33 mark words between this ouput and next
+;-----
+ORSMRK:	CLR	LDHAOS#(R3)		;;Output state <-- ACK timer
+	MOVB	#33.,LDHAOC#(R3)	;;Init output word count
+	BR	OMRKWD			;;Go send 2nd mark word
+
+;-----
+; Here to send 1 word of mark (send 33 words of mark as retransmission timer)
+;-----
+OTIMER:	DECB	LDHAOC#(R3)		;;Decrease output word count - expired?
+	BMI	OREXMT			;;Yes - see if frame to retransmit
+;-----
+; Here to send inter-frame mark word
+;-----
+OMRKWD:	MOV	#-1,R0			;;Get mark word (= all 1's)
+	BR	OWORD			;;Go send mark word
+
+;-----
+; Here to send word from frame body
+;-----
+OBODY:	DECB	LDHAOC#(R3)		;;Bump word count - anything left?
+	BLE	OLCKSM			;;All done - send longitudinal checksum
+
+	MOV	@LDHAOW#(R3),R0		;;Get word to send
+	ADD	#2,LDHAOW#(R3)		;;Bump word pointer
+	SWAB	R0			;;Get bytes in correct order
+;	BR	OLONGC			;;Go send data word
+
+;-----
+; Here to calculate longitudinal and diagonal checksums from output word
+;-----
+OLONGC:	XOR	R0,LDHAOL#(R3)		;;Compute longitudinal checksum
+	XOR	R0,LDHAOD#(R3)		;;Compute diagonal checksum
+OLONG1:	CLC				;;Clear residue
+	ROL	LDHAOD#(R3)		;;Left rotate diagonal checksum word
+	ADC	LDHAOD#(R3)		;;Complete rotation
+;	BR	OWORD			;;Go send word
+
+;-----
+; Here to begin sending word (send high byte of word)
+;-----
+OWORD:	BIS	#OS.LOW,LDHAOS#(R3)	;;Indicate low byte next
+	MOVB	R0,LDHAOB#(R3)		;;Store low byte
+	CLRB	R0			;;Clear low byte
+	SWAB	R0			;;Get high byte
+;	BR	OBYTE			;;Go send byte
+
+;-----
+; Here with a byte to send on the interface
+;-----
+OBYTE:
+
+.IF EQ ..DUP
+;---------------------------------------;;  DU-11/DUV-11 support code
+	BIS	#$XSEND,@LDHAXS#(R3)	;;Enable transmitter send bit
+;---------------------------------------;;
+.ENDC
+
+	MOVB	T201BI(R0),@LDHAXB#(R3)	;;Send high byte
+	BIS	#<$OACTV!$IRMA>,LDHAFG#(R3) ;;Set active & IRMA bits
+	RTI03				;;Return from interrupt (pop R0, R3)
+
+;-----
+; Here to send low byte of word
+;-----
+OLBYTE:	BIC	#OS.LOW,LDHAOS#(R3)	;;High byte is next to send
+	CLR	R0			;;Clear residue
+	BISB	LDHAOB#(R3),R0		;;Get low byte
+	BR	OBYTE			;;Go send low byte
+
+;-----
+; Here to send longitudinal checksum word
+;-----
+OLCKSM:	MOV	LDHAOL#(R3),R0		;;Get longitudinal checksum word
+	MOV	#OS.DCS,LDHAOS#(R3)	;;Output state <-- diag checksum
+
+	XOR	R0,LDHAOD#(R3)		;;Compute final diagonal checksum
+	BR	OWORD			;;Go send longitudinal checksum word
+
+;-----
+; Here to send diagonal checksum word
+;-----
+ODCKSM:	MOV	LDHAOD#(R3),R0		;;Get diagonal checksum
+	MOV	#OS.NXT,LDHAOS#(R3)	;;Output state <-- next frame to send
+	BR	OWORD			;;Go send diagonal checksum word
+
+;-----
+; Here to determine next frame to send
+;-----
+ONEXTF:	CMP	LDHAQN#(R3),LDHAQP#(R3)	;;New frame to send?
+	BNE	OSEND			;;Yes - go send it
+
+	CMPB	LDHAFR#(R3),LDHAMX#(R3)	;;Window closed?
+	BHIS	ORSMRK			;;Yes - enter ACK timer state
+
+;-----
+; Go idle if nothing to transmit
+;-----
+OIDLE:	MOV	#OS.IDL,LDHAOS#(R3)	;;Output state <-- going idle
+
+;-----
+; Here to delay 1 mark word time on the interface when needed
+;-----
+OMARK1:	CLRB	LDHAOC#(R3)		;;Send exactly 1 word of mark
+	BR	OMRKWD			;;Send word
+
+;-----
+; Here to go idle after sending 1 mark word following message
+;-----
+OIDLE1:	CMP	LDHAQP#(R3),LDHAQT#(R3)	;;Any new output?
+	BNE	OSEND			;;Yes - go send new frame
+
+.IF EQ ..DUP
+;---------------------------------------;;  DU-11/DUV-11 support code
+	BIC	#$XSEND,@LDHAXS#(R3)	;;Clear transmitter send bit
+;---------------------------------------;;
+.ENDC
+	CLR	LDHAOS#(R3)		;;Output state <-- idle
+	BIC	#<$OACTV!$IRMA>,LDHAFG#(R3) ;;Clear flags: active, IRMA
+	RTI03				;;Return from interrupt (pop R0, R3)
+
+;-----
+; Here to determine if there is a frame to retransmit
+;-----
+OREXMT:	TBBE	$RESET,LDHAFG#(R3),1$	;;SKIP UNLESS RESETTING
+	JMP	ORESET			;;Send reset pattern if resetting
+
+1$:	CMPB	LDHAFR#(R3),LDHAMX#(R3)	;;Window closed?
+	BLO	OIDLE			;;No - go idle
+	CMP	LDHAQT#(R3),LDHAQP#(R3)	;;Any frames in queue?
+	BEQ	OIDLE			;;No - go idle
+;-----
+; Retransmit 1st frame in output queue
+;-----
+	MOV	@LDHAQT#(R3),R0		;;Get 1st frame in queue
+	BEQ	OMARK1			;;Null frame pointer - try after 1 word
+
+	INC	LDHERX#(R3)		;;Bump retransmission sent count
+	BR	OHEADR			;;Start sending frame
+
+;-----
+; Here if not retransmitting and have new frame to send
+;-----
+OSEND:	MOV	#OS.NXT,LDHAOS#(R3)	;;Set output state to return here if
+					;;  output is delayed one word time
+	MOV	@LDHAQN#(R3),R0		;;Get next frame to send
+	BEQ	OMARK1			;;Null frame pointer - try after 1 word
+
+	ADD	#2,LDHAQN#(R3)		;;Bump next to send pointer
+	CMP	LDHAQN#(R3),LDHAQE#(R3)	;;End of queue?
+	BLO	OHEADR			;;No
+	MOV	LDHAQB#(R3),LDHAQN#(R3)	;;Yes - reset next to send pointer
+
+;	BR	OHEADR			;;Start sending frame
+
+;-----
+; Here to send frame header word
+;-----
+OHEADR:	MOV	#OS.BDY,LDHAOS#(R3)	;;Output state <-- frame body
+	CLRB	LDHAUA#(R3)		;;Init unsent ACK count
+
+	INC	R0			;;Point at word count
+	MOVB	(R0)+,LDHAOC#(R3)	;;Store word count for frame
+	MOV	R0,LDHAOW#(R3)		;;Store output word pointer
+	MOV	-(R0),R0		;;Get record number and count
+
+	ASLB	R0			;;Adjust record number left
+	ASLB	R0
+	ASLB	R0
+	TBBE	$L0SAT,LDHST0#(R3),2$	;;Go finish normal header
+
+	ASLB	R0			;;Satellite header - adjust 1 more time
+	BISB	LDHACK#(R3),R0		;;Pick up acknowledgement number
+	BIS	#$BIT13,R0		;;Set beginning of record bit
+	BR	3$			;;Go put direction bit into header
+
+;-----
+; Here to finish normal header
+;-----
+2$:	BISB	LDHACK#(R3),R0		;;Normal header - pick up ACK number
+	ASLB	R0			;;Left justify on halfword boundary
+	ASLB	R0
+	ASHI	-2,R0			;;Right justify header
+	BIS	#$BIT12,R0		;;Set beginning of record bit
+
+;-----
+; Here to put direction bit into header and send it
+;-----
+3$:	TBBE	$L0DIR,LDHST0#(R3),4$	;;Direction = 0, go send word
+	BIS	#$BIT14,R0		;;Direction = 1, set bit
+4$:
+;---------------------------------------;;
+.IF NE ..BUG				;;
+	PUSH	R0			;;Save header word
+	MOV	LHAPUT,R0		;;Get debug ring putter
+	MOV	(SP),(R0)+		;;Store output header
+	MOV	UPTIME#,(R0)+		;;Store low word of up time
+	CMP	R0,#LHAEND		;;End of ring?
+	BLO	47$			;;No
+	MOV	#LHARNG,R0		;;Yes - reset putter
+47$:	MOV	R0,LHAPUT		;;Update putter
+	POP	R0			;;Restore header word
+.ENDC					;;
+;---------------------------------------;;
+
+	MOV	R0,LDHAOL#(R3)		;;Init longitudinal checksum
+	MOV	R0,LDHAOD#(R3)		;;Init diagonal checksum
+	JMP	OLONG1			;;Go send header word
+	.PAGE
+	.SBTTL	LHAINX	- LDB initialization
+;-----
+; LHAINX - called to initialize LDB for type H link
+;
+; Linkage:
+;	R4 - DDB pointer
+;	R3 - LDB pointer
+;
+;	CALL	LHAINX
+;
+; Unpreserved registers:
+;	R0, R1
+;-----
+LHAINX:: MOV	#<$L1UNV!$L1DWN>,LDHST1#(R3) ; Declare line unavailable & down
+	CLR	@LDHAXS#(R3)		; Clear Xmitter status/control reg
+	NXMJMP	RTN000			; Hardware does not exist - return
+
+;-----
+; Clear LDB initially zero area
+;-----
+	MOV	#LDHAFC#,R0		; Get offset to first word to clear
+	ADD	R3,R0			; Add LDB base address
+	MOV	#LDHACZ#,R1		; Get number of words to clear
+
+8$:	CLR	(R0)+			; Clear a word
+	SOB	R1,8$			; Continue until whole section cleared
+
+;-----
+; Initialize queue pointers
+;-----
+	BIC	#$L1UNV,LDHST1#(R3)	; Indicate line exists
+	MOV	LDHAQB#(R3),LDHAQT#(R3)	; Init output queue taker
+	MOV	LDHAQB#(R3),LDHAQN#(R3)	; Init output queue next-to-send ptr
+	MOV	LDHAQB#(R3),LDHAQP#(R3)	; Init output queue putter
+
+;---------------------------------------;
+.IF NE ..BUG				;
+	MOV	#LHARNG,R0		; Get ptr to frame header ring
+	MOV	#<LHAEND-LHARNG>/2,R1	; Get # words to clear
+					;
+10$:	CLR	(R0)+			; Clear ring word
+	SOB	R1,10$			; Continue
+					;
+	MOV	#LHARNG,LHAPUT		; Init debug frame header ring putter
+					;
+	MOV	#LHAPKR,R0		; Get ptr to packet ring
+	MOV	#<LHAPKE-LHAPKR>/2,R1	; Get # words to clear
+					;
+20$:	CLR	(R0)+			; Clear ring word
+	SOB	R1,20$			; Continue
+					;
+	MOV	#LHAPKR,LHAPKP		; Init debug packet pointer ring putter
+.ENDC					;
+;---------------------------------------;
+
+	CJMP	LHADWX			; Return through line down routine to
+					;   init LDB fields & master reset line
+	.PAGE
+	.SBTTL	LHAMAI	- Main loop entry point
+;-----
+; Here each time through main loop to see if a line needs service
+;-----
+	MAINXX	LHAMAI
+
+LHAMAI:	MOV	#LHALDB#,R3		; Get 1st LDB for line type A
+
+1$:	TBBN	$L1UNV,LDHST1#(R3),11$	; Skip line if unavailable
+	MOVB	LDHAIA#(R3),R0		; Get input ACK number
+	BPL	2$			; Skip unless reset detected (= -1)
+;-----
+; Reset detected on input
+;-----
+	BICB	LDHAMD#(R3),LDHAIA#(R3)	; Init incoming ACK number to "-1"
+	TBBN	$IGNOR,LDHAFG#(R3),9$	; Skip if ignoring resets
+
+	BIS	#$IGNOR,LDHAFG#(R3)	; Indicate now ignoring resets
+	MOVB	#TIME.R,LDHATR#(R3)	; Start ignore resets timer
+	MOV	#100004,R0		; Inform sup of reset received on line
+	CALL	LKHDWN#			; Take line down
+	CALL	LKHUP#			; Bring line back up (reset line)
+	BIC	#$RESET,LDHAFG#(R3)	; Clear reset flag (link is now up)
+	BR	9$			; Check for new input
+
+;-----
+; Check for new acknowledgement
+;-----
+2$:	TBBN	$L1DWN,LDHST1#(R3),11$	; Skip if line is down
+
+	CMPB	R0,LDHALA#(R3)		; Anything new to ACK?
+	BEQ	3$			; No
+
+	CALL	ACKFRM			; Free ACK'd frames
+
+;-----
+; Check input interrupt ring for new input
+;-----
+3$:	CMP	LDHAKP#(R3),LDHAKT#(R3)	; Anything in interrupt ring?
+	BEQ	10$			; No
+
+	MOV	LDHAKT#(R3),R0		; Get taker pointer
+	MOV	(R0)+,R1		; Get first frame in ring
+
+	CMP	R0,LDHAKE#(R3)		; End of ring?
+	BLO	4$			; No
+	MOV	LDHAKB#(R3),R0		; Yes - reset pointer
+4$:	MOV	R0,LDHAKT#(R3)		; Update taker pointer
+
+	CLR	R0			; Clear residue
+	BISB	(R1),R0			; Get low byte of header
+
+	ASHI	-3,R0			; Right adjust REC number
+
+	TBBE	$L0SAT,LDHST0#(R3),5$	; Skip if normal header
+	ASR	R0			; Right adjust REC 1 more if satellite
+
+5$:	BICB	LDHAMD#(R3),R0		; Isolate REC number
+
+	PUSH	R1			; Save packet pointer
+
+	CLR	R1			; Clear residue
+	BISB	LDHACK#(R3),R1		; Get last ACK number
+
+	CLR	R2			; Clear residue
+	BISB	LDHAMX#(R3),R2		; Get window size
+	ASL	R2			; Get modulus
+
+	CMPB	R0,R1			; Input REC < output ACK?
+	BHI	6$			; No
+	BEQ	7$			; Already ACK'd - discard frame
+	ADD	R2,R0			; Yes - add modulus to REC
+
+6$:	ASR	R2			; Get window size again
+	ADD	R2,R1			; Get top of window
+
+	CMPB	R0,R1			; New REC inside window?
+	BHI	7$			; No
+
+	ASL	R0			; Convert REC to word offset
+	BICB	LDHAMD#(R3),R0		; Isolate sector offset
+	ADD	#LDHASX#,R0		; Add base offset to sector storage
+	ADD	R3,R0			; Point at LDB sector for frame
+
+	TST	(R0)			; Frame already in sector?
+	BEQ	8$			; No
+
+;-----
+; Here to discard frame if outside window or already stored
+;-----
+7$:	INC	LDHERS#(R3)		; Bump sequence error count
+	POP	R1			; Retrieve packet pointer
+	FREPKT				; Discard frame
+	BR	9$			; Finish end of frame processing
+
+;-----
+; Here to store frame pointer in unoccupied input sector
+;-----
+8$:	POP	(R0)			; Remove frame pointer from stack and
+					;   put it into sector storage
+;-----
+; Check for new input frame
+;-----
+9$:	MOV	LDHAST#(R3),R0		; Get input sector taker
+	MOV	(R0),R1			; Get input frame pointer
+	BEQ	10$			; Skip if nothing there yet
+
+	CLR	(R0)+			; Free sector for new frame
+	BIC	#$IGNOR,LDHAFG#(R3)	; Clear ignore resets flag
+	CLRB	LDHATR#(R3)		; Stop ignore resets timer
+	CALL	SNDFRM			; Try to send data frame into node
+
+;-----
+; Here to check for new output frames
+;-----
+10$:	TBBE	$L1BSY,LDHST1#(R3),11$	; Skip line if not busy
+
+	CMPB	LDHAFR#(R3),LDHAMX#(R3)	; Room in output queue?
+	BHIS	11$			; No
+	CALL	LHASTX			; Yes - try to get new output frame
+
+;-----
+; Pick up LDB for next line
+;-----
+11$:	MOV	LDHNXS#(R3),R3		; Get next line on this gateway
+	BNE	1$			; Continue if more lines exist
+
+	RETURN				; All done - return to main loop
+	.PAGE
+	.SBTTL	ACKFRM	- Free acknowledged frames from output queue
+;-----
+; ACKFRM - called to free frames from output queue as acknowledged
+;-----
+ACKFRM:	MOVB	#TIME.D,LDHATD#(R3)	; Restart non-ACK take down timer
+
+	PUSH	R0			; Save new ACK number
+	MOV	LDHAQT#(R3),R0		; Get head of output queue
+	MOVB	LDHALA#(R3),R2		; Get last ACK done
+
+;-----
+; Remove frames from output queue as ACK'd
+;-----
+1$:	CMP	R0,LDHAQP#(R3)		; Trying to free unsent frame?
+	BEQ	ACKERR			; Yes - error
+
+	INC	R2			; No - bump last ACK done
+	BICB	LDHAMD#(R3),R2		; Isolate next ACK to do
+
+	CMPB	R2,@(R0)		; Does next ACK == 1st REC in queue?
+	BNE	ACKERR			; No - error
+
+	MOVB	R2,LDHALA#(R3)		; Yes - update last ACK done
+
+	SETPSW	LDHAPL#(R3)		; Raise to interrupt level
+	DECB	LDHAFR#(R3)		;;Decrease queue frame count
+	MOV	(R0),R1			;;Get frame to acknowledge
+	CLR	(R0)+			;;Clear queue entry
+	CMP	R0,LDHAQE#(R3)		;;End of queue?
+	BLO	3$			;;No
+	MOV	LDHAQB#(R3),R0		;;Yes - reset pointer
+
+3$:	CMP	LDHAQT#(R3),LDHAQN#(R3)	;;Late acknowledgement for sent frame?
+	BNE	4$			;;No
+	MOV	R0,LDHAQN#(R3)		;;Yes - update next-to-send pointer
+4$:	MOV	R0,LDHAQT#(R3)		;;Update queue taker
+	CLRPSW				;;Lower to main program level
+
+;---------------------------------------;
+.IF NE ..BUG				;
+	PUSH	R1			; Save packet pointer
+	MOV	@LHAPKP,R1		; Get first packet pointer in ring
+.ENDC					;
+;---------------------------------------;
+
+	TST	R1			; Non-zero packet pointer?
+	BEQ	10$			; Skip if zero packet pointer
+	FREPKT				; Give up acknowledged frame
+10$:
+
+;---------------------------------------;
+.IF NE ..BUG				;
+	POP	@LHAPKP			; Save newly acknowledged frame
+					;
+	ADD	#2,LHAPKP		; Bump ring putter
+	CMP	LHAPKP,#LHAPKE		; End of ring?
+	BLO	47$			; No
+	MOV	#LHAPKR,LHAPKP		; Yes - reset putter
+47$:					;
+.ENDC					;
+;---------------------------------------;
+
+	CMPB	R2,(SP)			; All new ACK's done?
+	BNE	1$			; No - continue until they are
+
+	POP	R0			; Restore register
+
+	CMP	LDHAQN#(R3),LDHAQP#(R3)	; Any new frames in output queue?
+	BEQ	RTN000			; No - return
+
+	CJMP	LHASTO			; Yes - try to start output if idle
+
+;-----
+; Here on acknowledgement errors (other side ACK'ing unsent frames)
+;-----
+ACKERR:	POP	R0			; Fix up stack pointer
+	INC	LDHAEA#(R3)		; Count ACK error
+	MOV	#100505,R0		; Tell sup about bad records
+	CALL	LKHDWN#			; Take line down
+RTN000:	RETURN				; Return to caller
+	.PAGE
+	.SBTTL	SNDFRM	- Send data frame into node
+;-----
+; SNDFRM - called to send input frame into node
+;
+; Linkage:
+;	R0 - input sector storage taker incremented by 1 word
+;	R1 - pointer to new input frame (from current sector)
+;
+;	CALL	SNDFRM
+;
+; Unpreserved registers:
+;	R0, R1, R2, R4
+;-----
+SNDFRM:	MOV	(R1),R2			; Get frame header
+	ASHI	-3,R2			; Right adjust record number
+	TBBE	$L0SAT,LDHST0#(R3),1$	; Skip if normal header
+	ASR	R2			; Right justify satellite record number
+
+1$:	BICB	LDHAMD#(R3),R2		; Isolate record number
+
+	MOVB	LDHACK#(R3),R4		; Get last record received
+	INC	R4			; Bump receive number
+	BICB	LDHAMD#(R3),R4		; Isolate receive number + 1
+
+	CMPB	R2,R4			; Is this the next expected record?
+	BEQ	2$			; Yes
+	INC	LDHERS#(R3)		; No - bump sequence error count
+	BR	6$			; Discard frame
+;-----
+; Get frame byte count and send frame to packet level
+;-----
+2$:	PUSH	R0			; Save registers
+	PUSH	R1
+	PUSH	R3
+	PUSH	R4
+
+	MOV	R1,R2			; Get pointer for emptying frame
+	MOV	(R2)+,R0		; Get frame header
+
+	TBBN	$L0SAT,LDHST0#(R3),3$	; Skip if satellite header
+	ASHI	2,R0			; Adjust normal header left
+
+3$:	SWAB	R0			; Right justify count field
+	DEC	R0			; Subtract 1 for header word
+	BIC	#^C37,R0		; Isolate word count
+	ASL	R0			; Convert to byte count
+
+	CALL	EMPFRM#			; Let packet level routines empty frame
+	  BR	5$			; Skip acknowledgement if error
+;-----
+; Acknowledge new input frame on normal return from EMPFRM
+;-----
+	POP	R4			; Restore registers
+	POP	R3
+	POP	R1
+	POP	R0
+
+	CMP	R0,LDHASE#(R3)		; End of sector queue?
+	BLO	4$			; No
+	MOV	LDHASB#(R3),R0		; Yes - reset pointer
+4$:	MOV	R0,LDHAST#(R3)		; Update taker
+
+	INCB	LDHAUA#(R3)		; Bump unsent ACK count
+	MOVB	R4,LDHACK#(R3)		; Update ACK number
+	TBBN	$L1BSY,LDHST1#(R3),6$	; Free packet and return if busy
+
+	MOV	#2,R2			; Not busy - get empty frame byte count
+	BR	LHAST1			; Go see if null packet needed for ACK
+
+;-----
+; Here on error return from EMPFRM
+;-----
+5$:	CMP	(SP)+,(SP)+		; Remove 2 words of garbage from stack
+	POP	R1			; Restore packet pointer
+	TST	(SP)+			; Remove 1 word of garbage from stack
+
+;-----
+; Discard packet and return
+;-----
+6$:	FREPKT				; Discard frame
+	RETURN				; Return to caller
+	.PAGE
+	.SBTTL	LHASTX	- Get output frame when room in output queue (not busy)
+;-----
+; LHASTX - subroutine to start output when idle
+;
+; Linkage:
+;	R3 - LDB pointer
+;
+;	CALL	LHASTX
+;
+; Upreserved registers:
+;	R0, R1, R2
+;-----
+LHASTX::MAKPKT	.PLSTP#			; Get a packet for new frame
+	BCC	1$			; Go on if got one
+
+	INCB	LDHZCN#(R3)		; None available - bump buffer zap count
+	CMPB	#10,LDHZCN#(R3)		; Time to zap a buffer?
+	BGT	RTN001			; No - forget it for this time
+
+	CALL	ZAPBUF#			; Yes - do it
+	  RETURN			; If couldn't!
+	BR	LHASTX			; Should have a packet now!
+
+1$:	CLRB	LDHZCN#(R3)		; Clear buffer zap counter
+
+	MOV	R1,R2			; Get frame pointer
+	CLR	(R2)+			; Clear 1st word, point at second
+
+	PUSH	R1			; Got a packet for frame - save it
+	CALL	FILFRM#			; Got a packet for frame - fill it
+	POP	R1			; Restore frame pointer
+
+	TBBE	1,R2,2$			; Skip if even # of bytes
+	CLRB	(R2)+			; Clear last byte if odd # of bytes
+
+2$:	SUB	R1,R2			; Get frame byte count
+	CMP	R2,#2			; Anything in frame?
+	BGT	LHAST2			; Process frame if something in it
+;-----
+; Here with empty frame to see if null frame should be sent for acknowledgement
+;-----
+LHAST1:	TSTB	LDHAFR#(R3)		; Output queue empty?
+	BNE	1$			; No
+	CMPB	LDHAUA#(R3),#2		; 2 unsent ACK's & no frames buffered?
+	BGE	LHAST2			; Yes - send empty frame
+
+;-----
+; Discard empty frame if not needed as ACK
+;-----
+1$:	BIC	#$L1BSY,LDHST1#(R3)	; Indicate not busy now
+	FREPKT				; Discard packet if nothing in it
+	SEC				; Indicate output not started
+	RETURN				; Return to caller
+
+;-----
+; Here with non-empty frame from FILFRM or empty frame for ACK
+;-----
+LHAST2:	ASR	R2			; Convert byte count to word count
+	MOVB	R2,1(R1)		; Store frame word count
+	MOVB	LDHAOR#(R3),(R1)	; Store record number for frame
+	INCB	LDHAOR#(R3)		; Bump record number
+	BICB	LDHAMD#(R3),LDHAOR#(R3)	; Isolate record number
+
+	MOV	LDHAQP#(R3),R0		; Get output queue putter
+	MOV	R1,(R0)+		; Store new frame
+	CMP	R0,LDHAQE#(R3)		; End of queue?
+	BLO	1$			; No
+	MOV	LDHAQB#(R3),R0		; Yes - reset putter
+1$:	MOV	R0,LDHAQP#(R3)		; Update putter
+
+	INCB	LDHAFR#(R3)		; Bump output frame queue count
+	BIS	#$L1BSY,LDHST1#(R3)	; Indicate line busy now
+
+	CALL	LHASTO			; Start output if possible
+
+	TSTB	LDHATD#(R3)		; Non-ACK take down timer running?
+	BNE	2$			; Yes
+	MOVB	#TIME.D,LDHATD#(R3)	; No - start it
+2$:	CLC				; Indicate output started
+RTN001:	RETURN				; Return to caller
+	.PAGE
+	.SBTTL	LHASTO	- Start frame output by faked output done interrupt
+;-----
+; LHASTO - Subroutine to start the output interrupt routines
+;
+; Linkage:
+;	R3 - LDB pointer
+;
+;	CALL	LHASTO
+;
+; Note:
+;	This subroutine MUST be CALL'ed or entered with return address on top
+;	of the stack.
+;-----
+LHASTO:	PUSH	(SP)			; Duplicate return address
+	CLR	2(SP)			; Leave stacked PSW clear
+
+	SETPSW	LDHAPL#(R3)		; Raise to interrupt level
+	TBBN	$OACTV,LDHAFG#(R3),1$	;;Skip if output is active
+;-----
+; Output is inactive - start sending new frame now
+;-----
+	PUSH	R3			;;Save R3 (as interrupt code does)
+	PUSH	R0			;;Save R0 (as interrupt code does)
+	JMP	ONEXTF			;;Return through interrupt service to
+					;;  start sending new frame
+;-----
+; Here if output is active - see if in middle of frame or mark words
+;-----
+1$:	CMP	LDHAOS#(R3),#OS.LOW	;;Sending a frame?
+	BHI	2$			;;Yes - output takes care of new frame
+	BIS	#OS.NXT,LDHAOS#(R3)	;;No - set output state to next frame
+
+2$:	RTI				;;Output service will start output when
+					;;  finished with this frame or word
+	.PAGE
+	.SBTTL	LHASEC	- Once a second routine
+;-----
+; LHASEC - Once a second entry point
+;-----
+	ONCSEC	LHASEC
+
+LHASEC:	MOV	#LHALDB#,R3		; Get base LDB pointer
+
+LHASE1:	TBBN	$L1UNV!$L1DWN,LDHST1#(R3),LHASE2 ; If device not there or line
+					;   down, check next LDB
+;-----
+; Check IRMA timer for lost output interrupt
+;-----
+1$:	TBBE	$IRMA,LDHAFG#(R3),2$	; IRMA bit clear - check lost interrupt
+	BIC	#$IRMA,LDHAFG#(R3)	; IRMA set - clear and wait 1 second
+	BR	3$			; Check timers
+
+2$:	TBBE	$OACTV,LDHAFG#(R3),3$	; Output not active, check timers
+	INC	LDHAEL#(R3)		; Count lost interrupt
+
+	CALL	MSTRST			; Master reset device when it is sick
+
+;-----
+; Here to check non-input timer
+;-----
+3$:	TSTB	LDHATI#(R3)		; Non-input timer running?
+	BEQ	4$			; No
+	DECB	LDHATI#(R3)		; Yes - count down
+	BNE	4$			; Time left - check next timer
+
+	INC	LDHAEI#(R3)		; Count lost input
+	CALL	MSTRST			; Master reset device when it is sick
+
+;-----
+; Here to check ignore reset on input timer
+;-----
+4$:	TSTB	LDHATR#(R3)		; Ignore reset timer running?
+	BEQ	5$			; No
+	DECB	LDHATR#(R3)		; Yes - count down
+	BNE	5$			; Time left - check next timer
+
+	BIC	#$IGNOR,LDHAFG#(R3)	; Timer expired - stop ignoring resets
+
+;-----
+; Here to check non-acknowledgement take down timer
+;-----
+5$:	TSTB	LDHATD#(R3)		; Take down timer running?
+	BEQ	6$			; No
+	DECB	LDHATD#(R3)		; Yes - count down
+	BNE	6$			; Time left - check next timer
+
+	INC	LDHAED#(R3)		; Count line reset
+;	rstop	lh2			; [Timer expired]
+	MOV	#100105,R0		; Tell SUP no input interrupts
+	CALL	LKHDWN#			; Take line down when ACK timer expires
+
+6$:
+;-----
+; Here to get next type H link type A line LDB
+;-----
+LHASE2:	MOV	LDHNXS#(R3),R3		; Get next LDB of same type
+	BNE	LHASE1			; Continue if more lines
+	RETURN				; Return to once-a-second when done
+	.PAGE
+	.SBTTL	MSTRST	- Master reset device when sick
+;-----
+; MSTRST - called to master reset interface when lost input or output activity
+;
+; Linkage:
+;	R3 - LDB pointer
+;
+;	CALL	MSTRST
+;
+;-----
+MSTRST:	PUSH	(SP)			; Push return address
+	CLR	2(SP)			; Set clear PSW
+	PUSH	R3			; Save R3 (as interrupt code would)
+
+	SETPSW	LDHAPL#(R3)		; Raise to interrupt level
+	MOV	#$XMSTR,@LDHAXS#(R3)	;;Master reset device
+
+	CLR	LDHAIS#(R3)		;;Wait for device to stabilize - clear
+					;;  input interrupt state
+	MOV	LDHAIF#(R3),R1		;;Get input frame pointer
+	BEQ	1$			;;Skip if not reading frame now
+	CLR	LDHAIF#(R3)		;;Make sure packet freed only here
+	FREPKT				;;Discard input frame
+
+1$:	MOV	#.PINIT,@LDHAPR#(R3)	;;Initialize device parameter register
+	MOV	#.RINIT,@LDHARS#(R3)	;;Initialize receiver control/status
+	MOV	#.XINIT,@LDHAXS#(R3)	;;Init transmitter control/status reg
+
+.IF NE ..DUP
+;---------------------------------------;;  DUP-11 support code
+	BIS	#$XSMSG,@LDHAXB#(R3)	;;Set start of message bit for DUP-11
+	BIS	#$BYTE1,LDHAFG#(R3)	;;Set search for 1st byte flag
+;---------------------------------------;;
+.ENDC
+
+	CJMP	LHAOSV			;;Return through output service to
+					;;  continue output if possible
+	.PAGE
+	.SBTTL	LHADWX	- Clean up LDB when line goes down
+;-----
+; LHADWX - called to clean up frame level portion of LDB and start resetting
+;
+; Linkage:
+;	R3 - LDB pointer
+;
+;	CALL	LHADWX
+;-----
+LHADWX::CALL	GETPSW#			;Get current interrupt level
+	SETPSW	LDHAPL#(R3)		; Disable interrupts
+	MOV	#$XMSTR,@LDHAXS#(R3)	;;Master reset device
+	SETPSW	R0			;;Re-enable interrupts now that the
+					;   device has been disabled
+	MOV	LDHAQP#(R3),LDHAQN#(R3)	; Close output queue window
+	MOV	LDHAQT#(R3),R0		; Get frame output queue taker
+	MOV	LDHAQP#(R3),LDHAQT#(R3)	; Close output window for retransmit
+
+;-----
+; Discard frames from output queue
+;-----
+1$:	CMP	R0,LDHAQP#(R3)		; Queue empty?
+	BEQ	3$			; Yes - all done
+
+	MOV	(R0),R1			; Get frame
+	BEQ	2$			; Bypass empty frame pointers
+
+	FREPKT				; Free the packet
+2$:	CLR	(R0)+			; Clear frame pointer
+
+	CMP	R0,LDHAQE#(R3)		; End of queue?
+	BLO	1$			; No - free next frame
+	MOV	LDHAQB#(R3),R0		; Yes - reset pointer
+	BR	1$			; Continue while frames still in queue
+
+;-----
+; Discard frames from input interrupt ring
+;-----
+3$:	MOV	LDHAKT#(R3),R0		; Get interrupt ring taker
+	MOV	LDHAKP#(R3),LDHAKT#(R3)	; Close input interrupt ring
+
+4$:	CMP	R0,LDHAKP#(R3)		; Input interrupt ring empty?
+	BEQ	6$			; Yes
+
+	MOV	(R0),R1			; Get next frame in ring
+	BEQ	5$			; Skip empty ring entries
+
+	FREPKT				; Discard frame
+
+5$:	CLR	(R0)+			; Clear frame pointer
+	CMP	R0,LDHAKE#(R3)		; End of ring?
+	BLO	4$			; No - free next frame
+	MOV	LDHAKB#(R3),R0		; Yes - reset pointer
+	BR	4$			; Continue until frames freed
+
+;-----
+; Discard frames from input sector storage
+;-----
+6$:	MOV	LDHASB#(R3),R0		; Get pointer to beginning sector
+
+7$:	MOV	(R0),R1			; Get frame pointer
+	BEQ	8$			; Skip empty sectors
+
+	FREPKT				; Discard frame
+
+8$:	CLR	(R0)+			; Clear sector frame pointer
+	CMP	R0,LDHASE#(R3)		; End of sector storage?
+	BNE	7$			; No - continue until frames freed
+
+	MOV	LDHASB#(R3),LDHAST#(R3)	; Initialize sector storage taker
+
+;-----
+; Initialize line control values
+;-----
+	CLRB	LDHAFR#(R3)		; Init output queue frame count
+	MOVB	LDHAMD#(R3),R0		; Get modulus bit mask
+	COM	R0			; Get modulus - 1
+	MOVB	R0,LDHALA#(R3)		; Init last ACK done
+	MOVB	R0,LDHAIA#(R3)		; Init last ACK received
+	MOVB	R0,LDHACK#(R3)		; Init ACK number to send
+	CLRB	LDHAOR#(R3)		; Init REC number to send
+	BIC	#$L1BSY,LDHST1#(R3)	; Indicate not busy now
+
+;-----
+; Initialize line timers
+;-----
+	CLRB	LDHATD#(R3)		; Clear take-down timer
+	CLRB	LDHATI#(R3)		; Clear idle input timer
+	CLRB	LDHATR#(R3)		; Clear ignore resets timer
+	BIC	#$IGNOR,LDHAFG#(R3)	; Don't ignore resets
+
+;-----
+; Master reset device and initiate sending reset patterns
+;-----
+	PUSH	(SP)			; Push return address
+	CALL	GETPSW#			; Get current PSW
+	MOV	R0,2(SP)		; Save it as the interrupt PSW
+	PUSH	R3			; Save R3 (as interrupt code would)
+	PUSH	R0			; Save R0 (as interrupt code would)
+
+	CLR	LDHAIS#(R3)		;;Wait for device to stabilize - clear
+					;;  input interrupt state
+	MOV	LDHAIF#(R3),R1		;;Get input frame pointer
+	BEQ	9$			;;Skip if not reading frame now
+	CLR	LDHAIF#(R3)		;;Make sure packet freed only here
+	FREPKT				;;Discard input frame
+
+9$:	SETPSW	LDHAPL#(R3)		; Raise to interrupt level
+	MOV	#.PINIT,@LDHAPR#(R3)	;;Initialize device parameter register
+	MOV	#.RINIT,@LDHARS#(R3)	;;Initialize receiver control/status
+	MOV	#.XINIT,@LDHAXS#(R3)	;;Init transmitter control/status reg
+
+.IF EQ ..DUP
+;---------------------------------------;;  DU-11/DUV-11 support code
+	BIS	#$RESET,LDHAFG#(R3)	;;Set reset mode flag
+;---------------------------------------;;
+.IFF
+;---------------------------------------;;  DUP-11 support code
+	MOV	#<$XSMSG!377>,@LDHAXB#(R3) ;;Start sending marks as idle
+	BIS	#<$RESET!$BYTE1>,LDHAFG#(R3) ;;Set flags: reset mode, find 1st
+					;; byte
+;---------------------------------------;;
+.ENDC
+
+	CJMP	ORESET			;;Return through output service to
+					;;  start sending reset pattern
+
+	.END
+-
+   HlAhw
