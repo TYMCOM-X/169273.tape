@@ -1,0 +1,719 @@
+	.TITLE	LKHTPC - Terminal protocol conversion routines for LINK H
+	.SBTTL	LKHTPC - Nexilis/JRG
+
+	XLPAR			;Don't list general parameter file
+.HLIST=!1			;Don't list LINK H parameter file
+	CODE
+
+	.SBTTL	LKHTPC - LHOTPC - Do data output with protocol conversion
+
+;Subroutine for data output for socket which requires protocol conversion
+;	R2 -	Pointer to current byte in T201 packet
+;	R4 - 	Pointer to data in packet to be sent
+;	CAUTION!!  Destroys R3 
+;	CALL	LHOTPC
+;	  return if stopped by end of frame
+;	  return if stopped by send-ahead count
+;	return if stopped by end of packet
+
+LHOTPC::DEC	SDACNT#(SD)		;Reduce the send-ahead count
+	BGE	2$			;Go on if output still OK
+	ADD	#2,(SP)			;Stop for now-give skip 2 return
+	RETURN
+
+2$:	MOVB	(R4)+,R0		;Get character
+	MOV	R0,R3			;Copy character
+	BIC	#^C177,R3		;Just 7 bits
+	MOVB	CHRINX#(R3),R3		;Get dispatch index for character
+	CALL	@LHODSP(R3)		;Dispatch on the character index
+	  RETURN			;If can't store the character
+	INCB	PKPNT(R1)		;OK-bump pointer
+	DECB	PKCNT(R1)		;Any more there?
+	BGT	LHOTPC			;Yes-continue
+	ADD	#4,(SP)			;No-give skip 4 return
+	RETURN
+
+;Dispatch table for character output
+
+	PURE
+
+LHODSP:	.WORD	LHOCNT		;.CXNUL =  0 - Null
+	.WORD	LHOCNT		;.CXCNT =  2 - Control character
+	.WORD	LHOBSP		;.CXBSP =  4 - Back space
+	.WORD	LHOHTB		;.CXHTB =  6 - Horizontal tab
+	.WORD	LHOLFD		;.CXLFD = 10 - Line feed
+	.WORD	LHOVTB		;.CXVTB = 12 - Vertical tab
+	.WORD	LHOFFD		;.CXFFD = 14 - Form feed
+	.WORD	LHOCRN		;.CXCRN = 16 - Carriage return
+	.WORD	LHOCNT		;.CXDLE = 20 - DLE
+	.WORD	LHOCNT		;.CXXON = 22 - X-ON
+	.WORD	LHOCNT		;.CXDC2 = 24 - DC2
+	.WORD	LHOCNT		;.CXXOF = 26 - X-OFF
+	.WORD	LHOCNT		;.CXCAN = 30 - CAN
+	.WORD	LHOESC		;.CXESC = 32 - ESC
+	.WORD	LHOUCA		;.CXUCA = 34 - Upper case character
+	.WORD	LHOUCA		;.CXSMI = 36 - Semi-colon
+	.WORD	LHOLCA		;.CXLCA = 40 - Lower case character
+	.WORD	LHOUCA		;.CXHSP = 42 - High special character
+	.WORD	LHOCNT		;.CXRUB = 44 - Rub-out (DEL)
+
+	CODE
+	.PAGE
+;Here to output lower case printing character
+
+LHOLCA:	TBBN	$T5LCO,SDLHT5#(SD),LHOUCA;Should we change this to upper case?
+	BIC	#40,R0			;Yes-do so
+
+;Here to output upper case printing character
+
+LHOUCA:	TST	LKHLFT#			;Can we output this character now?
+	BEQ	RTN002			;No-forget it for a while!
+	INCB	SDLHHP#(SD)		;Yes-bump the horizontal position
+	CMPB	SDLHLW#(SD),SDLHHP#(SD)	;At end of line now?
+	BHIS	LHOCNT			;No-just output the character
+	TBBN	$T4NFC,SDLHT4#(SD),LHOCNT;Yes-do we want a free CR-LF?
+	TSTB	SDLHLW#(SD)		;Yes-was a line width specified?
+	BEQ	LHOCNT			;No-forget it!
+	CMP	#2,LKHLFT#		;Room for 2 more bytes?
+	BGT	RTN002			;No-forget it for now
+	PUSH	R0			;Yes-save current character
+	MOV	#CR,R0			;Insert a CR
+	CALL	LKHBYO#
+	  NOP
+	CLRB	SDLHHP#(SD)
+	MOV	#LF,R0			;And a LF
+	CALL	LKHBYO#
+	  NOP
+	POP	R0			;Restore character
+	BR	LHOUCA			;Go try again
+
+;Here to output backspace character
+
+LHOBSP:	TSTB	SDLHHP#(SD)		;Already at left margin?
+	BEQ	LHOCNT			;Yes
+	DECB	SDLHHP#(SD)		;No-reduce horizontal position
+	BR	LHOCNT			;Go output the backspace character
+
+;Here to output horizontal tab character
+
+LHOHTB:	TBBN	$T4HTS,SDLHT4#(SD),10$	;Are we simulating horizontal tabs?
+	BISB	#7,SDLHHP#(SD)		;No-advance horizontal position
+	INCB	SDLHHP#(SD)
+	BR	LHOCNT			;And go output the tab
+
+;Here if simulating horizontal tabs
+
+10$:	MOVB	SDLHHP#(SD),R0		;Get horizontal position
+	BIC	#^C7,R0			;Calculate number of spaces needed
+	SUB	#10,R0
+	NEG	R0
+	CMP	R0,LKHLFT#		;Do we have room for this many?
+	BGT	RTN002			;No-forget it for now
+	PUSH	R0			;Yes-save count on the stack
+	BISB	#7,SDLHHP#(SD)		;Update position
+	INCB	SDLHHP#(SD)
+	MOV	#SPA,R0			;Get character to output
+LHOHT2:	CALL	LKHBYO#			;Output the character
+	  NOP
+	DEC	(SP)			;More to output?
+	BGT	LHOHT2			;Yes-continue
+	TST	(SP)+			;No-fix up the stack
+	ADD	#2,(SP)			;Give good (skip) return
+RTN002:	RETURN
+
+;Here to output vertical tab character
+
+LHOVTB:	TBBE	$T4VTS,SDLHT4#(SD),LHOCNT;Go output it if not simulating
+	PUSH	#4			;Simulate with 4 LF's
+	BR	LHOFF2
+
+;Here to output form feed character
+
+LHOFFD:	TBBE	$T4FFS,SDLHT4#(SD),LHOCNT;Go output it if not simulating
+	PUSH	#10			;Simulate with 10 LF's
+LHOFF2:	MOV	#LF,R0
+	CMP	(SP),LKHLFT#		;Room for this many output characters?
+	BLE	LHOHT2			;Yes-go on
+	TST	(SP)+			;No-fix up the stack
+	RETURN				;And return
+
+;Here to output ESC character
+
+LHOESC:	CLRB	SDLHHP#(SD)		;Clear horizontal position
+	TBBE	$T5ESQ,SDLHT5#(SD),LHOCNT;If not processing ESC sequences
+	BIS	#$T2IMX,SDLHT2#(SD)	;Output next character as image character
+	BR	LHOCNT			;Output the ESC
+
+;Here to output line feed character
+
+LHOLFD:	TBBE	$T4ALF,SDLHT4#(SD),LHOCNT;Auto-line feed terminal?
+	TBBE	$T2CRO,SDLHT2#(SD),LHOCNT;Yes-was last character a CR?
+	RETURN				;Yes-ignore this LF
+
+;Here to output carriage return character
+
+LHOCRN:	BIS	#$T2CRO,SDLHT2#(SD)	;Indicate this is a CR
+	CLRB	SDLHHP#(SD)		;Clear position on line
+	CJMP	LKHBYO#			;And go output the CR
+
+;Here to output non-printing character which does not affect horizontal
+;  position
+
+LHOCNT:	TBBE	$T2CRO,SDLHT2#(SD),6$	;Was last character output a CR?
+	TBBE	$T2XLC,SDLHT2#(SD),4$	;Want extra LF?
+	PUSH	R0			;Yes-save character
+	BIC	#^C177,R0		;Reduce to 7 bits
+	CMP	#LF,R0			;Is this a LF?
+	BEQ	2$			;Yes-nothing special
+	CMP	#ESC,R0			;Or an ESC?
+	BEQ	2$			;Yes
+	MOV	#LF,R0			;No-insert an extra LF
+	CALL	LKHBYO#
+	  BR	10$			;If can't store it now
+2$:	POP	R0			;Restore character
+4$:	BIC	#$T2CRO,SDLHT2#(SD)	;Indicate CR was not last
+6$:	CJMP	LKHBYO#			;And go output the character
+
+;Here if could not output character now
+
+10$:	POP	R0			;Fix up the stack
+	RETURN				;And return
+	.PAGE
+	.SBTTL	LKHTPC - LHITPC - Do data input with protocol conversion
+
+;Subroutine to process input character for socket which requires protocol
+;  conversion
+;	C(R0) = Input character
+;	CALL	LHITPC
+
+LHITPC::
+	MOVB	SDLHIT#(SD),SDLHT6#(SD)	;RESTART IDLE TIMER ON A NEW INPUT CHAR
+	MOV	R0,R1			;Copy character
+	BIC	#^C177,R1		;Just 7 bits
+	TBBN	$T1IMI,SDLHT1#(SD),INPTO4;If in image input mode
+;-----
+; Bypass the checking for character delete and line delete character if 
+;  line editing (X.3 parameter 15.) is disabled.   06/11/82 IW
+	TBBE	$T5EDT,SDLHT5#(SD),5$
+;-----
+	CMPB	SDLHDL#(SD),R1		;Is this the delete character?
+;	BEQ	LHIDEL			;Yes
+	BNE	2$			;Changed to these three lines
+	JMP	LHIDEL			; because it's too far for a BR inst.
+2$: 					;
+	CMPB	SDLHLX#(SD),R1		;Is this the line delete character?
+	BEQ	LHILND			;Yes
+5$:
+	MOVB	SDLHES#(SD),R2		;Get ESC processing state
+	ADD	R2,PC			;Dispatch on the state
+	BR	INPTO4		;.ESNRM = 0 - Normal
+	BR	INPES0		;.ESSTR = 2 - Start of ESC sequence
+	BR	INPTR1		;.ESTR1 = 4 - First trailing character
+;	BR	INPTRL		;.ESTRL = 6 - Last trailing character
+
+;Here for last trailing character
+
+INPTRL:	CMP	#40,R1			;Is it a control character?
+	BGT	INPTO4			;Yes-just process it!
+INPTR0:	CLRB	SDLHES#(SD)		;No-reset state to normal
+	BR	INPEST			;Go store character
+
+;Here for first trailing character
+
+INPTR1:	CMP	#40,R1			;Is it a control character?
+	BGT	INPTO4			;Yes-just process it
+INPTR2:	MOVB	#.ESTRL,SDLHES#(SD)	;No-update state
+	BR	INPEST			;Continue
+
+;Here for start of ESC sequence
+
+INPES0:	CMP	#40,R1			;Is it a control character
+	BGT	INPTO4			;Yes-almost normal
+	CMP	#60,R1			;No-is it a noise character?
+	BGT	INPEST			;Yes-just store it
+	CMP	#'O,R1			;Does it require one trailing chr?
+	BEQ	INPTR2			;Yes
+	CMP	#'P,R1
+	BEQ	INPTR2
+	CMP	#'?,R1
+	BEQ	INPTR2
+	CMP	#'Y,R1			;Does it require two?
+	BNE	INPTR0			;No-thats the last one!
+	MOVB	#.ESTR1,SDLHES#(SD)	;Yes-update state
+INPEST:	CALL	PUTCHR#			;Store the character
+	  NOP
+	TSTB	SDLHES#(SD)		;End of ESC sequence?
+	BNE	RTN004			;No-go on
+	CJMP	SNDTRP#			;Yes-send the packet and return
+
+;Here for normal input (no ESC sequence in progress)
+
+INPTO4:	MOVB	CHRINX#(R1),R2		;Get index for character
+	JMP	@LHIDSP(R2)		;Dispatch on the character index
+
+;Dispatch table for input characters
+
+	PURE
+
+LHIDSP:	.WORD	LHIUCA		;.CXNUL =  0 - Null
+	.WORD	LHICNT		;.CXCNT =  2 - Control character
+	.WORD	LHIBSP		;.CXBSP =  4 - Back space
+	.WORD	LHIUCA		;.CXHTB =  6 - Horizontal tab
+	.WORD	LHILFD		;.CXLFD = 10 - Line feed
+	.WORD	LHIUCA		;.CXVTB = 12 - Vertical tab
+	.WORD	LHIUCA		;.CXFFD = 14 - Form feed
+	.WORD	LHICRN		;.CXCRN = 16 - Carriage return
+	.WORD	LHICNT		;.CXDLE = 20 - DLE
+	.WORD	LHICNT		;.CXXON = 22 - X-ON
+	.WORD	LHICNT		;.CXDC2 = 24 - DC2
+	.WORD	LHICNT		;.CXXOF = 26 - X-OFF
+	.WORD	LHICNT		;.CXCAN = 30 - CAN
+	.WORD	LHIESC		;.CXESC = 32 - ESC
+	.WORD	LHIUCA		;.CXUCA = 34 - Upper case character
+	.WORD	LHIUCA		;.CXSMI = 36 - Semi-colon
+	.WORD	LHILCA		;.CXLCA = 40 - Lower case character
+	.WORD	LHIHSP		;.CXHSP = 42 - High special character
+	.WORD	LHICNT		;.CXRUB = 44 - Rub-out (DEL)
+
+	CODE
+	.PAGE
+;Here for the line delete character
+
+LHILND:	TSTB	SDLHES#(SD)		;Processing input ESC sequence?
+	BNE	RTN004			;Yes-junk this!
+	BITB	#210,SDLHBS#(SD)	;No-break-on-all chrs or Teco mode?
+	BNE	INPTO4			;Yes-just normal character
+	BIC	#$T2ICH,SDLHT2#(SD)	;Indicate not hard interrupt chr
+	CALL	DELSRC#			;Delete current input line
+	  RETURN			;If line was empty
+	CJMP	ECHOIT			;Otherwise echo it and return
+
+;Here for backspace
+
+LHIBSP:	BITB	#210,SDLHBS#(SD)	;Break-on-all chrs or Teco mode?
+	BNE	LHIBS5			;Yes-just normal character
+	TBBE	$T5EDT,SDLHT5#(SD),LHIBS5 ; ALSO NORMAL IF LINE EDITING DISABLED
+	TBBE	$T5BDE,SDLHT5#(SD),LHIBS5;Also normal if backspace
+						; delete not set 
+LHIBS2:	BIC	#$T2ICH,SDLHT2#(SD)	;Not hard interrupt character
+	CALL	DELCHR#			;Delete a character
+	  RETURN			;Finished if nothing to delete
+LHIBS3:	TBBE	$T4XBE,SDLHT4#(SD),4$	;Go on if just want single backspace
+	CALL	4$			;Echo first backspace
+	MOV	#SPA,R0			;Followed by a space
+	CALL	ECHOIT
+4$:	MOV	#BS,R0			;Get backspace character
+	JMP	ECHOIT			;And go send it to him
+
+;Here if want extended echo (BS-SPA-BS)
+
+LHIBS4:	MOV	#BS,R0			;Send him the string
+	CALL	ECHSLF#
+	MOV	#SPA,R0
+	CALL	ECHSLF#
+	MOV	#BS,R0
+	CJMP	ECHSLF#			;And return
+
+;Here to process backspace as input character
+
+LHIBS5:	TBBN	$T4LCP!$T4LEM,SDLHT4#(SD),2$;Go on if we are not echoing
+	JMP	LHIUCA			;If we are echoing now
+
+2$:	TSTB	SDLHHP#(SD)		;We are not echoing-at start of line?
+	BEQ	4$			;Yes-don't mess p the count!
+	DECB	SDLHHP#(SD)		;No-decrement horizontal position
+4$:	CALL	PUTCHR#			;Store the character
+	  NOP
+RTN004:	RETURN				;And return
+
+;Here for the delete character
+
+LHIDEL:	TSTB	SDLHES#(SD)		;Processing input ESC sequence?
+	BNE	RTN004			;Yes-junk this!
+	BITB	#210,SDLHBS#(SD)	;No-break-on-all chrs or Teco mode?
+	BNE	INPTO4			;Yes-just normal character
+	BIC	#$T2ICH,SDLHT2$(SD)	;Not hard interrupt character
+	TBBN	$T4EDB,SDLHT4#(SD),20$	;If should echo like backspace
+	CALL	DELCHR#			;Delete a character
+	  BR	14$			;If nothing to delete
+	TBBN	$T4LCP!$T4LEM,SDLHT4#(SD),RTN004;If not echoing now
+	CMPB	#SPA,SDLHDL#(SD)	;Is the delete character non-printing?
+	BGT	4$			;Yes-echo even if local copy
+	CMPB	#DEL,SDLHDL#(SD)
+	BNE	RTN004			;No-forget it
+4$:	TBBE	$T1ECH,SDLHT1#(SD),RTN004;Finished if no echo wanted
+	TBBN	$T1DEA,SDLHT1#(SD),16$	;Is delete echo active now?
+	BIS	#$T1DEA,SDLHT1#(SD)	;No-but it is now!
+	PUSH	R0			;Save character
+	MOV	#'\,R0			;Echo backslash
+	CALL	ECHSLF#
+	POP	R0			;Restore character
+	BR	16$			;And go echo it
+
+;Here if nothing to delete now
+
+14$:	TBBE	$T1DEA,SDLHT1#(SD),RTN004;Finished if delete echo not active
+	BIC	#$T1DEA,SDLHT1#(SD)	;Not active any longer
+	MOV	#'\,R0			;Echo a backslash
+16$:	JMP	ECHOI2
+
+;Here to echo delete character like backspace
+
+20$:	TBBE	$T4LCP,SDLHT4#(SD),LHIBS2;Just like backspace if not local copy
+	CALL	DELCHR#			;Local copy-delete character
+	  RETURN			;If nothing to delete
+	CMPB	#SPA,SDLHDL#(SD)	;Is delete character printing?
+	BGT	RTN004			;No-forget it!
+	CMPB	#DEL,SDLHDL#(SD)
+	BEQ	LHIBS3			;Yes-go echo backspace
+	RETURN				;No-finished
+	.PAGE
+;Here for input of ESC character
+
+LHIESC:	TBBE	$T5ESQ,SDLHT5#(SD),LHICNT;Should we handle ESC sequences?
+	MOVB	#.ESSTR,SDLHES#(SD)	;Yes-set input state
+	JMP	INPEST			;And go store the ESC character
+
+;Here for input of control character
+
+LHICNT:	CMPB	SDLHHI#(SD),R1		;Is this the hard interrupt character?
+	BEQ	INPINH			;Yes-go handle it
+	BIC	#$T2ICH,SDLHT2#(SD)	;No-remember that
+	CMPB	SDLHSI#(SD),R1		;Is this the soft interrupt character?
+	BEQ	INPINS			;Yes
+;-----
+; Bypass checking for line retype char if line editing is disabled  06/11/82
+	TBBE	$T5EDT,SDLHT5#(SD),5$
+;-----
+	CMPB	SDLHRE#(SD),R1		;Is this the "retype line" character?
+	BEQ	LHIREC			;Yes
+5$:
+	CMPB	SDLHSO#(SD),R1		;Is it the output suppress character?
+	BEQ	LHISOP			;Yes
+;
+;** Add a check for 'status request' character 
+;	GMT - 10/30/81
+;
+	CMPB	SDLHSR#(SD),R1		;Is it the "status request" character?
+	BEQ	LHISTA			;Yes
+	JMP	LHIUCA			;No, go store the character
+	.PAGE
+;Here for the hard interrupt character
+
+INPINH:	CMPB	SDLHSI#(SD),R1		;Is the soft interrupt chr the same?
+	BNE	INPIN6			;No
+	TBBN	$T2ICH,SDLHT2#(SD),INPIN6;Yes-is the 2nd in a row?
+	BIS	#$T2ICH,SDLHT2#(SD)	;No-indicate we have one
+					;And fall into soft interrupt routine
+
+;Here for the soft interrupt character
+
+INPINS:	PUSH	R0			;Save character
+	CALL	DELSRC#			;Delete current line
+	  NOP
+	MAKPKT	.PLSTP#			;Get a packet
+	BCS	4$			;We tried!
+	MOV	#.PTFUN*400+2,PKCNT(R1)	;It is a 2 byte Function packet
+	MOVB	#.FNSIN,PKDATA(R1)	;Function = soft interrupt
+	MOVB	(SP),PKDATA+1(R1)	;Data = character typed
+	INCB	SDPCNT#(SD)
+	CALL	SNDPKT#			;Send the packet
+4$:	POP	R0			;Restore character
+	BR	ECHOIT			;And go echo it
+
+;Here to really do hard interrupt
+
+INPIN6:	PUSH	R0			;Save character
+	CALL	DELSRC#			;Delete all input
+	  NOP
+	POP	R0
+	MOV	#1,R2			;Indicate hard interrupt
+	BR	LHISO2			;Continue
+
+;Here for the output suppress character
+
+LHISOP:	CLR	R2			;Indicate output suppress
+LHISO2:	MAKPKT	.PLSTP#			;Get a packet
+	BCS	RTN05A			;We tried!
+	BIS	#$S1JNK,SDSTS1#(SD)	;Always set the bit here!
+	MOV	#.PTEAT*400+3,PKCNT(R1)	;This is a 3 byte EAT packet
+	MOVB	#.FNXGB,PKDATA(R1)	;Store 1st byte
+	MOVB	R0,PKDATA+1(R1)		;Store 2rd byte
+	MOVB	R2,PKDATA+2(R1)		;Store 3rd byte
+	CJMP	PKTSLF#			;Send it back to us and return
+	.PAGE
+;Here for the "retype line" character
+
+LHIREC:	CALL	LHECN4			;Echo the character first
+LHIRE2::MOV	SDPKSP#(SD),R2		;Get last input packet
+	BEQ	RTN05A			;If no input packets
+	PUSH	R2			;Save address of last packet
+4$:	MOV	(R2),R2			;Get next packet
+	MAKPKT	.PLSTP#			;Get another packet
+	BCS	12$			;If none available now!
+	MOVB	PKCNT(R2),R0		;Calculate number of words to copy
+	ADD	#7,R0
+	ASR	R0
+	PUSH	R2			;Save address of packet
+	PUSH	R1			;  09/21/82 ***
+10$:	MOV	(R2)+,(R1)+		;Copy the packet
+	SOB	R0,10$
+	POP	R1			;  09/21/82 ***
+	CALL	PKTSLF#			;Send it to ourself
+	POP	R2			;Restore address of packet
+12$:	CMP	R2,(SP)			;Was this the last packet?
+	BNE	4$			;No-continue
+	TST	(SP)+			;Yes-fix up the stack
+RTN05A:	RETURN				;And return
+	.PAGE
+;Here for input of carriage return
+
+LHICRN:	CALL	PUTCHR#			;Store the character
+	  RETURN
+	TBBE	$T2SLC,SDLHT2#(SD),ECHOIT;Should we add a line feed?
+	PUSH	R0			;Yes-save this character
+	MOV	#LF,R0			;Get a line feed character
+	BR	LHILF2			;Continue
+
+;Here for input of line feed
+
+LHILFD:	CALL	PUTCHR#			;Store the character
+	  RETURN
+	TBBE	$T2SCL,SDLHT2#(SD),ECHOIT;Should we add a carriage return?
+	PUSH	R0			;Yes-save this character
+	MOV	#CR,R0			;Get a carriage return character
+LHILF2:	CALL	PUTCHR#			;Store second character
+	  NOP
+	POP	R0			;Restore first character
+	BR	ECHOIT			;And go echo it
+	.PAGE
+;Here for input of status request character
+;Added 10/30/81
+LHISTA:	MAKPKT	.PLSTP#			;Get a packet
+	BCS 	RTN005	
+	MOV	#.PTINT*400+1,PKCNT(R1)	;1 byte function packet
+	MOVB	#.FNSRQ,PKDATA(R1)	;function = status request
+	INCB	SDPCNT#(SD)
+	CALL	SNDPKT#			;send this packet
+	RETURN
+	.PAGE
+;Here for input of "high special" characters
+
+LHIHSP:	TBBE	$T4HSP,SDLHT4#(SD),LHIUCA;Should these codes be special?
+	MOV	#ESC,R0			;Yes-change to ESC
+	JMP	LHIESC			;And go process it
+
+;Here for input of lower case character
+
+LHILCA:	TBBN	$T5LCI,SDLHT5#(SD),LHIUCA;Go on if don't want to translate
+	BIC	#40,R0			;Change to upper case
+	CALL	PUTCHR#			;Store the character
+	  RETURN			;If error
+	BIS	#40,R0			;Change back to lower case!
+	BR	ECHOIT			;And go echo it
+
+;Here for input of upper case character
+
+LHIUCA:	CALL	PUTCHR#			;Store the character
+	  RETURN			;If error
+ECHOIT:	TBBE	$T1ECH,SDLHT1#(SD),RTN005;Finished now if not echoing
+	TBBE	$T1DEA,SDLHT1#(SD),ECHOI2;Is a delete echo active now?
+	BIC	#$T1DEA,SDLHT1#(SD)	;Yes-but now now
+	PUSH	R0			;Save current character
+	MOV	#'\,R0			;Echo a backslash first
+	CALL	ECHSLF#
+	POP	R0
+ECHOI2:	MOV	R0,R1			;Get 7 bits
+	BIC	#^C177,R1
+	MOVB	CHRINX#(R1),R2		;Get dispatch index
+	JMP	@LHEDSP(R2)		;Dispatch on the character
+
+;Dispatch table for echo characters
+
+	PURE
+
+LHEDSP:	.WORD	LHEUCA		;.CXNUL =  0 - Null
+	.WORD	LHECNT		;.CXCNT =  2 - Control character
+	.WORD	LHEBSP		;.CXBSP =  4 - Back space
+	.WORD	LHEHTB		;.CXHTB =  6 - Horizontal tab
+	.WORD	LHELFD		;.CXLFD = 10 - Line feed
+	.WORD	LHEVTB		;.CXVTB = 12 - Vertical tab
+	.WORD	LHEFFD		;.CXFFD = 14 - Form feed
+	.WORD	LHECRN		;.CXCRN = 16 - Carriage return
+	.WORD	LHECNT		;.CXDLE = 20 - DLE
+	.WORD	LHECNT		;.CXXON = 22 - X-ON
+	.WORD	LHECNT		;.CXDC2 = 24 - DC2
+	.WORD	LHECNT		;.CXXOF = 26 - X-OFF
+	.WORD	LHECNT		;.CXCAN = 30 - CAN
+	.WORD	LHEESC		;.CXESC = 32 - ESC
+	.WORD	LHEUCA		;.CXUCA = 34 - Upper case character
+	.WORD	LHEUCA		;.CXSMI = 36 - Semi-colon
+	.WORD	LHEUCA		;.CXLCA = 40 - Lower case character
+	.WORD	LHEUCA		;.CXHSP = 42 - High special character
+	.WORD	LHEUCA		;.CXRUB = 44 - Rub-out (DEL)
+
+	CODE
+	.PAGE
+;Here to echo normal printing character
+
+LHEUCA:	TBBE	$T4LCP!$T4LEM,SDLHT4#(SD),LHISLF;Are we echoing now?
+	INCB	SDLHHP#(SD)		;No-bump the horizontal position
+RTN005:	RETURN				;Thats all
+
+;Here to echo ESC
+
+LHEESC:	TBBE	$T5EED,SDLHT5#(SD),LHISLF;Should we echo ESC as "$"?
+	MOV	#'$,R0			;Yes-dt
+	BR	LHEUCA
+
+;Here to echo control character
+
+LHECNT:	TBBN	$T5SCE,SDLHT5#(SD),RTN006;Finished if not echoing control
+					 ;  characters
+	TBBN	$T4LEM,SDLHT4#(SD),RTN006;Or finished if not echoing at all
+	BITB	#010,SDLHBS#(SD)	;Doing Teco mode input?
+	BEQ	10$			;No-go on
+	CMPB	SDLHHI#(SD),R1		;Yes-only hard interrupt chr is
+					;  special for echoing
+	BEQ	LHECN4			;Echo hard interrupt char with CR-LF
+	BR	13$			;All others get ^ without CR-LF
+
+;Here if not Teco sub-mode
+
+10$:	MOV	#SDTRSL#,R2		;Make pointer to list of special
+	ADD	SD,R2			;  Characters in the SDB
+	MOV	#SDTRSN#,R3		;Get number of special characters
+12$:	CMPB	(R2)+,R1		;See if this is a special character
+	BEQ	LHECN4			;Yes-always echo with uparrow
+	SOB	R3,12$
+13$:	TBBE	$T5ECC,SDLHT5#(SD),LHISLF;Not special-want up-arrow anyway?
+LHECN2:	PUSH	R0			;Save character
+;
+;Before echoing control character, check if delete echo active (GT-10/26/81)
+;
+	TBBE	$T1DEA,SDLHT1#(SD),LHECN3;Is delete echo active?
+	BIC	#$T1DEA,SDLHT1#(SD)	;Yes - for the last time
+	MOV	#'\,R0			;Echo a backslash
+	CALL	ECHSLF#
+;
+LHECN3:	MOV	#'^,R0			;Get up-arrow
+	CALL	ECHSLF#			;Echo it
+	POP	R0			;Recover character
+	BIS	#100,R0			;Make it printing
+	BR	LHISLF			;Echo it and return
+
+;Here to echo control character preceeded with up-arrow and followed by
+;  CR-LF
+
+LHECN4:	CALL	LHECN2			;Echo preceeded with up-arrow
+	MOV	#CR,R0			;And followed with CR-LF
+	CALL	ECHSLF#
+	MOV	#LF,R0
+LHISLF:	CJMP	ECHSLF#			;Echo the character and return
+	.PAGE
+;Here to echo backspace character
+
+LHEBSP:	TSTB	SDLHHP#(SD)		;At left of line now?
+	BEQ	RTN006			;Yes-don't the backspace
+	TBBE	$T4LCP!$T4LEM,SDLHT4#(SD),LHISLF;If we are echoing now
+	DECB	SDLHHP#(SD)		;Adjust horizontal position
+RTN006:	RETURN				;Thats all
+
+;Here to echo horizontal tab
+
+LHEHTB:	TBBE	$T4LCP!$T4LEM,SDLHT4#(SD),LHISLC;If we are echoing now
+	TBBE	$T4LCP,SDLHT4#(SD),RTN006;Forget it if not local copy
+	TBBN	$T4HTS,SDLHT4#(SD),LHISLF;Echo anyway if simulated
+	BISB	#7,SDLHHP#(SD)		;Not simulated-fix up the horizontal
+	INCB	SDLHHP#(SD)		;  position
+	RETURN				;Finished
+
+;Here to echo vertical tab
+
+LHEVTB:	TBBE	$T4LCP!$T4LEM,SDLHT4#(SD),LHISLC;If we are echoing now
+	TBBE	$T4LCP,SDLHT4#(SD),RTN006;Forget it if not local copy
+	TBBN	$T4VTS,SDLHT4#(SD),LHISLF;If not simulated
+	RETURN
+
+;Here to echo form feed
+
+LHEFFD:	TBBE	$T4LCP!$T4LEM,SDLHT4#(SD),LHISLC;If we are echoing now
+	TBBE	$T4LCP,SDLHT4#(SD),RTN006;Forget it if not local copy
+	TBBN	$T4FFS,SDLHT4#(SD),LHISLF;If not simulated
+	RETURN
+
+;Here to echo line feed
+
+LHELFD:	TBBN	$T4LEM,SDLHT4#(SD),RTN006;If we are not echoing now
+	TBBN	$T4LCP,SDLHT4#(SD),4$	;Go on if local copy terminal
+	TBBN	$T5SCE,SDLHT5#(SD),RTN006;Forget it if not echoing control char
+	CALL	ECHSLF#			;Echo the character
+4$:	TBBE	$T2ECL,SDLHT2#(SD),RTN006;Should we add a carriage return?
+	MOV	#CR,R0			;Yes-do that
+	BR	LHISLF			;  and return
+
+;Here to echo carriage return
+
+LHECRN:	TBBN	$T4LEM,SDLHT4#(SD),6$	;If we are not echoing now
+	TBBE	$T4LCP,SDLHT4#(SD),2$	;Go on if not local copy terminal
+	CLRB	SDLHHP#(SD)		;Local copy-clear position
+	BR	4$			;Continue
+
+2$:	TBBN	$T5SCE,SDLHT5#(SD),RTN006;forget it if not echoing control char
+	CALL	ECHSLF#			;Echo the character
+4$:	TBBE	$T2ELC,SDLHT2#(SD),RTN006;Should we add a line feed?
+	MOV	#LF,R0			;Yes-do that
+	BR	LHISLF			;  and return
+
+;Here if we should not echo the carriage return for some reason
+
+6$:	CLRB	SDLHHP#(SD)		;Not echoing-reset horizontal position
+	RETURN				;Thats all
+
+;Here to echo control character if we should
+
+LHISLC:	TBBE	$T5SCE,SDLHT5#(SD),LHISLF;Should we echo control characters?
+	RETURN				;No
+
+	.PAGE
+	.SBTTL	LKHTPC - LKHITD - Ten times a second routine
+;-----
+; This subroutine is called 10 times a second to scan the idle timer.
+; When the idle timer expires, the data buffered at a SDB will be forwarded.
+;-----
+LKHITD:
+	MOV	#LKHDDB#,R4	;GET 1ST LINK H DDB
+1$:
+	MOV	DDSX#(R4),R2	;GET ADDRESS OF SDB POINTER TABLE
+	MOV	DDSOC#(R4),R1	;GET NUMBER OF SOCKETS
+5$:
+	MOV	(R2)+,SD	;GET THE SDB ADDRESS
+	TST	SDPKSP#(SD)	;ANY DATA BUFFERED HERE?
+	BEQ	50$		;NO, TRY NEXT SDB
+	TBBN	$T5EDT,SDLHT5#(SD),50$ ;NO TIME-OUT IF LINE-EDITING IS ENABLED
+	
+	PUSH	R1		;LINE-EDITING IS DISABLED, CHECK IDLE TIMER
+	CLR	R1
+	BISB	SDLHT6#(SD),R1	;GET CURRENT IDLE TIMER COUNT
+	DEC	R1		;EXPIRED?
+	BEQ	35$		;YES, BRANCH
+	DEC	R1		;NO, TRY AGAIN (EVERY COUNT = 1/20 A SECOND)
+	BEQ	35$		;EXPIRED. GO FORWARD DATA.
+	MOVB	R1,SDLHT6#(SD)	;SAVE UPDATED IDLE TIMER COUNT
+	BR	40$		;
+35$:
+	PUSH	R2
+	PUSH	R4
+	CALL	SNDTRP#		;FORWARD DATA
+	POP	R4
+	POP	R2
+40$:
+	POP	R1
+50$:
+	SOB	R1,5$		;LOOP IF MORE SDB TO CHECK
+	MOV	DDLKNS#(R4),R4	;
+	BNE	1$		;LOOP IF MORE DDB TO CHECK
+	RETURN
+
+	.END
+   @Gl
