@@ -1,0 +1,329 @@
+	.SBTTL	8086 code for HPU program
+	.TITLE	HPU - demonstrate DCP with several terminals
+	.ASECT
+	.ENABL	LC
+
+;-----
+;  DCP demonstration routine - types a message on a terminal in response to
+;  a carriage return.  All other input characters get a beep.  Handles as
+;  many terminals as there are LINTAB definitions.
+;
+;  This program allows accessing of DCP I/O devices and memory
+;  under PDP-11 ODT keyboard control.  Three CSR registers accomplish
+;  this control:
+;
+;	162000	Control word
+;			100000	Loop on this operation
+;			040000	This operation is a read
+;			020000	This operation is a write
+;			000377	These bits form a delay count
+;	162002	DCP I/O (or memory) address
+;	162004	Data - Placed here on read, obtained here on write
+;-----
+
+;  Define CSR locations
+ODTCTL=CSRADR				;ODT Control word
+	ODT.LP=100000				;Loop on this command
+	ODT.RD=040000				;Perform a read
+	ODT.WR=020000				;Perform a write
+	ODT.CT=000377				;Delay count
+ODTADR=CSRADR+2				;ODT Address
+ODTDAT=CSRADR+4				;ODT Data
+CURLIN=CSRADR+6				;Current LINTAB addr - where ODT can see
+
+;  LINTAB definitions
+LINTAB=200				;Area to which LININI will be copied
+L.CHAD=0				;LINTAB entry offset for channel address
+L.CHTX=2				;  offset for transmit text pointer
+L.NEXT=4				;  offset for next LINTAB entry pointer
+L.TCNT=6				;  OFFSET FOR TRANSMIT CHAR COUNTER
+L.TZWT=10				;  OFFSET FOR COUNT OF ZERO-WAITS
+
+;  OTHER RAM LOCATIONS
+ODTCTR=100				;ODT loop counter
+
+;  Macros
+	.MACRO	TWIDDLE,?X,?Y		;Wait until ODT sez go
+	TESTBI	M,CSRADR+17,200		;See if we should wait
+	JNZ	Y			;Go bit set, so get going
+	MOVWI	M,CSRADR+16,4747
+X:	CMPBI	M,CSRADR+16,0
+	JNE	X
+Y:
+	.ENDM
+
+;  Code!  (Finally!)
+	$ORG	FUDGE+RSTADR		;Start DCP code at RESET address
+BOOT86:	LJUMP	ROMADR,0		;Zero CS reg, start at beginning of ROM
+
+	$ORG	FUDGE+ROMADR		;Now assemble code at bottom of ROM
+
+;  Initialize ODT control words
+	MOVWI	M,ODTCTL,0		;Zero the ODT control words
+	MOVWI	M,ODTADR,0
+	MOVWI	M,ODTDAT,0
+	MOVWI	M,ODTCTR,0
+
+;  Initialize LINTAB
+	MOVWIR	SI,LININI		;Move from here
+	MOVWIR	DI,LINTAB		;  to here
+	MOVWF	DI,M,CURLIN		;Set LINTAB entry pointer to first
+	MOVWIR	CX,LINSIZ		;Move this many bytes
+	CLD				;Move forward
+	REP
+	MOVSB				;Move string of bytes
+
+;  Initialize SIO boards
+	MOVWI	R,BX,SIOTAB		;Get address of SIO table
+SLOOP:	MOVWT	DI,IBX			;Get next SIO address
+	CMPWS	R,DI,0			;See if all SIO's done
+	JE	SDONE			;Jump out of SIO initialization
+	ADDWI	R,BX,2			;Increment SIO table pointer
+	MOVWI	R,SI,INITAB		;Get address of initialize table
+ILOOP:	MOVWT	BP,ISI			;Get next address
+	CMPWS	R,BP,0			;See if we are done
+	JE	SLOOP			;Jump out if done initializing
+	ADDWI	R,SI,2			;  (Increment pointer to data)
+	MOVWT	AX,ISI			;Get initialization data
+	ADDWI	R,SI,2			;  (Increment pointer to next address)
+	MOVWF	AX,IBPDI			;Write to where it's going
+	JMP	ILOOP
+SDONE:
+	MOVWF	AX,M,CSRADR+12		;Show AX
+	MOVWF	SI,M,CSRADR+14		;Show SI
+	TWIDDLE
+
+;  THE BIG LOOP  --  Main loop starts here.
+LOOP:
+
+;  Handle ODT command, if there is one.  See if delay count expired.
+	CMPWS	M,ODTCTL,0		;See if there is a command to do
+	JE	SKIPDL			;Jump around all ODT code if no command
+	MOVBFM	ODTCTL			;Get delay count
+	MOVBTM	ODTCTR			;  and re-initialize counter
+	DECB	M,ODTCTR		;See if still waiting
+	JGE	SKIPDL			;Jump around all ODT code if delaying
+	MOVWT	BX,M,ODTADR		;Get device/memory address
+
+;  Perform read if so requested
+	TESTWI	M,ODTCTL,ODT.RD		;Check for read command
+	JZ	NOREAD			;Jump if no read command
+	MOVWT	AX,IBX			;Read indirect off BX
+	MOVWTM	ODTDAT			;  and put it in data register
+NOREAD:
+
+;  Perform write if so requested
+	TESTWI	M,ODTCTL,ODT.WR		;Check for write command
+	JZ	NOWRIT			;Jump if no write command
+	MOVWFM	ODTDAT			;Get data from data register
+	MOVWF	AX,IBX			;  and write it to device/memory
+NOWRIT:
+
+;  Zap control word if no repeat
+	TESTWI	M,ODTCTL,ODT.LP
+	JNZ	NOZAP
+	MOVWI	M,ODTCTL,0
+NOZAP:
+SKIPDL:
+
+;  Here to scan keyboards for input
+	MOVWT	SI,M,CURLIN		;Get old entry address, so
+	MOVWT	SI,SSI,L.NEXT		;  we can get next entry in chain
+	CMPWS	R,SI,0			;See if we are at end of the chain
+	JNE	GOTLIN			;Jump if not; use the addess we have
+	MOVWIR	SI,LINTAB		;Get initial line block address
+GOTLIN:	MOVWF	SI,M,CURLIN		;Save current LINTAB entry address
+
+;  Get port status into AL
+	MOVWT	BX,SSI,L.CHAD		;Get channel address
+	MOVBT	AL,SBX,4		;Control register is at channel+4
+;	MOVWI	M,CSRADR+12,147		;Flag where we are
+;	MOVWF	AX,M,CSRADR+14		;Show port status
+;	TWIDDLE
+
+;  Check for and handle input
+	TESTBI	R,AL,ZIORCA		;Check for Received Character Available
+	JZ	RDONE			;Jump if no character to read
+	MOVWT	DL,IBX			;Get character from channel
+;	MOVWI	M,CSRADR+12,247		;Flag where we are
+;	MOVWF	DX,M,CSRADR+14		;Show character
+;	TWIDDLE
+	ANDBI	R,DL,177		;Mask down to 7 bits
+	CMPWS	SSI,L.CHTX,0		;See if text to output to this channel
+	JNE	RDONE			;Jump if already typing out message
+	MOVWI	SSI,L.CHTX,MBEEP	;Give him a beep
+	CMPBI	R,DL,15			; unless he typed a <cr>
+	JNE	RDONE			; in which case
+	MOVWI	SSI,L.CHTX,MHPU		; give him the message
+RDONE:
+
+;  Handle output
+	MOVWT	DI,SSI,L.CHTX		;See if text to output to this channel
+	CMPWS	R,DI,0
+	JE	TDONE			;Jump if no more text
+	TESTBI	R,AL,ZIOTBE		;Check for Transmit Buffer Empty
+	JZ	TWAIT			;Jump if not done with last character
+	MOVBT	DL,IDI			;Get character
+	CMPBI	R,DL,0			;Zero char marks end of message
+	JNE	TCHAR			;Jump on good char
+	MOVWI	SSI,L.CHTX,0		;Zap message pointer if end of message
+	MOVWI	SSI,L.TCNT,0		;ZERO CHARS THIS MESSAGE COUNTER
+	JMP	TDONE
+;
+TWAIT:	MOVWI	M,CSRADR+12,347		;FLAG WHERE WE ARE
+	MOVWF	AX,M,CSRADR+14		;SHOW AX (STATUS)
+	TWIDDLE
+	JMP	TDONE
+;
+TCHAR:	MOVBF	DL,IBX			;Write char to channel
+	MOVBIR	DL,ZIORTP		;RESET TRANSMIT INTERRUPT PENDING
+	MOVBF	DL,SBX,4
+	INCW	SSI,L.TCNT		;Increment character count this message
+	CMPWS	SSI,L.TCNT,2		;See if we've sent two characters
+	JNE	TINC
+	MOVBT	AL,SBX,4		;GET STATUS AGAIN
+	MOVWI	M,CSRADR+12,447		;STOP AND WAIT
+	MOVWF	AX,M,CSRADR+14
+	TWIDDLE
+TINC:	INCW	SSI,L.CHTX		;Bump pointer to next character
+TDONE:
+
+;  Done - here we go 'round the loop again, the loop again, the loop again
+;	MOVWI	M,CSRADR+12,747		;Flag where we are
+;	TWIDDLE
+	JUMP	LOOP
+
+;  Messages
+MBEEP=.-FUDGE
+	$ASCIZ	<<007>>			;  Beep (^G)
+MHPU=.-FUDGE
+	$ASCIZ	</? Host processor unavailable/<15><12>>
+
+;  Initial contents of LINTAB
+	.MACRO	LINDEF,CHNADR,NEXT	;Define line: channel addr, next LINTAB
+	$WORD	CHNADR			;L.CHAD
+	$WORD	0			;L.CHTX
+	$WORD	NEXT			;L.NEXT
+	$WORD	0			;L.TCNT
+	$WORD	0			;L.TZWT
+	.ENDM
+
+LININI=.-FUDGE
+.LININ:
+..L=.LININ-LINTAB
+	LINDEF	SIO0+SIOCH0,1$-..L
+1$:	LINDEF	SIO0+SIOCH1,2$-..L
+2$:	LINDEF	SIO0+SIOCH2,3$-..L
+3$:	LINDEF	SIO0+SIOCH3,4$-..L
+4$:	LINDEF	SIO0+SIOCH4,5$-..L
+5$:	LINDEF	SIO0+SIOCH5,6$-..L
+
+6$:	LINDEF	SIO1+SIOCH0,7$-..L
+7$:	LINDEF	SIO1+SIOCH1,8$-..L
+8$:	LINDEF	SIO1+SIOCH2,9$-..L
+9$:	LINDEF	SIO1+SIOCH3,10$-..L
+10$:	LINDEF	SIO1+SIOCH4,11$-..L
+11$:	LINDEF	SIO1+SIOCH5,12$-..L
+
+12$:	LINDEF	SIO2+SIOCH0,13$-..L
+13$:	LINDEF	SIO2+SIOCH1,14$-..L
+14$:	LINDEF	SIO2+SIOCH2,15$-..L
+15$:	LINDEF	SIO2+SIOCH3,16$-..L
+16$:	LINDEF	SIO2+SIOCH4,17$-..L
+17$:	LINDEF	SIO2+SIOCH5,0
+LINSIZ=.-.LININ				;End of LINTAB initialization table
+
+;  SIO table
+SIOTAB=.-FUDGE
+	$WORD	SIO0
+	$WORD	SIO1
+	$WORD	SIO2
+	$WORD	SIO3
+	$WORD	SIO4
+	$WORD	SIO5
+	$WORD	0
+
+;  Initialization table
+	.MACRO	INI,ADDR,DATA		;Define initializations
+	$WORD	ADDR
+	$WORD	DATA
+	.ENDM
+
+INITAB=.-FUDGE
+	INI	SIOCLK,CLK01I!CLK23I!CLK45I		;SIO 0 internal clocks
+	INI	SIOTM0,TMDSC0!TMDRLB!TMDMD3		;Clock 0 R/L both Mode 3
+	INI	SIOTC0,014				;Clock 0 Low half 9600
+	INI	SIOTC0,000				;Clock 0 High half 9600
+	INI	SIOTM0,TMDSC1!TMDRLB!TMDMD3		;Clock 1 R/L both Mode 3
+	INI	SIOTC1,140				;Clock 1 Low half 1200
+	INI	SIOTC1,000				;Clock 1 High half 1200
+	INI	SIOTM0,TMDSC2!TMDRLB!TMDMD3		;Clock 2 R/L both Mode 3
+	INI	SIOTC2,200				;Clock 2 Low half 300
+	INI	SIOTC2,001				;Clock 2 High half 300
+	INI	SIOTM3,TMDSC0!TMDRLB!TMDMD3		;Clock 3 R/L both Mode 3
+	INI	SIOTC3,014				;Clock 3 Low half 9600
+	INI	SIOTC3,000				;Clock 3 High half 9600
+	INI	SIOTM3,TMDSC1!TMDRLB!TMDMD3		;Clock 4 R/L both Mode 3
+	INI	SIOTC4,140				;Clock 4 Low half 1200
+	INI	SIOTC4,000				;Clock 4 High half 1200
+	INI	SIOTM3,TMDSC2!TMDRLB!TMDMD3		;Clock 5 R/L both Mode 3
+	INI	SIOTC5,200				;Clock 5 Low half 300
+	INI	SIOTC5,001				;Clock 5 High half 300
+	INI	SIOCT0,ZIORTU!ZIORST			;Reset Channel 0
+	INI	SIOCT0,ZIOR4				;Prime Write Register 4
+	INI	SIOCT0,ZIOX16!ZIOS1			;Baud x16, 1 stop bit
+	INI	SIOCT0,ZIOR5				;Prime Write Register 5
+	INI	SIOCT0,ZIODTR!ZIOTC8!ZIOTXE!ZIORTS	;DTR 8-bit Tx en int clk
+	INI	SIOCT0,ZIOR1				;Prime Write Register 1
+	INI	SIOCT0,0				;Disable interrupts
+	INI	SIOCT0,ZIOR3				;Prime Write Register 3
+	INI	SIOCT0,ZIORC8!ZIOSLI!ZIORXE		;8-bit Syn Ld Inh Rx ena
+	INI	SIOCT1,ZIORTU!ZIORST			;Reset Channel 1
+	INI	SIOCT1,ZIOR4				;Prime Write Register 4
+	INI	SIOCT1,ZIOX16!ZIOS1			;Baud x16, 1 stop bit
+	INI	SIOCT1,ZIOR5				;Prime Write Register 5
+	INI	SIOCT1,ZIODTR!ZIOTC8!ZIOTXE!ZIORTS	;DTR 8-bit Tx en int clk
+	INI	SIOCT1,ZIOR1				;Prime Write Register 1
+	INI	SIOCT1,0				;Disable interrupts
+	INI	SIOCT1,ZIOR3				;Prime Write Register 3
+	INI	SIOCT1,ZIORC8!ZIOSLI!ZIORXE		;8-bit Syn Ld Inh Rx ena
+	INI	SIOCT2,ZIORTU!ZIORST			;Reset Channel 2
+	INI	SIOCT2,ZIOR4				;Prime Write Register 4
+	INI	SIOCT2,ZIOX16!ZIOS1			;Baud x16, 1 stop bit
+	INI	SIOCT2,ZIOR5				;Prime Write Register 5
+	INI	SIOCT2,ZIODTR!ZIOTC8!ZIOTXE!ZIORTS	;DTR 8-bit Tx en int clk
+	INI	SIOCT2,ZIOR1				;Prime Write Register 1
+	INI	SIOCT2,0				;Disable interrupts
+	INI	SIOCT2,ZIOR3				;Prime Write Register 3
+	INI	SIOCT2,ZIORC8!ZIOSLI!ZIORXE		;8-bit Syn Ld Inh Rx ena
+	INI	SIOCT3,ZIORTU!ZIORST			;Reset Channel 3
+	INI	SIOCT3,ZIOR4				;Prime Write Register 4
+	INI	SIOCT3,ZIOX16!ZIOS1			;Baud x16, 1 stop bit
+	INI	SIOCT3,ZIOR5				;Prime Write Register 5
+	INI	SIOCT3,ZIODTR!ZIOTC8!ZIOTXE!ZIORTS	;DTR 8-bit Tx en int clk
+	INI	SIOCT3,ZIOR1				;Prime Write Register 1
+	INI	SIOCT3,0				;Disable interrupts
+	INI	SIOCT3,ZIOR3				;Prime Write Register 3
+	INI	SIOCT3,ZIORC8!ZIOSLI!ZIORXE		;8-bit Syn Ld Inh Rx ena
+	INI	SIOCT4,ZIORTU!ZIORST			;Reset Channel 4
+	INI	SIOCT4,ZIOR4				;Prime Write Register 4
+	INI	SIOCT4,ZIOX16!ZIOS1			;Baud x16, 1 stop bit
+	INI	SIOCT4,ZIOR5				;Prime Write Register 5
+	INI	SIOCT4,ZIODTR!ZIOTC8!ZIOTXE!ZIORTS	;DTR 8-bit Tx en int clk
+	INI	SIOCT4,ZIOR1				;Prime Write Register 1
+	INI	SIOCT4,0				;Disable interrupts
+	INI	SIOCT4,ZIOR3				;Prime Write Register 3
+	INI	SIOCT4,ZIORC8!ZIOSLI!ZIORXE		;8-bit Syn Ld Inh Rx ena
+	INI	SIOCT5,ZIORTU!ZIORST			;Reset Channel 5
+	INI	SIOCT5,ZIOR4				;Prime Write Register 4
+	INI	SIOCT5,ZIOX16!ZIOS1			;Baud x16, 1 stop bit
+	INI	SIOCT5,ZIOR5				;Prime Write Register 5
+	INI	SIOCT5,ZIODTR!ZIOTC8!ZIOTXE!ZIORTS	;DTR 8-bit Tx en int clk
+	INI	SIOCT5,ZIOR1				;Prime Write Register 1
+	INI	SIOCT5,0				;Disable interrupts
+	INI	SIOCT5,ZIOR3				;Prime Write Register 3
+	INI	SIOCT5,ZIORC8!ZIOSLI!ZIORXE		;8-bit Syn Ld Inh Rx ena
+	INI	0,0			;End of initialization table
+
+	.END
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
