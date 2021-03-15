@@ -1,0 +1,408 @@
+
+begin "CPY"
+
+require '1 lsh 24 lor '0 version;
+
+require "(SAILIB)SAIL.DEF"   source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "(SAILIB)ATFILE.REQ" source!file;
+require "(SAILIB)CVPPN.REQ"  source!file;
+require "(SAILIB)FNDKEY.REQ" source!file;
+require "(SAILIB)ARGS.REQ"   source!file;
+
+Define BrkString =
+    {(If Brk="*" then "######" else if Brk="?" then "#" else null)};
+
+Define !FILE = 0, !EXT = 1;		! Lookup block offset data ;
+
+Define Gettab(x,y) = { calli( !Xwd( (x),(y) ), calli!GETTAB ) };
+Define Printx(x) = { print( cvps(x)&" (",props(x),")  ",datum(x),crlf ) };
+
+  redefine !Block(Group, Name, Size) = {
+    Ifcr Length(Cvps(Size)) = 0 thenc assignc Size = 1; Endc
+    Define Group}&{Name = Group;
+    Redefine Group = Group + Size;};
+
+    Define S! = 0;			! ** Filespec block offsets ** ;
+    !Block( S!,Dev )			! Device ;
+    !Block( S!,Usr,2 )			! Username ;
+    !Block( S!,Nam )			! Name ;
+    !Block( S!,Ext )			! Extension ;
+
+
+String  FileLine, FileSpec, CopySpec, Text;
+Integer Inbrk, InLst, Quest, Brk;	! various break table stuff ;
+Integer File, Ext, UserPPN, LastPPN;	! file information ;
+Integer ProcessedFiles, CIndex;		! file counter, cmd index ;
+Integer IChan, OChan;			! file channels for in/out ;
+Integer ThisHost;			! host number ;
+Boolean Interactive;			! determine how run ;
+
+Record!Class E( Integer Ext; r!p (E) Next );
+Record!Class F( Integer File; r!p (E) Ext; r!p (F) Next );
+Record!Class P( Integer Ppn; string User; r!p (F) File; r!p (P) Next );
+
+r!p (P) Users, ThisUser, ThatUser;
+r!p (F) Files, That, Name;
+r!p (E) Last, This;
+
+Safe Integer Array Spec[ S!Dev:S!Ext ];	! holds parsed file spec ;
+
+Preset!with "CPY";
+Safe String Array LegalCommands[ 1:1 ];
+
+Preset!with '17, cvsix("DSK"), 0;	! open block for DSK: ;
+Safe Integer Array DSK[ 0:2 ];
+
+string item OutputFiles;		! output file(s) ;
+string item InputFiles;			! list of input files ;
+string item HostList;			! list of output hosts ;
+string item UserName;			! output username ;
+
+integer item GateWay;			! gateway host number ;
+integer item Days;			! number of days ;
+integer item Hours;			! number of hours ;
+integer item Minutes;			! number of minutes ;
+
+item Sticky;				! controls "sticky" username ;
+item Reverse;				! controls sorting order ;
+item Center;				! hosts in this data center ;
+item Default;				! default missing values ;
+item Supersede;				! supersede files ;
+
+
+simple procedure InitSystem;
+begin "init system"
+    ThisHost_ Gettab( !cnSYS,!gtCNF );
+end "init system";
+require InitSystem initialization;
+
+
+internal simple string procedure CvNAME( integer AUN );
+! ----------------------------------------------------------------------;
+!									;
+!	CvName		Routine to get the username for a specific	;
+!			AUN by looking up the UFD.  Uses the .chNXT	;
+!			feature to get a channel and releases it to	;
+!			preserve outside file/channel integrity.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    integer NotEof, Chan;
+    Preset!with '17, cvSIX( "DSK   " ), 0;
+    Own safe integer array Dev[ 0 : 2 ];
+    Own safe integer array Look[ 0 : !RBUNM+1 ];
+
+    Look[ !RBCNT ]_ !RBUNM+1;		! PPN -> User;
+    Look[ !RBPPN ]_ !Xwd( 1,1 );	! (UFD)  ;
+    Look[ !RBNAM ]_ AUN;		! [user] ;
+    Look[ !RBEXT ]_ cvSIX("UFD   ");	! .UFD   ;
+
+    Chan_-1;				! channel to use ;
+    Chnior( Chan, Dev[ 0 ], !chOPN );	! open DSK ;
+    start!code HRRZM '3,Chan end;	! remember channel ;
+    If ( NotEof_ !skip! )
+     then begin
+	Chnior( Chan, Look[!RBCNT], !chLK );
+	NotEof_ !skip!;
+	Chnior( Chan, memory[0], !chREL );
+     end;
+
+    If ( NotEof )
+     then return( Cv6str(Look[!RBUNM])&Cv6str(Look[!RBUNM+1]) )
+     else return( Cvos(!lh(aun))&","&Cvos(!rh(aun)) );
+end;
+
+
+Simple Integer procedure GetText( Reference string Line;
+				  Integer Byte, Count; String Chars );
+begin "get text"
+    Own integer wp;
+    String Str;
+
+    while ( length( Line ) )
+     do begin "get data"
+
+	Str_ Chars;				! copy break chars ;
+	while ( length( Str ) )			! if any break chars ;
+	 do if ( Line = Lop( Str ) )		!  and match a brk ;
+	     then return( Line );		!  return that character ;
+
+	if ( 0 leq count_ count - 1 )		! if room left in string ;
+	 then if ( "a" leq wp_lop(Line) )	!  then check case ;
+	       then idpb( wp-'100, byte )	!    lowercase to sixbit ;
+	       else idpb( wp-'40, byte )	!    uppercase to sixbit ;
+	 else wp_ lop( Line );			!  throw away extras ;
+
+     end "get data";
+
+    return( 0 );				! no line left? ;
+
+end "get text";
+
+
+Simple Boolean Procedure VMSpec( String Line );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMSpec( FileSpecification )					;
+!		Routine to read a string file specification and build	;
+!		the special file block used by the VMFile routine.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Spec"
+
+    arrclr( spec );				! clear out the array ;
+
+    GetText( Line, point( 6,spec[S!Nam],-1 ), 6, ":(." );
+
+    if ( ":" = Line )				! it was a device, good! ;
+     then begin
+	lop( Line );				! throw away the colon and ;
+	spec[S!Dev] swap spec[S!Nam];		! swap data to right places ;
+     end
+     else spec[S!Dev]_ cvsix("DSK");		!  and fill in the device ;
+
+    if ( "(" = Line )				! if it starts with "(" ;
+     then begin "get user"			!  then pick up username ;
+	lop( Line );				!    eat the "(" ;
+	GetText( Line, point( 6,spec[ S!Usr ],-1 ), 12, ")" );
+	lop( Line );				!    eat the ")" ;
+     end "get user"
+     else begin "default user"			! set default if no user ;
+	spec[ S!Usr   ]_ calli( '31, '41 );	! .GTNM1 (GFD user 1-6)  ;
+	spec[ S!Usr+1 ]_ calli( '32, '41 );	! .GTNM2 (GFD user 7-12) ;
+	If not( !Skip! )			! set blank if GETTAB fails ;
+	 then spec[ S!Usr ]_ spec[ S!Usr+1 ]_ 0;
+     end "default user";
+
+    if not( length( Line ) or spec[S!Nam] )	! must have a name ;
+     then return( false );			!  so return false ;
+
+    if not( "." = Line or spec[S!Nam] )
+     then GetText( Line, point( 6,spec[ S!Nam ],-1 ), 6, "." );
+
+    if not( spec[S!Nam] )			! seen anyone ;
+     then return( false );			! no, go home ;
+
+    if ( "." = Line )				! if dot seen ;
+     then begin "get ext"
+	lop( Line );				!  then chop it off ;
+	GetText( Line, point( 6,spec[ S!Ext ],-1 ), 3, " "&'11 );
+     end "get ext";
+
+    return( true );				! got here, return ok ;
+
+end "VM Spec";
+
+
+boolean procedure WantFile( Reference Integer Filename, Extension );
+begin
+    Return( Extension neq CvSix("TMP") );
+end;
+
+procedure FileProc( Reference Integer Chan, Cnt, Brk, FileEof;
+		    Integer Array LKB );
+Begin "Each File"
+    Integer N;
+
+    Name_ P:File[ ThisUser ];			! Head of list   ;
+
+    While ( That_ F:Next[ Name ] )		! While ( more ) ;
+     do If ( LKB[!File] = N_ F:File[ That ] )	!  do if same    ;
+	 then begin "New extension"		!   then add ext ;
+	    Last_ F:Ext[ That ];		!   : first one  ;
+	    While ( This_ E:Next[ Last ] )	!   : scan list  ;
+	     do If ( !lh( LKB[!Ext] ) < !lh( E:Ext[This] ) )
+		 then if not( props(Reverse) )	! test direction ;
+		       then done		!   : insert it  ;
+		       else Last_ This		!  loop for more ;
+		 else if not( props(Reverse) )	! test direction ;
+		       then Last_ This		!   : make ext!  ;
+		       else If ( !lh( LKB[!Ext] ) > !lh( E:Ext[This] ) )
+			     then done		!   : insert it  ;
+			     else Last_ This;	!   : make ext!  ;
+	    If ( !lh(LKB[!Ext]) = !lh(E:Ext[Last]) )
+	     then return;			! skip identical ;
+	    E:Next[ Last_ E:Next[ Last ]_ new!record( E ) ]_ This;
+	    E:Ext[ Last ]_ LKB[!Ext];		!   : in place   ;
+	    Return;				! then return.   ;
+	 end "New extension"
+	 else If ( LKB[!File] < N )		!  else insert?  ;
+	       then if not( props(Reverse) )	! test direction ;
+		     then done			!    yes, skip!  ;
+		     else Name_ That		! no, re do scan ;
+	       else if not( props(Reverse) )	! test direction ;
+		     then Name_ That		! no, re do scan ;
+		     else If ( LKB[!File] > N )	!  else insert?  ;
+			   then done		!    yes, skip!	 ;
+			   else Name_ That;	! no, re do scan ;
+
+    F:Next[ Name_ F:Next[ Name ]_ new!record( F ) ]_ That;
+    F:File[ Name ]_ LKB[!File];
+    This_ F:Ext[ Name ]_ new!record( E );
+    E:Ext[ E:Next[ This ]_ new!record( E ) ]_ LKB[!Ext];
+
+end "Each File";
+
+
+simple procedure Package;
+begin "pack it in"
+    string Name, AHost;
+
+    ProcessedFiles_ ProcessedFiles + 1;		! increment counter ;
+
+    Name_ Cv6str( F:File[That] ) &		! let user see what ;
+	  (if !lh( E:Ext[This] )		! file we are doing ;
+	      then "." & Cv6str( E:Ext[This] )	!  at the moment.   ;
+	      else null);
+
+    Print(  "(", P:User[ ThisUser ],		! username ;
+	    ":", cvs( ThisHost ), ")",		! host ;
+	    Name,				! file ;
+	    ",(", datum( UserName ),		! output username ;
+	    ":", AHost, ")",			! each host ;
+	    Name,				! file ;
+	    crlf
+	);
+
+end "pack it in";
+
+!	***  M A I N   P R O G R A M   L O O P  ***
+;
+
+setbreak(inbrk_getbreak,#LF&#FF,null,"INS");	! break on LF FF;
+setbreak(inlst_getbreak,",[ "," "&#HT,"KTINS");	! break on comma;
+setbreak(quest_getbreak,"?*",Null,"INS");	! break on qmark;
+MFDset( 0, 4, 0, 132 );				! ascii, in, out, count;
+
+if not( 0 < CIndex_ FndKey( ArgV[0], LegalCommands ) )
+ then Usererr( 0,0, "Illegal command: "&ArgV[0], "X" );
+
+ArgParse( any, InputFiles,
+	  {Sticky,Reverse,Supersede,Center,Default,
+	   Days,Hours,Minutes,
+	   GateWay,
+	   HostList,
+	   UserName},
+	  ARGS );
+
+LastPpn_ Calli(!Xwd(-1,!GtPPN), Calli!GETTAB);	! initially self ;
+Interactive_ true;			! default to interactive mode ;
+
+while ( true )
+ do begin "!TRUE!"
+
+    if ( props(InputFiles) )		! if something specified ;
+     then begin "command line"		!  then ;
+	Interactive_ false;		!   become non-interactive ;
+	FileLine_ datum(InputFiles);	!   and simulate input line ;
+     end "command line";
+
+    If ( Interactive )			! non command line data ;
+     then begin "real session"
+	Print( "Spec(s): " );		! prompt for an input line ;
+	FileLine_ AtFile( True );	! then read it. ;
+	If Length( FileLine ) = 0	! on a blank line from user ;
+	 then Calli(0,Calli!EXIT);	!  simply terminate session ;
+     end "real session";
+
+    Users_ new!record( P );			! initialize...;
+
+    While Length( FileLine )			! for each spec typed ;
+     do begin "line typed"
+	FileSpec_ Scan(FileLine,inlst,brk);	! gobble one file-spec ;
+	if ( brk = "[" )			! handle [,] ;
+	 then FileSpec_ FileSpec & "[" &
+		Scan(FileLine,inlst,brk) & brk
+		& Scan(FileLine,inlst,brk);
+	If Length( FileSpec )			! if it has substance ;
+	 then begin "file typed"
+	    CopySpec_ Null;			! init copy variables ;
+	    Brk_ 0;
+	    While ( length( FileSpec ) )
+	     do CopySpec_ CopySpec & BrkString & Scan( FileSpec, quest, Brk );
+	    CopySpec_ CopySpec & BrkString;		! translate *,? to # ;
+	    File_ cvfil( CopySpec, Ext, UserPpn );	! dissect into parts ;
+	    If ( 0 neq (File lor Ext lor UserPpn) )	! any non-null ok ;
+	     then begin "use GFD ppn"
+		If UserPpn = 0				! handle null ppn ;
+		 then if ( props(STICKY) )		! use /STICKY here ;
+		       then UserPpn_ LastPpn		! previous username ;
+		       else UserPpn_ Calli( !Xwd(-1,!GtPPN), Calli!GETTAB );
+		If !lh( UserPpn ) = 0			! pointer to UNAME ;
+		 then UserPpn_ CvPPN( Cv6str( memory[ UserPpn   ] ) &
+				      Cv6str( memory[ UserPpn+1 ] ) );
+	     end "use GFD ppn";
+	    If File = 0 then File_ cvsix("*");		! handle null file ;
+	    If Ext = 0 then Ext_ cvsix("*");		! handle null ext ;
+
+	    THisUser_ Users;				! While ( more ) ;
+	    While ( ThisUser_ P:Next[ ThatUser_ ThisUser ] )
+	     do If ( UserPpn = P:Ppn[ ThisUser ] )	!  do if same    ;
+		 then done;				!   have a match ;
+	    If not( ThisUser )				! Got one?       ;
+	     then begin "first time"			! No, set one up ;
+		ThisUser_ P:Next[ ThatUser ]_ new!record( P );
+		P:Ppn[ ThisUser ]_ UserPpn;		! store username ;
+		P:User[ ThisUser ]_ CvName( UserPpn );	! in both forms  ;
+		P:File[ ThisUser ]_ new!record( F );	! init file area ;
+	     end "first time";
+
+	    UfdScn( UserPpn, File, Ext, 1, WantFile, FileProc );
+	    LastPpn_ UserPpn;			! remember last user ;
+
+	 end "file typed"
+     end "line typed";
+
+!	fall through from above -- scanner sorting code.
+!	***  I N T E R E S T I N G   P A R T  ***
+;
+    ProcessedFiles_ 0;				! initialize count   ;
+
+    if not( props( UserName ) )
+     then datum( UserName )_ CvName( Gettab( -1,!gtPPN ) );
+
+    if ( props( HostList ) )
+     then print( "Hosts: ", datum( HostList ), crlf );
+
+    ThatUser_ Users;				! one user at a time ;
+    while( ThisUser_ P:Next[ ThatUser ] )	! if any at all      ;
+     do begin "each user"			!  P:Ppn[ ThisUser ] ;
+
+	Name_ P:File[ ThisUser ];		! get name pointer   ;
+	While ( That_ F:Next[ Name ] )		! look one at a time ;
+	 do begin "each name"			!  F:File[ That ]    ;
+
+	    This_ F:Ext[ That ];		! get ext pointer    ;
+	    While ( This_ E:Next[ This ] )	! one at a time      ;
+	     do begin "each ext"		!  E:Ext[ This ]     ;
+
+		Case ( CIndex - 1 ) of
+		begin
+		  [0] Package;			! oh no, do it to it ;
+		  [else] usererr( 0,0, "Bad command", "C" )
+		end;
+
+	     end "each ext";			! ran of end of list ;
+
+	    Name_ That;				! setup for next "F" ;
+
+	 end "each name";
+	ThatUser_ ThisUser;			! setup for next "P" ;
+
+     end "each user";
+
+    if not( ProcessedFiles )
+     then Print( crlf & "% No files satisfying request" & crlf );
+
+    if not( Interactive )		! if we were a command line ;
+     then calli(0,calli!EXIT);		!  then we are done. ;
+
+    Interactive_ true;			! in case user says continue ;
+
+ end "!TRUE!";
+
+start!code uuo!EXIT 0, end;		! really exit! ;
+
+end "CPY" $
