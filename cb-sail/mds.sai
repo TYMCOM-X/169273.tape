@@ -1,0 +1,335 @@
+begin
+
+require ('0 lsh 18) lor '1 version;
+require "(SAILIB)SAIL.DEF" source!file;
+require "MDSDEF.DEF" source!file;
+require "CMDSCN.REQ" source!file;
+require "AUXLIB.REQ" source!file;
+require "TTYINT.REQ" source!file;
+require "UUOSYM.DEF" source!file;
+
+
+Item IntPro;					! interrupt process  ;
+
+Own Integer Array VirtualStorage[0:'2000];	! for memory mapping ;
+Own Integer Base, MemAdr;			! for memory mapping ;
+Own Integer Array Arg[0:1];			! for memory mapping ;
+
+Own Integer BrkNam, BrkUsr, BrkPpn, Brk;	! break table index  ;
+Own Integer BrkLin, BrkWht, BrkBrk, BrkCmd;	! break table index  ;
+
+Own Integer Index;				! loop index "HELP"  ;
+Own Integer Array FileBlk[ F.Usr:F.End ];	! file specification ;
+Own String Command, Line;			! scratch strings    ;
+
+simple procedure BrkIni;
+! ----------------------------------------------------------------------;
+!									;
+!	BrkIni		Define and initialize the breakset tables	;
+!			to be used by various INPUT and SCAN calls	;
+!			throughout the program.				;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Define ##Cmd = {";=/ "&#ht}
+    ,      ##Wht = {" "&#ht&#cr}
+    ,      ##Brk = {" !@#$%^&*()-_+=~`[]|\:;'<>,.?/" & '42 & '173 & '175}
+    ,      ##Chr = {"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"}
+    ,      ##Num = {"0123456789"}
+    ,      ##Nam = {##Chr & ##Num}
+    ,      ##Ppn = {"01234567"}
+    ,      ##End = {#lf&#vt&#ff&#cr&#esc};
+
+    setbreak(BrkLin_Getbreak,#lf&#ff,     null, "SINF");  ! line;
+    setbreak(BrkNam_Getbreak,##Nam,       crlf, "RXNF");  ! name or token;
+    setbreak(BrkUsr_Getbreak, ")",        null, "SINK");  ! end of username;
+    setbreak(BrkPpn_Getbreak,##Ppn, ##Wht&crlf, "RXNK");  ! octal ppn;
+    setbreak(BrkWht_Getbreak,#lf & ##Wht, crlf, "RXNK");  ! white space;
+    setbreak(BrkBrk_Getbreak,#lf & ##Brk, #cr,  "RINK");  ! all break chars;
+    setbreak(BrkCmd_Getbreak,#lf & ##Cmd, #cr,  "SINK");  ! command line;
+end;
+require BrkIni initialization;
+
+
+simple procedure PageUp;
+! ----------------------------------------------------------------------;
+!									;
+!	PageUp		Initialize "funny" memory array for paging.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Base _ ( Location( VirtualStorage[0] ) + '1000 ) lsh -9;
+    MemAdr_ Base lsh 9;
+end;
+require PageUp initialization;
+
+simple procedure PageDn;
+! ----------------------------------------------------------------------;
+!									;
+!	PageDn		Reset "funny" memory array to zero.		;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Calli( !Xwd( '2001, Base ), calli!VCLEAR );	! clear current page ;
+    Calli( !Xwd( '6001, Base ), Calli!VCREAT );	! replace with clean ;
+end;
+
+
+internal simple boolean procedure PageMp( Integer Chan,FPage,FProt );
+! ----------------------------------------------------------------------;
+!									;
+!	PageMp		Map the specified file page into memory.	;
+!			Currently uses Base, but may use MPage arg.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Calli( !Xwd( '2001, Base ), calli!VCLEAR );	! clear memory page;
+    If FProt < 1 or FProt > 3 then FProt_ 1;	! if bad, use .prro=1;
+    Arg[ 0 ]_ !Xwd((FProt lsh 10) lor 1,Base);	! prot & count,,page;
+    Arg[ 1 ]_ FPage;				! file-page;
+    Chnior( Chan, Arg[0], !chMFP );		! map file page;
+    Return( !skip! );				! status;
+end;
+
+internal simple boolean procedure PageOpen( Reference Integer Chn );
+! ----------------------------------------------------------------------;
+!									;
+!	PageOpen	Open the specified file for mapping (read).	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Own Integer Eof;
+    Open( Chn_getchan, CvXstr(FileBlk[F.DEV]), '17, 0,0, 0,0, Eof_-1 );
+    Chnior( Chn, FileBlk[F.NAM], !chLK );
+    Return( !skip! );
+end;
+
+
+internal simple boolean procedure PageEnter( Reference Integer Chn );
+! ----------------------------------------------------------------------;
+!									;
+!	PageEnter	Enter the specified file - .chENT for mapping.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Chnior( Chn, FileBlk[F.NAM], !chENT );
+    Return( !skip! );
+end;
+
+
+internal simple string procedure Token (reference string S);
+! ----------------------------------------------------------------------;
+!									;
+!	Token		Scan the string S and return the first word	;
+!			or punctuation character to the caller.		;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    string S1;
+    Scan( S, BrkWht, Brk );	! clear whitespace;
+    S1 _ scan(S, BrkBrk, Brk);	! get the next word;
+    If length(S1) = 0		! null?;
+	then if length(S) = 0	!   null source also?;
+	    then return (null)	!    yes - return null;
+	    else S1 _ lop(S);	!    no  - get a character;
+    Return(S1);			! return the token;
+end;
+
+
+internal simple boolean procedure SubSet(String Str, Sub);
+! ----------------------------------------------------------------------;
+!									;
+!	SubSet		Return TRUE if all the characters in string	;
+!			"STR" are some subset of those in string "SUB".	;
+!									;
+! ----------------------------------------------------------------------;
+begin "SubSet"
+    Integer C,D,E;
+    If Length( Str ) = 0 or Length( Sub ) = 0 then Return( False );
+    While Length( Str )
+     do begin
+       C_ Lop(Str);  E_ False;
+       For D_ 1 step 1 until Length( Sub )
+	 do If C = Sub[D for 1] then E_ True;
+       If not E then Return( False );
+     end;
+    Return( True );
+end;
+
+internal string procedure Daytim( Integer UseTime );
+! ----------------------------------------------------------------------;
+!									;
+!	Daytim		Return the time of day in the form HH:MM:SS	;
+!			using 24-hour time from 00:00:00 to 23:59:59.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Integer T,HH;
+    T _ If UseTime > 0
+	 then UseTime div 1000
+	 else Calli(0,calli!timer) div 60;
+    HH _ T Div 3600;	T  _ T Mod 3600;
+    Return( CvS(100 + HH)[2 for 2] & ":" &
+	    CvS(100 + (T Div 60))[2 for 2] & ":" &
+	    Cvs(100 + (T Mod 60))[2 for 2]  );
+end;
+
+
+simple string procedure
+  FileSpec( Reference string S, Dev; Reference Boolean Dot, Err);
+! ----------------------------------------------------------------------;
+!									;
+!	FileSpec	Read a filespec from the given string and	;
+!			pass a "legal" name back to the caller.  Also	;
+!			return information regarding errors, device	;
+!			and "dot".  Fill in value for FileBlk.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "read a file name"
+    String Usr, Fil, Ext, Ppn;
+    Dot _ Err _ False;					! Initially false;
+    Dev _ Usr _ Fil _ Ext _ Ppn _ Null;			! Initially empty;
+    ArrClr( FileBlk );					! Clear storage;
+    Fil _ Scan( S, BrkNam, Brk );			! Read name?;
+    If Brk = ":" then begin
+	Lop( S );					! eat ":";
+	Dev _ Fil;					! set device;
+	Fil _ Scan( S, BrkNam, Brk );			! Re-read name?;
+    end;
+    If Brk = "(" then begin
+	Lop( S );					! eat "(";
+	Usr _ Scan( S , BrkUsr, Brk );			! get username;
+	FileBlk[F.USR]_ CvSIX( Usr[1 for 6] );		! convert username;
+	FileBlk[F.US2]_ CvSIX( Usr[7 for 6] );		!  in two parts;
+	FileBlk[F.PPN]_ Location( FileBlk[F.USR] );	! and set ppn pointer;
+	Usr _ "(" & Usr & ")";				! slap on the parens;
+	If Brk neq ")" then err _ True;			! everything ok?;
+	Fil _ Scan( S , BrkNam, Brk );			! then filename;
+    end;
+    If Brk = "." then begin
+	Lop( S );					! eat ".";
+	Dot _ True;					! declare extension;
+	Ext _ "." & Scan( S , BrkNam, Brk );		! and read it;
+	FileBlk[F.EXT]_ CvSIX( Ext[2 for 3] );		! convert to value;
+    end;
+    If Brk = "[" then begin
+	Lop( S );					! eat "[";
+	Ppn_ Scan( S, BrkPpn, Brk );			! get first part;
+	If Brk = ","					! check for comma;
+	 then Lop( S )					! and eat ",";
+	 else err_ True;				!  else complain;
+	FileBlk[F.PPN]_ Cvo( Ppn ) lsh 18;		! setup gan;
+	Ppn_ Scan( S, BrkPpn, Brk );			! get second part;
+	FileBlk[F.PPN]_ FileBlk[F.PPN] lor Cvo( Ppn );	! setup uun;
+	Ppn_ "[" & Cvos( !lh(FileBlk[F.PPN]) ) & ","	! put ppn string;
+		 & Cvos( !rh(FileBlk[F.PPN]) ) & "]";	!  together again;
+	Lop( S );					! eat "]";
+	If Brk neq "]" or Length( Usr )			! check for bracket;
+	 then err_ True;				!  or duplicates;
+    end;
+    Scan( S, BrkWht, Brk );				! clear whitespace;
+    If Length(Dev) = 0 then Dev _ "DSK";		! Default to DSK;
+    FileBlk[F.DEV]_ CvSIX( Dev );			!  make sure got copy;
+    FileBlk[F.NAM]_ CvSIX( Fil );			!  for later;
+    Return ( Usr & Fil & Ext & Ppn );			! All done;
+end "read a file name";
+
+Simple Integer Procedure MakeCircuit( String Where; Integer T(0) );
+begin
+    Integer Aux;
+
+    If length(Where)
+     then begin
+	IntAux( Aux_ CreAux( Where ) );
+	If Aux < 0
+	 then Return( Aux );
+	While -1 < Auxin(T) do;
+	AuxOut( "PDP" & #CR );
+	AuxSync( Crlf & "." );
+	Return( Aux );
+     end
+     else Return( -1 );
+end;
+
+Simple procedure KillCircuit;
+begin
+    AuxOut( '3&'3 );
+    AuxSync( "." );
+    AuxOut( "EXIT" & #CR );
+    AuxSync( "EXIT" & Crlf );
+    AuxZap;
+end;
+
+
+
+Simple Boolean Procedure All.Legal( Reference Integer Index );
+Return( True );
+
+
+Procedure Cmd.Action(Reference Integer Command.Index;
+			    Reference String  Command.Line;
+			    Reference Integer Break.Char );
+begin "command actions"
+
+    Simple procedure NotImp;
+    Print( Cmd.Name[ Command.Index ], " Not Implemented", Crlf );
+
+
+    Simple Procedure C.Help;
+    begin "HELP"
+	If Command.Line = "?"			! followed by ? ;
+	 then Command.Line_ "HELP";		! make it "..HELP";
+	If Length( Command.Line )		! "HELP <token>";
+	 then begin "short help check"
+	    Index_ FndCmd( Token(Command.Line), Cmd.Name, All.Legal );
+	    If Index geq ArrInfo( Cmd.Name, 1 )
+	     then Print( "  ", Cmd.Text[ Index ], Crlf )
+	     else Print( "  ", "Unrecognized or ambigious help command", Crlf );
+	 end "short help check"
+	 else begin "long help text"
+	    Print(  Crlf, "Multi-Directory System %",
+		    Cvos(!lh(memory['137])), ".",
+		    Cvos(!rh(memory['137])), Crlf,
+		    "Commands:", Crlf );
+	    For Index _ ArrInfo( Cmd.Name, 1 )	! for each keyword;
+			step 1 until		!  in the specified;
+			ArrInfo( Cmd.Name, 2 )	!  array -- do;
+	     do If 0 = ( Cmd.Flag[ Index ] land MDS$Inv )
+		 then Print( "  ", Cmd.Text[ Index ], Crlf )
+	 end "long help text";
+
+	Print( Crlf );
+    end "HELP";
+
+
+    Simple Procedure C.Quit;		! procedure "QUIT" - "EXIT" ;
+    begin "QUIT"
+	PageDn;				! replace with private page ;
+	Calli( 0, Calli!EXIT );		! exit to monitor / Exec    ;
+    end "QUIT";
+
+
+    Index_ Command.Index;		! ***  M A I N   C M D  *** ;
+    Line_ Command.Line;			! copy inaccessable formals ;
+    Command_ Cmd.Name[ Command.Index ];
+
+    Case Command.Index			! case of begin C:C:C:C end ;
+     of begin
+	$$C$PROCS
+     end
+
+end "command actions";
+
+
+TTYUP( True );
+Print(  Crlf, "[Multi-Directory System %", Cvos(!lh(Memory['137])),
+	".",Cvos(!rh(Memory['137])), "]", Crlf );
+
+IntIni( IntPro );
+
+CmdScn( "MDS>", Cmd.Name, All.Legal, Cmd.Action, True );
+
+PageDn;
+
+end;
+  
