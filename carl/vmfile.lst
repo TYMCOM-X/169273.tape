@@ -1,0 +1,1141 @@
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 1
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+1	entry
+2		VMFile, VMFree, VMSpec,
+3		VMChan, VMPMap,
+4		VMLine, VMText, VMMove,
+5		VMGetC, VMSetC,
+6		VMGetW, VMSetW,
+7		VMRecF
+8		define FT!InternalPages = True;
+9		Ifcr not FT!InternalPages thenc , VMInit endc
+10	
+11	;
+12	
+13	begin "VM Package"
+14	
+15	  require "(SAILIB)SAIL.DEF"   source!file;
+16	  require "(SAILIB)UUOSYM.DEF" source!file;
+17	  require "(CARL)VMFILE.DEF"   source!file;
+18	
+19	
+20	  Define Gettab(x,y) = { calli( !xwd( (x),(y) ), calli!GETTAB ) };
+21	
+22	  Define
+23		MaxSlot = 47			! number of available slots ;
+24	  ,	MemMax  = MaxSlot * 512		! pages in words ;
+25	  ,	CharPerPage = 512 * 5		! characters per page ;
+26	  ,	BackByte    = '430000000001	! offset to backup a byte ;
+27	  ,	AddaByte    = '070000000000	! offset to increment byte ;
+28	  ;
+29	
+30	
+31	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 2
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+32	
+33	  Record!Class F (  Integer Page;	! memory page to use ;
+34			    Integer File;	! file page in use ;
+35			    Integer Chan;	! channel for file open ;
+36			    Integer Mode;	! file access mode ;
+37			    Integer Name;	! file name in sixbit ;
+38			    Integer FExt;	! file extension in sixbit ;
+39			    Integer FPPN;	! file ppn ;
+40			    Integer Char;	! character pointer in file ;
+41			    Integer Line;	! line pointer in file +/-;
+42			    Integer PTxt;	! text page pointer in file +/- ;
+43			    Integer MTxt;	! text message pointer in file +/- ;
+44			    Integer Last;	! last eol character ;
+45			    Integer CRet;	! carriage return on line ;
+46			    Integer Size;	! character size of file ;
+47			    Integer LSiz;	! lines in file (if known) ;
+48			    Integer PSiz;	! pages in file (if known) ;
+49			    Integer MSiz;	! messages in file (if known) ;
+50			    Integer FLic;	! file license info ;
+51			    Integer Time;	! file creation time in seconds ;
+52			    Integer Date;	! file creation date ;
+53			    Integer Flag;	! file access flags (VM$APPEND) ;
+54			    R!P (F) Next   );	! next record - dormant only ;
+55	
+56	  R!P (F) S;
+57	  Safe R!P (F) Array Files[ 1 : MaxSlot ];
+58	
+59	  Internal Boolean VMRecF;			! flag for keeping dormant ;
+60	  R!P (F) Dormant;
+61	
+62	  Integer VMMem, VMPage;			! virtual memory pointers  ;
+63	  Integer MaxSlots;				! remember available slots ;
+64	
+65	  Own Safe Integer Array FileSpec[ S!Dev : S!Ext ];
+66	
+67	 Ifcr FT!InternalPages thenc			! selectable by feature sw ;
+68	  Preset!with [ MemMax + 512 ] 0;		! expect to use 1 : MemMax ;
+69	  Own Safe Integer Array VM[ 1 : MemMax+512 ];	!  entries minus page slop ;
+70	 endc
+71	
+72	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 3
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+73	
+74	Ifcr FT!InternalPages thenc
+75	  Simple Procedure InitStuff;
+76	elsec
+77	  Internal Simple Procedure VMInit( Integer Page, Count );
+78	endc
+79	! ----------------------------------------------------------------------;
+80	!									;
+81	!	InitStuff							;
+82	!		Routine to initialize data structures and calculate	;
+83	!		where to put the initial cache of pages to use for	;
+84	!		this venture.						;
+85	!									;
+86	!	VMInit( FirstPage, Count )					;
+87	!		Routine to setup a cache of pages for the user to use	;
+88	!		instead of using the preset range designated by this	;
+89	!		package.  This is setup via the assembly parameter:	;
+90	!		(FT!InternalPages).					;
+91	!									;
+92	! ----------------------------------------------------------------------;
+93	begin "VM Init"
+94	
+95	  Ifcr FT!InternalPages thenc		! internal definition ;
+96	    VMPage_ (location( VM[1] ) + '777) lsh -9;
+97	    MaxSlots_ MaxSlot;			! count of pages ;
+98	  elsec
+99	    VMPage_ Page;			! base page ;
+100	    MaxSlots_ Count max MaxSlot;	! count of pages ;
+101	  endc
+102	    VMMem_ VMPage lsh 9;		! base memory address ;
+103	
+104	    ArrClr( Files );			! files not open ;
+105	
+106	end "VM Init";
+107	Ifcr FT!InternalPages thenc
+108	  require InitStuff initialization;
+109	endc
+110	
+111	
+112	Internal Simple Integer Procedure VMMaxS( Integer Count );
+113	! ----------------------------------------------------------------------;
+114	!									;
+115	!	NewCount_ VMMaxS( Count )					;
+116	!		Routine to limit the maximum number of slots to use	;
+117	!		in this package.  Useful to insure that specifically	;
+118	!		allocated channels between the top of SAILs channel	;
+119	!		range and those used by VMFILE are not used.		;
+120	!									;
+121	! ----------------------------------------------------------------------;
+122	begin "VM Max Slots"
+123	
+124	    return( MaxSlots_ Count max MaxSlot );	! count of pages ;
+125	
+126	end "VM Max Slots";
+127	
+128	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 4
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+129	
+130	Simple Integer Procedure MapPage( r!p (F) Rec; Integer NewPage );
+131	! ----------------------------------------------------------------------;
+132	!									;
+133	!	MapPage( Rec, NewPage )						;
+134	!		Routine to map the specified new file-page into the	;
+135	!		page designated by F:Page[Rec] and update F:File[Rec]	;
+136	!		to NewPage.						;
+137	!									;
+138	! ----------------------------------------------------------------------;
+139	begin "Map Page"
+140	    Own safe integer array Arg[ 0:1 ];
+141	    Own integer Status, Err;
+142	
+143	    If ( F:File[Rec] = NewPage )		! if the same page ;
+144	     then begin "check protection"
+145	
+146		If not( F:Mode[Rec] )			! if no writing request ;
+147		 then return( NewPage );		! then nothing special ;
+148		Status_Calli(F:Page[Rec],calli!PAGSTS);	! read page protection ;
+149		If ( '3 = ( Status land '7 ) )		! if read/write? ;
+150		 then return( NewPage );		!  then nothing to do ;
+151		Err_ Calli( !Xwd( '6001,F:Page[Rec] ), calli!VPROT );
+152		If ( !skip! )				! if no problems, return! ;
+153		 then return( NewPage )			!  nothing else to do ;
+154		 else begin				! otherwise complain and ;
+155		    Print( "Map error: ",cvos(Err)," pagsts: ",cvos(Status),crlf );
+156		    return( F:File[Rec]_ 0 );		! make believe un-mapped ;
+157		 end;
+158	
+159	     end "check protection";
+160	
+161	    Calli( Arg[0]_ !Xwd('2001,F:Page[Rec]), calli!VCLEAR );
+162	    if ( VM$Read neq F:Mode[Rec] )		! if we're writing then ;
+163	     then Arg[0]_ !Xwd('6001,F:Page[Rec]);	!  make it .prrw not .prro ;
+164	    Arg[1]_ NewPage;				! point at file page ;
+165	    Chnior( F:Chan[Rec], Arg[0], !chMFP );	! map the page ;
+166	    Start!code MOVEM '3,ERR; end;		! remember any errors ;
+167	
+168	    if ( !Skip! )				! remember file page ;
+169	     then F:File[Rec]_ NewPage			!  NewPage (if map ok) ;
+170	     else begin "map failure"			! else check the fault ;
+171		F:File[Rec]_ 0;				! default (if map fails) ;
+172	
+173		if ( F:Mode[Rec] ) and			! if writing and past ;
+174		      ( !rh(ERR)='6 )			!   highest page (FLPHP%) ;
+175		 then begin "create page"		!  then try to create it ;
+176	
+177		    Chnior( F:Chan[Rec], NewPage, !chCFP );
+178		    If ( !Skip! )			! check success flag ;
+179		     then begin "try map again"		! if ok, then try map ;
+180			Chnior( F:Chan[Rec], Arg[0], !chMFP );
+181			if ( !Skip! )			! any errors? ;
+182			 then F:File[Rec]_ NewPage;	! no, it's ok ;
+183		     end "try map again";
+184	
+185		 end "create page";
+186	     end "map failure";
+187	
+188	    return( F:File[Rec] );			! return current mapping ;
+189	
+190	end "Map Page";
+191	
+192	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 5
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+193	
+194	Integer Procedure VM!PMap( Integer Slot, NewPage );
+195	Return( MapPage( Files[ Slot ], NewPage ) );
+196	
+197	Internal Simple Integer Procedure VMPMap( Integer Slot, NewPage );
+198	! ----------------------------------------------------------------------;
+199	!									;
+200	!	NewPage_ VMPMap( Slot, NewPage )				;
+201	!		Routine to map the specified new page into the map	;
+202	!		slot for this slot and return the new page on success.	;
+203	!		Returns 0 if any errors occur, including wrong page	;
+204	!		protection.						;
+205	!									;
+206	! ----------------------------------------------------------------------;
+207	begin  "VM Page Map"
+208	
+209	    If not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+210	     then return( false );		!  valid, else return ;
+211	
+212	    If not( Files[ Slot ] )		! slot assigned? ;
+213	     then return( false );		!  not this time ;
+214	
+215	    return( VM!PMap( Slot, NewPage ) );	! return the proper page ;
+216	
+217	end "VM Page Map";
+218	
+219	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 6
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+220	
+221	Simple Integer Procedure Dbp( Reference Integer Ptr );
+222	! ----------------------------------------------------------------------;
+223	!									;
+224	!	Dbp( AsciiBytePointer )						;
+225	!		Routine to decrement a 7-bit byte pointer.  Its only	;
+226	!		magic relies on the assumption that a negative pointer	;
+227	!		is setup as '440700 from the point/bbpp operation that	;
+228	!		creates a ildb pointer to the first byte of the word.	;
+229	!		This routine fixes this to point to the last byte of	;
+230	!		the previous word whenever this is seen.  In "this"	;
+231	!		initial case, this works so that the pointer is never	;
+232	!		decremented the WRONG way.				;
+233	!									;
+234	! ----------------------------------------------------------------------;
+235	begin "Decrement Byte Pointer"
+236	
+237	    If ( Ptr < 0 )			! initially '440700,,addr ;
+238	     then Ptr_ Ptr - BackByte		! so set to prev-last byte ;
+239	     else Ptr_ Ptr + AddaByte;		! else decrement a byte ;
+240	
+241	    If ( Ptr < 0 )			! must now be '440700,,addr ;
+242	     then Ptr_ Ptr - BackByte;		! so set to prev-last byte ;
+243	
+244	    return( Ptr );			! so it can be an expression ;
+245	
+246	end "Decrement Byte Pointer";
+247	
+248	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 7
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+249	
+250	Simple Integer procedure GetText( Reference string Line;
+251					  Integer Byte, Count; String Chars );
+252	begin "get text"
+253	    Own integer wp;
+254	    String Str;
+255	
+256	    while ( length( Line ) )
+257	     do begin "get data"
+258	
+259		Str_ Chars;				! copy break chars ;
+260		while ( length( Str ) )			! if any break chars ;
+261		 do if ( Line = Lop( Str ) )		!  and match a brk ;
+262		     then return( Line );		!  return that character ;
+263	
+264		if ( 0 leq count_ count - 1 )		! if room left in string ;
+265		 then if ( "a" leq wp_lop(Line) )	!  then check case ;
+266		       then idpb( wp-'100, byte )	!    lowercase to sixbit ;
+267		       else idpb( wp-'40, byte )	!    uppercase to sixbit ;
+268		 else wp_ lop( Line );			!  throw away extras ;
+269	
+270	     end "get data";
+271	
+272	    return( 0 );				! no line left? ;
+273	
+274	end "get text";
+275	
+276	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 8
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+277	
+278	Internal Simple Boolean Procedure VMSpec(String L; Integer array Spec );
+279	! ----------------------------------------------------------------------;
+280	!									;
+281	!	Ok_ VMSpec( FileSpecification, SpecificationBlock )		;
+282	!		Routine to read a string file specification and build	;
+283	!		the special file block used by the VMFile routine.	;
+284	!									;
+285	! ----------------------------------------------------------------------;
+286	begin "VM Spec"
+287	
+288	    arrclr( Spec );				! clear out the array ;
+289	
+290	    GetText( L, point( 6,Spec[S!Nam],-1 ), 6, ":(." );
+291	
+292	    if ( ":" = L )				! it was a device, good! ;
+293	     then begin
+294		lop( L );				! throw away the colon and ;
+295		Spec[S!Dev] swap Spec[S!Nam];		! swap data to right places ;
+296	     end
+297	     else Spec[S!Dev]_cvsix("DSK");		!  and fill in the device ;
+298	
+299	    if ( "(" = L )				! if it starts with "(" ;
+300	     then begin "get user"			!  then pick up username ;
+301		lop( L );				!    eat the "(" ;
+302		GetText( L, point( 6,Spec[ S!Usr ],-1 ), 12, ")" );
+303		lop( L );				!    eat the ")" ;
+304	     end "get user"
+305	     else begin "default user"			! set default if no user ;
+306		Spec[ S!Usr   ]_ Gettab( -1,'31 );	! .GTNM1 (GFD user 1-6)  ;
+307		Spec[ S!Usr+1 ]_ Gettab( -1,'32 );	! .GTNM2 (GFD user 7-12) ;
+308		If not( !Skip! )			! set blank if GETTAB fails ;
+309		 then Spec[ S!Usr ]_ Spec[ S!Usr+1 ]_ 0;
+310	     end "default user";
+311	
+312	    if not( length( L ) or Spec[S!Nam] )	! must have a name ;
+313	     then return( false );			!  so return false ;
+314	
+315	    if not( "." = L or Spec[S!Nam] )
+316	     then GetText( L, point( 6,Spec[ S!Nam ],-1 ), 6, "." );
+317	
+318	    if not( Spec[S!Nam] )			! seen anyone ;
+319	     then return( false );			! no, go home ;
+320	
+321	    if ( "." = L )				! if dot seen ;
+322	     then begin "get ext"
+323		lop( L );				!  then chop it off ;
+324		GetText( L, point( 6,Spec[ S!Ext ],-1 ), 3, " "&'11 );
+325	     end "get ext";
+326	
+327	    return( true );				! got here, return ok ;
+328	
+329	end "VM Spec";
+330	
+331	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 9
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+332	
+333	Internal Simple Integer Procedure VMChan;
+334	! ----------------------------------------------------------------------;
+335	!									;
+336	!	Chan_ VMChan							;
+337	!		Returns the next available channel for this user.	;
+338	!		If none are available, returns -1.			;
+339	!									;
+340	! ----------------------------------------------------------------------;
+341	begin "VM Chan"
+342	
+343	    start!code
+344	
+345		ReDefine !chNXT = '46;		! get next channel ;
+346	
+347		Hrloi	'1,!chNXT;		! setup [.chnxt,,-1] ;
+348		uuo!CHANIO '1,;			! to get next available ;
+349		  seto	'1;			! no channels available ;
+350		skipl	'1;			! if less than zero ;
+351		  tlz	'1,-1;			!  skip, else zero left ;
+352	
+353	    end;
+354	
+355	end "VM Chan";
+356	
+357	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 10
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+358	
+359	R!P (F) Procedure NewRec;
+360	! ----------------------------------------------------------------------;
+361	!									;
+362	!	Rec_ NewRec							;
+363	!		Returns the next available record of class (F) from	;
+364	!		the dormant list or the record pool.			;
+365	!									;
+366	! ----------------------------------------------------------------------;
+367	begin "new record"
+368	    r!p (F) Rec;
+369	
+370	    if ( Dormant )
+371	     then begin "dormant records"
+372	
+373		Rec_ Dormant;
+374		Dormant_ F:Next[ Rec ];
+375		F:Next[ Rec ]_ null!record;
+376		F:Page[ Rec ]_ F:File[ Rec ]_
+377		F:Chan[ Rec ]_ F:Mode[ Rec ]_
+378		F:Name[ Rec ]_ F:FExt[ Rec ]_ F:FPPN[ Rec ]_
+379		F:Char[ Rec ]_ F:Line[ Rec ]_ F:PTxt[ Rec ]_ F:MTxt[ Rec ]_
+380		F:Last[ Rec ]_ F:CRet[ Rec ]_
+381		F:Size[ Rec ]_ F:LSiz[ Rec ]_ F:PSiz[ Rec ]_ F:MSiz[ Rec ]_
+382		F:FLic[ Rec ]_ F:Time[ Rec ]_ F:Date[ Rec ]_
+383		F:Flag[ Rec ]_ 0;
+384	
+385	     end "dormant records"
+386	     else Rec_ new!record( F );
+387	
+388	    return( Rec );
+389	
+390	end "new record";
+391	
+392	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 11
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+393	
+394	Simple Integer Procedure VMSlot;
+395	! ----------------------------------------------------------------------;
+396	!									;
+397	!	Slot_ VMSlot							;
+398	!		Returns the next available file slot in the internal	;
+399	!		file table.  If no slots or channels are available,	;
+400	!		returns 0.  Array Files[slot] is setup with F:Chan,	;
+401	!		F:Page and F:Char.					;
+402	!									;
+403	! ----------------------------------------------------------------------;
+404	begin "VM Slot"
+405	    Own Integer Slot, Chan;
+406	
+407	    For Slot_ 1 upto MaxSlots		! check each legal slot ;
+408	     do if not( Files[ Slot ] )		! if it's free ;
+409		 then begin "setup slot"	!  then make it available ;
+410	
+411		    S_ Files[ Slot ]_ NewRec;		! initialize record ;
+412	
+413		    if ( 0 > Chan_ VMChan )		! is it legal ;
+414		     then begin "bad channel"		!  nope. ;
+415			if ( VMRecF )			!   dormant records? ;
+416			 then begin "keep dormant"
+417			    F:Next[ S ]_ Dormant;	!   place at front ;
+418			    Dormant_ S;			!   of list ;
+419			 end "keep dormant";
+420			Files[ Slot ]_ S_ null!record;	!   clear slot ;
+421			return( 0 );			!   and return ;
+422		     end "bad channel";
+423	
+424		    F:Chan[ S ]_ Chan;			! copy the channel ;
+425		    F:Page[ S ]_ VMPage  + Slot - 1;	! memory page ;
+426		    F:File[ S ]_ F:Char[ S ]_ -1;	! file/char position ;
+427	
+428		    S_ null!record;		! free up working pointer ;
+429	
+430		    return( Slot );		! give caller a slot number ;
+431	
+432		 end "setup slot";
+433	
+434	    return( 0 );
+435	
+436	end "VM Slot";
+437	
+438	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 12
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+439	
+440	Internal Simple Integer Procedure VMGetC( Integer Slot, Index(VM$Char) );
+441	! ----------------------------------------------------------------------;
+442	!									;
+443	!	Position_ VMGetC( Slot, Index(VM$Char) )			;
+444	!		Read the specified characteristic from the file table.	;
+445	!									;
+44---------------------------------------------------------------------;
+447	begin "VM Get Character Pointer"
+448	
+449	    If not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+450	     then return( -2 );			!  valid, else return ;
+451	
+452	    If not( S_ Files[ Slot ] )		! slot assigned? ;
+453	     then return( -2 );			!  not this time ;
+454	
+455	    Case Index of begin
+456		[VM$Char]   return( F:Char[ S ] );	! return character position ;
+457		[VM$Line]   return( F:Line[ S ] );	! return line position ;
+458		[VM$Page]   return( F:PTxt[ S ] );	! return page position ;
+459		[VM$Msg]    return( F:MTxt[ S ] );	! return message position ;
+460		[VM$Eol]    return( F:Last[ S ] );	! return last eol char ;
+461		[VM$ECR]    return( F:CRet[ S ] );	! return last cr on line ;
+462		[VM$Size]   return( F:Size[ S ] );	! return file size in chars ;
+463		[VM$LSize]  return( F:LSiz[ S ] );	! return file size in lines ;
+464		[VM$PSize]  return( F:PSiz[ S ] );	! return file size in pages ;
+465		[VM$MSize]  return( F:MSiz[ S ] );	! return file size in msgs ;
+466		[VM$Lic]    return( F:FLic[ S ] );	! return file license ;
+467		[VM$Access] return( F:Mode[ S ] );	! return file access mode ;
+468		[VM$Time]   return( F:Time[ S ] );	! return file creation time ;
+469		[VM$Date]   return( F:Date[ S ] );	! return file creation date ;
+470		[VM$Base]   return( F:Page[ S ] );	! return memory base page ;
+471		[VM$FPage]  return( F:File[ S ] );	! return file page on dsk ;
+472		[VM$Chan]   return( F:Chan[ S ] );	! return physical channel ;
+473		[VM$Flag]   return( F:Flag[ S ] );	! return file access flags ;
+474		[else]      return( -3 )		! illegal index ;
+475	    end;
+476	
+477	end "VM Get Character Pointer";
+478	
+479	
+480	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 13
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+481	
+482	Internal Simple Integer Procedure VMSetC( Integer Slot, Position );
+483	! ----------------------------------------------------------------------;
+484	!									;
+485	!	NewPosition_ VMSetC( Slot, TrialPosition )			;
+486	!		Set the character position with the file open on the	;
+487	!		specified slot.  All further references to the slot	;
+488	!		will use the new file position.  If the specified	;
+489	!		position is outside the file, the position is set to	;
+490	!		-1.  The routine always returns the new position.	;
+491	!									;
+492	! ----------------------------------------------------------------------;
+493	begin "VM Set Character Pointer"
+494	
+495	    If not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+496	     then return( false );		!  valid, else return ;
+497	
+498	    If not( S_ Files[ Slot ] )		! slot assigned? ;
+499	     then return( false );		!  not this time ;
+500	
+501	    If ( 0 leq Position leq F:Size[S] )	! if position within range ;
+502	     then F:Char[S]_ Position		!  then set it up ;
+503	     else F:Char[S]_ Position_ -1;	!  else set to -1 ;
+504	
+505	    return( Position );			! return the new position ;
+506	
+507	end "VM Set Character Pointer";
+508	
+509	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 14
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+510	
+511	Internal Simple Boolean Procedure VMFree( Integer Slot, Bits(0) );
+512	! ----------------------------------------------------------------------;
+513	!									;
+514	!	Ok_ VMFree( Slot )						;
+515	!		Closes any open file for this slot and frees the	;
+516	!		slot for future use.  Returns true if the slot was	;
+517	!		in use.							;
+518	!									;
+519	! ----------------------------------------------------------------------;
+520	begin "VM Free"
+521	    preset!with 0,0,0,0;
+522	    Own integer array delete[0:3];
+523	    Own integer chan;
+524	
+525	    If not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+526	     then return( false );		!  valid, else return ;
+527	
+528	    If not( S_ Files[ Slot ] )		! slot assigned? ;
+529	     then return( false );		!  not this time ;
+530	
+531	    Calli( !Xwd( '2001, F:Page[ S ] ), calli!VCLEAR );
+532	
+533	    Chan_ F:Chan[S];			! get a handy channel ;
+534	    if ( Bits or F:Mode[ S ] )		! if any writes ;
+535	     then begin "some changes"		!  reset size & close file ;
+536	
+537		If ( F:Size[ S ] > 0 )		! if non-zero size ;
+538		 then Chniov( Chan, (F:Size[S]+4) div 5, !chFTR );
+539	
+540		if ( Bits = -1 )		! Special "RENAME" ;
+541		 then begin "rename"
+542		    Chnior( Chan, Delete[0], !chREN );
+543		    Chnior( Chan, memory[0], !chCLS );
+544		    Chnior( Chan, memory[0], !chREL );
+545		 end "rename"
+546		 else begin "normal"
+547		    Chnior( Chan, memory[Bits], !chCLS );
+548		    Chnior( Chan, memory[Bits], !chREL );
+549		 end "normal";
+550	
+551	     end "some changes"
+552	     else Chnior( Chan, memory[0], !chREL );
+553	
+554	    if ( VMRecF )			!   dormant records? ;
+555	     then begin "keep dormant"
+556		F:Next[ S ]_ Dormant;		!   place at front ;
+557		Dormant_ S;			!   of list ;
+558	     end "keep dormant";
+559	
+560	    Files[ Slot ]_ S_ null!record;	! clear out tables ;
+561	
+562	    return( true );			! everything is ok ;
+563	
+564	end "VM Free";
+565	
+566	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 15
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+567	
+568	Internal String Procedure VMLine( Integer Slot; Reference Integer More;
+569					  Integer Dir( 0 ) );
+570	! ----------------------------------------------------------------------;
+571	!									;
+572	!	Line_ VMLine( Slot, More, Dir(0) )				;
+573	!		Returns the next consecutive line from the file that	;
+574	!		is connected to the specified slot.  More is set to	;
+575	!		the line terminator (LF, FF, VT, CR or EOT) or to 0	;
+576	!		when the end of the file is reached or the slot is 	;
+577	!		inactive.  Dir is the direction to read the file ( 0	;
+578	!	 	indicates forward, -1 or non-zero for backward).	;
+579	!									;
+580	! ----------------------------------------------------------------------;
+581	begin "VM Line"
+582	    Integer Page, Byte, Copy, Count, Len, Last;
+583	    Boolean Eol;
+584	    String Str;
+585	
+586	    More_ 0;				! Initialize for bad exits ;
+587	
+588	    If not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+589	     then return( null );		!  valid, else return ;
+590	
+591	    If not( S_ Files[ Slot ] )		! slot assigned? ;
+592	     then return( null );		!  not this time ;
+593	
+594	    If ( Dir )				! verify proper usage of Dir ;
+595	     then Dir_ -1			!  non-zero = backward = -1 ;
+596	     else Dir_ +1;			!  was-zero = forward  = +1 ;
+597	
+598	    If ( F:Char[S] = -1 )		! we are mapped? ;
+599	     then If ( Dir < 0 )		! Forward or Backward? ;
+600		   then F:Char[S]_ F:Size[S]	!   Set after last character ;
+601		   else F:Char[S]_ 0;		!   Set before first character ;
+602	
+603	    If ( F:File[S] neq Page_ ( F:Char[S] div CharPerPage ) + 1 )
+604	     then if not( MapPage( S, Page ) )	! Verify using right page ;
+605		   then return( null );		!  and page gets mapped ;
+606	
+607	    Count_ F:Char[S] mod CharPerPage;	! Character position in page ;
+608	    Copy_Byte_point(7,memory[(F:Page[S] lsh 9)+(Count div 5)],((Count mod 5)*7)-1);
+609	    If ( Byte < 0 )			! Means we have '440700,,x ;
+610	     then Copy_ Byte_ Byte - BackByte;	! Point at an actual byte ;
+611	    If ( Dir < 0 )			! If backward direction ;
+612	     then Ibp( Copy );			!  then setup for Dbp by 1 ;
+613	
+614	    Str_ Null;				! Initial return string ;
+615	
+616	    If ( Dir geq 0 )			!   Fix count (# left) ;
+617	     then If ( ( F:File[S] * CharPerPage ) > F:Size[S] )
+618		   then Count_ (F:Size[S] mod CharPerPage) - Count
+619		   else Count_ CharPerPage - Count;
+620	
+621	    Len_ 0;				! Initialize string length ;
+622	    F:Last[S]_ F:CRet[S]_ 0;		! Initialize break vars ;
+623	    Last_ -1;				! Last character seen ;
+624	    Eol_ false;				! Initialize line var ;
+625	    While not( Eol )			! Read one line ;
+626	     do begin "one line"
+627	
+628		If ( Count > 0 )		! Must have chars left ;
+629		 then begin "more characters"	!  to even try to read ;
+630	
+631		    If ( Dir < 0 )		! Forward or Backward? ;
+632		     then Dbp( Copy )		!  position the character ;
+633		     else Ibp( Copy );		!  pointer in the page ;
+634	
+635		    F:Char[S]_ F:Char[S] + Dir;	! Update file character count ;
+636	
+637		    Case More_ Ldb( Copy ) of begin	! check for end of line ;
+638			[#nul] begin "found eos break"
+639			    If ( Len )			! length to concatenate? ;
+640			     then if ( Dir < 0 )	! yes, use right direction ;
+641				   then Str_ StMake( Copy, Len ) & Str
+642				   else Str_ Str & StMake( Byte, Len );
+643			    If ( Dir < 0 ) and		! Backing up? ;
+644			       not( F:Last[S] )		! First time through? ;
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 15.1
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+645			     then Dbp( Byte )		!  yes, keep it this way ;
+646			     else Byte_ Copy;		!  no, update pointer ;
+647			    Len_ 0;			! Reset string length ;
+648			 end "found eos break";
+649	
+650			[#cr] begin "found return"
+651			    If ( Dir < 0 )
+652			     then if ( #LF leq Last leq #FF )
+653				   then F:CRet[S]_ #CR	! remember we saw this ;
+654				   else begin "lone cr"
+655				      If ( Copy = Byte )	! if first char ;
+656				       then F:Last[S]_ More	!  remember and go ;
+657				       else begin "eol cr"	! else do eol stuff ;
+658					 Eol_ true;		! set end of line ;
+659					 More_ F:Last[S];	! and get last one ;
+660					 F:Char[S]_ F:Char[S]+1	! bump pointer by 1 ;
+661				       end "eol cr";
+662				   end "lone cr";
+663			    If ( ( Dir > 0 ) and ( #CR = Last ) )
+664			     then Eol_ true;		! flag as end of line ;
+665			    If ( Len )			! length to concatenate? ;
+666			     then if ( Dir < 0 )	! yes, use right direction ;
+667				   then Str_ StMake( Copy, Len ) & Str
+668				   else Str_ Str & StMake( Byte, Len );
+669			    Byte_ Copy;			! synchronize pointers ;
+670			    Len_ 0;			! Reset string length ;
+671			 end "found return";
+672	
+673	!		[#eot] ;
+674			[#lf][#vt][#ff] begin "found eol break"
+675			    Eol_ true;			! looks like one? ;
+676			    if ( Dir < 0 )		! were we going backward? ;
+677			     then if ( Copy = Byte )	!  and the first character ;
+678				   then begin "not eol"
+679				      Eol_ false;	!  yes, not really eol ;
+680				      F:Last[S]_ More;	!  remember this for later ;
+681				      F:Line[S]_ F:Line[S] + Dir;	! each line ;
+682				      If ( More = #FF )			! each FF ;
+683				       then F:PTxt[S]_ F:PTxt[S] + Dir;	! text page ;
+684				      If ( More = #EOT )		! each EOT ;
+685				       then F:MTxt[S]_ F:MTxt[S] + Dir;	! message ;
+686				   end "not eol"
+687				   else begin "got eol"
+688				      F:Char[S]_ F:Char[S] + 1;		! each char ;
+689				      More_ F:Last[S];			! eol-brk ;
+690				   end "got eol"
+691			     else begin "forward eol"
+692				If ( Last = #CR ) and ( #LF leq More leq #FF )
+693				 then F:CRet[S]_ Last;		! mark CR before Brk ;
+694				If ( More = #FF )		! for each FF seen ;
+695				 then F:PTxt[S]_ F:PTxt[S]+Dir;	!  count a text page ;
+696				If ( More = #EOT )		! for each EOT seen ;
+697				 then F:MTxt[S]_ F:MTxt[S]+Dir;	!  count a text message ;
+698				F:Line[S]_ F:Line[S] + Dir;	! count each line ;
+699			     end "forward eol";
+700			    If ( Len )			! length to concatenate? ;
+701			     then if ( Dir < 0 )	! yes, use right direction ;
+702				   then Str_ StMake( Copy, Len ) & Str
+703				   else Str_ Str & StMake( Byte, Len );
+704			 end "found eol break";
+705	
+706			[else] begin "normal character"
+707			    If ( Last = #CR ) and ( Dir > 0 )
+708			     then begin "lonely cr"	! else do eol stuff ;
+709				Eol_ true;		! set end of line ;
+710				F:Char[S]_ F:Char[S]-1;	! bump pointer by 1 ;
+711				More_ #CR;		! set eol to CR ;
+712				If ( Len )		! length to concatenate? ;
+713				 then Str_ Str & StMake( Byte, Len );
+714			     end "lonely cr"
+715			     else Len_ Len + 1		!  increment string length ;
+716			 end "normal character"
+717		    end;
+718	
+719		    If ( memory[ !rh( copy ) ] land 1 )	! bit 35 set ;
+720		     then begin "sequence numbers"	! in this word? ;
+721	
+722			If ( Dir < 0 )
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 15.2
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+723			 then begin "seq backward"
+724			    F:Char[S]_ F:Char[S] - 4;	! tab already seen backwards ;
+725			    Count_ Count - 4;		!  update counts by 4 chars ;
+726			    If ( Len > 2 )
+727			     then begin "add text"	!  +1 for tab after seq # ;
+728				Ibp( Copy );		! make string skipping tab ;
+729				Str_ StMake( Copy, Len-2 ) & Str;
+730			     end "add text"
+731			 end "seq backward"
+732			 else begin "seq forward"
+733			    F:Char[S]_ F:Char[S] + 5;	! include tab in count here ;
+734			    Count_ Count - 5;		!  update counts by 5 chars ;
+735			    if ( Len neq 1 )
+736			     then Print( "*** Bad SEQ # in text file. ***"& Crlf );
+737			 end "seq forward";
+738	
+739			Byte_ Copy_ Copy + Dir;		!  update 1 word ;
+740			Len_ 0;				! Reset length ;
+741	
+742		     end "sequence numbers";
+743	
+744		    If ( 0 = Count_ (Count-1) max 0 )	! If now out of characters ;
+745		     then begin "fake eos break"
+746			If ( Len )			! length to concatenate? ;
+747			 then if ( Dir < 0 )
+748			       then Str_ StMake( Dbp( Copy ), Len ) & Str
+749			       else Str_ Str & StMake( Byte, Len );
+750			Len_ 0;				! Reset string length ;
+751		     end "fake eos break";
+752	
+753		    If ( More )				! if this is not a null ;
+754		     then Last_ More;			! last char for next time ;
+755	
+756		 end "more characters"
+757		 else begin "need next page"		! If no-more-characters ;
+758	
+759		    If ( F:Char[S] geq F:Size[S] )	! Forwards at end or ;
+760		       or ( F:Char[S] leq 0 )		!  backwards at beginning ;
+761		     then begin "end of file"		! At end-of-file? ;
+762	
+763			Eol_ true;			! Set flags true ;
+764			If ( Dir < 0 )			! If backing up ;
+765			 then More_ F:Last[S]		!  use last break at end ;
+766			 else begin "save info"
+767			    More_ 0;			!  set flag var to 0 ;
+768			    F:LSiz[S]_ F:Line[S];	!  save total size in lines ;
+769			    F:PSiz[S]_ F:PTxt[S];	!  save total size in pages ;
+770			    F:MSiz[S]_ F:MTxt[S];	!  save total size in pages ;
+771			 end "save info";
+772			Done "one line";		! Finish loop ;
+773	
+774		     end "end of file";			! Guess, read next page ;
+775	
+776		    If not( MapPage( S, Page_ ( F:Char[S] div CharPerPage ) + 1 ) )
+777		     then return( null );		! error mapping! ;
+778	
+779		    ! ** assume: here at the beginning of the page ** ;
+780		    If ( Dir < 0 )			! Forward or Backward? ;
+781		     then Copy_ Byte_ point( 7, memory[(F:Page[S]+1) lsh 9], -1 )
+782		     else Copy_ Byte_ point( 7, memory[F:Page[S] lsh 9], -1 );
+783	
+784		    If ( ( Page * CharPerPage ) > F:Size[S] )
+785		     then Count_ F:Size[S] mod CharPerPage
+786		     else Count_ CharPerPage;
+787	
+788		 end "need next page";
+789	
+790	     end "one line";
+791	
+792	    return( Str );			! give 'em what they came for ;
+793	
+794	end "VM Line";
+795	
+796	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 16
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+797	
+798	Internal Boolean Procedure VMText( Integer Slot; String Text );
+799	! ----------------------------------------------------------------------;
+800	!									;
+801	!	Ok_ VMText( Slot, Text, Dir(0) )				;
+802	!		Writes the next consecutive line or lines to the file	;
+803	!		that is connected to the specified slot.		;
+804	!									;
+805	! ----------------------------------------------------------------------;
+806	begin "VM Text"
+807	    Integer Page, Byte, Char, Count;
+808	
+809	    if not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+810	     then return( false );		!  valid, else return ;
+811	
+812	    if not( S_ Files[ Slot ] )		! slot assigned? ;
+813	     then return( false );		!  not this time ;
+814	
+815	    if not( F:Mode[S] )			! were we writing? ;
+816	     then return( false );		! no, don't bother! ;
+817	
+818	    if ( F:Char[S] = -1 )		! we are mapped? ;
+819	     then F:Char[S]_ 0;			!   Set before first character ;
+820	
+821	    if not( MapPage( S, Page_ ( F:Char[S] div CharPerPage ) + 1 ) )
+822	     then begin
+823		Print( "Page map error: p",page,"  c",F:Char[S],"  f",F:Chan[S],crlf );
+824		return( false );		! if no page, error return ;
+825	     end;
+826	
+827	    Count_ F:Char[S] mod CharPerPage;	! Character position in page ;
+828	    Byte_point(7,memory[(F:Page[S] lsh 9)+(Count div 5)],((Count mod 5)*7)-1);
+829	
+830	    Count_ CharPerPage - Count;		! Fix count (# left) ;
+831	
+832	    while ( length( Text ) )		! Must have some text left ;
+833	     do begin "writing line"
+834	
+835		If ( Count > 0 )		! Must have room left on page ;
+836		 then begin "more characters"	!  to even try to write ;
+837	
+838		    If not( Char_ Lop( Text ) )	! if char = null then try next ;
+839		     then continue "writing line";
+840	
+841		    IDpb( Char, Byte );		! deposit byte at position ;
+842		    F:Char[S]_ F:Char[S] + 1;	! Update file character count ;
+843	
+844		    Case ( Char ) of begin	! check for end of line ;
+845			[#cr] F:CRet[S]_ #CR;	! remember we saw this ;
+846	
+847	!		[#eot] ;
+848			[#lf][#vt][#ff] begin "count lines"
+849			  F:Last[S]_ Char;		! remember eol character ;
+850			  F:Line[S]_ F:Line[S] + 1;	! count lines seen ;
+851			  If ( Char = #FF )		! for each FF seen ;
+852			   then F:PTxt[S]_ F:PTxt[S]+1;	!  count a text page ;
+853			  If ( Char = #EOT )		! for each EOT seen ;
+854			   then F:MTxt[S]_ F:MTxt[S]+1;	!  count a text message ;
+855			 end "count lines";
+856	
+857			[else] F:CRet[S]_ 0	! forget we saw a cr ;
+858		     end;
+859	
+860		    Count_ (Count-1) max 0;	! keep character count ;
+861	
+862		 end "more characters"
+863		 else begin "need next page"	! If no-more-characters ;
+864	
+865		    If not( MapPage( S, Page_ ( F:Char[S] div CharPerPage ) + 1 ) )
+866		     then begin
+867			Print( "Page(2) map error: ",page," ",F:Char[S],crlf );
+868			return( false );	! if no page, error return ;
+869		     end;
+870	
+871		    Byte_ point( 7, memory[F:Page[S] lsh 9], -1 );
+872		    Count_ CharPerPage;		! always a full page to write in ;
+873	
+874		 end "need next page";
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 16.1
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+875	
+876	     end "writing line";
+877	
+878	    If ( F:Char[S] geq F:Size[S] )	! At or Past end of file? ;
+879	     then begin "end of file"
+880	
+881		F:Size[S]_ F:Char[S];		!  save size in characters ;
+882		F:LSiz[S]_ F:Line[S];		!  save total size in lines ;
+883		F:PSiz[S]_ F:PTxt[S];		!  save total size in pages ;
+884		F:MSiz[S]_ F:MTxt[S];		!  save total size in pages ;
+885	
+886	     end "end of file";			! Guess, read next page ;
+887	
+888	    return( true );			! give 'em what they came for ;
+889	
+890	end "VM Text";
+891	
+892	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 17
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+893	
+894	Internal Boolean Procedure VMMove( Integer Slot, HowMany(1) );
+895	! ----------------------------------------------------------------------;
+896	!									;
+897	!	Ok_ VMMove( Slot, HowMany(1) )					;
+898	!		Moves the position pointer forward or backward up to	;
+899	!		HowMany lines in the file.  Returns true if the slot is	;
+900	!		active and HowMany lines exist, otherwise it returns	;
+901	!		false and leaves the pointer positioned at logical end	;
+902	!		of file (at the beginning if direction is backward).	;
+903	!									;
+904	! ----------------------------------------------------------------------;
+905	begin "VM Move"
+906	    Own Integer Brk;
+907	
+908	    If not( 1 leq Slot leq MaxSlot )	! only "my" Slots are ;
+909	     then return( false );		!  valid, else return ;
+910	
+911	    If not( S_ Files[ Slot ] )		! slot assigned? ;
+912	     then return( false );		!  not this time ;
+913	
+914	    If not( HowMany )			! we can always move ;
+915	     then return( true );		!  a distance of 0 ;
+916	
+917	    while ( HowMany )			! while lines to go read them ;
+918	     do begin "moving lines"
+919	
+920		If not( length( VMLine( Slot, Brk, HowMany < 0 ) ) or Brk )
+921		 then return( false );		!  then take the cows to town ;
+922	
+923		If ( HowMany > 0 )		! decrement the right direction ;
+924		 then HowMany_ HowMany - 1	!  down to zero  ;
+925		 else HowMany_ HowMany + 1;	!  or up to zero ;
+926	
+927	     end "moving lines";
+928	
+929	    return( true );			! give 'em what they came for ;
+930	
+931	end "VM Move";
+932	
+933	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 18
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+934	
+935	Internal Simple Boolean Procedure VMFile( String Spec; Integer Mode(VM$Read) );
+936	! ----------------------------------------------------------------------;
+937	!									;
+938	!	Slot_ VMFile( StringSpec, AccessMode )				;
+939	!		Opens a file for the specified access.  A positive	;
+940	!		slot number is returned if the file is available.  A 	;
+941	!		0 means no slots and a negative value means there was	;
+942	!		some file error or the file is not available.		;
+943	!									;
+944	! ----------------------------------------------------------------------;
+945	begin "VM File"
+946	    Own Safe Integer Array File[ 0 : !RBLIC ];
+947	    Preset!with '17, cvsix("DSK   "), 0;
+948	    Own Safe Integer Array Dev[ 0 : 2 ];
+949	    Own Integer Slot, Flag, Chan;
+950	
+951	    if not( Slot_ VMSlot )		! If no Slots available ;
+952	     then return( false );		!  then no file opened ;
+953	
+954	    if not( S_ Files[ Slot ] )		! slot assigned? *Debug check* ;
+955	     then return( false );		!  not this time *huh why not* ;
+956	
+957	    if not( VMSpec( Spec, FileSpec ) )	! trouble with the spec? ;
+958	     then return( false );		!  then don't do anything ;
+959	
+960	    Chan_ F:CHan[ S ];			! Save for local usage ;
+961	    Mode_ !rh( Flag_ Mode );		! Remember flags ;
+962	
+963	    if not( VM$Read leq Mode leq VM$Multi )	! if an invalid mode ;
+964	     then return( false );		! Read, Write, Update, Multi ;
+965	
+966	    Dev[ 0 ]_ Ldb( Point(6,Mode,17) );	! Set proper mode (!ioASC) ;
+967	    Dev[ 1 ]_ FileSpec[ S!Dev ];	! Setup device block ;
+968	    Chnior( Chan, Dev[ 0 ], !chOPN );	! OPEN [ '17, Dev, 0 ] ;
+969	    If not( !Skip! )			! If open-failure ;
+970	     then begin "open failure"		!  then no file opened ;
+971		VMFree( Slot );			! Free the slot ;
+972		return( !Xwd( -1,-1 ) );	!  and return ;
+973	     end "open failure";
+974	
+975	    arrclr( File );			! Clear out unused fields ;
+976	    File[ !RBCNT ]_ !RBLIC;		! Setup file lookup block ;
+977	    if ( FileSpec[ S!Usr ] )
+978	     then File[ !RBPPN ]_ location( FileSpec[ S!Usr ] );
+979	    File[ !RBNAM ]_ FileSpec[ S!Nam ];
+980	    File[ !RBEXT ]_ FileSpec[ S!Ext ] land (-1 lsh 18);
+981	
+982	    If ( VM$Write neq Mode )		! if mode neq VM$Write ;
+983	     then begin "read update"		!   do lookup ;
+984	
+985		Chnior( Chan, File[ !RBCNT ], !chLK );
+986		If not( !Skip! ) and ( 0 = !rh(File[!RBEXT]) )
+987		 then begin "not found"		! no skip and file not found ;
+988		    If ( VM$Read neq Mode )	! if mode neq VM$Read, do create ;
+989		     then begin "update stuff"
+990	
+991			Chnior( Chan, File[ !RBCNT ], !chENT );
+992			if ( !Skip! )		! enter ok, so close & lookup ;
+993			 then begin "ok find it"
+994			    Chnior( Chan, memory[0], !chCLS );
+995			    Chnior( Chan, File[ !RBCNT ], !chLK );
+996			 end "ok find it";
+997	
+998		     end "update stuff";	! if !skip! found or created file ;
+999		 end "not found";		!  else some other file error ;
+1000	
+1001		if not( !Skip! )		! lookups failed - not ERFNF% ;
+1002		 then begin "huh what's up"	! unless happened 2nd time ;
+1003		    VMFree( Slot );		! so, clear out and return ;
+1004		    return( !Xwd( -1,!rh(File[!RBEXT]) ) );
+1005		 end "huh what's up";
+1006	
+1007	     end "read update";			! have old file, or new file ;
+1008	
+1009	    if ( VM$Read neq Mode )		! for VM$Write, VM$Update, VM$Multi ;
+1010	     then Chnior( Chan, File[ !RBCNT ],
+1011			   if (Mode = VM$Multi)	! if mode eql VM$Multi ;
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 18.1
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+1012			     then !chMEN	!  then use multiple enter ;
+1013			     else !chENT );	!  else use normal enter ;
+1014	
+1015	    if not( !Skip! )			! if lookup-enter failure ;
+1016	     then begin "no file or access"	!  then Free the slot ;
+1017		VMFree( Slot );			!  and return error code ;
+1018		return( !Xwd( -1,!rh(File[!RBEXT]) ) );
+1019	     end "no file or access";
+1020	
+1021	    F:Mode[ S ]_ Mode;			! Remember these things ;
+1022	    F:Flag[ S ]_ Flag;
+1023	    F:FPPN[ S ]_ File[!RBPPN];		! File directory ;
+1024	    F:Name[ S ]_ File[!RBNAM];		! File name ;
+1025	    F:FExt[ S ]_ File[!RBEXT];		! File extension ;
+1026	    F:Size[ S ]_ File[!RBSIZ] * 5;	! File size in characters (Rounded) ;
+1027	    F:FLic[ S ]_ !rh( File[!RBLIC] );	! File license ;
+1028	
+1029	    F:Time[ S ]_ (((File[!RBPRV] lsh -12) land '3777) * 60 )
+1030		       + ((File[!RBLIC] lsh -18) land '77);
+1031	    F:Date[ S ]_ (Ldb( Point( 2,File[!RBEXT],21 ) ) lsh 12)
+1032		       + (File[!RBPRV] land '7777);
+1033	
+1034	    if ( Mode > VM$Read ) and		! are we writing and ;
+1035		( VM$Append land Flag )		! wanting to append ;	
+1036		and  ( F:Size[ S ] )		! must have something ;
+1037	     then begin "tack it on"
+1038		VMSetC( Slot, F:Size[ S ] );	! set file to last word ;
+1039		VMMove( Slot, -1 );		! backup from the end ;
+1040		VMMove( Slot, 1 );		! and move forward ;
+1041	     end "tack it on";
+1042		 
+1043	    return( Slot );			! Return the slot number ;
+1044	
+1045	end "VM File";
+1046	
+1047	
+
+VMFILE.SAI                      created 03-Dec-86 16:53                                  Page 19
+Program Listing                 by CRFSYM %5 at 03-Dec-86 16:56
+
+1048	end "VM Package";
+|Bw]œ
