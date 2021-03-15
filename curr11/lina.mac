@@ -1,0 +1,235 @@
+	.TITLE	LINA  ASYNC LINE DRIVER TYPE A (DL11/DLV11)
+	.SBTTL	LINA   - NEXILIS/JRG
+
+	XLPAR				;DON'T LIST PARAMETER FILE
+
+.IF NDF ..SAT
+  ..SAT=!0
+.ENDC
+
+	CODE
+
+	.SBTTL	LINA   - RESET ROUTINE
+
+;THIS ROUTINE IS CALLED WHEN THE NODE IS STARTED OR RESTARTED
+;	C(R4) = ADDRESS OF ADB
+;	CALL	ASAINT
+
+ASAINT::CLR	SDTXAP#(SD)		;Clear packet pointer
+	MOV	#100,@ADARSR#(R4)	;Enable receiver interrupt
+	NXMJMP	ASAIN6			;If hardware not there!
+	MOV	#100,@ADAXSR#(R4)	;Enable xmit interrupt
+	BIS	#$S1AVL,SDSTS1#(SD)	;Indicate socket is available
+	BISB	#$A1AVL,ADSTS1#(R4)	;And that interface is available
+	RETURN				;Thats all
+
+;HERE IF INTERFACE HARDWARE DOES NOT EXIST
+
+ASAIN6:	BICB	#$A1AVL,ADSTS1#(R4)	;Indicate hardware does not exist
+	RETURN
+	.PAGE
+	.SBTTL	LINA   - INTERRUPT LEVEL ROUTINES
+
+;HERE FOR INPUT READY INTERRUPT
+;BEFORE GETTING HERE THE FOLLOWING CODE HAS BEEN EXECUTED:
+;	ASnIN:	PUSH	R4		;SAVE R4
+;		MOV	#ADBn$,R4	;GET ADDRESS OF ADB
+;		JMP	ASAINI		;GO TO COMMON ROUTINE
+
+ASAINI::PUSH	R0			;SAVE R0 TOO
+	PUSH	R1			;ALSO R1
+        MOV     @ADARBF#(R4),R0        ;*******PATCH******8-18-80****
+                                        ;***USED TO READ**************
+                                        ;***"MOV ADINDX#(R4),R0"*******
+                                        ;***"BISB @ADARBF#(R4),R0"*****
+        CMP     #CTYRSR#,ADARSR#(R4)
+        BNE     ASAIN3
+	PUSH	R0			;SAVE CHARACTER
+	BIC	#^C177,R0		;JUST 7 BITS
+	CMP	#RS,R0			;IS IT SPECIAL?
+	BNE	ASAIN2			;NO-GO ON
+                                        ;***USED TO READ**************
+                                        ;***"CMP #CTYRSR#,ADARSR(R4)"**
+                                        ;***"BNE ASAIN2"****************
+BPTINS::BPT				;YES-GO TO XDT IF ITS LOADED
+	TST	(SP)+			;FIX UP THE STACK
+	BR	DISMIS			;AND GO AWAY
+
+;HERE IF NOT SPECIAL
+
+ASAIN2:	POP	R0			;RESTORE CHARACTER
+ASAIN3: MOV     #.LFDAT,R1              ;*****************************
+                                        ;***LABEL ADDED ON ABOVE LINE.*****
+        TBBE    020000,R0,2$            ;*****************************
+        MOV     #.LFBRK,R1              ;******************************
+2$:     BIC     #^C377,R0               ;*****************************
+        ADD     ADINDX#(R4),R0          ;*****************************
+                                        ;******END OF PATCH***********
+	BR	CALLTR			;GO CALL TERMINAL SERVICE
+
+;HERE ON TRAP FROM BPT IF XDT NOT LOADED
+;NOTE THAT IN ORDER TO MAKE THE TRACE CODE GO FASTER THE TRACE BIT CHECK IS
+;BEFORE THE LINA BREAKPOINT TEST, WHICH MEANS THAT A CTL-P TYPED ON THE
+;CONSOLE DURING A TRACE WILL BE IGNORED
+	VECTOR	14,BPTLOC,7
+
+BPTLOC:	BIT	#20,2(SP)		;TEST THE TRACE BIT
+	BEQ	1$
+	JMP	TRCINT#			;GO HANDLE TRACE INTERRUPT
+1$:	CMP	#BPTINS+2,(SP)		;WAS IT FROM THE RIGHT PLACE?
+	BEQ	2$			;YES-OK
+	FSTOP	BPT			;[BAD BPT INSTRUCTION]
+
+2$:	MOV	#ASAIN2,(SP)		;MODIFY RETURN ADDRESS
+	RTI				;AND DISMISS
+	.PAGE
+;HERE FOR OUTPUT DONE INTERRUPT
+;BEFORE GETTING HERE THE FOLLOWING CODE HAS BEEN EXECUTED:
+;	ASnOU:	PUSH	R4		;SAVE R4
+;		MOV	#ADBn$,R4	;GET ADDRESS OF ADB
+;		JMP	ASAOUI		;GO TO COMMON ROUTINE
+
+ASAOUI::PUSH	R0			;Save R0
+	PUSH	R1			;And R1
+	MOVB	ADINDX#+1(R4),R0	;Find the SDB for this line
+	ASL	R0
+	MOV	T0SX#(R0),R0
+	MOV	SDTXAP#(R0),R1		;Do we have a packet?
+	BEQ	6$			;No-go on
+	TSTB	PKCNT(R1)		;Yes-anything in it now?
+	BEQ	6$			;No
+	PUSH	R2			;Yes-free up another register
+.IF EQ ..SAT
+	MOVB	SDTRLW#(R0),R2		;Get line width
+	BEQ	2$			;If not specified
+	CMPB	SDTRHP#(R0),R2		;At end of line now?
+	BHIS	4$			;Yes-must stop here!
+.ENDC
+2$:	MOVB	PKPNT(R1),R2		;Yes-get next character
+	ADD	R1,R2
+	MOVB	PKDATA-1(R2),R2
+	TBBE	140,R2,4$		;Stop output if not simple printing
+					;  character
+	INCB	PKPNT(R1)		;Simple character-bump pointer
+	DECB	PKCNT(R1)		;And reduce count
+.IF EQ	..SAT
+	INC	COTCNT#			;Count the character output
+.ENDC
+	INCB	SDTRHP#(R0)		;bump the horizontal position
+	MOVB	R2,@ADAXBF#(R4)		;Output the character
+	POP	R2
+	BR	DISMIS			;And go restore registers and dismiss
+
+;Here if must stop output now
+
+4$:	POP	R2
+6$:	MOV	ADINDX#(R4),R0		;Get index
+	CLR	R1			;Function = 0 = .LFRDY
+CALLTR:	CALL	TRINTR#			;Call terminal service
+DISMIS:	POP	R1			;Restore R1
+	POP	R0			;And R0
+	POP	R4			;And R4
+	RTI				;Dismiss interrupt
+	.PAGE
+	.SBTTL	LINA   - OUTPUT ROUTINES
+
+;Subroutine to output data character
+;	C(R0) = Character to output
+;	C(R1) = Address of packet for continued output
+;	C(R4) = Address of ADB
+;	C(SD) = Address of SDB
+;	CALL	ASAOUT
+
+ASAOUT::MOV	R1,SDTXAP#(SD)		;Store address of packet (if any)
+	MOV	R0,@ADAXBF#(R4)		;Output the character
+	RETURN				;And return
+
+;Subroutine to perform output function
+;	C(R0) = Function code
+;	C(R4) = Address of ADB
+;	CALL	ASAFNC
+
+ASAFNC::ADD	R0,PC			;Dispatch on the function
+	BR	SNDBRK			; 0 = .LFSBK   Send break
+	BR	SETHWR			; 2 = .LFSET   Setup hardware
+	BR	NULFNC			; 4 = .LFANS   Answer line (NO-OP)
+	BR	NULFNC			; 6 = .LFFHG   Force hang-up (NO-OP)
+	BR	STPOUT			;10 = .LFSTP   Stop output
+	BR	ENDBRK			;12 = .LFEBK   End break
+
+;Here for stop output function
+
+STPOUT:	CLR	SDTXAP#(SD)		;Clear packet pointer
+	RETURN				;Thats all
+
+;Here to setup hardware
+
+SETHWR:	MOVB	SDTRS3#(SD),R1		;Get output baud rate
+	BIC	#^C$BRORT,R1
+	MOVB	ASARAT(R1),R1		;GET SETUP PATTERN
+	BMI	BADFNC			;REPORT INCORRECT VALUE
+	BISB	R1,@ADAXSR#(R4)		;SET BITS IN THE HARDWARE
+	BR	NULFNC			;DO OK RETURN
+
+;Here for start break command
+
+SNDBRK:	BIS	#1,@ADAXSR#(R4)		;Turn on break bit
+	RETURN
+
+;Here for end of break command
+
+ENDBRK:	BIC	#1,@ADAXSR#(R4)		;Clear the break bit
+	RETURN
+
+;Here for No-op
+
+NULFNC:	CLC				;MAKE SURE C IS CLEAR
+	RETURN
+
+;HERE FOR ILLEGAL FUNCTION
+
+BADFNC:	SEC				;SET C AS ERROR FLAG
+	RETURN
+	.PAGE
+	.SBTTL	LINA   - ONCE-A-SECOND ROUTINE
+
+;SUBROUTINE CALLED ONCE EACH SECOND AT MAIN PROGRAM LEVEL
+;  THIS SUBROUTINE MAKES SURE THAT EACH DL11 HAS ITS INTERRUPTS ENABLED!
+;	CALL	ASASEC
+
+	ONCSEC	ASASEC
+
+ASASEC:	MOV	#ASAADB#,R4		;GET FIRST TYPE A ADB
+2$:	TBBE	$A1AVL,ADSTS1#(R4),4$	;DOES THIS INTERFACE EXIST?
+	BIS	#100,@ADARSR#(R4)	;YES-SET ITS INTERRUPT ENABLE BITS!
+	BIS	#100,@ADAXSR#(R4)
+4$:	MOV	ADNEXT#(R4),R4		;ADVANCE TO NEXT TYPE A ADB
+	BNE	2$			;CONTINUE IF ANOTHER ONE THERE
+	RETURN				;THATS ALL
+
+	PURE
+ASARAT:	.BYTE	42		; 0 =  AUTO-DETECT
+	.BYTE	-1		; 1 =    50   BAUD, 5 BITS, 1.5 STOP BITS
+	.BYTE	-1		; 2 =    75   BAUD, 5 BITS, 1.5 STOP BITS
+	.BYTE	-1		; 3 =   110   BAUD, 8 BITS, 2   STOP BITS
+	.BYTE	-1		; 4 =   134.5 BAUD, 7 BITS, 1   STOP BIT
+	.BYTE	-1		; 5 =   150   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	-1		; 6 =   200   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	00		; 7 =   300   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	00		;10 =   300   BAUD, 7 BITS, 1   STOP BIT
+	.BYTE	-1		;11 =   400   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	12		;12 =   600   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	22		;13 =  1200   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	-1		;14 =  1800   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	-1		;15 =  2000   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	32		;16 =  2400   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	-1		;17 =  3600   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	42		;20 =  4800   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	-1		;21 =  7200   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	52		;22 =  9600   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	62		;23 = 19200   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	-1		;24 =   100   BAUD, 8 BITS, 1   STOP BIT
+	.BYTE	72		;25 = 38400   BAUD, 8 BITS, 1   STOP BIT
+	.EVEN
+	.END
+
