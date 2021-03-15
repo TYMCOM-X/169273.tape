@@ -1,0 +1,1019 @@
+entry DO!ALTER,ALTER,ALTER!EXTEND;
+begin "alter"
+    require "SAI:CSWIT.SAI" source!file;
+    define HISEGGING=ifcr COMPILER!SWITCH!H thenc +1 elsec -1 endc;
+    define !NOBAYSAILIB! = true;
+    REQUIRE "SAI:BAYSAI" SOURCE!FILE;
+
+!-------------------------------------------------
+!
+! ABSTRACT:
+! This is essentially the ALTER command of SOS implemented for SAIL
+! strings.  All SOS ALTER commands work as indicated below:
+! @begin(format)
+!	semicolon - Skip to next word
+!	colon - undo semicolon
+!	tab - skip to end of line (X without "insert")
+!	A - Add
+!	C - Change
+!	D - Delete
+!	F - just like S
+!	I - Insert
+!	J - Join
+!	K - Kill
+!	L - List line
+!	M - Munch
+!	P - Print line and reposition
+!	Q - Quit
+!	R - Replace
+!	S - Scan
+!	T - Transpose
+!	V - Invert
+!	X - Extend
+!	Z - no-op.  Consume mistyped numeric argument
+!	^U- Cancel changes so far and start over
+!	^H- Backspace (same as rubout)
+!	% - In debug version only, enable echoing and enter DDT
+!	Rubout - Backspace (same as ^H)
+! @end(format)
+!
+! ALTER will recognize when a terminal is in full altmode mode and
+! recognize the characters } and ~ as valid input characters during
+! insertion.
+!
+! It is possible to insert a carriage return/linefeed pair and they are
+! treated as any other character.
+!
+!-------------------------------------------------;
+source!l(ALTER);
+source!l(TTYSER);
+source!l(STRFIL);
+! Submodule: alter.sai
+! Date: 26-Jan-79
+! Who: David Lamb logged in as SAIL Files
+! Code rearranged and rewritten to decrease size.  Multiple escape-character
+! arrays combined into a single array.  Common code moved into subroutines.
+! The massive nested IF-THEN-ELSE was replaced by a CASE.  Dealing with CRLF
+! was simplified by replacing CRLFs with LFs on entry, then restoring on exit.
+! Some macros were converted to subroutines to save code space.
+! Present version is about 1/2 size of original.
+!
+! ;
+! Submodule: alter.sai
+! Date: 24-Jan-79
+! Who: David Lamb logged in as SAIL Files
+! Transformed A710 ALTER to Shepherd format for A709 library.
+!
+! ;
+! Submodule: ALTER.SAI
+! Date: 14-Jun-78
+! Who: Craig Everhart
+! Added "^" command
+!
+! ;
+! Submodule: ALTER.SAI
+! Date: 4-Jun-78
+! Who: Joe Newcomer
+! Added "tab" as command, "bell" to respond to unknown commands
+! Changed "*" command to "%" command because "*" is now a valid
+! numeric designator
+! Added ":" command
+!
+! ;
+! Submodule: ALTER.SAI
+! Date: 9-Dec-77
+! Who: Craig Everhart
+! Trivial: added F command (just like S), and corrected TI cancel
+! (should be NULL).
+!
+! ;
+! Submodule: ALTER.SAI
+! Date: 9-Nov-77
+! Who: Bruce Nelson
+! Added semicolon command from new SOS. Also "*" as numeric arg,
+! & Burge GDP BS hack.
+!
+! ;
+! Submodule: ALTER.SAI
+! Date: 3-Nov-76
+! Who: Philip Karlton
+!    Made a high segment version conditional on HISEGGING
+!
+! ;
+!------------------------------------------------
+!
+! DESIGN:
+! To avoid enormous numbers of string garbage collections, ALTER does
+! many of its edits in place.  Because of this, it often needs to force
+! a complete copy of a string.  Carriage return/line feed pairs are
+! represented by bare linefeeds.  Thus any bare linefeeds in the
+! original will become a CRLF pair on normal exit.
+!
+! Command scanning is implemented via a large CASE statement.  Letter
+! commands must be labelled with both the uppercase and the lowercase
+! letter.
+!
+!------------------------------------------------;
+
+REQUIRE "{}<>" DELIMITERS;
+define DEBUG=false;
+ifcr DEBUG thenc
+	require CRLF&"     * * * DEBUG VERSION * * *  " message;
+endc
+
+preload!with  0,"!","""","#","$","%","&","'",	! 0-7;
+	      "(",0,0,0,0,0,")","*",		! 10-17;
+	      "+",",","-",".","/","0","1","2",	! 20-27;
+	      "9","6","4","=","<",">","7","8",	! 30-37;
+	      0,0,0,0,0,0,0,0,			! 40-47;
+	      0,0,0,0,0,0,0,0,			! 50-57;
+	      0,0,0,0,0,0,0,0,			! 60-67;
+	      0,0,0,0,0,0,0,"??",		! 70-77;
+	      0,"A","B","C","D","E","F","G",	! 100-107;
+	      "H","I","J","K","L","M","N","O",	! 110-117;
+	      "P","Q","R","S","T","U","V","W",	! 120-127;
+	      "X","Y","Z",0,0,0,0,0,		! 130-137;
+	      "@","A","B","C","D","E","F","G",	! 140-147;
+	      "H","I","J","K","L","M","N","O",	! 150-157;
+	      "P","Q","R","S","T","U","V","W",	! 160-147;
+	      "X","Y","Z","[",":","]","3","\";	! 170-177;
+own safe integer array Escape!Character[0:'177];
+own string CANCEL,BACKSPACE;
+own boolean ALTFLAG,GRAPHICS;
+integer TTYPE,RUBFLG;
+string ALTER!COMMANDS;
+define
+    IS!BSP={fulstr(BACKSPACE)},
+    ISALTMODE(X)={((X)='33 or (not ALTFLAG and ((X)='176 or (X)='175)))};
+simple string procedure COPY!STRING(string STR);
+!------------------------------------------------
+!
+! ABSTRACT:
+!    Return a copy of a string.
+!
+! PARAMETERS:
+! STR:	the string to be copied.
+!
+! RESULT:
+! Returns the copied string.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+! Appending a character to the start of a string forces a copy
+! of the entire string.  Appending to the end might not, and a
+! simple assignment never generates a copy.
+!
+!------------------------------------------------;
+    begin
+    string TEMP;
+
+    TEMP _ 0&STR;
+    return(TEMP[2 to inf])
+    end;
+simple string procedure REMOVE!CRLF(string STR);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Convert CRLF pairs to linefeeds.
+!
+! PARAMETERS:
+! STR:	string from which CRLFs are to be removed.
+!
+! RESULT:
+! Returns a copy of the argument with CRLFs replaced by linefeeds.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+! A copy is forced, even if there are no linefeeds.
+!
+!------------------------------------------------;
+    begin
+    integer CHAR;  string RESULT;
+
+    RESULT _ null;
+    while fulstr(STR) do
+	begin
+	CHAR _ lop(STR);
+	if CHAR = cr then begin
+	    if fulstr(STR) then begin
+		CHAR _ lop(STR);
+		if CHAR  lf then RESULT _ RESULT & cr
+		end;
+	    end;
+	RESULT _ RESULT & CHAR
+	end;
+    return(RESULT);
+    end;
+simple string procedure RESTORE!CRLF(string STR);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Restore removed CRLFs to a string.
+!
+! PARAMETERS:
+! STR:	string to which CRLFs should be restored
+!
+! RESULT:
+! Returns a copy of the argument with linefeeds replaced by CRLFs.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+! A copy is forced even if there are no linefeeds.
+!
+!------------------------------------------------;
+    begin
+    integer CHAR;  string RESULT;
+
+    RESULT _ null;
+    while fulstr(STR) do
+	begin
+	if (CHAR_lop(STR)) = lf
+	    then RESULT _ RESULT & crlf
+	    else RESULT _ RESULT & CHAR
+	end;
+    return(RESULT);
+    end;
+simple string procedure Escaped(integer Character);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Return the printable form of a character.  For GRAPHICS terminals,
+! this is the character itself.  For all other terminals, control
+! characters (other than tab, lf, vt, ff, cr), rubout, and ? are
+! escaped.  For teletypes without lowercase, lowercase letters are
+! escaped.
+!
+! PARAMETERS:
+! Character:	7-bit character to be converted to printable form.
+!
+! RESULT:
+! Returns a string form of the character, suitable for printing on
+! the user's terminal.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+! The array Escape!Character contains one entry for each character.
+! If the entry is zero, the character is NEVER escaped.  If the entry
+! is positive, the escape sequence is ? followed by the entry.  If the
+! entry is negative, the character is escaped for some terminals, but
+! not the current one.  The table is set up by ALTER!INIT.
+!
+!------------------------------------------------;
+    begin
+    if Escape!Character[Character]0
+	then return(Character)
+	else return("?"&Escape!Character[Character]);
+    end;
+simple procedure TYPE!CHR(integer Character);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Output a character to the user's terminal.
+!
+! PARAMETERS:
+! Character:	the character to be printed
+!
+! RESULT:
+!
+! SIDE EFFECTS:
+! The character or its appropriate escape sequence is printed.
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+    outstr(if Character=lf then crlf else Escaped(Character));
+boolean simple procedure IS!DELIM(integer CHAR);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Decide whether a character is a "word" delimiter.  These delimiters
+! are used by the semicolon and colon commands.  Present delimeters
+! are space, tab and (cr)lf.
+!
+! PARAMETERS:
+! CHAR:	character to be tested for delimiterness.
+!
+! RESULT:
+! Returns TRUE if the character is a delimiter, FALSE otherwise.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+    return(CHAR=" " or CHAR=tab or CHAR=lf);
+simple procedure ALTER!INIT;
+!------------------------------------------------
+!
+! ABSTRACT:
+! Initialise the ALTER procedure.  Set up escape sequences, delete
+! sequences, and flags depending on the terminal type.
+!
+! PARAMETERS:
+!
+! RESULT:
+!
+! SIDE EFFECTS:
+! Escape!Characters is set to provide escapes for those characters that
+! need it.  BACKSPACE and CANCEL are set for proper deletions.
+!
+! ERRORS:
+!
+! DESIGN:
+! First!Clear and Last!Clear are used to control removal of escape
+! sequences for alphabetics and `.  For most terminals all are removed.
+! For some, only the upper or lower case, as appropriate, is removed.
+! The range contains some characters which are never escaped, but
+! they are not affected by removal.
+!
+!------------------------------------------------;
+    begin
+    boolean Escape!Lower, Escape!Upper;
+    integer First!Clear, Last!Clear, I;
+
+    ALTFLAG_TTYREAD('1026);	   ! get altmode flag;
+    TTYPE_TTYREAD('3001);	! get terminal type;
+    for I_0 thru '177 do Escape!Character[I]_abs Escape!Character[I];
+
+    BACKSPACE _ "";  CANCEL _ " ";
+    Escape!Lower _ Escape!Upper _ false;
+    First!Clear _ "A";  Last!Clear _ "z";
+
+    if TTYPE=CVSIX("TELETY") then begin
+	BACKSPACE _ CANCEL _ null;
+	if TTYREAD('1003) then Escape!Lower _ true;
+	end
+    else if TTYPE=CVSIX("INFOTO") then begin
+	BACKSPACE _ "";  CANCEL _ " ";
+	end
+    else if TTYPE = CVSIX("MODEL3") or TTYPE=CVSIX("TI") then begin
+	CANCEL _ null;
+	end
+    else if TTYPE = CVSIX("GRAPHI") then begin
+	CANCEL _ null; BACKSPACE _ '177;
+	First!Clear_0;  Last!Clear _ '177
+	end;
+    CANCEL_BACKSPACE&CANCEL;
+
+    if Escape!Lower then Last!Clear _ "Z"
+    else if Escape!Upper then First!Clear _ "a";
+    for I_First!Clear thru Last!Clear do
+	Escape!Character[I] _ -(abs Escape!Character[I]);
+    end;
+simple procedure TYPE!STR(string S);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Print all the characters in a string on the user's terminal.
+!
+! PARAMETERS:
+! S:	String to be typed.
+!
+! RESULT:
+!
+! SIDE EFFECTS:
+! The characters in the string are printed, with appropriate escape
+! sequences, on the user's terminal.
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+     begin "typestr"
+	integer BP;
+	integer I,CH;
+
+	I_length(S);
+	start!code "getbp"
+	    MOVEI 1,S;
+	    MOVE  1,0(1);
+	    MOVEM 1,BP;
+	end "getbp";
+	while true do
+	    begin "typeloop"
+		if I=0 then done "typeloop";
+		start!code "getchr"
+			SOS I;
+			ILDB 1,BP;
+			MOVEM 1,CH;
+		end "getchr";
+		TYPE!CHR(CH);
+	    end "typeloop";
+     end "typestr";
+simple integer procedure CMPRS(integer CHAR);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Return the character for which this is the escape character.
+!
+! PARAMETERS:
+! CHAR:	Character that was preceded by a question mark in the input.
+!
+! RESULT:
+! Returns the character for which the argument is an escape, if any.
+! Otherwise returns the argument.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+begin "cmprs"
+	integer I;
+	if "@"CHAR"Z" or "a"CHAR"z"then return(CHAR xor '40);
+	for I_0 thru '177 do
+		if CHAR=(abs Escape!Character[I]) then return(I);
+	return(CHAR);
+end "cmprs";
+simple string procedure N!BACKSPACES(integer CHAR);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Return a string suitable for cancelling the printed representation
+! of a character.
+!
+! PARAMETERS:
+! CHAR:	character to be cancelled
+!
+! RESULT:
+! Returns a string which can be printed to cancel the argument.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+    begin "nbsp"
+    return(if Escape!Character[Char]>0 then CANCEL&CANCEL else CANCEL);
+    end "nbsp";
+simple integer procedure GET!CHARACTER;
+!------------------------------------------------
+!
+! ABSTRACT:
+! Fetch the next character from the command stream.
+!
+! PARAMETERS:
+!
+! RESULT:
+! Returns the next character.
+!
+! SIDE EFFECTS:
+! The fetched character is removed from the command stream.
+!
+! ERRORS:
+!
+! DESIGN:
+! The string ALTER!COMMANDS is always checked before the console.
+! Thus, to rescan a character or place new commands at the front
+! of the stream, concatenate them to the start of ALTER!COMMANDS.
+!
+!------------------------------------------------;
+    begin "getchar"
+    return(if nulstr(ALTER!COMMANDS) then inchrw else lop(ALTER!COMMANDS));
+    end "getchar";
+simple integer procedure GET!QUESTION!CHARACTER;
+!------------------------------------------------
+!
+! ABSTRACT:
+! Fetch a character which is potentially represented by an escape
+! sequence.
+!
+! PARAMETERS:
+!
+! RESULT:
+! Returns the character.
+!
+! SIDE EFFECTS:
+! The fetched character (or its two-character escape sequence) is
+! removed from the input stream.
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+    begin "getquest"
+    integer CHAR;
+
+    CHAR_GET!CHARACTER;
+    if GRAPHICS or CHAR"?" then return(CHAR);
+    return(CMPRS(GET!CHARACTER));
+    end "getquest";
+simple integer procedure GET!NON!CR;
+!------------------------------------------------
+!
+! ABSTRACT:
+! Fetch the next character (potentially represented by an escape
+! sequence) from the input stream.  Represent a CRLF pair by the
+! single character LF.
+!
+! PARAMETERS:
+!
+! RESULT:
+! Returns the next character.
+!
+! SIDE EFFECTS:
+! The character or its escape sequence is removed from the input.
+! If the next two characters are CRLF, both are removed.
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+    begin
+    integer CHAR;
+
+    CHAR _ GET!QUESTION!CHARACTER;
+    if CHAR=cr then begin
+	CHAR _ GET!QUESTION!CHARACTER;
+	if CHARlf then begin
+	    ALTER!COMMANDS_Escaped(CHAR)&ALTER!COMMANDS;
+	    CHAR _ cr
+	    end
+	end;
+    return(CHAR);
+    end;
+simple procedure ONRUB(integer NUM);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Turn on RUBOUT mode, if it isn't already on.
+!
+! PARAMETERS:
+!
+! RESULT:
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+    begin
+    if RUBFLG<0 then begin
+	RUBFLG _ NUM-1;
+	outstr(if NUM=2 or IS!BSP
+		then case RUBFLG of ("\","\\")
+		else null)
+	end
+    end;
+simple procedure OFFRUB;
+!------------------------------------------------
+!
+! ABSTRACT:
+! Turn off RUBOUT mode, if it is on.
+!
+! PARAMETERS:
+!
+! RESULT:
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+    begin
+    if RUBFLG0 then begin
+	if RUBFLG=1 or IS!BSP
+		then outstr(case RUBFLG of ("\","\\"));
+	RUBFLG _ -1
+	end
+    end;
+simple procedure CHGRUB;
+!------------------------------------------------
+!
+! ABSTRACT:
+! I don't understand this routine.
+!
+! PARAMETERS:
+!
+! RESULT:
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+    begin
+    if RUBFLG=0 then begin
+	if IS!BSP
+	    then outchr("\")
+	    else outstr(BACKSPACE);
+	RUBFLG _ -1
+	end
+    end;
+internal string procedure DO!ALTER(string LINENUM,OLDSTRING,COMMANDS);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Enter SOS alter mode on a SAIL string.
+!
+! PARAMETERS:
+! LINENUM:	prompt to be printed to the user when he starts,
+!		or when he backs up to the beginning of the string.
+!		It behaves much like an SOS line number does in ALTER
+!		mode.
+!
+! OLDSTRING:	the string to be edited.
+!
+! COMMANDS:	Commands to be executed before asking for terminal input.
+!
+! RESULT:
+! Returns the edited string.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+!
+!------------------------------------------------;
+    begin							"ALTER"
+
+integer REALCNT, RCNT,P,PTR,CH,TEMP,LIM;
+string A,B;
+DEFINE
+	TYPE(X)={TYPE!STR(X)},
+	TYPELINE(X)={TYPE(X&lf)},
+	RUBOUT='177,
+	NULSTR(X)={length(X)=0},
+	infinity=9999999,
+	NOTHING={};
+
+
+simple procedure SETPOINTER;
+    start!code "SETPOINTER"
+	label	L1,L2;
+	MOVE	1,A;
+	MOVE	2,P;
+	SUBI	2,1;
+	IDIVI	2,5;
+	ADD	1,2;
+	JUMPE	3,L2;
+L1:	IBP	1;
+	SOJG	3,L1;
+L2:	SKIPGE	1;
+	  SUB	1,['430000000001];
+	MOVEM	1,PTR;
+    end "SETPOINTER";
+
+
+simple procedure SPACE!FORWARD(integer NUM);
+    begin "ASPACE"
+    OFFRUB;
+    TEMP _ (P+NUM-1) min LIM;
+    TYPE(A[P to TEMP]);
+    P_TEMP+1
+    end "ASPACE";
+
+
+simple procedure SPACE!BACKWARD(integer NUM);
+    begin "goback"
+    for DUM_1 thru NUM do
+	if P=1 then begin OFFRUB; TYPE(LINENUM); done end else
+	begin "ARUB"
+	ONRUB(1);
+	if not IS!BSP
+	    then TYPE!CHR(ONECHAR(A,(P_P-1)))
+	    else begin "backspace it"
+		integer CNT,CHR;
+
+		if (CHR_ONECHAR(A,P_P-1))=LF or CHR=tab
+		    then begin "rublf"
+			outstr(CRLF);
+			for CNT_P-1 downto 0 do
+			    if ONECHAR(A,CNT)=LF then done;
+			TYPE!STR(A[CNT+1 to P-1]);
+			end "rublf"
+		    else OUTSTR(N!BACKSPACES(CHR));
+		end "backspace it";
+	end "ARUB"
+    end "goback";
+
+
+simple procedure INSERT!CHARACTERS(integer IN!COUNT);
+    begin "AI"
+    B_COPY!STRING(A[P to inf]);
+    SETPOINTER;
+    while (IN!COUNT_IN!COUNT-1)0 do
+	begin "AIL"
+	CH_GET!NON!CR;
+	if ISALTMODE(hen done "AIL";
+	if CH=RUBOUT or CH="H"-'100
+	    then begin "rubout in insert"
+		IN!COUNT_IN!COUNT+2;
+		SPACE!BACKWARD(1);
+		SETPOINTER;
+		end "rubout in insert"
+	    else
+		begin "DOI"
+		OFFRUB;
+		TYPE!CHR(CH);
+		if P>length(A) then begin A_COPY!STRING(A&"          "); SETPOINTER end;
+		IDPB(CH,PTR);
+		P_P+1;
+		end "DOI";
+	end "AIL";
+    A_A[1 to P-1]&B;  B_null;
+    end "AI";
+
+
+simple procedure DELETE!CHARACTERS(integer NUM);
+    begin "AD"  ! works even if P or P+NUM-1 > LIM
+    CHGRUB;
+    ONRUB(2);
+    TYPE((A[P to P+NUM-1])[inf-2 to inf]);
+    A_A[1 to P-1]&A[P+NUM to inf];
+    LIM_length(A)
+    end "AD";
+
+
+simple procedure KILL!CHARACTERS(integer NUM);
+    begin "AK"
+    integer KCH;
+    KCH_GET!NON!CR;
+    while (NUM_NUM-1)0 and (TEMP_INDEX1(A[P+1 to inf],KCH))0 do
+	DELETE!CHARACTERS(TEMP)
+    end "AK";
+
+
+ALTER!INIT;
+if NULSTR(LINENUM) then LINENUM_">>  ";
+ALTER!COMMANDS _ COMMANDS;
+
+ECHOFF;
+A_REMOVE!CRLF(OLDSTRING);  B_NULL;
+TYPE(LINENUM);
+LINENUM _ lf&LINENUM;
+P_1;
+RUBFLG_-1;
+while true do
+    begin "ALOOP"
+    LIM_length(A);
+    if P>LIM or P=1 then OFFRUB;
+    REALCNT_RCNT_0;
+    while "0"(CH_GET!CHARACTER)"9" do REALCNT_REALCNT*10+CH-"0";
+    if CH="*" then begin "*"
+		CH _ GET!CHARACTER;
+		REALCNT _ LIM-P+1;
+		end "*";
+    RCNT _ REALCNT max 1;
+
+    case CH of
+	begin "command case"
+["L"]["l"]
+	begin "AL"
+	OFFRUB;
+	TYPE(A[P to inf]);  TYPE(LINENUM);
+	P_1;
+	end "AL";
+[";"]
+	begin "skip to next word"
+	integer oldP;
+	OFFRUB;
+	oldP _ P;
+	for TEMP_1 thru RCNT do
+	    begin
+	    while PLIM and IS!DELIM(ONECHAR(a,p)) do p_p+1;
+	    while PLIM and IS!DELIM(ONECHAR(a,p)) do p_p+1
+	    end;
+	TYPE(a[oldP to p-1]);
+	end "skip to next word";
+["T"]["t"]
+	begin "transpose"
+	OFFRUB;
+	if P+1 LIM then
+	     begin "doxpose"
+		integer T1, T2, TPTR;
+		SETPOINTER;
+		T1_ILDB(PTR);
+		TPTR_PTR;
+		T2_ILDB(PTR);
+		TYPE!CHR(T2); TYPE!CHR(T1);
+		DPB(T1,PTR); DPB(T2,TPTR);
+		P_P+2;
+	     end "doxpose";
+        end "transpose";
+["Q"]["q"]
+	begin "AQ"
+	OFFRUB;
+	ECHON;
+	A_NULL;
+	return(OLDSTRING);
+	end "AQ";
+[""]
+	begin "^U"
+	OFFRUB;
+	OUTSTR("^U");
+	TYPE(LINENUM);
+	A_REMOVE!CRLF(OLDSTRING);	! make sure we use copy, not original;
+	P_1;
+	end "^U";
+[cr][lf]
+	begin "ACRLF"
+	OFFRUB;
+	if CH=CR then CH_GET!CHARACTER;
+	TYPELINE(A[P to inf]);
+	ECHON;
+	return(RESTORE!CRLF(A));
+	end "ACRLF";
+["A"]["a"]
+	INSERT!CHARACTERS(RCNT);
+["V"]["v"]["^"]
+	begin "VERT"
+	OFFRUB;
+	if REALCNT=0 then RCNT_if CH="^" then 1 else LIM;
+	SETPOINTER;
+	TEMP _ (P+RCNT-1) min LIM;
+	while PTEMP do
+	    begin "dovert";
+	    CH_ILDB(PTR);
+	    if CH<"A" or "Z"<CH<"a" or CH>"z"
+		then done;
+	    TYPE!CHR(CH_CH xor '40);
+	    DPB(CH,PTR);
+	    P_P+1;
+	    end "dovert";
+	end "VERT";
+["I"]["i"]
+	INSERT!CHARACTERS(infinity);
+["R"]["r"]
+	begin "AR"
+	DELETE!CHARACTERS(RCNT);
+	INSERT!CHARACTERS(infinity)
+	end "AR";
+["D"]["d"]
+	DELETE!CHARACTERS(RCNT);
+["J"]["j"]
+	begin "join"
+	integer J,I;
+	OFFRUB;
+	SETPOINTER;
+	J_INDEX1(A[P to inf],lf)+P-1;
+	! works even if J=0 (no LF found);
+	A_A[1 to P-1]&lf&A[P to J-1]&A[J+1 to inf];
+	P_P+1;
+	TYPE!CHR(lf)
+	end "join";
+["X"]["x"]
+	begin "AX"
+	SPACE!FORWARD(LIM);
+	INSERT!CHARACTERS(infinity)
+	end "AX";
+[tab]
+	SPACE!FORWARD(LIM);
+[" "]
+	SPACE!FORWARD(RCNT);
+["P"]["p"]
+	begin "AP"
+	OFFRUB;
+	TYPE(A[P to inf]&LINENUM&A[1 to P-1]);
+	end "AP";
+[":"]
+	begin "figure r"
+	integer CP;
+
+	CP_P-1;
+	for TEMP_1 thru RCNT do
+	    begin "move back word"
+	    while CP1 and IS!DELIM(ONECHAR(A,CP)) do CP_CP-1;
+	    while CP1 and IS!DELIM(ONECHAR(A,CP)) do CP_CP-1;
+	    end "move back word";
+        SPACE!BACKWARD(P-CP-1)
+	end "figure r";
+['10][rubout]
+	SPACE!BACKWARD(RCNT);
+["C"]["c"]
+	begin "AC"
+	OFFRUB;
+	SETPOINTER;
+	TEMP _ (P+RCNT-1) min LIM;
+	do  begin
+	    CH_GET!NON!CR;
+	    TYPE!CHR(CH);
+	    IDPB(CH,PTR);
+	    end
+	until (P_P+1)>TEMP
+	end "AC";
+["S"]["s"]["F"]["f"]
+	begin "AS"
+	OFFRUB;
+	CH_GET!NON!CR;
+	while (RCNT_RCNT-1)0 and PLIM do
+	    begin
+	    if (TEMP_INDEX1(A[P+1 to inf],CH))=0 then TEMP_LIM;
+	    SPACE!FORWARD(TEMP)
+	    end;
+	end "AS";
+ifc DEBUG thenc
+["%"]
+	begin "ddt"
+	ECHON;
+	USERERR(0,1,null,"D");
+	ECHOFF;
+	end "ddt";
+endc
+["M"]["m"]
+	begin "AM"
+	KILL!CHARACTERS(RCNT);
+	INSERT!CHARACTERS(infinity)
+	end "AM";
+["K"]["k"]
+	KILL!CHARACTERS(RCNT);
+[""][""][""][""][""][""][""]	! ^A - ^G ;
+['13]['14][""][""]				! ^K, ^L, ^N, ^O ;
+[""][""][""][""][""]			! ^P to ^T ;
+[""][""][""][""][""]			! ^V to ^Z ;
+[""][""][""][""][""]			! '33 to '37 ;
+["!"][""""]["#"]["#"]["$"]["&"]["'"]["("][")"]
+["="]["-"]["`"]["@"]["~"]["^"]["["]["{"]["]"]["}"]
+["+"]["<"][">"][","]["."]["/"]["\"]["|"]["_"]["?"]
+["B"]["b"]["E"]["e"]["G"]["g"]["H"]["h"]
+["N"]["n"]["O"]["o"]["U"]["u"]["W"]["w"]
+ifcr not DEBUG thenc
+["%"]
+endc
+	outchr("");
+["Z"]["z"]
+	NOTHING
+	end "command case";
+    end "ALOOP";
+    end "ALTER";
+internal string procedure ALTER(string LINENUM,OLDSTRING);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Enter SOS ALTER mode on a SAIL string
+!
+! PARAMETERS:
+! LINENUM:	A string to be used as a prompt.  It behaves much as
+!		an SOS line number does.
+!
+! OLDSTRING:	The string to be edited.
+!
+! RESULT:
+! Returns the edited string.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+! The actual work is done by DO!ALTER.
+!
+!------------------------------------------------;
+	return(DO!ALTER(LINENUM,OLDSTRING,null));
+internal string procedure ALTER!EXTEND(string LINENUM, OLDSTRING);
+!------------------------------------------------
+!
+! ABSTRACT:
+! Simulate an SOS eXtend command on a SAIL string.
+!
+! PARAMETERS:
+! LINENUM:	A string to be used as a prompt.  It behaves much as
+!		an SOS line number does.
+!
+! OLDSTRING:	The string to be edited.
+!
+! RESULT:
+! Returns the edited string.
+!
+! SIDE EFFECTS:
+!
+! ERRORS:
+!
+! DESIGN:
+! The actual work is done by DO!ALTER.
+!
+!------------------------------------------------;
+	return(DO!ALTER(LINENUM,OLDSTRING,"X"));
+REQUIRE UNSTACK!DELIMITERS;
+end "alter";
+    ,lR­
