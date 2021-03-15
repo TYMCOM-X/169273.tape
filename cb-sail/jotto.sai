@@ -1,0 +1,484 @@
+Begin "JOTTO"
+
+require 1 lsh 18 lor 2 version;
+require "(SAILIB)SAIL.DEF" Source!File;
+require "UUOSYM.DEF" source!file;
+	!get!definitions(tymint);
+	!get!definitions(proces);
+require processes;
+
+!	JOTTO - A word Game where multiple users try to guess each
+!		other's game word.  Each game word must be composed
+!		of exactly 5 different characters.  Guess words on
+!		the other hand must be real words, but do not have
+!		the added restriction of having 5 unique characters.
+!
+!	%1 (2)	Changed mapping code to "preset" the array used for
+!		mapping, thus fixing the "restart" problem.
+;
+
+define !Block(Group, Name, Size) = {
+    Ifcr Length(Cvps(Size)) = 0 thenc assignc Size = 1; Endc
+    Define Group}&{Name = Group;
+    Redefine Group = Group + Size;};
+
+
+!   Page Formats for Game MAP and Game Pages;
+
+Define	Map! = 0;
+	!Block(Map!,Lock)
+	!Block(Map!,Go)
+	!Block(Map!,Next)
+	!Block(Map!,Players)
+	!Block(Map!,Waiting)
+	!Block(Map!,Games,500)
+	
+Define	Game! = 0;
+	!Block(Game!,Player)
+	!Block(Game!,Active)
+	!Block(Game!,Words,128)
+	!Block(Game!,Texts,128)
+
+Define GameMap  = 1;			! Page # for game map;
+Define GameFile = {"(GAMES)JOTTO.DAT"};	! Name of file to use;
+
+Define	Int!ZAP = 12, Int!NTQ = 14, Int!ESC = 16;
+
+item	INTPRO;			! Item for interrupt processing;
+itemvar	Intvar;			! Itemvar for INTPRO calls to INTINI;
+Own Boolean ZAP!, NTQ!, ESC!;
+Own Boolean Eof, ErrorStatus, MapLock, InGame;
+Own Integer Array File[ 1 : 6 ];
+Own Integer BasePage, Base, MyBase, MyNumber, GamePage, Chan, LogChan;
+Own Integer StoreWord, PlayerWord, MyByte, GuessByte;
+Own Integer Players, PlayersLeft, PlayerNumber, Printed, MoreToGuess;
+String GameWord, UserName;
+
+Preload!with ['2000]0;
+Own Integer Array VirtualStorage[ 0 : '1777 ];
+
+simple procedure ZAP;	ZAP! _ True;	! set flag;
+simple procedure NTQ;	NTQ! _ True;	! set flag;
+simple procedure ESC;	ESC! _ True;	! set flag;
+
+simple procedure INTINI( itemvar INTPRO );
+begin
+    intset (INTPRO,pstack(8));
+    ZAP! _ NTQ! _ ESC! _ False;
+    intmap (tinass(-1,!IAZAP,Int!ZAP),ZAP,0);   enable (newenb(Int!ZAP));
+    intmap (intass(!IANTQ,Int!NTQ),NTQ,0);      enable (newenb(Int!NTQ));
+    intmap (tinass(-1,!IAESC,Int!ESC),ESC,0);   enable (newenb(Int!ESC));
+end;
+
+Internal simple procedure IntZap;
+begin
+    disable (newenb(Int!ZAP));		! circuit zapper;
+    disable (newenb(Int!NTQ));		! notice to quit;
+    disable (newenb(Int!ESC));		! user types <esc>;
+end;
+
+simple procedure SetupBasePage;
+begin
+    BasePage _ (Location(VirtualStorage[0]) +'777) lsh -9;
+    Base _ BasePage lsh 9;
+    MapLock _ InGame _ 0;
+end;
+require SetupBasePage initialization;
+
+simple procedure MapFilePage( Integer FilePage );
+begin
+    own integer array arg[0:1];
+    Arg[ 0 ]_ !Xwd( '6001, BasePage );	! <.prrw>b7 + 1b17,,base;
+    Arg[ 1 ]_ FilePage;			! use specified file-page;
+    Calli( !Xwd('2001,BasePage), -'66);	! unmap the previous page;
+    Chnior( Chan, Arg[0], !chMFP );	! map file page;
+    If not !skip! then usererr(0,1,"Cannot map file page");
+end;
+
+
+simple procedure Logit( Integer Word );
+If LogChan > 0 then Cprint( LogChan, CvASTR( Word ), Crlf );
+
+
+simple procedure Quit;
+begin!code
+	Push	P,GamePage;		! remember game page for end-of-game;
+	Pushj	P,MapFilePage;		! then map it for play;
+	Move	1,Base;			! get base address;
+	Sos	Game!Active(1);		! decrement active players count;
+	Move	2,MyBase;		! get my base offset;
+	Setzm	Game!Words-1(2);	! zap my game word;
+end;
+
+Simple Procedure SetupGameBoard;
+begin!code
+    label Retry, Tarry, CFPerr, Finish;
+    label Snooze, GWait, GReady, PWait, Abort;
+
+	Move	1,Base;			! get base address of map;
+	Move	2,Players;		! get number of players;
+Retry:	Sosg	3,Map!Lock(1);		! get lock counter;
+	 Came	3,[ -1 ];		! if we're lucky, we got it;
+	  Jrst	GWait;			! nope, sleep it off;
+	Setom	MapLock;		! mark that we have the lock;
+	Movem	2,Map!Players(1);	! set the player count;
+	Skipg	Map!Next(1);		! if already positive, skip;
+	  Aos	Map!Next(1);		! else initialize to 1;
+	Aos	Map!Next(1);		! increment game page count;
+	Move	3,Chan;			! get the file channel;
+	Hrli	3,!chCFP;		! set to create-file-page;
+	uuo!Chanio 3,Map!Next(1);	! create page for everyone;
+	  Jrst	CFPerr;			! hmmmmm, what happenned;
+	Move	0,Map!Next(1);		! copy game page number for later;
+	Move	3,0;			! and for setting map table;
+	Add	3,1;			! add map-page offset;
+	Setom	Map!Games(3);		! set that game is in play;
+	Setzm	Map!Waiting(1);		! clear the waiting count;
+	Aos	3,Map!Waiting(1);	! take a player number;
+	Setom	Map!Go(1);		! let others take a number;
+Tarry:	Camg	2,Map!Waiting(1);	! are enough players ready;
+	  Jrst	Finish;			! yes-- now finish up;
+	Pushj	P,Snooze;		! no -- take a nap;
+	Skipe	NTQ!;			! check NTQ;
+	  Jrst	Finish;			!  set - so finish up;
+	Skipe	ESC!;			! check ESC;
+	  Jrst	Finish;			!  set - so finish up;
+	Skipe	ZAP!;			! check ZAP;
+	  Jrst	Finish;			!  set - so finish up;
+	Jrst	Tarry;			! wait around for awhile;
+
+CFPerr:	Sos	Map!Next(1);		! decrement page-use-count;
+	Setom	ErrorStatus;		! set my error status and fall out;
+					! to let the next person try;
+Finish:	Setzm	Map!Players(1);		! clear player count;
+	Setzm	Map!Go(1);		! insure that this game is full;
+	Setzm	Map!Lock(1);		! release the game map lock;
+	Setzm	MapLock;		! set that we gave this away;
+	Jrst	GReady;			! and act like any other player;
+
+Snooze:	Push	P,3;			! make this a painless sleep;
+	Movei	3,'200;			! get hibernation counter;
+	Calli	3,calli!hiber;		! sleep for a bit;
+	  Jfcl;				! ignore error return;
+	Pop	P,3;			! back to the real world;
+	Popj	P,;			! return from your nap;
+
+!	Come here while someone sets up the game page
+!	or while you are waiting for the game-page map
+;
+
+GWait:	Pushj	P,Snooze;		! sleep for a bit;
+	Skipe	NTQ!;			! check NTQ;
+	  Jrst	Abort;			!  set - so finish up;
+	Skipe	ESC!;			! check ESC;
+	  Jrst	Abort;			!  set - so finish up;
+	Skipe	ZAP!;			! check ZAP;
+	  Jrst	Abort;			!  set - so finish up;
+	Skipn	Map!Lock(1);		! is there still a lock;
+	  Jrst	Retry;			!   no -- must be a different game;
+	Skipl	Map!Go(1);		! can we go yet;
+	  Jrst	GWait;			!   no -- nobody's there;
+	Came	2,Map!Players(1);	! is this our game;
+	  Jrst	GWait;			!   no -- unless my count is off;
+	Move	0,Map!Next(1);		!   yes-- get the page for this game;
+	Aos	3,Map!Waiting(1);	! count myself in;
+	Camle	3,2;			! am I too late;
+	  Jrst	GWait;			!   yes-- try another game;
+GReady:	Movem	3,MyNumber;		! remember my player number;
+	Add	3,1;			! add in the base page offset;
+	Movem	3,MyBase;		! and remember that too;
+	Movem	0,GamePage;		! remember game page for end-of-game;
+	Setom	InGame;			! mark that we made it;
+	Push	P,0;			! save the game page;
+	Pushj	P,MapFilePage;		! then map it for play;
+	Move	1,Base;			! get base address;
+	Aos	Game!Player(1);		! increment players in the game;
+	Aos	Game!Active(1);		! increment active players count;
+	Move	2,MyBase;		! get my base offset;
+	Move	3,StoreWord;		! get my word for storage;
+	Movem	3,Game!Words-1(2);	! store my game word;
+	Movem	3,Game!Texts-1(2);	! store a copy of it;
+	Move	2,Players;		! then wait for everyone;
+PWait:	Pushj	P,Snooze;		! wait a few seconds;
+	Skipe	NTQ!;			! check NTQ;
+	  Jrst	Abort;			!  set - so finish up;
+	Skipe	ESC!;			! check ESC;
+	  Jrst	Abort;			!  set - so finish up;
+	Skipe	ZAP!;			! check ZAP;
+	  Jrst	Abort;			!  set - so finish up;
+	Came	2,Game!Player(1);	! are we all there;
+	  Jrst	PWait;			! no -- wait some more;
+Abort:
+
+end;
+
+Simple Procedure PlayJotto;
+begin!code
+	label	NextW, Guess, Again, Loser, Winner;
+	label	Match, MatchC, MatchL, MatchP, MatchN, MatchM;
+	label	GetWrd, NoData, NxtChr, BadWrd, GotWrd;
+
+NextW:	Move	1,Base;			! get page base address;
+	Move	2,MyBase;		! get my base offset;
+	Skipn	ESC!;			! check ESC;
+	Skipl	2,Game!Words-1(2);	! see if my word has been guessed;
+	  Jrst	Loser;			! yes -- we lost;
+	Skipn	ZAP!;			! check ZAP;
+	Skipe	NTQ!;			! check NTQ;
+	  Jrst	Loser;			! yes -- we lost;
+	Pushj	P,GetWrd;		! get a word;
+	  Jrst	NextW;			! some error, ignore it;
+	Move	2,MyBase;		! get my base offset;
+	Skipl	2,Game!Words-1(2);	! see if my word has been guessed;
+	  Jrst	Loser;			! yes -- we lost;
+	Movn	3,Game!player(1);	! get the number of players;
+	Hrlz	3,3;			! set -players,,0;
+	Hrr	3,1;			! set -players,,base;
+	Setzm	Printed;		! count the number printed;
+	Setzm	MoreToGuess;		! clear count of active players;
+Guess:	Move	4,MyBase;		! get my number (plus base);
+	Cain	4,1(3);			! is this me;
+	  Jrst	Again;			! yes -- guess again;
+	Hrroi	4,!AxOCI;		! !Xwd( -1, !AxOCI );
+	Skipe	Printed;		! have we printed yet;
+	Auxcal	4,",";			! separate by commas;
+	Aos	Printed;		! count prints;
+	Pushj	P,Match;		! count matching characters;
+	Hrroi	4,!AxOCI;		! !Xwd( -1, !AxOCI );
+	Auxcal	4,(2);			! print status;
+Again:	Aobjn	3,Guess;		! loop through players;
+	Push	P,0;			! take your guess word;
+	Pushj	P,Logit;		! and log it wherever;
+	Hrroi	4,!AxOCI;		! !Xwd( -1, !AxOCI );
+	Auxcal	4,'11;			! type a tab;
+	Skipe	MoreToGuess;		! skip if you got everyone;
+	 Jrst	NextW;			! and loop till game over;
+	Jrst	Winner;			! I win.;
+
+
+
+!	Come here to check for a match
+;
+
+Match:	Movei	2,"#";			! assume first that player quit;
+	Skipn	Game!Words(3);		! see if player is still here;
+	  Popj	P,;			! no - player quit;
+	Movei	2,"*";			! assume that player was guessed;
+	Skipl	4,Game!Words(3);	! see if player has been guessed;
+	  Popj	P,;			! yes -- player has been got;
+	Came	0,4;			! see if my guess gets player;
+	  Jrst	MatchC;			! no -- do counting;
+	Move	2,MyNumber;		! get my number;
+	Movem	2,Game!Words(3);	! let player know about death;
+	Movei	2,"$";			! let me know I got player;
+	Popj	P,;			! return;
+
+MatchC:	Aos	MoreToGuess;		! increment active player count;
+	Movei	2,"0";			! initial count;
+	Movem	4,PlayerWord;		! save player's word;
+	Hrli	4,'440700;		! point 7;
+	Hrri	4,PlayerWord;		! address of player's word;
+	Movem	4,GuessByte;		! save it;
+	Movei	4,5;			! number of characters to check;
+MatchL:	Hrlzi	5,'440700;		! byte pointer to my guess;
+	Movem	5,MyByte;		! save it;
+	Movei	5,5;			! number of characters to check;
+	Ildb	6,GuessByte;		! get player's character;
+MatchP:	Ildb	7,MyByte;		! get my character;
+	Camn	6,7;			! is it a match;
+	  Aoja	2,MatchM;		! yes -- skip to next level;
+MatchN:	Sojg	5,MatchP;		! increment to my next character;
+MatchM:	Sojg	4,MatchL;		! increment to next player character;
+	Popj	P,;			! return when done;
+
+!	Come here to read in a word
+;
+
+GetWrd:	Setz	0,;			! clear storage;
+	Movei	3,5;			! setup count;
+	Hrlzi	4,'440700;		! setup pointer;
+NoData:	Move	2,MyBase;		! get my base offset;
+	Skipn	ESC!;			! check ESC;
+	Skipl	2,Game!Words-1(2);	! see if my word has been guessed;
+	  Popj	P,;			! yes -- we lost;
+	Skipn	ZAP!;			! check ZAP;
+	Skipe	NTQ!;			! check NTQ;
+	  Popj	P,;			!  set - so finish up;
+	Movei	5,'400;			! get hibernation counter;
+	Calli	5,calli!hiber;		! sleep for a bit;
+	  Jfcl;				! ignore error return;
+NxtChr:	Hrroi	5,!AxICS;		! !Xwd( -1, !AxICS );
+	Auxcal	5,5;			! get a character;
+	  Jrst	NoData;			! take a hike for awhile;
+	Caie	5,"-";			! see if got a word yet;
+	Cain	5,"/";			! ddt hackers beware;
+	  Jrst	GotWrd;			! think so, let's go check;
+	Cain	5,'15;			! carriage-return is special;
+	  Jrst	NxtChr;			! simply restart;
+	Cain	5,'12;			! and line-feed reset's it;
+	  Jrst	GetWrd;			! by restarting word;
+	Cail	5,"a";			! see if lower case;
+	Caile	5,"z";			! between a & z;
+	  Caia;				! no -- skip over;
+	Movei	5,-'40(5);		! yes-- convert to upper case;
+	Cail	5,"A";			! now see if a legal character;
+	Caile	5,"Z";			! between A & Z;
+	  Jrst	BadWrd;			! no -- complain;
+	Sojl	3,BadWrd;		! count characters;
+	Idpb	5,4;			! store character;
+	Jrst	NxtChr;			! get next;
+
+BadWrd:	Hrroi	4,!AxOCI;		! !Xwd( -1, !AxOCI );
+	Auxcal	4,'7;			! ring a bell;
+	Auxcal	4,"?";			! print a question-mark;
+	Auxcal	4,'15;			! a carriage-return;
+	Auxcal	4,'12;			! line-feed;
+	Popj	P,;			! and return;
+
+GotWrd:	Skipe	3;			! this had better be 0;
+	  Jrst	BadWrd;			! otherwise give error;
+	Aos	(P);			! set skip return;
+	Popj	P,;			! return wih word in ac0;
+
+Winner:	Movei	2,0;			! nobody got me!  I won;
+Loser:	Movem	2,PlayerNumber;		! store who got me;
+	Sos	2,Game!Active(1);	! decrement now that we're done;
+	Movem	2,PlayersLeft;		! remember how many are left;
+	Setzm	InGame;			! clear game flag;
+
+end;
+
+simple boolean procedure Legal!Word( String Word );
+begin
+    Integer C,D,E;
+    E _ True;
+    If Length( Word ) = 5
+     then begin "so far the right length"
+	For C _ 1 step 1 until 5 do
+	    If "A" leq Word[C for 1] leq "Z"
+	     then
+	     else E _ False;
+	For C _ 1 step 1 until 4
+	 do For D _ C+1 step 1 until 5
+	     do If Kequ( Word[C for 1], Word[D for 1])
+		 then E _ False;
+     end "so far the right length"
+     else E _ False;
+    If not E then begin
+	Print(  Crlf,"Your guess-word must contain 5 different letters",
+		Crlf,"please try another word.",crlf);
+	Return( False );
+    end
+    else Return( True );
+end;
+
+simple procedure CheckTypeAhead( Integer Penalty );
+begin
+    Auxclv( -1, 0, !AxSIC );			! see if player typed ahead;
+    Do begin
+      If !Skip! then begin "naughty naughty"
+	Auxclv( -1, 0, !AxCBI );		! -- clear the input buffer;
+	Print(  "{Sigh}",crlf,crlf,		! yes -- type nasty message;
+		"You are not supposed to type ahead!",crlf,
+		"however, since you did you are penalized ",
+		Penalty," seconds.",crlf,
+		"please WAIT (this time)..." );
+	Calli(!Xwd(1,Penalty), calli!Hiber);	! -- force the user to sleep;
+	Auxclv( -1, 0, !AxSIC );
+	Penalty _ Penalty + Penalty;		! -- double the penalty;
+      end "naughty naughty";
+    end until not !skip!;
+end;
+
+simple procedure OpenGameFile;
+begin
+    Open(Chan_getchan,"DSK",'17,0,0,0,0,Eof_-1);
+    Lookup( Chan, GameFile, Eof_-1);
+    If Eof then begin
+	FileInfo( FILE );
+	Chnior( Chan, FILE[1], !chENT);		! create file;
+	Eof_ If not !SKIP!			! if skip, all is good;
+	      then !rh( FILE[2] ) else 0;
+	If not EOF then begin "no errors"	! Otherwise -- we must stop;
+	    Chnior( Chan, 1, !chCFP );		! Create page 1;
+	    Close( Chan );			! On file;
+	    Lookup( Chan, GameFile, Eof_-1);
+	end "no errors";
+    end;
+    If not EOF
+     then begin "continue entry code"
+	FileInfo( FILE );			! read file data;
+	Chnior( Chan, FILE[1], !chMEN);		! multiple enter;
+	Eof_ If not !SKIP!			! if skip, all is good;
+	      then !rh(FILE[2]) else 0;
+     end "continue entry code"
+     else begin "must not continue"
+	Print( "File error ",Cvos(EOF)," on ",GameFile,crlf);
+	Calli( 1, calli!EXIT );
+    end "must not continue";
+end;
+
+
+simple procedure Closeout( String Text );
+begin
+    If InGame then Quit;
+    If ESC! or NTQ! or ZAP! then Quit;
+    Print( Crlf, Crlf, Text, Crlf );
+    IntZAP;
+    Close( Chan );
+    Close( LogChan );
+    Release( Chan );
+    Release( LogChan );
+    Calli( 1, calli!EXIT );
+end;
+
+
+    TTYup( True );			! make everything uppercase;
+    Print( "Jotto %",Cvos(!lh(memory['137])),".",
+	   Cvos(!rh(memory['137])),Crlf,Crlf);
+    OpenGameFile;			! start the game rolling;
+    MapFilePage( GameMap );		! read the game map page;
+    Do begin
+      Print( "How many players: ");	! get the player count;
+      Players _ Cvd(Inchwl);
+      If Players < 2 then Print( "You can't play alone.",crlf);
+    end until Players > 1;
+    Auxclr( -1, memory['200], !AxCFS );	! set no-echo;
+    Do begin
+      Print( "Enter your Game Word: ");	! read your game-word;
+      GameWord _ Inchwl;
+      Print( Crlf );
+    end until Legal!Word( GameWord );	! until it's legal;
+    StoreWord _ CvASC( GameWord );	! remember this for later;
+    Auxclr( -1, memory[0], !AxCFS );	! then reset echo;
+    Print( "Please wait..." );		! tell the player to wait;
+    IntINI( Intvar_INTPRO );		! turn on interrupts;
+    SetupGameBoard;			! whilst we setup the board;
+    If ErrorStatus then	Closeout("Problem setting game.");
+    If ESC! then Closeout( "Bye!");	! if you want to quit -- Bye;
+    If NTQ! then Closeout( "Game Closed -- Bye!" );
+    If ZAP! then Closeout( "Circuit Zapped!" );
+    CheckTypeAhead( 15 );		! don't let the user type ahead;
+    Print( "Ok!  Go!",Crlf,Crlf );	! sound the starting gun;
+    Open( LogChan _ getchan, "DSK", 1, 0,2, 0,0, Eof_-1 );
+    Enter( LogChan, Cvs(1000+Calli(0,calli!PJOB))[2 for 3]&"WRD.JOT", Eof_-1);
+    PlayJotto;				! now play the game;
+    Calli( !Xwd('2001,BasePage), -'66);	! unmap the game page;
+    If ESC! then Closeout( "Bye!");	! if you want to quit -- Bye;
+    If NTQ! then Closeout( "Game Closed -- Bye!" );
+    If ZAP! then Closeout( "Circuit Zapped!" );
+    Closeout(
+      If PlayerNumber > 0
+       then
+	"Player number "&Cvs( PlayerNumber )&" has guessed your word."&
+	 Crlf & "In case you forgot, your word was: "& GameWord &
+	 Crlf & "Better ""Luck"" next time, LOSER!"
+       else
+	"Congratulations!!!  You are the last player left." &
+	 Crlf & "In case you forgot, your word was: "& GameWord &
+	 Crlf & "You are the winner!!!!!"
+    );
+
+end $
+
+   
