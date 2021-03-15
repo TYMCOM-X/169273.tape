@@ -1,0 +1,517 @@
+
+begin "PACK"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "(SAILIB)ATFILE.REQ" source!file;
+require "(SAILIB)CVPPN.REQ"  source!file;
+require "(SAILIB)FNDKEY.REQ" source!file;
+require "PGCOPY.REQ" source!file;
+require "PCKSUB.REQ" source!file;
+require "ARGS.REQ" source!file;
+
+Define BrkString =
+    {(If Brk="*" then "######" else if Brk="?" then "#" else null)};
+
+Define MemPageSize = 512;		! # words in a memory page ;
+Define MemPages = 10;			! # memory pages for stuff ;
+Define MemMax = MemPages * MemPageSize;	! # words to reserve ;
+
+Define IC = 20, OC = 21;		! Channel numbers for XFER ;
+Define !chVMP = '47;			! Chanio fn move vmp to f  ;
+Define !FILE = 0, !EXT = 1;		! Lookup block offset data ;
+
+Define PCKCOD = '776;			! an unlikely place? ;
+Define PCKSLF = '777;			! a redundant identifier ;
+
+Define Pack!Code = '314052314025;	! unlikely code ;
+Define Pack!Self = { ( !bit(2) lor Map[1] ) };
+
+Define Printx(x) = { print( cvps(x)&" (",props(x),")  ",datum(x),crlf ) };
+Define MemLok(x) = { memory[ VMBase+(x) ] };
+
+  redefine !Block(Group, Name, Size) = {
+    Ifcr Length(Cvps(Size)) = 0 thenc assignc Size = 1; Endc
+    Define Group}&{Name = Group;
+    Redefine Group = Group + Size;};
+
+    Define S! = 0;			! ** Filespec block offsets ** ;
+    !Block( S!,Dev )			! Device ;
+    !Block( S!,Usr,2 )			! Username ;
+    !Block( S!,Nam )			! Name ;
+    !Block( S!,Ext )			! Extension ;
+
+
+String  FileLine, FileSpec, CopySpec, Text;
+Integer Inbrk, InLst, Quest, Brk;	! various break table stuff ;
+Integer File, Ext, UserPPN, LastPPN;	! file information ;
+Integer ProcessedFiles, CIndex;		! file counter, cmd index ;
+Integer IChan, OChan;			! file channels for in/out ;
+Integer VMBase, VMPage;			! virtual memory pointers  ;
+Boolean Interactive;			! determine how run ;
+
+Record!Class E( Integer Ext; r!p (E) Next );
+Record!Class F( Integer File; r!p (E) Ext; r!p (F) Next );
+Record!Class P( Integer Ppn; r!p (F) File; r!p (P) Next );
+
+r!p (P) Users, ThisUser, ThatUser;
+r!p (F) Files, That, Name;
+r!p (E) Last, This;
+
+Safe Integer Array Spec[ S!Dev:S!Ext ];	! holds parsed file spec ;
+Safe Integer Array Map[ 0:1 ];		! hold file mapping info ;
+Safe Integer Array Put[ 0:1 ];		! hold file storing info ;
+
+Preset!with "PACK", "UNPACK";		! same basic principle ;
+Safe String Array LegalCommands[ 1:2 ];	!  for both commands. ;
+
+Preset!with '17, cvsix("DSK"), 0;	! open block for DSK: ;
+Safe Integer Array DSK[ 0:2 ];
+
+Preset!with [MemMax + MemPageSize] 0;	! expect to use aligned 1:MemMax ;
+Safe Integer Array VM[ 1:MemMax+MemPageSize ];
+
+string item OutputFiles;		! output file(s) ;
+string item InputFiles;			! list of input files ;
+
+item Sticky;				! controls "sticky" username ;
+item Reverse;				! controls sorting order ;
+
+
+Simple Procedure InitStuff;
+! ----------------------------------------------------------------------;
+!									;
+!	InitStuff							;
+!		Routine to initialize data structures and calculate	;
+!		where to put the initial cache of pages to use for	;
+!		this venture.						;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Init"
+
+    VMPage_ (location( VM[1] ) + '777) lsh -9;
+    VMBase_ VMPage lsh 9;		! base memory address ;
+    Map[0]_ !Xwd( '6001, VMPage+1 );	! 1 page at base address + 1 ;
+    Put[0]_ !Xwd(     1, VMPage );	! 1 page at base address ;
+    Put[1]_ -1;				! always at end of file ;
+
+end "VM Init";
+require InitStuff initialization;
+
+
+Simple Integer procedure GetText( Reference string Line;
+				  Integer Byte, Count; String Chars );
+begin "get text"
+    Own integer wp;
+    String Str;
+
+    while ( length( Line ) )
+     do begin "get data"
+
+	Str_ Chars;				! copy break chars ;
+	while ( length( Str ) )			! if any break chars ;
+	 do if ( Line = Lop( Str ) )		!  and match a brk ;
+	     then return( Line );		!  return that character ;
+
+	if ( 0 leq count_ count - 1 )		! if room left in string ;
+	 then if ( "a" leq wp_lop(Line) )	!  then check case ;
+	       then idpb( wp-'100, byte )	!    lowercase to sixbit ;
+	       else idpb( wp-'40, byte )	!    uppercase to sixbit ;
+	 else wp_ lop( Line );			!  throw away extras ;
+
+     end "get data";
+
+    return( 0 );				! no line left? ;
+
+end "get text";
+
+
+Simple Boolean Procedure VMSpec( String Line );
+! ----------------------------------------------------------------------;
+!									;
+!	Ok_ VMSpec( FileSpecification )					;
+!		Routine to read a string file specification and build	;
+!		the special file block used by the VMFile routine.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "VM Spec"
+
+    arrclr( spec );				! clear out the array ;
+
+    GetText( Line, point( 6,spec[S!Nam],-1 ), 6, ":(." );
+
+    if ( ":" = Line )				! it was a device, good! ;
+     then begin
+	lop( Line );				! throw away the colon and ;
+	spec[S!Dev] swap spec[S!Nam];		! swap data to right places ;
+     end
+     else spec[S!Dev]_ cvsix("DSK");		!  and fill in the device ;
+
+    if ( "(" = Line )				! if it starts with "(" ;
+     then begin "get user"			!  then pick up username ;
+	lop( Line );				!    eat the "(" ;
+	GetText( Line, point( 6,spec[ S!Usr ],-1 ), 12, ")" );
+	lop( Line );				!    eat the ")" ;
+     end "get user"
+     else begin "default user"			! set default if no user ;
+	spec[ S!Usr   ]_ calli( '31, '41 );	! .GTNM1 (GFD user 1-6)  ;
+	spec[ S!Usr+1 ]_ calli( '32, '41 );	! .GTNM2 (GFD user 7-12) ;
+	If not( !Skip! )			! set blank if GETTAB fails ;
+	 then spec[ S!Usr ]_ spec[ S!Usr+1 ]_ 0;
+     end "default user";
+
+    if not( length( Line ) or spec[S!Nam] )	! must have a name ;
+     then return( false );			!  so return false ;
+
+    if not( "." = Line or spec[S!Nam] )
+     then GetText( Line, point( 6,spec[ S!Nam ],-1 ), 6, "." );
+
+    if not( spec[S!Nam] )			! seen anyone ;
+     then return( false );			! no, go home ;
+
+    if ( "." = Line )				! if dot seen ;
+     then begin "get ext"
+	lop( Line );				!  then chop it off ;
+	GetText( Line, point( 6,spec[ S!Ext ],-1 ), 3, " "&'11 );
+     end "get ext";
+
+    return( true );				! got here, return ok ;
+
+end "VM Spec";
+
+
+boolean procedure WantFile( Reference Integer Filename, Extension );
+begin
+    Return( Extension neq CvSix("TMP") );
+end;
+
+procedure FileProc( Reference Integer Chan, Cnt, Brk, FileEof;
+		    Integer Array LKB );
+Begin "Each File"
+    Integer N;
+
+    Name_ P:File[ ThisUser ];			! Head of list   ;
+
+    While ( That_ F:Next[ Name ] )		! While ( more ) ;
+     do If ( LKB[!File] = N_ F:File[ That ] )	!  do if same    ;
+	 then begin "New extension"		!   then add ext ;
+	    Last_ F:Ext[ That ];		!   : first one  ;
+	    While ( This_ E:Next[ Last ] )	!   : scan list  ;
+	     do If ( !lh( LKB[!Ext] ) < !lh( E:Ext[This] ) )
+		 then if not( props(Reverse) )	! test direction ;
+		       then done		!   : insert it  ;
+		       else Last_ This		!  loop for more ;
+		 else if not( props(Reverse) )	! test direction ;
+		       then Last_ This		!   : make ext!  ;
+		       else If ( !lh( LKB[!Ext] ) > !lh( E:Ext[This] ) )
+			     then done		!   : insert it  ;
+			     else Last_ This;	!   : make ext!  ;
+	    If ( !lh(LKB[!Ext]) = !lh(E:Ext[Last]) )
+	     then return;			! skip identical ;
+	    E:Next[ Last_ E:Next[ Last ]_ new!record( E ) ]_ This;
+	    E:Ext[ Last ]_ LKB[!Ext];		!   : in place   ;
+	    Return;				! then return.   ;
+	 end "New extension"
+	 else If ( LKB[!File] < N )		!  else insert?  ;
+	       then if not( props(Reverse) )	! test direction ;
+		     then done			!    yes, skip!  ;
+		     else Name_ That		! no, re do scan ;
+	       else if not( props(Reverse) )	! test direction ;
+		     then Name_ That		! no, re do scan ;
+		     else If ( LKB[!File] > N )	!  else insert?  ;
+			   then done		!    yes, skip!	 ;
+			   else Name_ That;	! no, re do scan ;
+
+    F:Next[ Name_ F:Next[ Name ]_ new!record( F ) ]_ That;
+    F:File[ Name ]_ LKB[!File];
+    This_ F:Ext[ Name ]_ new!record( E );
+    E:Ext[ E:Next[ This ]_ new!record( E ) ]_ LKB[!Ext];
+
+end "Each File";
+
+!	***  P A C K A G E  ***
+;
+
+Simple Procedure Package;
+begin "pack it in"
+    Boolean Err;				! hold temporary flags ;
+
+    Calli( !xwd( 2,VMPage ), calli!VCLEAR );	! 2 pages: LKB & check ;
+    Calli( !xwd('6001,VMPage), calli!VCREAT );	! this one for lookup  ;
+    MemLok( !RBCNT )_ !RBPID;			! full set of data   ;
+    Do begin "check file"
+	FileSpec_ PCKDAT;			! Get random name    ;
+	MemLok( !RBNAM )_ cvsix( FileSpec[1 for 6] );
+	MemLok( !RBEXT )_ cvsix( FileSpec[7 for 3] );
+	Chnior( OChan, MemLok(!RBCNT), !chENT );
+	If not( !Skip! )
+	    or ( !Skip! and MemLok(!RBEXT) land '400000 )
+	 then Chnior( OChan, memory[CL!RST lor CL!ACS], !chCLS );
+     end "check file" until (MemLok(!RBEXT) land '400000) = 0;
+
+    MemLok( !RBPPN )_ P:Ppn[ ThisUser ];	! PPN  ;
+    MemLok( !RBNAM )_ F:File[ That ];		! File ;
+    MemLok( !RBEXT )_ E:Ext[ This ];		! Ext  ;
+    Chnior( IChan, MemLok(!RBCNT), !chLK );	! Read file ;
+    if not( !Skip! )
+     then begin "abort this one"
+	Chnior( OChan, memory[CL!RST lor CL!ACS], !chCLS );
+	return;
+     end "abort this one";
+
+    MemLok( PCKCOD )_ Pack!Code;		! set unlikely code ;
+    MemLok( PCKSLF )_ Pack!Self + 1;		! set 1B2 lor page# ;
+
+    ProcessedFiles_ ProcessedFiles + 1;		! increment counter ;
+    Print(  Cv6str(F:File[That]),		! let user see what ;
+	    (if !lh(E:Ext[This])		! file we are doing ;
+	      then "." & Cv6str(E:Ext[This])	!  at the moment.   ;
+	      else null)
+	);
+
+    if ( 1 < Map[1]_ (MemLok(!RBSIZ) + '777) lsh -9 )
+     then begin "more than a page"
+	Chnior( IChan, Map[0], !chMFP );	! map last page of file ;
+	if not( !Skip! ) or
+	    ( MemLok('1000+PCKCOD) = Pack!Code
+	      and MemLok('1000+PCKSLF) = Pack!Self )
+	 then begin "cannot repack"
+	    print( " [already packaged]" & crlf );
+	    Calli( !Xwd(1,VMPage+1), calli!VCLEAR );
+	    Chnior( IChan, memory[CL!RST lor CL!ACS], !chCLS );
+	    Chnior( OChan, memory[CL!RST lor CL!ACS], !chCLS );
+	    return;
+	 end "cannot repack";
+     end "more than a page";
+
+    Print( " ==> ", Filespec[1 for 6], ".", FileSpec[7 for 3] );
+
+    Err_ PGCopy( OChan, IChan, Map[1], VMPage+1, MemPages-1 );
+    Chnior( IChan, memory[CL!RST lor CL!ACS], !chCLS );
+
+    If ( Err )
+     then begin "did not work"
+	print( " [aborted " );
+	PGCErr( Err );
+	print( "]" & crlf );
+	Chnior( OChan, memory[CL!RST lor CL!ACS], !chCLS );
+	return;
+     end "did not work";
+
+    Chnior( OChan, Put[0], !chVMP );		! store block at end ;
+    start!code Movem '3,Err end;		!  in case of error  ;
+    if not( !Skip! )
+     then begin "fatal flaw"
+	print(  " [aborted ",cvos(!lh(Err)),",,",cvos(!rh(Err)),
+		" file write error CHANIO '47]" & crlf );
+	Chnior( OChan, memory[CL!RST lor CL!ACS], !chCLS );
+	return;
+     end "fatal flaw";
+
+    Calli( !Xwd( 1,VMPage ), calli!VCLEAR );	! lookup block page! ;
+    Chnior( OChan, memory[0], !chCLS );		! close off the file ;
+    Print( " [ok]" & crlf );			! then let them know ;
+
+end "pack it in";
+
+!	***  U N P A C K  ***
+;
+
+Simple procedure UnPack;
+begin "fix it up"
+    Boolean Err;				! hold temporary flags ;
+
+    Calli( !xwd( 3,VMPage ), calli!VCLEAR );	! 3 pages LKB & checks ;
+    Calli( !xwd('6002,VMPage), calli!VCREAT );	! these are for lookup ;
+
+    ProcessedFiles_ ProcessedFiles + 1;		! increment counter ;
+    Print(  Cv6str(F:File[That]),		! let user see what ;
+	    (if !lh(E:Ext[This])		! file we are doing ;
+	      then "." & Cv6str(E:Ext[This])	!  at the moment.   ;
+	      else null)
+	);
+
+    MemLok( !RBCNT )_ !RBPID;			! full set of data   ;
+    MemLok( !RBPPN )_ P:Ppn[ ThisUser ];	! PPN  ;
+    MemLok( !RBNAM )_ F:File[ That ];		! File ;
+    MemLok( !RBEXT )_ E:Ext[ This ];		! Ext  ;
+    Chnior( IChan, MemLok(!RBCNT), !chLK );	! Read file ;
+    if not( !Skip! )
+     then begin "abort this one"
+	print( " [file lookup error: ",cvos(!rh( MemLok(!RBEXT) )),"]"&crlf );
+	return;
+     end "abort this one";
+
+    MemLok( PCKCOD )_ Pack!Code;		! set unlikely code ;
+    MemLok( PCKSLF )_ Pack!Self + 1;		! set 1B2 lor page# ;
+
+    if ( 1 < Map[1]_ (MemLok(!RBSIZ) + '777) lsh -9 )
+     then begin "more than a page"
+	Chnior( IChan, Map[0], !chMFP );	! map last page of file ;
+	if not( !Skip! ) or
+	    ( MemLok('1000+PCKCOD) = Pack!Code
+	      and MemLok('1000+PCKSLF) = Pack!Self )
+	 then begin "cannot repack"
+	    print( " [already packaged]" & crlf );
+	    Calli( !Xwd(1,VMPage+1), calli!VCLEAR );
+	    Chnior( IChan, memory[CL!RST lor CL!ACS], !chCLS );
+	    Chnior( OChan, memory[CL!RST lor CL!ACS], !chCLS );
+	    return;
+	 end "cannot repack";
+     end "more than a page";
+
+    Print( " ==> ", Filespec[1 for 6], ".", FileSpec[7 for 3] );
+
+    Err_ PGCopy( OChan, IChan, Map[1], VMPage+1, MemPages-1 );
+    Chnior( IChan, memory[CL!RST lor CL!ACS], !chCLS );
+
+    If ( Err )
+     then begin "did not work"
+	print( " [aborted " );
+	PGCErr( Err );
+	print( "]" & crlf );
+	Chnior( OChan, memory[CL!RST lor CL!ACS], !chCLS );
+	return;
+     end "did not work";
+
+    Chnior( OChan, Put[0], !chVMP );		! store block at end ;
+    start!code Movem '3,Err end;		!  in case of error  ;
+    if not( !Skip! )
+     then begin "fatal flaw"
+	print(  " [aborted ",cvos(!lh(Err)),",,",cvos(!rh(Err)),
+		" file write error CHANIO '47]" & crlf );
+	Chnior( OChan, memory[CL!RST lor CL!ACS], !chCLS );
+	return;
+     end "fatal flaw";
+
+    Calli( !Xwd( 1,VMPage ), calli!VCLEAR );	! lookup block page! ;
+    Chnior( OChan, memory[0], !chCLS );		! close off the file ;
+    Print( " [ok]" & crlf );			! then let them know ;
+
+end "fix it up";
+
+!	***  M A I N   P R O G R A M   L O O P  ***
+;
+
+setbreak(inbrk_getbreak,#LF&#FF,null,"INS");	! break on LF FF;
+setbreak(inlst_getbreak,", "," "&#HT,"KTINS");	! break on comma;
+setbreak(quest_getbreak,"?*",Null,"INS");	! break on qmark;
+MFDset( 0, 4, 0, 132 );				! ascii, in, out, count;
+
+if not( 0 < CIndex_ FndKey( ArgV[0], LegalCommands ) )
+ then Usererr( 0,0, "Illegal command: "&ArgV[0], "X" );
+
+ArgParse( any, InputFiles, {Sticky,Reverse}, ARGS );
+
+LastPpn_ Calli(!Xwd(-1,!GtPPN), Calli!GETTAB);	! initially self ;
+Interactive_ true;			! default to interactive mode ;
+
+while ( true )
+ do begin "!TRUE!"
+
+    if ( props(InputFiles) )		! if something specified ;
+     then begin "command line"		!  then ;
+	Interactive_ false;		!   become non-interactive ;
+	FileLine_ datum(InputFiles);	!   and simulate input line ;
+     end "command line";
+
+    If ( Interactive )			! non command line data ;
+     then begin "real session"
+	Print( "Spec(s): " );		! prompt for an input line ;
+	FileLine_ AtFile( True );	! then read it. ;
+	If Length( FileLine ) = 0	! on a blank line from user ;
+	 then Calli(0,Calli!EXIT);	!  simply terminate session ;
+     end "real session";
+
+    Users_ new!record( P );			! initialize...;
+
+    While Length( FileLine )			! for each spec typed ;
+     do begin "line typed"
+	FileSpec_ Scan(FileLine,inlst,brk);	! gobble one file-spec ;
+	If Length( FileSpec )			! if it has substance ;
+	 then begin "file typed"
+	    CopySpec_ Null;			! init copy variables ;
+	    Brk_ 0;
+	    While ( length( FileSpec ) )
+	     do CopySpec_ CopySpec & BrkString & Scan( FileSpec, quest, Brk );
+	    CopySpec_ CopySpec & BrkString;		! translate *,? to # ;
+	    File_ cvfil( CopySpec, Ext, UserPpn );	! dissect into parts ;
+	    If ( 0 neq (File lor Ext lor UserPpn) )	! any non-null ok ;
+	     then begin "use GFD ppn"
+		If UserPpn = 0				! handle null ppn ;
+		 then if ( props(STICKY) )		! use /STICKY here ;
+		       then UserPpn_ LastPpn		! previous username ;
+		       else UserPpn_ Calli( !Xwd(-1,!GtPPN), Calli!GETTAB );
+		If !lh( UserPpn ) = 0			! pointer to UNAME ;
+		 then UserPpn_ CvPPN( Cv6str( memory[ UserPpn   ] ) &
+				      Cv6str( memory[ UserPpn+1 ] ) );
+	     end "use GFD ppn";
+	    If File = 0 then File_ cvsix("*");		! handle null file ;
+	    If Ext = 0 then Ext_ cvsix("*");		! handle null ext ;
+
+	    ThatUser_ Users;				! Start at top   ;
+	    While ( ThisUser_ P:Next[ ThatUser ] )	! While ( more ) ;
+	     do If ( UserPpn = P:Ppn[ ThisUser ] )	!  do if same    ;
+		 then done;				!   have a match ;
+	    If not( ThisUser )				! Got one?       ;
+	     then begin "first time"			! No, set one up ;
+		ThisUser_ P:Next[ ThatUser ]_ new!record( P );
+		P:Ppn[ ThisUser ]_ UserPpn;		! store username ;
+		P:File[ ThisUser ]_ new!record( F );	! init file area ;
+	     end "first time";
+
+	    UfdScn( UserPpn, File, Ext, 1, WantFile, FileProc );
+	    LastPpn_ UserPpn;			! remember last user ;
+
+	 end "file typed"
+     end "line typed";
+
+!	fall through from above -- scanner sorting code.
+!	***  I N T E R E S T I N G   P A R T  ***
+;
+    Chnior( IChan_IC, DSK[0], !chOPN );		! prepare for xfers  ;
+    Chnior( OChan_OC, DSK[0], !chOPN );		!   to occur below   ;
+    ProcessedFiles_ 0;				! initialize count   ;
+
+    ThatUser_ Users;				! one user at a time ;
+    while( ThisUser_ P:Next[ ThatUser ] )	! if any at all      ;
+     do begin "each user"			!  P:Ppn[ ThisUser ] ;
+
+	Name_ P:File[ ThisUser ];		! get name pointer   ;
+	While ( That_ F:Next[ Name ] )		! look one at a time ;
+	 do begin "each name"			!  F:File[ That ]    ;
+
+	    This_ F:Ext[ That ];		! get ext pointer    ;
+	    While ( This_ E:Next[ This ] )	! one at a time      ;
+	     do begin "each ext"		!  E:Ext[ This ]     ;
+
+		Case ( CIndex - 1 ) of
+		begin
+		  [0] Package;			! oh no, do it to it ;
+		  [1] Unpack;			! consider it done ;
+		  [else] usererr( 0,0, "Bad command", "C" )
+		end;
+
+	     end "each ext";			! ran of end of list ;
+
+	    Name_ That;				! setup for next "F" ;
+
+	 end "each name";
+	ThatUser_ ThisUser;			! setup for next "P" ;
+
+     end "each user";
+
+    if not( ProcessedFiles )
+     then Print( crlf & "% No files satisfying request" & crlf );
+
+    if not( Interactive )		! if we were a command line ;
+     then calli(0,calli!EXIT);		!  then we are done. ;
+
+    Interactive_ true;			! in case user says continue ;
+ "!TRUE!";
+
+start!code uuo!EXIT 0, end;		! really exit! ;
+
+end "PACK" $
+   P|`
