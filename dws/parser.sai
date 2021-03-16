@@ -1,0 +1,513 @@
+Entry P!Init, P!Parse;
+
+begin "Symbol Table, Lexical Scanner, and LR Parser"
+
+  define DEBUG = false;
+
+  require "(sailib)sail.def" source!file;
+  require "parser.def" source!file;
+  require "tables.inc" source!file;
+
+
+  ! external routines that we want to call ;
+
+  external procedure I!Err( integer Inf; string ErrMsg );
+  external boolean procedure I!Line( reference string Line );
+  external integer procedure A!Prod( integer ProdNum );
+  ! The symbol table - used for open hashing. ;
+  own string array Symbol!Table[ 0 : SYMBOLTABLESIZE - 1 ];
+  own integer array Symbol!Type[ 0 : SYMBOLTABLESIZE - 1 ];
+
+
+  ! "Line" holds the line of text we're currently munching on. ;
+  own string Line;
+  boolean OneLineSeen, EOFSeen;
+
+  ! The constant table holds numeric constants.  Type is kept in a
+  ! parallel type table.  A token type "constant" is returned, with
+  ! the info word pointing into the constant & type tables. ;
+
+  define CONSTANTTABLESIZE = 25;
+  own integer Const!Top;
+  own integer array Const!Table[ 1 : CONSTANTTABLESIZE ];
+  own integer array Const!Type[ 1 : CONSTANTTABLESIZE ];
+  define Type!Integer = 1, Type!Real = 2;
+
+  ! The string table holds strings.  A token type "string" is returned,
+  !  and the info word points into the string table. ;
+
+  define STRINGTABLESIZE = 25;
+  own integer String!Top;
+  own string array String!Table[ 1 : STRINGTABLESIZE ];
+
+  internal own integer P!SPnt;
+  internal own integer P!SMax;
+  internal own integer array P!StkT[ 1 : STACKSIZE ];
+  internal own integer array P!StkS[ 1 : STACKSIZE ];
+  internal own integer array P!StkI[ 1 : STACKSIZE ];
+  internal own integer P!Info;
+
+  integer LookAhead;
+
+  boolean Trace!Prods, Trace!Tokens;
+! Initialize the module ;
+
+internal simple procedure P!Init;
+  begin
+
+    ! clear the symbol table ;
+    arrclr( Symbol!Table, NULL );
+
+    ! clear out the string and constant tables ;
+    String!Top := Const!Top := 0;
+    arrclr( String!Table, NULL );
+    arrclr( Const!Table, 0 );
+
+    OneLineSeen := EOFSeen := false;
+    Line := NULL;
+
+    P!SPnt := P!SMax := 1;
+    P!StkS[ P!SPnt ] := 1;
+
+    Trace!Prods := Trace!Tokens := false;
+  end;
+! Routine to return the offset into the symbol table for a string ;
+!  Returns -1 if we run out of symbol table ;
+
+integer simple procedure Hasher( string Sym );
+  begin
+    own integer i, hash;
+
+ifc FOLDCASE thenc
+    hash := (( Sym[1 for 1] land '77 ) + length( Sym )) mod SYMBOLTABLESIZE;
+elsec
+    hash := ( Sym[1 for 1 ] + length( Sym )) mod SYMBOLTABLESIZE;
+endc
+    i := hash;
+    do begin
+      if ( Symbol!Table[ i ] = NULL ) then return( i );
+ifc FOLDCASE thenc
+      if ( kequ( Sym, Symbol!Table[ i ] )) then return( i );
+elsec
+      if ( equ( Sym, Symbol!Table[ i ] )) then return( i );
+endc
+      i := i + 1;
+      if ( i = SYMBOLTABLESIZE ) then i := 0;
+    end until ( i = hash );
+
+    usererr( 0,0, "Symbol table overflow" );
+  end;
+
+! Return the offset of the symbol in the symbol table, or -1 if
+!  none is found. ;
+
+internal integer procedure S!Get( string Sym );
+  begin
+    own integer i;
+    i := Hasher( Sym );
+    if ( Symbol!Table[ i ] = NULL ) then return( -1 );
+    return( i );
+  end;
+
+! Return the offset of the symbol in the symbol table.  Make a new
+!  symbol table entry if none is found. ;
+
+internal integer procedure S!Ent( string Sym);
+  begin
+    own integer i;
+    i := Hasher( Sym );
+    if ( Symbol!Table[ i ] = NULL ) then
+      Symbol!Table[ i ] := Sym;
+    return( i );
+  end;
+
+! return the next lexical token ;
+
+internal procedure L!Scan( reference integer Token, Info );
+  begin
+    string TokenString;  integer i;
+
+    TokenString := NULL;
+    Token := 0;			! default to "eof" token ;
+    Info := 0;
+
+    while ( true ) do
+      begin "get a token"
+	label S0;
+	label S1x0, S1x1, S1x2;
+	label S2x0, S2x1;
+	label S3x0, S3x1, S3x2;
+	label S4x0, S5x0;
+
+S0:	if ( EOFSeen ) then return;
+
+	! skip leading whitespace ;
+	while (( Line = " " ) or ( Line = '11 )) do lop( Line );
+
+	! eof yet? ;
+	if ( Line = NULL ) then
+	  begin
+ifc not STREAM thenc
+	    if ( OneLineSeen ) then return;
+	    OneLineSeen := true;
+endc
+	    if ( not I!Line( Line )) then EOFSeen := true;
+	    goto S0;
+	  end;
+
+! continued ... ;
+! continued ... ;
+
+S1x0:	! begin recognizing identifier ;
+	if ((( Line >= "A" ) and ( Line <= "Z" )) or
+	    (( Line >= "a" ) and ( Line <= "z" ))) then
+	  begin
+	    Token := 1;
+	    TokenString := TokenString & lop( Line );
+	    goto S1x1;
+	  end
+	else
+	  goto S2x0;
+
+S1x1:	! continue recognizing identifier ;
+	if ((( Line >= "A" ) and ( Line <= "Z" )) or
+	    (( Line >= "a" ) and ( Line <= "z" )) or
+	    (( Line >= "0" ) and ( Line <= "9" ))) then
+	  begin
+	    TokenString := TokenString & lop( Line );
+	    goto S1x1;
+	  end
+	else
+	  begin
+ifcr RESERVEDWORDS thenc
+	    for i := 0 upto arrinfo( P!KeyW, 2 ) do
+	      if ( kequ( TokenString, P!KeyW[ i ] )) then
+		begin
+		  Token := KEYWORDOFFSET + i;
+		  return;
+		end;
+endc
+	    Info := S!Ent( TokenString );
+	    return;
+	  end;
+! Recognize numeric constants.  Return with "Info" set to point into
+!  the parallel value & type arrays. ;
+
+S2x0:	! begin recognizing constant ;
+	if (( Line >= "0" ) and ( Line <= "9" )) then
+	  begin
+	    Token := 2;
+	    TokenString := lop( Line );
+	    goto S2x1;
+	  end
+	else
+	  goto S3x0;
+
+S2x1:	! continue recognizing constant ;
+	if (( Line >= "0"  ) and ( Line <= "9" )) then
+	  begin
+	    TokenString := TokenString & lop( Line );
+	    goto S2x1;
+	  end
+	else
+	  begin
+	    return;
+	  end;
+! Quoted string recognizer.  Allows for the double quote to itself be
+!  quoted, as per tradition.  Sets "Info" to index in string table ;
+
+S3x0:	! begin recognizing a quoted string ;
+	if ( Line = """" ) then
+	  begin
+	    Token := 3;
+	    lop( Line );
+	    goto S3x1;
+	  end
+	else
+	  goto S4x0;
+
+S3x1:	! continue recognizing a quoted string ;
+	if ( Line = """" ) then
+	  begin
+	    lop( Line );
+	    goto S3x2;
+	  end
+	else
+	  begin
+	    if ( Line = NULL ) then usererr( 0,0, "bad string" );
+	    TokenString := TokenString & lop( Line );
+	    goto S3x1;
+	  end;
+
+S3x2:	! deal with a (possibly closing) quote ;
+	if ( Line = """" ) then
+	  begin
+	    TokenString := TokenString & lop( Line );
+	    goto S3x1;
+	  end
+	else
+	  begin
+	    for i := 1 upto String!Top do
+	      if ( equ( TokenString, String!Table[ i ] )) then
+		begin
+		  Info := i;
+		  return;
+		end;
+	    String!Top := String!Top + 1;
+	    if ( String!Top > STRINGTABLESIZE ) then
+	      usererr( 0,0, "out of string table space" );
+	    String!Table[ String!Top ] := TokenString;
+	    Info := String!Top;
+	    return;
+	  end;
+! more token scanning.  Here to first try recognizing composite tokens. ;
+
+S4x0:	if ( Line = "*" ) then
+	  begin
+	    Token := 19;
+	    lop( Line );
+	    if ( Line = "*" ) then
+	      begin
+		Token := 35;		! ** -> ^ in many languages ;
+		lop( Line );
+	      end;
+	    return;
+	  end
+	else if ( Line = "." ) then
+	  begin
+	    Token := 23;
+	    lop( Line );
+	    if ( Line = "." ) then
+	      begin
+		Token := 54;
+		lop( Line );
+	      end;
+	    return;
+	  end
+	else if ( Line = ":" ) then
+	  begin
+	    Token := 25;
+	    lop( Line );
+	    if ( Line = "=" ) then
+	      begin
+		Token := 50;
+		lop( Line );
+	      end;
+	    return;
+	  end
+	else if ( Line = "<" ) then
+	  begin
+	    Token := 27;
+	    lop( Line );
+	    if ( Line = "=" ) then
+	      begin
+		Token := 52;
+		lop( Line );
+	      end
+	    else if ( Line = ">" ) then
+	      begin
+		Token := 51;
+		lop( Line );
+	      end;
+	    return;
+	  end
+	else if ( Line = ">" ) then
+	  begin
+	    Token := 28;
+	    lop( Line );
+	    if ( Line = "=" ) then
+	      begin
+		Token := 53;
+		lop( Line );
+	      end;
+	  end
+
+! continued ... ;
+! continued ... ;
+
+	! Now we can map single special characters to tokens ;
+
+	else if ( '41 <= Line <='57 ) then	! "!" .. "/" ;
+	  begin
+	    Token := lop( Line ) - 23;
+	    return;
+	  end
+	else if ( '72 <= Line <= '100 ) then	! ":" .. "@" ;
+	  begin
+	    Token := lop( Line ) - 33;
+	    return;
+	  end
+	else if ( '133 <= Line <= '140 ) then	! "[" .. "`" ;
+	  begin
+	    Token := lop( Line ) - 59;
+	    return;
+	  end
+	else if ( '173 <= Line <= '176 ) then	! "{" .. "~" ;
+	  begin
+	    Token := lop( Line ) - 85;
+	    return;
+	  end;
+
+	I!Err( 0,"** Bad Character in input ('"&cvos(Line)&")" );
+	lop( Line );
+
+      end "get a token" ;
+  end;
+! Entry points for the rest of the world to change our environment ;
+
+! Trace productions? ;
+
+internal simple procedure P!PTrace( boolean Flag );
+  begin
+    Trace!Prods := Flag;
+  end;
+
+! Trace tokens ? ;
+
+internal simple procedure P!TTrace( boolean Flag );
+  begin
+    Trace!Tokens := Flag;
+  end;
+! Procedure to return the string name of a token # ;
+
+simple string procedure MapSym( integer UserSym );
+  begin
+    own integer i;
+    for i := 1 upto NSYMBOLS do
+      begin
+	if ( UserSym = P!SMap[ i ] ) then
+	  return( P!Sym[ i ] );
+      end;
+    usererr( 0,0,"Error in MapSym for usersym = " & cvs(UserSym) );
+  end;
+! Routine to "pretty print" a production ;
+
+procedure Print!Prod( integer ProdNum, LookAhead(-1) );
+  begin
+    integer idx, len, j;
+
+ifcr DEBUG thenc
+    print( "PTrace: " );
+endc
+    if ( LookAhead >= 0 ) then
+      print( ( MapSym( LookAhead )&"           ")[1 for 12], " | " );
+
+    idx := P!PIdx[ ProdNum ] + 1;
+    len := P!PLen[ ProdNum ];
+    print( P!SYM[ P!PTab[ idx ]], " ::=" );
+    idx := idx + 1;
+    while ( len > 0 ) do
+      begin
+	print( " ", P!SYM[ P!PTab[ idx ]] );
+	idx := idx + 1;
+	len := len - 1;
+      end;
+    print( crlf );
+  end;
+! Routine to return the parser action for the specified State and
+!  lookahead symbol.  Return 0 (bad action) if no action found. ;
+
+integer procedure GetAction( integer State, LookAhead );
+  begin
+    integer idx, len;
+    idx := P!AIdx[ State ];
+    len := P!ALen[ State ];
+    while ( len > 0 ) do
+      begin
+	if ( P!ATab[ idx ] = LookAhead ) then
+	  return( P!ATab[ idx + 1 ] );
+	idx := idx + 2;
+	len := len - 2;
+      end;
+    return( 0 );
+  end;
+! Routine to find the Goto State from a given state ;
+
+integer procedure GotoState( integer State, NonTerminal );
+  begin
+    integer idx, len;
+    idx := P!GIdx[ State ];
+    len := P!GLen[ State ];
+    while ( len > 0 ) do
+      begin
+	if ( P!GTab[ idx ] = NonTerminal ) then
+	  return( P!GTab[ idx + 1 ] );
+	idx := idx + 2;
+	len := len - 2;
+      end;
+    print( " ***  Internal Error  ***  " );
+    print( "No goto from state ", state, " on ", NonTerminal, crlf );
+    usererr( 0,0, "nuts" );
+  end;
+! Attempt to recover from errors. (Har Har). ;
+
+boolean procedure ErrorRecovery;
+  begin
+    integer idx, len;  string S;
+
+    S := "Saw """ & MapSym( LookAhead ) & """";
+    S := S & ", expected one of: ";
+    idx := P!AIdx[ P!StkS[ P!SPnt ] ];
+    len := P!ALen[ P!StkS[ P!SPnt ] ];
+    while ( len > 0 ) do
+      begin
+        S := S & " " & MapSym( P!ATab[ idx ] );
+	idx := idx + 2;
+	len := len - 2;
+      end;
+    I!Err( 0, S );
+    return( false );
+  end;
+! Your standard, garden variety, LR parser. ;
+
+internal boolean procedure P!Parse;
+  begin
+    own integer A, NextState, Temp;
+
+    L!Scan( LookAhead, P!Info );
+    if ( Trace!Tokens ) then
+      print( "Token: ", MapSym( LookAhead ), crlf );
+
+    while ( true ) do
+      begin "parse"
+	if ( P!SPnt > P!SMax ) then P!SMax := P!SPnt;
+
+	A := GetAction( P!StkS[ P!SPnt ], LookAhead );
+
+	if ( A = 0 ) then
+	  begin "error"
+	    if ( not ErrorRecovery ) then return( false );
+	  end "error"
+
+	else if ( A > 0 ) then
+	  begin "shift"
+	    P!SPnt := P!SPnt + 1;
+	    P!StkS[ P!SPnt ] := A;
+	    P!StkT[ P!SPnt ] := LookAhead;
+	    P!StkI[ P!SPnt ] := P!Info;
+	    L!Scan( LookAhead, P!Info );
+	    if ( Trace!Tokens ) then
+	      print( "Token: ", MapSym( LookAhead ), crlf );
+	  end "shift"
+
+	else
+	  begin "reduce"
+	    A := -A;
+	    P!Info := A!Prod( P!PTab[ P!Pidx[ A ]] );
+	    if ( Trace!Prods ) then
+	      Print!Prod( A, LookAhead );
+	    P!SPnt := P!SPnt - P!PLen[ A ];
+	    P!StkI[ P!SPnt ] := P!Info;
+	    if ( A = 1 ) then done "parse";
+	    NextState := GotoState( P!StkS[ P!SPnt ],
+				    P!PTab[ P!PIdx[ A ] + 1 ] );
+	    P!SPnt := P!SPnt + 1;
+	    P!StkT[ P!SPnt ] := P!PTab[ P!PIdx[ A ] + 1 ];
+	    P!StkS[ P!SPnt ] := NextState;
+	  end "reduce" ;
+      end "parse" ;
+    return( true );
+  end;
+
+end "Symbol Table, Lexical Scanner, and LR Parser" ;
+   
