@@ -1,0 +1,477 @@
+.	<<	EBUSIM.BIO	>>
+
+.SEC(|Block-I/O|)
+
+	Block-I/O is a special form of Host I/O which is independent of the
+normal Host input- and output-rings.
+
+	Via special messages (passed in the rings), the host request either
+Block-input (Bin) or Block-output (Bout); arguments are the block start-
+address and a byte-count.
+
+.SS(|Request for Ports|)
+
+	Before any Block-IO transaction, the PDP queries the availability
+of BIO capabilities (for historical reasons:  In the Varian/TYMNET-I
+implementation, there were only a limited number of BIO descriptors;
+this constraint does not apply to EBUS).
+
+	Thus, in response to the host request, we perform:
+
+.BEGIN BOX
+	case 45:	/* $2E: Request for Block-IO ports */
+	    WAITDAT();		/* just return his request */
+.TOPIC(|PUTIFC Routine|)
+	    PUTIFC();		/* promise all he asked for */
+	    continue;
+.END
+
+.SS(|Block-Output|)
+
+	Block-output is relative straight-forward:  The host makes a
+request, and we transmit the data until the block is exhausted,
+or until the host cancels the request.  In either case, we then
+inform the host of the status.
+
+	The requests are serviced by:
+
+.SKIP BEGIN VERBATIM
+	case 36:	/* $24: Request for block-output */
+	    if ( Rp->P_FLAGS & PF_ACT == 0 /* port not active */
+	      || Rp->P_FLAGS & PF_BKO != 0 ) /* Bout active */
+	    {	RDPDP();	/* just skip second word */
+		continue;
+	    }
+	    list *p = BLKFREE;	/* get a list entry */
+	    BLKFREE = p->next;
+	    p->next = BKOHEAD;
+	    p->port = PORTNO;
+	    BKOHEAD = p;	/* place entry onto BKO list */
+.TOPIC(|BO_TAR - Block-output: (PDP) block start addr.|)
+.TOPIC(|BO_BYT - Block-output: byte position within word|)
+.TOPIC(|BO_TCN - Block-output: output count (remaining)|)
+	    RP->BO_TCN = (short) DAT3; /* total count */
+	    RP->BO_TAR = RDPDP(); /* block address */
+	    RP->BO_BYT = 0;	/* next byte to send */
+	    continue;
+.SKIP 3
+	case 42:	/* $2A: Terminate Block-output */
+	    BKOTERM($2D);	/* reason $2D -- Bout Termination */
+	    continue;
+.END
+.SKIP 3
+	The process which actually performs block output is:
+
+.SKIP BEGIN VERBATIM
+.DTOPIC(|DOBKOUT Process|)
+	/*	Perform Block-output for all active ports,
+		subject to ISIS back-pressure
+	*/
+DOBKOUT()
+{   if ( HTDWN ) return;	/* the host must be up */
+    SAVE1 = BKOHEAD;
+    while  (SAVE1 != 0 )
+    {	SETPORT( SAVE1->port );	/* set up port */
+	SAVE1 = SAVE1->next );	/* next entry */
+	if ( Rp->P_FLAGS & PF_OBP != 0 )
+	    continue;		/* skip ports back-pressured */
+.TOPIC(|BO_TCN - Block-output: output count (remaining)|)
+	int n = Rp->BO_TCN;	/* number we have */
+	if ( n > Rp->XMITLMT )
+	    n = Rp->XMITLMT;	/* number we can send */
+	if ( not ROOM( n+3 );
+	    continue;		/* skip port if no room in ring */
+	SLOR(PORTNO,n);		/* message-type = count */
+	RDBLK();		/* get the first word */
+	while ( n-- > 0 )	/* copy bytes */
+.TOPIC(|BO_BYT - Block-output: byte position within word|)
+	{   PUTCH( DAT[ Rp->BO_BYT++ ];
+	    Rp->BO_TCN--;	/* count byte transmitted */
+	    if (Rp->BO_BYT >= 4 ) /* word exhausted */
+	    {	(Rp->BO_BYT = 0; /* fold cursor */
+		RDBLK();	/* ...and get next word */
+	    }
+	}	/* while n > 0 */
+
+	ELOR();			/* done */
+	if ( Rp->BO_TCN == 0 )
+	    BKOTERM($25);	/* block done */
+
+    }	/* while SAVE1 != 0 */
+    return;
+}
+
+
+/*	Terminate Block-output	*/
+.DTOPIC(|BKOTERM Routine|)
+BKOTERM(v)
+int	v;			/* reason for termination */
+	RBTBKO();		/* cancel Bout */
+	DAT1 = v;		/* termination reason */
+	DAT2 = PORTNO;
+	WAITDAT();		/* send it */
+.TOPIC(|PUTIFC Routine|)
+	PUTIFC();
+	return;
+}
+.END
+
+.SS(|Block-Input|)
+
+	Block-input (Bin) is significantly more complicated.  The host will
+initially make a Bin request fo a particular port;  this enables BKI
+mode.  This mode is retained until the host explicitly terminates
+block-input.  while this mode is in progress, successive data is placed
+into the specified block until this block is terminated:  there are
+three reasons for terminating a block:
+
+.BEGIN OFFSET
+	The block is filled;
+	An End-Of-Transmission (EOT, designated by arrival of a Yellow-ball)
+is received; or
+	No data has been received for more than 16 seconds.
+.END
+
+	When a block is Filled ("BFD" state), any subsequent data arriving
+is placed into a buffer;  if a new block is specified, the buffered
+data will be copied into the block.  If, however, Bin is terminated,
+this buffered data must be forwarded into the host via the regular host
+input-ring mechanism (subject, of course, to back-pressure from the host).
+
+	The code which services the requests is:
+
+.SKIP BEGIN VERBATIM
+	case 38:	/* $26: Request for block-input */
+	    if ( Rp->P_FLAGS & PF_BKI == 0 ) /* Bin not active */
+	    {	Rp->P_FLAGS != PF_BKI; /* set active */
+		RBTBUF();	/* remove buffer from buffer-list */
+		list *p = BLKFREE; /* get a list entry */
+		BLKFREE = p->next;
+		p->next = BKIHEAD;
+		p->port = PORTNO;
+		BKIHEAD = p;	/* place entry onto BKI list */
+	    }
+	    Rp->P_FLAGS &= not PF_BFD; /* clear Filled */
+.TOPIC(|BI_TIM - Block-input: time (FASTC) last activity|)
+.TOPIC(|BI_TAR - Block-input: (PDP) block start address|)
+.TOPIC(|BI_TCN - Block-input: input count (total)|)
+.TOPIC(|BI_LCN - Block-input: input count (so far)|)
+.TOPIC(|BI_BYT - Block-input: pos. within current word|)
+	    RP->BI_TCN = (short) DAT3; /* total count */
+	    RP->BI_TAR = RDPDP(); /* block address */
+	    RP->BI_LCN = 0;	/* local count (# received) */
+	    RP->BI_BYT = 0;	/* next byte to fill */
+	    RP->BI_TIM = *.SLOWC; /* current time */
+	    if ( Rp->BCT > 0 )
+		BU_BK();	/* try to empty buffer */
+	    continue;
+
+
+	case 44:	/* $2C: Terminate Block-input */
+	    if ( Rp->P_FLAGS & PF_BFD == 0 ) /* if Filled, */
+		BKITERM($2C);	/* message $2C */
+	    else BKITERM($2B);	/* message $2B */
+	    RBTBKI();		/* cancel Bin */
+	    if ( Rp->BCT > 0 )
+		BU_ADD();	/* insure buffer will be flushed */
+	    continue;
+.END
+.SKIP 3
+
+	ISISIN executes the following code for Block-input:
+
+.SKIP BEGIN VERBATIM
+.DTOPIC(|BLOKIN Process|)
+BLOKIN:	if ( Rp->P_FLAGS & PF_BFD == 0 ) /* if Filled, */
+	    goto IS_BU;		/* move to buffer */
+.TOPIC(|BI_TCN - Block-input: input count (total)|)
+	n = Rp->BI_TCN - Rp->LCN; /* space left */
+	if ( n > INTYBT )
+	    n = INTYBT;		/* number of chars */
+	GETBLK();		/* get the current word to fill */
+	while ( n-- > 0 )
+	/*	copy chars	*/
+.TOPIC(|BI_BYT - Block-input: pos. within current word|)
+	{   DAT[Rp->BI_BYT++] = GETCH();
+	    if ( Rp->BI_BYT > 3 )
+	    {	WRBLK();	/* word full..send it */
+		Rp->BI_BYT = 0;	/* cycle counter */
+	    }
+	    INTYBT--;
+.TOPIC(|BI_LCN - Block-input: input count (so far)|)
+	    Rp->BI_LCN++;	/* counting... */
+	}	/* while n > 0 */
+
+	/*	n bytes transfered...clean up	*/
+	if ( Rp->BI_BYT != 0 )
+	{   WRBLK();		/* send in partial word */
+.TOPIC(|BI_TAR - Block-input: (PDP) block start address|)
+	    Rp->BI_TAR--;	/* ...and back up word-cursor */
+	}
+.TOPIC(|BI_TIM - Block-input: time (FASTC) last activity|)
+	Rp->BI_TIM = *.SLOWC;	/* record time */
+.TOPIC(|BI_TCN - Block-input: input count (total)|)
+	if ( Rp->BI_TCN == Rp->BI_LCN )
+	    BKITERM($27);	/* report Filled */
+	if ( INTYBT == 0 )
+	    goto CLEANUP;	/* message exhausted */
+	else
+	    goto IS_BU;		/* more in message...buffer it */
+.END
+
+.SKIP 2; BEGIN BLOX
+	NOTE:###See also ISISIN : Control-signal case $AC:.  This specifies
+the activity incured if an EOT (Yellow-ball) is encountered.
+.END
+
+	In addition, there are also additional processes which are executed
+as a part of the "EXEC-loop", rather than being driven by input:
+
+.SKIP BEGIN VERBATIM
+/*	EXEC-loop Processes	*/
+    if ( HTDWN ) goto EXEC;	/* the host must be up */
+
+
+/*	Examine all active block-input for timeouts	*/
+    SAVE1 = BKIHEAD;
+    while  (SAVE1 != 0 )
+    {	SETPORT( SAVE1->port );	/* set up port */
+	SAVE1 = SAVE1->NEXT );	/* next entry */
+.TOPIC(|BI_TIM - Block-input: time (FASTC) last activity|)
+	if (  ( Rp->BI_TIM - *.FASTC )  > 9600 ) /* 16 seconds */
+	    if ( Rp->P_FLAG & PF_BFD == 0 ) /* and not Filled */
+		BKITERM($29);	/* block done -- timeout */
+	    continue;		/* skip ports back-pressured */
+
+    }	/* while SAVE1 != 0 */
+.SKIP 3
+/*	Examine all active block-input for buffered-data	*/
+    SAVE1 = BKIHEAD;
+    while  (SAVE1 != 0 )
+    {	SETPORT( SAVE1->port );	/* set up port */
+	SAVE1 = SAVE1->NEXT );	/* next entry */
+	if ( Rp->P_FLAG & PF_BFD == 0 /* not Filled */
+	    && Rp->BCT > 0 )	/* and data buffered */
+		BU_BK();	/* flush those buffers */
+
+    }	/* while SAVE1 != 0 */
+.SKIP 3
+/*	Examine Buffer-list for buffered-data	*/
+    SAVE1 = BUFHEAD;
+    while  (SAVE1 != 0 )
+    {	SETPORT( SAVE1->port );	/* set up port */
+	SAVE1 = SAVE1->NEXT );	/* next entry */
+	BU_RG();		/* try to flush */
+	if (Rp->BCT == 0 )	/* now empty */
+	   RBTBUF();		/* ...remove from service */
+
+    }	/* while SAVE1 != 0 */
+
+goto EXEC;			/* Done...start over */
+.END
+.SKIP 3
+	The functions which do all the work are:
+
+.SKIP BEGIN VERBATIM
+/*	Move data from buffer to ring	*/
+.DTOPIC(|BU_RG Routine|)
+BU_RG()
+{	if ( Rp->BCT == 0 )
+	    return;		/* don't try if buffer empty */
+	if ( Rp->P_FLAGS & PF_HBP != 0 )
+	    return;		/* ...or if host has applied BP */
+	INTYBT = 30;		/* parameter to call... */
+	BKINSZ();		/* find size of message we can send */
+	INRGSP = ( INRGSP > 32 ) ? 30 : ( INRGSP - 2 );
+	DAT1 = 0;		/* count bytes */
+	DAT2 = PORTNO;
+	char	*p = DAT3;	/* where the next char goes */
+	INTYBT = 0;		/* used to record control-codes */
+	while ( Rp->BCT != 0 )
+	{   if ( DAT1 >= INRGSP )
+		break;		/* message full */
+	    c = DGCI();		/* get the next char */
+	    if ( c == ESC )
+	    {	if (Rp->BCT == 0 ) FCRASH($60);
+		c = DGCI();	/* get escaped char */
+		if (c != ESC )
+		{   INTYBT = c;
+		    break;	/* abort -- Control-signal */
+		}
+	    }
+	    *p++ = c;		/* save char away */
+	    DAT1++;		/* count another char */
+	}	/* while Rp->BCT > 0 */
+
+	if ( DAT1 != 0 )
+	{   DAT1 != $80;	/* make proper message type */
+	/*	now copy the message (in DAT) into the PDP	*/
+	    for ( char *pp = DAT ; pp < p ; WRPDP( *pp++ );
+.TOPIC(|PUTIFC Routine|)
+	    PUTIFC();		/* insure host sees it */
+	}
+	BU_COD();		/* report control-signal (if any) */
+	BU_RGX();		/* see if buffer empty */
+	return;
+}
+.SKIP 3
+	/*	Input any code in INTYBT	*/
+.DTOPIC(|BU_COD Routine|)
+BU_COD()
+{	if ( INTYBT != 0 )	/* something to do */
+	{   LOOKUP();		/* yes...look it up */
+	    DAT2 = PORTNO;
+	    WAITDAT();
+.TOPIC(|PUTIFC Routine|)
+	    PUTIFC();		/* pass to host */
+	}
+	return;
+}
+.SKIP 3
+	/*	see if buffer empty -- release Back-pressure if so */
+.DTOPIC(|BU_RGX Routine|)
+BU_RGX()
+{	if ( Rp->BCT == 0 )	/* something to do */
+	{   if ( Rp->P_FLAG & PF_IBP == 0 )
+		return;		/* back-pressure not applied */
+	    Rp->P_FLAG &= not PF_IBP;
+	    SENDQI(PORTNO,$A1);	/* release back-pressure */
+	}
+	return;
+}
+.SKIP 3
+/*	Move data from buffer to block	*/
+.DTOPIC(|BU_BK Routine|)
+BU_BK()
+{
+BU_BK:	INTYBT = 0;		/* used to record control-codes */
+	GETBLK();		/* get the current word to fill */
+	while ( Rp->BCT != 0 )
+.TOPIC(|BI_TCN - Block-input: input count (total)|)
+	{   if ( Rp->BI_LCN == Rp->BI_TCN )
+		break;		/* block full */
+	    c = DGCI();		/* get the next char */
+	    if ( c == ESC )
+	    {	if (Rp->BCT == 0 ) FCRASH($60);
+		c = DGCI();	/* get escaped char */
+		if (c != ESC )
+		{   INTYBT = c;
+		    break;	/* abort -- Control-signal */
+		}
+	    }
+.TOPIC(|BI_BYT - Block-input: pos. within current word|)
+	    DAT[Rp->BI_BYT++] = c; /* save char away */
+	    if ( Rp->BI_BYT > 3 )
+	    {	WRBLK();	/* word filled */
+		Rp->BI_BYT = 0;
+	    }
+.TOPIC(|BI_LCN - Block-input: input count (so far)|)
+	    ++Rp->BI_LCN;	/* count another char */
+	}	/* while Rp->BCT > 0 */
+
+	if ( Rp->BI_BYT != 0 )
+
+	{   WRBLK();		/* save partial word */
+.TOPIC(|BI_TAR - Block-input: (PDP) block start address|)
+	    Rp->BI_TAR--;	/* ...back up word-cursor */
+	}
+
+	if ( INTYBT == YB_CODE )
+	    BKITERM($28);	/* EOT */
+.TOPIC(|BI_TCN - Block-input: input count (total)|)
+	else if ( Rp->BI_TCN == Rp->BI_LCN )
+	    BKITERM($27);	/* block done */
+	if ( INTYBT != 0 )
+	    BU_COD();		/* report control-signal */
+	if ( Rp->P_FLAG & PF_BFD == 0 ) /* not yet Filled */
+	    goto BU_BK;		/* continue */
+	BU_RGX();		/* release back-pressure */
+	return;
+}
+.SKIP 3
+.DTOPIC(|BKITERM Routine|)
+BKITERM(v)
+int	v;			/* reason for termination */
+{	Rp->P_FLAG != PF_BFD;	/* set Filled */
+	DAT1 = v;		/* set reason for termination */
+	DAT2 = PORTNO;
+.TOPIC(|BI_LCN - Block-input: input count (so far)|)
+	DAT3 = (short) Rp->BI_LCN; /* how much we did */
+	WAITDAT();		/* report completion to host */
+.TOPIC(|PUTIFC Routine|)
+	PUTIFC();		/* insure host sees it */
+	return;
+}
+.END
+.SKIP 3
+	Primative routine for managing lists are:
+
+.SKIP BEGIN VERBATIM
+	/*	Remove an entry from BKI list	*/
+.DTOPIC(|RBTBKI Routine|)
+RBTBKI()
+{	if ( Rp->P_FLAGS & PF_BKI == 0 /* not active */
+	    return;
+	Rp->P_FLAGS &= not PF_BKI;
+.TOPIC(|UNLINK Routine|)
+	UNLINK( $BKIHEAD );	/* unlink entry for this port */
+	return;
+}
+.SKIP 3
+	/*	Remove an entry from BKO list	*/
+.DTOPIC(|RBTBKO Routine|)
+RBTBKO()
+{	if ( Rp->P_FLAGS & PF_BKO == 0 /* not active */
+	    return;
+	Rp->P_FLAGS &= not PF_BKO;
+	UNLINK( $BKOHEAD );	/* unlink entry for this port */
+	return;
+}
+.SKIP 3
+	/*	Remove an entry from BUF list	*/
+.DTOPIC(|RBTBUF Routine|)
+RBTBUF()
+{	UNLINK( $BUFHEAD );	/* unlink entry for this port */
+	return;
+}
+.SKIP 3
+	/*	Remove an entry from list	*/
+.DTOPIC(|UNLINK Routine|)
+UNLINK(p)
+link	*p;			/* pointer to list */
+{	while (   ( link *pp = *p )  != 0 )
+	{   if ( p->port != PORTNO )
+	    {	p = pp;		/* continue search */
+		continue;
+	    }
+	    *p = pp->next;	/* unlink it */
+	    pp->next = BLKFREE; /* append free-list */
+	    BLKFREE = pp->next; /* this becomes new head */
+	    break;		/* done */
+	}	/* while... */
+	return;
+}
+.SKIP 3
+	/*	Place an entry onto the BUF list	*/
+.DTOPIC(|BU_ADD Routine|)
+BU_ADD();
+{	list *p = BLKFREE;	/* get a list entry */
+	BLKFREE = p->next;
+	p->next = BUFHEAD;
+	p->port = PORTNO;
+	BUFHEAD = p;		/* place entry onto BUF list */
+	return;
+}
+.SKIP 3
+	/*	Close a port...reset everything	*/
+.DTOPIC(|RBTALL Routine|)
+RBTALL()
+{	RBTBKO();		/* reset Block-output */
+	RBTBKI();		/* reset Block-input */
+	DEMPTY();		/* empty buffer */
+	RBTBUF();		/* un-queue buffer */
+	Rp->XMITLMT = 157;	/* reset transmit-limit */
+	Rp->P_FLAGS = 0;	/* clear all flags */
+	return;
+}
+.END
