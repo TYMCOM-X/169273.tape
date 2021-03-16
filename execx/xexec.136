@@ -1,0 +1,981 @@
+begin	"XEXEC"
+
+require "XEXEC.INF" source!file;
+
+Define XEXEC!VERSION = (XEXEC!!VER lsh 24) lor XEXEC!!EDIT;
+require XEXEC!VERSION version;
+
+require "
+
+XEXEC %"&CVOS(XEXEC!VERSION lsh -24)&"("&CVOS(XEXEC!VERSION land '777777)&")"&
+     " - TYMCOM-X Periodic Processing Scheduler
+
+Assembly: Load @XEXEC.CMD
+
+
+Sources:  XEXEC.SAI                 Main program source file
+          XEXEC.INF                 Main release information file
+          XEXEC.PAR                 Main parameter file
+          XEXEC.REQ                 Global declaration file
+          SAIL.DEF                  General macro definition file
+          UUOSYM.DEF                System call definition file
+          JQUEUE.DEF                Job queue definition file
+
+Library:  JQUE.REQ   [SAI] [REL]    Job queue manipulation package
+          NEXTIM.REQ [SAI] [REL]    Job reschedule daytime routine
+          XEXPKG.REQ [SAI] [REL]    Miscellaneous support package
+          VMFILE.REQ [SAI] [REL]    VM input file mapping pacakge
+          DAYTIM.REQ [SAI] [REL]    Date time conversion package
+          XEXINT.REQ [SAI] [REL]    Interrupt trapping package
+
+License:  ALL license bits!!!
+          WC RC SY OP GD TD ST JL AC XC HF RA WA
+          WC       - absolute frame access rights
+          SY       - reading info about jobs
+          HF QM JL - writing system queue and log files
+
+" message;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(CARL)XEXEC.PAR"  source!file;
+require "(MPL)UUOSYM.DEF"  source!file;
+require "(CARL)JQUEUE.DEF" source!file;
+require "(CARL)JQUE.REQ"   source!file;
+require "(CARL)NEXTIM.REQ" source!file;
+require "(CARL)VMFILE.REQ" source!file;
+require "(CARL)XEXPKG.REQ" source!file;
+require "(CARL)DAYTIM.REQ" source!file;
+require "(CARL)XEXINT.REQ" source!file;
+
+
+!	Definitions
+;
+
+Define
+	Sys$Run   =  0		! normal operation ;
+,	Sys$Reset =  1		! system reset ;
+,	Sys$Abort =  2		! error indication ;
+;
+
+Define Spaces = { "                                                  " };
+Define LPad(x,y) = { (Spaces[1 for y-1]&(x))[inf-(y-1) to inf] };
+Define !gtRDV = '135, !gtRDI = '136, !gtRFN = '137;
+Define Gettab(x,y) = { calli( !xwd( (x), (y) ), calli!GETTAB ) };
+Define !Job(x) = { ( (x) land '7777 ) };
+Define cvj(x) = { cvs( !Job(x) ) };
+Define Xvs(x) = { ( if x > E!RunMax then "stream #" & cvs(x-E!RunMax)
+				    else "run #" & cvs(x) ) };
+
+Define SetFlg(x,y) = { x_ x lor (1 lsh y) };		! set bit lsh x ;
+Define ClrFlg(x,y) = { x_ x land lnot(1 lsh y) };	! clr bit lsh x ;
+
+Define VersionString = { "%"&CVOS(XEXEC!VERSION lsh -24) &
+			 "("&CVOS(XEXEC!VERSION land '777777)&")" };
+Define DayStamp  = { cvSDat( !lh( GetTDT ) ) };		! day  only ;
+Define TimeStamp = { cvSTim( !rh( GetTDT ) ) };		! time only ;
+Define DateStamp = { TymDay( GetTDT ) };		! date-time ;
+
+!	Variable definitions for outer block;
+
+Internal integer
+	MyJob			! current job slot;
+,	XEXJob			! my job number for interrupts ;
+;
+
+boolean
+	NeedEscape		! flag whether waiting for escape;
+,	NeedReset		! flag whether this is a reset ;
+;
+
+integer 
+	Status			! job status code from record ;
+,	JPri			! schedule priority level -1,0,1-9,10-15;
+,	Uptime			! current system uptime ;
+,	SlotAdr			! address of record slot in memory ;
+,	JobType			! type of job, 2 = DET + RUN = RJob ;
+,	Seq			! current sequence number index;
+;
+
+string
+	S			! temporary string variable;
+;
+
+!	Record and array definitions
+;
+
+record!class job( Integer Run, Seq, Sts, Opt; r!p (job) Nxt );
+r!p (job) jobs, tjob, njob, ljob;
+
+Own safe r!p (job) array JobPri[ JP$Run : JP$Max ]; ! job queue by priority ;
+
+Preset!with [E!Length] 0;
+Own safe integer array Del[ 0 : E!Length-1 ];	! For Delete ;
+Preset!with [E!Length] 0;
+Own safe integer array Rec[ 0 : E!Length-1 ];	! The Record ;
+
+!	Support routines
+;
+
+Internal Simple Procedure GetInt( reference integer Flag; integer Why );
+return;
+
+
+Simple Boolean Procedure ClearFrame( Integer This );
+begin "clear frame"
+
+    if ( QRF( This ) )			! anything here? ;
+     then begin "frame must die"
+	QRF( This )_ 0;			! clear frame position ;
+     end "frame must die";
+
+    return( false );			! give 'em what they came for ;
+
+end "clear frame";
+
+
+Simple procedure ClearSlot( Integer JobSlot, Address(0) );
+begin "Clear Slot"
+    Own integer Adr;
+
+    if ( Address )			! if one is specified ;
+     then Adr_ Address			!  then use it, else calculate ;
+     else Adr_ QueRun + (E!Length * (JobSlot - 1 ));
+
+    memory[Adr]_ 0;			! clear active area ;
+    ArrBlt( memory[Adr+1], memory[Adr], E!Length );
+
+    QRS( JobSlot )_ QRA( JobSlot )_	! cleanup database ;
+    QRF( JobSlot )_ QRU( JobSlot )_ 0;	! cleanup database ;
+
+end "Clear Slot";
+
+
+Simple procedure KillJob( Integer J );
+begin "Kill Job"
+
+    if not( J )				! don't try anything to job 0 ;
+     then return;			! it won't buy us much ;
+
+    if not( calli( !Xwd(1,!Job(J) ), calli!EVICT ) )
+     then calli( !Xwd(3,!Job(J) ), calli!HANG );
+
+end "Kill Job";
+
+
+Simple procedure EXIT( String Msg(Null) );
+! ----------------------------------------------------------------------;
+!									;
+!	Exit	Routine to print a message to the CTY and then exit	;
+!		checking the Logout enable flag.			;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    own boolean Logout;
+
+    EscDis;				! disable any interrrupts ;
+    NtqDis;				! for ESC, NTQ ;
+    SiaDis;				! and from frame ;
+
+    LogInfo( Msg );			! report the reason for leaving ;
+    CtyLog( "XEXEC: "& Msg, true );	! to the log and the CTY ;
+
+    if ( InQue land que$Map )		! check for logoff flag ;
+     then begin "finish up"
+	if ( calli(0,calli!PJOB) = QQ(Schedule) )
+	 then QQ( HaveS )_ 0;		! for others to keep track ;
+	Logout_ ( QQ(Feature) land QFet$Logout ) or NTQ!;
+     end "finish up"
+     else Logout_ NTQ!;
+
+    calli(querun lsh -9, calli!CLBLEV);	! leave RUN page club ;
+    ClsQue;
+
+    if ( Logout )			! if debugging on ;
+     then calli( 0, calli!LOGOFF )	!  and maybe logout ;
+     else start!code uuo!EXIT end;	!  else just exit ;
+
+end;
+
+!	Initialization routines;
+
+simple procedure WhoShouldIBe;
+begin
+    LogWho( "Scheduler" );		! label my messages ;
+    XEXJob_ calli( 0,calli!PJOB );	! remember my name  ;
+end;
+require WhoShouldIBe initialization;
+
+
+simple procedure LicenseCheck;
+! ----------------------------------------------------------------------;
+!									;
+!	LicenseCheck	Routine to check the license set on the frame	;
+!			and the program to determine if it is really	;
+!			sufficient to get any work accomplished.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+! '777617 ;
+    If ( Gettab( -1, !GTLIC )
+  Ifcr PRELIMINARY thenc
+	land ( LC!SY lor LC!JL lor LC!WC )
+	 neq ( LC!SY lor LC!JL lor LC!WC ) )
+  elsec
+	land ( LC!SY lor LC!JL lor LC!WC lor LC!HF )
+	 neq ( LC!SY lor LC!JL lor LC!WC lor LC!HF ) )
+  endc
+     then EXIT( "Insufficient License - SY JL WC HF -" );
+end;
+require LicenseCheck initialization;
+
+
+simple boolean procedure Create!Child;
+! ----------------------------------------------------------------------;
+!									;
+!	Create!Child	Routine to create a child frame from the	;
+!			information found in the REC array.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "birth procedure"
+    Own Integer frame!index;
+
+    Redefine CF!LIC = !bit(16);		! until UUOSYM.DEF is right;
+    Redefine CF!LOG = 0;		! really !bit(17);
+
+    Rec[ E!Runtime ]_ CF!LIC lor CF!LOG lor (E!License - E!Runtime - 1);
+
+    start!code				! take a trip to the hospital ;
+	Setom	!skip!;			! skip return;
+	Hrli	1,!foCFM;		! function: create frame;
+	uuo!FRMOP 1,Rec[E!Runtime];	! attempt to bear a child;
+	  Setzm	!skip!;			!   unbearable!;
+	Skipn	!skip!;			! successful birth? ;
+	  Exch	1,!skip!;		! no - swap error & skip ;
+    end;
+
+end "birth procedure";
+
+
+Simple boolean procedure FrontEnd;
+begin "FrontEnd"
+    integer C, Chan, RunFlag, Adr;
+    string MyName, MySelf;
+    own safe integer array RunBlock[0:5];
+
+    If ( ESC! or NTQ! )			! if ( ^C or Notice-to-quit ) ;
+     then return( false );		!  just return immediately ;
+
+    Adr_ queRun + ( E!Length * ( MyJob - 1 ) );	! get a slot adr ;
+    MyName_ cv6str(memory[Adr+E!Username]) & cv6str(Memory[Adr+E!Username+1]);
+
+    if (memory[Adr+E!AUN] = memory[Adr+E!PPN])	! if same ppn/aun ;
+     then MySelf_ MyName			!  then copy name ;
+     else MySelf_ cvName(memory[Adr+E!PPN]);	!  else generate. ;
+
+    If ( LAPRunF(Adr) )				! if RUN program  ;
+      and ( LAPDetF(Adr) )			!    and DETACH   ;
+     then begin "run detached job"		!  then do it.    ;
+
+	If (QRF(MyJob)_ Create!child )		! create a child frame;
+	 then QRU(MyJob)_ Gettab( QRF(MyJob), !gtUID )
+	 else begin "birth defect"
+	    If ( !rh( QRF(MyJob) ) < 2 )	! frame error code ;
+	     then begin "labor pains"		! capacity error   ;
+		dpb( Sched$Frame, PStap( QRS(MyJob) ) );
+		return( false );		! so, try later... ;
+	     end "labor pains"
+	     else begin "still birth"		! other error code ;
+		dpb( Abort$Frame, PStap( QRS(MyJob) ) );
+		return( false );		! abort & give up! ;
+	     end "still birth";
+	 end "birth defect";
+
+	RunBlock[0]_ !Xwd( if LAPCCLF(Adr) then 1 else 0, 5 );
+	RunBlock[1]_ memory[ Adr+E!CmdFile+F!Device ];
+	RunBlock[2]_ Adr+E!CmdFile+F!User;
+	RunBlock[3]_ memory[ Adr+E!CmdFile+F!Name ];
+	Runblock[4]_ memory[ Adr+E!CmdFile+F!Ext ] land (-1 lsh 18);
+	FrmXct( QRF(MyJob), RunBlock[0], !foRUN );
+
+	EcfEnb( QRF(MyJob) );			! enable ECF ;
+	QRS( MyJob )_ memory[ Adr+E!Status ];	! copy status ;
+	dpb( Proc$Run, PStap( QRS(MyJob) ) );	! Processing, Run ;
+
+     end "run detached job"
+     else begin "schedule job for processing"
+
+	QRS( MyJob )_ Rec[ E!Status ];		! copy status ;
+	dpb( Sched$Wait, PStap( QRS(MyJob) ) );	! Scheduled, Wait ;
+
+     end "schedule job for processing";
+
+    ArrBlt( memory[querun+(MyJob-1)*E!Length], Rec[0], E!Length );
+    QRA( MyJob )_ Rec[ E!Action ];		! copy options ;
+    LogInfo( "Scheduling " & xvs(MyJob) & " " & InfJob( Adr ) );
+    if ( LPCtyF( QRA(MyJob) ) )
+     then CtyLog( "Scheduling " & xvs(MyJob) & " " & InfJob( Adr ) );
+
+end "FrontEnd";
+
+Simple Boolean Procedure CommandMode;
+return( Gettab( QRF(MyJob), !gtSTS ) geq 0 );
+
+
+procedure ESCAPE;
+begin "Escape"
+
+    if ( CommandMode )				! if command mode ;
+     then ClrFlg( NeedEscape, MyJob )		!  clear escape   ;
+     else begin "halt frame"
+	DEFINE !FOSTP = '41;
+	FrmXct( QRF(MyJob), 0, !foSTP );	! stop the frame  ;
+	SetFlg( NeedEscape, MyJob );		!  set NeedEscape ;
+     end "halt frame";
+
+end "Escape";
+
+
+Simple Procedure StartProcessor;
+begin "startup a processor"
+    Own integer Page, Err;
+    preset!with 5,cvSIX("SYS"),0,cvSIX("EXECX"),0,0;
+    own safe integer array RunBlock[0:5];
+
+    Page_ queAct lsh -9;			! get page number ;
+    Err_ calli( location(Page), calli!CLBINI );	! get interlock ;
+    if not( !Skip! ) and ( Err = CBHIL# )	! if already have it ;
+     then !Skip!_ true;				!  fake we got it again ;
+    if not( !Skip! )				! cannot get interlock ;
+     then if ( ( Err = CBAIL# )  and		! is interlock busy ;
+	       ( QQ( HaveP ) neq Gettab( QQ( Process ), !gtUID ) ) )
+	   then begin "have porcessor"
+	      LogInfo( "Processor already in frame "&cvj(QQ( Process )) );
+	      return;				! yes, return. ;
+	   end "have porcessor"
+	   else begin "bad interlock"
+	      LogInfo("EXECX interlock problem ("&cvos(Err)&") check system");
+	      Ctylog("EXECX interlock problem ("&cvos(Err)&") check system");
+	      QQ( Feature )_ QQ( Feature ) lor QFet$Shut;
+	      QQ( HaveP )_ false;		! hmmm, indicate problem ;
+	   end "bad interlock";
+
+    ArrClr( Rec );				! setup empty slate ;
+    Rec[ E!PPN ]_      Gettab( -1,!gtPPN );	! gfd'd ppn ;
+    Rec[ E!Privs ]_    Gettab( -1,!gtPRV );	! privileges ;
+    Rec[ E!AUN ]_      Gettab( -1,!gtAUN );	! login ppn ;
+    Rec[ E!Username ]_ Gettab( -1,!gtUNM );	! username - part 1 ;
+    Rec[E!Username+1]_ Gettab( -1,!gtUN1 );	! username - part 2 ;
+    Rec[ E!License ]_  Gettab( -1,!gtLIC );	! license ;
+    if ( QQ( Process )_ create!child )		! create processor and ;
+     then begin "successful"			! let him fend for himself ;
+	RunBlock[1]_ Gettab( -1,!gtRDV );
+	RunBlock[2]_ Gettab( -1,!gtRDI );
+	FrmXct( QQ( Process ), RunBlock[0], !foRUN );
+	if not( !Skip! )
+	 then LogInfo( "Problem with processor in frame "& cvj(QQ( Process )) );
+     end "successful";
+
+    SetTim( 300 );				! maximum of 5 minutes ;
+    while not( TIM! )
+     do if ( QQ( HaveP ) = Gettab( QQ(Process),!gtUID ) )
+	 then begin "give away interlock"
+	    QQ( Feature )_ QQ( Feature ) land lnot QFet$Shut;
+	    calli( Page, calli!CLBRLI );	! release interlock ;
+	    done;
+	 end "give away interlock"
+	 else calli( 1, calli!SLEEP );		! else sleep ;
+    if not( TIM! )
+     then begin "wait for interlock"
+	SetTim( 300 );
+	while not( TIM! )
+	 do if ( QQ( HaveP ) neq QQ( ProcessUDT ) )
+	     then calli( 1, calli!SLEEP )
+	     else done;
+     end "wait for interlock";
+    if not( TIM! )
+     then begin "processor started"
+	TimDis;					! turn off timer ;
+	QQ( ProcessUDT )_ GetUDT;		! set time process started ;
+	LogInfo( "Starting processor in frame "& cvj(QQ( Process )) );
+     end "processor started"
+     else calli( location(Page),calli!CLBINI );	! else take interlock ;
+
+ end "startup a processor";
+
+
+Simple Boolean Procedure NextRecord;
+begin "next record"
+
+    arrclr( Rec );			! clear record fields ;
+
+    if ( ESC! or NTQ! )			! if ( ^C or Notice-to-quit ) ;
+     then return( false );		!  just return immediately ;
+
+    dpb( Seq, PPSeq( Rec ) );		! set sequence number to select ;
+    return( GetRec( Rec[E!Runtime] ) );	! oh, get on with it ;
+
+end "next record";
+
+
+Procedure SortQueue;
+begin "sort queue"
+    Integer ASeq;
+
+    Seq_ 0;					! loop through them all ;
+
+    if ( LPPStat(Rec) = JS$Cancel )		!  if cancel, remove it ;
+     then begin "cancel it"
+	ModRec( Del[E!Runtime], Rec[E!Runtime] );
+	return;
+     end "cancel it";
+
+    ASeq_ LPPSeq( Rec );			! remember this a while ;
+
+    if not( JobPri[ JP$RUN ] )			! check the run list ;
+     then njob_ JobPri[JP$Run]_ new!record(job)	!  null?  make a record ;
+     else njob_ JobPri[JP$Run];			! begin at top of list  ;
+
+    while ( njob_ job:Nxt[tjob_njob] )		! until the empty list  ;
+     do if ( job:Seq[njob] = ASeq )		! if same as record ;
+	 then return;				!  it's running, ignore ;
+
+    JPri_ LPPJPri( Rec );			! get priority level ;
+    if ( JPri = JP$Min )			! absolute minimum says ;
+     then JPri_ LPJPri( QQ( Action) );		!  use default priority ;
+
+    if not( JobPri[ JPri ] )			! check this priority   ;
+     then njob_ JobPri[JPri]_ new!record(job)	!  null?  make a record ;
+     else njob_ JobPri[JPri];			! begin at top of list  ;
+
+    while ( njob_ job:Nxt[tjob_njob] )		! until the empty list  ;
+     do if ( Rec[E!Runtime] < job:Run[njob] )	!  if runtime < job:Run ;
+	 then done;				!   then fall to insert ;
+
+    tjob_ job:Nxt[tjob]_ new!record( job );	! create the new record ;
+    job:Nxt[tjob]_ njob;			! keep any forward ptrs ;
+    job:Opt[tjob]_ Rec[E!Action];		! copy all action flags ;
+    job:Sts[tjob]_ Rec[E!Status];		! copy status field ;
+    job:Run[tjob]_ Rec[E!Runtime];		! copy runtime  & seq # ;
+    job:Seq[tjob]_ ASeq;
+
+end "sort queue";
+
+
+Procedure Prune( Integer ASeq  );
+begin "prune"
+    r!p (job) nj,tj;
+    integer Pri;
+
+    for Pri_ JP$Run upto JP$Max		! for each priority level ;
+     do begin "each level of priority"
+
+	if not( nj_ JobPri[ Pri ] )	! if nothing at this level ;
+	 then continue;			!  then try the next one ;
+
+	while ( nj_ job:Nxt[tj_nj] )	! for each record ;
+	 do if ( job:Seq[nj] = ASeq )	! if seq match ;
+	   then begin "process"
+
+	      job:Nxt[tj]_ job:Nxt[nj];	! delete NJOB from list ;
+
+	   end "process";		! search for any multiples ;
+
+     end "each level of priority";
+
+end "prune";
+
+
+Procedure TellAll;
+begin "Tell All"
+    r!p (job) nj,tj;
+    integer Pri;
+
+    for Pri_ JP$Run upto JP$Max		! for each priority level ;
+     do begin "each level of priority"
+
+	if not( nj_ JobPri[ Pri ] )	! if nothing at this level ;
+	 then continue;			!  then try the next one ;
+
+	while ( nj_ job:Nxt[tj_nj] )	! for each record ;
+	 do LogInfo("Rec:"& LPad( cvs(job:Seq[nj]), 3 ) &
+		" at " & Tymday(job:Run[nj]) &
+		" pri " & LPad( cvs(Pri), 2 ) &
+		" opt " & LPad( cvos(job:Opt[nj]), 12 ) &
+		" sts " & cvos(job:Sts[nj])    );
+
+     end "each level of priority";
+
+    for MyJob_ 1 upto E!JobMax
+     do if ( QRS(MyJob) )
+	 then LogInfo( Xvs(MyJob) & " seq" & LPad(cvs(LPSeq(QRS(MyJob))),3) &
+		   " opt " & LPad( cvos(QRA(MyJob)), 12 ) &
+		   " sts " & cvos(QRS(MyJob))  );
+
+end "Tell All";
+
+
+simple procedure ReBuildQueue;
+begin "rebuild"
+
+    ljob_ JobPri[ JP$Run ];		! remember this pointer ;
+    ArrClr( JobPri );			! forget this table now ;
+    JobPri[ JP$Run ]_ ljob;		! remember this pointer ;
+
+    Seq_ -1;				! initialize sequencer  ;
+
+    While ( NextRecord )		! while records exist   ;
+     do SortQueue;			!  sort/insert in list  ;
+
+end "rebuild";
+
+
+Integer Procedure SlotsAvailable;
+begin "slots available"
+    Own r!p (job) rjob;
+
+    if ( ESC! or NTQ! )				! if ( ^C or Notice-to-quit ) ;
+     then return( 0 );				!  just go home now... ;
+
+    QQ( Daytime )_ GetTDT;			! specify schedule time ;
+    QQ( Uptime )_Gettab(!nsUPT,!gtNSW);		!    set current uptime ;
+
+! *** Don't forget %KSYS time ***
+;
+    if ( QQ( New ) )				! if anything changed ;
+     then begin "un-mark queue"
+	QQ( New )_ 0;				! clear change flag ;
+	QQ( Daytime )_ GetTDT;			! leave a timestamp ;
+	ReBuildQueue;				! and sort the queue ;
+     end "un-mark queue";
+
+    for JPri_ JP$Max downto JP$Min		! for each priority level ;
+     do begin "each level of priority"
+
+	if not( njob_ JobPri[ JPri ] )		! if nothing at this level ;
+	 then continue;				!  then try the next one ;
+
+	while ( njob_ job:Nxt[tjob_njob] )	! for each record ;
+	 do b"process queue"
+
+	    if ( ESC! or NTQ! )			! if ( ^C or Notice-to-quit ) ;
+	     then return( 0 );			!  just go home now... ;
+
+	    if ( LPStap(job:Sts[njob]) neq Queued$Wait )
+	     then continue;			! only schedule queued jobs ;
+
+	    if ( job:Run[njob] > GetTDT )	! scheduled for later? ;
+	     then done;				! none left on this level ;
+
+	    if ( LPRunF( job:Opt[njob] )	! if runnable job ;
+	      and LPDetF( job:Opt[njob] ) )	!  and run detached ;
+	     then begin "running job"
+
+		if ( QQ( Running ) geq QQ( RJobs ) )
+		 then continue;			! run slots available? ;
+		for MyJob_ 1 upto QQ( RSlot )	! yes, find right slot ;
+		 do if not( QRS( MyJob ) )	!  in range 1 to Q!Rslot ;
+		     then done;
+		if ( QRS( MyJob ) )		! find one? ;
+		 then continue;			! no? ;
+
+	     end "running job"
+	     else begin "interactive job"
+
+		if ( QQ( Active ) geq QQ( IJobs ) )
+		 then continue;			! i slots available? ;
+		for MyJob_ E!RunMax+1 upto QQ( ISlot )
+		 do if not( QRS( MyJob ) )	!  in range for Q!ISlot ;
+		     then done;
+		if ( QRS( MyJob ) )		! find one? ;
+		 then continue;			! no? ;
+
+	     end "interactive job";
+
+	    job:Nxt[tjob]_ job:Nxt[njob];	! delete NJOB from list ;
+
+	    dpb( job:Seq[njob], PPSeq( Rec ) );	! store sequence ;
+	    if not( GetRec( Rec[E!Runtime] ) )	! get record from queue ;
+	     then continue;			! not there? oops! ;
+
+	    tjob_ JobPri[ JP$Run ];		! to insert in active list ;
+	    while ( tjob_ job:Nxt[rjob_tjob] )	!  loop through the list ;
+	     do if ( job:Run[njob] < job:Run[tjob] )
+		 then done;			!  runtime < job:Run ;
+
+	    job:Nxt[njob]_ tjob;		! current record pointer ;
+	    job:Nxt[rjob]_ njob;		!  insert in active list ;
+
+	    ArrBlt( memory[querun+(E!Length*(MyJob-1))], Rec[0], E!Length );
+	    QRS( MyJob )_ Rec[ E!Status ];	! copy status ;
+	    QRA( MyJob )_ Rec[ E!Action ];	! copy options ;
+
+	    return( job:Seq[njob] );		! return this record number ;
+
+	 end "process queue";
+     end "each level of priority";
+
+    return( 0 );				! nothing there to do ;
+
+end "slots available";
+
+
+Simple Procedure ReSchedule( Integer JobSlot, Type( Sys$Run ) );
+begin "reschedule"
+    Own integer Adr,Sts;
+
+    arrClr( Rec );
+    Adr_ QueRun + E!Length * ( JobSlot - 1 );
+    dpb( Seq_ LPSeq(QRS(JobSlot)), PPSeq(Rec) );
+
+    if ( Seq )
+     then begin "valid slot info"
+	if ( GetRec( Rec[E!Runtime] ) )
+	 then begin "valid queue entry"
+
+	    LogInfo( "-R- " & Xvs(JobSlot) & " [" & cvs(Type) & "]" &
+		     " Seq #"&cvs(LPSeq(QRS(JobSlot))) &
+		     " File " & InfNam( Adr+E!CmdFile ) &
+		     " C<" & cvs(LPStat(QRS(JobSlot))) &
+		     ":" & cvs(LPProc(QRS(JobSlot))) & ">" );
+
+	    Sts_ Queued$Wait;		! initial expected default ;
+	    case ( LPStat(QRS(JobSlot)) )
+	     of begin "new status"
+	      [JS$Done]
+		if ( LPProc(QRS(JobSlot)) = PSD$Restart )
+		 then Sts_ Hold$Restart
+		 else Sts_ Queued$Wait;
+	      [JS$Sched]
+		Sts_ Queued$Wait;
+	      [JS$Proc]
+		if ( LPRestart( QRA(JobSlot) ) )
+		 then Sts_ (if (Type) then Hold$Restart else Queued$Wait)
+		 else Sts_ case Type of (
+		    [Sys$Reset] Queued$Crash,
+		    [Sys$Abort] Hold$Restart,
+		    [Sys$Run]   Queued$Wait   );
+	      [JS$Abort]
+	        Sts_ Queued$Abort
+	     end "new status";
+
+	    if ( Rec[ E!Runtime ] )
+	     then begin "check schedule"
+		memory[Adr+E!RanTime]_ Rec[E!Runtime];
+		memory[Adr+E!Runtime]_ NexTim( memory[Adr],GetTDT);
+		dpb( Sts, APStap( Adr ) );	! set new status ;
+		if not( ModRec( memory[Adr+E!Runtime], Rec[E!Runtime] ) )
+		 then LogInfo( Xvs(MyJob)&" Modrec failed = "&cvs(QError) );
+	     end "check schedule";
+	 end "valid queue entry";
+
+	Prune( LPSeq(QRS(JobSlot)) );	! prune from JobPri tree ;
+	if ( LPCtyF( QRA(MyJob) ) )
+	 then CtyLog( "Finished " & xvs(MyJob) & " " & InfJob( Adr ) );
+     end "valid slot info";
+
+    ClearSlot( JobSlot, Adr );		! clear out slot ;
+
+end "reschedule";
+
+
+Simple procedure FirstTime;
+begin "first time"
+
+    QQ( System )_ QQ( ScheduleUDT );		! set restart time.  ;
+
+    for MyJob_ 1 upto E!RunMax + E!JobMax	! loop thru active area ;
+     do begin "reset job slot"
+
+	QRF(MyJob)_ QRU(MyJob)_ 0;		! clear bogus identifiers ;
+	ReSchedule( MyJob, Sys$Reset );		!  and better reschedule ;
+
+     end "reset job slot";
+
+    QQ( Active )_ QQ( Running )_ 0;		! nobody is active now ;
+
+end "first time";
+
+
+Simple procedure SecondTime;
+begin "scheduler restart"
+    integer Act, Run;				! count of active jobs ;
+
+    Act_ Run_ 0;				! clear active job count ;
+    for MyJob_ 1 upto E!RunMax			! for each running job ;
+     do if ( QRS(MyJob) )
+	 then begin "capture jobs"
+
+	if ( QRF(MyJob)   and			! frame and uid's match ;
+	     QRU(MyJob) = Gettab(QRF(MyJob),!gtUID) )
+	 then begin "graft job"			! this incarnation ok ;
+
+	    Run_ Run + 1;			! increment running jobs ;
+	    FrmXct( QRF(MyJob), QQ(Schedule), !foGFT );
+	    LogInfo( "Run #" & cvs(QRF(MyJob)) &
+		    (if ( !skip! ) then null else " not") & " grafted." );
+
+	 end "graft job"
+	 else begin "clear job"			! wrong incarnation here ;
+	    LogInfo( "Aborting " & Xvs(MyJob) );
+	    Reschedule( MyJob, Sys$Abort );	! clear it out for later ;
+	 end "clear job";
+
+     end "capture jobs";
+
+    QQ( Running )_ Run;				! set running total now ;
+
+    for MyJob_ 1 upto E!JobMax			! for each active job ;
+     do begin "count active jobs"
+
+	if ( QQS(MyJob) )			! with a valid entry ;
+	 then Act_ Act + 1;			! increment the counter ;
+
+     end "count active jobs";
+
+    if ( QQ( Active )_ Act )			! set active total now ;
+     then StartProcessor;			! and if any start processor ;
+
+end "scheduler restart";
+
+
+Simple procedure SetupJobTables;
+begin "setup job tables"
+    Own integer Err;
+
+    JobPri[ JP$Run ]_ null!record;		! clear running schedule ;
+    ReBuildQueue;				! Initialize "my" queue ;
+
+    Seq_ queRun lsh -9;
+    calli( Seq, calli!CLBADD );			! join club on RUN page ;
+    if not( !Skip! )				! this should be easy ;
+     then Exit( "No Club for Scheduler" );	!  otherwise weird... ;
+
+    Err_ calli( location(Seq), calli!CLBINI );	! get interlock, nowait ;
+    if not( !Skip! )
+     then begin "not me"
+	Exit( "Scheduler Interlock Busy ("&cvos(Err)&")" );	! sigh! ;
+     end "not me";
+
+    QQ( ScheduleUDT )_ GetTDT;			! setup my start time ;
+    QQ( Schedule )_ XEXJob;			! and remember job number ;
+    LogInfo( "** "& DayStamp &" "& VersionString &" **" );
+    LogInfo( "Starting XEXEC in frame "& cvs(QQ( Schedule )) );
+    CtyLog( "Starting XEXEC in frame "& cvs(QQ( Schedule )), true );
+    QQ( HaveS )_ true ;
+
+    Seq_ queAct lsh -9;				! ACT page number ;
+    calli( Seq, calli!CLBADD );			! join ACT club ;
+    if not( !skip! )
+     then Exit( "No Club for Porcessor" );
+
+    Err_ calli( location(Seq), calli!CLBINI );	! get interlock ;
+    if not( !Skip! )				! cannot get interlock ;
+     then if ( ( Err = CBAIL# )  and		! is interlock busy ;
+	       ( QQ( HaveP ) neq Gettab( QQ( Process ), !gtUID ) ) )
+	   then LogInfo( "Processor already in frame "&cvj(QQ( Process )) )
+	   else begin "bad interlock"
+	      LogInfo("EXECX interlock problem ("&cvos(Err)&") check system");
+	      Ctylog("EXECX interlock problem ("&cvos(Err)&") check system");
+	      QQ( HaveP )_ false;		! indicate problem ;
+	   end "bad interlock";
+
+    if ( QQ( Uptime ) = 0 ) or			! If never been set or  ;
+     ( Gettab( !nsUPT,!gtNSW ) < QQ( UpTime ) )	! If less than reported ;
+     then FirstTime				!  the system went away ;
+     else SecondTime;				!  else was I went away ;
+
+    QQ( Uptime )_ Gettab( !nsUPT,!gtNSW );	! set current uptime ;
+
+!    SIAEnb;					! enable frame interrupts ;
+    NTQEnb;					! enable for system ksys ;
+    ESCEnb;					! enable for escapes ;
+
+end "setup job tables";
+
+
+Simple procedure MonitorRunningJobs;
+begin "monitor running jobs"
+
+    if ( ECF! or LCF! or FEX! )
+     then LogInfo( "ECF: "&cvos(ECF!)&"LCF: "&cvos(LCF!)&"FEX: "&cvos(FEX!) );
+
+    if ( ECF! or LCF! )
+     then for MyJob_ 1 upto E!RunMax
+	   do begin "check exit"
+
+	      if ( ECF! land (1 lsh MyJob) )
+	        or ( LCF! land (1 lsh MyJob) )
+	       then begin "stopped job"
+
+		  if ( CommandMode )
+		   then begin "job finished"
+		    ! * Check here for HltF on this job * ;
+		      Dpb( Done$End, PStap(QRS(MyJob)) );
+		      ReSchedule( MyJob );
+		   end "job finished"
+		   else LogInfo( Xvs(MyJob) & "spurious ECF-LCF:" &
+				 cvos( ECF! ) & " " & cvos( LCF! )  );
+
+		  ClrFlg( ECF!, MyJob );
+		  ClrFlg( LCF!, MyJob );
+
+	       end "stopped job";
+
+	   end "check exit";
+
+    for MyJob_ 1 upto E!RunMax
+     do begin "check running jobs"
+
+	if ( QRS(MyJob) )
+	 then begin "have a job"
+	    if ( LPStat(QRS(MyJob)) > JS$Sched )
+	     then begin "legal to check"
+		if not( QRU(MyJob) = Gettab(QRF(MyJob),!gtUID) )
+		 then begin "job went away"
+		    ReSchedule( MyJob, Sys$Abort );
+		    QQ( Running )_ QQ( Running ) - 1;
+		 end "job went away";
+	     end "legal to check";
+	 end "have a job";
+
+     end "check running jobs";
+
+ end "monitor running jobs";
+
+
+Simple procedure MonitorActiveJobs;
+for MyJob_ 1 upto E!JobMax	
+ do begin "monitor active jobs"
+
+    if not( QQ(HaveP) )			! if there isn't a processor ;
+     then StartProcessor;		!  then start one ;
+
+    if ( QQS( MyJob ) )			! something in slot ;
+     then begin "active slot"
+
+	case ( LPStat(QQS(MyJob)) )
+	 of begin
+
+	[JS$Hold] ;			! hold user request - restart ;
+
+	[JS$Done]			! complete, good termination ;
+	if ( LPProc(QQS(MyJob)) = PSD$Restart )
+	 then dpb( Hold$Restart, PStap(  QQS(MyJob) ) )
+	 else begin "complete and reschedule"
+	    ! Send Mail here ;
+	    ReSchedule( MyJob+E!RunMax );
+	    QQ( Active )_ QQ( Active )-1;
+	 end "complete and reschedule";
+
+	[JS$Abort]			! abort on error condition ;
+	 begin "abort and reschedule"
+	    ! Send Mail here ;
+	    dpb( Queued$Abort, PStap(  QQS(MyJob) ) );
+	    ReSchedule( MyJob+E!RunMax );
+	    QQ( Active )_ QQ( Active )-1;
+	 end "abort and reschedule";
+
+	[else]
+	end;
+
+     end "active slot";
+
+    if not( QQ( Active ) )  and		! if no activity left ;
+	( QQ( HaveP ) )  and		!  we have a processor ;
+	( QQ( Process ) )  and		! double check identity card ;
+       not( QQ( Feature ) land QFet$Shut )
+     then begin "Kill Processor"
+
+	LogInfo("Cancelling EXECX in frame "& cvj(QQ( Process )) );
+	QQ( Feature )_ QQ( Feature ) lor QFet$Shut;
+
+     end "Kill Processor";
+
+end "monitor active jobs";
+
+
+Simple procedure DebugOptions;
+begin "Debug Options"
+
+    if ( QQ( Feature ) land QFet$Tell )
+     then TellAll;			! dump the table ;
+
+    QQ( Feature )_ QQ( Feature ) land lnot QFET$Tell;
+
+    if ( QQ( Feature ) land QFet$RSched )
+     then begin "finish up"
+
+	QQ( Feature )_ QQ( Feature ) land lnot QFET$RSched;
+	ClsQue;				! close the queue ;
+	if not( RunSlf )		! attempt to run. ;
+	 then Exit( "Cannot run self" );
+
+     end "finish up";
+
+end "Debug Options";
+
+
+simple procedure CleanupJobs;
+begin "time to leave"
+
+    for MyJob_ 1 upto E!RunMax		!  for each run job ;
+     do if ( QRS( MyJob ) )		!   if there is one ;
+	then KillJob( QRF(MyJob) );	!    knock it off   ;
+
+    if ( QQ( HaveP ) )  and		!  have a processor ;
+       ( QQ( Process ) )		!  check him out..  ;
+     then QQ( Feature )_ QQ( Feature ) lor QFET$Shut;
+
+    while ( QQ( Running ) )		! anything going on ;
+     do MonitorRunningJobs;		!  check them out   ;
+
+    ESC!_ true;				!  set escape flag  ;
+
+end "time to leave";
+
+
+!	M A I N   program
+;
+
+if not( OpnQue( que$Real lor que$Run lor que$Act ) )	! we're in deep #### ;
+ then Exit( "Serious startup error, check job queue" );
+
+SetupJobTables;				! set everything up ;
+
+while not( ESC! )			! while it's ok to proceed ;
+ do begin "the system is running"	! *** working loop *** ;
+
+    if ( QQ( Running ) )		! anything going ;
+     then MonitorRunningJobs;		! yes, so check them out ;
+    if ( QQ( Active ) )			! anything active ;
+     then MonitorActiveJobs;		! yes, monitor activity ;
+
+    if ( Seq_ SlotsAvailable )		! if any slots are available ;
+     then begin "check availability"	!  try to schedule it ;
+
+	if ( FrontEnd )			! setup user and keep track ;
+	 then begin "got one"		! put into slot and log it. ;
+
+	    if ( MyJob > E!RunMax )	! increment proper counter ;
+	     then QQ( Active )_  QQ( Active )  + 1
+	     else QQ( Running )_ QQ( Running ) + 1;
+
+	 end "got one";	    
+
+     end "check availability";
+
+    if ( NTQ! )				! if notice received ;
+     then CleanupJobs;			! clean up stuff now ;
+
+    if ( QQ( Feature ) < 0 )		! if debug flag on ;
+     then DebugOptions;			!  then check options ;
+
+    calli( 30, calli!SLEEP );		! sleep for awhile ;
+
+ end "the system is running";
+
+Exit( "Signing off." );			! time to leave ;
+
+end 	"XEXEC" $
+
+$@:â
