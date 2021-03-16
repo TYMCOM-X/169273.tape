@@ -1,0 +1,2339 @@
+;PS:<KERMIT>KERMIT-20.MAC.2, 14-Dec-82 15:25:40, Bill C.
+;[23] Be scrupulous in PMAP use after errors.  Don't make files with holes.
+;PS:<KERMIT>KERMIT.MAC.44, 28-Sep-82 09:47:32, Bill C.
+;[22] Add ignore parity option for some UNIX systems.
+;PS:<KERMIT>KERMIT.MAC.19, 28-Apr-82 16:00:31, Bill C.
+;[21] Big clean up.  Consolidate duplicate sections of code.  Also,
+;      no longer die on bad packet type, just NAK or retransmit.
+;      Removed empty show command.
+;PS:<KERMIT>KERMIT.MAC.18, 21-Apr-82 16:31:04, Bill C.
+;[20] Clean up line on ^C from transfer. 
+;PS:<KERMIT>KERMIT.MAC.17, 17-Feb-82 16:16:10, Bill C.
+;[17] Add eight bit file mode.
+;PS:<KERMIT>KERMIT.MAC.16, 28-Jan-82 12:31:09, Bill C.
+;[16] Clean up better on some error conditions.
+;PS:<KERMIT>KERMIT.MAC.15,  6-Jan-82 12:18:06, Bill C.
+;[15] Fill out some of the SET command options.
+
+
+	Title Kermit - KL10 Error-free Reciprocol Micro Interface Transfer
+
+; Based on the KERMIT Protocol.
+
+		search MONSYM,MACSYM,CMD
+		.require SYS:MACREL,SYS:CMD
+
+
+$verno==^o1			; Major version number.
+$mnver==^o1			; Minor version number.
+$edno==^o22			; Edit number.
+$who==^o0			; Local edit.
+
+; Written by Bill Catchings				April 23, 1981
+;
+; This program is the DEC-20 side of a file transfer system.  Intended
+; for micros this system can be used between any computer that implements
+; the micro side and the DEC-20.  See KERMIT.DOC for the complete program
+; specifications to which this program and any other component of the
+; system must adhere.
+
+
+	subttl Definitions
+
+pdlsiz==^d100			; Stack size.
+
+f=0				; AC defs:  flag AC,
+t4=<t3=<t2=<t1=1>+1>+1>+1	;  temporary Ac's,
+q4=<q3=<q2=<q1=t4+1>+1>+1>+1	;  and preserved AC's.
+state=q4+1			; State of the automaton.
+rtot=state+1			; Total chars received.
+stot=rtot+1			; Total chars sent.
+rchr=stot+1			; Total data chars received.
+schr=rchr+1			; Total data chars sent.
+
+mappag==200			; Where to map things in.
+
+maxpkt=="~"-" "+2		; Maximum size of a packet.
+dmxtry==5			; Default number of retries on a packet.
+dimxtr==20			; Default number of retries send initiate.
+drpsiz==^d40			; Default receive packet size.
+dspsiz==^d40			; Default send packet size.
+dstim==^d10			; Default send time out interval.
+drtim==^d8			; Default receive time out interval.
+dspad==^o000			; Default send padding char.
+drpad==^o000			; Default receive padding char.
+dspadn==^d0			; Default number of send padding chars.
+drpadn==^d0			; Default number of recieve padding chars.
+dseol==.chcrt			; Default send EOL char.
+dreol==.chcrt			; Default receive EOL char.
+dsquot=="#"			; Default send quote char.
+drquot=="#"			; Default receive quote char.
+ddelay==^d5			; Wait 5 seconds before the first packet.
+
+SOH==^o001			; Start of header char.
+
+diasw==0			; Default is diagnostics off.
+
+
+	subttl Macros
+
+define diamsg (msg) <
+	 call [	skipn debug	;; Is the debug switch on?
+		 ret		;;  No, don't print the info.
+		hrroi t2, [asciz/%'msg/] ;; Pointer to the message.
+		jrst error]	;; Print the error message.
+>
+error:	saveac <t1,t2,t3,t4>
+	move t1, diajfn		;; Output to the right place.
+	movem t2, errptr	;;[16] Save pointer to error mess for status.
+	setzb t3, t4		;; Set up.
+	SOUT%			;; Send the error message.
+	ret
+
+define ermsg (msg) <
+	 call [	tmsg <
+>
+		hrroi t1, [asciz/?'msg/]
+		movem t1, errptr ;;[16] Save pointer to error mess for status.
+		PSOUT%
+		tmsg <
+>
+		ret]
+>
+
+;[16] Change the order to increase the likelyhood of the micro seeing
+; the error packet.
+
+define kermsg (msg) <
+	$count=0
+	irpc msg, <$count=$count+1>
+	call [	movei t1, "E"	;; An error packet.
+		move t2, pktnum	;; Packet number.
+		movei t3, $count+^d13 ;; The count.
+		move t4, [point 7, [asciz/?Kermit-20:  'msg/]] ;; Error mess.
+		movem t4, errptr ;;[16] Save pointer to error mess for status.
+		call spack	;; Send the error packet.
+		 nop
+		tmsg <
+?Kermit:  'msg
+>
+		ret]
+>
+
+
+; Error handling macros.
+
+define %jserr (msg, label) <	;; Use this immediately following a JSYS.
+	erjmp [	tmsg <
+?Kermit:  'msg>			;; Type given msg with our prefix,
+ifnb <msg>,<	call jserr0>	;;  if given, put JSYS error after dash,
+ifb <msg>,<	call jsmsg0>	;;  else right after "?Kermit:  "
+ifb <label>,<	HALTF%		;; then if no label was specified, halt,
+		jrst .+1	;; continuably,
+>;ifb
+ifnb <label>,<	jrst label>	;; or if there was, go there.
+	      ]
+>;%jsErr
+
+jserr0:	movei t1,.priin
+	CFIBF%			; Clear typeahead.
+	move t1,diajfn
+	DOBE%			; Wait for previous output to finish.
+	tmsg < - >
+jsmsg0:	move t1,diajfn
+	hrloi t2,.fhslf		; Say:  this fork ,, last error.
+	setz t3,
+	ERSTR%
+	 jfcl
+	 jfcl
+	tmsg <
+>
+	ret
+
+;[16] Improve order to facilitate error packets.
+
+define %jsker (msg, label) <	;; Use this immediately following a JSYS.
+	erjmp [	move t1, [point 7, [asciz/?Kermit-20:  'msg   /]] ;; Error.
+		movem t1, errptr ;;[16] Save pointer to error mess for status.
+		call %%krms
+		tmsg <
+?Kermit:  'msg>			;; Type given msg with our prefix,
+ifnb <msg>,<	call jserr0>	;;  if given, put JSYS error after dash,
+ifb <msg>,<	call jsmsg0>	;;  else right after "?Kermit:  "
+ifb <label>,<	HALTF%		;; then if no label was specified, halt,
+		jrst .+1	;; continuably,
+>;ifb
+ifnb <label>,<	jrst label>	;; or if there was, go there.
+	      ]
+>;%jsKer
+
+%%krms:	move t3, [point 7, %%krbf] ;; Get a pointer to the buffer.
+	setz t4,		;; Zero the counter.
+%%krm1:	ildb t2, t1		;; Get the byte.
+	jumpe t2, %%krm2	;; Is it a null?
+	addi t4, 1		;; Increment the counter.
+	idpb t2, t3		;; Deposit the byte.
+	jrst %%krm1
+%%krm2:	move t1, t3		;; Put the information into the buffer.
+	hrloi t2, .fhslf	;; Say:  this fork ,, last error.
+	movei t3, ^d80		;; Eighty chars minus the number so far.
+	sub t3, t4
+	ERSTR%
+	 trn
+	 trn
+	move t2, t1		;; Put in the correct AC.
+	move t1, [point 7, %%krbf] ;; Find the length of the string.
+	call subbp		;; Subtract byte pointers.
+	 movei t3, ^d80		;; If there is an error assume this count.
+	movei t1, "E"		;; An error packet.
+	move t2, pktnum		;; Packet number.
+	move t4, [point 7, %%krbf] ;; Pointer to string.
+	call spack		;; Send the error packet.
+	 trn
+	ret
+
+
+; %Clear
+;
+;    This macro takes three args, two of which are optional.  The first,
+; non-optional, argument is the starting address of the area to be cleared.
+; The next is the number of locations to clear, which defaults to one.
+; The last argument is the desired filler, which defaults to zero.
+
+define %clear (area, length, fill) <
+   ifb <fill>, <setzm area>
+   ifnb<fill>, <
+	movx .sac, <fill>
+	movem .sac, area
+   >
+   if1, <ifnb <length>, <exp 0, 0, 0>>
+   if2, <
+      ifb <length>, <%%%clr==1>
+      ifnb<length>, <%%%clr==<length>>
+      ifg <%%%clr-1>, <
+	   hrli .sac, area
+	   hrri .sac, <1>+area
+	   blt .sac, <%%%clr-1>+area
+      >
+   >
+>
+
+; Parsing aids
+
+defstr %prsadr,0,17,18		; Parse routine address
+defstr %evladr,0,35,18		; Evaluation routine address
+
+; %Table
+;
+;    This macro is used to start a keyword table definition.
+
+define %table <
+	%%tbst== .		;; Plant start of table
+	exp 0			;;  and leave a hole for %tbend to fill
+>
+
+; %TBend 
+;
+;    This macro is the compliment of %Table; it ends a keyword table.
+
+define %tbend <
+	%%tbnd==.-1		;; Get address of last entry in table
+	.org %%tbst		;; Move back to start
+	xwd %%tbnd-%%tbst, %%tbnd-%%tbst;;  and build table header
+	.org			;; Finally, get back to the way we were
+>
+
+; %Key
+;
+;    This macro takes three arguments: an (alphanumerics only!) name, the
+; data to be associated with the name, and an (optional) flag value.  It
+; creates either a flag-less keyword (the normal case), or, if flags are
+; given, a keyword with flags in the first word (and cm%fw set).  Thus,
+; the result is a TBLUK table entry, suitable for use by the .CMkey COMND
+; Jsys function.  Note that all %Key words in a table must be bracketted
+; by %Table and %TbEnd macros (see above).
+
+define %key (name, data, flags) < ;; Flags are optional
+   ifb <flags>, <
+	xwd [asciz\name\],data	;; No-flags case
+   >
+   ifnb<flags>, <
+	xwd [<flags>!cm%fw	;; Flags: first word holds them,
+	     asciz\name\], data	;;  second is start of name
+   >
+>
+
+	subttl Check rescan line
+
+rescan:	saveac <t2,q4>		; Save the used AC's.
+	move q4, t1		; Save AC1.
+
+	movx t1, .rsini		; Any rescan arguments?
+	RSCAN%			;  ...
+	 erjmp rskp		;  If not return.
+
+	movx t1, .rscnt		; Get the size of the rescan.
+	RSCAN%			;  ...
+	 erjmp rskp		;  Return if unsucessful.
+	jumpe t1, rskp		; If the size is zero return.
+
+	prompt <>		; Null prompt.
+
+	movei t1, r+1		; Get the address we want to go to on reparse.
+	movem t1, repara	; Fudge it.  This is to prevent looping back
+				;  to prompt <> for ever on an error on the 
+				;  rescan line.
+	move t1, q4		; Parse for the "keyword" in q4.
+	call rflde		; Parse it, returning +2 on success.
+	 retskp			;  If we don't find it return.
+	movei t1, [flddb. (.cmcfm,cm%sdh)] ; See if we can parse a confirm.
+	call rflde
+	 ret			;  If not, we have a rescan argument.
+	retskp			; Say we haven't got one.
+
+
+
+Kermit:	jrst start		; Start entry.
+	jrst reen		; Re-entry.
+versio:	byte (3)$who(9)$verno(6)$mnver(18)$edno	; Program version.
+
+reen:	jrst start
+
+start:	RESET%			; Normal startup: reset everything
+	move p, [iowd pdlsiz,pdl] ;  and set up a stack.
+	call main		; The actual program.
+halt:	HALTF%			; Stop.
+	jrst cont		; Go around again.
+
+cont:	setzm f$exit		; Turn off the exit flag.
+	GJINF%			; Get the our terminal number.
+	movem t4, pars3		; Make believe we parsed it.
+	call $setln		; Set the line to our own.
+	movx t1, .nulio		; Defaults to null.
+	movem t1, diajfn	; Make that the error JFN.
+	call prsint
+	jrst halt
+
+
+main:	call pinit		; Initialize interupt system.
+	GJINF%			; Get the our terminal number.
+	movem t4, pars3		; Make believe we parsed it.
+	call $setln		; Set the line to our own.
+	movx t1, .nulio		; Defaults to null.
+	movem t1, diajfn	; Make that the error JFN.
+	call cmdini		; Initialize the command package.
+	movei t1, [flddb. (.cmkey,,<[exp <1,,1>,<[asciz/Kermit/],,0>]>)]
+	call rescan		; Check rescan buffer.
+	 jrst [	skipe f$exit	;  Is the exit flag already on?
+		 jrst prsint	;   Yes, then we have parsed an error on the
+				;    rescan line.  Go handle it.
+		setom f$exit	;  Turn on the exit flag.
+		jrst parse]	;  Parse the rescan line.
+
+prsint:	skipe f$exit		; Exit?
+	 ret			;  If so, return.
+	prompt (Kermit-20>)
+parse:	%clear pars1, parsnm	; Clear parse values.
+	setzm cjfnbk+.gjgen	; Clear the JFN bits.
+	movei t1, [flddb. (.cmkey,,cmdtab,,,)]
+	call rfield		; Parse a keyword.
+	hrrz t2, (t2)		; Get the command routine addresses.
+	movem t2, pars1		; Save into pars1.
+	load t1, %prsad, (t2)	; Get the next level routine.
+	call (t1)		; Call it.
+eval:	move t2, pars1		; Get back data value.
+	load t1, %evlad, (t2)	; Get evaluation routine.
+	call (t1)		; Call it.
+	jrst prsint		; Do it again.
+
+	subttl	EXIT command
+
+.exit:	noise <from Kermit>
+	confrm			; Confirm.
+	ret
+
+$exit:	move t1, netjfn		; Get the output JFN.
+	CLOSF%			; Close it.
+	 %jserr (,.+1)
+	setzm netjfn		; Indicate no tty.
+	setom f$exit		; Set exit flag.
+	ret
+
+	subttl	HELP command
+
+.help:	noise <with Kermit>
+	confrm			; Confirm.
+	ret
+
+$help:	tmsg <
+KERMIT is a family of  programs that do reliable file transfer between 
+computers  over TTY  lines.   These are  the commands  for the  DEC-20
+version. 
+
+SEND	 Sends  a file  or file  group from the  DEC-20 to the  remote
+	 host.   The name of each file is passed to the remote host in
+	 a special control packet, so that the remote host  can  store
+	 it  with  the same name.  Wildcarding of files is allowed.
+>
+	tmsg <
+RECEIVE	 Receive a file or file group from the remote  host.    If  an
+	 incoming file name is not legal, then attempt to transform it
+	 to  a  similar  legal  name,  e.g.  by  deleting  illegal  or
+	 excessive characters.  If the  file already exists simply use
+	 a higher generation number.
+>
+	tmsg <
+SET	 Establish  various  system-dependent parameters, such as max-
+	 imum packet length, debugging mode, transmission delay, etc.
+
+STATUS	 Give information  about the last file  transfer such as effec-
+	 tive baud rate, number of charcters, etc.
+
+HELP	 Type this message.
+
+EXIT	 Exit from KERMIT back to the host operating system.
+
+QUIT	 Synonym for EXIT.
+
+[End of KERMIT.HLP]  Oct 1981
+>
+	ret
+
+	subttl	SET command
+
+.set:	movei t1, [flddb. .cmkey,,setabl,,,]
+	call rfield		; Parse a keyword.
+	hrrz t2, (t2)		; Get the command routine addresses.
+	movem t2, pars2		; Save into pars2.
+	load t1, %prsad, (t2)	; Get the next level routine.
+	call (t1)		; Call it.
+	ret
+
+.setdb:	noise <protocol mode>
+	movei t1, [flddb. .cmkey,,dbgtab,,on,]
+	call rfield		; Parse a keyword.
+	hrrz t2, (t2)		; Get the value for the keyword (0 or 1).
+	movem t2, pars3		; Save into pars3.
+	confrm
+	ret
+
+;[17] Begin addition
+
+.setf8:	noise <to>
+	movei t1, [flddb. (.cmkey,,sftab,<DEC-20 file byte size, >,seven-bit,)]
+	call rfield		; Parse a keyword.
+	hrrz t2, (t2)		; Get the value for the keyword (0 or 1).
+	movem t2, pars3		; Save into pars3.
+	confrm
+	ret
+
+;[17] End addition
+
+;[22] Begin addition
+
+.setip:	movei t1, [flddb. .cmkey,,dbgtab,,on,]
+	call rfield		; Parse a keyword.
+	hrrz t2, (t2)		; Get the value for the keyword (0 or 1).
+	movem t2, pars3		; Save into pars3.
+	confrm
+	ret
+
+;[22] End addition
+
+.setln:	noise <to tty>
+	movei t1, [flddb. (.cmnum,cm%sdh,^d8,<octal tty to transfer files over>,)]
+	call rfield		; Parse a tty number.
+	movem t2, pars3		; Save the tty number.
+	confrm
+	ret
+
+.setdl:	noise <to>
+	movei t1, [flddb. (.cmnum,cm%sdh,^d10,<decimal number of seconds>,)]
+	call rfield		; Parse a number.
+	movem t2, pars3		; Save the number.
+	confrm
+	ret
+
+
+.setrc:	movei t1, [flddb. (.cmkey,,srtabl,,)]
+	call rfield		; Parse a keyword.
+	hrrz t2, (t2)		; Get the command routine addresses.
+	movem t2, pars3		; Save into pars3.
+	load t1, %prsad, (t2)	; Get the next level routine.
+	call (t1)		; Call it.
+	ret
+
+.setsn:	movei t1, [flddb. (.cmkey,,sstabl,,)]
+	call rfield		; Parse a keyword.
+	hrrz t2, (t2)		; Get the command routine addresses.
+	movem t2, pars3		; Save into pars3.
+	load t1, %prsad, (t2)	; Get the next level routine.
+	call (t1)		; Call it.
+	ret
+
+
+.setpk:	noise <to>
+	movei t1, [flddb. (.cmnum,cm%sdh,^d10,<decimal number between 10 and 94>,)]
+	call rfield		; Parse the packet size.
+	movem t2, pars4		; Save the packet size.
+	confrm
+	move t2, pars4		; Get the packet size we parsed.
+	cail t2, ^d10		; Is the number in the right range?
+	 caile t2, ^d94
+	  jrst [tmsg <?Illegal packet size>
+		jrst cmder1]
+	ret
+
+.setpd:	noise <to>
+	movei t1, [flddb. (.cmnum,cm%sdh,^d10,<positive decimal number of padding characters>,)]
+	call rfield		; Parse the number of padding chars.
+	movem t2, pars4		; Save the number.
+	confrm
+	move t2, pars4		; Get the amount of padding we parsed.
+	skipge t2		; Is the number in the right range?
+	 jrst [	tmsg <?Must be a positive number>
+		jrst cmder1]
+	ret
+
+.setpc:	noise <to>
+	movei t1, [flddb. (.cmnum,cm%sdh,^o10,<octal number of character between 0 and 37 or 177>,)]
+	call rfield		; Parse the padding character.
+	movem t2, pars4		; Save the padding char.
+	confrm
+	move t2, pars4		; Get the padding char we parsed.
+	skipl t2		; Is the number in the right range?
+	 caile t2, ^o37		;[15]  Fix to compare correctly.
+	  jrst [caie t2, ^o177
+		tmsg <?Illegal padding character>
+		jrst cmder1]
+	ret
+
+.seteo:	noise <to>
+	movei t1, [flddb. (.cmnum,cm%sdh,^o10,<octal number of character between 0 and 37>,)]
+	call rfield		; Parse the EOL char.
+	movem t2, pars4		; Save the EOL char.
+	confrm
+	move t2, pars4		; Get the EOL char we parsed.
+	skipl t2		; Is the number in the right range?
+	 caile t2, ^o37		;[15]  Fix to compare correctly.
+	  jrst [tmsg <?Illegal EOL character>
+		jrst cmder1]
+	ret
+
+.setqu:	noise <to>
+.setq1:	movei t1, [flddb. .cmuqs,,j0brm,<a single character>]
+				; Break on everything.
+	call rfield
+	move t2, sbk+.cmptr	; This is the quote character.
+	ildb t1, t2
+	cain t1," "		; space?
+	 jrst .setq1		; yes, skip it
+	movem t1, pars4
+	dpb t1, [point 7, jbdlm, 6] ; Here it goes.
+	movei t1, [flddb. .cmtok,,<-1,,jbdlm>]
+	call rfield
+	confrm
+	ret
+
+.setim:	noise <to>
+
+;[15] Begin addition
+
+	movei t1, [flddb. (.cmnum,cm%sdh,^d10,<number of seconds before timing out, between 1 and 94>,)]
+	call rfield		; Parse the number.
+	movem t2, pars4		; Save the number.
+	confrm
+	move t2, pars4		; Get the number we parsed.
+	cail t2, 1		; Is the number in the right range?
+	 caile t2, ^d94		;  Fix to compare correctly.
+	  jrst [tmsg <?Illegal number of seconds>
+		jrst cmder1]
+	ret
+;[15] End addition
+
+$set:	move t2, pars2		; Get back data value.
+	load t1, %evlad, (t2)	; Get evaluation routine.
+	call (t1)		; Call it.
+	ret
+
+$setdb:	move t1, pars3		; Get the value we parsed.
+	movem t1, debug		; Say whether we want messages.
+	skipn debug		; On?
+	 ret
+	movx t1, .priou		; Get primary output.
+	movem t1, diajfn	; Send diagnostics and errors to the terminal.
+	ret
+
+$setrs:	move t1, @pars3		; Get the address of the variable to store.
+	move t2, pars4		; Get the value parsed.
+	movem t2, (t1)		; Save the value.
+	ret
+
+$setdl:	move t1, pars3		; Get the number of seconds to delay.
+	movem t1, delay		; Save the delay time.
+	ret
+
+$setf8:	move t1, pars3		;[17] Get the value of the flag.
+	movem t1, ebtflg	;[17] Set the flag.
+	ret			;[17]
+
+;[22] Begin addition
+
+$setip:	move t1, pars3		; Get the value we parsed.
+	movem t1, igpar		; Say whether we want parity ignored.
+	GJINF%			; Get the our terminal number.
+	movem t4, pars3		; Make believe we parsed it.
+	call $setln		; Set the line to our own.
+	ret 
+
+;[22] End addition
+
+$setln:	stkvar <oldjfn>
+	move t1, netjfn		; Get the present JFN.
+	movem t1, oldjfn	; Save it so we can close it up.
+	move t1, [170700,,filbuf] ; Pointer to file name buffer.
+	move t2, [ascii/TTY/]	; Build TTY: filename.
+	movem t2, filbuf	; Into filbuf.
+	move t2, pars3		; TTY number.
+	movem t2, ttynum
+	movei t3, ^d8		; Octal.
+	NOUT%
+	 erjmp [ermsg <Unto assign tty>
+		ret]
+	movei t2, ":"		; Get a colon.
+	idpb t2, t1
+	setz t2,
+	idpb t2, t1
+	movx t1, gj%sht		; Now try to get a JFN on the TTY:.
+	hrroi t2, filbuf
+	GTJFN%
+	 erjmp [ermsg <Unable to assign TTY> ;  Probably no such device.
+		ret]
+	hrrzm t1, netjfn	; Save it as the net JFN.
+	movx t2, fld(8,of%bsz)!of%wr!of%rd ; 8-bit bytes, read & write access.
+	skipe igpar		;[22] Should we ignore the parity?
+	 movx t2, fld(7,of%bsz)!of%wr!of%rd ;[22] 7-bit, read & write access.
+	OPENF%			; Assign the TTY.
+	 erjmp [movei t1, .fhslf ;  Check error code.
+		GETER%
+		hrrzs t2
+		caie t2, opnx7	;  Some other job has the TTY line?
+		 jrst [	ermsg <Unable to assign TTY> ;  Some other error.
+			move t2, oldjfn	;  Set back to old tty.
+			movem t2, netjfn
+			ret]
+		tmsg <In use by job >
+		move t1, netjfn	;  Get back JFN.
+		move t2, oldjfn	;  Set back to old tty.
+		movem t2, netjfn
+		DVCHR%		;  Find out who has it.
+		 erjmp r	;   Who cares?
+		hlre t2, t3	;  Get job number in t2.
+		movei t1, .priou ;  Output the job number in decimal.
+		movei t3, ^d10
+		NOUT%
+		 erjmp r
+		ret]
+	move t1, oldjfn		; Get the old tty.
+	jumpe t1, $stln2
+	CLOSF%			; Close it.
+	 %jserr (,.+1)
+$stln2:	move t1, netjfn
+	movei t2, .chcrt	; Send a CR down the line to get things going.
+	BOUT%
+	 %jserr (,r)
+	ret
+
+	subttl	STATUS command
+
+.stat:	noise <of Kermit>
+	confrm
+	ret
+
+$stat:	stkvar <sec>
+	tmsg < Debugging mode on TTY>
+	move t2, ttynum
+	movei t1, .priou
+	movei t3, ^d8
+	NOUT%
+	 %jserr (,.+1)
+	tmsg <: is >
+	skipn debug
+	 jrst [	tmsg <not >
+		jrst .+1]
+	tmsg <being used.
+>
+	tmsg < Maximum number of characters in packet:  >
+	move t2, rpsiz
+	movei t1, .priou
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg < received; >
+	move t2, spsiz
+	movei t1, .priou
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg < sent
+ Number of characters transmitted in >
+	move t2, stdat		; Get the number of thirds of seconds.
+	idivi t2, ^d3		; Get the number of seconds.
+	movem t2, sec		; Save the number of seconds.
+	idivi t2, ^d60		; Divide to get minutes.
+	move t4, t3		; Save the remainder.
+	jumpe t2, $stat2	; If no minutes then don't print them.
+	movei t1, .priou	; Output the time to the terminal.
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg < minutes and >
+$stat2:	move t2, t4		; Get the remainder.
+	jumpe t2, $stat3	; If no seconds then don't print them.
+	movei t1, .priou	; Output the time to the terminal.
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg < seconds>
+$stat3:	tmsg <
+	Sent:      >
+	movei t1, .priou	; Output the number of chars in decimal.
+	move t2, stot
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg <    	Overhead:	>
+	movei t1, .priou	; Output the number of chars in decimal.
+	move t2, stot
+	sub t2, stchr
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg <
+	Received:  >
+	movei t1, .priou	; Output the number of chars in decimal.
+	move t2, rtot
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg <    	Overhead:	>
+	movei t1, .priou	; Output the number of chars in decimal.
+	move t2, rtot
+	sub t2, rtchr
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg <
+  Total recieved:  >
+	movei t1, .priou	; Output the number of chars in decimal.
+	move t2, rtot
+	add t2, stot
+	move t4, t2		; Save the total number of chars.
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg <    	Overhead:	>
+	movei t1, .priou	; Output the number of chars in decimal.
+	move t2, t4		; Get total chars.
+	sub t2, rtchr
+	sub t2, stchr
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg <
+ Total characters transmitted per second:	>
+	move t2, t4		; Total chars transmitted.
+	idiv t2, sec		; Divided by the number of seconds.
+	movei t1, .priou	; Output the number of chars/sec in decimal.
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg <
+ Effective data rate:	>
+	skipn t2, stchr		; Is the number of chars sent zero?
+	 move t2, rtchr		;  If so we were receiving.
+	idiv t2, sec		; Divided by the number of seconds.
+	imuli t2, ^d10		; Multiply chars/sec by 10 to get bits/sec.
+	movei t1, .priou	; Output the baud rate in decimal.
+	movei t3, ^d10
+	NOUT%
+	 %jserr (,.+1)
+	tmsg < Baud
+>
+	skipn errptr		;[16] Was there an error?
+	 ret			;[16]  If not return.
+	tmsg < Aborted by error:  > ;[16]
+	move t1, errptr		;[16]
+	PSOUT%			;[16] If so output it.
+	tmsg <
+>				;[16]
+	ret
+
+	subttl	RECEIVE command
+
+.recv:	noise <into files>
+	movei t1, [flddb. (.cmofi,cm%sdh,,<output file spec>,,[
+		   flddb. (.cmcfm,cm%sdh,,<confirm to use micro's file spec>,,)])]
+	call rfield		; Parse a file spec or a confirm.
+	ldb t3, [pointr (.cmfnp(t3),cm%fnc)] ; Get function code.
+	caie t3, .cmofi		; Is it an input file spec?
+	 jrst .recv2		;  If not it must be a confirm.
+	movem t2, filjfn	; Save the JFN.
+	movei t1, [flddb. .cmcfm]
+	call rflde
+	 jrst [ move t1, filjfn	;  Get the JFN.
+		RLJFN%		;  Release it.
+		 erjmp .recv1	;   Ignore.
+.recv1:		setzm filjfn	;  Set the JFN to zero.
+		tmsg <?Not confirmed>
+		jrst cmder1]
+.recv2:	ret
+
+
+$recv:	setzb stot, rtot	; Initialize character counters.
+	setzb schr, stchr
+	setzb rchr, rtchr
+	setzm errptr		;[16] Zero the error message pointer.
+	call inilin		; Initialize the line.
+	call ccon		;[20] Turn on the ^C trap so line is restored.
+	 ret			;[20]  Where we come on ^C.
+	setzm pktnum		; Inititial the packet sequence number.
+	movei state, "R"	; Set the state to receive initiate.
+	setzm numtry		; Set the number of tries to zero.
+$recv2:	move t1, diajfn		; Get where to diagnostics.
+	move t2, pktnum		; Output the packet number.
+	movei t3, ^d10		; In decimal.
+	NOUT%
+	 jrst .+1		;  Who cares?
+	cain state, "D"		; Are we in the data send state?
+	 jrst [	diamsg <D >
+		call rdata
+		jrst $recv2]
+	cain state, "F"		; Are we in the file receive state?
+	 jrst [	diamsg <F >
+		move t1, filjfn	;  Get the file's JFN.
+		call rfile	;  Call receive file.
+		jrst $recv2]
+	cain state, "R"		; Are we in the receive initiate state?
+	 jrst [	diamsg <R >
+		call rinit	;  Call receive initiate.
+		jrst $recv2]
+	cain state, "C"		; Are we in the receive complete state?
+	 jrst [	diamsg <C >
+		call reslin	;  Restore the line.
+		GTAD%		;  Get the time we ended.
+		subm t1, stdat	;  Figure how long it all took.
+		ret]
+	cain state, "A"		; Are we in the receive abort state?
+	 jrst [	diamsg <A >
+		call reslin	;  Restore the line.
+		GTAD%		;  Get the time we ended.
+		subm t1, stdat	;  Figure how long it all took.
+		ret]
+	diamsg <U >
+	ret
+
+
+	subttl receive routines
+
+rinit:	saveac <q1>
+	move q1, numtry		; Get the number of tries.
+	caml q1, imxtry		; Have we reached the maximum number of tries?
+	 jrst [ ermsg <Unable to receive initiate
+>
+		movei state, "A" ;  Change the state to abort.
+		ret]
+	addi q1, 1		; Increment it.
+	movem q1, numtry	; Save the updated number of tries.
+	call rpack		; Get a packet.
+	 ret			;  Trashed packet don't change state, retry.
+	move q1, t1		; Save the packet type.
+	GTAD%			; Get the time we start.
+	movem t1, stdat		; Save it.
+	cain q1, "S"		; Check the packet.
+	 jrst [	movem t2, pktnum ;  Synchronize packet numbers.
+		call spar	;  Get the information
+		move t4, [point 8, data] ;  Get a pointer to our data block.
+		call rpar	;  Set the information.
+		movei t1, "Y"	;  Acknowledge packet.
+		move t2, pktnum	;  Packet number.
+		move t4, [point 8, data] ;  The address of the data.
+		call spack	;  Send the packet.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		move t2, numtry ;  Get the number of tries.
+		movem t2, oldtry ;  Save it.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		movei state, "F" ; Set the state to file send.
+		ret]
+
+; If we get here than we have either timed out or possibly the packet
+; type is wrong.  Just NAK the packet we were expecting.
+
+	move t2, pktnum		; Packet number for packet we wanted.
+	call nak		; NAK it.
+	ret
+
+rfile:	saveac <q1,q2>
+	move q1, numtry		; Get the number of tries.
+	caml q1, maxtry		; Have we reached the maximum number of tries?
+	 jrst [ ermsg <Unable to receive file header
+>
+		movei state, "A" ;  Change the state to abort.
+		ret]
+	addi q1, 1		; Increment it.
+	movem q1, numtry	; Save the updated number of tries.
+	move q1, t1		; Save the arguments.
+	move q2, t2
+	call rpack		; Get a packet.
+	 ret			;  Trashed packet don't change state, retry.
+	cain t1, "S"		; Check the packet.
+	 jrst [	move q1, oldtry	;  Get the number of tries.
+		caml q1, imxtry	;  Have we reached the maximum number of tries?
+		 jrst [ ermsg <Unable to receive initiate
+>
+			movei state, "A" ;   Change the state to abort.
+			ret]
+		addi q1, 1	;  Increment it.
+		movem q1, oldtry ;  Save the updated number of tries.
+		move q1, pktnum ;  Get the present packet number.
+		caie t2, -1(q1)	;  Is the packet's number one less than now?
+		 jrst [ ermsg <Error receiving initiate
+>
+			movei state, "A" ;   Change the state to abort.
+			ret]
+		setzm numtry	;  Start count over.
+		move t4, [point 8, data] ;  Get a pointer to our data block.
+		call rpar	;  Set the information.
+		movei t1, "Y"	;  Acknowledge packet.
+		move t4, [point 8, data] ;  The address of the data.
+		call spack	;  Send the packet.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		ret]
+	cain t1, "Z"		; Check the packet.
+	 jrst [	move q1, oldtry	;  Get the number of tries.
+		caml q1, maxtry	;  Have we reached the maximum number of tries?
+		 jrst [ ermsg <Maximum retries exceeded, unable to receive EOF
+>
+			movei state, "A" ;   Change the state to abort.
+			ret]
+		addi q1, 1	;  Increment it.
+		movem q1, oldtry ;  Save the updated number of tries.
+		move q1, pktnum ;  Get the present packet number.
+		caie t2, -1(q1)	;  Is the packet's number one less than now?
+		 jrst [ ermsg <Invalid EOF packet received
+>
+			movei state, "A" ;   Change the state to abort.
+			ret]
+		setzm numtry	;  Start count over.
+		movei t1, "Y"	;  Acknowledge packet.
+		setzb t3, t4	;  No data.
+		call spack	;  Send the packet.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		ret]
+	cain t1, "F"		; Start of file?
+	 jrst [	came t2, pktnum	;  Is it the right packet number?
+		 jrst [ ermsg <Incorrect packet number on start of file packet
+>
+			movei state, "A" ;   Change the state to abort.
+			ret]
+		move t1, t4	;  Get a pointer to the data.
+		move t2, t3	;  Get the length of the data.
+		call gofil	;  Get a file to write to.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		movem t1, filjfn ;  Save the JFN.
+		movei t1, "Y"	;  Acknowledge packet.
+		move t2, pktnum
+		setzb t3, t4	;  No data.
+		call spack	;  Send the packet.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		move t1, filjfn
+		movx t2, fld(7,of%bsz)!of%wr ;  7-bit bytes, write access.
+		skipe ebtflg	 ;[17]  Eight bit access?
+		 movx t2, fld(8,of%bsz)!of%wr ;[17]  8-bit bytes, write access.
+		OPENF%			; Open the file.
+		 erjmp [kermsg <Unable to open file
+>
+			move t1, filjfn	;   Get the output JFN.
+			RLJFN%	;   Release the JFN.
+			 erjmp .+1 ;    Ignore the error.
+			setzm filjfn ;   Clear the JFN.
+			movei state, "A" ;   Change state to EOF
+			ret]
+		setzm mapflg	;[23]  Say no pages mapped in yet.
+		move t2, numtry ;  Get the number of tries.
+		movem t2, oldtry ;  Save it.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		movei state, "D" ; Set the state to file send.
+		ret]		
+	cain t1, "B"		; End of transmission?
+	 jrst [	came t2, pktnum	;  Is it the right packet number?
+		 jrst [ ermsg <Incorrect packet number on EOT packet
+>
+			movei state, "A" ;   Change the state to abort.
+			ret]
+		movei t1, "Y"	;  Acknowledge packet.
+		setzb t3, t4	;  No data.
+		call spack	;  Send the packet.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		movei state, "C" ;  Set state to complete.
+		ret]		
+	cain t1, "T"		; Timer interupt pseudo packet?
+	 jrst [	movei t1, "N"	;  Send a NAK.
+		move t2, pktnum
+		setzb t3, t4	;  No data.
+		call spack	;  Send the packet.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		ret]
+	movei state, "A"	; Otherwise abort.
+	ret
+
+
+rdata:	saveac <q1,q2>
+	move q1, numtry		; Get the number of tries.
+	caml q1, maxtry		; Have we reached the maximum number of tries?
+	 jrst [ ermsg <Unable to receive data
+>
+		jrst rdterr]
+	addi q1, 1		; Increment it.
+	movem q1, numtry	; Save the updated number of tries.
+	move q1, t1		; Save the arguments.
+	move q2, t2
+	call rpack		; Get a packet.
+	 ret			;  Trashed packet don't change state, retry.
+	cain t1, "D"		; Data packet?
+	 jrst [	came t2, pktnum	;  Is it the right packet?
+		 jrst .+1
+		move t1, t4	;  Get the pointer to the data.
+		move t2, t3	;  Get the length of the data.
+		call ptchr	;  Write the chars to a file.
+		 jrst rdterr	;   Die cleanly.
+		movei t1, "Y"	;  Acknowledge packet.
+		move t2, pktnum	;  Get the sequence number.
+		setzb t3, t4	;  No data.
+		call spack	;  Send the packet.
+		 jrst rdterr	;   Die cleanly.
+		move t2, numtry ;  Get the number of tries.
+		movem t2, oldtry ;  Save it.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		ret]
+	cain t1, "D"		; Is it a previous data packet?
+	 jrst [	move q1, oldtry	;  Get the number of tries.
+		caml q1, maxtry	;  Have we reached the maximum number of tries?
+		 jrst [ ermsg <Unable to receive data
+>
+			jrst rdterr] ;  Die cleanly
+		addi q1, 1	;  Increment it.
+		movem q1, oldtry ;  Save the updated number of tries.
+		move q1, pktnum ;  Get the present packet number.
+		caie t2, -1(q1)	;  Is the packet's number one less than now?
+		 jrst [ ermsg <Error receiving data
+>
+			 jrst rdterr] ;  Die cleanly
+		setzm numtry	;  Start count over.
+		movei t1, "Y"	;  Acknowledge packet.
+		setzb t3, t4	;  No data.
+		call spack	;  Send the packet.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		ret]	
+	cain t1, "F"		; Check the packet.
+	 jrst [	move q1, oldtry	;  Get the number of tries.
+		caml q1, maxtry	;  Have we reached the maximum number of tries?
+		 jrst [ ermsg <Unable to acknowledge file header
+>
+			 jrst rdterr] ;  Die cleanly
+		addi q1, 1	;  Increment it.
+		movem q1, oldtry ;  Save the updated number of tries.
+		move q1, pktnum ;  Get the present packet number.
+		caie t2, -1(q1)	;  Is the packet's number one less than now?
+		 jrst [ ermsg <Error receiving file header
+>
+			 jrst rdterr] ;  Die cleanly
+		setzm numtry	;  Start count over.
+		movei t1, "Y"	;  Acknowledge packet.
+		setzb t3, t4	;  No data.
+		call spack	;  Send the packet.
+		 jrst rdterr	;   Die cleanly
+		ret]	
+	cain t1, "Z"		; Is it an EOF.
+	 jrst [	came t2, pktnum	;  Is the packet number correct?
+		 jrst [ ermsg <Invalid EOF packet received
+>
+			movei state, "A" ;   Change the state to abort.
+			ret]
+		movei t1, "Y"	;  Acknowledge packet.
+		setzb t3, t4	;  No data.
+		call spack	;  Send the packet.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		skipe mapflg	;  Any pages mapped in?
+		 jrst [	movx t1, <.fhslf,,mappag> ;   <our fork,,mapping page>
+			hrl t2, filjfn ;  <file JFN,, page #>
+			hrr t2, prepag
+			movx t3, pm%rd!pm%wr ;   Read and write.
+			PMAP%	;   Map it out.
+		 	 %jsker (,r)
+			setzm mapflg ;   Say no page mapped in.
+			jrst rd1]
+rd1:		movx t1, co%nrj
+		hrr t1, filjfn	;  Get the JFN.
+		CLOSF%		;  Close it.
+		 erjmp rd2
+		movx cf%nud
+		hrli t1, .fbsiz	;  Set the number of bytes
+		ior t1, [cf%nud]
+		hrr t1, filjfn	;  Get the JFN.
+		seto t2,	;  Change all bits.
+		move t3, rchr	;  Get the number of bytes.
+		CHFDB%
+		 erjmp rd12
+rd12:		hrli t1, .fbbyv	;  Set the byte size.
+		hrr t1, filjfn
+		move t2, [007700,,0] ;  Just the correct six bits.
+		move t3, [000700,,0] ;  Seven bit.
+		skipe ebtflg	;[17]  Eight bit mode?
+		 move t3, [001000,,0] ;[17]  Set it as such.
+		CHFDB%
+		 erjmp rd2
+rd2:		hrr t1, filjfn	;  Get the JFN.
+		RLJFN%		;  Release the JFN.
+		 nop
+		setzm filjfn	;  Say we have no file.
+		addm rchr, rtchr ;  Add to the total.
+		setz rchr,
+		move t2, numtry ;  Get the number of tries.
+		movem t2, oldtry ;  Save it.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		movei state, "F"
+		ret]
+	cain t1, "T"		; Timer interupt pseudo packet?
+	 jrst [	movei t1, "N"	;  Send a NAK.
+		move t2, pktnum
+		setzb t3, t4	;  No data.
+		call spack	;  Send the packet.
+		 jrst [	movei state, "A" ;   Set state to abort.
+			ret]
+		ret]
+rdterr:	movx t1, cz%abt		; Abort the file.
+	hrr t1, filjfn		; Get the JFN.
+	CLOSF%			; Close it.
+	 erjmp .+1
+	setzm filjfn		; Say we have no file.
+	movei state, "A"	; Change the state to abort.
+	ret
+
+	subttl	Utility protocol routines
+
+; Send a NAK.  Accepts the packet number to NAK in AC2.
+
+nak:	movei t1, "N"		; Send a NAK.
+	setzb t3, t4		; No data.
+	call spack		; Send the packet.
+	 jrst [	movei state, "A" ;  Set state to abort.
+		ret]
+	ret
+
+; Get the arguments from a Send_init packet.
+
+spar:
+;* Check the amount of data.
+	ildb t2, t4		; Get the first argument.
+	subi t2, " "		; Convert it to a real number.
+	movem t2, spsiz		; Set the maximum packet size to send.
+	ildb t2, t4		; Get the second argument.
+	subi t2, " "		; Convert it to a real number.
+	movem t2, stimou	; Set the time out interval.
+	ildb t2, t4		; Get the second argument.
+	subi t2, " "		; Convert it to a real number.
+	movem t2, spadnm	; Set the padding.
+	ildb t2, t4		; Get the second argument.
+	addi t2, ^o100
+	andi t2, ^o177
+	movem t2, spadch	; Set the padding char.
+	ildb t2, t4		; Get the second argument.
+	subi t2, " "		; Convert it to a real number.
+	movem t2, seolch	; Set the EOL char.
+	ildb t2, t4		; Get the second argument.
+	movem t2, squote	; Set the quote char.
+	ret
+
+; Sets up the init packet.  Returns number of elements in T3.
+
+rpar:	saveac <q1>
+	move q1, rpsiz		; Get the packet size.
+	addi q1, " "		; Make the char printable.
+	idpb q1, t4		; Put it in the data block.
+	move q1, rtimou		; Get the time out interval.
+	addi q1, " "		; Make the char printable.
+	idpb q1, t4		; Put it in the data block.
+	move q1, rpadnm		; Get the padding.
+	addi q1, " "		; Make the char printable.
+	idpb q1, t4		; Put it in the data block.
+	move q1, rpadch		; Get the padding char.
+	addi q1, ^o100		; De-controlify it.
+	andi q1, ^o177
+	idpb q1, t4		; Put it in the data block.
+	move q1, reolch		; Get the EOL char.
+	addi q1, " "		; Make the char printable.
+	idpb q1, t4		; Put it in the data block.
+	move q1, rquote		; Get the quote char.
+	idpb q1, t4		; Put it in the data block.
+	movei t3, 6		; Six pieces of data.
+	ret
+
+
+	subttl	SEND command
+
+.send:	noise <from files>
+	move t2, cjfnbk+.gjgen	; Get the JFN flag bits.
+	txo t2, gj%ifg!gj%old	; Turn on wild carding for old files only.
+	movem t2, cjfnbk+.gjgen	; Return the JFN flag bits.
+	movei t1, [flddb. (.cmfil,cm%sdh,,<input file spec (possibly wild)>,,)]
+	call rfield		; Parse a file spec or a confirm.
+	movem t2, ndxjfn	; Save the indexable JFN.
+	hrrm t2, filjfn		; Save the JFN.
+	noise <initial>
+	movei t1, [flddb. (.cmcfm,cm%sdh,,<Carriage return to send them all>,,[
+		   flddb. (.cmfil,cm%sdh,,<Initial filespec>)])]
+	call rflde
+	 jrst [ move t1, filjfn	;  Get the JFN.
+		RLJFN%		;  Release it.
+		 erjmp .snd2	;   Ignore.
+.snd1:		setzm filjfn	;  Set the JFN to zero.
+		tmsg <?Not confirmed>
+		jrst cmder1]
+	ldb t3, [pointr (.cmfnp(t3),cm%fnc)] ; Get function code.
+	cain t3, .cmcfm		; Confirmation?
+	 ret			;  Yes, just return.
+	hrrm t2, ndxjfn		; No, initial filespec - substitute it.
+	hrrm t2, filjfn
+	movei t1, [flddb. .cmcfm]
+	call rflde
+	 jrst [ move t1, filjfn	;  Get the JFN.
+		RLJFN%		;  Release it.
+		 erjmp .snd2	;   Ignore.
+.snd2:		setzm filjfn	;  Set the JFN to zero.
+		tmsg <?Not confirmed>
+		jrst cmder1]
+	ret
+
+$send:	setzb stot, rtot	; Initialize character counters.
+	setzb schr, stchr
+	setzb rchr, rtchr
+	setzm errptr		;[16] Zero the error message pointer.
+	move t1, delay		; Get the delay.
+	imuli t1, ^d1000	; Make into milliseconds.
+	DISMS%			; Amount of time to delay.
+	GTAD%			; Get the time we start.
+	movem t1, stdat		; Save it.
+	call inilin		; Initialize the line.
+	call ccon		;[20] Turn on the ^C trap so line is restored.
+	 ret			;[20]  Where we come on ^C.
+	setzm pktnum		; Inititial the packet sequence number.
+	movei state, "S"	; Set the state to send initiate.
+	setzm numtry		; Set the number of tries to zero.
+$send2:	move t1, diajfn		; Get where to diagnostics.
+	move t2, pktnum		; Output the packet number.
+	movei t3, ^d10		; In decimal.
+	NOUT%
+	 jrst .+1		;  Who cares?
+	cain state, "D"		; Are we in the data send state?
+	 jrst [	diamsg <D >
+		call sdata
+		jrst $send2]
+	cain state, "F"		; Are we in the file send state?
+	 jrst [	diamsg <F >
+		move t1, filjfn	;  Get the file's JFN.
+		call sfile	;  Call send file.
+		jrst $send2]
+	cain state, "Z"		; Are we in the end of file state?
+	 jrst [	diamsg <Z >
+		call seof
+		jrst $send2]
+	cain state, "S"		; Are we in the send initiate state?
+	 jrst [	diamsg <S >
+		move t1, rpsiz	;  Get the receive packet size
+		move t2, stimou ;  and the time out interval.
+		call sinit	;  Call send initiate.
+		jrst $send2]
+	cain state, "B"		; Are we in the end of send state?
+	 jrst [	diamsg <B >
+		call seot
+		jrst $send2]
+	cain state, "C"		; Are we in the send complete state?
+	 jrst [	diamsg <C >
+		call reslin	;  Restore the line.
+		GTAD%		;  Get the time we ended.
+		subm t1, stdat	;  Figure how long it all took.
+		ret]
+	cain state, "A"		; Are we in the send abort state?
+	 jrst [	diamsg <A >
+		call reslin	;  Restore the line.
+		GTAD%		;  Get the time we ended.
+		subm t1, stdat	;  Figure how long it all took.
+		ret]
+	diamsg <U >
+	ret
+
+
+	subttl Send routines
+
+sinit:	saveac <q1>
+	move q1, numtry		; Get the number of tries.
+	caml q1, imxtry		; Have we reached the maximum number of tries?
+	 jrst [ diamsg <Unable to send initiate
+>
+		movei state, "A" ;  Change the state to abort.
+		ret]
+	addi q1, 1		; Increment it.
+	movem q1, numtry	; Save the updated number of tries.
+	move t4, [point 8, data] ; Get a pointer to our data block.
+	call rpar		; Set the information.
+	movei t1, "S"		; Send initiate packet.
+	move t2, pktnum		; Packet number.
+	move t4, [point 8, data] ; The address of the data.
+	call spack		; Send the packet.
+	 jrst [	movei state, "A" ;  Set state to abort.
+		ret]
+	call rpack		; Get a packet.
+	 ret			;  Trashed packet don't change state, retry.
+	cain t1, "Y"		; Check the packet.
+	 jrst [	came t2, pktnum	;  Is it the right ACK?
+		 ret		;   No, don't settle, hold out for right one.
+		call spar	;  Get the information
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		movei state, "F" ; Set the state to file send.
+		ret]
+	cain t1, "N"		; NAK?
+	 jrst [	move t1, pktnum	;  Get the expected packet number.
+		caie t2, 1(t1)	;  Is the NAK for the next packet?
+		 ret		;   Assume its for this packet.
+		ildb t2, t4	;  Yes, same as ACK; get the first argument.
+		subi t2, " "	;  Convert it to a real number.
+		movem t2, spsiz	;  Set the maximum packet size to send.
+		ildb t2, t4	;  Get the second argument.
+		subi t2, " "	;  Convert it to a real number.
+		movem t2, stimou ;  Set the time out interval.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		movei state, "F" ; Set the state to file send.
+		ret]
+	cain t1, "T"		; Timer interupt pseudo packet?
+	 ret
+	movei state, "A"	; Otherwise abort.
+	ret
+
+
+sfile:	saveac <q1>
+	move q1, numtry		; Get the number of tries.
+	caml q1, maxtry		; Have we reached the maximum number of tries?
+	 jrst [ ermsg <Unable to send file name
+>
+		movei state, "A" ;  Change the state to abort.
+		ret]
+	addi q1, 1		; Increment it.
+	movem q1, numtry	; Save the updated number of tries.
+	move t2, t1		; Get the JFN.
+	move t1, [point 8, data] ; Get a pointer to the data buffer.
+	movx t3, js%nam+js%typ+js%paf ; Just the file name and type.
+	setz t4,
+	JFNS%			; Get the file name.
+	move t2, t1		; Set up to subtract the byte pointers.
+	move t1, [point 8, data] ; Get a pointer to our data block.
+	call subbp		; Subtract the byte pointers.
+	 ret
+	movei t1, "F"		; File send packet.
+	move t2, pktnum		; Packet number.
+	move t4, [point 8, data] ; Get a pointer to our data block.
+	call spack		; Send the packet.
+	 jrst [	movei state, "A" ;  Set state to abort.
+		ret]
+	call rpack		; Get a packet.
+	 ret			;  Trashed packet don't change state, retry.
+	cain t1, "Y"		; Check the packet.
+	 jrst [	came t2, pktnum	;  Is it the right ACK?
+		 ret		;   No, don't settle, hold out for right one.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ;  Save modulo 64 of the number.
+		move t1, filjfn	;  Get the JFN.
+		movx t2, fld(7,of%bsz)!of%rd ; 7-bit bytes, read only.
+		skipe ebtflg	;[17]  Eight bit access?
+		 movx t2, fld(8,of%bsz)!of%rd ;[17]  8-bit bytes, write access.
+		OPENF%			; Open the file.
+		 erjmp [kermsg <Unable to open file>
+			movei state, "Z" ;   Change state to EOF
+			ret]
+		setzm mapflg	;[23]  Say no pages mapped in yet.
+		move t1, spsiz	;  Get the send packet size.
+		subi t1, 5	;  Subtract the overhead.
+		call gtchr	;  Get the chars.
+		 jrst [	skipe t1 ;   Is it end of file?
+			 jrst [	movei state, "A" ;   No, change state to abort.
+				ret]
+			movei state, "Z" ;   Set state to end of file.
+			ret]
+		movei state, "D" ;  Set the state to file send.
+		movem t1, size	;  Save the length of the data.
+		ret]
+	cain t1, "N"		; NAK?
+	 jrst [	move t1, pktnum	;  Get the expected packet number.
+		caie t2, 1(t1)	;  Is the NAK for the next packet?
+		 ret		;   Assume its for this packet.
+		setzm numtry	;  Yes, means the same as ACK.  
+		addi t1, 1	;  Increment it.
+		dpb t1, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		move t1, filjfn	;  Get the JFN.
+		movx t2, fld(7,of%bsz)!of%rd ; 7-bit bytes, read only.
+		skipe ebtflg	;[17]  Eight bit access?
+		 movx t2, fld(8,of%bsz)!of%rd ;[17]  8-bit bytes, write access.
+		OPENF%			; Open the file.
+		 erjmp [kermsg <Unable to open file>
+			movei state, "Z" ;   Change state to EOF
+			ret]
+		setzm mapflg	;[23]  Say no pages mapped in yet.
+		move t1, spsiz	;  Get the send packet size.
+		subi t1, 5	;  Subtract the overhead.
+		call gtchr	;  Get the chars.
+		 jrst [	skipe t1 ;   Is it end of file?
+			 jrst [	movei state, "A" ;   No, change state to abort.
+				ret]
+			movei state, "Z" ;   Set state to end of file.
+			ret]
+		movei state, "D" ;  Set the state to file send.
+		movem t1, size	;  Save the length of the data.
+		ret]
+	cain t1, "T"		; Timer interupt pseudo packet?
+	 ret
+	movei state, "A"	; Otherwise abort.
+	ret
+
+
+sdata:	saveac <q1>
+	move q1, numtry		; Get the number of tries.
+	caml q1, maxtry		; Have we reached the maximum number of tries?
+	 jrst [ ermsg <Unable to send data
+>
+		movei state, "A" ;  Change the state to abort.
+		ret]
+	addi q1, 1		; Increment it.
+	movem q1, numtry	; Save the updated number of tries.
+	movei t1, "D"		; File send packet.
+	move t2, pktnum		; Packet number.
+	move t3, size		; Get the data length.
+	move t4, [point 8, data] ; Get a pointer to our data block.
+	call spack		; Send the packet.
+	 jrst [	movei state, "A" ;  Set state to abort.
+		ret]
+	call rpack		; Get a packet.
+	 ret			;  Trashed packet don't change state, retry.
+	cain t1, "Y"		; Check the packet.
+	 jrst [	came t2, pktnum	;  Is it the right ACK?
+		 ret		;   No, don't settle, hold out for right one.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		move t1, spsiz	;  Get the send packet size.
+		subi t1, 5	;  Subtract the overhead.
+		call gtchr
+		 jrst [	skipe t1 ;   Is it end of file?
+			 jrst [	movei state, "A" ;   No, change state to abort.
+				ret]
+			movei state, "Z" ;   Set state to end of file.
+			ret]
+		movem t1, size	;  Save the length of the data.
+		ret]
+	cain t1, "N"		; NAK?
+	 jrst [	move t1, pktnum	;  Get the expected packet number.
+		caie t2, 1(t1)	;  Is the NAK for the next packet?
+		 ret		;   Assume its for this packet.
+		setzm numtry	;  Yes, means the same as ACK.  
+		addi t1, 1	;  Increment it.
+		dpb t1, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		move t1, spsiz	;  Get the send packet size.
+		subi t1, 5	;  Subtract the overhead.
+		call gtchr
+		 jrst [	skipe t1 ;   Is it end of file?
+			 jrst [	movei state, "A" ;   No, change state to abort.
+				ret]
+			movei state, "Z" ;   Set state to end of file.
+			ret]
+		movem t1, size	;  Save the length of the data.
+		ret]
+	cain t1, "T"		; Timer interupt pseudo packet?
+	 ret
+	movei state, "A"	; Otherwise abort.
+	ret
+
+
+seof:	saveac <q1>
+	move q1, numtry		; Get the number of tries.
+	caml q1, maxtry		; Have we reached the maximum number of tries?
+	 jrst [ ermsg <Unable to send end of file
+>
+		movei state, "A" ;  Change the state to abort.
+		ret]
+	addi q1, 1		; Increment it.
+	movem q1, numtry	; Save the updated number of tries.
+	movei t1, "Z"
+	move t2, pktnum		; Packet number.
+	setzb t3, t4		; No data.
+	call spack		; Send the packet.
+	 jrst [	movei state, "A" ;  Set state to abort.
+		ret]
+	call rpack		; Get a packet.
+	 ret			;  Trashed packet don't change state, retry.
+	cain t1, "Y"		; Check the packet.
+	 jrst [	came t2, pktnum	;  Is it the right ACK?
+		 ret		;   No, don't settle, hold out for right one.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		move t1, filjfn	;  Get the file JFN.
+		txo t1, co%nrj	;  Don't release the JFN (for GNJFN%).
+		CLOSF%
+		 erjmp gt3
+		addm schr, stchr ;  Add the last file's size to the total.
+		setz schr,	;  Zero the present count.
+gt3:		call gtnfil	;  Get the next file.
+		 jrst [	setzm filjfn ;   Zero the JFN.
+			movei state, "B" ;   No more, set state to complete.
+			ret]
+		movei state, "F" ;  File send state.
+		ret]
+	cain t1, "N"		; NAK?
+	 jrst [	move t1, pktnum	;  Get the expected packet number.
+		caie t2, 1(t1)	;  Is the NAK for the next packet?
+		 ret		;   Assume its for this packet.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		move t1, filjfn	;  Get the file JFN.
+		txo t1, co%nrj	;  Don't release the JFN (for GNJFN%).
+		CLOSF%
+		 erjmp gt3
+		addm schr, stchr ;  Add the last file's size to the total.
+		setz schr,	;  Zero the present count.
+		call gtnfil	;  Get the next file.
+		 jrst [	setzm filjfn ;   Zero the JFN.
+			movei state, "B" ;   No more, set state to complete.
+			ret]
+		movei state, "F" ;  File send state.
+		ret]
+	cain t1, "T"		; Timer interupt pseudo packet?
+	 ret
+	movei state, "A"	; Otherwise abort.
+	ret
+
+
+seot:	saveac <q1>
+	move q1, numtry		; Get the number of tries.
+	caml q1, maxtry		; Have we reached the maximum number of tries?
+	 jrst [ ermsg <Unable to send end of file
+>
+		movei state, "A" ;  Change the state to abort.
+		ret]
+	addi q1, 1		; Increment it.
+	movem q1, numtry	; Save the updated number of tries.
+	movei t1, "B"
+	move t2, pktnum		; Packet number.
+	setzb t3, t4		; No data.
+	call spack		; Send the packet.
+	 jrst [	movei state, "A" ;  Set state to abort.
+		ret]
+	call rpack		; Get a packet.
+	 ret			;  Trashed packet don't change state, retry.
+	cain t1, "Y"		; Check the packet.
+	 jrst [	came t2, pktnum	;  Is it the right ACK?
+		 ret		;   No, don't settle, hold out for right one.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		movei state, "C" ;  Complete state.
+		ret]
+	cain t1, "N"		; NAK?
+	 jrst [	move t1, pktnum	;  Get the expected packet number.
+		caie t2, 1(t1)	;  Is the NAK for the next packet?
+		 ret		;   Assume its for this packet.
+		setzm numtry	;  Reset the number of tries.
+		move t2, pktnum ;  Get the packet number.
+		addi t2, 1	;  Increment it.
+		dpb t2, [point 6, pktnum, 35] ; Save modulo 64 of the number.
+		movei state, "C" ;  Complete state.
+		ret]
+	cain t1, "T"		; Timer interupt pseudo packet?
+	 ret
+	movei state, "A"	; Otherwise abort.
+	ret
+
+
+	subttl File routines
+
+gtchr:	saveac <q1,q2,q3,q4>
+	stkvar <len,tmpac>
+	subi t1, 1		; So we don't mess up on quoting.
+	movem t1, len		; Save the length.
+	skipe eoflag		; Is the end of file flag set?
+	 jrst [	setz t1,	;  Indicate EOF.
+		setzm eoflag
+		ret]
+	skipn mapflg		; Do we have any thing mapped in?
+	 jrst [	move t1, filjfn	;  Get the JFN.
+		movx t2, <2,,.fbbyv> ;  Get number of pages and bytes
+		movei t3, filpag ;  into filpag and filbyt.
+		GTFDB%		;  Get the file descriptor block.
+		 %jsker (Unable to get file length,r) ;   Error close up.
+		skipn filbyt	;  Any bytes in the file?
+		 jrst [	setom eoflag ;   No, set end of file flag.
+			setz t1, ;   Say no chars.
+			retskp]
+		ldb t2, [point 6, filpag, 11] ;  Get the byte size.
+		movem t2, filbsz ;  Save the file byte size.
+;[17] Begin addition
+		skipe ebtflg	;   Eight bit mode?
+		 jrst [	cain t2, ^d8 ;   Is the byte size 8?
+			 jrst gtc ;   If so nothing to do.
+			movei t3, ^d36 ;   If so, get the size of a word.
+			idiv t3, t2 ;   Divide by the byte size.
+			move q1, filbyt	;   Get the number of bytes in file.
+			idiv q1, t3 ;   Divide by the bytes/word to get words.
+			imuli q1, 4 ;   Multilply by 4 (as if 8bit bytes).
+			movem q1, filbyt ;   Save the new byte size.
+			jrst gtc]
+;[17] End addition
+		caie t2, 7	;  Is the byte size seven?
+		 jrst [	movei t3, ^d36 ;   If not, get the size of a word.
+			idiv t3, t2 ;   Divide by the byte size.
+			move q1, filbyt	;   Get the number of bytes in file.
+			idiv q1, t3 ;   Divide by the bytes/word to get words.
+			imuli q1, 5 ;   Multiply by 5 (as if 7bit bytes).
+			movem q1, filbyt ;   Save the new byte size.
+			jrst gtc]
+gtc:		hrlzs t1	;  If so continue.  <file JFN,, page 0>
+		hrlm t1, filpag	;  Zero the left half of filpag.
+		movx t2, <.fhslf,,mappag> ;  <our fork,,mapping page>
+		movx t3, pm%rd	;  Just want to read it.
+		PMAP%		;  Map it in.
+	 	 %jsker (Unable to map in file page,r) ;   Error close up.
+		move q4, [point 7, mappag*1000]	;  Get a pointer to it.
+		skipe ebtflg	;[17]  Eight bit access?
+		 move q4, [point 8, mappag*1000] ;[17]  Get a pointer to it.
+		setzm prepag	;  Present page is zero.
+		setom mapflg	;  Say we've got a page mapped in.
+		jrst gtchr1]
+	move q4, mapptr		; Get the PMAP buffer pointer.
+gtchr1:	setz q1,		; Initialize the character count.
+	move q2, [point 8, data] ; Get a pointer to where to put the chars.
+gtchr2:	caml q1, len		; Have we exceeded the length?
+	 jrst [	move t1, q1	;  Return the length.
+		movem q4, mapptr ;  Save the pointer.
+		retskp]
+	caml schr, filbyt	; Any more chars?
+	 jrst [	setom eoflag	;  Set the end of file flag.
+		seto t1,	;  Indicate unmap.
+		movx t2, <.fhslf,,mappag> ;  This process.
+		setz t3,
+		PMAP%		;  Unmap the page.
+		 %jsker (Error unmapping page,r)
+		setzm mapflg	;  Say nothing mapped in.
+		move t1, q1	;  Return the size in the right AC.
+		retskp]
+	ildb t2, q4		; Get the next byte.
+	movei t1, <mappag+1>*1000 ; Are we at the end yet
+	caig t1, (q4)
+	 jrst [	seto t1,	;  Indicate unmap.
+		movx t2, <.fhslf,,mappag> ;  This process.
+		setz t3,
+		PMAP%		;  Unmap the page.
+		 %jsker (Error unmapping page,r)
+		move t1, prepag	;  Get the present page number.
+		addi t1, 1	;  Increment it.
+		caml t1, filpag	;  Any more pages?
+		 jrst [	setom eoflag ;   Set the end of file flag.
+			move t1, q1 ;   Return the size in the right AC.
+			setzm mapflg ;   Say nothing mapped in.
+			retskp]
+		movem t1, prepag ;  Save the new number.
+		hrl t1, filjfn	;  <file JFN,, page 0>
+		movx t2, <.fhslf,,mappag> ;  <our fork,,mapping page>
+		movx t3, pm%rd	;  Just want to read it.
+		PMAP%		;  Map it in.
+	 	 %jsker (Unable to map in the file,r) ;   Error close up.
+		move q4, [point 7, mappag*1000]	;  Get a pointer to it.		
+		skipe ebtflg	;[17]  Eight bit access?
+		 move q4, [point 8, mappag*1000] ;[17]  Get a pointer to it.
+		ildb t2, q4	;  Get the next byte.
+		jrst .+1]
+	addi schr, 1		; Increment the file chars sent total.
+	addi q1, 1		; Increment char count.
+	movem t2, tmpac		;[17] Save the char.
+	andi t2, ^o177		;[17] Turn off the 8th bit.
+	cail t2, " "		; Is it a control char?
+	 cain t2, .chdel	;  Or a delete?
+	  jrst [move q3, squote	;   Get the quote character.
+		addi q1, 1	;   Increment char count.
+		idpb q3, q2	;   Put in the quote character.
+		move t2, tmpac	;[17] Restore the char.
+		xori t2, ^o100	;   Make the char noncontrol.
+		jrst gtchr3]
+	camn t2, squote		; Is it the quote character?
+	 jrst [	addi q1, 1	;  Increment char count.
+		idpb t2, q2	;  Put in the quote character.
+		jrst .+1]
+	move t2, tmpac		;[17] Restore the char.
+gtchr3:	move q3, schr		; Get the char count.
+	skipe ebtflg		;[17] Eight bit mode?
+	 jrst gtchr4		;[17]  If so don't fool with this hack.
+	movem q4, tmpac		; Save the AC.
+	idivi q3, 5
+	skipn q4		; Is this the last char in the word?
+	 jrst [	hrr q4, tmpac	;  Get the address of the word.
+		move q4, (q4)	;  Get its contents.
+		andi q4, 1	;  Get just bit 35.
+		lsh q4, 7	;  Shift it over into bit 8.
+		ior t2, q4	;  Or in that bit to the char.
+		jrst .+1]
+	move q4, tmpac		; Restore the AC.
+gtchr4:	idpb t2, q2		; Put in the character.
+	jrst gtchr2		; Loop
+
+
+ptchr:	saveac <q1,q2,q3,q4>
+	stkvar <siz,tmp>
+	movem t2, siz		; Save the size.
+	move q1, t1		; Save the arguments.
+	move q2, t2
+	skipn mapflg		; Is there a page mapped in?
+	 jrst [	move q3, [point 7, mappag*1000]	;  Get a pointer to it.
+		skipe ebtflg	;[17]  Eight bit access?
+		 move q3, [point 8, mappag*1000] ;[17]  Get a pointer to it.
+		setzm prepag	;  Present page is zero.
+		setom mapflg	;  Say we've got a page mapped in.
+		jrst ptchr1]
+	move q3, mapptr		; Get a pointer to the buffer.
+ptchr1:	setz q4,		; Zero quote char count.
+ptchr2:	skipg q2		; Are we done?
+	 jrst [	movem q3, mapptr ;  Save the byte pointer.
+		retskp]
+	addi rchr, 1		; Add to the character count.
+	subi q2, 1		; Decrement char count.
+	ildb t2, q1		; Get the char.
+	camn t2, rquote		; Is it the quote character?
+	 jrst [	subi q2, 1	;  Decrement char count.
+		addi q4, 1	;  Increment quote char count.
+		ildb t2, q1	;  Get the quoted character.
+		move t1, t2	;  Save the parity bit.
+		andi t1, ^o177	;  Save modulo 200 of the number.
+		camn t1, rquote	;  Is it the quote character?
+		 jrst .+1	;   Yes, don't convert it.
+		xori t2, ^o100	;  Make the char noncontrol.
+		jrst .+1]
+	idpb t2, q3		; Put it in the page.
+	skipn ebtflg		;[17] Eight bit mode?
+	 caige t2, ^o200	; Is the parity bit on?
+	 skipa			;[17]
+	 jrst [	move t3, rchr	;  If so, get the char count.
+		idivi t3, 5
+		skipn t4	;  Is this the last char in the word?
+		 jrst [	move t4, (q3) ;   If so, get its contents.
+			iori t4, 1 ;   Turn on bit 35.
+			movem t4, (q3)
+			jrst .+1]
+		jrst .+1]
+	movei t1, <mappag+1>*1000 ; Are we at the end yet?
+	caig t1, (q3)
+	 jrst [	movem t2, tmp	;  Save char we just put in the wrong place.
+		movx t1, <.fhslf,,mappag> ;  <our fork,,mapping page>
+		hrl t2, filjfn ;  <file JFN,, page #>
+		hrr t2, prepag
+		movx t3, pm%rd!pm%wr ;  Read and write.
+		PMAP%		;  Map it out.
+	 	 %jsker (Unable to map out file page,r) ;   Error close.
+		move t1, prepag	;  Get the present page number.
+		addi t1, 1	;  Increment it.
+		movem t1, prepag ;  Save the new number.
+		move q3, [point 7, mappag*1000]	;  Get a pointer to it.		
+		skipe ebtflg	;[17]  Eight bit access?
+		 move q3, [point 8, mappag*1000] ;[17]  Get a pointer to it.
+		move t2, tmp	;  Get back our char.
+		idpb t2, q3	;  Put it into the new page.
+		jrst .+1]
+	jrst ptchr2		; Loop.
+
+
+gtnfil:	move t1, ndxjfn		; Get the indexable JFN.
+	GNJFN%			; Get the next JFN.
+	 ret			;  No more files, so give up.
+	hrrm t1, ndxjfn		; Save the new JFN.
+	hrrm t1, filjfn		; Save the new JFN.
+	retskp
+
+;	Get an output file spec.
+;	AC1 - Pointer to a file name from the micro.
+;	AC2 - Number of characters.
+
+gofil:	saveac <q1>
+	move q1, t1		; Save the pointer to the file name.
+	skipe t1, filjfn	; Do we have a file yet?
+	 retskp			;  If so just return its JFN.
+	skipg t2		; Are there at least a few chars?
+	 jrst [	kermsg <Micro did not specify file name>
+		ret]
+	move t1, q1		; Get the file name pointer.
+	call filfix
+	movx t1, gj%sht!gj%fou	; Short form.
+	GTJFN%
+	 %jsker (Unable to get a JFN on the file,r)
+	retskp
+
+filfix:	move t3, [point 7, filbuf]
+filfx2:	ildb t2, t1		; Get the next char.
+	skipn t2		; The end?
+	 jrst [	idpb t2, t3	; Put the null in.
+		move t2, [point 7, filbuf] ; Return a pointer to the file.
+		ret]
+	caile t2, " "		; Space or less?
+	 cain t2, ^o177		;  Or a delete?
+	  jrst filfx2		;   If so skip it and move on.
+	cain t2, "."
+	 jrst filfx4
+	cail t2, "0"		; Test if it is legal.
+	 caile t2, "z"
+	  jrst filfx3
+	caige t2, "a"
+	 caig t2, "9"
+	  jrst filfx4
+	cail t2, "A"
+	 caile t2, "Z"
+	  jrst filfx3
+	jrst filfx4
+filfx3:	movei t4, ^o26		; If illegal get a control V.
+	idpb t4, t3		; Quote the illegal character.
+filfx4:	idpb t2, t3		; Put the character in.
+	jrst filfx2
+
+
+
+	subttl	Line routines
+
+inilin:	move t1, netjfn		; Get the line.
+	RFMOD%			; Get current mode for this line.
+	 %jserr (,r)
+	movem t2, oldmod	; Save the present mode.
+	movx t2, tt%mff+tt%tab+tt%lca+tt%dum+tt%pgm ; No conversion, half
+				; .. duplex, pause on end and no echo.
+	SFMOD%
+	 %jserr (,.+1)
+	STPAR%
+	 %jserr (,.+1)
+	ret
+
+reslin:	move t1, netjfn		; Get the line.
+	move t2, oldmod		; Get the previous mode.
+	SFMOD%
+	 %jserr (,.+1)
+	STPAR%
+	 %jserr (,.+1)
+	ret
+
+
+	subttl Packet routines
+
+; Send_Packet
+; This routine assembles a packet from the arguments given and sends it
+; to the micro.
+;
+; Expects the following:
+;	AC1 - Type of packet (D,Y,N,S,R,E,F,Z,T)
+;	AC2 - Packet sequence number
+;	AC3 - Number of data characters
+;	AC4 - Byte pointer to data characters
+; Returns: +1 on failure
+;	   +2 on success
+
+spack:	saveac <q1,q2,q3>
+	setz q2,		; Zero the checksum AC.
+	move q1, [point 8, sndpkt] ; Get a byte pointer to the send packet.
+	move q3, sthdr		; Get the start of header char.
+	idpb q3, q1		; Put in the packet.
+	move q3, spsiz		; Get the send packet size.
+	caml t3, [-3]		; Does the packet have some length?
+	 caile t3, -5(q3)	;  Is this packet small enough?
+	  jrst [ermsg <Invalid data field of message>
+		ret]
+	move q3, t3		; We need the count for later.
+	addi stot, 5(t3)	; Add the number of chars to grand total.
+	addi q3, " "+3		; Real packet character count made printable.
+	idpb q3, q1		; Put the count into the packet.
+	add q2, q3		; Add the count to the checksum.
+	skipl t2		; Is the sequence number valid? (0-64)?
+	 cail t2, ^o100
+	  jrst [ermsg <Invalid message sequence number>
+		ret]
+	addi t2, " "		; Add a space so the number is printable.
+	idpb t2, q1		; Put the sequence number into the packet.
+	add q2, t2		; Add the number to the checksum.
+	cail t1, "A"		; Check if the type is a capital letter.
+	 caile t1, "Z"
+	  jrst [ermsg <Illegal message type>
+		ret]
+	idpb t1, q1		; Put the type into the packet.
+	add q2, t1		; Add in the message type.
+	skipg t3		; Are there any chars of data?
+	 jrst spack3		;  No, finish up.
+spack2:	ildb t2, t4		; Get the next char.
+	idpb t2, q1		; Put it into the packet.
+	add q2, t2		; Add the char to the checksum.
+	subi t3, 1		; Decrement the char count.
+	skiple t3		; Are there any chars of data left?
+	 jrst spack2		;  Yes, go get another.
+spack3:	move t3, q2		; Save the character total.
+	andi q2, ^o300		; And out all but 2 bits.
+	lsh q2, -6		; Shift them to the far right.
+	add q2, t3		; Add in the original value.
+	ldb t2, [point 6, q2, 35] ; Get the modulo 64 of the char total.
+	addi t2, " "		; Add a space so the number is printable.
+	idpb t2, q1		; Put the checksum into the packet.
+	move t2, seolch		; Get the requested EOL char.
+	idpb t2, q1		; Add it to the packet.
+	setz t2,		; Get a null.
+	idpb t2, q1		; Put it at the end.
+	move t1, netjfn		; Output to the tty (micro).
+	move t2, [point 8, sndpkt] ; The address of the packet.
+	setzb t3, t4		; End on a null.
+	SOUT%			; Send the string.
+	 %jserr (Unable to output to the micro,r)
+	retskp
+
+
+; Receive_Packet
+; This routine waits for a packet to arrive from the micro.  It reads
+; characters until it finds a SOH.  It then reads the packet into recpkt.
+;
+; Returns:  +1 failure (if the checksum is wrong or the packet trashed)
+;	    +2 success with AC1:  message type
+;			    AC2:  message number
+;                           AC3:  length of data
+;			    AC4:  byte pointer to data
+
+rpack:	saveac <q1,q2,q3>
+	stkvar <type,num>
+	call timeit		; Time out if it takes too long.
+	move t1, netjfn		; Get the chars from the net.
+rpack0:	BIN%			; Get a character from the micro.
+	 %jserr(Error inputing character from micro,rperr)
+	addi rtot, 1		; Increment total count.
+	came t2, sthdr		; Is the char the start of header char?
+	 jrst rpack0		;  No, go until it is (or we are timed out).
+rpack1:	move q1, [point 8, recpkt] ; Get a pointer to the packet buffer.
+	idpb t2, q1		; Put the char into the packet.
+	BIN%			; Get the character count from the micro.
+	 %jserr(Error inputing character from micro,rperr)
+	addi rtot, 1		; Increment total count.
+	camn t2, sthdr		; Is the char the start of header char?
+	 jrst rpack1		;  Yes, then go start over.
+	idpb t2, q1		; Put the char into the packet.
+	move q2, t2		; Start the checksum.
+	subi t2, " "+3		; Get the real data count.
+	skipge t2		; Make sure the number makes sense.
+	 jrst [	ermsg <Bad character count
+>
+		jrst rperr]
+	move t3, t2		; Prepare it for returning.
+	BIN%			; Get the packet number from the micro.
+	 %jserr(Error inputing character from micro,rperr)
+	addi rtot, 1		; Increment total count.
+	camn t2, sthdr		; Is the char the start of header char?
+	 jrst rpack1		;  Yes, then go start over.
+	idpb t2, q1		; Put the char into the packet.
+	add q2, t2		; Add it to the checksum.
+	subi t2, " "		; Get the real packet number.
+	movem t2, num		; Save it for later.
+	BIN%
+	 %jserr(Error inputing character from micro,rperr)
+	addi rtot, 1		; Increment total count.
+	camn t2, sthdr		; Is the char the start of header char?
+	 jrst rpack1		;  Yes, then go start over.
+	idpb t2, q1		; Put the char into the packet.
+	add q2, t2		; Add it to the checksum.
+	movem t2, type		; Save the message type.
+	move q3, t3		; Get the number of data characters.
+	move t4, q1		; For returning the data pointer.
+	skipg q3		; Any data characters?
+	 jrst rpack3		;  If not go get the checksum.
+rpack2:	BIN%			; Get the next char.
+	 %jserr(Error inputing character from micro,rperr)
+	addi rtot, 1		; Increment total count.
+	camn t2, sthdr		; Is the char the start of header char?
+	 jrst rpack1		;  Yes, then go start over.
+	idpb t2, q1		; Put the char into the packet.
+	add q2, t2		; Add it to the checksum.
+	subi q3, 1		; Decrement the character count.
+	skiple q3		; Any data characters left?
+	 jrst rpack2		;  If so go get the next character.
+rpack3:	BIN%
+	 %jserr(Error inputing character from micro,rperr)
+	addi rtot, 1		; Increment total count.
+	camn t2, sthdr		; Is the char the start of header char?
+	 jrst rpack1		;  Yes, then go start over.
+	setz t1,
+	idpb t1, q1		; Put a null at the end.
+	move q3, q2		; Save the character total.
+	andi q2, ^o300		; And out all but 2 bits.
+	lsh q2, -6		; Shift them to the far right.
+	add q2, q3		; Add in the original value.
+	ldb q2, [point 6, q2, 35] ; Get the modulo 64 of the char total.
+	subi t2, " "		; Get the real received checksum.
+	came t2, q2		; Are they equal?
+	 jrst [	diamsg <Bad checksum:  should be >
+		addi q2, " "
+		move t2, q2
+		move t1, diajfn
+		BOUT%
+		diamsg <
+>
+		jrst rperr]
+	call timoff		; Turn the timer interupt off.
+	move t1, netjfn		; Get the tty JFN.
+	CFIBF%			; Clear the input buffers.
+	 erjmp .+1
+	move t1, type		; Get the type.
+	move t2, num		; Get the sequence number.
+	retskp
+
+rperr:	call timoff		; Cancel the time out.
+	move t1, netjfn		; Get the tty JFN.
+	CFIBF%			; Clear the input buffers.
+	 erjmp .+1
+	ret
+
+	Remark - Initialize the Priority Interrupt system.
+
+pinit:	movei t1, .FHSLF	; This fork.
+	move t2, [levtab,,chntab] ; Say where our tables are.
+	SIR%
+	EIR%			; Enable the interrupt system.
+	ret
+
+	Remark - Set timer.
+
+timeit:	movei t1, .FHSLF
+	movx t2, 1b0		; Turn on channel 0.
+	AIC%
+	move t1, [.fhslf,,.timel] ; Our process and time from now.
+	move t2, stimou		; Get the number of seconds to timeout.
+	imuli t2, ^d1000	; Make into milliseconds.
+	setz t3,		; Channel zero.
+	TIMER%
+	 jrst [	kermsg <Unable to set timer interupt>
+		ret]
+	pop p, t1		; Get the return address off the stack.
+	movem p, intstk		; Save the stack.
+	push p, t1		; Restore stack.
+	hrri t1, tmout		; Make the interupt PC point to tmout.
+	movem t1, intpc		; Save the PC.
+	ret
+
+	Remark - Turn off timer.
+
+timoff:	saveac <t1,t2>
+	move t1, [.fhslf,,.timbf]
+	move t2, [377777,,-1]	; Time way out in the boonies (won't
+				; clobber any runtime limit setting).
+	timer%
+	 jrst .+1		; Ignore errors.
+	movx t1, .FHSLF		; Turn off ^O trap.
+	movx t2, 1b0
+	DIC%			; Deactivate the channel.
+	ret
+
+	Remark - Time out trap.
+
+tmtrp:	push p, t1		; Get a work AC.
+	move t1, intpc		; Get the PC we want.
+	movem t1, pc1		; Restore as if we came from there.
+	pop p, t1
+	move p, intstk		; Restore the stack.
+	DEBRK%
+
+	Remark - Return time out packet.
+
+tmout:	diamsg <T>		;* Temporary.
+	movei t1, "T"		; Say we timed out on the packet.
+	move t2, pktnum		; Tell which packet num.
+	setzb t3, t4		; No data.
+	retskp
+
+
+	subttl SubBP - Subtract two arbitrary byte pointers
+
+;	 Subroutine to subtract two byte pointers.
+;	 The two byte pointers must point to bytes of the same size.
+;	
+;	 Call with:
+;	   t1/ First byte pointer.
+;	   t2/ Second byte pointer.
+;		Call SubBP
+;	
+;	 Returns:
+;	   +1 if the byte sizes are different, with
+;		t1-t3 unchanged, or else
+;	   +2 with:
+;	
+;	   t1/ Unchanged.
+;	   t2/ Unchanged.
+;	   t3/ The number of bytes of the specified
+;		bytesize in the string pointed to by the
+;		first byte pointer (in t1) up to, but 
+;		not including, the byte pointed to by
+;		the second byte pointer (in t2).
+;
+;	Thanks and compliments to Frank da Cruz
+
+subbp:	saveac	<q1,q2,q3,q4>	; Save permanent regs for work below.
+	ldb q1, [point 6, t1, 11] ; q1 := bytesize 1.
+	ldb q2, [point 6, t2, 11] ; q2 := bytesize 2.
+	came q1, q2		; Are they equal?
+	 ret			; No, failure
+
+	; Byte pointers are equal, it's OK to proceed.
+
+	movei q2, @t1		; Do address calculation for t1
+	movei q4, @t2		;  and t2.
+	sub q4, q2		; q4 := (A1 - A2) = N words.
+	movei q2, ^d36		; q2 := bits/word.
+	idiv q2, q1		; q2 := bytes/word.
+	imul q4, q2		; q4 := bytes in N words.
+	move q2, q4		; (to leave q3-q4 free for Idiv)
+	ldb q3, [point 6, t2, 5] ; q3 := Q2
+	ldb t3, [point 6, t1, 5] ; t3 := Q1
+	sub t3, q3		; t3 := (Q1 - Q2)
+	idiv t3, q1		; t3 := (Q1 - Q2) / S
+	add t3, q2		; Adjust previous count.
+	retskp			; And return, with success.
+
+;[20] Begin addition
+
+	subttl Interrupt routines.
+
+; More thanks to FdC.
+
+; Turn Control-C trap on.
+
+$ccn==2				; Number of ^C's to get out of ^C trap.
+
+ccon:	movei t1, .fhslf	; Read current capabilities.
+	RPCAP%
+	movem t3, capas		; Save them.
+	movei t1, $ccn 		; Initialize ^C count to this.
+	movem t1, ccn
+	move t1, p		; Save stack pointer of our caller.
+	sub t1, [1,,1]
+	movem t1, psave
+	movx t1, .fhslf		; Now, for this fork,
+	movx t2, 1b1		;  activate channel 1
+	AIC%
+	move t1, [.ticcc,,1]	;  for ^C.
+	ATI%
+	retskp
+
+; Turn Control-C trap off.
+
+ccoff:	setzm ccn		; Put ^C count back to 0.
+	movx t1, .fhslf		; This fork.
+	movx t2, 1b1		; Deactivate channel 1.
+	DIC%
+	RTIW%			; Fix up the interrupt mask
+	tlz t2, 040000		;  for ^C... (^C = ASCII 3 = bit 3)
+	STIW%			;  ...
+	move t3, capas		; Restore capabilities.
+	EPCAP%
+	 erjmp .+1
+	ret
+
+cctrap:	sosle ccn		; Count the ^C's.
+	 DEBRK%			; If they haven't typed enough, just resume.
+	move t1, [1b5+reslin]	; They typed enough; put clean-up line address
+	movem t1, pc1		;  in PC for level 1, 1b5 means user space.
+	hrroi t1, [asciz/^C
+/]
+	PSOUT%			; Echo the ^C.
+	move p, psave		; Make sure stack pointer is right.
+	setom f$exit		; Say we want to exit.
+	DEBRK%			; Resume at clean up line code.
+
+;[20] End addition
+
+
+	subttl	Comnd tables
+
+cmdtab:	%table
+	%key	<exit>, [xwd .exit,$exit]
+	%key	<help>, [xwd .help,$help]
+	%key	<quit>, [xwd .exit,$exit]
+	%key	<receive>, [xwd .recv,$recv]
+	%key	<s>, send, cm%inv+cm%abr
+send:	%key	<send>, [xwd .send,$send]
+	%key	<set>, [xwd .set,$set]
+	%key	<status>, [xwd .stat,$stat]
+	%tbend
+
+setabl:	%table
+	%key	<debugging>, [xwd .setdb,$setdb]
+	%key	<delay>, [xwd .setdl,$setdl]
+	%key	<file-byte-size>, [xwd .setf8,$setf8]	;[17]
+	%key	<ignore-parity>, [xwd .setip,$setip]	;[22]
+	%key	<line>, [xwd .setln,$setln]
+	%key	<receive>, [xwd .setrc,$setrs]
+	%key	<send>, [xwd .setsn,$setrs]
+	%tbend
+
+;[17] Begin addition
+
+sftab:	%table
+	%key	<eight-bit>, 1
+	%key	<seven-bit>, 0
+	%tbend
+
+;[17] End addition
+
+srtabl:	%table
+	%key	<end-of-line>, [xwd .seteo,reolch]
+	%key	<packet-length>, [xwd .setpk,rpsiz]
+	%key	<padchar>, [xwd .setpc,rpadch]
+	%key	<padding>, [xwd .setpd,rpadnm]
+	%key	<quote>, [xwd .setqu,rquote]
+	%key	<timeout>,[xwd .setim,rtimou]
+	%tbend
+
+sstabl:	%table
+	%key	<end-of-line>, [xwd .seteo,seolch]
+	%key	<packet-length>, [xwd .setpk,spsiz]
+	%key	<padchar>, [xwd .setpc,spadch]
+	%key	<padding>, [xwd .setpd,spadnm]
+	%key	<quote>, [xwd .setqu,squote]
+	%key	<timeout>,[xwd .setim,stimou]
+	%tbend
+
+dbgtab:	%table
+	%key	<off>, 0
+	%key	<on>, 1
+	%tbend
+
+	Remark	Pure storage
+
+LevTab:	pc1
+	pc2
+	pc3
+chnTab:	1,,tmtrp		; Timer trap on channel 0, priority 1.
+	1,,cctrap		;[20] ^C trap on channel 1, same priority.
+	repeat <^d34>,<0>	; Nothing on other channels.
+
+
+	subttl	Impure data storage
+
+CMDSTG				; Allocate COMND JSYS storage
+pdl:	block pdlsiz		;  and stack.
+pc1:	0			; Interrupt PC storage, levels 1,
+pc2:	0			;  2,
+pc3:	0			;  and 3.
+intpc:	z			; PC to restore on timer interupt.
+intstk:	z			; Stack pointer to restore on timer interupt.
+ccn:	z			;[20] Number of ^C's typed.
+psave:	z			;[20] Stack pointer for ^C interupt.
+capas:	z			;[20] Process capabilities.
+
+pars1:	z			; Data from first parse.
+pars2:	z			; Data from second parse.
+pars3:	z			; Data from third parse (flags to turn on).
+pars4:	z			; Data from fourth parse.
+jbdlm:	z			; Delimiter character for job command
+parsnm==.-pars1
+j0brm:	brini. 0,0,0,0
+	brkch. (1,177)		; Break on everything.
+	exp w0.,w1.,w2.,w3.
+f$exit:	z			; Exit flag.
+filjfn:	z			; File JFN.
+ndxjfn:	z			; Indexable JFN.
+diajfn:	z			; Where to send diagnostic messages.
+netjfn:	z			; Where to transmit the information.
+oldmod:	z			; Previous mode of the line.
+ttynum:	z			; Number of the TTY being used.
+errptr:	z			;[16] Storage for previous error.
+ebtflg:	0			;[17] One if file is to be used in 8-bit mode.
+igpar:	0			;[22] Ignore parity flag.
+mapflg:	0			;[23] One if a page is mapped in.  (Init to 0.)
+mapptr:	z			; Pointer into the page.
+filpag:	z			; Number of pages in the file.
+filbyt:	z			; Number of bytes in the file.
+filbsz:	z			; Byte size of file.
+prepag:	z			; Present page number.
+stdat:	z			; Time taken in transmitting.
+size:	z			; Size of the present data.
+spsiz:	dspsiz			; Maximum size packet to send.
+rpsiz:	drpsiz			; Maximum size packet to receive.
+stimou:	dstim			; Time out interval micro needs.
+rtimou:	drtim			; Time out interval I need.
+spadch:	dspad			; Pad char micro wants.
+rpadch:	drpad			; Pad char I want.
+spadnm:	dspadn			; Number of pad chars for micro.
+rpadnm:	drpadn			; Number for me.
+seolch:	dseol			; EOL char micro needs.
+reolch:	dreol			; EOL I need.
+squote:	dsquot			; Quote character micro wants.
+rquote:	drquot			; Quote character I want.
+delay:	ddelay			; How long before I send the first packet.
+sthdr:	SOH			; Start of header character.
+rtchr:	z			; Space for counting.
+stchr:	z			; Space for counting.
+numtry:	z			; Number of tries on a packet.
+oldtry:	z			; Number of tries for previous packet.
+maxtry:	dmxtry			; Maximum number of times to try.
+imxtry: dimxtr			; Maximum retries in send initiate.
+debug:	diasw			; If on print diagnostics.
+pktnum:	z			; Packet sequence number.
+eoflag:	z			; End of file flag.
+test:	0			; Test.
+test2:	0			; Test.
+filbuf:	block ^d20		; File name building buffer.
+buffer:	block maxpkt/4		; Buffer for file I/O.
+data:	block maxpkt/4		; Temp data storage.
+sndpkt:	byte (7) SOH,0		; Start with the start of header char.
+	block maxpkt/4
+recpkt:	byte (7) SOH,0		; Start with the start of header char.	
+	block maxpkt/4
+%%krbf:	asciz/                                                                                /		; Storage for error packet.
+
+
+	end	<3,,Kermit>
+
+  3@qt
