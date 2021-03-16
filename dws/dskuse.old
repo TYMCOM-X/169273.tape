@@ -1,0 +1,382 @@
+begin "DskUse - Report on Disk Usage by Directory & Author"
+
+require "(sailib)sail.def" source!file;
+
+define DEBUG = {true};
+
+
+! A hack to report on disk useage.
+!
+! Dave W. Smith,  September 27-28, 1982.
+;
+
+
+! Use the DUL scanning package ;
+
+require "(sailib)dul.req" source!file;
+! Constants
+;
+
+! CHANIO functions ;
+
+define	$CHUFD = '33, $CHLK = '4;
+
+! offsets into a lookup block ;
+
+define	$RBCNT = 0, $RBAUN = 1, $RBNAM = 2, $RBEXT = 3,
+	$RBAUT = '26, $RBALP = '33;
+! Globals for the MFD/UFD Scanning stuff.
+;
+
+integer	MFD!Chan, MFD!EOF,		! for scanning the MFD ;
+	UFD!Chan, UFD!EOF;		! for scanning UFDs ;
+
+integer ThisUFD;			! UFD being scanned ;
+integer ThisFileName, ThisFileExt;	! file being scanned ;
+
+safe integer array MFD!Blk1[ 0 : 7 ];	! for the chanio ;
+safe integer array MFD!Blk2[ 0 : 99 ];	! " " " ;
+integer MFD!Cnt, MFD!Idx;		! for looking at blk2 ;
+integer MFD!LastName, MFD!LastExt;	! for scanning ;
+
+safe integer array UFD!Blk1[ 0 : 7 ];	! for the chanio ;
+safe integer array UFD!Blk2[ 0 : 99 ];	! " " " ;
+integer UFD!Cnt, Ufd!Idx;		! for looking at blk2 ;
+integer UFD!LastName, UFD!LastExt;	! for scanning ;
+
+safe integer array LKB[ 0 : '34 ];
+integer File!Chan, File!EOF;		! for scanning files ;
+
+
+procedure SetupChannels;
+  begin
+    open( MFD!Chan := getchan, "DSK", '17, 0,0,512,0, MFD!EOF );
+    open( UFD!Chan := getchan, "DSK", '17, 0,0,512,0, UFD!EOF );
+    open( File!Chan:= getchan, "DSK", '17, 0,0,512,0, File!EOF );
+  end;
+
+require SetupChannels initialization;
+! Self-Organizing symbol table for tallying.
+!
+! Counts are tallied in 'AUN!Rec's.  These are kept chained out of
+! hash buckets (singly linked).  To access an AUN its record is first
+! moved (or created) at the head of the chain (to reduce probing).
+! These chains are eventually linked together (with the records
+! doubly linked) to be sorted for the report.
+;
+
+record!class AUN!Rec (
+  record!pointer ( AUN!Rec ) LLink, RLink;
+  integer AUN,
+	  FilesInUFD, PagesInUFD,
+	  FilesAuthored, PagesAuthored
+  );
+
+
+define HASH = 47;		! ** keep this prime ** ;
+
+safe record!pointer ( AUN!Rec ) array HashBucket[ 0 : HASH-1 ];
+
+
+procedure SetupTally;
+  begin
+    arrclr( HashBucket, null!record );
+  end;
+
+require SetupTally initialization;
+! Some userfriendliness...
+;
+
+integer Tic#;			! tic mark serial # ;
+
+
+procedure SetupTic;
+  begin
+    Tic# := 0;
+  end;
+
+require SetupTic initialization;
+
+
+procedure TicMark;
+  begin "tic"
+
+    if ( Tic# = 0 ) then
+      print( "
+	     Directories Processed
+
+        10        20        30        40        50
++---+----+----+----+----+----+----+----+----+----+" );
+
+    if (( Tic# mod 50 ) = 0 ) then print( crlf );
+    print( "I" );
+    Tic# := Tic# + 1;
+
+  end "tic";
+! Setup the MFD for scanning
+;
+
+procedure SetupMFD;
+  begin "setup the MFD"
+
+    lookup( MFD!Chan, "(UFD)'1000001.UFD", !Skip! );
+    if ( !Skip! ) then
+      usererr( 0,0,"? Lookup Failed for MFD, error "&cvos(!Skip!), "x" );
+
+    MFD!Blk1[ 0 ] := !XWD( -100, location( MFD!Blk2[ 0 ] ));
+    MFD!Blk1[ 1 ] := cvsix( "######" );
+    MFD!Blk1[ 2 ] := cvsix( "UFD" );
+
+    MFD!LastName := MFD!LastExt := 0;
+
+    MFD!Cnt := 0;
+
+  end "setup the MFD";
+! Return the next entry in the MFD.
+!
+! Sets ThisUFD.
+;
+
+boolean procedure ReadMFD;
+  begin "read MFD"
+
+    while ( true ) do
+      begin "loop until satisfied"
+
+	if ( MFD!Cnt > 0 ) then
+	  begin
+	    ThisUFD := MFD!Blk2[ MFD!Idx ];
+	    MFD!Idx := MFD!Idx + 2;
+	    MFD!Cnt := MFD!Cnt - 1;
+	    return( true );
+	  end;
+
+	MFD!Blk1[ 5 ] := MFD!LastName;
+	MFD!Blk1[ 6 ] := MFD!LastExt;
+
+	CHNIOR( MFD!Chan, MFD!Blk1[0], $CHUFD );
+	if ( not !Skip! ) then return( false );
+
+	MFD!LastName := MFD!Blk1[ 5 ];
+	MFD!LastExt := MFD!Blk1[ 6 ];
+	MFD!Cnt := MFD!Blk1[ 7 ];
+	MFD!Idx := 0;
+	
+      end "loop until satisfied";
+
+  end "read MFD";
+! Setup a UFD to be scanned
+;
+
+procedure SetupUFD;
+  begin "setup a UFD"
+    string S;
+
+    S := "(UFD)'" & cvos( ThisUFD ) & ".UFD";
+    lookup( UFD!Chan, S, !Skip! );
+    if ( !Skip! ) then
+      usererr( 0,0, "? Lookup Failed for "&S, "x" );
+
+    arrclr( UFD!Blk1 );
+    UFD!Blk1[ 0 ] := !XWD( -100, location( UFD!Blk2[ 0 ] ));
+    UFD!Blk1[ 1 ] := cvsix( "######" );
+    UFD!Blk1[ 2 ] := cvsix( "###" );
+
+    UFD!LastName := UFD!LastExt := 0;
+
+    UFD!Cnt := 0;
+
+  end "setup a UFD";
+! Return the next entry in the UFD
+!
+! Sets ThisFileName, ThisFileExt.
+;
+
+boolean procedure ReadUFD;
+  begin "read UFD"
+
+    while ( true ) do
+      begin "loop until satisfied"
+
+	if ( UFD!Cnt > 0 ) then
+	  begin
+	    ThisFileName := UFD!Blk2[ UFD!Idx ];
+	    ThisFileExt :=  UFD!Blk2[ UFD!Idx + 1 ] land '777777000000;
+	    UFD!Idx := UFD!Idx + 2;
+	    UFD!Cnt := UFD!Cnt - 1;
+	    return( true );
+	  end;
+
+	UFD!Blk1[ 5 ] := UFD!LastName;
+	UFD!Blk1[ 6 ] := UFD!LastExt;
+
+	CHNIOR( UFD!Chan, UFD!Blk1[0], $CHUFD );
+	if ( not !Skip! ) then return( false );
+
+	UFD!LastName := UFD!Blk1[ 5 ];
+	UFD!LastExt := UFD!Blk1[ 6 ];
+	UFD!Cnt := UFD!Blk1[ 7 ];
+	UFD!Idx := 0;
+	
+      end "loop until satisfied";
+
+  end "read UFD";
+! Do a long lookup on the current file.
+;
+
+procedure LongLookup;
+  begin "long lookup"
+
+    arrclr( LKB );
+
+    LKB[ $RBCNT ] := $RBALP;
+    LKB[ $RBAUN ] := ThisUFD;
+    LKB[ $RBNAM ] := ThisFileName;
+    LKB[ $RBEXT ] := ThisFileExt;
+
+    CHNIOR( File!Chan, LKB[ $RBCNT ], $CHLK );
+
+    if ( not !Skip! ) then
+      begin
+	print( "% Lookup error ", !rh( LKB[ $RBEXT ] ), " for " );
+	print( "(", CVUser( ThisUFD ), ")" );
+	print( cv6str( ThisFileName ), "." );
+	print( cv6str( ThisFileExt ), crlf );
+      end;
+    
+  end "long lookup";
+! Setup a record for tallying at the head of a list, and
+! return a pointer to it.
+;
+
+record!pointer ( AUN!Rec ) procedure SetupRecord( integer AUN );
+  begin "setup record"
+    integer B;
+    record!pointer ( AUN!Rec ) P, T;
+
+    B := AUN mod HASH;
+    P := HashBucket[ B ];
+
+    if ( P = null!record ) then
+      begin "create a new record"
+	HashBucket[ B ] := P := new!record( AUN!Rec );
+	AUN!Rec:AUN[ P ] := AUN;
+	return( P );
+      end "create a new record";
+
+    if ( AUN!Rec:AUN[ P ] = AUN ) then return( P );
+
+    ! O.K.  We're not at the head of the list, and may
+    ! not be there at all.  Start probing. ;
+
+    while ( true ) do
+      begin "scan the list"
+
+	T := P;
+	P := AUN!Rec:RLink[ P ];
+
+	if ( P = null!record ) then done "scan the list";
+
+	if ( AUN!Rec:AUN[ P ] = AUN ) then
+	  begin "move to the head of the list"
+	    AUN!Rec:RLink[ T ] := AUN!Rec:RLink[ P ];
+	    AUN!Rec:RLink[ P ] := HashBucket[ B ];
+	    HashBucket[ B ] := P;
+	    return( P );
+	  end "move to the head of the list";
+
+      end "scan the list";
+
+    ! Not in the list.  Create a new record ;
+
+    P := new!record( AUN!Rec );
+    AUN!Rec:AUN[ P ] := AUN;
+    AUN!Rec:RLink[ P ] := HashBucket[ B ];
+    HashBucket[ B ] := P;
+    return( P );
+
+  end "setup record";
+! Tally a file
+;
+
+procedure Tally;
+  begin "tally"
+    record!pointer ( AUN!Rec ) P;
+
+    P := SetupRecord( ThisUFD );
+
+    AUN!Rec:FilesInUFD[ P ] := AUN!Rec:FilesInUFD[ P ] + 1;
+    AUN!Rec:PagesInUFD[ P ] := AUN!Rec:PagesInUFD[ P ] + LKB[ $RBALP ];
+
+    if ( ThisUFD neq LKB[ $RBAUT ] ) then
+      P := SetupRecord( LKB[ $RBAUT ] );
+
+    AUN!Rec:FilesAuthored[ P ] := AUN!Rec:FilesAuthored[ P ] + 1;
+    AUN!Rec:PagesAuthored[ P ] := AUN!Rec:PagesAuthored[ P ] + LKB[ $RBALP ];
+
+  end "tally";
+! The report driver
+;
+
+procedure GenerateLogFile;
+  begin "logfile"
+    integer B, F1, F2;
+    record!pointer ( AUN!Rec ) P;
+    string S;
+
+    print( "Reporting to DSKUSE.LOG... " );
+    setprint( "DSKUSE.LOG", "F" );
+    getformat( F1, F2 );
+
+    for B := 0 upto HASH-1 do
+      begin "every bucket"
+
+	P := HashBucket[ B ];
+
+	while ( P neq null!record ) do
+	  begin "every record on list"
+
+	    print(( CVUser( AUN!Rec:AUN[ P ] )&"              " )[1 for 15]);
+	    setformat( 8, 0 );
+	    print( AUN!Rec:FilesInUFD[ P ],
+		   AUN!Rec:PagesInUFD[ P ],
+		   AUN!Rec:FilesAuthored[ P ],
+		   AUN!Rec:PagesAuthored[ P ], crlf );
+	    setformat( F1, F2 );
+
+	    P := AUN!Rec:RLink[ P ];
+	  end "every record on list";
+
+      end "every bucket";
+
+    setprint( NULL, "T" );
+    print( "Done", crlf );
+
+  end "logfile";
+! Top level, wherein all files in all directories are accounted for.
+;
+
+  SetupMFD;
+
+  while ( ReadMFD ) do
+    begin "every UFD"
+
+      SetupUFD;
+
+      while ( ReadUFD ) do
+	begin "every file in UFD"
+
+	  LongLookup;
+	  Tally;
+
+	end "every file in UFD";
+
+      TicMark;
+
+    end "every UFD";
+
+  GenerateLogFile;
+
+
+end "DskUse - Report on Disk Usage by Directory & Author";
+   
