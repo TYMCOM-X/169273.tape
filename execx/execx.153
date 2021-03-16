@@ -1,0 +1,1935 @@
+begin	"EXECX"
+
+require "EXECX.INF" source!file;
+
+Define EXECX!VERSION = (EXECX!!VER lsh 24) lor EXECX!!EDIT;
+require EXECX!VERSION version;
+
+require "
+
+EXECX %"&CVOS(EXECX!VERSION lsh -24)&"("&CVOS(EXECX!VERSION land '777777)&")"&
+     " - TYMCOM-X Periodic Processing Exec
+
+Assembly: Load @EXECX.CMD
+
+Sources:  EXECX.SAI                 Main program source file
+          EXECX.INF                 Main release information file
+          XEXEC.PAR                 Main parameter file
+	  XEXEC.REQ                 Global declaration file
+          SAIL.DEF                  General macro definition file
+          UUOSYM.DEF                System call definition file
+          JQUEUE.DEF                Job queue definition file
+
+Library:  XEXSUB.REQ [SAI] [REL]    Main support routines
+          JQUE.REQ   [SAI] [REL]    Job queue manipulation package
+          XEXPKG.REQ [SAI] [REL]    Miscellaneous support package
+          VMFILE.REQ [SAI] [REL]    VM input file mapping pacakge
+          DAYTIM.REQ [SAI] [REL]    Date time conversion package
+          XEXINT.REQ [SAI] [REL]    Interrupt package
+
+License:  ALL license bits!!!
+          WC RC SY OP GD TD ST JL AC XC HF RA WA
+
+" message;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(CARL)XEXEC.PAR"  source!file;
+require "(MPL)UUOSYM.DEF"  source!file;
+require "(CARL)JQUEUE.DEF" source!file;
+require "(CARL)XEXSUB.REQ" source!file;
+require "(CARL)XEXPKG.REQ" source!file;
+require "(CARL)JQUE.REQ"   source!file;
+require "(CARL)VMFILE.REQ" source!file;
+require "(CARL)DAYTIM.REQ" source!file;
+require "(CARL)XEXINT.REQ" source!file;
+
+require 10000 new!items,  pnames;
+
+!	Definitions
+;
+
+Define !gtRDV = '135, !gtRDI = '136, !gtRFN = '137;
+
+Define Rec(x) = { memory[ASlot+(x)] };	! record element ;
+Define Sleep!Time = !Xwd(1,3);		! sleep period between lines;
+Define Minute = 60;			! seconds in a minute ;
+
+Define DoIf(Flg,Top) = {
+    If (Flg) then for MyJob_ 1 upto (Top)
+     do if ( (Flg) land (1 lsh MyJob) )
+};
+
+Define Complete = {"completed"};! successful completion;
+Define Default!Ext = {".CTL"};	! default command file extension;
+Define Uppercase(x) = {Scan(x, B!Up, Dummy)};
+Define White(x) = {Scan(x, B!Wht, Brk)};
+
+Define !Job(x)     = { ( (x) land '7777 ) };
+Define Cvj(x)      = { cvs( !Job(x) ) };
+Define Gettab(x,y) = { calli( !xwd( (x), (y) ), calli!GETTAB ) };
+Define SetFlg(x)   = { x_ x lor MyBit };
+Define ClrFlg(x)   = { x_ x land NoBit };
+Define NewLic(x,y) = { ( ((x lor y) land '777717777700)  lor
+			 ((x land  '3) max (y land  '3)) lor
+			 ((x land '14) max (y land '14)) ) };
+
+Define DayStamp  = { cvSDat( !lh( GetTDT ) ) };		! day  only ;
+Define TimeStamp = { cvSTim( !rh( GetTDT ) ) };		! time only ;
+Define DateStamp = { TymDay( GetTDT ) };		! date-time ;
+
+!	Command macro definitions
+;
+
+Define KQ(x,y) = 		     {	Kequ(x,CvPS(y))
+    ifcr length( CvPS(y) ) > 3 thenc or Kequ(x,CvPS(y)[1 for 3]) endc
+	};
+
+
+Define AllCommands = {
+    XC(AFTER)
+    XC(BACKTO,    GOTO(CMD))
+    XC(BACK,      GOTO(CMD))
+    XC(CHECKPOINT,CHECKPOINT(CMD))
+    XC(CHKPNT,    CHECKPOINT(CMD))
+    XC(COM,       COM(CMD))
+    XC(CONTINUE)
+    XC(DEFINE,    REASSIGN(CMD))
+    XC(ESCAPE,    ESCAPE)
+    XC(FIND)
+    XC(GOTO,      GOTO(CMD))
+    XC(GO,        GOTO(CMD))
+    XC(IF)
+    XC(LOOK)
+    XC(LOGFILE)
+    XC(PAUSE,     PAUSE)
+    XC(PARAMETERS,PARAMETERS(CMD))
+    XC(QUIT,      QUIT)
+    XC(REMARK)
+    XC(RESTART,   RESTART(CMD))
+    XC(SEND,      SEND(CMD))
+    XC(STOP,      STOP)
+    XC(TIME,      TIME(CMD))
+    XC(UNLESS)
+    XC(WAIT)
+  };
+
+!	Variable definitions for outer block;
+
+Internal integer
+	MyBit			! always 1 lsh myjob ;
+,	MyJob			! current job slot ;
+,	NoBit			! always lnot 1 lsh myjob ;
+,	XEXJob			! processor job slot ;
+;
+
+boolean
+	ERR!, STOP!		! true when error occurrs or we stop;
+,	TRU!			! true when the tru limit is exceeded;
+,	OverTime		! true when time limit exceeded;
+,	NeedEscape		! true when waiting for command mode;
+,	NeedZap			! true when waiting for zapper on job;
+,	Quoted			! true if parameter is quoted [Get!Token];
+,	DoParam			! true if $Substitutions;
+,	DoNumerics		! true if $Numerics;
+,	DoLog			! true if $Logging;
+,	DoMail			! true if $Mail;
+;
+
+own integer 
+	Club			! club interlock variable ;
+,	Minutes			! how many minutes we've been here ;
+,	Seq			! current sequence number index;
+,	Status			! current status of active stream;
+;
+
+string	S, Disposition		! temp and completion variables;
+,	Error!Text		! reason for error;
+;
+
+!	Array definitions
+;
+
+  redefine CommandsLength = 0;
+  redefine seperatorcharacter = {,};
+  redefine XC(Text,Action) = {
+    ifcr length( Cvps( Text ) ) thenc
+      ifcr CommandsLength > 0 thenc seperatorcharacter endc
+      redefine CommandsLength = CommandsLength + 1;
+      Cvps( Text )
+    endc
+  };
+Preset!with AllCommands;
+Own safe string  array Commands[ 1 : CommandsLength ];
+
+Own safe integer array OChan  [ 0 : E!JobMax ];	! Logfile channel ;
+Own safe integer array PORT   [ 0 : E!JobMax ];	! port used for child i/o ;
+Own safe integer array Zone   [ 0 : E!JobMax ];	! time zone for child ;
+
+Own safe string  array Delim!list[0:E!JobMax ];	! stack of delimiter chars ;
+Own safe string  array Del!Chr[ 0 : E!JobMax ];	! delimiter character ;
+Own safe string  array Buffer [ 0 : E!JobMax ];	! additional lines ;
+Own safe string  array IChan  [ 0 : E!JobMax ];	! stack of nested input files ;
+Own safe string  array LineNo [ 0 : E!JobMax ];	! input  file line number ;
+
+Safe list array Par!!List[0:E!JobMax ];		! List of ordered parameters ;
+Safe list array Par!!Set[ 0:E!JobMax ];		! Lists of named parameters;
+Safe list itemvar array Par!List[ 0:E!JobMax ];	! List of Ordered parameters;
+Safe set  itemvar array Par!Set[ 0:E!JobMax ];	! Set of Named parameters;
+
+!	System variable definitions - currently defined
+;
+
+string	Item
+	$Daytime		! Current time-of-day;
+,	$Hour,$Minute,$Second	! Current time-of-day pieces;
+,	$HH,$SS			! Current time-of-day pieces;
+,	$HHMMSS,$HHMM,$MMSS	! Current time-of-day combinations;
+,	$Date			! Current date dd-mmm-yy;
+,	$Day,$Month,$Year	! Current day(dd),month(month),year(yyyy);
+,	$Mon			! Current month(mmm);
+,	$DD,$MM,$YY		! Current day(dd),month(mm),year(yy);
+,	$Weekday		! Day of week, Sunday---Saturday;
+,	$Yesterday,$Tomorrow	! Day of week, Sunday---Saturday;
+,	$Delimiter;		! Delimiter variable;
+
+boolean	Item
+	$False			! FALSE value;
+,	$Logging		! Logging variable;
+,	$Substitution		! Substitution variable;
+,	$Mail			! Mail variable;
+,	$Numerics		! Numeric results variable;
+,	$True;			! TRUE value;
+
+integer	Item
+	$TimeLimit		! Current Time Limit variable;
+,	$TruLimit;		! Current TRU limit variable;
+
+
+!	Support routines
+;
+
+Procedure Forget!substitutions;
+begin
+    String Itemvar SI;
+
+    If Length( Par!!List[MyJob] ) or Length( Par!!Set[MyJob] )
+     then Logit( QFet$Subs lor QFet$Items, "Stream #"&cvs(MyJob)&" Forget: " );
+
+    If Length( Par!!List[MyJob] )
+     then begin "zap list by 1"
+	Par!List[MyJob] _ Lop( Par!!List[MyJob] );
+	While Length( Datum(Par!List[MyJob]) )
+	 do begin "ordered"
+	    SI _ Lop( Datum(Par!List[MyJob]) );
+	    Logit( QFet$Subs lor QFet$Items, " ${"& Datum(SI) &"}" );
+	    Delete( SI );
+	 end "ordered";
+	Delete( Par!List[MyJob] );
+     end "zap list by 1";
+    If Length( Par!!Set[MyJob] )
+     then begin "zap set by 1"
+	Par!Set[MyJob] _ Lop( Par!!Set[MyJob] );
+	While Length( Datum(Par!Set[MyJob]) )
+	 do begin "named"
+	    SI _ Lop( Datum(Par!Set[MyJob]) );
+		begin
+		    String PN; Integer Dummy;
+		    PN _ Cvis( SI, dummy );
+		    If PN < " " then PN _ "<"&CVOS(LOP(PN))&">" & PN;
+		    Logit( QFet$Subs lor QFet$Items,
+			  " "& PN &"{"& Datum(SI) &"}"  );
+		end;
+	    Del!Pname( SI );
+	    Delete( SI );
+	 end "named";
+	Delete( Par!Set[MyJob] );
+     end "zap set by 1";
+
+end;
+
+
+simple procedure ClearFlags;
+begin "clear flags"
+
+    forLC Arg_ (ECF!,ZAP!,ORG!,LOS!,CHR!,ERR!,STOP!,TRU!,
+		OverTime,NeedZap,NeedEscape,
+		DoParam,DoNumerics,DoLog,DoMail)
+     doC { Arg_ Arg land NoBit; }	! and clear out these flags ;
+     endc
+
+end "clear flags";
+
+
+
+Simple Boolean Procedure ClearFrame;
+begin "clear frame"
+    own integer That;
+
+    If ( Port[ MyJob ] )		! if there is a port ;
+     then begin "zzzZap the port"
+
+	PrtDis( Port[ MyJob ] );	! clear interrupts and zzzZap! ;
+	calli( Port[ MyJob ], calli!ZAPCIR );
+
+     end "zzzZap the port";
+
+    if ( That_ QQF )			! anything here? ;
+     then begin "frame must die"
+
+	if not( calli( !Xwd(1,That), calli!EVICT ) )
+	 then calli( !Xwd(3,That), calli!HANG );
+
+	QQF_ 0;				! clear frame position ;
+
+	if not( QQ( Schedule ) )	! no scheduler?  Watch out! ;
+	 then QQ( Active )_ ( QQ( Active ) - 1 ) max 0;
+
+     end "frame must die";
+
+    ClearFlags;				! clear out all the job flags ;
+
+    while ( length( Par!!List[MyJob] ) or length( Par!!Set[MyJob] ) )
+     do Forget!Substitutions;		! clear out all item storage ;
+
+    return( false );			! give 'em what they came for ;
+
+end "clear frame";
+
+
+Simple procedure EXIT( String Msg(Null) );
+begin
+
+    EscDis;				! disable any interrrupts ;
+    NtqDis;				! for ESC, NTQ ;
+    SiaDis;				! and from frame ;
+
+    LogInfo( Msg );			! notify them we have gone ;
+
+    if ( InQue land que$Map )		! check for logoff flag ;
+     then begin "last minute things"
+
+	if ( XEXJob = !Job( QQ( Process ) ) and
+	     QQ( HaveP ) = Gettab( XEXJob,!gtUID ) )
+	 then QQ( HaveP )_ QQ( Process )_ 0;
+
+	ClearFeature( Shut );
+
+	QQ( Flags )_ QQ( Flags ) land
+		    lnot ( ( QF$Log lor QF$Act ) lsh 18 );
+
+     end "last minute things";
+
+    calli(queAct lsh -9, calli!CLBRLI);	! release interlock here ;
+    calli(queAct lsh -9, calli!CLBLEV);	! leave club on ACT page ;
+    ClsQue;
+
+    if not( !lh( Gettab(-1,!gtLIN) ) )	! if no terminal attached ;
+     then calli( 0, calli!LOGOFF )	!  then logout normally ;
+     else start!code uuo!EXIT end;	!  else just exit ;
+
+end;
+
+
+Simple Boolean procedure JobExit( Integer Msg(0) );
+begin
+
+    LogInfo( "Stream #"& cvs(MyJob) &
+	     " JobExit: "& cvos(Msg lsh -6) &","& cvos(Msg land '77) );
+    If ( MyJob )			! if working on a job ;
+     then begin "job exit"
+
+	ClearFrame;			! send the frame away ;
+	Dpb( Msg, PStap( QQS ) );	! after recording error code ;
+
+     end "job exit";
+
+    return( false );
+
+end;
+
+
+!	Initialization routines;
+
+simple procedure WhoShouldIBe;
+begin
+    LogWho( "Processor" );
+    XEXJob_ calli( 0,calli!PJOB );
+end;
+require WhoShouldIBe initialization;
+
+
+simple procedure LicenseCheck;
+begin
+    integer X;
+    Define LicNeeded = Ifcr PRELIMINARY thenc '775617 elsec '777617 endc ;
+
+    X_ !lh( Gettab( -1,!GTLIC ) );
+    if ( LicNeeded land ( lnot X ) )
+     then Exit( "Not enough license, Notify support group" );
+end;
+require LicenseCheck initialization;
+
+
+procedure ParIni;
+begin "parameter initialization"
+    integer X;
+
+    DoParam_ False;			! Insure no substitution;
+    For X_ 0 upto E!JobMax
+     do Delim!list[X]_ Del!Chr[X]_ "\";	! Default parameter escape;
+    Setbreak( B!Quote_Getbreak,		! Initial breaktable for the;
+		"\", null, "SINF");	!    parametization delimiter;
+    Arrclr( Par!!List );		! Empty channel/file list;
+    Arrclr( Par!!Set );			! Empty parameter set;
+end;
+require ParIni initialization;
+
+
+simple procedure Fatal(String Msg);
+begin
+
+    if ( OChan[MyJob] > 0 )		! Else put into log file ;
+     then VMText( OChan[MyJob], crlf & "?" & Msg &
+	(If LineNo[MyJob] > 0
+	  then " in line "&Cvs(LineNo[MyJob])
+	  else "" ) & crlf );
+
+    Error!Text _ Msg;
+    SetFlg( ERR! );
+end;
+
+
+procedure SetTimeLimit( Integer TimeLimit );
+begin
+    own safe integer array Limit[0:2];
+    define calli!DAYTIM = -'143;
+
+    if TimeLimit = 0
+     then Limit[0]_ 0
+     else begin "new limit"
+	Limit[0]_ Calli( '20,calli!DAYTIM ) + (60 * TimeLimit);
+	Limit[2]_ !xwd( '600020,'500020 );	! old=TYM-SEC,,new=TYM-UDT ;
+	calli( location(Limit[0]), calli!DATUUO );
+     end "new limit";
+
+    QQT_ Limit[0];
+
+end;
+
+
+procedure Set!Delimiter( String Character );
+begin
+    Del!Chr[MyJob] _ Character[1 for 1];	! one character wi<dth;
+    If Del!Chr[MyJob] = 0			! default to "\";
+     then Del!Chr[MyJob]_ "\";			! change the delimiter list;
+    Delim!list[MyJob]_Del!Chr[MyJob]&Delim!list[MyJob][2 to INF];
+    Breakset(B!Quote, Del!Chr[MyJob], "I");	! change the break table;
+  Logit( QFet$Subs," SetDelim("&Del!Chr[MyJob]&")["&Delim!list[MyJob]&"] ");
+end;
+
+
+simple procedure SYNC;
+begin					! synchronize with slave ;
+    auxclv(PORT[MyJob],0,!axSYB);	! send yellow ball ;
+    If ( 0 < QQR < GetTRU( QQF ) )	! passed TRU limit? ;
+     then SetFlg( TRU! );
+end;
+
+
+simple procedure OutPtr (integer PORT; string S);
+! ----------------------------------------------------------------------;
+!									;
+!	OutPtr		Routine to pass a string to the specified	;
+!			aux-port.  Sends a yellow ball after the	;
+!			string to coordinate handshaking with the	;
+!			port.						;
+!									;
+! ----------------------------------------------------------------------;
+begin "out pointer"
+    while ( length(S) )			! while something to do ;
+     do auxclv(PORT,lop(S),!axO8);	! send a character ;
+    SYNC;				! send yellow ball & synch ;
+end "out pointer";
+! begin!code	! could use this but it won't do image mode;
+!	MOVEI	1,!AXOPC;		! output SAIL string;
+!	HRL	1,PORT;
+!	AUXCAL	1,-1(SP);		! output through pointer;
+! end ;
+
+
+String Procedure BoolToStr( Boolean T );	! Boolean to String;
+Return( If T
+    then If ( DoNumerics land MyBit ) then "1" else "TRUE"
+    else If ( DoNumerics land MyBit ) then "0" else "FALSE"
+	);
+
+Boolean Procedure StrToBool( String S );	! String to Boolean;
+Return( Kequ(S,"1") or Kequ(S,"TRUE"[1 for length(S)]) );
+
+
+procedure RW!Item( String Itemvar W,R; Reference Boolean B);
+begin
+    If ( R neq any )
+     then B_ StrToBool( Datum(R) );	! Set from source if there;
+    If ( W neq any )
+     then Datum(W)_ BoolToStr( B );	! Return to dest if there;
+    Logit( QFet$Items, "RW!I " &
+		(If R neq any then " R(" & Datum(R) & ")" else "") &
+		(If W neq any then " W(" & Datum(W) & ")" else "")  );
+end;
+
+
+procedure RW!MyItem( String Itemvar W,R; Reference Boolean B);
+begin
+    If ( R neq any )
+     then begin "source"		! Set from source if there;
+	B_ B land NoBit;		! clear bit first then ?set;
+	B_ B lor  (StrToBool( Datum(R) ) lsh MyJob);
+     end "source";
+    If ( W neq any )			! Return to dest if there;
+     then Datum(W)_ BoolToStr( B land MyBit );
+    Logit( QFet$Items, "RW!MyI " &
+		(If R neq any then " R(" & Datum(R) & ")" else "") &
+		(If W neq any then " W(" & Datum(W) & ")" else "")  );
+end;
+
+
+procedure Date$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 0, Zone[ MyJob ] );
+
+procedure Day$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 1, Zone[ MyJob ] );
+
+procedure Daytime$( String Itemvar W, R);	! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	Timer( HH, MM, SS, Zone[ MyJob ] );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(HH) & ":" & CvS(MM) & ":" & Cvs(SS);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure Delimiter$(String Itemvar W, R);
+Begin
+    If R neq any then Set!Delimiter(Datum(R));	! change the delimiter;
+    If W neq any then Datum(W)_ Del!Chr[MyJob];	! return the current setting;
+end;
+
+procedure False$( String Itemvar W, R);
+RW!Item( W, any, FALSE);			! return FALSE;
+
+procedure Hour$( String Itemvar W, R);		! Read-only * Time of day;
+begin
+    Integer HH,MM,SS;
+    If W neq any then begin
+	Timer( HH, MM, SS, Zone[ MyJob ] );
+	Datum(W) _ CvS(HH);
+    end;
+end;
+
+procedure HH$( String Itemvar W, R);		! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	Timer( HH, MM, SS, Zone[ MyJob ] );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(HH);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure HHMM$( String Itemvar W, R);		! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	Timer( HH, MM, SS, Zone[ MyJob ] );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(HH) & CvS(MM);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure HHMMSS$( String Itemvar W, R);	! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	Timer( HH, MM, SS, Zone[ MyJob ] );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(HH) & CvS(MM) & Cvs(SS);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure Logging$( String Itemvar W, R);
+If ( LPLog( QQA ) )				! log file output state;
+ then RW!MyItem( W, R, DoLog )			! if LogFile R|W;
+ else RW!MyItem( W, any, DoLog );		! if not LogFile R-only;
+
+procedure Mail$( String Itemvar W, R);
+RW!MyItem( W, R, DoMail );			! sending mail;
+
+procedure Minute$( String Itemvar W, R);	! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	Timer( HH, MM, SS, Zone[ MyJob ] );
+	Datum(W) _ CvS(MM);
+    end;
+end;
+
+procedure MMSS$( String Itemvar W, R);		! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	Timer( HH, MM, SS, Zone[ MyJob ] );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum(W) _ CvS(MM) & Cvs(SS);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure MM$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 7, Zone[ MyJob ] );
+procedure Mon$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 2, Zone[ MyJob ] )[1 for 3];
+procedure Month$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 2, Zone[ MyJob ] );
+
+procedure Numerics$( String Itemvar W, R);
+RW!MyItem( W, R, DoNumerics );			! boolean representation;
+
+procedure Second$( String Itemvar W, R);	! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	Timer( HH, MM, SS, Zone[ MyJob ] );
+	Datum(W) _ CvS(SS);
+    end;
+end;
+
+procedure SS$( String Itemvar W, R);		! Read-only * Time of day;
+begin
+    Integer T,D,HH,MM,SS;
+    If W neq any then begin
+	Timer( HH, MM, SS, Zone[ MyJob ] );
+	Getformat(T,D); SetFormat(-2,0);
+	Datum Cvs(SS);
+	SetFormat(T,D);
+    end;
+end;
+
+procedure Substitution$( String Itemvar W, R);
+RW!MyItem( W, R, DoParam );			! parameter substitution;
+
+procedure TimeLimit$(String Itemvar W, R);
+begin
+    own safe integer array Limit[0:2];
+
+    if ( R neq any )
+     then SetTimeLimit( Cvd(Datum(R)) );
+
+    if ( W neq any )
+     then begin "read limit"
+
+	if not( Limit[0]_ QQT )			! any limit? ;
+	 then begin "non zero"
+	    Limit[0]_ Limit[0] - GetTDT;	! difference in time ;
+	    if ( Limit[0] > 0 )
+	     then begin "good limit"		! TYM-UDT => TYM-SEC ;
+		Limit[2]_ !xwd( '500020,'600020 );
+		calli( location(Limit[0]), calli!DATUUO );
+		Limit[0]_ Limit[0] div 60;	! convert to minutes ;
+	     end "good limit"
+	     else Limit[0]_ -1;			! past due = -1 ;
+	 end "non zero";
+	Datum( W )_ CvS( Limit[0] );
+
+     end "read limit";
+
+end;
+
+procedure True$( String Itemvar W, R);
+RW!Item( W, any, TRUE);				! return TRUE;
+
+procedure Trulimit$( String Itemvar W, R);
+begin
+    If R neq any then QQR_ If Cvd( Datum(R) ) = 0
+			    then 0
+			    else GetTru( QQF ) + Cvd( Datum(R) );
+    If W neq any then Datum( W )_ Cvs( If QQR = 0
+				        then 0
+				        else QQR - GetTru( QQF ) );
+end;
+
+procedure Tomorrow$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 5, Zone[ MyJob ] );
+procedure Weekday$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 4, Zone[ MyJob ] );
+procedure Yesterday$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 6, Zone[ MyJob ] );
+
+procedure Year$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 3, Zone[ MyJob ] );
+procedure YY$( String Itemvar W, R);
+If W neq any then Datum( W ) _ DatStr( 3, Zone[ MyJob ] )[3 for 2];
+
+
+procedure ItemIni;			! Alphabetical;
+begin "procedure item initialization"
+    Assign( $Date,       Date$);	! Current Date;
+    Assign( $Day,        Day$);		! Current Day of Month;
+    Assign( $Daytime,    Daytime$);	! Current Time of day;
+    Assign( $DD,         Day$);		! Current Day of Month;
+    Assign( $Delimiter,  Delimiter$);	! Delimiter value;
+    Assign( $False,      False$);	! FALSE;
+    Assign( $HH,         HH$);		! Current Hour of day 00-23;
+    Assign( $HHMM,       HHMM$);	! Current Hour-minutes hhmm;
+    Assign( $HHMMSS,     HHMMSS$);	! Current Hour-minutes-seconds;
+    Assign( $Hour,       Hour$);	! Current Hour of day 0-23;
+    Assign( $Logging,    Logging$);	! If logging to file;
+    Assign( $Mail,       Mail$);	! If mail wanted at end;
+    Assign( $Minute,     Minute$);	! Current Minutes of hour;
+    Assign( $Mon,        Mon$);		! Current Month as Mmm;
+    Assign( $Month,      Month$);	! Current Month of year;
+    Assign( $MM,         MM$);		! Current Month as numeric;
+    Assign( $MMSS,       MMSS$);	! Current Minutes-seconds;
+    Assign( $Numerics,   Numerics$);	! If booleans are 1/0 or TRUE/FALSE;
+    Assign( $Second,     Second$);	! Current seconds of minute;
+    Assign( $SS,         SS$);		! Current seconds of minute SS;
+    Assign($Substitution,Substitution$);! If parameter substitutions on;
+    Assign( $Timelimit,  Timelimit$);	! Time-limit remaining (Minutes);
+    Assign( $True,       True$);	! TRUE;
+    Assign( $Trulimit,   Trulimit$);	! TRU-limit remaining (TRUs);
+    Assign( $Weekday,    Weekday$);	! Day of Week;
+    Assign( $Year,       Year$);	! Current Year;
+    Assign( $YY,         YY$);		! Current Year as two digits;
+end;
+require ItemIni initialization;
+
+procedure MOV ( itemvar DST,SRC );
+begin
+    string item TMP;
+    own string itemvar SI;
+    own real itemvar RI;
+    own integer itemvar II;
+    own integer BRK;
+Logit( QFet$Items,
+    "Mov: SRC["&cvs(typeit(SRC))&"] ==> DST["&cvs(typeit(dst))&"] " );
+
+    case typeit(SRC) of begin		! Convert ??? to string;
+	[3] "string   " datum(TMP)_ datum(SI_SRC);
+	[4] "real     " datum(TMP)_ cvf(datum(RI_SRC));
+	[5] "integer  " datum(TMP)_ cvs(datum(II_SRC));
+	[8] "procedure" apply( datum(SRC), arg!list(TMP,any) );
+	else Fatal( "System error: "& typeit(SRC)
+		    &" ?MOV: can't coerce SRC type " )
+    end;
+    case typeit(DST) of begin		! Convert string to ???;
+	[3] "string   " datum(SI_DST)_ datum(TMP);
+	[4] "real     " datum(RI_DST)_ realscan(datum(TMP),BRK);
+	[5] "integer  " datum(II_DST)_ intscan(datum(TMP),BRK);
+	[8] "procedure" apply( datum(DST), arg!list(any,TMP) );
+	else Fatal( "System error: "& typeit(DST)
+		    &" ?MOV: can't coerce DST type " )
+    end;
+end;
+
+String procedure Substitute(Integer Chan; String Key);
+begin
+    String Item SITM;    String Itemvar SI;    Boolean Not!Defined;
+    Integer Dummy;		! used in UPPERCASE macro ;
+
+    Key _ Uppercase(Key);			! make sure this works;
+    If Key neq "$" then Key _ Chan & Key;	! user keyword? ;
+    SI _ Cvsi(Key, Not!Defined);		! lookup variable;
+    If Not!Defined then Return( Null );		! return null if undefined;
+    MOV( SITM, SI );				! convert ITM _ SI;
+    Return( Datum(SITM) );			! return string;
+end;
+
+simple string procedure Get!Token( Reference string Par!Lst );
+begin "get a parameter"
+    String S, Old!Brk;
+    Integer InQuote, Save!Brk;
+
+    White( Par!Lst );					! Clear whitespace;
+    Quoted _ False;					! Initialize flag;
+    S _ Scan(Par!Lst, B!Sub, Brk);			! Get Token;
+    If Brk = '177 or Brk = '42 or BRK = "'"
+      then begin "in quote"				! We found a quote;
+        Quoted _ InQuote _ True;    Save!Brk _ Brk;	! For matching pair;
+	If Length(S) then begin				! not allowed yet;
+	    Fatal("parameter text """&S&""" discarded");
+	    S _ null;
+	end;
+	Old!Brk _ null;					! Start anew;
+	While InQuote do begin "Matching quote"		! Match quotes! ;
+	    S _ S & Old!Brk & Scan(Par!Lst, B!Sub, Brk);! Ignore other breaks;
+	    If Brk = '42 and Save!Brk = '42 or		! Check for pairs;
+	       Brk = "'" and Save!Brk = "'" or		!    of each type;
+	       Brk = '177 and Save!Brk = '177		!    "for child";
+		then If Brk = Par!Lst			! Match! Double?;
+		    then begin "quote quote"		!  Yes - handle "";
+			Old!Brk _ Null;			!   Clear break!char;
+			S _ S & Lop(Par!Lst);		!   Add to string;
+		    end "quote quote"			!  Continue;
+		    else begin "done quote"		!  Not double - ;
+			InQuote _ False;		! Set we are done;
+			White( Par!Lst );		! Clear Whitespace;
+			Scan(Par!Lst, B!Sub, Brk);	! Eat to next break*;
+		    end "done quote"
+		else Old!Brk _ If Brk = 0 then Null else Null & Brk;
+	    If length(Par!Lst) = 0 then Done;		! If missing quote?;
+	end "Matching quote";
+      end "in quote";
+
+
+!
+  * --	It would be nice at this point to allow some kind of combination
+	or other parameter tricks.  However... not so decided...  (YET)
+;
+    If Brk = "/" then Par!Lst _ "/" & Par!Lst;		! restore "/";
+    If Brk = " " or Brk = #ht then begin
+	White( Par!Lst );				! Clear whitespace;
+	If Brk = "=" or Brk = ","			! Eat certain breaks;
+	    then Brk _ Lop( Par!Lst );			!  so things work;
+    end;
+    Return(If Length( S ) then S else null);		! Return something;
+end "get a parameter";
+
+Procedure New!Parameter(Integer Chan; String Name, Initial!Value, New!Value);
+begin
+    String Itemvar SI;
+    String Item ITM;
+    Own Boolean Not!Defined;
+    Integer Dummy;			! used in UPPERCASE macro ;
+
+    Name _ Uppercase(Name);				! Force upper-case;
+    If Name neq "$" then Name _ Chan & Name;		! Maybe add channel;
+    Logit( QFet$Items,
+	"NewP: "&Name&" ("&initial!value&") N("&New!value&")" );
+
+    SI _ Cvsi( Name, Not!Defined);			! See if PNAME exists;
+    If Not!Defined then begin				! No, then;
+	If Name = "$" then begin "don't allow $ vars"	!   if system var?;
+	    Fatal("Illegal variable name """&Name&"""");!   illegal not found;
+	    Return;					!     so bug out.;
+	end;						!   else;
+	New!Pname(SI _ New(Initial!Value), Name);	!     define it;
+	Par!Set[MyJob] _ Lop(Par!!Set[MyJob]);		! Get current set;
+	Put SI in Datum( Par!Set[MyJob] );		! Put new item in set;
+	Put Par!Set[MyJob] in Par!!Set[MyJob] before 1;	! Put set away;
+    end;
+    If length(New!Value) then begin			! If something there;
+	Datum( ITM ) _ New!Value;			!   store as string;
+	MOV( SI, ITM );					!   mov SI _ ITM;
+    end;
+    Logit( QFet$Items,
+	" Pname[ "& Cvis( SI, Not!defined ) &" ]" );
+end;
+
+
+simple procedure Set!Parameter(Reference string Par!Lst);
+begin "build substitution table"
+    String Par!,Name;    String Itemvar SI;
+    Integer Par!Index;   Boolean Named!Parameters;
+
+    Par!Set[MyJob]  _ New(Phi);				! Empty set;
+    Put Par!Set[MyJob] in Par!!Set[MyJob] before 1;	! First item in list;
+    Par!List[MyJob] _ New(Nil);				! Empty list;
+    Named!Parameters _ False;				! None at first;
+    While Length(Par!Lst)
+     do begin "reading parameters"
+	Name _ null;					! Clear name;
+	Par! _ Get!Token( Par!Lst );			! Read a parameter;
+	If Brk = "=" then begin "named parameters"	! Assignment!;
+	    If Quoted then				! To a string?;
+		Fatal("Assignment to string """&Par!&"""");
+	    Named!Parameters _ True;			!   Set flag;
+	    Name _ Scan( Par!, B!Par, Brk );		!   Set name;
+	    If Length(Par!) then begin			!   Error if non-null;
+		Fatal("Illegal character """&Brk&	!     print message;
+			""" in parameter");
+		Name _ null;				!     clear name;
+	    end;
+	    Par! _ Get!Token( Par!Lst );		!   Set parameter;
+	end "named parameters";
+
+Logit( QFet$Items,
+    "List: {"&Name&"}={"&Par!&"}" &
+    cvs(Length(name))&":"&cvs(Length(par!)) );
+
+	If ( Length( Name ) ) then begin		! Named parameter;
+	    SetFlg( DoParam );				! Set flag true;
+	    New!Parameter(IChan[MyJob],Name,Null,Par!)	! Create parameter;
+	  end
+	  else begin					! Ordered parameter;
+	    If ( Named!parameters ) then Fatal(		!   ** ERROR **;
+	     "Ordered parameter after Named parameter ignored: """&Par!&"""")
+	    else begin
+		SetFlg( DoParam );			! Set flag true;
+		SI _ New( Par! );			!   create item;
+		Put SI in Datum(Par!List[MyJob]) after INF;  ! Put into list;
+	    end;
+	end;
+    end "reading parameters";
+    Put Par!List[MyJob] in Par!!List[MyJob] before 1;	! First item in list;
+end "build substitution table";
+
+
+String procedure parametize(Value String S);
+begin "parameter substitution"
+    String L, Key;    Integer Par!Chr;
+
+    Logit( QFet$Subs, "R("&cvs(MyJob)&"): "& S );
+
+    L _ Null;					! Newline;
+    While ( Length(S) )				! While we have a string ;
+     do begin "have string"
+      L_ L & Scan(S, B!Quote, Brk);		! Scan for a parameter;
+      If ( Brk = Del!Chr[MyJob] )		! Null?;
+       then begin "got one"
+	Par!Chr_ Lop(S);			! Get next char;
+	If ( Par!Chr = Del!Chr[MyJob] )		! Do we have quote quote?;
+	  then L_ L & Par!chr			!  Yes, use a quote here;
+	  else begin				!  No. ;
+	    Key_ Par!Chr & Scan(S,B!Par,Brk);	!   Read keyword;
+	    If ( Brk = Del!Chr[MyJob] )		! If followed by quote;
+	     then Par!Chr_ Lop(S);		!   eat the quote;
+	    L_L & Substitute(IChan[MyJob],Key);	!   Perform substitution;
+	    Logit( QFet$Subs, "Par: Key("& key &") <= """ &
+		    Substitute(IChan[MyJob],key) &"""" );
+	  end;
+      end "got one";				! Done parameter;
+    end "have string";				! Done Line;
+    Logit( QFet$Subs, "P("&cvs(MyJob)&"): "& L );
+    Return (L);					! So, Return it;
+End;
+	
+
+!	Command checking code
+;
+
+redefine XC(Text,Action) = { or Kq(KW,Text) };    
+
+
+simple boolean procedure MyCommand(String KW);
+Return( BRK = "=" or length( KW ) = 0 ! or ; AllCommands );
+
+
+simple boolean procedure ChkCommand( String Str );
+begin "check command"
+    String S, KW;
+    Boolean Eof;
+
+    if ( Str = "." or Str = "-" or Str = "@" )
+     then lop( Str );			! remove leading character ;
+
+    S_ Tok( Str );			! get a small parcel ;
+
+    If ( Brk = ":" )
+     then return( true );		! seems to be a label ;
+
+    If ( Brk = "=" )
+     then return( true );		! seems to be a definition ;
+
+    return( MyCommand( S ) );		! some "known" command? ;
+
+end "check command";
+
+
+Simple boolean procedure SPROUT( Boolean NeedPort; Integer Cradle );
+begin
+    Own integer MyPort, APort;
+    Own Safe Integer Array Pty[0:1];
+
+    if ( NeedPort )			! does this job require a port ;
+     then begin "need a port"		! yes, so setup a PTY-pair ;
+
+	APort _ calli(0,calli!CREPTY);	! create the PTYs ;
+	if not( !SKIP! )		! failed? ;
+	 then return( false );		! then go home ;
+
+	Port[MyJob]_MyPort_ !lh(APort);	! my pty port to remember ;
+
+     end "need a port";
+
+    If ( QQF_ CChild( Cradle ) )	! create a frame;
+     then QQU_ Gettab( QQF,!gtUID )	! remember name;
+     else return( false );		! else go home ;
+
+    if ( NeedPort )
+     then begin "transfer port"
+
+	auxcli(MyPort,'214,!axCFS);	! we are in image no echo;
+	auxclv(MyPort,1,!axSOX);	! expand tabs for output ;
+
+	Pty[0]_ !Xwd( -1,QQF );		! from self to child ;
+	Pty[1]_ !Xwd( '200000,APort );	!  using this port ;
+	calli( location(Pty[0]), calli!RETACH );
+
+	if not( !SKIP! )		! can't attach port? ;
+	 then return( false );		! go home ;
+
+	PrtEnb( MyPort );		! enable interrupts on port ;
+
+     end "transfer port";
+
+    return( true );
+
+end;
+
+simple boolean procedure FrontEnd;
+begin "FrontEnd"
+    own safe integer array RunBlock[0:5];
+    own safe integer Array F[1:6];
+    integer C, Chan, PBP, RunFlag, MakeLog, ASlot;
+    string Name, Cmd, Log, S, TempFile;
+
+    ASlot_ QueAct + E!Length * (MyJob - 1);
+    ClearFlags;					! clear all flag bits ;
+
+    Zone[ MyJob ]_ Ldb( Point( 6,memory[ASlot+E!Privs],7 ) );
+    Cmd_ InfNam( ASlot+E!CmdFile );
+
+!	setup input file
+;
+    IChan[MyJob]_ VMFile( Cmd, VM$Read );	! open input file. ;
+    if ( IChan[MyJob] leq 0 )			! if not available ;
+     then begin "no input file"
+	Dpb( !rh(IChan[MyJob]), APFErr(ASlot) );
+	LogInfo( "Stream #"& cvs(MyJob) &" no input file ("&
+		 cvos(!rh(IChan[MyJob])) &") "& Cmd );
+	return( JobExit( Abort$Input ) );
+     end "no input file";
+
+    If ( RunFlag_ LAPRunF( ASlot ) )		! if RUN program  ;
+     then VMFree( Lop( IChan[MyJob] ) );	!  close file now ;
+
+!	Create frame & determine if PTY needed here.
+;
+    if ( LPProc( QQS ) leq PSS$Frame )
+     then If not( Sprout( LAPDetF(ASlot) = 0, ASlot+E!Runtime ) )
+	   then if ( !rh(!skip!) < 2 )		! waiting for frame? ;
+		 then dpb( PSS$Frame,PProc( QQS ) )
+		 else return( JobExit( Abort$Frame ) );
+
+!	Handle parameters here.  Note: Do this even if no parameters. ;
+
+    S_ null;
+    If ( Rec( E!Parameters ) )		! some parameters ;
+     then begin "build line"
+	PBP_ point( 7,Rec(E!Parameters),-1 );
+	For Count_ 1 upto E!ParLength
+	 do if ( C_ ILdb(PBP) )
+	     then S_ S & C;
+	Logit( QFet$Pars, "Parameters: "& S );
+     end "build line";
+
+    Set!Parameter(S);			! scan thru EOL;
+
+    If ( MakeLog_ LAPLog( ASlot ) )	! If log file wanted ;
+     then SetFlg( DoLog );		!  then set flag ;
+
+    Log_ InfNam( ASlot+E!LogFile );
+
+
+!	open LOG file
+;
+    if ( DoLog land MyBit )				! making a log file? ;
+     then begin "get log file"
+
+	If ( JL$Append leq MakeLog leq JL$Supersede )	! if logging ;
+	 then begin "open LogFile"			!  setup file ;
+
+	    If ( MakeLog = JL$Supersede )		! if supercede? ;
+	     then begin "supercede"
+		Chan_ VMFile( Log, VM$Write );		! $Write (re-open) ;
+		If ( Chan > 0 )				! if no errors ;
+		 then VMFree( Chan )			!  close it! (done) ;
+		 else begin "enter error"		!  write failure? ;
+		    LogInfo( "Stream #"& cvs(MyJob) &" file enter error ("&
+			 cvos(!rh(Log)) &") "& Cmd );
+		    Dpb( !rh(Chan), APFErr(ASlot) );
+		    return( JobExit( Abort$Enter ) );
+		 end "enter error";
+	     end "supercede";
+
+	    Chan_ VMFile( Log,
+		    (if MakeLog = JL$Append then VM$Append else 0)
+		    lor VM$Update );			! $Update ;
+	    if ( Chan leq 0 )				! all ok? ;
+	     then begin "update error"			! failure ;
+		LogInfo( "Stream #"& cvs(MyJob) &" file append error ("&
+		     cvos(!rh(Log)) &") "& Cmd );
+		Dpb( !rh(Chan), APFErr(ASlot) );
+		return( JobExit( Abort$Update ) );
+	     end "update error";
+
+	 end "open LogFile"
+	 else begin "spool LogFile"
+	    ! not implemented in the monitor;	! ** Future LPT: ** ;
+	 end "spool LogFile";
+
+	OChan[ MyJob ]_ Chan;		! store proper output channel ;
+
+    end "get log file";
+
+    if ( LAPMail( ASlot ) )		! if any Mail action ;
+     then SetFlg( DoMail );		!  then set flag ;
+
+    SetTimeLimit( LAPTimL( ASlot ) );	! timeout in minutes;
+    SetFlg( DoNumerics );		! Default NUMERICS=$TRUE ;
+    Buffer[ MyJob ]_ Null;		! clear type-ahead msg buffer ;
+
+    If ( LAPRunF( ASlot ) )		! if RUN program  ;
+     then begin "run job"		!  then do it.    ;
+
+	RunBlock[0]_ if ( LAPCclF( ASlot ) or	! CCL specified? ;
+			  LAPTmpF( ASlot ) or	! TMP or parameters? ;
+			  memory[ ASlot+E!Parameters ] )
+		      then !Xwd( 1,5 ) else 5;	! setup run offset+count ;
+	RunBlock[1]_ memory[ ASlot+E!CmdFile+F!Device ];
+	RunBlock[2]_ ASlot+E!CmdFile+F!User;
+	RunBlock[3]_ memory[ ASlot+E!CmdFile+F!Name ];
+	Runblock[4]_ memory[ ASlot+E!CmdFile+F!Ext ] land (-1 lsh 18);
+
+	if ( !lh( RunBlock[0] ) )		! CCL entry expected? ;
+	 then begin "write TMP file"		! create temp file ;
+	    TempFile_ cvs(1000+!job( QQF ))[inf-2 to inf] &
+		      (if ( LAPTmpF(ASlot) )
+		        then cv6str( LAPTmpF(ASlot) lsh 18 )
+			else cv6str( RunBlock[3] )[1 for 3]) & ".TMP";
+	    if ( 0 > Chan_ VMFile( TempFile, VM$Write ) )
+	     then begin "write parameters"
+		for C_ 0 upto (E!ParLength div 5)-1
+		 do if ( memory[ASlot+E!Parameters+C] )
+		     then VMText( Chan,cvAstr(memory[ASlot+E!Parameters+C]) )
+		     else done;
+		VMText( Chan, crlf );		! finish text with crlf ;
+		VMFree( Chan );			! close temp file ;
+	     end "write parameters";
+	 end "write TMP file";
+
+	FrmXct( QQF, RunBlock[0], !foRUN );
+
+	EcfEnb( QQF );			! enable ECF ;
+	dpb( Proc$Run, PStap( QQS ) );	! Processing, Run ;
+
+     end "run job";
+
+  return( true );
+
+end "FrontEnd";
+
+
+procedure REASSIGN (string CMD);
+begin "DEFINE COMMAND"
+    string  Key, Val, Expr;
+
+    While Length(CMD) do begin "scanning parameters"
+	White( CMD );					! Clear whitespace;
+	Key _ Scan( CMD, B!Par, Brk);			! Get name;
+	Logit( QFet$Pars lor QFet$Items,
+		" Key("& Key &") Break("& Brk &")["& cvs(Brk) &
+		"] CMD: "& CMD );
+	If Brk = " " or Brk = #HT then White( Cmd );	! Eat whitestuff;
+	If Brk = "=" then begin
+	    Lop( CMD );					! Eat = ;
+	    Expr _ Get!Token(CMD);			! Read next token;
+	    Logit( QFet$Pars lor QFet$Items,
+		" Expr("& Expr &") Break("& Brk &")["& cvs(Brk) &
+		"] CMD: "& CMD );
+	    If not (quoted or Numeric(Expr) ) then begin
+		Val _ Scan(Expr,B!Par,Brk);
+		If length(Expr) then Fatal(
+		    "Illegal character """&Brk&""" in parameter name")
+		  else begin
+		    Expr _ Substitute( IChan[MyJob], Val );
+		    New!Parameter(IChan[MyJob], Key, Null, Expr )
+		  end;
+	    end
+	    else New!Parameter(IChan[MyJob], Key, Null, Expr )
+	end
+	else begin
+	    Fatal("Illegal format in assignment """&Brk&Cmd&"""");
+	    Logit( QFet$Pars lor QFet$Items,
+		" Key("& Key &") Break("& Brk &")["& cvs(Brk) &
+		"] CMD: "& CMD );
+	    Done;
+	end;
+    end "scanning parameters";
+end "DEFINE COMMAND";
+
+
+simple procedure CHECKPOINT( string CMD );
+begin "CHECKPOINT"
+    integer ASlot;
+
+    ASlot_ QueAct + E!Length * (MyJob - 1);	! setup slot pointer ;
+    Dpb( CvSIX(Get!Token(CMD)), Rec(E!Label) );	! set label - if any ;
+end "CHECKPOINT";
+
+
+procedure COM (string CMD);
+begin "COM COMMAND"
+    Integer Chan;
+    String Name, Dev;
+    Boolean Ext!Found, File!Error;
+
+    Name _ GetFil(CMD, Dev_ "DSK", Ext!Found, File!Error);	! read off filename;
+    If ( File!Error ) then begin		! If error...;
+	Fatal("COM Filename error """&Name&"""");
+      end
+      else begin				! add delimiter to list;
+	Delim!list[MyJob]_ Del!Chr[MyJob] & Delim!list[MyJob];
+	Set!Parameter(CMD);			! NOW setup parameters;
+	Chan_ VMFile( Name );
+	If ( Chan leq 0 ) and not Ext!Found	! if not there, then;
+	 then Chan_ VMFile(Name&Default!Ext);	!  try other extension;
+	If ( Chan leq 0 )
+	 then Fatal( "COM File error ("&Cvs(!rh(Chan))&") for file: "&Name);
+	IChan[MyJob] _ Chan & IChan[MyJob];	! add channel to list;
+    end;
+end;
+
+
+Simple Boolean Procedure CommandMode;
+return( Gettab( QQF,!gtSTS ) geq 0 );
+
+
+procedure ESCAPE;
+begin "Escape"
+
+    if ( CommandMode )			! if command mode ;
+     then ClrFlg( NeedEscape )		!  clear escape   ;
+     else begin "halt frame"
+	DEFINE !FOSTP = '41;
+	FrmXct( QQF, 0, !foSTP );	! stop the frame  ;
+	SetFlg( NeedEscape );		!  set NeedEscape ;
+     end "halt frame";
+
+    SYNC;
+
+end "Escape";
+
+
+Simple Procedure GOTO (string CMD);
+if ( IChan[MyJob] > 0 )
+ then begin "GOTO COMMAND"
+    string S, SS, ST;
+    integer Where;
+
+    S _ "::" & (ST_ Tok( CMD ));		! Define label = ::name ;
+    SS_ ST & ":";				!  also label = name: ;
+
+    do begin "scanning file"
+
+	LineNo[MyJob]_ LineNo[MyJob]+1 & LineNo[MyJob][2 to INF];
+	ST _ null;				! Count source file lines;
+	Where_ VMGetC( IChan[MyJob] );		! Remember start point ;
+
+	Do ST_ ST & VMLine( IChan[MyJob], Brk )	! Read a line of the file;
+	 until ( BRK = #lf ) or ( Brk = 0 );
+
+	if Kequ( S, ST )			! Compare ::name to ST ;
+	  or Kequ( SS, ST[1 for length(SS)] )	! Compare name: to ST ;
+	  or Kequ( SS_ SS & ":", ST[1 for length(SS)] )	! or name:: ;
+	 then begin "got label"
+	    VMSetC( IChan[MyJob], Where );	! Reset to start of line ;
+	    return;				! If match, then "found";
+	 end "got label"
+	 else if ( OChan[MyJob] > 0 )		! Else put into log file ;
+	       then VMText( OChan[MyJob], ST & Crlf );
+
+     end "scanning file" until ( Brk = 0 );
+
+    Fatal("end of file while scanning for label """&S&"""");
+
+end "GOTO COMMAND";
+
+
+Simple Procedure BackTo (string CMD);
+if ( IChan[MyJob] > 0 )
+ then begin "BACKTO COMMAND"
+
+    string S, SS, ST;
+    integer Where;
+
+    S _ "::" & (ST_ Tok( CMD ));		! Define label = ::name ;
+    SS_ ST & ":";				!  also label = name: ;
+
+    do begin "scanning file"
+
+	LineNo[MyJob]_ LineNo[MyJob]-1 & LineNo[MyJob][2 to INF];
+	ST _ null;				! Count source file lines;
+
+	Do ST_ ST & VMLine(IChan[MyJob],Brk,-1)	! Read a line of the file;
+	 until ( BRK = #lf ) or ( Brk = 0 );
+
+	if Kequ( S, ST )			! Compare ::name to ST ;
+	  or Kequ( SS, ST[1 for length(SS)] )	! Compare name: to ST ;
+	  or Kequ( SS_ SS & ":", ST[1 for length(SS)] )	! or name:: ;
+	 then return;				! If match, then "found";
+
+     end "scanning file" until ( Brk = 0 );
+
+    Fatal("end of file while scanning for label """&S&"""");
+
+end "BACKTO COMMAND";
+
+
+
+procedure PARAMETERS(String CMD);
+begin "PARAMETERS COMMAND"
+    string Key, Par!Default, Par!Value;    String Itemvar SI;
+
+    SetFlg( DoParam );					! Set flag true;
+    Par!List[MyJob] _ Lop( Par!!List[MyJob] );		! Get ordered list;
+    While Length(CMD)
+     do begin "scanning parameter names"
+	Key _ Get!Token(CMD);				! Name;
+	Par!Default _ If Brk = "=" or Brk = "_"		! Parameter or null;
+	    then Get!Token(CMD)
+	    else Null;
+	If Length( Datum(Par!List[MyJob]) )		! If any in list;
+	 then begin
+	    SI _ Lop( Datum(Par!List[MyJob]) );		! Get Item;
+	    Par!Value _ Datum( SI );			! Get string value;
+	    Delete( SI );				! No longer needed;
+	 end
+	 else Par!Value _ Null;				! Get null value;
+	New!Parameter(IChan[MyJob], Key, Par!Default, Par!Value );
+     end "scanning parameter names";
+    Put Par!List[MyJob] in Par!!List[MyJob] before 1;	! Restore list;
+end "PARAMETERS COMMAND";
+
+
+simple procedure PAUSE;
+begin "PAUSE"
+    Dpb( PSP$Pause, PProc( QQS ) );
+end "PAUSE";
+
+
+simple procedure QUIT;
+SetFlg( STOP! );
+
+
+simple procedure RESTART( string CMD );
+begin "RESTART"
+    Own integer ASlot;
+    ASlot_ QueAct + E!Length * (MyJob - 1);	! setup slot pointer ;
+    Dpb( CvSIX(Get!Token(CMD)), Rec(E!Label) );	! change label - if any ;
+    Dpb( PSP$Restart, PProc( QQS ) );		! set restart flag ;
+end "RESTART";
+
+
+procedure SEND (string CMD);
+begin	"SEND"
+    string KW;
+    KW _ Get!Token(CMD);
+    If ( quoted )
+     then KW _ Brk&KW&Brk;		! restore quoted string ;
+    If Kequ(KW,"CHARACTER"[1 for length(KW)]) then begin
+	    integer K;
+	    K _ Cvo(CMD);
+	    Logit( QFet$Strs, "SEND "&KW&" '"& Cvos(K) );
+	    auxclv(PORT[MyJob],K,!axO8);	! cvo(CMD),!axO8) ;
+    end
+    else if Kequ(KW,"STRING"[1 for length(KW)]) then begin
+	    KW _ Get!Token(CMD);
+	    Logit( QFet$Strs, "SEND S """&KW&""""&crlf );
+	    Outptr( Port[MyJob], KW );		! Get!Token(CMD) );
+    end
+    else if Kequ(KW,"FILE"[1 for length(KW)]) then begin "SEND FILE"
+	String Name, Dev, L;  Integer LastBrk;
+	Boolean Ext!Found, File!Error, Eof;
+
+	Name _ GetFil(CMD, Dev, Ext!Found, File!Error);
+	If ( File!Error )
+	  then Fatal( "SEND FILE - File error: "&Name )
+	  else begin "good filename"
+	    IChan[MyJob] _ VMFile( Name ) & IChan[MyJob];
+	    if ( IChan[MyJob] < 0 )
+	      then Fatal( "SEND FILE - File error: "&Name )
+	      else While not( Eof )
+	       do begin "transmit file"
+		  L_ VMLine( IChan[MyJob], Brk );
+		  L_ L & (If VMGetC( IChan[MyJob],VM$ECR )
+			   then #cr else if Brk then Brk&Null else "");
+		  If length( L ) or ( Brk )
+		   then begin "got line"
+		      if not( length( Buffer[MyJob] ) )
+		       then Outptr( Port[MyJob], L );
+		      Buffer[MyJob]_ Buffer[MyJob] & L;
+		   end "got line";
+		  EOF_ Brk = 0;
+	      end  "transmit file";
+	    Scan( Buffer[MyJob], B!Cr, Brk );	! trim first time away ;
+	  end "good filename"
+    end "SEND FILE"
+    else Fatal( "illegal SEND command: "&CMD );
+end;
+
+
+simple procedure STOP;
+SetFlg( STOP! );
+
+procedure TIME (string CMD);
+SetTimeLimit( cvd( Tok(CMD) ) );	! Time in minutes;
+
+
+recursive procedure COMMAND (string CMD);
+begin	"COMMAND"
+    string KW;  integer Index;
+    lop(CMD);				! Eat first char (colon,dot,dash) ;
+    KW _ Get!Token(CMD);		! Get first token;
+    Logit( QFet$Cmds, "Cmd: "& KW &" >> "& CMD );
+    if ( Brk = "=" )
+     then begin "fake define"
+	CMD_ KW & Brk & CMD;
+	KW_ "DEFINE";
+	BRK_ " ";
+     end "fake define";
+
+  redefine XC(Text,Action) = {
+    ifcr length( Cvps( Text ) )
+     thenc
+      ifcr length( Cvps( Action ) )
+       thenc  Action;
+       elsec  begin end;
+      endc
+    endc
+  };
+
+    if ( KW = ":" )
+     then				! ignore label here;	! Defer;
+     else if ( Length(KW) )
+	   then begin "my commands"
+	      Case ( Index_ FndKey( KW, Commands ) + 1 ) of begin
+		  Fatal( "Ambigious command: "& KW );
+		  Fatal( "Unknown command: "& KW );
+		  AllCommands
+	      end;
+	   end "my commands";
+
+end	"COMMAND";
+
+
+Simple Integer Procedure SlotsAvailable;
+begin "slots available"
+
+    For MyJob_ 1 step 1 until E!JobMax
+     do begin "check each slot"
+
+	if ( NTQ! or ESC! )		! if ( ^C or Notice-to-quit ) ;
+	 then return( MyJob_ 0 );	!  just go home now... ;
+
+	NoBit_ lnot (MyBit_ 1 lsh MyJob);
+
+	If ( LPStat( QQS ) = JS$Sched )
+	 then begin "consider slot"
+
+	    if ( FrontEnd )		! setup user and keep track ;
+	     then begin "user ready"
+		LogInfo("Stream #"& cvs(MyJob) &
+			" seq " & cvs(Seq_ LPSeq( QQS )) &
+			" " & InfJob( queAct+(E!Length*(MyJob-1)) ) &
+			" * activated *" );
+		Dpb( Proc$Run, PStap( QQS ) );
+		return( MyJob );	! give them the slot ;
+
+	     end "user ready"
+
+	 end "consider slot";
+     end "check each slot";
+
+    return( MyJob_ 0 );			! no slots to initialize ;
+
+end "slots available";
+
+
+Simple String Procedure JobStatus;
+begin "job status"
+    string str;
+
+    define ifst(x,y,z,l) = {if ( x land MyBit )
+			     then begin
+				Dpb( y, PStap( QQS ) );
+				Str_ z
+				  ifcr length(cvps(l))
+				   thenc & " at line " & cvs(LineNo[MyJob])
+				  endc ;
+			     end};
+    Str_ Complete;
+    if ( LPStat( QQS ) = JS$Proc )
+       and not ( LPProc( QQS ) = PSP$Restart )
+     then Dpb( Done$End, PStap( QQS ) );
+
+    ifst( OverTime, Abort$Time,["aborted - time limit exceeded"], line );
+    ifst( NTQ!,   Abort$Notice,["aborted - halted by operator"], line );
+    ifst( ZAP!,   Abort$Zap,   ["aborted - lost command rport"], line );
+    ifst( STOP!,  Done$Stop,   ["aborted - :STOP"], line );
+    ifst( ERR!,   Done$Error,  ["aborted - :ERROR in job"], line );
+    ifst( TRU!,   Abort$Tru,   ["aborted - TRU limit exceeded"], line );
+    ifst( LOS!,   Done$Lost,   [Str & " [check for data lossage]"] );
+
+    return( Str );
+
+end "job status";
+
+
+Simple Procedure Do!Cleanup;
+begin "do cleanup"
+    Own integer ASlot;
+
+    ASlot_ QueAct + E!Length * (MyJob - 1);	! setup slot pointer ;
+    NoBit_ lnot (MyBit_ 1 lsh MyJob);	! setup logical flag bits ;
+
+    if ( ZAP! land MyBit )		! seen a zapper yet? ;
+	 and ( NeedZap land MyBit )	!  and waiting for one ;
+     then ClrFlg( ZAP! );		! don't complain here ;
+
+    Disposition_ JobStatus;		! get job disposition ;
+
+    if ( DoMail land MyBit )		! send mail, set flag ;
+     then;
+
+    LogInfo(    "Stream #"& cvs(MyJob) &
+		" seq " & cvs(Seq_ LPSeq( QQS )) &
+		" " & InfJob( queAct+(E!Length*(MyJob-1)) ) &
+		" * " & Disposition & " *" );
+
+    Buffer[ MyJob ]_ Crlf& "; Job "& Disposition & Crlf;
+    If ( LPLog( QQA ) )
+     then VMText( OChan[MyJob], Buffer[MyJob] );
+
+    Buffer[MyJob]_ Null;
+
+    If ( LPLog( QQA ) and (
+	( LPDisp( QQA ) = JD$DELETE ) or
+	( LPDisp( QQA ) = JD$ERROR and Kequ(Disposition,Complete) ) ) )
+     then VMFree( OChan[MyJob], -1 )	! delete the log-file ;
+     else VMFree( OChan[MyJob] );	! or simply close it ;
+
+    ClearFrame;				! make it go away for real ;
+
+end "do cleanup";
+
+Simple procedure ClearFile;
+begin "clear file"
+
+    if ( length( IChan[ MyJob ] ) )	! anything left to do? ;
+     then begin "are we done"
+
+	Forget!Substitutions;		! clear current substitutions;
+
+	VMFree( IChan[ MyJob ] );	! Free the channel ;
+
+	if ( 1 = length(IChan[MyJob]) ) or ( ERR! land MyBit )
+	 then begin "clear slot"		! last eof or error ;
+
+	    Escape;				! put into command mode ;
+	    if ( Port[MyJob] )			! if port, send LOGOUT ;
+	     then begin "logout job"
+		Buffer[MyJob]_ "LOGOUT" & #cr;
+		SetFlg( NeedZap );		! get ready for the end ;
+	     end "logout job";
+
+	    ClrFlg( DoParam );		! clear parametization ;
+	    QQR_ QQT_ 0;		! and time/tru limits ;
+
+	 end "clear slot";
+
+	if not( (STOP! lor ERR! lor OverTime lor TRU!) land MyBit )
+	 then lop( LineNo[ MyJob ] );	!  the line # for this file ;
+
+	lop( IChan[ MyJob ] );		! clear out the channel and ;
+	lop( Delim!list[ MyJob ] );	! lop off the last delimiter;
+
+	if ( Delim!list[MyJob] neq Del!Chr[MyJob] )	! if mangled, then ;
+	 then Set!Delimiter( Delim!list[MyJob] );	! reset from stack ;
+
+     end "are we done";
+
+ end "clear file";
+
+
+Simple Procedure PortLine;
+begin "port line"
+    Define LineLen = 64 * 10;		! constant length = 640 ;
+    Preset!with
+	"################################################################" &
+	"################################################################" &
+	"################################################################" &
+	"################################################################" &
+	"################################################################" &
+	"################################################################" &
+	"################################################################" &
+	"################################################################" &
+	"################################################################" &
+	"################################################################";
+    Own String array Line[0:0];
+    Own Integer Chan, MyLen, MyPtr;
+
+    NoBit_ lnot (MyBit_ 1 lsh MyJob);	! setup flag bits ;
+    Chan_ Ochan[MyJob];			! setup channel variable ;
+
+    begin!code
+
+	Label Loop, NoMore;
+	Define ax = '13, ch = '14, ct = '15;
+
+	Move	ax,Line[0];		! copy string pointer ;
+	Movem	ax,MyPtr;		! save it for use ;
+	Move	ax,MyJob;		! get job index ;
+	Hrlz	ax,Port[0](ax);		! get port ;
+	Hrri	ax,!axi8s;		! set to image mode skip ;
+	Setzm	MyLen;			! start with null string ;
+Loop:	Auxcal	ax,ch;			! get a character ;
+	  Jrst	NoMore;			! no more ;
+	Jumpe	ch,Loop;		! ignore nulls ;
+	Skipn	Chan;			! if no channel open ;
+	  Jrst	Loop;			! throw characters away ;
+	Idpb	ch,MyPtr;		! deposit character ;
+	Aos	ct,MyLen;		! count characters ;
+	Caige	ct,LineLen;		! enough room? ;
+	  Jrst	Loop;			! yes, go back for next ;
+NoMore:
+     end;				! end begin!code ;
+
+    if ( MyLen )			! if any, put directly into file ;
+     then VMText(Chan, Line[0][1 for MyLen]);
+
+    if ( MyLen neq LineLen )		! if no overflow, then ;
+     then ClrFlg( CHR! );		! clear BRK seen flag ;
+
+    Logit( QFet$Ports, "TTY"&cvos(Port[MyJob])&": "&Line[0][1 for MyLen] );
+	
+end "port line";
+
+
+Simple Boolean Procedure OneLine;
+begin "one line"
+    string S, C;
+    integer Brk,Cmd;
+
+    If ( NeedEscape land MyBit )		! Are we waiting for ESC? ;
+     then begin "wait till next time"
+	Escape;					! Do escape procedure ;
+	return( true );				!  and come back later ;
+     end "wait till next time";
+
+    If ( length( Buffer[MyJob] ) )		! Do we have any leftovers? ;
+     then begin "process leftovers"
+	S_ Scan( Buffer[MyJob], B!Cr, Brk );	! Get one line from buffer ;
+	OutPtr( Port[MyJob], S );		!  and send it along ;
+	ClrFlg( ORG! );				!  clear data flag ;
+	return( true );				!  then return ;
+     end "process leftovers";
+
+    S_ VMLine( IChan[MyJob], Brk );		! Read first line of file;
+
+    If ( VMGetC(IChan[MyJob], VM$ECR) )		! Was there a crlf? ;
+     then C_ #Cr				!  yes, so make a string ;
+     else C_ Null;				!  no,  make it empty ;
+
+    if ( Length( S ) or Brk )			! End of File? If no line;
+     then begin "got line"
+
+	LineNo[MyJob]_ LineNo[MyJob]+1 & LineNo[MyJob][2 to INF];
+
+	If ( DoParam land MyBit )		! if substitutions enabled ;
+	 then S_ Parametize(S);			!  then parametize the line ;
+
+	Logit( QFet$Jobs lor QFet$Ports lor QFet$Subs,
+	    "Stream #"&cvs(MyJob)&":("&cvs(LineNo[MyJob][1 for 1])&"): "& S );
+	Cmd_ true;				! default is a command ;
+
+	if ( S = ":" )				! if "known-command" ;
+	 then Command(S)			!  then process as a command ;
+	 else if ( S = "." or S = "-" )		!  else check for want command ;
+	     then if ( ChkCommand(S) )		!    then if a legal command ;
+		 then Command(S)		!       then process a command ;
+		 else begin "an escape"
+		    ESCAPE;			! put into exec and ;
+		    Cmd_ false;			!  clear command flag ;
+		    Lop( S );			!  and remove esc flag ;
+		 end "an escape"
+	     else if ( S = "=" or S = "*" )
+		 then begin "user mode"
+		    If not( CommandMode )	! if at user level then ;
+		     then Cmd_ false;		! clear command flag ;
+		    If ( Lop( S ) = "=" )	! throw away char & compare ;
+		     then C_ Null;		! use either Null or CR ;
+		 end "user mode"		! don't forget labels:: ;
+		 else Cmd_ false;
+
+	if not( Cmd )
+	 then begin "user data"
+	    OutPtr( Port[MyJob], S&C );		! if data send it to the job ;
+	    ClrFlg( ORG! );			! clear data flag ;
+	 end "user data";
+
+	return( not( (STOP! lor ERR! lor OverTime lor TRU!)
+			land MyBit ) );		! return ANY flags set? ;
+
+     end "got line"
+     else return( false );			! no line -- eof reached ;
+
+end "one line";
+
+
+Simple Procedure FileLine;
+begin "each line"
+
+    if ( LPStat( QQS ) = JS$Proc )
+     then begin "valid job slot"
+
+	NoBit_ lnot (MyBit_ 1 lsh MyJob);
+
+	Case ( LPProc( QQS ) ) of
+	begin "each process type"
+	    [PSP$Run]			! Run - normal mode ;
+	    if ( QQF )			! if active frame ;
+	     then if ( OneLine )	! check for data to job ;
+		   then			! all is ok, nothing more to do ;
+		   else ClearFile	! if end, clear file and go on. ;
+	     else;			! log line to nonexistant frame ;
+
+	    [PSP$Pause]			! Pause - wait at next statement ;
+	    [PSP$Stop]			! Stop  - ^C/Halt job ;
+		;			! do nothing if paused, stopped ;
+
+	    [PSP$Restart]		! Restart - user/opr/job restart ;
+	    [PSP$Cancel]		! Cancel  - user/opr abort job ;
+	    if ( QQF )			! if active frame ;
+	     then begin "finish job"
+		while ( length( IChan[MyJob] ) )
+		 do ClearFile;		!  clear file and set done flag ;
+		if ( length( Buffer[MyJob] ) )
+		 then OneLine;		!  send LOGOUT, etc. to line ;
+	     end "finish job";
+
+	    else
+	end "each process type";
+
+     end "valid job slot"
+     else begin "invalid"
+	Logit( QFet$Jobs, "** invalid stream #"& cvs(MyJob) &" **" );
+     end "invalid";
+
+ end "each line";
+
+
+Internal Simple Procedure GetInt( reference integer Flag; integer Why );
+begin "get int"
+    Own safe integer array Ports[ -1 : E!JobMax ];
+    Own Integer Idx, MyP, MyJ;
+
+    Arrclr( Ports );			! initialize data structure ;
+    Ports[-1]_ E!JobMax + 1;		! specify length of list ;
+    Idx_ Calli( Why + location(Ports[-1]), calli!POLPRT );
+    if not( !Skip! )			! if cannot read ports list ;
+     then return;			!  then ignore interrupt ;
+
+    While ( 0 leq Idx_ Idx - 1 )	! for each possible port ;
+     do if ( Ports[Idx] land Why )	! if condition set ;
+	 then begin "find job port"
+
+	    MyP_ !rh( Ports[Idx] );	! make it just a port ;
+
+	    For MyJ_ 1 upto E!JobMax	! for each active job ;
+	     do if ( Port[MyJ] = MyP )	! if the port matches ;
+		 then begin "found one"
+		    Flag_ Flag lor (1 lsh MyJ);	!  flag the port ;
+		    done;		!  and finish loop ;
+		 end "found one";
+
+	 end "find job port";		! either port found or ignored ;
+
+end "get int";
+
+
+simple procedure ShutDown;
+begin "shut down"			! start genocide process ;
+    own boolean Blitzkreig;		! flag so only here once ;
+
+    if ( Blitzkreig )			! deja vu? ;
+     then return			! can only do this once ;
+     else Blitzkreig_ true;		! else kilroy was here ;
+
+    LogInfo( "Evicting all jobs:" &
+	     (if NTQ! then " ntq" else "") &
+	     (if ESC! then " esc" else "")    );
+
+    For MyJob_ 1 upto E!JobMax
+     do if ( QQS )
+	 then Do!Cleanup;
+
+end "shut down";
+
+
+
+simple procedure EveryMinute;
+begin "once a minute"
+    Own integer time, now;
+
+    SetTim( Minute );			! reset the watchdog timer ;
+    Minutes_ Minutes + 1;		! count the minutes ;
+
+    Now_ GetTDT;			! get current time ;
+    for MyJob_ 1 upto E!JobMax		! for each job ;
+     do begin "each job"
+	NoBit_ lnot (MyBit_ 1 lsh MyJob);
+	if ( 0 < QQT < Now )		! passed time limit? ;
+	 then SetFlg( OverTime );	!  then mark the job ;
+	if ( 0 < QQR < GetTRU( QQF ) )	! passed TRU limit? ;
+	 then SetFlg( TRU! );		!  then mark the job ;
+     end "each job";
+
+end "once a minute";
+
+
+simple boolean procedure WaitForInterlock;
+begin "wait for interlock"
+
+    SetTim( 300 );			! wait 5 minutes (300 sec) ;
+    while not( TIM! )			! maximum for interlock ;
+     do begin "waiting"
+
+	calli( 1, calli!SLEEP );	! sleep for a second ;
+
+	if ( ClubInit( Club_ queAct lsh -9 ) )
+	 then begin "got it"
+
+	    if ( QQ( Process ) = 0 )		! no processor??? ;
+	     then QQ( Process )_ XEXJob;	!  take it for me ;
+
+	    QQ( ProcessUDT )_ QQ( HaveP );	! mark that I have it ;
+	    QQ( Flags )_ QQ( Flags ) lor ( QF$Act lsh 18 );
+
+	    LogInfo( "Got interlock" );		! let scheduler know ;
+	    return( true );			! we're on our way ;
+
+	 end "got it"
+	 else Club_ !skip!;		! copy error code ;
+
+     end "waiting";
+
+    return( false );			! show our failure ;
+
+end "wait for interlock";
+
+
+simple procedure SystemStartup;
+begin "system startup"
+
+    if not( OpnQue( que$Act ) )
+     then Exit( "Processor cannot access Job QUEUE" );
+
+    if not( ClubJoin( Club_ queAct lsh -9 ) )	! join club on ACT page ;
+     then Exit( "No Club for Processor" );	!  or complain about it ;
+
+    if not( ClubInit( Club_ queAct lsh -9 ) )	! get interlock, nowait ;
+     then begin "handshake"
+
+	QQ( Flags )_ QQ( Flags ) land lnot ( QF$Act lsh 18 );
+	if ( CBVPM# = Club_ !Skip! )		! bad page number ;
+	 then Exit( "Processor not in club - bad page" );
+	if ( CBAIL# = Club_ !Skip! )		! remember error code ;
+	 then begin "notify"
+
+	    QQ( HaveP )_ Gettab( XEXJob,!gtUID );
+	    Loginfo( "Waiting for interlock" );	! notify scheduler & ;
+	    if not( WaitForInterlock )		! wait for interlock ;
+	     then Exit( "Processor Interlock Busy ("&cvos(Club)&")" );
+
+	 end "notify"
+	 else Exit( "Processor Interlock Error ("&Cvos(Club)&")" );
+
+     end "handshake"
+     else begin "got interlock"
+
+	if ( QQ( Process ) = 0 )	! none? take it for me ;
+	 then QQ( Process )_ XEXJob;
+	QQ( ProcessUDT )_ QQ( HaveP )_ Gettab( XEXJob,!gtUID );
+	QQ( Flags )_ QQ( Flags ) lor ( QF$Act lsh 18 );
+
+     end "got interlock";
+
+    LogInfo( "Processor starting in frame "& cvs( XEXJob ) );
+    QQ( Flags )_ QQ( Flags ) lor ( QF$Log lsh 18 );
+
+    if ( TestFeature( Trigger ) )	! trigger software interrupts? ;
+     then SIAEnb;			! yes, enable interrupts ;
+    ESCEnb;				! enable trapping ESC/^C ;
+    NTQEnb;				! enable trapping NTQ ;
+
+end "system startup";
+
+
+!	M A I N   program
+;
+
+SystemStartup;				! crank it up to full ;
+SetTim( Minute );			! and start watchdog timer ;
+
+While ( QQ( HaveP )_ Gettab(XEXJob,!gtUID) )	! while we keep it honest ;
+ do begin "the system is running"		! proceed with the work ;
+
+    if ( TIM! )				! check watchdog timer ;
+     then EveryMinute;			!  time to look around ;
+
+    if ( LOS! lor CHR! lor ORG! lor ZAP! lor ECF! )
+     then Logit( QFet$Ports,
+		"L:"& cvos(LOS!) &" C:"& cvos(CHR!) &" O:"& cvos(ORG!) &
+		" Z:"& cvos(ZAP!) &" E:"& cvos(ECF!) );
+
+    if ( ZAP! lor ECF! lor OverTime lor TRU! lor ERR! )
+     then Logit( QFet$Jobs,
+		" Z:"& cvos(ZAP!) &" E:"& cvos(ECF!) &
+		" T:"& cvos(OverTime) &" R:"& cvos(TRU!) &
+		" err:"& cvos(ERR!) );
+
+    DoIf ( CHR!, E!JobMax )		! if *any* output is available ;
+     then PortLine;			! read any data lines available ;
+
+    DoIf ( ZAP! lor ECF!, E!JobMax )	! if *any* circuit zaps seen ;
+     then begin "finish job"
+
+	Port[ MyJob ]_ 0;		! clear port for clearframe ;
+
+	if ( QQS )			! if active job ;
+	 then Do!CleanUp;		!  close files, etc. ;
+
+     end "finish job";
+
+    If ( QQ( Active ) )			! any active slots? ;
+     then begin "move some data"
+
+	DoIf ( ORG!, E!JobMax )		! if *any* input requested ;
+	 then FileLine;			! read any file lines available ;
+
+	If ( NTQ! or ESC! )		! if notice received ;
+	 then ShutDown;			! shut everything down ;
+
+     end "move some data"
+     else if ( NTQ! or ESC! )		! when inactive, check flags ;
+	   then done;			!  and exit when done ;
+
+    if not( SlotsAvailable )		! if no slots initialized ;
+     then calli( 5, calli!SLEEP );	!    sleep for awhile ;
+
+    if ( TestFeature( Shut ) )		! Normal-Shutdown ;
+     then done;				!  we're out of here ;
+
+ end "the system is running";
+
+Exit( "Signing off." );
+
+end 	"EXECX" $
+
+`B>`·
