@@ -1,0 +1,203 @@
+Date: 4/26/78                   Dialout II
+
+I.  Introduction.
+
+This document provides an overview of the hardware and software that
+comprise OnTyme's Dialout system.  The major components are:
+
+    A.  The Vadic VA820 Multiline Automatic Calling System, described
+        in the following Vadic manuals:
+        18008-011       MACS
+        18008-012       MACS dialers
+        18008-013       MACS RS232C adaptor
+        18008-014       MACS modems
+
+    B.  Tymnet support for the VA820 MACS, described in section II.
+
+    C.  The OnTyme dialout package, described in section III.
+
+II.  Network aspects.
+
+The Vadic MACS hardware is accessed through a modified asynchronous
+Tymcom.  The Tymcom represents a single logical host;  predefined user
+names on that host select the adaptor/dialer or a particular group of
+equivalent modems (i.e., modems connected to the same class of telephone
+service -- local, WATS, etc.).  When a circuit is built to a user name
+on the Tymcom, the Tymcom selects a group member it believes to be free,
+establishes a connection to it, and sends back two Ascii characters
+representing the slot address (which is required when dialing) of the
+selected member, expressed in decimal.  This is true even when the user
+name refers to the adaptor, which is in a group by itself.
+
+Except for the above-mentioned character pair which is sent upon login,
+the Tymcom communicates with Dialout exclusively by means of port status
+messages, which cause a software interrupt on the PDP-10 and convey a
+four-bit status code.  Currently-defined codes are:
+
+    1   Answer tone detected.  The Tymcom also sends this code as soon
+        as a circuit is built to the adaptor, to signify that the dialer
+        is ready.
+
+    2   Hangup acknowledgment, sent in response to a hang character
+        pair.
+
+    3   Line lost.
+
+    The next four codes are responses to an attempt to log into the
+    Tymcom:
+
+    4   All ports busy.
+
+    5   Bad Sup port.
+
+    6   No host.
+
+    7   Please try again.
+
+The Tymcom, having been designed to interface a host to the network,
+knows essentially nothing about dealing with the terminals that it 
+dials;  in particular, it does no echoing and no padding after CR's and
+LF's.  The one exception to this rule is that it recognizes and 
+correctly handles the "set output baud rate" network message;  the
+default rate appears to be 110 baud.
+
+III.  OnTyme Dialout Design Overview.
+
+A.  Introduction.
+This section provides an overview of the design of Dialout II.  The
+procedure descriptions are schematic; in particular, abnormal condition
+detection, reporting, and recovery, which account for a great deal of
+the complexity of the design, are ignored here.  For more detail, see
+the individual module specifications.
+
+B.  Design goals.
+    1.  Maximize concurrency in the use of the Vadic dialers.  This
+        implies one process per modem.
+    2.  Minimize the number of auxiliary circuits built and torn down.
+        This implies that Dialout must identify all the calls it needs
+        to make and sort them by node and dialer before making any
+        calls.
+    3.  Minimize the number of disk accesses. Special provisions have
+        been made in the DBM for determining whether a user may have a
+        message waiting without examining his entire IN-list, and for
+        determining whether some user assigned to a station may have a
+        rush message waiting without examining all users' IN-lists.
+    4.  Maximize modifiability.  Since changes are sure to be required
+        as experience accumulates, an effort has been made to keep the
+        design straightforward and modular.
+
+C.  Overview.
+Dialout II may be regarded as a tree with three branches.  The root
+(DO000) serves as a driver for the three branches and is responsibile
+for scheduling itself periodically.  The first branch (modules named
+DO1nn) is responsible for deciding which stations must be called;  the
+second branch (modules named DO2nn) determines which dialer and modem
+group to use and sorts the calls to be made by dialer and modem group;
+and the third branch (modules named DO3nn) does the actual calling. 
+
+DO000 -- Dialout (process). Sprouted at OnTyme initialization; never
+    terminates. Awakens periodically and calls DO100 to decide which
+    stations must be called. If DO100 returns a nonempty list, calls
+    DO200 to assign the stations to modem groups and sort by MACS and
+    group, then sprouts one instantiation of DO300 for each MACS to be
+    used.  When all instantiations of DO300 have terminated, schedules
+    the next wakeup and goes back to sleep.
+
+    DO100 -- BuildListOfStationsRequiringService (procedure).  Returns a
+        list of stations that must be called during the current
+        execution of Dialout.
+
+        DO110 -- TimeToPoll (procedure).  Determines whether a station's
+            regular polling time has arrived since the last time Dialout
+            ran.
+
+        DO111 -- BuildListOfUsersWithMessagesWaiting (procedure).
+            Returns a list of users assigned to a given station who have
+            unread messages waiting.
+
+            DO120 -- GetUnreadMessageList (procedure).  Returns a list
+                of unread messages that originated on the local host for
+                a given user.
+
+    DO200 -- AssignStationsToModemGroups (procedure).  Returns a data
+        structure in which each station requiring service is associated
+        with the MACS and modem group that will be used to service it.
+
+        DO210 -- LookUpAreaCode/Exchange (procedure).  Decides which
+            MACS and modem group should be used to sevice a given
+            station.
+
+    DO300 -- ServiceMACS (process).  Builds a circuit to the dialer,
+        sprouts one instantiation of ServiceModemGroup for each modem
+        group associated with the given MACS that is to be used, waits
+        until all have terminated, zaps the circuit, and terminates
+        itself.
+
+        DO310 -- ServiceModemGroup (process).  Sprouts one instantiation
+            of ServiceModem for each modem in the given group that is to
+            be used, waits until all have terminated, and terminates
+            itself.
+
+            DO320 -- ServiceModem (process).  Builds an auxiliary
+                circuit to the modem, calls ServiceStation repeatedly
+                until no stations remain to be serviced through the
+                group of which the modem is a member, zaps the circuit,
+                and terminates itself.
+
+                DO330 -- ReadSlotAddress (procedure).  Called by both
+                    ServiceMACS and ServiceModem to read and interpret
+                    the slot address sent by the Tymcom when a circuit
+                    is built to it.
+
+                DO331 -- ServiceStation (procedure).  Dials the station;
+                    verifies the answerback, if requested;  polls for
+                    input, if requested;  calls ServiceUser for each
+                    user assigned to the station with messages waiting;
+                    and hangs up the phone.
+
+                    DO340 -- Dial (procedure).  Sends the phone number
+                        to the dialer and waits for answertone or
+                        timeout.
+
+                    DO341 -- SetTerminalCharacteristics (procedure).
+                        Informs the Tymcom of the characteristics of the
+                        terminal just dialed.
+
+                    DO342 -- LogInStation (procedure).  Initializes
+                        Usercor fields which depend only on account or
+                        station.
+
+                    DO343 -- VerifyAnswerback (procedure).  Reads and
+                        checks answerback code, if one is specified for
+                        the terminal.
+
+                    DO344 -- Poll (procedure).  Called only if the
+                        station is flagged "poll for input".  Performs a
+                        pseudo-logon for the station, sends an X-ON,
+                        reads and processes text until EOT or timeout,
+                        and performs a pseudo-logoff.
+
+                    DO345 -- ServiceUser (procedure).  Performs a
+                        pseudo-logon for the user, calls READ once for
+                        each message waiting for the user, and performs
+                        a pseudo-logoff.
+
+                    DO346 -- Hangup (procedure).  Hangs up the telephone
+                        (while retaining the auxiliary circuit to the
+                        modem) and waits for acknowledgment from the
+                        modem.
+
+                        DO350 -- DialoutLogon (procedure).  Initializes
+                            Usercor fields which depend on the
+                            particular user;  resets counters and
+                            workspace;  sets logon date and time.
+
+                        DO351 -- DialoutLogoff (procedure).  Sets logoff
+                            date and time and writes an accounting
+                            record.
+
+                        DO352 -- DialoutLineInput (procedure).  An
+                            abbreviated version of Line!Input which
+                            recognizes only :TEXT, :SEND, :MORE, and
+                            text lines.
+  
