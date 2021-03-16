@@ -1,0 +1,303 @@
+	SUBTTL	Asynch Ring Handler Package
+:******************************************************************
+:
+:	This program is the sole property and confidential
+:	information of Tymshare, Inc., and may not be copied
+:	in whole or in part or disclosed to any third party
+:	without the prior written consent of Tymshare.
+:
+:*******************************************************************
+	RA	0		:	ARING.LIB
+:	ASYNC RING HANDLING
+
+	GL	NAPORT,IZASYN,AGCI,AWCI,AWCP
+	GL	NGRP,RBS,DSR,DTR,CP,TAM,TOPORT,FPORT,ARING
+	SEG	A.DATA
+	MO	.,ASYNC
+
+:	INPUT CODES
+:	0	escape...always followed by second char
+:	1-FF	data codes 0-FF
+:	0\0	escaped data code 0
+:	0\8x	escaped terminal speed:
+:		x=0	10 cps
+:		x=1	15 cps
+:		x=2	30 cps
+:		x=3	40 cps
+:		x=4	60 cps
+:		x=5	120 cps
+:		x=6	30 cps (3767)
+:		x=7	14.7 cps (2741)
+:	0\90	escaped break detected
+:	0\91	escaped break end
+
+:	OUTPUT CODES
+:	0	escape...always followed by second char
+:	1-FF	data code
+:	0\0	data 0
+:	0\1-8F	delay time
+:	0\90-AF	output baud rate
+:	0\B0-CF	input baud rate
+:	0\D0-DF	enter connect mode
+:	0\E0	enter data mode
+:	0\E1	disconnect
+:	0\E2	enable
+:	0\E3	RS up
+:	0\E4	RS down
+
+Q	HS	0		:REMEMBER WHERE WE ARE
+	ORG	0
+:	DEFINE RING BLOCK ENTRIES
+RSIZE	EQ	$A14		:SIZE OF A RING
+:RIB	HS	1		:RING BCT
+:RIH	HS	1		:1 UNUSED HALFWORD
+RIF	BS	1		:RING INPUT FILL INDEX
+RIE	BS	1		:RING INPUT EMPTY INDEX
+RI	BS	RSIZE		:THE INPUT RING
+:ROB	HS	1		:RING BCT OUTPUT
+:ROT	HS	1		:RING TAM OUTPUT
+ROF	BS	1		:RING OUTPUT FILL INDEX
+ROE	BS	1		:RING OUTPUT EMPTY INDEX
+RO	BS	RSIZE		:THE OUTPUT RING
+RBS	BS	0		:SIZE OF RING BLOCK
+
+	ORG	Q		:RETURN TO NORMAL ADDRESS SPACE
+	BND	4
+NGRP	EQ	(NAPORT+$A15)/16	:THE NUMBER OF GROUPS IN USE
+DSR	HS	NGRP		:DATA SET READY TERM
+DTR	HS	NGRP		:DATA TERMINAL READY TERM
+CP	HS	NGRP		:CARRIER PRESENT TERM
+TAM	HS	NGRP		:TRANSMITTER ACTIVE MASK
+TOPORT	HS	NGRP		:DATA IN RING TO GO TO PORT
+FPORT	HS	NGRP		:DATA IN RING COMING FROM PORT
+
+ARING	BS	10*NGRP*RBS	:THE RING STORAGE
+
+	SEG	A.CODE
+
+:	Get a char from Async input ring
+:	R4	link
+:	R5	port #
+:	normal return if ring empty, turns off FPORT bit
+:	else skip return, char in R0
+AGCI	LR	R1,R5		:COPY PORT #
+	SLLS	R1,5
+	LB	R2,ARING+RIE,R1	:GET EMPTY INDEX
+	CLB	R2,ARING+RIF,R1	:TEST IF RING EMPTY
+	JEFS	AGCI2		:SKIP IF SO
+	AIS	R4,4		:NOT EMPTY...SET SKIP RETURN
+	LB	R0,ARING+RI,R1,R2	:GET THE CHAR
+	AIS	R2,1		:BUMP INDEX
+	CLHI	R2,RSIZE
+	JLFS	AGCI1
+	LIS	R2,0		:FOLD INDEX IF NECESSARY
+AGCI1	STB	R2,ARING+RIE,R1	:SAVE IT
+	CLB	R2,ARING+RIF,R1	:CHECK IF NOW EMPTY
+	JNR	R4		:EXIT IF NOT
+AGCI2	RBT	R5,FPORT	:ELSE TURN OFF BIT FLAG
+	CLB	R2,ARING+RIF,R1	:CHECK IF STILL EMPTY (AVOID POSSIBLE RACE CONDITION)
+	JER	R4		:EXIT IF SO
+	SBT	R5,FPORT	:ELSE TURN IT ON
+	JR	R4		:AND EXIT
+
+
+:	Place a single char in Async output ring
+:	R4	link
+:	R5	port #
+:	R0	char to transmit
+AWCI	LR	R1,R5		:COPY PORT #
+	SLLS	R1,5		:INDEX INTO RINGS
+	LB	R2,ARING+ROF,R1	:INDEX INTO RING
+	STB	R0,ARING+RO,R1,R2	:PLACE CHAR
+	AIS	R2,1
+	CLHI	R2,RSIZE
+	JLFS	AWCI1		:SKIP IF NO RING FOLDING
+	LIS	R2,0
+AWCI1	LB	R3,ARING+ROE,R1	:GET EMPTY POINTER
+	SR	R3,R2		:HOW MUCH ROOM IS LEFT?
+	JGEFS	AWCI2
+	AIS	R3,RSIZE
+AWCI2	SIS	R3,4		:LEAVE AT LEAST 4 CHARS OF SLOP
+	JGEFS	AWCI3
+	RBT	R5,TAM		:ELSE SET ACTIVE
+AWCI3	STB	R2,ARING+ROF,R1	:UPDATE INDEX
+	SBT	R5,TOPORT	:FLAG IT IN PLACE
+	JR	R4		:AND EXIT
+
+
+:	Place escaped char in Async output ring
+:	R4	link
+:	R5	port #
+:	R0	char to transmit
+AWCP	LR	R1,R5		:COPY PORT #
+	SLLS	R1,5		:INDEX INTO RINGS
+	LB	R2,ARING+ROF,R1	:INDEX INTO RING
+	LIS	R3,0		:SET ESCAPE
+	STB	R3,ARING+RO,R1,R2
+	AIS	R2,1
+	CLHI	R2,RSIZE
+	JLFS	AWCP1		:SKIP IF NO RING FOLDING
+	LIS	R2,0
+AWCP1	STB	R0,ARING+RO,R1,R2	:PLACE CHAR
+	AIS	R2,1
+	CLHI	R2,RSIZE
+	JL	AWCI1		:GO CLEAN UP IF NO FOLD
+	LIS	R2,0
+	J	AWCI1
+
+:	InitialiZe ASYNc
+:	R0	link
+:	Preserves NO registers
+IZASYN	LIS	R1,0
+	LCS	R2,1
+	LHI	R3,2*NGRP-2
+IZA1	STH	R1,DSR,R3	:DSR = 0
+	STH	R2,DTR,R3	:DTR = 1
+	STH	R1,CP,R3	:CP = 0
+	STH	R2,TAM,R3	:TAM = 1
+	STH	R1,TOPORT,R3	:TOPORT = 0
+	STH	R1,FPORT,R3	:FPORT = 0
+	SIS	R3,2
+	JGE	IZA1		:DO FOR ALL GROUPS
+	LHI	R2,10*NGRP*RBS-4	:INITIALIZE RINGS
+IZA2	ST	R1,ARING,R2
+	SIS	R2,4
+	JGEBS	IZA2
+	JR	R0		:AND RETURN
+
+	EM
+	SUBTTL	Async routines
+:-----------------------------------------------------------------------
+:  Start of Joe Smith's ASYNC LAB assignment.  9-Oct-88
+:  Set port 0 to 1200 baud, enable it, and output " OK ".
+:  Ignore all input from that port until a break is received.  Once the
+:  break signal has ended, output a welcome message and then enable echo.
+:  Be sure to echo CR as CR+LF.
+:-----------------------------------------------------------------------
+
+	GL	IZASYN,AGCI,AWCI,AWCP	: Routines in ARING.LIB
+	GL	NGRP,RBS,NAPORT		: Equates from ARING.LIB
+	GL	DSR,DTR,CP,TAM,TOPORT,FPORT,ARING	: Variables from ARING
+LUASYN	EQ	0		: Logical unit for 1st async group
+
+	SEG	A.DATA
+ASECHO	HS	NGRP		: Async echo needed when bit is set
+APORT	HC	0		: Port number that needs output
+ACOUNT	HC	0		: Count of bytes left to be output
+APOINT	WC	0		: Address of bytes left to be output
+	SEG	A.CODE
+
+: Start of program
+
+START	JAL	R13,INIASY	: Initialize and start async
+LOOP	SVC	DISMIS,0	: Give other slots a chance to run
+	JAL	R13,DOASYI	: Do async input
+	JAL	R13,DOASYO	: Do async output
+	J	LOOP
+
+: Messages to be sent
+
+ASINIT	SC /"00"95"00"B5"00"E0 OK / :IBAUD=1200, OBAUD=1200, connect
+WELCOM	SC /"8D"8AWelcome to Joe's ASYNC test slot.  This message is more than 14 bytes long."8D"8A/
+
+: Initialize ASYNC and start it.  Link on R13.
+
+INIASY	JAL	R0,IZASYN	: Init (zero) async variables
+	LIS	R1,0
+	STH	R1,ASECHO	: Mark port as not needing echo yet
+
+: Set up registers for the "connect async" SVC
+
+	LIS	R0,LUASYN	: Group #
+	LA	R1,ARING,,	: Array of rings
+	LA	R2,CP,,		: Bits of Carrier Present
+	LA	R3,DSR,,	: Bits of Data Set Ready (modem on-line)
+	LA	R4,DTR,,	: Bits of Data Term Ready (our ports)
+	LA	R5,TOPORT,,	: Bits of ports with output ready (set by us)
+	LA	R6,FPORT,,	: Bits of ports with input ready (set by ISIS)
+	LA	R7,TAM,,	: Bits of transmit activity
+	SVC	IO,030+R0	: Connect async (OP=3)
+	  JAL	R10,CRASH	: Die if no async defined in node's TYM file
+
+: Send an initialization message to set baud rates and enable I/O
+
+	LIS	R5,0		: Set port number
+	STH	R5,APORT
+	RBT	R5,DTR,,	: Clear DTR bit (which turns on the signal)
+	LB	R1,ASINIT	: Set byte count
+	STH	R1,ACOUNT
+	LA	R2,ASINIT+1	: Set message address
+	ST	R2,APOINT
+	JR	R13		: End of INIASY
+
+:--------------------------------------------------------------------------
+
+: Read input from the port.  Link on R13.
+
+DOASYI	LH	R5,APORT	: Check only port 0 in this assignment
+	JAL	R4,AGCI,,	: Get next byte (if any)
+	  J	0,R13		: Nothing there
+	CHI	R0,0		: Is it an escaped message?
+	JE	ESCIN		: Process escape on input
+	TBT	R5,ASECHO	: Are we supposed to echo on this port?
+	JER	R13		: Do nothing if BREAK has not been seen
+
+: Echo this input character.  Echo CR as CR+LF
+
+WAIT4	TBT	R5,TAM,,	: Is there room in the output ring?
+	JEBS	WAIT4		: No, spin here until ISIS sets the bit
+: The TAM bit gets set when there is room for 4 or more bytes in output ring
+	CHI	R0,0		: Test for null
+	JE	ECHNUL		: Because it has to be handled special
+	JAL	R4,AWCI,,	: Write this char as echo
+	NHI	R0,7F
+	CHI	R0,0D		: Check for the carriage return character
+	JNR	R13		: Done if not
+	LHI	R0,0A		: Get a linefeed
+	JAL	R4,AWCI,,	: Echo this as well
+	JR	R13		: Done 
+
+ECHNUL	JAL	R4,AWCP,,	: Write NULL as an escaped character
+	JR	R13		: Done
+
+: Here to handle an escaped input character
+
+ESCIN	JAL	R4,AGCI,,	: Get char after the escape
+	  J	ESCIN		: Spin here until it arrives
+	CHI	R0,91		: End of break?
+	JNR	R13		: Ignore all other escaped characters
+	CBT	R5,ASECHO	: OK to echo after break end
+:Set up to output a welcome messsage
+	LB	R1,WELCOM	: Get byte count
+	LA	R2,WELCOM+1	: Address of message
+	STH	R1,ACOUNT	: Store this for DOASYO
+	ST	R2,APOINT	: (which will do it a few bytes at a time)
+	JR	R13		: End of DOASYI
+
+:--------------------------------------------------------------------------
+
+: Do async output
+
+DOASYO	LH	R5,APORT	: Do only port 0 in this assignment
+	TBT	R5,TAM,,	: Is there room do to anything?
+	JER	R13		: Wait until room for at least 4 bytes
+	LH	R1,ACOUNT	: Check if anything left to output
+	JER	R13		: Nothing waiting if count is zero
+	L	R2,APOINT	: Address where we left off
+	LB	R0,0,R2		: Get the next byte
+	SIS	R1,1		: Decrement count
+	STH	R1,ACOUNT
+	AIS	R2,1		: Increment pointer
+	ST	R2,APOINT
+:*:	CHI	R0,0		: Check for null
+:*:	JE	SENDNL		:(not needed if nulls are already escaped)
+	JAL	R4,AWCI,,	: Write normal character
+	J	DOASYO		: Check if OK to do more
+
+: Nulls must be handled special
+
+SENDNL	JAL	R4,AWCP,,	: Write escaped null
+	J	DOASYO		: Check if OK to do more
+
+: End of ASYNC lab problem.
+ 
