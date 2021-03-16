@@ -1,0 +1,854 @@
+TITLE	TRMTYP - Routine to determine terminal type
+SUBTTL	By Joe Smith, Colorado School of Mines.
+IF2,<PRINTX VISUAL-550 responds $[2c without the question mark>
+
+COMMENT ~
+
+   Many of the definitions used in this program were extracted from a program
+of the same name written by David Weaver and distributed with TOPS-10 7.02
+
+  TRMTYP is a routine to determine the type of terminal the job is running
+on by sending escape sequences.  It is designed to be used as a subroutine
+to INITIA, or as a standalone program on TOPS-10 (Dave Weaver's version runs
+on TOPS-20 but the CSM version is not fully implemented for TOPS-20).
+
+  It is the responsibility of the caller of TRMTYP to turn off echo and make
+sure that ESCape characters can be sent and received.  The call is via
+a "PUSHJ P,TRMTYP".  On return, T1 contains the terminal type (in SIXBIT
+for TOPS-10 and a number for TOPS-20), T2 contains the address of an ASCIZ
+description, and T3 contains 80 or 132 if the terminal is like a VT100.
+The sign bit of T2 is set for ANSI terminals operating in VT52 mode.
+
+  Because not all DEC-manufactured terminals are defined in the TOPS-10 or
+TOPS-20 monitors, the value returned in T1 is translated if necessary to
+be a known type.
+
+  I have not been able to find the identifying sequence for the following:
+
+	DAS21	RT805	VT05	VT06	VT62	VT72	VT78
+	VT101	VT103	VT110	VT170
+
+If anyone has any information on the above terminals, I would appreciate
+hearing from you so that I can make this program complete.
+	Joe Smith	(303)273-3448
+	Colorado School of Mines, Computing Center
+	Golden CO 80401
+
+;End of COMMENT ~
+
+
+
+;                Table of Contents for TRMTYP.MAC
+;
+;
+;			   Section			      Page
+;
+;    1. Feature-test definitions . . . . . . . . . . . . . . .   2
+;    2. Main program . . . . . . . . . . . . . . . . . . . . .   3
+;    3. TOPS10 and TOPS20 terminal types . . . . . . . . . . .   3
+;    4. VT52 type terminals  . . . . . . . . . . . . . . . . .   5
+;    5. ANSI terminals . . . . . . . . . . . . . . . . . . . .   6
+;    6. VTxxx and LAxxx options  . . . . . . . . . . . . . . .   7
+;    7. Expansion of macros  . . . . . . . . . . . . . . . . .   8
+;    8. Subroutine TRMTYP  (entry and exit points) . . . . . .  10
+;    9. Dispatch routines  . . . . . . . . . . . . . . . . . .  11
+;   10. Subroutines  . . . . . . . . . . . . . . . . . . . . .  16
+;                  Table of Contents for TRMTYP
+;
+;
+;			   Section			      Page
+;
+;    1. Feature-test definitions . . . . . . . . . . . . . . .   2
+;    2. Main program . . . . . . . . . . . . . . . . . . . . .   3
+;    3. TOPS10 and TOPS20 terminal types . . . . . . . . . . .   3
+;    4. VT52 type terminals  . . . . . . . . . . . . . . . . .   5
+;    5. ANSI terminals . . . . . . . . . . . . . . . . . . . .   6
+;    6. VTxxx and LAxxx options  . . . . . . . . . . . . . . .   7
+;    7. Expansion of macros  . . . . . . . . . . . . . . . . .   8
+;    8. Subroutine TRMTYP  (entry and exit points) . . . . . .  10
+;    9. Dispatch routines  . . . . . . . . . . . . . . . . . .  11
+;   10. Subroutines  . . . . . . . . . . . . . . . . . . . . .  16
+SUBTTL	Feature-test definitions
+
+;Revision history
+;  1	 2-Mar-80  JMS	Routine was hardcoded into CSM's INITIA
+;  2	11-Feb-83  DW	TRMTYP.EXE distributed on 702 tools tape
+;  3	 2-May-83  JMS	Used Dave Weaver's version to create a subroutine
+;			for INITIA.  Updated list of terminal types.
+;  4	 6-Dec-83  JMS	VT102 is "$[6c" with no parameters. (PC100,PC350)
+
+
+IFNDEF TOPS,<TOPS=10>
+   IFE TOPS-10,<SEARCH	MACTEN,UUOSYM>
+   IFE TOPS-20,<SEARCH	MACSYM,MONSYM>
+	SALL
+
+ND INITIA,0	;Set to -1 to interface with TOPS-10 INITIA
+	.DIRECTIVE FLBLST	;First line only of ASCIZ
+
+;AC definitions
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	A= 5
+	B= 6	;Byte pointer
+	C= 7	;Holds character
+	P=17
+
+;Other definitions
+	TTY==0		;Channel for OPENning terminal
+	PDLEN==20	;Stack size
+	LF=12
+	CR=15
+	ESC=33		;ESCape character
+	WAITIM==3	;Wait 3 seconds for a response
+
+	TWOSEG
+	RELOC	0		;Start in the LOSEG
+
+	ND RESPSZ,6		;30 character buffer
+RESP1:	BLOCK	RESPSZ*2	;First response
+RESP2=RESP1+RESPSZ		;Second immediately follows first
+STRG:	BLOCK	2		;6 ASCII chars
+
+TIMOUT:	BLOCK	1		;UDT of when to quit
+PTR:	BLOCK	1		;Byte pointer to RESP1 or RESP2
+VT1WID:	BLOCK	1		;Width for VT100 like terminals
+
+IFE INITIA,<PDL: BLOCK	PDLEN>	;If standalone main program
+
+	RELOC	400000		;Code in the HISEG
+
+PAGE
+IFE TOPS-10,<
+IFN INITIA,<OPDEF TTYSTR [2B8 2,]>	;Non-blocking string output LUUO
+IFE INITIA,<OPDEF TTYSTR [OUTSTR]>
+
+DEFINE GETUDT(AC),<
+	MOVE	AC,[%CNDTM]	;Get universal date/time
+	GETTAB	AC,
+	  MOVEI	AC,0		;Can never happen
+>
+>  ;End of TOPS-10
+
+IFE TOPS-20,<
+DEFINE	TTYSTR(ADDR),<
+	HRRO	T1,ADDR
+	PSOUT%
+>
+
+DEFINE	CLRBFI,<
+	MOVEI	T1,.PRIIN
+	CFIBF%
+>
+>  ;End of TOPS-20
+
+	OPDEF	IFIW	[1B0]
+	.NODDT	IFIW
+
+
+IF2,<IFE INITIA,<PRINTX	[Assembling stand-alone TRMTYP]>
+     IFN INITIA,<PRINTX	[Assembling TRMTYP for INITIA]>
+>  ;End of IF2
+
+
+SUBTTL	Main program
+
+IFE INITIA,<	;Main program
+START:	JFCL			;No CCL entry
+	MOVE	P,[IOWD PDLEN,PDL]
+	OPEN	TTY,[EXP .IOPIM,'TTY   ',0]
+	  HALT	.		;Impossible error return
+
+	PUSHJ	P,TRMTYP	;Determine terminal type, set up T1, T2, T3
+
+	RESET			;Cancel .IOPIM
+	PUSHJ	P,FIXESC	;Convert ESC to dollar sign
+	OUTSTR	[ASCIZ /Response was  /] ;Something like  $/Z  $[?1;2c  $[1;80R
+	OUTSTR	RESP1		;For debugging purposes, output RESP1
+	OUTSTR	RESP2		; and RESP2
+	OUTSTR	CRLF
+	PUSHJ	P,T1SIX		;Output the terminal type in T1 as SIXBIT
+	OUTSTR	[ASCIZ /	This terminal is /]
+	OUTSTR	(T2)		;Output description from T2 as ASCIZ
+	JUMPE	T3,DONE		;Done if default or unknown width
+	OUTSTR	[ASCIZ / set to /]
+	PUSHJ	P,T3DEC		;Output width in T3 as decimal
+	OUTSTR	[ASCIZ / columns/]
+
+DONE:	OUTSTR	CRLF
+	EXIT	1,
+	EXIT
+CRLF:	BYTE	(7)CR,LF,0
+
+T1SIX:	PUSH	P,T2		;Save other AC
+T1SIX1:	SETZ	T2,		;Clear junk
+	ROTC	T1,6		;Put a byte into T2
+	ADDI	T2,40		;Convert to ASCII
+	OUTCHR	T2		;Type it
+	JUMPN	T1,T1SIX1	;Loop till end
+	POP	P,T2		;Restore AC
+	POPJ	P,
+
+T3DEC:	IDIVI	T3,^D10		;Standard decimal output routine
+	HRLM	T4,(P)
+	SKIPE	T3
+	 PUSHJ	P,T3DEC
+	HLRZ	T4,(P)
+	ADDI	T4,"0"
+	OUTCHR	T4
+	POPJ	P,
+
+FIXESC:	MOVE	B,[POINT 7,RESP1]
+	MOVEI	A,RESPSZ*5*2	;All characters of both responses
+FIXES1:	ILDB	C,B		;Get a byte
+	CAIN	C,ESC		;Convert ESCape
+	 MOVEI	C,"$"		;To dollarsign
+	DPB	C,B
+	SOJG	A,FIXES1	;Loop for all chars
+	POPJ	P,
+>  ;End of IFE INITIA
+SUBTTL	TOPS10 and TOPS20 terminal types
+
+;ESCape sequences that trigger ID codes
+
+  ;Code for VT52 like terminals
+IDVT52:	BYTE(7) ESC,"Z",0		;This works for all but LA120
+
+  ;The ANSI sequence $[ causes a VT52 to go into HOLD-SCREEN mode, but $\
+  ;returns it to normal.  $\ is used to terminate ReGIS, it puts ANSI terminals
+  ;back in normal mode also.
+IDANSI:	BYTE(7) ESC,"[","c",ESC,"\",0	;Device Attributes code
+
+  ;These 2 sequences are for an ANSI terminal in VT52 mode
+SETANS:	BYTE(7) ESC,"<",ESC,"[","c",0	;Switch to ANSI mode and send ANSI ID
+SETV52:	BYTE(7) ESC,"[","?","2","l",0	;Back to VT52 mode (l=lowercase L)
+
+  ;To report width, $7 = Save cursor position, $[01;40H = in case double width
+  ;$[1;132H = Attempt to position to column 132 (stay at 80 if in 80 mode)
+  ;$[6n = Report current cursor position, $8 = Restore previous cursor position
+REPWID:	BYTE(7) ESC,"7", ESC,"[","0","1",";","4","0","H"
+	BYTE(7) ESC,"[","1",";","1","3","2","H", ESC,"[","6","n", ESC,"8",0
+
+;-------------------------------------------------------------------------------
+
+;  The following hardcopy terminals do not identify themselves:
+;2741	LA30	LA36	TTY33	TTY35	TTY37
+
+;  The following special purpose peripherals are not RS-232 devices:
+;RT800	RT700	VSV11	VT30H	VT36	VS100(VAXstation)
+;GT40	VR30	VP10	Type 30	  Type 340 (displays with lightpen)
+
+;  As of 4-Oct-83, TOPS-10 7.02 does not understand the following terminals:
+;LA12	LA34VA	LA50	LA80	LA100	PRO350	RT805	VT52H	VT55	VT62
+;VT71t	VT72t	VT78	VT80	VT110	VT131	VT132	VT170	VT220	VT240
+;VT241	VT278
+;  LA120J,VT102J     = Japanese terminals with Katakana character set
+;  LQP01,LQP02,LQP8F = Letter quality printers
+;  GIGI              = Better known alias for the VK100
+
+
+;TOPS20 types 4,5,6,7 are for customer definition (such as DataMedia 1521)
+;TOPS20 types 19 to 34 are not listed in MONSYM.MAC
+
+;--------  SIXBIT to TOPS-10 and TOPS-20 convertion list  -------------------
+
+DEFINE LSTNAM,<	XLIST
+ X  ANSI52,VT52  ,<.TTV52>	;ANSI terminal in VT52 mode
+ X  CRT   ,CRT   ,<.TTDEF>	;[CSM] *HACK* Defined as customer type
+ X  DAS21 ,VT52  ,<.TTV52>			;Not in TOPS20
+ X  DEFAUL,TTY   ,<.TTDEF== 8>	;Not in TOPS10			;TOPS-20 default
+ X  EXECUP,TTY   ,<.TTEXE== 3>	;Not in TOPS10
+ X  GIGI  ,VK100 ,<.TTK10>
+ X  GT40  ,TTY   ,<.TTG40==13>	;Not in TOPS10
+ X  H19   ,H19   ,<.TTH19==38>	;Not in TOPS10
+ X  IBMPC ,IBMPC ,<.TTDEF>	;Special CSM hack
+ X  IDEAL ,TTY   ,<.TTILD== 9>	;Not in TOPS10
+ X  LA12  ,TTY35 ,<.TTDEF>	;Not in TOPS10	;Not in TOPS20
+ X  LA30  ,LA30  ,<.TTL30==12>
+ X  LA36  ,LA36  ,<.TTL36==14>
+ X  LA34  ,LA34  ,<.TTL38>			;Not in TOPS20
+ X  LA34VA,LA34  ,<.TTL38>	;Not in TOPS10	;Not in TOPS20
+ X  LA38  ,LA38  ,<.TTL38==17>
+ X  LA50  ,LA36  ,<.TTL36>	;Not in TOPS10	;Not in TOPS20
+ X  LA80  ,LA36  ,<.TTL36>	;Not in TOPS10	;Not in TOPS20
+ X  LA100 ,LA36  ,<.TTL36>	;Not in TOPS10	;Not in TOPS20
+ X  LA120 ,LA120 ,<.TT120==18>
+ X  LA120J,LA120 ,<.TT120>	;Not in TOPS10	;Not in TOPS20
+ X  LQP01 ,LA120 ,<.TT120>	;Not in TOPS10	;Not in TOPS20
+ X  LQP02 ,LA120 ,<.TT120>	;Not in TOPS10	;Not in TOPS20
+ X  LQP8F ,LA120 ,<.TT120>	;Not in TOPS10	;Not in TOPS20
+ X  PC100 ,VT102 ,<.TT102>	;Rainbow-100      says VT102
+ X  PC200 ,VT100 ,<.TT100>	;DECmate II       says VT100 with AVO
+ X  PC350 ,VT102 ,<.TT102>	;Professional 350 says VT125 with AVO and STP
+ X  PRO350,VT102+,<.TT102>	;Not in TOPS10	;Not in TOPS20	;8-bit chars
+ X  TIPRO ,TIPRO ,<.TTDEF>	;Special CSM hack
+ X  TTY   ,TTY   ,<.TTDEF>					;TOPS-10 default
+ X  TTY33 ,TTY33 ,<.TT33==  0>					;ASR-33
+ X  TTY35 ,TTY35 ,<.TT35==  1>
+ X  TTY37 ,TTY   ,<.TT37==  2>	;Not in TOPS10
+ X  RT805 ,VT100 ,<.TT100>	;Not in TOPS10	;Not in TOPS20
+ X  VK100 ,VK100 ,<.TTK10==36>					;Alias for GIGI
+ X  VT05  ,VT05  ,<.TTV05==10>
+ X  VT06  ,VT06  ,<.TTV05>			;Not in TOPS20
+ X  VT50  ,VT50  ,<.TTV50==11>
+ X  VT52  ,VT52  ,<.TTV52==15>
+ X  VT52H ,VT52  ,<.TTV52>	;Not in TOPS10	;Not in TOPS20
+ X  VT55  ,VT52  ,<.TTV52>	;Not in TOPS10	;Not in TOPS20
+ X  VT61  ,VT61  ,<.TTV52>			;Not in TOPS20
+ X  VT62  ,VT62  ,<.TTV52>	;Not in TOPS10	;Not in TOPS20
+ X  VT71t ,VT52  ,<.TTV52>	;Not in TOPS10	;Not in TOPS20
+ X  VT72t ,VT52  ,<.TTV52>	;Not in TOPS10	;Not in TOPS20
+ X  VT78  ,VT52  ,<.TTV52>	;Not in TOPS10	;Not in TOPS20
+ X  VT80  ,VT52  ,<.TTV52>	;Not in TOPS10	;Not in TOPS20
+ X  VT100 ,VT100 ,<.TT100==16>
+ X  VT101 ,VT100 ,<.TT100>	;Not in 7.01A	;Not in TOPS20
+ X  VT102 ,VT102 ,<.TT102==37>
+ X  VT102J,VT102 ,<.TT102>	;Not in TOPS10	;Not in TOPS20
+ X  VT103 ,VT103 ,<.TT100>	;Not in 7.01A	;Not in TOPS20
+ X  VT110 ,VT100 ,<.TT100>	;Not in TOPS10	;Not in TOPS20
+ X  VT125 ,VT125 ,<.TT125==35>
+ X  VT131 ,VT100 ,<.TT131==39>	;Not in TOPS10
+ X  VT132 ,VT100 ,<.TT102>	;Not in TOPS10	;Not in TOPS20
+ X  VT170 ,VT100 ,<.TT100> ;Is the Video Module Evaluation Kit really a terminal?
+ X  VT180 ,VT180 ,<.TT100>	;Not in 7.01A	;Not in TOPS20
+ X  VT185 ,VT185 ,<.TT100>	;Not in 7.01A	;Not in TOPS20
+ X  VT200 ,VT220 ,<.TT102>	;Not in TOPS10	;Not in TOPS20	;NEW;
+ X  VT220 ,VT220 ,<.TT102>	;Not in TOPS10	;Not in TOPS20  ;NEW;
+ X  VT240 ,VT240 ,<.TT102>	;Not in TOPS10	;Not in TOPS20  ;NEW;
+ X  VT241 ,VT241 ,<.TT102>	;Not in TOPS10	;Not in TOPS20  ;NEW;
+ X  VT278 ,VT100 ,<.TT100>	;Not in TOPS10	;Not in TOPS20
+ X  WANGPC,WANGPC,<.TTDEF>	;Special CSM hack
+ X  2741  ,2741  ,<.TTL36>			;Not in TOPS20
+ EXP  0
+LIST	;End of LSTNAM>
+SUBTTL	VT52 type terminals
+
+
+DEFINE LSTOLD,<	XLIST	;List of older DEC terminals
+;;  # , NAME,dispatch,description
+;     ,<VT05>,,<a VT05>		;Unknown ID                     (???)
+;     ,<VT06>,,<a VT06>		;Unknown ID                     (???)
+ X "A",<VT50>,,<a VT50>		;VT52 with only 12 lines		     $/A
+ X "B",<VT50>,,<a VT50>
+ X "C",<VT55>,,<a VT55>		;VT55 not in TOPS-10/20
+;; "D",
+ X "E",<VT55>,,<a VT55>
+;; "F",
+;; "G",
+ X "H",<VT52>,,<a VT52H>	;VT52H not in TOPS-10/20
+;; "I",
+ X "J",<VT52>,,<a VT52H(COP)>
+ X "K",<VT52>,,<a VT52>		;Standard VT52				     $/K
+ X "L",<VT52>,,<a VT52(COP)>	;VT52 with screen copier
+ X "M",<VT52>,,<a VT52(PRT)>	;VT52 with printer port			     $/M
+ X "W",<WANGPC>,,<a Wang-PC in VT52 mode>	;Special CSM hack
+ X "X",<TIPRO>,,<a TI Professional in VT52 mode>;Special CSM hack
+ X "Y",<IBMPC>,,<an IBM-PC in VT52 mode>	;Special CSM hack
+ X "Z",<ANSI>,,<an ANSI terminal in VT52 mode>	;VT100 and others	     $/Z
+ X "`",<VT61>,,<a VT61>		;Multidrop DDCMP device
+ X "a",<VT61>,,<a VT61(COP)>	;VT61 with sceen copier
+ X "b",<VT61>,,<a VT61(PRT)>	;VT61 with printer port
+ X "c",<VT61>,,<a VT61(PRT+COP)>
+;     ,<VT62>,,<a VT62>		;Unknown ID, not in TOPS-10/20  (???)
+ X "#",<VT71>,,<a VT71t>	;VT71 not in TOPS-10/20
+;     ,<VT72>,,<a VT72t>	;Unknown ID, not in TOPS-10/20  (???)
+;     ,<VT78>,,<a VT78>		;Unknown ID, not in TOPS-10/20  (???)
+ EXP  0
+LIST	;End of LSTOLD>
+SUBTTL	ANSI terminals
+
+DEFINE LSTANS,<	XLIST	;List of ANSI terminals
+;;  #  NAME, dispatch, description
+ X  0,<VT180 >,      ,<a VT180(KERMIT 2.5)>	;An early KERMIT sends only  $[c
+ X  1,<VT100 >,$VT100,<a VT100>			;           DECmate II = $[?1;2c
+ X  2,<LA120 >,      ,<an LA120>
+ X  3,<LA34  >,$LA34 ,<an LA34 or LA38>		;     Graphics Printer = $[?3;7c
+ X  4,<VT132 >,$VT132,<a VT132>
+ X  5,<GIGI  >,      ,<a GIGI (alias VK100)>
+ X  6,<VT102 >,$80132,<a VT102>			;Rainbow-100 or PRO-350  = $[?6c
+ X  7,<VT131 >,$80132,<a VT131>			;VT132 + printer + half-duplex
+ X  8,<VT278 >,      ,<a VT278>			;VT278 not in TOPS-10/20
+ X  9,<LPQ8F >,      ,<an LQP8F>		;LQP8F not in TOPS-10/20
+ X 10,<LA100 >,      ,<an LA100>		;LA100 not in TOPS-10/20
+ X 11,<LA120J>,      ,<an LA120J(Katakana)>
+ X 12,<VT125 >,$VT125,<a VT125>			;Pro 350 = $[?12;7;0;102c
+ X 13,<LQP02 >,      ,<an LQP02>		;LQP02 not in TOPS-10/20
+ X 15,<LA12  >,      ,<an LA12>			;LA12  not in TOPS-10/20
+ X 16,<VT102J>,$80132,<a VT102J(Katakana)>
+ X 17,<LA50  >,      ,<an LA50 Letter Printer>	;LA50  not in TOPS-10/20
+ X 18,<VT80  >,      ,<a VT80>			;VT80  not in TOPS-10/20
+ X 19,<TTY   >,      ,<a CLATTER>	   ;?HUH?       (???)      ?????????????
+ X 20,<LA80  >,      ,<an LA80>			;LA80  not in TOPS-10/20
+ X 21,<PC350 >,$PC350,<a PC-350 in native mode (running PRO/BASIC)>
+ X 22,<VT102 >,$PC350,<a pre-production Professional 350 in VT102 mode>;Obsolete
+ X 23,<PRO350>,$PC350,<a Professional (PRO350) in 8-bit VT102+ mode>
+;; 24-61  unknown
+ X 62,<VT200 >,$VT200,<a VT200 family terminal>	;VT220/VT240 not in TOPS-10/20
+;;   ,<RT805 >,$80132,<a Ruggedized VT100>	;Unknown ID, not in TOPS-10/20
+;;   ,<VT101 >,$80132,<a VT101>			;Unknown ID     (???)
+;;   ,<VT103 >,$80132,<a VT103 with LSI-11/02>	;Unknown ID     (???)
+;;   ,<VT110 >,$80132,<a VT110 multidrop>	;Unknown ID, not in TOPS-10/20
+;;   ,<VT170 >,      ,<a Video Module Evaluation Kit>	;Unknown ID  (???)
+ EXP  0
+LIST	;End of TRMLST>
+SUBTTL	VTxxx and LAxxx options
+
+DEFINE LST12,<	PRINTX	The list of LA12 options is missing>
+DEFINE LST120,<	PRINTX	The list of LA120 options is missing>
+
+
+DEFINE LST34,<	XLIST	;List of LA34 options
+ X  0,<LA34  >,,<an LA34 or LA38>		;38 = 34 + number pad	 $[?3;0c
+ X  1,<LA34  >,,<an LA34(Extended)>		;			 $[?3;1c
+ X  2,<LA34  >,,<an LA34(Katakana)>		;			 $[?3;2c
+ X  3,<LA34  >,,<an LA34(Katakana+Extended)>	;			 $[?3;3c
+ X  7,<LA34VA>,,<an LA34VA Graphics Printer>	;Printer for GIGI	 $[?3;7c
+ EXP  0
+LIST	;End of LST34>
+
+;  VT100 series options:
+
+;1=STP something is connected to the Standard Terminal Port, such as
+;  VT1XX-AC printer port, PDP-11(VT103), Z80(VT180/VT185), Graphics(VT105/VT125).
+;2=AVO Advanced Video Option, 132 by 24 of underline, bold, blink, inverse.
+;  (printer port will not function without AVO)
+;4=GPO Graphics Processor Option, VT105 stripchart or VT125 ReGIS processor.
+;  (GPO always sets the "STP option is present bit")
+;8=PRT Printer Port, requires STP and AVO (GPO is still optional).
+DEFINE LST100,<	XLIST	;List of VT100 options
+ X  0,<VT100 >,,<a VT100>		;VT100 with no options		 $[?1;0c
+ X  1,<VT180 >,,<a VT180>		;VT180 (Z80 connected to STP)    $[?1;1c
+ X  2,<VT100 >,,<a VT100(AVO)>		;VT100 or DECmate II		 $[?1;2c
+ X  3,<VT180 >,,<a VT180(AVO)>		;VT180 with AVO			 $[?1;3c
+ X  4,<TIPRO >,,<a TI-PRO in VT100 mode>;Real VT100's never answer this  $[?1;4c
+ X  5,<VT105 >,,<a VT105>		;VT105 Graphics Processor	 $[?1;5c
+;;  6,<xxxxxx>,,<graphics processor requires STP, therefor 1;6c is not valid>
+ X  7,<VT105 >,,<a VT105(AVO)>
+;;  8,9,10 are not valid because printer port uses STP and requires AVO
+ X 11,<VT102 >,,<a VT102 (VT100 with printer port)> ;VT1XX-AC option	$[?1;11c
+;; 12,13,14 are not valid because printer port uses STP and requires AVO
+ X 15,<VT105 >,,<a VT105 with printer port>
+ EXP  0
+LIST	;End of LST100>
+
+
+DEFINE LST125,<	XLIST	;List of VT125 and VT185 options
+;;The third number is "1" if graphics printer is on-line, always "0" on PC350
+ X  5,<VT125 >,,<a VT125 or VT185>	;Graphics Processor only  $[?12;5;1;100c
+ X  7,<VT125 >,,<a VT125(AVO) or Professional-350> ;		  $[?12;7;0;102c
+ EXP  0
+LIST	;End of LST125>
+
+
+DEFINE LST132,<	XLIST	;List of VT132 options
+ X 11,<VT132 >,,<a VT132 with printer port>	;			$[?4;11c
+ X 15,<VT132 >,,<a VT132 with printer and graphics> ;			$[?4;15c
+ EXP  0
+LIST	;End of LST132>
+
+PAGE
+DEFINE LST200,<	XLIST	;List of VT200 series terminal options
+;;VT220 = $[?62;1;2;6;7;8c = 132+PRT+SE+DCRS+UDF
+;;VT240 = $[?62;1;2;3;4;6;7;8c = 132+PRT+SE+REGIS+SIXEL+DCRS+UDF
+;;VT241 = $[?62;1;2;3;4;6;7;8c = 132+PRT+SE+REGIS+SIXEL+DCRS+UDF (same as 240)
+;; Check the 3rd parameter, 3=VT240 or VT241, 6=VT220
+ X  1,<VT220 >,,<VT200+132>	;  80 and 132 column modes
+ X  2,<VT220 >,,<VT200+printer>	;  Has printer port
+ X  3,<VT240 >,,<VT240 or VT241>;* Has ReGIS graphics
+ X  4,<VT240 >,,<VT200+SIXEL>	;  Can ve SIXEL graphics (like LA34-GA)
+ X  5,<VT200 >,,<VT200+(5)>	;  ?? unknown
+ X  6,<VT220 >,,<VT220>		;* Selective erase
+ X  7,<VT220 >,,<VT200+DRCS>	;  Dynamically Redefinable Character Set
+ X  8,<VT220 >,,<VT200+UDF>	;  User Definable Keys
+;;< To get the Secondary Device Attributes, send $[>c
+;;< Responses are VT220 = $[>1;10;0c
+;;			1=VT220, 10=Microcode 1.0, 0=no options
+;;<		  VT240 = $[>2;10;1c
+;;			2=VT240, 10=Microcode 1.0, 1=integral modem
+ EXP  0
+LIST	;End of LST200>
+
+
+;Professional 350 options:  (Response depends on SETUP parameters)
+
+;$[?6c          = acts EXACTLY like a VT102 (except bold+inverse looks lousy)
+;$[?12;7;0;102c = acts like a VT125 with AVO and no DSR signal from printer
+;$[?21;2;0;0;0c = 350 in 7-bit Native mode (running PRO-BASIC)
+;$[?23;2;0;0;0c = 350 in 8-bit Professional mode
+;The number after the 21 or 23 explained below, the 3rd number is 0 (reserved)
+; the 4th is release level, 5th is 0 (reserved)
+;EBO=Extended Bit Map, two additional planes for a total of 3
+
+DEFINE LST350,<	XLIST	;List of Professional 350 options
+ X  0,<VT102 >,,<a Professional-350 without EBO>   ;		 $[?2x;0;0;0;0;c
+ X  1,<VT125 >,,<a Professional-350 with B&W EBO>  ;8 level gray $[?2x;1;0;0;0;c
+ X  2,<VT125 >,,<a Professional-350 with COLOR EBO>;8/256 colors $[?2x;2;0;0;0;c
+ EXP  0
+LIST	;End of LST350>
+SUBTTL	Expansion of macros
+
+DEFINE X(NAM,T10,T20),<SIXBIT \NAM\>
+TYPNAM:	LSTNAM		;Table of all known terminal types
+
+IFE TOPS-10,<	DEFINE X(NAM,T10,T20),<SIXBIT \T10\>	;Code is SIXBIT   >
+IFE TOPS-20,<	DEFINE X(NAM,T10,T20),<DEC <T20>>	;Code is decimal  >
+TYPCOD:	LSTNAM		;Table of closest equivalent in the Monitor
+
+DEFINE TABLES(TBL),<LALL	;;List of names of macros to expand
+TBL'ANS: LSTANS
+TBL'OLD: LSTOLD
+TBL'34:  LST34
+TBL'100: LST100
+TBL'132: LST132
+TBL'125: LST125
+TBL'350: LST350
+;;TBL'12:  LST12
+;;TBL'120: LST120
+TBL'200: LST200
+	SALL>
+
+
+;Expand the number and text table
+
+DEFINE X(NUM,NAM,DISP,TEXT),<XWD NUM,[ASCIZ ~TEXT~]>
+
+	RADIX 5+5	;Numbers are in decimal
+
+	TABLES(NT.)	;Number and text table
+
+	RADIX 8
+;Table expansion, continued
+
+;Expand the SIXBIT name table
+
+DEFINE X(NUM,NAM,DISP,TEXT),<SIXBIT \NAM\>
+	TABLES(NM.)	;Name table
+
+;Expand the dispatch table for ANSI terminals
+
+DEFINE X(NUM,NAM,DISP,TEXT),<IFNB <DISP>,<IFIW DISP+>0>	;For PUSHJ P,@DS.ANS(T2)
+DS.ANS:	LSTANS		;Dispatch table for terminal sub type
+
+	..==.		;Show ending address
+SUBTTL	Subroutine TRMTYP  (entry and exit points)
+
+;Routine to determine terminal type.
+;Call with terminal OPENned in Packed Image Mode to turn off echo.
+;Returns with terminal type in T1, addr of ASCIZ string in T2, and width in T3.
+
+TRMTYP::CLRBFI			;Clear any typeahead
+	SETZM	VT1WID		;Unknown width for now
+	PJOB	T1,		;Get job number
+	CTLJOB	T1,		;Are we on a PTY?
+	  MOVEI	T1,0		;Should not happen
+	JUMPG	T1,ISPTY	;Jump if controlled
+	TTYSTR	[ASCIZ /[Terminal type is /]
+	TTYSTR	IDVT52		;Send old IDENTIFY command "$Z"
+	MOVEI	T1,^D250	;Let the line settle a bit
+	HIBER	T1,
+	  JFCL
+	MOVEI	T1,RESP1	;Point to first area
+	PUSHJ	P,GETRSP	;Get the response
+	ILDB	C,PTR		;Get first char
+	JUMPN	C,TERM1		;Jump if terminal is talking to us
+
+	TTYSTR	IDANSI		;Send "$[c" to trigger DA - Device Attributes
+	MOVEI	T1,RESP1	;Point to first area
+	PUSHJ	P,GETRSP	;Get the response
+	ILDB	C,PTR		;(only the LA120 does not respond to $Z)
+	JUMPE	C,UNKNWN	;Give up if no response to either sequence
+
+TERM1:	CAIN	C,CR		;Carriage return?
+	 JRST	ISCRT		;Yes, SET TTY CRT
+	CAIE	C,ESC		;Escape?
+	 JRST	UNKNWN		;No, terminal not answering properly
+	ILDB	C,PTR		;Get second char of response
+	JUMPE	C,UNKNWN	;Give up if no 2nd char
+	CAIN	C,"/"		;VT52 like?
+	 JRST	VT52		;Yes
+	CAIN	C,"["		;ANSI ID?
+	 JRST	ANSI		;Yes, VT1XX, VT2XX, LA1XX
+
+UNKNWN:	SETZB	T1,T3		;No, unknown terminal type, default width
+	MOVEI	T2,[ASCIZ /unknown/]
+	CLRBFI			;Clear any bogus input from the terminal
+	TTYSTR	[ASCIZ /unknown]
+/]
+	POPJ	P,		;Return from TRMTYP
+
+ISPTY:	TRMNO.	T1,		;Get TTY number of controlling job
+	  JRST	ISBAT		;Assume BATCON if detached
+	MOVE	T2,T1		;Copy UDX
+	MOVEI	T1,.TOTRM	;Code to read terminal type
+	MOVE	A,[2,,T1]	;Point to arg
+	TRMOP.	A,
+	  MOVSI	A,'PTY'
+	MOVEI	B,[ASCIZ /controlled by a PTY/]
+	JRST	FINISH
+
+ISBAT:	MOVE	A,[SIXBIT/BATCH/]
+	MOVEI	B,[ASCIZ /controlled by BATCON/]
+	JRST	FINISH
+
+ISCRT:	MOVSI	A,'CRT'		;If response is CR, return generic CRT
+	MOVEI	B,[ASCIZ /a CRT (video terminal)/]
+
+FINISH:	PUSHJ	P,OUT6A		;Output A as SIXBIT
+	TTYSTR	[ASCIZ /]
+/]
+	PUSHJ	P,TRANS		;Translate name in A to appropriate value in T1
+	MOVE	T2,B		;Return addr of text in T2 (1B0 set if VT52)
+	MOVE	T3,VT1WID	;Get width if known
+	POPJ	P,		;Return from TRMTYP
+SUBTTL	Dispatch routines
+
+DEFINE DISPAT(NAM,FLAG),<XALL	;;FLAG is 52, ANSI, 132, or HC
+IFDIF <FLAG>,<52>,<
+	 PUSHJ	P,GETNUM	;Get next numeric parameter
+>
+IFIDN <NAM>,<200>,<
+	 PUSHJ	P,GETNUM	;Get 2nd parameter from VT200
+	 PUSHJ	P,GETNUM	;Get 3rd parameter from VT200
+>
+	 MOVEI	T4,NT.'NAM	;Addr of NAME/TEXT table
+	 PUSHJ	P,SEARCH	;Try to find index
+	   JRST	XX'NAM		;Not found, leave A and B unchanged
+	 MOVE	A,NM.'NAM(T2)	;Get terminal name
+	 HRRZ	B,NT.'NAM(T2)	;Get addr of text
+IFIDN <FLAG>,<52>,<
+XX'NAM:	 CAMN	A,['ANSI  ']	;If ANSI terminal in VT52 mode
+	  PUSHJ	P,ANS.52	;Get real type
+>
+IFIDN <FLAG>,<ANSI>,<
+	 SKIPE	DS.'NAM(T2)	;If dispatch address nonzero,
+	  PUSHJ	P,@DS.'NAM(T2)	; go do it
+>
+IFIDN <FLAG>,<132>,<
+	 PUSHJ	P,$80132	;Check for 132 column mode on VT100 like device
+>
+IFDIF <FLAG>,<52>,<
+XX'NAM:	 POPJ	P,
+>
+	SALL	;End of DISPAT(NAM)>
+
+
+;Here when terminal is like a VT52.				VT52 answers $/K
+
+VT52:	ILDB	C,PTR		;Get 3rd char
+	MOVE	T3,C		;Subroutine SEARCH tests T3
+	MOVE	A,['VT52? ']	;In case SEARCH fails
+	MOVEI	B,[ASCIZ /a VT52 emulator/]
+	DISPAT	OLD,52
+	JRST	FINISH		;Finish up and return
+;Here when terminal is in ANSI mode.			   VT100 answers $[?1;2c
+
+ANSI:	PUSHJ	P,$ANSI		;Determine type and options
+	JRST	FINISH
+
+;If ANSI terminal in VT52 mode, return ANSI52 as type, but correct description
+
+ANS.52:	TTYSTR	SETANS		;Switch to ANSI mode and send ANSI ID command
+	MOVEI	T1,RESP1+1	;Point to 1st area (overwrites 1st word of RESP2)
+	PUSHJ	P,GETRSP	;Get the response
+	ILDB	C,PTR		;Get the ESCape
+	CAIE	C,ESC
+	 JRST	ANS52X		;?Huh, but it said $/Z
+	ILDB	C,PTR		;Next char should be "["
+	CAIN	C,"["
+	 PUSHJ	P,$ANSI		;Get description of actual type in B
+ANS52X:	MOVE	A,['ANSI52']	;Return value for ANSI terminal in VT52 mode
+	TTYSTR	SETV52		;Put the terminal back in VT52 mode
+	TXO	B,1B0		;Signify ANSI terminal emulating a VT52
+	POPJ	P,
+
+;Here to decode the sequence that starts with $[?
+
+$ANSI:	ILDB	C,PTR		;Third char should be "?"
+	MOVE	A,['VT100?']	;In case SEARCH fails
+	MOVEI	B,[ASCIZ /is in ANSI mode/]
+	DISPAT	ANS,ANSI
+;Dispatch routines, continued
+
+;Get VT100 options
+
+$VT100:	DISPAT	100,132
+
+
+;Get VT125 options
+
+$VT125:	DISPAT	125,132
+;Dispatch routines, continued
+
+;Get VT132 options
+
+$VT132:	DISPAT	132,132
+
+
+;Get VT200 series options
+
+$VT200:	DISPAT	200,132
+
+
+;Get Professional-350 options
+
+$PC350:	DISPAT	350,132
+
+
+;Get LA34 options
+
+$LA34:	DISPAT	34,HC
+;Routine to determine whether terminal is in 80 or 132 column mode
+
+$80132:	PUSH	P,B		;Save byte pointer
+;The message "[Terminal type is "] leaves cursor in column 19
+	TTYSTR	REPWID		;Terminal will respond with $[1;80R or $[1;132R
+	MOVEI	T1,RESP2	;Point to second area
+	PUSHJ	P,GETRSP	;Get the response
+	ILDB	C,PTR		;Get first char
+	CAIE	C,ESC		;ESC?
+	 JRST	WIDTHX		;No, cannot determine width
+	ILDB	C,PTR		;Get next
+	CAIE	C,"["		;Proper response?
+	 JRST	WIDTHX		;No
+	PUSHJ	P,GETNUM	;Get line number
+	PUSHJ	P,GETNUM	;Get column number
+	CAIE	C,"R"		;End of cursor position?
+WIDTHX:	 MOVEI	T3,0		;Width is unknown
+	CAIN	T3,^D40		;Is top line double width characters?
+	 MOVEI	T3,^D80		;Yes, character number 40 is in column 80
+	CAIN	T3,^D66
+	 MOVEI	T3,^D132
+	CAIL	T3,^D40		;APPLE III says "$[24;19R" instead of $[1;80R
+	 MOVEM	T3,VT1WID	;Store VT100 width
+	POP	P,B		;Restore pointer to description
+	POPJ	P,
+
+
+;Routine to translate name in A to type or number in T1
+
+TRANS:	MOVEI	T2,0		;Start at the beginning
+TRANS1:	SKIPN	T1,TYPNAM(T2)	;Get next name
+	 MOVE	T1,A		;End of table, force a match
+	CAME	T1,A		;Match?
+	 AOJA	T2,TRANS1	;No, keep looking
+	MOVE	T1,TYPCOD(T2)	;Yes, return type code in T1
+	POPJ	P,
+
+;Routine to search for a match in the number/text table
+;Call with address of table in T2, item to match in T3
+
+SEARCH:	MOVE	T2,T4		;Start at the beginning
+SEARC1:	SKIPN	(T2)		;Hit the end?
+	 POPJ	P,		;Yes, give error return
+	HLRZ	T1,(T2)		;Get number
+	CAME	T1,T3		;Match?
+	 AOJA	T2,SEARC1	;No, keep looking
+	SUB	T2,T4		;Yes, reduce to offset
+	AOS	(P)		;Make for skip return
+	POPJ	P,		;T2 is now an index into the table
+SUBTTL	Subroutines
+
+;Routine to get a decimal number in T3, terminator in C
+
+GETNUM:	MOVEI	T3,0		;Clear number accumulator
+GETNM1:	ILDB	C,PTR		;Get next char from terminal
+	CAIL	C,"0"		;Is it a digit?
+	CAILE	C,"9"		; ...
+	 POPJ	P,		;No, number is in T3, character in C
+	IMULI	T3,^D10		;Yes, shift over previous digits
+	ADDI	T3,-"0"(C)	;Add to total
+	JRST	GETNM1
+
+;Routine to get a response from the terminal, call with addr for response in T1.
+;End of response is any alphabetic character, or a 2-second timeout.
+
+GETRSP:	SETZM	(T1)		;Clear the response area
+	HRLI	T1,(POINT 7,)	;Make byte pointer
+	MOVEM	T1,PTR
+	MOVEI	T2,1(T1)	;Create BLT pointer
+	HRL	T2,T1		
+	BLT	T2,RESPSZ-1(T1)
+	PUSHJ	P,WAITO		;Wait until output is finished
+	GETUDT	T1,		;Get current time in T1
+	ADDI	T1,WAITIM*3	;Wait for 2 seconds max
+	MOVEM	T1,TIMOUT
+	MOVE	B,PTR		;Set up byte pointer
+
+GETRS1:	PUSHJ	P,GETCH		;Get a character
+	IDPB	C,B		;Store it
+	CAIL	C,"A"		;Alphabetic?
+	CAILE	C,"z"
+	 JUMPN	C,GETRS1	;No, get more if not "end of input"
+	CAILE	C,"Z"
+	CAIL	C,"a"
+	 JRST	GETRS2		;Stop at alpha or null
+	JRST	GETRS1		;Get more
+
+GETRS2:	MOVEI	C," "		;For ease in debugging,
+	IDPB	C,B		; put 2 blanks at the end
+	IDPB	C,B		; of the response
+	MOVEI	C,0
+	IDPB	C,B		;So that RESP1$0T works in DDT
+	POPJ	P,
+
+;Routine to output the contents of A in SIXBIT
+
+OUT6A:	MOVE	T2,A		;Copy word
+	SETZM	STRG		;Clear string storage
+	SETZM	STRG+1
+	MOVE	T3,[POINT 7,STRG]
+OUT6A1:	MOVEI	T1,0		;Clear junk
+	ROTC	T1,6		;Put a byte in T1
+	ADDI	T1," "		;Make printing
+	IDPB	T1,T3		;Store in string
+	JUMPN	T2,OUT6A1	;Loop till done
+	TTYSTR	STRG		;Output the message
+	POPJ	P,
+;Terminal I/O routines
+
+IFE TOPS-20,<
+WAITO:	MOVEI	T1,.PRIOU
+	DOBE%			;Dismiss until output buffer is empty
+	POPJ	P,
+
+GETCH:	;Routine to input a single character, in particular, an ESCape
+	MOVEI	C,0
+    PRINTX GETCH: has not been written for TOPS-20
+	POPJ	P,
+>  ;End of TOPS-20
+
+IFE TOPS-10,<
+;Routine to wait until the output buffer is empty
+;This routine should be rewritten to take into account delays in the network.
+
+WAITO:	MOVX	T1,.TOSOP	;Code to skip if output in progress
+	SETO	T2,		;Our terminal
+	MOVE	C,[2,,T1]	;Point to args
+	TRMOP.	C,		;Has the TTYSTR finished?
+	  POPJ	P,		;Yes
+	MOVX	C,HB.RTC+^D100	;No, wait a bit for output to finish
+	HIBER	C,		;(I wish TOPS-10 had a DOBE)
+	  JFCL
+	JRST	WAITO		;Check if done now
+
+;Routine to get a character from the terminal, with timeout
+
+GETCH:	SKPINC			;Post a read request with the monitor
+	  JFCL
+	INCHRS	C		;Skip if a char is available
+	 TDZA	C,C		;Not yet, wait a bit
+	  POPJ	P,		;Got one
+	GETUDT	T1,		;Get time now
+	CAMLE	T1,TIMOUT	;Waited too long?
+	 POPJ	P,		;Yes, return with zero in C
+	MOVX	T1,HB.RTC+^D250	;Wait up to 1/4 second for a char
+	HIBER	T1,
+	  JFCL
+	JRST	GETCH		;Try again
+>  ;End of TOPS-10
+
+LITS:	END	IFE INITIA,<START>
+
+  {Wrc
