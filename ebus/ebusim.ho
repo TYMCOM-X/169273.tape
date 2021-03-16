@@ -1,0 +1,334 @@
+.	<<	EBUSIM.HO	>>
+
+.SEC(|Host Output|)
+
+	This section deals with messages received from the host.  Most of
+these will be transliterated, and forwarded to ISIS.
+
+	Block-I/O will be treated in a seperate section.
+
+.BEGIN BLOX
+.TOPIC(PDPOSZ Variable)
+	NOTE:###Host-output is "throttled" by counter "ORRN";  this limits
+host-output to no more than <PDPOSZ> PDP-words per EXEC-loop.
+.END
+
+	The actual code follows (Note...for convenience, this is shown as
+Function;  in reality, "return" means "goto ISISIN"):
+
+.SKIP BEGIN VERBATIM
+HOSTIN()
+{   while ( not HTDWN )		/* exit if Host down */
+.TOPIC(|PUTOEC Routine|)
+    {	PUTOEC();		/* tell Host where our Cursor is */
+	if (ORRN < 0) break;	/* throttle us to 1 ring/invocation */
+	GETOFP();		/* read PDP's cursor */
+	if (PDPOFC==PDPOEC) break; /* quit if we've caught up */
+	RDPDP();		/* get next word */
+	TYPBYT = DAT1;		/* extract message-type */
+	SETPORT(DAT2);		/* ..and port -- set up */
+.TOPIC(GEHTLN Routine)
+	if (not ROOM(GEHTLN()) goto HOUT2; /* abort if no room
+					  to forward message */
+	if ( TYPBYT > $80 )	/* text message */
+	{	/* The message contains text (data) only */
+	    TYPBYT -= $80;	/* # chars */
+	    SLOR( PORTNM, TYPBYT );
+	    char *next = DAT3;	/* cursor for fetching bytes */
+	    while ( TYPBYT-- > 0 )
+	    {	PUTCH(*next++);
+		if ( (TYPBYT > 0) && (next > DAT4)
+		{   RDPDP();	/* get another word */
+		    next = DAT1; /* init. for new scan */
+		}
+	    }
+	    ELOR();
+	    continue;
+	}
+
+	*/	Control Message		*/
+	if (	TYPBYT==$16	/* these types require response */
+	     ||	TYPBYT==$19
+	     ||	TYPBYT==$1F
+	     ||	TYPBYT==$22
+	     ||	TYPBYT==$2E )
+.TOPIC(FDRGSZ Routine)
+	{   FDRGSZ();		/* find space available */
+	    if (INRGSP < 8)
+		goto HOUT2	/* abort if not enough space */
+	}
+
+	/*	Process individual Control-message Types	*/
+	switch (TYPBYT)
+	{
+
+	case 1:		/* Host Open */
+	    int V = 0;
+
+OPSHT:	    if (HSTAT == 1)	/* host was down */
+	    {	NPORTS = 0;
+		while (*.SLOWC-HTM < 8); /* insure no "yoyo" */
+		HTM = *.SLOWC;
+	    }
+	    HSTAT = V;
+	    HREPRT();		/* report new state */
+	    break;
+.SKIP 3
+        case 2:		/* Host Shut */
+	    V = 2; goto OPSHT;
+.SKIP 3
+	case 3:		/* Reset Interface */
+	    HVERNO = (short) DAT3; /* record host version number */
+	    EMPTY();		/* empty ISIS input-ring */
+	    HODOWN();		/* set Host Down */
+	    DAT1 = 4;		/* ACK it...type 4 */
+	    DAT2 = DEBUG;	/* 0 = normal, 1 = debugging */
+	    (short) DAT3 = VERSION;
+.TOPIC(|WAITDAT Routine|)
+	    WAITDAT();		/* wait and send ACK */
+.SKIP 3
+	case 4:		/* Reset Acknowledgement */
+	    HVERNO = (short) DAT3; /* record host version number */
+	    break;
+.SKIP 3
+	/*	The following cases all use common code SPEC	*/
+	case 8:		/* back-pressure On */
+	    if ( Rp->P_FLAGS & PF_HBP != 0 )
+		break;		/* Ignore if repeat */
+	    if ( Rp->P_FLAGS & PF_IBP != 0 )
+		break;		/* Ignore if we've applied it */
+	    goto SPEC;		/* SPEC is common code */
+
+	case 9:		/* back-pressure Off */
+	    if ( Rp->P_FLAGS & PF_HBP == 0 )
+		break;		/* Ignore if repeat */
+	    if ( Rp->BCT != 0 )
+		break;		/* Ignore if stuff buffered */
+	    if ( Rp->P_FLAGS & PF_IBP == 0 )
+		break;		/* Ignore if we've applied it */
+	    goto SPEC;		/* SPEC is common code */
+
+	case 11:	/* Zapper */
+	    if (PORTNO == 0)
+		break;	/* ignor for port 0 */
+	    if ( Rp->P_FLAGS & PF_ACT != 0 )
+	    {	DPORT();	/* port active...reduce count */
+		RBTALL();	/* turn port off */
+	    }
+	    goto SPEC1;
+
+	case 10:	/* Gobbler */
+	case 12:	/* Enter DEM */
+	case 13:	/* Leave DEM */
+	case 14:	/* Green Ball */
+	case 15:	/* Red Ball */
+	case 16:	/* Yellow Ball */
+	case 17:	/* Orange Ball */
+	case 18:	/* Hang-Up */
+	case 19:	/* Enter Transparancy */
+	case 20:	/* Leave Transparancy */
+	case 49:	/* Enter Alternate Output Device */
+	case 50:	/* Leave Alternate Output Device */
+			/* and, of course, 8, 9, and 11 too */
+SPEC:	    if ( Rp->P_FLAGS & PF_ACT == 0 )
+		break;		/* ignor if inactive port */
+
+SPEC1:	    SENDQI(PORTNO,SPTAB[TYPBYT]);
+	    break;		/* send it and go to next one */
+.SKIP 3
+/*	Case 22 and 24 together are used to request an AUX circuit.
+	The PDP expects to have to deal with the Sup directly;  under
+	ISIS, this is perfomed by the node code.  When PDP send the
+	22, we verify that this is the only outstanding request, and
+	then acknowledge it.  Subsequently, PDP send us successive
+	logon characters, which we buffer until we receive <CR> or
+	<;>, terminating the logon.  We then format up an ISIS Aux-
+	Pseudo-needle request, and forward it to ISIS.  Subsequent
+	operations are described in the ISISIN module.
+*/
+	case 22:	/* Supervisor Request */
+	    if ( AUXX => 0 )	/* last request still in progress */
+		if (  ( ( *.SLOWC - AUXTIM ) & (-32) ) != 0  )
+.TOPIC(SEND17 Routine)
+		{   SEND17($0900); /* reject request, timeout */
+		    break;
+		}
+	    SEND17(0);		/* approve request */
+	    AUXX = 0;		/* enable activity */
+	    AUXQ = PORTNM;	/* ...for this port */
+	    AUXTIM = *.SLOWC;	/* record time */
+.TOPIC(|PUTIFC Routine|)
+	    PUTIFC();		/* let PDP know */
+	    break;
+
+	case 24:	/* SUP Login Char */
+	    if ( PORTNM != AUXQ )
+		break;		/* ignor if not the current port */
+	    AUXC[AUXX++] = DAT3 | $80; /* save char */
+	    if ( DAT3==';' || DAT3=='\n' ) /* CR or ; terminate */
+	    {	WAITIS(AUXX+11); /* insure space in ISIS ring */
+		SLOR(0,8);	/* request Aux Circuit */
+		PUTCH(0);	/* padding */
+		PUTH((PORTNO);	/* local key */
+		PUTH(0);	/* no IIX */
+		PUTH(HOSTN);	/* Orig. host */
+		PUTCH(AUXX-1);	/* size */
+		for ( V=0 ; V<AUXX ; V++ )
+		    PUTCH(AUXC[V]); /* login-string */
+		ELOR;
+	    }
+	    break;
+.SKIP 3
+	case 25:	/* Test pattern Probe */
+	    DAT1 = $1A;		/* set response */
+	    DAT2 = 0;		/* for port 0 */
+.TOPIC(|WRDAT Routine|)
+	    WRDAT();		/* send back first word */
+	    WRDAT(RDPDP() );	/* send back second word */
+.TOPIC(|PUTIFC Routine|)
+	    PUTIFC();		/* tell it's there */
+	    break;
+.SKIP 3
+	case 27:	/* Host Sad */
+	    WAITIS(10);		/* wait for space in ISIS ring */
+	    SLOR(0,3);		/* port 0, diagnostic message */
+	    PUTCH(0);		/* padding */
+	    PUTH(RDPDP( ) );	/* host-specified value */
+	    PUTH($1000);	/* diagnostic type $10 */
+	    PUTCH(PRODID);	/* product-ID */
+	    ELOR();
+	    break;
+.SKIP 3
+	*/	The PDP treats Echo specially;  In ISIS, Echo is a
+		special case of terminal-parameters.
+	*/
+	case 28:	/* Echo On */
+	    DAT3 = 0;		/* subtype = 0 */
+	    DAT4 = 1;		/* value = 1 */
+	    goto STERM;		/* STERM forwards it */
+
+	case 29:	/* Echo Off */
+	    DAT3 = 0;
+	    DAT4 = 0;
+	    goto STERM;		/* STERM forwards it */
+
+	case 30:	/* Set Terminal Characteristics */
+	    if ( unsigned DAT3 >= $14) MERROR(); /* range-check */
+
+STERM:	    if ( Rp->P_FLAGS & PF_ACT == 0 )
+		break;		/* ignore inactive ports */
+	    WAITIS(8);		/* insure space in ISIS ring */
+	    if (DAT3 == 5)	/* special handling for
+				   Input Baud Rate */
+	    {	Rp->IBRATE = DAT4;
+		PTSMN1();	/* report it back */
+		break;
+	    }
+	    SLOR(PORTNM,$B1);	/* B1 is Set parameters */
+	    PUTCH(DAT3);	/* Dat3 is subtype */
+	    PUTCH(DAT4);	/* Dat4 is value */
+	    ELOR();
+	    break;
+.SKIP 3
+/*	subtype 63 is special case for query ALL parameters	/*
+	case 31:	/* query terminal characteristics */
+	    if ( Rp->P_FLAGS & PF_ACT == 0 )
+		break;		/* ignore inactive ports */
+	    if ( unsigned DAT3 <= $14)
+		PTMSND();	/* send one message */
+	    else if ( DAT3 = 63 )
+		for ( DAT3 = 0 ; DAT3 < $14 ; DAT3++ )
+		    PTMSND();	/* query all */
+	    break;
+.SKIP 3
+	case 33:	/* Set Host Number */
+	    if ( DAT3 != HOSTN || DAT2 != NPORTS )
+		HDOWN(3);	/* set Gone if changing things */
+	    else HDOWN(1);	/* ...otherwise just Down */
+	    HOSTN = DAT3;	/* new host number */
+	    if ( (HOSTP = PORTNO) == 0 )
+		HOSTP = MAXPORT-2; /* default number of ports */
+	    if ( HOSTP > MAXPORT-2 )
+		HOSTP = MAXPORT-2; /* range-check */
+	    MXPORT = HOSTP-3;
+	    HSTAT = 2;		/* set Shut */
+	    HREPRT();		/* report new Host-state */
+	    break;
+.SKIP 3
+	case 34;	/* SUP Clock Request */
+	    break;		/* just ignore it */
+.SKIP 3
+/*	THE CASES 38, 40, 42, 44, and 46 ARE ALL RELATED TO BLOCK-IO,
+	AND ARE TREATED IN THAT SECTION.
+.SKIP 3
+	case 51:	/* Set new Timeout Value */
+	    TOHOST = HOSTTO = (short) DAT3; /* set variables */
+	    break;
+.SKIP 3
+	Default:	/* all others */
+	    MERROR();	/* message-error Crash */
+
+	}	/* switch */
+	continue;
+
+/*	Must abort..."unread" last message */
+HOUT2:	if ( --PDPOEC < 0 )
+		PDPOEC = PDPOSZ-1; /* back up cursor */
+	break;
+
+    }	/* while (not HTDWN) */
+    return;
+}
+.END
+
+.SKIP 3
+	Specialized internal routines include:
+.SKIP BEGIN VERBATIM
+	/* send a single Request Terminal Characteristics Message */
+.DTOPIC(|PTMSND Routine|)
+PTMSND()
+{	if ( DAT3 = 5 )
+	    PTSMN1();		/* special case for 5 (IBR) */
+	else
+	{   ROOM(4);		/* we'll need 4 chars of space */
+	    SLOR(PORTNO,$B0);
+	    PUTCH(DAT3);	/* subtype */
+	    ELOR;
+	}
+	return;
+}
+.SKIP 3
+	/* return subtype=5 value to host */
+.DTOPIC(PTSMN1 Routine)
+PTSMN1()
+{	DAT1 = $20;
+	DAT2 = PORTNO;
+	DAT3 = 5;
+	DAT4 = Rp->IBRATE;	/* reply with internal IBR */
+.TOPIC(|WRDAT Routine|)
+	WRDAT();
+	return;
+}
+.SKIP 3
+	/* return Sup response (to AUX-circuit) to host */
+.DTOPIC(SEND17 Routine)
+SEND17(v)
+int	v;			/* value to return */
+{	DAT1 = $17;
+	DAT2 = PORTNO;
+	(short) DAT3 = v;
+.TOPIC(|WAITDAT Routine|)
+	WAITDAT();
+	return;
+}
+.SKIP 3
+	/* Translate PDP message-length to ISIS message-length */
+.DTOPIC(GEHTLN Routine)
+int	GEHTLN()
+{	if (  ( int v = ( unsigned char ) TYPBYT ) > $80  )
+	    return ( v - $80 + 3 );
+	else
+	    return ( TRHSTLN[v] );
+}
+.END
+ 
