@@ -1,0 +1,366 @@
+:
+:	Carl A Baltrunas,   TTE 442	Lab #3
+:	Source file for SLOT #1
+:
+
+	RA	0			: Reset radix (some libraries don't)
+
+MAXBIT	EQ	(MAXPRT+20-1)/20	: Max ports as bits for words
+WRDSIZ	EQ	4			: Bytes per word
+
+CmCr	EQ	0D			: Carriage return
+CmBELL	EQ	07			: Bell
+CmESC	EQ	1B			: Escape
+
+CmCONN	EQ	43			: "C"onnect
+CmHELP	EQ	48			: "H"elp
+CmMSGS	EQ	4D			: "M"essage
+CmQUIT	EQ	51			: "Q"uit
+CmTIME	EQ	54			: "T"ime of day
+CmWHAT	EQ	57			: "W"hat
+
+	SEG	A.DATA
+
+: Constant data storage
+
+	BC	0			: Dummy
+HUPMSG	BC	0E			: Msg byte count
+	HC	1000,HST0,HPRT0,0,0	: Host up message (type 10)
+	HC	PRODID,0		: Prod ID & filler for msg
+	BC	0			: Dummy
+HSTOOP	BC	8			: Msg byte count
+	HC	0A00,HST0,0,0		: Host port availability (none)
+	BC	0			: Dummy
+HSTOKP	BC	8			: Msg byte count
+	HC	0A00,HST0,HPRT0,0	: Host port availability
+
+WELMSG	SC	\"0A"0D"0DG'Day Bubba!"0A"0DWelcome to Carl's Host"0A"0D"0D\
+UIDMSG	SC	\"0A"0DUserid: \
+PMTMSG	SC	\"0A"0D=> \
+MxBYE	SC	\"0A"0DGo Away!!!"0A"0D"0A"0D\
+MxALQ	SC	\"0A"0DQuit already in progress! Go Away!!!"0A"0D"0A"0D\
+MxTIME	SC	\"0A"0DTime now is \
+MxBELL	SC	\"07\			: Ding!
+MxCRLF	SC	\"0A"0D\
+
+MxDET	HC	019E			: Detach message
+MxZAP	HC	019F			: Zap message
+MxEBP	HC	01A0			: Enable back-pressure message
+MxDBP	HC	01A1			: Disable back-pressure message
+MxGOB	HC	01A2			: Character gobbler message
+MxFINP	HC	01A3			: Flush input message
+MxBLB	HC	01A4			: Black ball message
+MxGRB	HC	01A5			: Grey ball message
+MxSDEM	HC	01A6			: Start Deferred Echo Mode
+MxFDEM	HC	01A7			: Finish Deferred Echo Mode
+MxGB	HC	01AA			: Green ball message
+MxRB	HC	01AB			: Red ball message
+MxYB	HC	01AC			: Yellow ball message
+MxOB	HC	01AD			: Orange ball message
+
+UIDSIZ	HC	4*WRDSIZ		: Words for user id entry
+: Variable data
+
+TCLASS	BS	MAXPRT			: Throughput class of port
+CCTYPE	BS	MAXPRT			: CCT for each port
+NFROM	HS	MAXPRT			: Node of origin for each port
+HFROM	HS	MAXPRT			: Host of origin for each port
+
+MsPORT	HS	1			: Current message port
+MsTYPE	HS	1			: Current message type
+CHRCNT	HS	1			: Place to hold character count
+LOGINS	WS	1			: Count number of active logins
+
+: Flags
+
+LOGGED	WS	MAXBIT			: Bit array - Logged-in
+LOGDET	WS	MAXBIT			: Bit array - DET sent
+NEEDID	WS	MAXBIT			: Bit array - need Id
+NEEDCR	WS	MAXBIT			: Bit array - need CR
+
+PORTSC	WS	MAXPRT*UIDSIZ		: Storage for port id's
+
+SvTIME	SC	\HH:MM:SS"0A"0D\		: Time of day
+
+	SEG	A.CODE
+
+: Program begins here, entry defined by START.LIB
+: Output initial host-up message to the SUP
+
+START	LIS	R2,0			: RPORT = 0
+	LA	R3,HUPMSG,,		: Setup msg address
+	JAL	R5,OCM,,		: Send message
+
+: Main message input loop, all routines return here one way or another
+
+NOMSGS	SVC	DISMIS			: Done
+ISMSG	JAL	R4,LOOK,,		: Look for a message (FRING)
+	  J	NOMSGS			: No messages
+
+: R1 condition codes setup. for message port (by FRING)
+: Messages with RPORT=0 can be tested at this point
+
+	JE	ZFLUSH			: RPORT 0 Msg!  Flush it
+
+: Save RPORT and message TYPE for this message for later
+
+	STH	R1,MsPORT		: Save current port
+	STH	R2,MsTYPE		: Save current type
+	LR	R2,R2			: Set condition codes for type
+	JE	ISNDL			: Got a needle?
+
+: Decide whether this is control or data
+
+	CHI	R2,09E			: Control or data message?
+	JL	MsDATA			: Data! -- Process the data
+	CHI	R2,09F			: ZAP? (received on port)
+	JE	MsIZAP			: Yes, incoming zap!
+
+: Come here to flush non-rport=0 messages
+: before returning to main loop
+
+MFLUSH	LH	R2,MsTYPE		: Remember type
+	LB	R0,LENGTH,R2,		: Get RPORT=N index byte
+	JAL	R4,FLUSH		: Flush message
+	J	ISMSG			: Any more messages
+
+: Come here to flush rport=0 messages
+: before returning to main loop
+
+ZFLUSH	LH	R6,LP0LST,,		: Get RPORT=0 index table
+	LB	R0,NRATE,R6,R2		: NRATE+TABLE(R2) Get message size
+	JAL	R4,FLUSH		: Flush message
+	J	ISMSG			: Any more messages
+
+: Control message code:  Handle Circuit-ZAP
+
+MsIZAP	LH	R2,MsPORT		: Get current port
+	RBT	R2,LOGDET		: Clear DET bit for this port
+	RBT	R2,LOGGED		: Clear logged-in bit
+	LA	R3,MxZAP		: Get zap message
+	JAL	R5,OCM,,		: Send it <Whack>
+	LIS	R2,0			: Tell the supervisor
+	LA	R3,HSTOKP		: host no longer
+	JAL	R5,OCM,,		: out of ports
+	LH	R0,LOGINS		: Decrement login count
+	SIS	R0,1			:  by 1
+	STH	R0,LOGINS		: to keep us honest
+	J	MFLUSH			: Return through flushing code
+
+: We have a needle, print startup (welcome) message to port and fall through
+
+ISNDL	LH	R2,MsPORT,,		: Get RPORT
+	RBT	R2,LOGDET		: Clear DET sent bit
+	RBT	R2,NEEDCR		:  and CR needed bit
+	JAL	R4,GETH,,		: Get 00+Messagelength
+	LR	R6,R0			: Remember length (bytes)
+	JAL	R4,GETW,,		: Grab invoice Number (to throw away)
+	JAL	R4,GETW,,		: Grab Dest-host, Orig Node
+	STH	R0,NFROM,R2,		: Store NODE of origin
+	JAL	R4,GETH,,		: Grab HOST of origin
+	STH	R0,HFROM,R2,		: Store it
+	JAL	R4,GETH,,		: Get port of origin (logical)
+	JAL	R4,GETW,,		: Get xxxx, xx Throughput class
+	STB	R0,TCLASS,R2,		: Store it (byte)
+	JAL	R4,GETH,,		: IIX + Destination node
+	JAL	R4,GETCH,,		: Get Circuit Control Type
+	STB	R0,CCTYPE,R2,		: Store for later
+	JAL	R4,GETCH,,		: Finish word
+	SHI	R6,5*4			: Decrement count by 5 full words
+	LR	R0,R6			: Get remaining byte count
+	JAL	R4,FLUSH,,		: Flush needle
+
+: Instead of prompting for Userid, later just use the username from the needle
+
+	LH	R2,MsPORT,,		: Get current port
+	LA	R3,WELMSG,,		: Get greeting message
+	JAL	R5,OCS,,		: Print message
+	LH	R1,LOGINS		: Get login count
+	AIS	R1,1			:   increment
+	STH	R1,LOGINS		:   and store
+	CHI	R1,HPRT0		: Reached port limit?
+	  JL	WANTID			: No, keep going
+	LIS	R2,0			: Tell the supervisor
+	LA	R3,HSTOOP		: host out of ports
+	JAL	R5,OCM,,		: so no more circuits
+: Ask the user for an ID - This need not be unique
+
+WANTID	LH	R2,MsPORT		: Get current port
+	SBT	R2,NEEDID		: Set need ID bit for this port
+	SBT	R2,NEEDCR		:  and wait for a CR too
+	LR	R3,R2			: Copy for offset
+	SIS	R3,1			: Decrement for 0 offset
+	MH	R3,UIDSIZ		: Multiply by entry size
+	LIS	R1,0			: Set to initial constant
+	STH	R1,PORTSC,R3,		:  for user id
+ASKUID	LA	R3,UIDMSG		: Get user id message
+	JAL	R5,OCS,,		: Print request
+	J	ISMSG			: Any others
+
+: Send a prompt to the currently selected port
+
+PRMPT	LH	R2,MsPORT		: Get RPORT
+	TBT	R2,NEEDCR		: Need a CR before re-prompt?
+	  JN	ISMSG			: Yes, don't say a thing
+	TBT	R2,NEEDID		: Waiting for user id?
+	  JN	ASKUID			: Yes, ask instead of prompt
+	SBT	R2,NEEDCR		: Say we need a CR
+	LA	R3,PMTMSG,,		: Get prompt message
+	JAL	R5,OCS,,		: Print message
+	J	ISMSG			: Any more messages
+: Received a data message.  For this exercise, we are looking for
+: a particular command, sans case, sans parity:
+:
+:	C = Connect to another line (echo on both)
+:	H = Help
+:	M = Message another line (send one time message)
+:	Q = Quit, teardown circuit and wait for a new login
+:	T = Print daytime in local time zone
+:	W = What lines are active and Who is on-line
+:
+:	any other character causes a bell
+:
+
+MsDATA	JAL	R4,GETCH		: Get count of characters (MsType)
+	STH	R0,CHRCNT		: Copy byte count to loop register
+	LH	R2,MsPORT		: Get current port number
+	TBT	R2,NEEDID		: Waiting for UserId?
+	  JN	MuDATA			: Yes, get user Id
+MsLOOP	JAL	R4,GETCH,,		: Get data byte
+	JAL	R4,CSEVEN,,		: Clip it to 7 bits (upper case)
+	CHI	R0,CmQUIT		: Do we want to quit?
+	JE	CxQUIT			: Yes
+	CHI	R0,CmTIME		: Do we want the time?
+	JE	CxTIME			: Yes
+	CHI	R0,CmWHAT		: Do we want to know what?
+	JE	CxWHAT
+	CHI	R0,CmCR			: A Return?
+	JN	MsUNK			: No, unacceptable -- beep
+	LH	R2,MsPORT		: Get current port number
+	RBT	R2,NEEDCR		: No longer waiting for CR
+MsNEXT	LH	R0,CHRCNT		: Get characters left
+	SIS	R0,1			: Decrement loop counter
+	STH	R0,CHRCNT		: and remember it
+	JG	MsLOOP			: More characters, go get em
+	JAL	R4,ELIR			: None left, fixup iring index
+	J	PRMPT			: New prompt and go
+
+: All messages reaching here contain unknown characters
+: Ignore the rest of the message (later until we see a CR)
+
+MsUNK	LH	R2,MsPORT		: Get current port
+	LA	R3,MxBELL		: Get bell message
+	JAL	R5,OCS,,		: Send message
+	J	MsNEXT			: We are done
+
+: All messages here are for user id characters
+: Once the buffer pointer is setup, up to 12 bytes are stored
+: as String Constants for use with OCS.
+
+MuDATA	LH	R2,MsPORT		: Get current port
+	LR	R8,R2			: Copy for offset
+	SIS	R8,1			: Decrement for 0 offset
+	MH	R8,UIDSIZ		: Multiply by entry size
+	LB	R7,PORTSC,R8,		: Get user id address size
+MuLOOP	JAL	R4,GETCH,,		: Get a byte
+	NHI	R0,07F			: Clip it to 7 bits (upper case)
+	CHI	R0,CmESC		: An ESCape
+	  JE	WANTID			: Yes, reset and try again
+	CHI	R0,CmCR			: A Return?
+	  JE	MuTEND			: Yes, finish name
+	CHI	R7,$A12			: Allow up to 12
+	  JGE	MuNEXT			: Overflow, just ignore for now
+	AIS	R7,1			: increment byte (count) pointer
+	STB	R0,PORTSC,R8,R7		: Store next byte
+MuNEXT	LH	R0,CHRCNT		: Get characters left
+	SIS	R0,1			: Decrement loop counter
+	STH	R0,CHRCNT		: and remember it
+	JG	MuLOOP			: More characters, go get em
+	LH	R8,MsPORT		: Get current port
+	SIS	R8,1			: Decrement for 0 offset
+	MH	R8,UIDSIZ		: Multiply by entry size
+	STB	R7,PORTSC,R8		: Store counter
+	JAL	R4,ELIR			: None left, fixup iring index
+	J	PRMPT			: New prompt and go
+
+MuTEND	RBT	R2,NEEDID		: Set Id is complete
+	RBT	R2,NEEDCR		:  and CR was seen
+	SBT	R2,LOGGED		: We are logged completely in
+	J	MuNEXT			: All done, finish up and return
+
+: QUIT - Mark we are in progress (check if already in progress)
+:	 and initiate d cycle
+
+CxQUIT	LH	R2,MsPORT		: Get current port
+	TBT	R2,LOGDET		: Check in array (in progress)?
+	  JN	CxALQ			: Quit in progress
+	LA	R3,MxBYE		: Get Goodbye message
+	JAL	R5,OCS,,		: Send it
+	LH	R2,MsPORT		: Get port again
+	LA	R3,MxDET		: Get detach message
+	SBT	R2,LOGDET		: Set in detach array
+	JAL	R5,OCM,,		: Send detach
+	LIS	R2,0			: Tell the supervisor
+	LA	R3,HSTOKP		: host no longer
+	JAL	R5,OCM,,		: out of ports
+	J	MsNEXT			: Get next character
+
+: %OOPS - Already waiting for OB from this port
+
+CxALQ	LA	R3,MxALQ		: Get message text
+	JAL	R5,OCS,,		: Print it
+	J	MsNEXT
+
+
+
+: TIME - Obtain current daytime and print t for the user
+
+CxTIME	L	R3,GMT,,		: Get current daytime
+	LIS	R4,8			: for HH:MM:SS format
+	LA	R5,SvTIME+1,,		: Indicate storage
+	JAL	R6,TMSTMP,,		: Get date string
+
+	LH	R2,MsPORT		: Get current port
+	LA	R3,MxTIME,,		: Get time message
+	JAL	R5,OCS,,		: Print it
+	LH	R2,MsPORT		: Get current port
+	LA	R3,SvTIME,,		: Get actual time string
+	JAL	R5,OCS,,		: Print it
+	J	MsNEXT			: Return to loop
+
+
+: WHAT - Tell what lines are available
+
+CxWHAT	JAL	R13,TCRLF		: Free CRLF
+	LIS	R9,1			: Start with first port
+CxWLOP	TBT	R9,LOGGED		: Is it logged?
+	  JE	CxWNXT			: No, try next
+	LR	R8,R9			: Copy for offset
+	SIS	R8,1			: Decrement for 0 offset
+	MH	R8,UIDSIZ		: Multiply by entry size
+	LB	R3,PORTSC,R8,		: Get entry size
+	  JE	CxWNXT			: Zero, so skip this rot
+	LA	R3,PORTSC,R8,		: Get user id address
+	LH	R2,MsPORT		: Get port (gets wiped out)
+	JAL	R5,OCS,,		: Output string
+	JAL	R13,TCRLF		: Output a CR
+CxWNXT	AIS	R9,1			: Increment port
+	CHI	R9,MAXPRT		: Reached the limit?
+	JLE	CxWLOP			: No, check it
+	JAL	R13,TCRLF		: Print extra crlf
+	J	MsNEXT			: And return
+
+
+: Utility routines: CSEVEN, TCRLF
+
+CSEVEN	NHI	R0,07F			: Only look at 7 bits
+	CHI	R0,60			: Check for lower-case range
+	JL	C7CASE			: No, skip subtraction
+	  SHI	R0,20			: Convert to upper case
+C7CASE	JR	R4			: Return
+
+
+TCRLF	LH	R2,MsPORT		: Get current port
+	LA	R3,MxCRLF		: Get message
+	JAL	R5,OCS,,		: Print it
+	JR	R13			: Return
