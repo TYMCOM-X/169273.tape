@@ -1,0 +1,1143 @@
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 1
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+1	entry
+2		GetRec, ActRec, ModRec
+3	,	ClsQue, OpnQue, UseQue
+4	,	Queue,  QueMsg, QueRun, QueAct
+5	,	QError, InQue
+6	;
+7	Begin "JQUE"
+8	
+9	require "(SAILIB)SAIL.DEF"   source!file;
+10	require "(SAILIB)UUOSYM.DEF" source!file;
+11	require "(CARL)JQUE.DEF"     source!file;
+12	require "(CARL)JQUEUE.DEF"   source!file;
+13	require "(CARL)VMFILE.REQ"   source!file;
+14	
+15	redefine QRS(j) = { QQ(Runner-1+(j)) };
+16	redefine QRA(j) = { QQ(RunAct-1+(j)) };
+17	
+18	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 2
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+19	!	Variable storage
+20	;
+21	
+22	Internal Boolean InQue;
+23	Internal Integer QError, Queue, QueMsg, QueRun, QueAct;
+24	
+25	Own String QueueName;
+26	
+27	Own Boolean Eof, Err, MapLock, Lockey, AllOk;
+28	Own Integer BasePage, Base, QuePage, MsgPage, RunPage, ActPage;
+29	Own Integer Chan, ChnErr, MyPage, MyRecord, RecBase;
+30	Own Integer MyR, MyB, NewR;
+31	Own Integer NewPage, NewRecord, NewBase;
+32	Own Integer Reading, Writing, Modify;
+33	
+34	Own Safe Integer Array File[ 1 : 6 ];
+35	Own Safe Integer Array Hold[ 0 : E!Length-1 ];
+36	
+37	Preload!with [E!Length]0;
+38	Own Safe Integer Array Zeros[ 0 : E!Length-1 ];
+39	
+40	Preload!with [(QueueData+1)*'1000]0;	! Ent, Map, Msg, Run, Act, Act ;
+41	Own Safe Integer Array VirtualStorage[ 0 : ((QueueData+1)*'1000)-1 ];
+42	
+43	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 3
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+44	simple procedure SetupBasePage;
+45	! ----------------------------------------------------------------------;
+46	!									;
+47	!	SetupBasePage	Initialize the page variables and setup for	;
+48	!			normal queue-file manipulation.			;
+49	!									;
+50	! ----------------------------------------------------------------------;
+51	begin
+52	
+53	    BasePage_ (Location(VirtualStorage[0]) +'777) lsh -9;
+54	    Base_ BasePage lsh 9;		! set base offsets into array;
+55	    QuePage_ BasePage + 1;		! use next page for status;
+56	    Queue_ QuePage lsh 9;		! easy access queue addess;
+57	    MsgPage_ QuePage + 1;		! use next page for messages;
+58	    QueMsg_ MsgPage lsh 9;		! easy access msg address;
+59	    RunPage_ MsgPage + 1;		! use next page for messages;
+60	    QueRun_ RunPage lsh 9;		! easy access msg address;
+61	    ActPage_ RunPage + 1;		! use next 2 pages for active;
+62	    QueAct_ ActPage lsh 9;		! easy access active address;
+63	
+64	    Calli( !Xwd(QueueData,BasePage), calli!VCLEAR );
+65	
+66	    If ( Chan and InQue land que$Open )	! if non-zero channel open;
+67	      then Release( Chan );		! clear any file usage;
+68	    Chan_ MyPage_ MyRecord_ RecBase_ 0;	! clear entry information;
+69	
+70	    MyR_ NewR_ MyB_ 0;			! clear active fields ;
+71	    MapLock_ InQue_ 0;			! clear lock & status ;
+72	
+73	    QueueName_ QueueFile;		! initialize filename ;
+74	
+75	end;
+76	require SetupBasePage initialization;
+77	
+78	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 4
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+79	
+80	internal simple boolean procedure UseQue( String File(QueueFile) );
+81	! ----------------------------------------------------------------------;
+82	!									;
+83	!	UseQue		Routine to setup a new queue file name for	;
+84	!			privileged users to manipulate alternate	;
+85	!			queue files.					;
+86	!									;
+87	! ----------------------------------------------------------------------;
+88	begin "use queue file"
+89	    redefine LC!QM = !bit(11);
+90	
+91	    if ( (calli( !xwd( -1,!gtPRV ), calli!GETTAB ) lsh 18) land LC!QM )
+92	     then begin "set new name"
+93	
+94		QueueName_ File;
+95		return( true );
+96	
+97	     end "set new name"
+98	     else return( false );
+99	
+100	end "use queue file";
+101	
+102	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 5
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+103	
+104	Simple Procedure GetLock;
+105	! ----------------------------------------------------------------------;
+106	!									;
+107	!	GetLock		Routine to lock the queue for single-access. 	;
+108	!			If the lock is in use, the routine will wait	;
+109	!			indefinately until the lock is free.		;
+110	!									;
+111	! ----------------------------------------------------------------------;
+112	begin!code
+113	    label Retry, GWait, GReady;
+114	
+115		Skipe	MapLock;		! do we already have it?;
+116		  Jrst	GReady;			! yes, count one more;
+117		Push	P,'1;			! don't clobber ac;
+118		Movei	'1,50;			! 5 * 10 * 200ms = 10 seconds ;
+119		Movem	'1,Lockey;		! The skeleton key ;
+120		Move	'1,Queue;		! get base address of map;
+121		Push	P,'3;			! make this a painless sleep;
+122	Retry:	Sosl	'3,Q!Lock('1);		! get lock counter;
+123		  Jrst	GWait;			! nope, sleep it off;
+124		Camn	'3,[ -1 ];		! if we're lucky, we got it;
+125		 Skipa;				! got it!
+126		Sosg	Lockey;			! have we timed out waiting ;
+127		 Skipa;				! got it!
+128		  Jrst	GWait;			! nope, sleep it off;
+129		Setom	Q!Lock('1);		! force the lock ;
+130		Pop	P,'3;			! back to the real world;
+131		Pop	P,'1;			! restore ac;
+132		Jrst	GReady;			! set internal lock and return;
+133	
+134	GWait:	Movei	'3,'200;		! get hibernation counter;
+135		Calli	'3,calli!hiber;		! sleep for a bit;
+136		  Jfcl;				! ignore error return;
+137		Skipn	Q!Lock('1);		! is there still a lock;
+138		  Jrst	Retry;			!   no -- try to get it now;
+139		 Jrst	GWait;			! well... back to sleep;
+140	
+141	GReady:	Sos	MapLock;		! mark that we have the lock;
+142						! one or more times ;
+143	end;
+144	
+145	
+146	simple procedure UnLock;
+147	! ----------------------------------------------------------------------;
+148	!									;
+149	!	UnLock		Routine to release the global lock on the	;
+150	!			queue.  This action reenables multiple access.	;
+151	!									;
+152	! ----------------------------------------------------------------------;
+153	begin!code
+154	    Label UReady;
+155	
+156		Aosge	MapLock;		! release one level of locks;
+157		  Jrst	UReady;			! and simply return if more;
+158		Push	P,'1;			! don't clobber ac;
+159		Move	'1,Queue;		! get queue address offset;
+160		Setzm	Q!Lock('1);		! release the global lock;
+161		Pop	P,'1;			! restore ac;
+162		Setzm	MapLock;		! insure this is given away;
+163	UReady:
+164	
+165	end;
+166	
+167	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 6
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+168	
+169	simple integer procedure MapQuePage;
+170	! ----------------------------------------------------------------------;
+171	!									;
+172	!	MapQuePage	Map the queue status page into memory at	;
+173	!			BasePage after insuring the page is clear.	;
+174	!									;
+175	! ----------------------------------------------------------------------;
+176	begin "Map Status Page"
+177	    own safe integer array arg[0:1];
+178	
+179	    Calli(!Xwd('2001,QuePage),-'66);	! unmap any previous page ;
+180	    InQue_ InQue land lnot que$Map;	!  and clear page flag ;
+181	
+182	    Arg[ 0 ]_ !Xwd( '6001,QuePage );	! <.prrw>b7 + 1b17,,queue;
+183	    Arg[ 1 ]_ QueueMap;			! use specified file-page;
+184	
+185	    Chnior( Chan, Arg[0], !chMFP );	! map file page ;
+186	    If not( !skip! )			!  ?error? ;
+187	     then begin "cannot get status"
+188		QError_ err$CMS;		!   set error flag ;
+189		Return( 0 );			!   and return 0 ;
+190	     end "cannot get status";
+191	
+192	    InQue_ InQue lor que$Map;		! set status page flag ;
+193	
+194	    Return( QQ( Open )_ QQ( Open ) + 1 );
+195	
+196	end "Map Status Page";
+197	
+198	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 7
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+199	
+200	simple boolean procedure MapDataPage( Integer NewPage );
+201	! ----------------------------------------------------------------------;
+202	!									;
+203	!	MapDataPage	Routine to unmap the current data page and	;
+204	!			map the next one into memory.			;
+205	!									;
+206	! ----------------------------------------------------------------------;
+207	begin "map data page"
+208	    own safe integer array arg[0:1];
+209	
+210	    if ( (InQue land que$Entry )  and	! page entry positive ;
+211		 ( MyPage = NewPage )  )	! and same as current page ;
+212	     then return( true );		! don't do any work ;
+213	
+214	    Calli( !Xwd('2001,BasePage), -'66);	! unmap any previous page;
+215	    InQue_ InQue land lnot que$Entry;	! turn off entry page bit;
+216	
+217	    Arg[0]_ !Xwd( '6001, BasePage );	! <.prrw>b7 + 1b17,,base;
+218	    Arg[1]_ QueueData-1 + NewPage;	! setup new data page ;
+219	
+220	    Chnior( Chan, Arg[0], !chMFP );	! map file page;
+221	    start!code Movem 3,ChnErr end;	! remember any error ;
+222	    if not( !skip! )			!  oops...later;
+223	     then begin "cannot map record"
+224	
+225		if ( !rh(ChnErr) = FLPHP# )  or		! if past highest page ;
+226		   ( !rh(ChnErr) = FLHOL# )		!  or is a hole ;
+227		 then Chniov( Chan, Arg[1], !chCFP );	! create page in file;
+228	
+229		if ( !skip! )
+230		 then begin "validate and map"
+231		    Chnior( Chan, 0, !chVRB );		! validate rib;
+232		    Chnior( Chan, Arg[0], !chMFP );	! map file page;
+233		 end "validate and map";
+234	
+235		if not( !skip! )
+236		 then begin "cannot map page"
+237		    UnLock;				! unlock the queue;
+238		    MyRecord_ MyPage_ RecBase_ 0;	! clear data fields;
+239		    QError_ err$CMR;			! error flag;
+240		    return( false );
+241		 end "cannot map page";
+242	
+243	     end "cannot map record";
+244	
+245	    calli( BasePage, calli!PREREF );	! pre-reference the page ;
+246	
+247	    MyPage_ NewPage;			! set data page reference ;
+248	    InQue_ InQue lor que$Entry;		! turn on entry page bit;
+249	    return( true );			! return with MyPage setup ;
+250	
+251	end "map data page";
+252	
+253	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 8
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+254	
+255	simple boolean procedure EmptyEntry;
+256	! ----------------------------------------------------------------------;
+257	!									;
+258	!	EmptyEntry	Routine to locate an empty entry on the queue	;
+259	!			data page currently mapped in memory.		;
+260	!									;
+261	! ----------------------------------------------------------------------;
+262	begin "empty entry"
+263	
+264	    for NewRecord_ 1 upto E!RPPage	! look for an empty entry;
+265	     do begin "check my page"		!  on the current page;
+266	
+267		If not( memory[RecBase_ Base + (NewRecord-1) * E!Length] )
+268		 then begin "got page"
+269	
+270		    UnLock;			! unlock the queue;
+271		    MyRecord_ ((MyPage-1) * E!RPPage) + NewRecord;
+272		    Return( true );		! return to the caller;
+273	
+274		 end "got page";
+275	
+276	     end "check my page";
+277	
+278	    return( false );
+279	
+280	end "empty entry";
+281	
+282	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 9
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+283	
+284	simple boolean procedure MapRecord( Integer r );
+285	! ----------------------------------------------------------------------;
+286	!									;
+287	!	MapRecord	Map a queue record into memory and set all	;
+288	!			the associated offset variables: RecBase and	;
+289	!			MyRecord.					;
+290	!									;
+291	! ----------------------------------------------------------------------;
+292	begin "Map Record"
+293	    own safe integer array arg[0:1];
+294	
+295	    GetLock;					! lock queue;
+296	
+297	    If not( r )					! no record specified;
+298	     then If ( r_ QQ( Hole ) )			! set any "known" hole;
+299		   then QQ( Hole )_ 0;			!   if found, clear it;
+300	
+301	    If not( r )					! no "known" specified;
+302	     then If ( QQ( High ) leq QQ( Count ) )
+303		   then begin "no holes"
+304		      r_ QQ( Count ) + 1;		! setup high record + 1;
+305		   end "no holes";
+306	
+307	    If ( not( r ) and				! still nothing shown;
+308		 ( InQue land que$Entry ) and		!  data page mapped ;
+309		 ( MyPage ) and				!  page number known ;
+310		 ( EmptyEntry )  )			! and entry available ;
+311	     then return( true );			! we are done here ;
+312	
+313	    If not( r )					! still nothing shown;
+314	     then begin "Find Hole"			!  then find a hole;
+315	
+316		For NewPage_ 1 upto ((QQ( High )-1) div E!RPPage) + 1
+317		 do if ( MapDataPage( NewPage ) and EmptyEntry )
+318		     then return( true );
+319	
+320	     end "Find Hole";
+321	
+322	    if not( MapDataPage( NewPage_ ( (r-1) div E!RPPage ) + 1 ) )
+323	     then return( false );			! die a horrible death ;
+324	
+325	    UnLock;					! unlock the queue;
+326	    MyRecord_ r;				! store record number;
+327	
+328	    RecBase_ Base + ( ( (r-1) * E!Length ) land '777 );
+329	
+330	    return( true );
+331	
+332	end;
+333	
+334	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 10
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+335	
+336	simple boolean procedure ArrCMP(reference integer LOC1, LOC2; integer Count);
+337	! ----------------------------------------------------------------------;
+338	!									;
+339	!	ArrCMP		Compare the contents of two arrays beginning	;
+340	!			at LOC1 for array 1 and LOC2 for array 2 for	;
+341	!			a total of COUNT words.  Return false [0] if	;
+342	!			any of the compared words do not match.		;
+343	!			Return true [-1] otherwise.			;
+344	!									;
+345	! ----------------------------------------------------------------------;
+346	start!code "ARRCMP"
+347	    Define C='0, T1='1, CH1='2, CH2='3, P='17;
+348	    Label Loop, OK, NoGood;
+349	
+350		SETZ	T1,;			! assume .false. at first ;
+351		MOVE	C,-1(P);		! get the count ;
+352		JUMPE	C,OK;			! zero count? must all match ;
+353		HRRI	CH1,'444400;		! (point 36,0,-1) ;
+354		HRLM	CH1,-3(P);		! build pointer to LOC1 ;
+355		HRLM	CH1,-2(P);		! build pointer to LOC2 ;
+356	Loop:	ILDB	CH1,-3(P);		! get item to compare ;
+357		ILDB	CH2,-2(P);		! get item to compare ;
+358		CAME	CH1,CH2;		! match ? ;
+359		  JRST	NoGood;			! No... return .false. ;
+360		SOJG	C,Loop;			! Loop till out of words ;
+361	OK:	SETO	T1,;			! Set to .true. ;
+362	NoGood:
+363	
+364	end "ARRCMP";
+365	
+366	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 11
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+367	
+368	Simple procedure Wrap;
+369	! ----------------------------------------------------------------------;
+370	!									;
+371	!	Wrap		Routine to resequence the queue and return to	;
+372	!			NextRequest with the next request number.	;
+373	!									;
+374	! ----------------------------------------------------------------------;
+375	Return;
+376	
+377	Simple integer procedure NextRequest;
+378	! ----------------------------------------------------------------------;
+379	!									;
+380	!	NextRequest	Routine to generate the next logical request	;
+381	!			number for the queue.  The values range from	;
+382	!			1 to 131071  (or '1 to '377777).		;
+383	!									;
+384	! ----------------------------------------------------------------------;
+385	begin!code
+386		Label NoWrap;
+387	
+388		Pushj	P,GetLock;		! Lock the queue;
+389		Push	P,'2;			! Save register;
+390		Move	'1,Queue;		! Setup status page offset;
+391		Aos	'2,Q!Next('1);		! Increment request number;
+392		Trnn	'2,'400000;		! Wrap around?;
+393		 Jrst	NoWrap;			! Nope, all is ok;
+394		Setzm	Q!Next('1);		! Yep, reset to 0;
+395		Pushj	P,Wrap;			!  and do all the work;
+396		Aos	'2,Q!Next('1);		! Now get new request number;
+397	NoWrap:	Pushj	P,UnLock;		! all done;
+398		Exch	'1,'2;			! put result in ac 1;
+399		Pop	P,'2;			! restore register;
+400	
+401	end;
+402	
+403	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 12
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+404	
+405	Internal simple procedure ClsQue;
+406	! ----------------------------------------------------------------------;
+407	!									;
+408	!	ClsQue		Routine to close out the queue.  Unmap data	;
+409	!			pages and close the files.			;
+410	!									;
+411	! ----------------------------------------------------------------------;
+412	begin
+413	
+414	    If ( InQue )			! if queue is open ;
+415	     then begin "close queue"		!  we need to clear these ;
+416	
+417		QQ( Open )_ ( 0 max ( QQ( Open )-1 ) );		! minimum of 0 ;
+418	
+419		Calli( !Xwd('2001,BasePage),calli!VCLEAR );	! record data  ;
+420		Calli( !Xwd('2001,QuePage), calli!VCLEAR );	! queue status ;
+421		Calli( !Xwd('2001,MsgPage), calli!VCLEAR );	! message area ;
+422		Calli( !Xwd('2001,RunPage), calli!VCLEAR );	! run-que area ;
+423		Calli( !Xwd('2002,ActPage), calli!VCLEAR );	! active data  ;
+424	
+425		Close( Chan );			! close the file;
+426		Release( Chan );		!  and release the channel;
+427	
+428	     end "close queue";
+429	
+430	    Chan_ InQue_ 0;			! reset all variables;
+431	    MyPage_ MyRecord_ RecBase_ 0;
+432	
+433	end;
+434	
+435	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 13
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+436	
+437	simple boolean procedure CreateQueue;
+438	! ----------------------------------------------------------------------;
+439	!									;
+440	!	CreateQueue	Routine to create and initialize a virgin	;
+441	!			queue file.					;
+442	!									;
+443	! ----------------------------------------------------------------------;
+444	begin "queue error"
+445	
+446	    FileInfo( FILE );
+447	    Chnior( Chan, FILE[1], !chENT);		! create file;
+448	
+449	    Eof_ If not( !SKIP! )			! if skip, all is good;
+450		  then !rh( FILE[2] ) else 0;
+451	
+452	    If EOF )				! Otherwise -- we must stop;
+453	     then begin "no errors"
+454	
+455		Chnior( Chan, QueueMap,   !chCFP );	! Create page  [1]   Map;
+456		Chnior( Chan, QueueMsg,   !chCFP );	! Create page  [2]   Msg;
+457		Chnior( Chan, QueueRun,   !chCFP );	! Create page  [3]   Run;
+458		Chnior( Chan, QueueAct+1, !chCFP );	! Create pages [4,5] Act;
+459	
+460		InQue_ InQue lor que$Open;		! mark it open ;
+461		If ( MapQuePage )
+462		 then begin "init queue"
+463		    QQ( RSlot )_ E!RunMax;		! number of run slots ;
+464		    QQ( RJobs )_ E!RunMax;		! number of runs available ;
+465		    QQ( ISlot )_ E!JobMax;		! number of slots to use ;
+466		    QQ( IJobs )_ E!JobMax;		! number of slots available ;
+467		    QQ( LogLim )_ E!DefLogLim;	! no page limit, 60 minutes ;
+468		    QQ( Action )_ E!DefAction;	! action parameters ;
+469		    QQ( New )_ -1;			! indicate something changed ;
+470		    ClsQue;				! close and reset ;
+471		    Open(Chan_VMChan,"DSK",'17,0,0,0,0,Eof_-1);
+472		 end "init queue"
+473		 else begin
+474		    Release( Chan );		! *** error, free channel ;
+475		    QError_ err$COQ;		! *** set error flag ;
+476		    return( InQue_ Chan_ false );	! *** and return false ;
+477		 end;
+478	
+479		Lookup( Chan, QueueName, Eof_-1);	! then re-open file ;
+480		if not( !skip! )
+481		 then begin "we have a problem"
+482		    QError_ err$COQ;		! can't open created queue ;
+483		    release( Chan );		! so, clear out channel ;
+484		    return( InQue_ Chan_ false );	! and just give up. ;
+485		 end "we have a problem";
+486	
+487	    end "no errors";
+488	
+489	end "queue error";
+490	
+491	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 14
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+492	
+493	simple boolean procedure OpenQueue;
+494	! ----------------------------------------------------------------------;
+495	!									;
+496	!	OpenQueue	Routine to read the queue status page into	;
+497	!			memory and allow the caller to access the	;
+498	!			the queue.  Returns the number of users that	;
+499	!			are accessing the queue.			;
+500	!									;
+501	! ----------------------------------------------------------------------;
+502	begin
+503	
+504	    Open(Chan_VMChan,"DSK",'17,0,0,0,0,Eof_-1);
+505	    Lookup( Chan, QueueName, Eof_-1);
+506	
+507	    If ( Eof and !rh(Eof) = 0 )			! if Eof and %ERFNF ;
+508	     then if not( CreateQueue )			!  we need to create one ;
+509		   then return( false );		!  oops, forget it ;
+510	
+511	    If not( Eof )
+512	     then begin "continue entry code"
+513	
+514		InQue_ InQue lor que$Open;		! indicate file is open ;
+515	
+516		FileInfo( FILE );			! read file data;
+517		Chnior( Chan, FILE[1], !chMEN);		! multiple enter;
+518		Eof_ If not( !SKIP! )			! if skip, all is good;
+519		      then !rh(FILE[2]) else 0;
+520		if not( Eof )
+521		 then InQue_ InQue lor que$Write;
+522	
+523	     end "continue entry code"
+524	     else begin "must not continue"
+525	
+526	!	Print( "File error ",Cvos(EOF)," on ",QueueName,crlf);
+527		QError_ err$COQ;			! set error flag ;
+528		Release( Chan );			! release channel ;
+529		Return( InQue_ Chan_ false );		! and go ;
+530	
+531	     end "must not continue";
+532	
+533	    Return( MapQuePage );
+534	
+535	end;
+536	
+537	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 15
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+538	
+539	Simple boolean procedure GetArea( Integer Mem, Dsk, Bit, Size(1) );
+540	begin "get area"
+541	    own safe integer array arg[0:1];
+542	
+543	    Calli(!Xwd('2000+Size,Mem),-'66);	! unmap any previous page(s) ;
+544	    InQue_ InQue land lnot Bit;		! indicate area cleared ;
+545	    Arg[ 0 ]_ !Xwd( '6000+Size,Mem );	! <.prrw>b7 + nb17,,active ;
+546	    Arg[ 1 ]_ Dsk;			! use specified file-page ;
+547	
+548	    Chnior( Chan, Arg[0], !chMFP );	! map file page;
+549	    If not( !skip! )
+550	     then begin "cannot open area"
+551		ClsQue;				! close queue first ;
+552		QError_ err$CMA;		! store code ;
+553		Return( false );		! then report error ;
+554	     end "cannot open area";
+555	
+556	    InQue_ InQue lor Bit;		! set active pages mapped ;
+557	
+558	    Return( true );
+559	
+560	end "get area";
+561	
+562	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 16
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+563	
+564	internal simple boolean procedure OpnQue( integer Bits(0) );
+565	! ----------------------------------------------------------------------;
+566	!									;
+567	!	OpnQue		Open the queue and map the status and active	;
+568	!			pages into memory for queue manipulation.	;
+569	!									;
+570	! ----------------------------------------------------------------------;
+571	begin "OpnQue"
+572	
+573	    If not( InQue land que$Open )	! if initial entry;
+574	     then If not( OpenQueue )		!  then open things up;
+575		   then return( InQue_ false );	!  oops! queue error;
+576	
+577	    if ( Bits land que$Real )		! are we setting the reality ;
+578	     then InQue_ InQue lor que$Real;	! factor for future access ;
+579	
+580	! *** Should we check here for QM license?
+581	;
+582	
+583	    if ( Bits land que$Msg )		! requesting message area ;
+584	     then if not( GetArea( MsgPage, QueueMsg, que$Msg ) )
+585		   then return( false );
+586	
+587	    if ( Bits land que$Run )		! requesting running entries ;
+588	     then if not( GetArea( RunPage, QueueRun, que$Run ) )
+589		   then return( false );
+590	
+591	    if ( Bits land que$Act )		! requesting active ;
+592	     then if not( GetArea( ActPage, QueueAct, que$Act, 2 ) )
+593		   then return( false );
+594	
+595	    return( QQ( Open ) );		! number open in queue ;
+596	
+597	end "OpnQue";
+598	
+599	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 17
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+600	
+601	simple boolean procedure FindRecord( integer A );
+602	! ----------------------------------------------------------------------;
+603	!									;
+604	!	FindRecord	Routine to scan through the queue for the	;
+605	!			specified record.  Return recnum if found,	;
+606	!			otherwise return false and set QError to	;
+607	!			the proper error code.				;
+608	!									;
+609	! ----------------------------------------------------------------------;
+610	begin "Find Record"
+611	
+612	    If ( NewRecord_ memory[ A+E!RecNum ] )
+613	     then begin "record known"
+614	
+615		AllOk_ MapRecord( NewRecord );	! get the record ;	
+616		If ( ( AllOk )  and
+617		     ( memory[ RecBase + E!Runtime ] ) and
+618		     ( LAPReq( RecBase ) = LAPReq( A ) )
+619		   )
+620		 then return( NewRecord );
+621	
+622	     end "record known"
+623	     else for NewRecord_ 1 step 1 until QQ( High  )
+624		   do begin "check record"
+625	
+626		AllOk_ MapRecord( NewRecord );	! get a record ;
+627		If ( ( AllOk )  and
+628		     ( memory[ RecBase + E!Runtime ] ) and
+629		     ( LAPReq( RecBase ) = LAPReq( A ) )
+630		   )
+631		 then return( NewRecord );
+632	
+633	     end "check record";
+634	
+635	    QError_ err$CFR;			! cannot find record ;
+636	    Return( false );			! notify the authorities ;
+637	
+638	end "Find Record";
+639	
+640	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 18
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+641	
+642	simple boolean procedure Verify( integer A, B );
+643	! ----------------------------------------------------------------------;
+644	!									;
+645	!	Verify		Routine to check records specified for those	;
+646	!			fields which matter to the user.  Different	;
+647	!			users have different capabilities and want	;
+648	!			more specific information.			;
+649	!									;
+650	! ----------------------------------------------------------------------;
+651	begin "verify"
+652	
+653	Define Chk(x,op) = {
+654	    if ( memory[A+(x)] )
+655	     then if (memory[A+(x)] op memory[B+(x)])
+656		   then return( false );
+657	};
+658	
+659	    if ( LAPReq( A ) )
+660	     then if ( LAPReq(A) neq LAPReq(B) )
+661		   then return( false );
+662	
+663	    if ( !rh( memory[A+E!AUN] ) )
+664	     then if ( !rh(memory[A+E!AUN]) neq !rh(memory[B+E!AUN]) )
+665		   then return( false );
+666	
+667	    if ( !lh( memory[A+E!AUN] ) )
+668	     then if ( !lh(memory[A+E!AUN]) neq !lh(memory[B+E!AUN]) )
+669		   then return( false );
+670	
+671	    Chk( E!PPN, neq );
+672	    Chk( E!Username, neq );
+673	    Chk( E!Username+1, neq );
+674	    Chk( E!Project, neq );
+675	    Chk( E!Project+1, neq );
+676	    Chk( E!Project+2, neq );
+677	    Chk( E!CmdFile+F!Name, neq );
+678	    Chk( E!Runtime, [<] );
+679	
+680	    return( true );
+681	
+682	end "verify";
+683	
+684	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 19
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+685	
+686	simple boolean procedure ActRecord( integer A );
+687	! ----------------------------------------------------------------------;
+688	!									;
+689	!	ActRecord	Routine to scan through the active area for	;
+690	!			the next record which matches the specified	;
+691	!			criteria.  If no fields are specified, the	;
+692	!			next record is returned.  Match fields are:	;
+693	!			AUN, USER ,PPN, PROJECT and JOBNAME.  If a	;
+694	!			record exists return true, otherwise set	; 
+695	!			QError to the proper code and return false.	;
+696	!									;
+697	! ----------------------------------------------------------------------;
+698	begin "Act Record"
+699	
+700	    if ( LAPReq( A ) )			! non-zero, reset file pointers;
+701	     then MyR_ 0;			! clear record field information;
+702	    if ( LAPReq( A ) land '400000 )	! negative, so ;
+703	     then Dpb( 0, APReq( A ) );		! reset request ;
+704	
+705	    for NewR_ MyR+1 upto E!ActMax	! all active records ;
+706	     do begin "check record"
+707	
+708		MyB_ QueRun + (E!Length * (NewR-1));
+709	
+710		if ( (AllOk_ QRS(NewR) )  and  memory[ MyB + E!Runtime ] )
+711		 then if ( Verify( A, MyB ) )
+712		       then return( MyR_ NewR );
+713	
+714	     end "check record";
+715	
+716	    QError_ err$CFR;			! cannot find any records ;
+717	    return( false );			! notify the authorities ;
+718	
+719	end "Act Record";
+720	
+721	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 20
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+722	
+723	simple boolean procedure NextRecord( integer A );
+724	! ----------------------------------------------------------------------;
+725	!									;
+726	!	NextRecord	Routine to scan through the queue for the next	;
+727	!			record which matches the specified criteria.	;
+728	!			If no fields are specified, the next record is	;
+729	!			returned.  Match fields include: AUN, USER,	;
+730	!			PPN, PROJECT and JOBNAME (control file name).	;
+731	!			If a record exists return true, otherwise set	; 
+732	!			QError to the proper code and return false.	;
+733	!									;
+734	! ----------------------------------------------------------------------;
+735	begin "Next Record"
+736	
+737	    if ( LAPReq( A ) )			! non-zero, reset file pointers;
+738	     then MyPage_ MyRecord_ RecBase_ 0;	! clear record field information;
+739	    if ( LAPReq( A ) land '400000 )	! negative, so ;
+740	     then Dpb( 0, APReq( A ) );		! reset request ;
+741	
+742	    for NewRecord_ MyRecord+1 step 1 until QQ( High )
+743	     do begin "check record"
+744	
+745		AllOk_ MapRecord( NewRecord );	! get a record ;
+746	
+747		if ( AllOk  and  memory[ RecBase + E!Runtime ] )
+748		 then if ( Verify( A, RecBase ) )
+749		       then return( MyRecord_ NewRecord );
+750	
+751	     end "check record";
+752	
+753	    QError_ err$CFR;			! cannot find any records ;
+754	    return( false );			! notify the authorities ;
+755	
+756	end "Next Record";
+757	
+758	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 21
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+759	
+760	simple procedure DeleteRecord;
+761	! ----------------------------------------------------------------------;
+762	!									;
+763	!	DeleteRecord	Routine to clear the current record entry	;
+764	!			and reset the appropriate queue data fields	;
+765	!			concerning highest records and counts.		;
+766	!									;
+767	! ----------------------------------------------------------------------;
+768	begin "delete record"
+769	
+770	    ArrBlt( memory[RecBase], Zeros[0], E!Length );
+771	    QQ( Count )_ QQ( Count ) - 1;
+772	
+773	    If ( MyRecord geq QQ( High ) )
+774	     then begin "decrement high"
+775	
+776		while ( ( RecBase geq Base ) and not( memory[Recbase] ) )
+777		 do begin "backup on current page"
+778	
+779		    RecBase_ RecBase - E!Length;
+780		    MyRecord_ QQ( High )_ QQ( High ) - 1;
+781	
+782		    If ( RecBase < Base )
+783		     then begin "backup a page"
+784	
+785			Chniov( Chan, (QueueData-2+MyPage) * '1000, !chFTR );
+786			Chnior( Chan, 0, !chVRB );	! truncate and validate RIB;
+787	
+788			If not( MapRecord( MyRecord ) )
+789			 then RecBase_ MyPage_ 0;
+790	
+791		     end "backup a page";		
+792		 end "backup on current page";
+793	
+794		If ( QQ( Hole ) geq QQ( High ) )
+795		 then QQ( Hole )_ 0;
+796	
+797	     end "decrement high"
+798	     else begin "check hole"
+799	
+800		If ( MyRecord < NewRecord_ QQ( Hole ) )
+801		   or not( NewRecord )
+802		 then QQ( Hole )_ MyRecord;
+803	
+804	     end "check hole";
+805	
+806	end "delete record";
+807	
+808	
+809	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 22
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+810	
+811	internal simple boolean procedure ActRec( integer A );
+812	! ----------------------------------------------------------------------;
+813	!									;
+814	!	ActREC		Routine to scan the job queue and return one	;
+815	!			of the following:				;
+816	!			  (a) the first record of the requested type	;
+817	!			  (b) the next record of the requested type	;
+818	!			  (c) a specific record				;
+819	!									;
+820	!			The contents of the specified request, gan,	;
+821	!			username, aun, ppn, jobname, project and	;
+822	!			runtime fields affect which records are to	;
+823	!			considered.					;
+824	!									;
+825	! ----------------------------------------------------------------------;
+826	begin "ActRec"
+827	    integer ThisBase;
+828	
+829	    If not( InQue land que$Open )	! if initial entry;
+830	     then if not( OpnQue( que$run lor que$act ) )
+831		   then return( false );	!  oops! queue error;
+832	
+833	    if not( InQue land que$Run )	! make sure we have the RUN area ;
+834	     then if not( GetArea( RunPage, QueueRun, que$Run, 1 ) )
+835		   then return( false );	! cannot get it? ;
+836	
+837	    if not( InQue land que$Act )	! make sure we have the Act area ;
+838	     then if not( GetArea( ActPage, QueueAct, que$Act, 2 ) )
+839		   then return( false );	! cannot get them? ;
+840	
+841	    If ( AllOk_ ActRecord( A ) )	! if any more, copy the entry;
+842	     then begin "got record"
+843	
+844		ArrBlt( memory[A], memory[MyB], E!Length );
+845		memory[ A+E!Status ]_ QRS( AllOk );
+846		memory[ A+E!Action ]_ QRA( AllOk );
+847	
+848	     end "got record";
+849	
+850	    Return( AllOk );
+851	
+852	end "ActRec";
+853	
+854	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 23
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+855	
+856	simple procedure Transform( integer A );
+857	! ----------------------------------------------------------------------;
+858	!									;
+859	!	Transform	Routine to transform the hashed opername in	;
+860	!			the designated record to and from the internal	;
+861	!			and external form.				;
+862	!									;
+863	! ----------------------------------------------------------------------;
+864	begin "transform"
+865	    own integer Hash, Index;
+866	
+867	    Hash_ 0;
+868	    for Index_ E!Runtime upto E!OperName-1
+869	     do Hash_ Hash xor memory[A+Index];
+870	
+871	    memory[A+E!OperName]_   memory[A+E!OperName]   xor Hash;
+872	    memory[A+E!OperName+1]_ memory[A+E!OperName+1] xor Hash;
+873	
+874	end "transform";
+875	
+876	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 24
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+877	
+878	internal simple boolean procedure GetRec( integer A );
+879	! ----------------------------------------------------------------------;
+880	!									;
+881	!	GetREC		Routine to scan the job queue and return one	;
+882	!			of the following:				;
+883	!			  (a) the first record of the requested type	;
+884	!			  (b) the next record of the requested type	;
+885	!			  (c) a specific record				;
+886	!									;
+887	!			The contents of the request, gan, aun, ppn,	;
+888	!			username, project, jobname and runtime fields	;
+889	!			are matched against the available records.	;
+890	!									;
+891	! ----------------------------------------------------------------------;
+892	begin "GETREC"
+893	    integer ThisBase;
+894	
+895	    If not( InQue land que$Open )	! if initial entry;
+896	     then if not( InQue land que$Real )	!  then open things up;
+897		   then if not( OpnQue( que$run lor que$act ) )
+898			 then return( false )	!  oops! queue error;
+899			 else
+900		   else if not( OpenQueue )	!  else open just a little ;
+901			 then return( false );	!  oops! queue error;
+902	
+903	!    GetLock;				! lock the queue during fetch;
+904	    If ( AllOk_ NextRecord( A ) )	! if any more, copy the entry;
+905	     then begin "use proper entry"
+906	
+907		ThisBase_ RecBase;		! initialize to record ;
+908		if not( InQue land que$Real )	! if not forcing real records ;
+909		 then begin "check active"	!  see if in active memory ;
+910		    integer index;
+911	
+912		    if ( InQue land que$Run )
+913		     then For index_ 1 step 1 until E!RunMax
+914		     do if ( LAPReq(RecBase) = LPReq(QRS(index)) )
+915			 then begin "set base"
+916			    ThisBase_ QueRun + E!Length * (index-1);
+917			    Done;
+918			 end "set base";
+919	
+920		    if ( InQue land que$Act )
+921		     then For index_ E!RunMax+1 step 1 until E!RunMax+E!JobMax
+922		     do if ( LAPReq(RecBase) = LPReq(QRS(index)) )
+923			 then begin "set base"
+924			    ThisBase_ QueRun + E!Length * (index-1);
+925			    Done;
+926			 end "set base";
+927		 end "check active";
+928	
+929		ArrBlt( memory[A], memory[ThisBase], E!Length );
+930	
+931		if ( ThisBase = RecBase )	! did we use active data? ;
+932		 then Transform( A )		! no, fixup passwords ;
+933		 else memory[A+E!Status]_ QRS(((ThisBase-QueRun) div E!Length) + 1);
+934	
+935	     end "use proper entry";
+936	!    UnLock;				! and release the queue-lock;
+937	
+938	    Return( AllOk );
+939	
+940	end "GETREC";
+941	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 25
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+942	
+943	simple procedure MarkChange;
+944	! ----------------------------------------------------------------------;
+945	!									;
+946	!	MarkChange	Routine to mark the queue flag and signal	;
+947	!			the scheduler (if there is one) to work it's	;
+948	!			magic.						;
+949	!									;
+950	! ----------------------------------------------------------------------;
+951	begin "mark change"
+952	
+953	    QQ( New )_ -1;			! indicate something changed ;
+954	
+955	    if ( QQ(Feature) land QFet$Signal )	! signal implemented ;
+956	     then if  ( calli(0,calli!PJOB) neq (QQ(Schedule) land '777) )
+957		   then begin!code
+958		Define !foCSI = '44;		! cause software interrupt ;
+959	
+960		Hrrz	1,Queue;		! Get address of queue map ;
+961		Hrrz	1,Q!Schedule(1);	! Get frame to signal ;
+962		Hrl	1,!foCSI;		! Get function ;
+963		Setom	!skip!;			! Set skip return ;
+964		Trne	1,'777777;		! If no frame, skip work ;
+965		uuo!FRMOP  1,;			! Do the work ;
+966		  Setzm	!skip!;			! OOPS! too bad ;
+967	
+968	     end;
+969	
+970	 end "mark change";
+971	
+972	
+
+JQUE.SAI                        created 15-Nov-86 00:03                                  Page 26
+Program Listing                 by CRFSYM %5 at 03-Dec-86 17:00
+
+973	
+974	internal simple boolean procedure ModRec( integer A, S );
+975	! ----------------------------------------------------------------------;
+976	!									;
+977	!	ModRec		Routine to modify an existing record in the	;
+978	!			queue or insert a new record into the queue.	;
+979	!			The determination is made by examining the	;
+980	!			value of the request number: if zero it is	;
+981	!			a new insert, otherwise it is a modification.	;
+982	!			On modificiation, if the next runtime is zero	;
+983	!			the record is deleted from the queue.		;
+984	!									;
+985	! ----------------------------------------------------------------------;
+986	begin "MODREC"
+987	
+988	    If not( InQue land que$Open )	! if initial entry;
+989	     then If not( OpenQueue )		!  then open things up;
+990		   then return( false );	!  oops! queue error;
+991	
+992	    If ( LAPReq( A ) )			! modify requested;
+993	     then begin "specific record"
+994	
+995		GetLock;			! Lock the queue first;
+996		AllOk_ FindRecord( S );		! YES, see if the record is there;
+997	
+998		Transform( S );			! Hash OPER password stuff ;
+999		If ( AllOk )			! Ok, is it the same record;
+1000		 then if not( AllOk_ ArrCMP( memory[S], memory[RecBase], E!Length ) )
+1001		       then QError_ err$MRM;	! modify record mismatch ;
+1002	
+1003		If ( AllOk )			! same, then process it;
+1004		 then If (memory[A+E!Runtime])	! if Runtime non-zero modify it;
+1005		       then ArrBlt( memory[RecBase], memory[A], E!Length )
+1006		       else DeleteRecord;	!  else delete it;
+1007		UnLock;				! unlock the queue;
+1008		Transform( S );			! Rehash OPER password stuff ;
+1009	
+1010	     end "specific record"
+1011	     else begin "insert record"
+1012	
+1013		Dpb( NextRequest, APReq( A ) );
+1014	
+1015		GetLock;
+1016		if ( AllOk_ MapRecord( QQ( Hole ) ) )
+1017		 then begin "create entry"
+1018		    memory[A+E!RecNum]_ MyRecord;
+1019		    Transform( A );
+1020		    ArrBlt( memory[RecBase], memory[A], E!Length );
+1021		    Transform( A );
+1022		    QQ( Count )_ QQ( Count ) + 1;
+1023		    If ( QQ( High ) < MyRecord )
+1024		     then QQ( High )_ MyRecord;
+1025		    QQ( Hole )_ 0;
+1026		 end "create entry";
+1027		UnLock;
+1028	
+1029	     end "insert record";
+1030	
+1031	    if ( AllOk )
+1032	     then MarkChange;
+1033	
+1034	    return( AllOk );
+1035	
+1036	end "MODREC";
+1037	
+1038	end $
+    @=°
