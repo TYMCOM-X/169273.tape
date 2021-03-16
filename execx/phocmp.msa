@@ -1,0 +1,466 @@
+-- file PhoenixCompile.mesa rewritten by PGS, 11-Sep-81 13:37
+-- PhoenixCompile.mesa
+-- Edit by Bruce, 20-Aug-81 16:27:00
+-- Edit by Randy, 11-Sep-81 13:35:24
+
+DIRECTORY
+  Heap USING [systemMDSZone],
+  HeapString USING [AppendChar, AppendString],
+  PhoenixDefs,
+  PhoenixOps USING [AppendDate, DOMToDate, oneDay, ReduceStrings, today],
+  PhoenixParse USING [LRef, QRef, VRef],
+  PhoenixParseTable USING [ProdDataRef],
+  System USING [SecondsSinceEpoch],
+  Time USING [Current, Pack, Packed, Unpack, Unpacked];
+
+PhoenixCompile: PROGRAM
+  IMPORTS Heap, HeapString, PhoenixOps, System, Time
+  EXPORTS PhoenixParse =
+BEGIN OPEN PhoenixDefs, PhoenixOps, PhoenixParse;
+
+heap: MDSZone = Heap.systemMDSZone;
+
+dateString: STRING _ NIL;
+
+stringStacked: PACKED ARRAY [0..256) OF BOOLEAN _ ALL[FALSE];
+q: PhoenixParse.QRef;
+v: PhoenixParse.VRef;
+l: PhoenixParse.LRef;
+proddata: PhoenixParseTable.ProdDataRef;
+
+AssignDescriptors: PUBLIC PROCEDURE
+  [lq: QRef, lv: VRef, ll: LRef, lproddata: PhoenixParseTable.ProdDataRef] =
+  {q _ lq; v _ lv; l _ ll; proddata _ lproddata; today _ Time.Current[];
+  dateString _ NIL};
+
+GetDate: PUBLIC PROCEDURE RETURNS [STRING] =
+  BEGIN
+  FOR i: CARDINAL IN [0..LENGTH[v^]) DO
+    IF stringStacked[i] THEN FreeString[i];
+    ENDLOOP;
+  RETURN[dateString];
+  END;
+
+FreeString: PROCEDURE [i: CARDINAL] = INLINE
+  {str: STRING _ v[i]; heap.FREE[@str]; v[i] _ NIL; stringStacked[i] _ FALSE};
+
+ProcessQueue: PUBLIC PROCEDURE [qI, top: CARDINAL] =
+  BEGIN
+  rule: [0..256);
+  i: CARDINAL;
+  vTop: UNSPECIFIED;
+  FOR i IN [0..qI) DO
+    OPEN HeapString;
+    s: STRING _ NIL;
+    Snarf: PROCEDURE [n, index: CARDINAL] =
+      {FOR i: CARDINAL IN [index..index+n) DO
+        IF v[i]#0 THEN {AppendString[@s, v[i]]; FreeString[i]} ENDLOOP};
+    top _ top-q[i].tag.pLength+1;  vTop _ v[top];
+    rule _ proddata[q[i].transition].rule;
+    SELECT rule FROM
+    
+    0  => --TABLE: PhoenixTable  EXPORTS: SELF
+      --TYPE: PhoenixParseTable
+      --GOAL:  goal
+      
+      --TERMINALS:
+      --    ; .
+      --    num dow moy yearValue
+      --    AFTER AND BASE BEFORE BETWEEN DAY DAYS EVERY EXCEPT FULL
+      --    LAST MONTH MONTHS MOON MOONS NEW NEXT ON OR REFERENCE STARTING
+      --    TODAY TOMORROW UNTIL WEEK WEEKDAY WEEKDAYS WEEKS YEAR YEARS
+      --    YESTERDAY
+
+      --ALIASES:
+      --  ; tokenSemi
+      --  yearValue tokenYEARVAL
+      --  moy tokenMONTH
+      --  dow tokenDAY
+      --  num tokenNUM
+      --  eof endmarker
+
+      --  PRODUCTIONS:
+
+          --  goal              ::= dateExpression .
+          BEGIN
+          dateString _ vTop;
+          AppendChar[@dateString, done];
+          END;
+
+    1  => -- dateExpression     ::= rangedDateSpec dateTail
+          Snarf[2, top];
+
+    2  => -- rangedDateSpec     ::= domain dateSpec
+          Snarf[2, top];
+
+    3  => -- dateTail           ::= ; rangedDateSpec
+          s _ v[top+1];
+
+    4  => --domain              ::= pStarting pUntil pReference
+          Snarf[3, top];
+
+    5  => --pStarting           ::= STARTING explicitDate
+          BEGIN
+          AppendChar[@s, starting];
+          Snarf[1, top+1];
+          END;
+    6  => --pStarting           ::= 
+          NULL;
+
+    7  => --pUntil              ::= UNTIL explicitDate
+          BEGIN
+          AppendChar[@s, until];
+          Snarf[1, top+1];
+          END;
+    8  => --pUntil              ::= 
+          NULL;
+
+    9  => --pReference          ::= REFERENCE explicitDate
+          --pReference          ::= BASE explicitDate
+          BEGIN
+          AppendChar[@s, base];
+          Snarf[1, top+1];
+          END;
+   10  => --pReference          ::= 
+          NULL;
+
+   11  => --explicitDate        ::= beforeOrAfter noncyclicDate
+          Snarf[2, top];
+
+   12  => --dateSpec            ::= noncyclicDate
+            s _ vTop;
+   13  => --dateSpec            ::= cyclicDate pBetween pExcept
+          Snarf[3, top];
+   14  => --dateSpec            ::= beforeOrAfter dateSpec
+          BEGIN
+          vStr: STRING = LOOPHOLE[v[top+1]];
+          IF vStr[0] = nonCyclic THEN
+            BEGIN
+            dateStr: STRING _ [4];
+            FOR i: CARDINAL IN [0..4) DO dateStr[i] _ vStr[i+1] ENDLOOP;
+            dateStr.length _ 4;
+            AppendChar[@s, nonCyclic];
+            AppendDate[@s, ReduceStrings[vTop, dateStr]];
+            FreeString[top]; FreeString[top+1];
+            END
+          ELSE Snarf[2, top];
+          END;
+
+   15  => --pBetween            ::= BETWEEN dayOfMonth AND dayOfMonth
+          BEGIN
+          AppendChar[@s, betweenDOM];
+          Snarf[1, top+1];
+          Snarf[1, top+3];
+          END;
+   16  => --pBetween            ::= BETWEEN cyclicSpec AND cyclicSpec
+          BEGIN
+          AppendChar[@s, betweenCyc];
+          Snarf[1, top+1];
+          Snarf[1, top+3];
+          END;
+   17  => --pBetween            ::= BETWEEN dow AND dow
+          BEGIN
+          AppendChar[@s, betweenDOW];
+          AppendChar[@s, v[top+1]];
+          AppendChar[@s, v[top+3]];
+          END;
+   18  => --pBetween            ::= 
+          NULL;
+
+   19  => --pExcept             ::= EXCEPT exceptList
+          s _ v[top+1];
+   20  => --pExcept             ::= 
+          NULL;
+
+   21  => --exceptList          ::= exceptSpec
+          BEGIN
+          AppendChar[@s, except];
+          Snarf[1, top];
+          END;
+   22  => --exceptList          ::= exceptSpec OR exceptList
+          BEGIN
+          AppendChar[@s, except];
+          Snarf[1, top]; Snarf[1, top+2];
+          END;
+
+   23  => --exceptSpec          ::= noncyclicDate
+            s _ vTop;
+   24  => --exceptSpec          ::= cyclicDate pBetween
+          Snarf[2, top];
+   25  => --exceptSpec          ::= beforeOrAfter exceptSpec
+          BEGIN
+          vStr: STRING = LOOPHOLE[v[top+1]];
+          IF vStr[0] = nonCyclic THEN
+            BEGIN
+            dateStr: STRING _ [4];
+            FOR i: CARDINAL IN [0..4) DO dateStr[i] _ vStr[i+1] ENDLOOP;
+            dateStr.length _ 4;
+            AppendChar[@s, nonCyclic];
+            AppendDate[@s, ReduceStrings[vTop, dateStr]];
+            FreeString[top]; FreeString[top+1];
+            END
+          ELSE Snarf[2, top];
+          END;
+
+   26  => --cyclicDate          ::= cyclicSpec cyclicUnits
+          Snarf[2, top];
+   27  => --cyclicDate          ::= cyclicSpec
+          --cyclicDate          ::= cyclicUnits
+          s _ vTop;
+
+   28  => --beforeOrAfter       ::= units BEFORE
+          BEGIN
+          AppendChar[@s, before];
+          Snarf[1, top];
+          END;
+   29  => --beforeOrAfter       ::= units AFTER
+          BEGIN
+          AppendChar[@s, after];
+          Snarf[1, top];
+          END;
+   30  => --beforeOrAfter       ::= pDows ON OR BEFORE
+          BEGIN
+          AppendChar[@s, onOrBefore];
+          Snarf[1, top];
+          END;
+   31  => --beforeOrAfter       ::= pDows ON OR AFTER
+          BEGIN
+          AppendChar[@s, onOrAfter];
+          Snarf[1, top];
+          END;
+
+   32  => --noncyclicDate       ::= TODAY
+          BEGIN
+          AppendChar[@s, nonCyclic];
+          AppendDate[@s, today];
+          END;
+   33  => --noncyclicDate       ::= TOMORROW
+          BEGIN
+          AppendChar[@s, nonCyclic];
+          AppendDate[@s, [today + oneDay]];
+          END;
+   34  => --noncyclicDate       ::= YESTERDAY
+          BEGIN
+          AppendChar[@s, nonCyclic];
+          AppendDate[@s, [today - oneDay]];
+          END;
+   35  => --noncyclicDate       ::= dayOfMonth yearValue
+          BEGIN
+          AppendChar[@s, nonCyclic];
+          AppendDate[@s, DOMToDate[vTop, v[top+1]]];
+          FreeString[top];
+          END;
+   36  => --noncyclicDate       ::= NEXT dow
+          BEGIN
+          targetWeekday: CARDINAL _ v[top+1];
+          uToday: Time.Unpacked = Time.Unpack[today];
+          offset: CARDINAL _
+            IF targetWeekday <= uToday.weekday THEN targetWeekday + 7 - uToday.weekday
+            ELSE targetWeekday - uToday.weekday;
+          AppendChar[@s, nonCyclic];
+          AppendDate[@s, [today + offset * oneDay]];
+          END;
+   37  => --noncyclicDate       ::= LAST dow
+          BEGIN
+          targetWeekday: CARDINAL _ v[top+1];
+          uToday: Time.Unpacked = Time.Unpack[today];
+          offset: CARDINAL _
+            IF targetWeekday < uToday.weekday THEN uToday.weekday - targetWeekday
+            ELSE uToday.weekday + 7 - targetWeekday;
+          AppendChar[@s, nonCyclic];
+          AppendDate[@s, [today - offset * oneDay]];
+          END;
+   38  => --noncyclicDate       ::= dayOfMonth
+          BEGIN
+          uToday: Time.Unpacked = Time.Unpack[today];
+          target: Time.Packed _ DOMToDate[vTop, uToday.year];
+          IF System.SecondsSinceEpoch[target] < System.SecondsSinceEpoch[today] THEN
+            BEGIN
+            uTarget: Time.Unpacked _ Time.Unpack[target];
+            uTarget.year _ uTarget.year + 1;
+            target _ Time.Pack[uTarget];
+            END;
+          AppendChar[@s, nonCyclic];
+          AppendDate[@s, target];
+          FreeString[top];
+          END;
+
+   39  => --cyclicSpec  ::= num EVERY pMonths
+          BEGIN
+          AppendChar[@s, cyclic];
+          AppendChar[@s, monthly];
+          AppendChar[@s, vTop];
+          Snarf[1, top+2];
+          END;
+   40  => --cyclicSpec  ::= num DAY EVERY pMonths
+          BEGIN
+          AppendChar[@s, cyclic];
+          AppendChar[@s, monthly];
+          AppendChar[@s, vTop];
+          Snarf[1, top+3];
+          END;
+   41  => --cyclicSpec  ::= EVERY dayOfMonth
+          BEGIN
+          AppendChar[@s, cyclic];
+          Snarf[1, top+1];
+          END;
+
+   42  => --cyclicUnits ::= EVERY units
+          BEGIN
+          AppendChar[@s, cyclic];
+          Snarf[1, top+1];
+          END;
+   43  => --cyclicUnits ::= EVERY units cyclicUnits
+          BEGIN
+          AppendChar[@s, cyclic];
+          Snarf[2, top+1];
+          END;
+
+   44  => --dayOfMonth  ::= num moy
+          BEGIN
+          AppendChar[@s, domSimple];
+          AppendChar[@s, v[top+1]];
+          AppendChar[@s, vTop];
+          END;
+   45  => --dayOfMonth  ::= moy num
+          BEGIN
+          AppendChar[@s, domSimple];
+          AppendChar[@s, vTop];
+          AppendChar[@s, v[top+1]];
+          END;
+   46  => --dayOfMonth  ::= domUnits moy
+          BEGIN
+          AppendChar[@s, domUnits];
+          Snarf[1, top];
+          AppendChar[@s, v[top+1]];
+          END;
+
+   47  => --domUnits            ::= num DAY
+          BEGIN
+          AppendChar[@s, day];
+          AppendChar[@s, vTop];
+          END;
+   48  => --domUnits            ::= num WEEK
+          BEGIN
+          AppendChar[@s, week];
+          AppendChar[@s, vTop];
+          END;
+   49  => --domUnits            ::= num newOrFull MOON
+          BEGIN
+          AppendChar[@s, v[top+1]];
+          AppendChar[@s, vTop];
+          END;
+   50  => --domUnits            ::= num dow
+          BEGIN
+          AppendChar[@s, dow];
+          AppendChar[@s, vTop];
+          AppendChar[@s, v[top+1]];
+          END;
+
+   51  => --units               ::= pDays
+          --units               ::= pWeeks
+          --units               ::= pMoons
+          --units               ::= pMonths
+          --units               ::= pDows
+          --units               ::= pYears
+          s _ vTop;
+
+   52  => --pDows               ::= WEEKDAY
+          BEGIN
+          AppendChar[@s, dow];
+          AppendChar[@s, 1C];
+          AppendChar[@s, 7C];
+          END;
+   53  => --pDows               ::= num WEEKDAY
+          --pDows               ::= num WEEKDAYS
+          BEGIN
+          AppendChar[@s, dow];
+          AppendChar[@s, vTop];
+          AppendChar[@s, 7C];
+          END;
+   54  => --pDows               ::= dow
+          BEGIN
+          AppendChar[@s, dow];
+          AppendChar[@s, 1C];
+          AppendChar[@s, vTop];
+          END;
+   55  => --pDows               ::= num dow
+          BEGIN
+          AppendChar[@s, dow];
+          AppendChar[@s, vTop];
+          AppendChar[@s, v[top+1]];
+          END;
+
+   56  => --pDays               ::= DAY
+          BEGIN
+          AppendChar[@s, day];
+          AppendChar[@s, 1C];
+          END;
+   57  => --pDays               ::= num DAY
+          --pDays               ::= num DAYS
+          BEGIN
+          AppendChar[@s, day];
+          AppendChar[@s, vTop];
+          END;
+
+   58  => --pMonths             ::= MONTH
+          BEGIN
+          AppendChar[@s, month];
+          AppendChar[@s, 1C];
+          END;
+   59  => --pMonths             ::= num MONTH
+          --pMonths             ::= num MONTHS
+          BEGIN
+          AppendChar[@s, month];
+          AppendChar[@s, vTop];
+          END;
+
+   60  => --pMoons              ::= newOrFull MOON
+          BEGIN
+          AppendChar[@s, vTop];
+          AppendChar[@s, 1C];
+          END;
+   61  => --pMoons              ::= num newOrFull MOON
+          --pMoons              ::= num newOrFull MOONS
+          BEGIN
+          AppendChar[@s, v[top+1]];
+          AppendChar[@s, vTop];
+          END;
+
+   62  => --newOrFull           ::= NEW
+          AppendChar[@s, newMoon];
+   63  => --newOrFull           ::= FULL
+          AppendChar[@s, fullMoon];
+
+   64  => --pYears              ::= YEAR
+          BEGIN
+          AppendChar[@s, yearUnits];
+          AppendChar[@s, 1C];
+          END;
+   65  => --pYears              ::= num YEAR
+          --pYears              ::= num YEARS
+          BEGIN
+          AppendChar[@s, yearUnits];
+          AppendChar[@s, vTop];
+          END;
+
+   66  => --pWeeks              ::= WEEK
+          BEGIN
+          AppendChar[@s, week];
+          AppendChar[@s, 1C];
+          END;
+   67  => --pWeeks              ::= num WEEK
+          --pWeeks              ::= num WEEKS
+          BEGIN
+          AppendChar[@s, week];
+          AppendChar[@s, vTop];
+          END;
+
+    ENDCASE => ERROR;
+    
+  v[top] _ s; IF s # NIL THEN stringStacked[top] _ TRUE;
+  ENDLOOP;
+  END;
+
+
+END.
