@@ -1,0 +1,914 @@
+	SUBTTL	LAB5+ASYNC
+:------------------------------------------------------------------: 
+:  Class TTE 442 - ISIS Slot Programming - 31-Oct-88 to 11-Nov-88  : 
+:  Student: Joe Smith, MDFSCO, mail stop D21, phone 922-6220       :
+:  Node 2033, Slot 03, Host 30, File JS2033.#03 in (TECHTRAIN:31)  :
+:------------------------------------------------------------------: 
+
+	RA	0		: In case DATIME.LIB left radix at $A
+	SEG	A.DATA
+
+MAXNAM	EQ	$A 1+12+1	: "!" + 12 chars name + CR or semi
+MAXPHW	EQ	(MAXPRT/10)+1	: Number of bits (3 halfwords if MAXPRT=$A 32)
+INUSE	HS	MAXPHW		: Bit array for in use ports
+OBWAIT	HS	MAXPHW		: Bit array for ports waiting for orange ball
+USECNT	HC	00		: Count of ports in use
+
+Q	EQ	.
+	ORG	0		: Ports database
+P.READ	WS	01		: 4 bytes address of input read routine
+P.INVN	WS	01		: 4 bytes invoice number (accounting)
+P.PORT	HS	01		: 2 bytes port number (from Dispatcher)
+P.DHST	HS	01		: 2 bytes destination host (this slot)
+P.ONOD	HS	01		: 2 bytes origination node (CONSAT)
+P.OHST	HS	01		: 2 bytes origination host (CONSAT)
+P.OPRT	HS	01		: 2 bytes origination port (obsolete)
+P.LOG2	HS	01		: 2 bytes for LOG-II invoice extension
+P.XTPC	BS	02		: 1 byte unused, 1 byte thru-put class
+P.DNOD	HS	01		: 2 bytes destination node (this node)
+P.CCT	BS	01		: 1 byte circuit characteristic type
+P.NAMS	BS	01		: 1 count of bytes in name
+P.NAME	BS	MAXNAM		:12+2 bytes user name
+P.XXXX	BS	0		: End of structure
+	ORG	Q		: End of structure
+P.WS	EQ	(P.XXXX+3)/4	: Number of words required
+P.BASE	WS	(MAXPRT+1)*P.WS	: Array of structures (word aligned)
+P.LAST	EQ	.-(P.WS*4)	: Beginning of MAXPRT's structure
+P.SIZE	HC	P.WS*4		: This is for the multiply instruction
+
+
+: Host up message
+
+HSTUP	HC	$A 14		: Size of message (including 2 filler bytes)
+	BC	10		: RPORT=0, message type 10 = Host UP
+	BC	0		: Dispatcher's key
+	HC	HST0		: Host number (from TYM file)
+	HC	HPRT0		: Number of ports on this host (from TYM file)
+	HC	0		: Relative host number (Host 0)
+HSTDWN	BC	0		: 0=up, 1=down, 2=shut, 3=gone
+	BC	0		: Host key, not used
+	BC	0		: IIX file is off
+	BC	PRODID		: Product ID, 99x=TEST
+	HC	0		: 2 bytes filler
+
+: All of these messages have filler (to make ORING easier to read)
+DETMSG	XC	029E00		: ISIS message to DETACH circuit
+ZAPMSG	XC	029F00		: ISIS message to ZAP circuit
+GREMSG	XC	02AA00		: ISIS message for green ball
+REDMSG	XC	02AB00		: ISIS message for red ball
+YBLMSG	XC	02AC00		: ISIS message for yellow ball
+ORAMSG	XC	02AD00		: ISIS message for orange ball
+EC1MSG	XC	06B10001000000	: ISIS message to turn echo on
+
+CRLF	SC	/"8D"8A/
+SPACE	SC	/ /
+BELSTR	SC	/"87 /		: BEEP, SPACE
+BCOUNT	WC	0
+
+: Global variables
+	GL	SCOUNT
+	SEG	A.CODE
+: Slot's execution starts at label START (called from CRASH.LIB)
+
+START	LIS	R2,0		: RPORT=0 message, to node code
+	LA	R3,HSTUP+1,,	: Point to byte count at start of message
+	JAL	R5,OCM,,	: Output canned message saying we are up
+	LIS	R0,0
+	LHI	R1,MAXPHW-1	: Number of HW's to clear, starting at 0
+START1	SH	R0,INUSE,R1	: Clear out the "in use" bits
+	SIS	R1,1
+	JGE	START1
+	SH	R0,USECNT	: Clear count
+: Put host and slot number in connect message
+	LHI	R2,HST0		: Our host number
+	LI	R0,0220+0A	: 2 bytes, blank fill, decimal
+	LA	R1,HOSTXX	: Address of XX in CONSTR
+	JAL	R6,OUTNUM,,
+	LH	R2,SLOTNO,,	: Our slot number 
+	LI	R0,0140+10	: 1 byte, zero fill, hex
+	LA	R1,SLOTXX	: Address of X in CONSTR
+	JAL	R6,OUTNUM,,
+	LH	R2,NODEX,,	: Our node number
+	LI	R0,0440+08	: 4 bytes, zero fill, octal
+	LA	R1,NODEXX	: Address of XXXXX in CONSTR
+	JAL	R6,OUTNUM,,
+	LHI	R2,MAXPRT	: Max port number
+	LI	R0,0220+0A	: 2 bytes, blank fill, decimal
+	LA	R1,MAXPXX	: Address of XX in CONSTR
+	JAL	R6,OUTNUM,,
+
+	GL	FSTART,FCHECK	: Defined in JS2033.F03
+: Here is where the foreground task is started
+	LA	R0,FSTART,,	: Foreground starting address
+	SVC	SYS,CFGND.	: Connect foreground
+	LIS	R0,0
+	ST	R0,BCOUNT	: Zero the background counter
+	J	BMAIN		: Main loop starts on next page
+: Main processing loop (for background)
+
+BMAIN	SVC	DISMIS,0	: Give other slots a chance to run
+	LIS	R0,1
+	AM	R0,BCOUNT	: Count # of times thru here
+	JAL	R13,FCHECK,,	: Check if foreground wants anything done
+	JAL	R4,LOOK,,	: Look to see if there is anything in IRING
+	  J	BMAIN		: Nothing there, dismiss and try again
+	JE	B0FLSH		: If port zero message, flush it
+: R1 has port, R2 has message type
+	LR	R13,R1		: RPORT number
+	MH	R13,P.SIZE	: Point to port data structure
+	LA	R13,P.BASE,R13,	:  "		"
+	CHI	R2,0		: Message type of 0 is a needle, the
+	JE	NEEDL		:  only thing allowed on an unused port
+	TBT	R1,INUSE	: Is this port in use?
+	JN	BPROC		: Yes, process the command
+				: No, flush this message
+: Message type must still be in R2
+BFLUSH	LB	R0,LENGTH,R2,	: Get size from table in SEG F
+	JAL	R4,FLUSH,,	: Skip to end of message
+	J	BMAIN		: Go check next message
+
+: Here to flush a port 0 message
+
+B0FLSH	LH	R6,LP0LST,,	: Get addr of port 0 length list (from SEG F)
+				: "NRATE,R6" now points to start of table
+	LB	R0,NRATE,R6,R2	: Pickup size based on message type in R2
+	JAL	R4,FLUSH,,	: Skip to end of this input message
+	J	BMAIN		: See if next message is a needle
+: At last, we finally got a needle
+
+NEEDL	STH	R1,P.PORT,R13,	: Store port # in easy to access place
+	SBT	R1,INUSE	: Mark this port as in use
+	SBT	R1,HSECHO	: Host must do echo
+	JAL	R4,GETH,,	: Put msg type & length in R0
+	JAL	R4,GETW,,	: Get invoice number
+	ST	R0,P.INVN,R13,
+	JAL	R4,GETH,,	: Get dest host
+	STH	R0,P.DHST,R13,
+	JAL	R4,GETH,,	: Get orig node
+	STH	R0,P.ONOD,R13,
+	JAL	R4,GETH,,	: Get orig host
+	STH	R0,P.OHST,R13,
+	JAL	R4,GETH,,	: Get orig port
+	STH	R0,P.OPRT,R13,
+	JAL	R4,GETH,,	: Get invoice number, third half
+	STH	R0,P.LOG2,R13,
+	JAL	R4,GETH,,	: Get unused byte and TPC
+	STH	R0,P.XTPC,R13,
+	JAL	R4,GETH,,	: Get dest node number
+	STH	R0,P.DNOD,R13,
+	JAL	R4,GETCH,,	: Get circuit characteristics type
+	STB	R0,P.CCT,R13,
+	JAL	R4,GETCH,,	: Get size of username
+	STB	R0,P.NAMS,R13,
+	LR	R6,R0		: Save count
+	LIS	R7,0
+NEEDL1	JAL	R4,GETCH,,	: Get next byte of username
+	CHI	R7,MAXNAM
+	JGE	NEEDL2		: Don't store if name is too long
+	STB	R0,P.NAME,R13,R7
+NEEDL2	AIS	R7,1
+	SIS	R6,1
+	JG	NEEDL1		: Loop for all of username
+	JAL	R4,ELIR		: End of needle
+
+	LH	R2,P.PORT,R13,
+	LA	R3,EC1MSG	: Send message to turn on echo
+	JAL	R5,OCM,,
+	LIS	R2,1		: One more port in use
+	AHM	R2,USECNT
+	LA	R0,CREAD	: Connect port to command reader
+	ST	R0,P.READ,R13,
+	JAL	R7,PORTIS	: Output "port xx"
+	JAL	R7,SYSTAT	: Show who is currently logged in
+	LH	R2,P.PORT,R13,
+	LA	R3,WELSTR	: Point to the welcome message
+	JAL	R5,OCS,,	: Send string (including message length)
+	J	BMAIN
+WELSTR	SC	/"8D"8AWelcome to Joe's slot.  Type ? for help."8D"8A"8A/
+: Here to process ISIS messages
+
+BPROC	CHI	R2,009E		: Check for control message
+	JGE	BCNTRL		: Go do OB, YB, GB, RB, EC type stuff
+	JAL	R4,GETCH,,	: Officially get the count
+	STH	R0,NCOUNT	: Store for MYGETC
+	AM	R0,ICOUNT	: Increment number of characters input
+	CHI	R0,1		: Check for multi-byte messages
+	JE	NEXTC
+	LIS	R0,1
+	AM	R0,MCOUNT	: Increment count of multi's
+
+:Loop back here if it is a multi-byte string
+
+NEXTC	JAL	R6,MYGETC	: Get a character, echo if needed
+	  J	BMAIN		: No more input (ELIR called already)
+	L	R4,P.READ,R13,	: Get address of input routine
+	JR	R4		: Go there (usually goes to CREAD)
+
+: Read a command (default input handler)
+
+CREAD	JAL	R4,UPCASE	: Convert to uppercase, strip parity
+	LHI	R4,CMDLEN	: Size of table to check
+CMDCHK	SIS	R4,4
+	JL	NOTCMD		: Continue if count hasn't run out
+	LB	R2,CMDTAB,R4	: Get char
+	NHI	R2,7F		: Strip parity bit that SC left on
+	CR	R0,R2		: Match?
+	JN	CMDCHK		: Loop if not
+
+: Found a matching command.  Now go to it.
+
+	L	R6,CMDTAB,R4	: Get dispatch address
+	NI	R6,00FFFFFF	: Mask off char, leave only 24-bit address
+	JR	R6		: Go to routine
+
+: Here if character is not a command
+
+NOTCMD	LA	R3,BELSTR	: No match, output a bell
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,	: Go beep
+	J	NEXTC		: Get new command
+
+XX	MACRO(CH,ADDR)	[WC CH*01000000+ADDR]	: Combine CH and address
+
+XCMDX	MACRO	[
+	XX(03F,CMD.)		:"?" = help
+	XX(048,CMDH)		:"H" = help
+	XX(050,CMDP)		:"P" = print time
+	XX(051,CMDQ)		:"Q" = quit
+	XX(053,CMDS)		:"S" = status
+	XX(057,CMDW)		:"W" = who
+	]
+HLPSTR	SC	/elp: commands are Present-time, Quit, Status, Who."8D"8A/
+
+CMDTAB	WS	0		: Must start on a word boundary
+	XCMDX			: Create command table
+CMDLEN	EQ	.-CMDTAB	: Number of bytes in command table
+	KILL	XCMDX,XX
+
+: Routine to convert byte in R0 to uppercase.  Link on R4
+
+UPCASE	NI	R0,7F		: Strip parity bit before doing compares
+	CHI	R0,61		: Test for lowercase "a"
+	JL	ISUPR
+	CHI	R0,7A		: Test for lowercase "z"
+	JG	ISUPR
+	SHI	R0,20		: Convert lower to upper case
+ISUPR	JR	R4
+: The user typed "H" or "h"
+
+CMDH	LA	R3,HLPSTR	: Output the "H" message
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,	: "Help: Commands are:..."
+	J	NEXTC
+
+: The user typed "?"
+
+HSTR	SC	/ Legal command characters are:/
+CMD.	LA	R3,HSTR		: Output the "?" message
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,	: "Legal commands are: "
+	LHI	R0,(CMDLEN/4)*2	: Number of bytes = 2 * number of commands
+	LH	R1,P.PORT,R13,
+	LR	R2,R0		: Message type
+	JAL	R4,SLOR,,	: Start Logical Output Record
+	LIS	R6,0		: Start from beginning of commmand table
+CMDH1	LB	R0,SPACE+1	: Seperate letters
+	JAL	R4,PUTCH,,
+	LB	R0,CMDTAB,R6	: Get command code
+	JAL	R4,PUTCH,,	: Output the character
+	AIS	R6,4		: Each entry in command table is 4 bytes long
+	CHI	R6,CMDLEN	: At end of table?
+	JL	CMDH1		: No, do more
+	JAL	R4,ELOR		: End of Logical Output Record
+	LA	R3,CRLF
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,	: Finish with CR LF
+	J	NEXTC
+: The user typed "P" or "p"
+
+PSTR	SC	/resent time is: /
+CMDP	LA	R3,PSTR		: Output the "P" message
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,	: Output "The present time is: "
+	JAL	R7,PTIME
+	J	NEXTC
+
+	SEG	A.DATA
+TIMSTR	SC	/00:00:00"8D"8A/
+	SEG	A.CODE
+
+: Routine to output time of day and CRLF.  Link on R7
+
+PTIME	L	R3,GMT,,	: Get current time of day
+	LIS	R4,8		: Want to do 8 bytes
+	LA	R5,TIMSTR+1	: Put it right after the byte count
+	JAL	R6,TMSTMP,,	: Convert GMT to timestamp
+	LA	R3,TIMSTR
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,	: Output HH:MM:SS CR LF
+	JR	R7
+
+: User typed "Q" or "q"
+
+QSTR	SC	/uit"8D"8A/
+CMDQ	LA	R3,QSTR		: Output the "Q" message
+	LH	R2,P.PORT,R13,
+	RBT	R2,INUSE	: Port is not in use any more
+	JAL	R5,OCS,,	: "You typed Q to QUIT"
+	LA	R3,DETMSG	: Output a DETACH command
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCM,,	: Output 1 byte message (no byte count)
+	LCS	R0,1		: One less port in use
+	AHM	R0,USECNT
+	J	NEXTC		: Go back looking for more commands
+: User typed "S" or "s"
+
+SSTR	SC	/tatus of slot at /
+CMDS	LA	R3,SSTR		: Output "S" message
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,
+	JAL	R7,PTIME	: Output time of day and CRLF
+	L	R2,ICOUNT	: Number of data bytes (excludes control msg)
+	LI	R0,0920+0A	: 9 bytes, blank fill, decimal
+	LA	R1,BYTEXX	: Where to store them
+	JAL	R6,OUTNUM,,
+	L	R2,MCOUNT	: Number of multi-byte messages
+	LI	R0,0620+0A	: 6 bytes, blank fill, decimal
+	LA	R1,MULTXX	: Where to store them
+	JAL	R6,OUTNUM,,
+	LH	R2,P.PORT,R13,
+	LA	R3,MBSTR	: Output statistics
+	JAL	R5,OCS,,
+	L	R2,BCOUNT,,	: Number of background executions
+	LI	R0,0920+0A	: 9 bytes, blank fill, decimal
+	LA	R1,BCNTXX
+	JAL	R6,OUTNUM,,
+	L	R2,SCOUNT,,	: Number of sync bytes sent
+	LI	R0,0840+10	: 8 bytes, zero fill, hex
+	LA	R1,SCNTXX
+	JAL	R6,OUTNUM,,
+	LH	R2,P.PORT,R13
+	LA	R3,BCSTR	: Output background count
+	JAL	R5,OCS,,
+	J	NEXTC
+
+	SEG	A.DATA
+MBSTR	SC	/000000000 bytes input 000000 multi-byte messages received"8D"8A/
+BYTEXX	EQ	$A MBSTR+1
+MULTXX	EQ	$A BYTEXX+22
+BCSTR	SC	/000000000 background executions, sync count is 00000000"8D"8A/
+BCNTXX	EQ	$A BCSTR+1
+SCNTXX	EQ	$A BCNTXX+47
+	SEG	A.CODE
+
+: User typed "W" or "w"
+
+WSTR	SC	/ho - you are on/
+CMDW	LA	R3,WSTR		: Output the "W" message
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,
+	JAL	R7,PORTIS	: Output " port XX"
+	JAL	R7,SYSTAT	: Show system status
+	J	NEXTC
+: Routine to output port number and CRLF.  Link on R7
+
+PORTIS	LI	R0,0240+10	: 2 digits, zero fill, hex
+	LA	R1,THISXX	: Address of XX in "This is port XX"
+	LH	R2,P.PORT,R13,
+	JAL	R6,OUTNUM
+	LA	R3,GRTSTR	: Output greeting message
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,
+	JR	R7
+
+	SEG	A.DATA
+GRTSTR	SC	/ port XX"8D"8A/
+THISXX	EQ	$A GRTSTR+7
+CONSTR	SC	/This is host XX in node XXXX slot X. XX ports in use out of XX"8D"8A/
+HOSTXX	EQ	$A CONSTR+14
+NODEXX	EQ	$A HOSTXX+11
+SLOTXX	EQ	$A NODEXX+10
+USEDXX	EQ	$A SLOTXX+3
+MAXPXX	EQ	$A USEDXX+23
+LINSTR	SC	/Port XX came from node XXXX, user /
+PORTXX	EQ	$A LINSTR+6
+ONODXX	EQ	$A PORTXX+18
+	SEG	A.CODE
+
+: Show status (who's logged in).  Link on R7
+SYSTAT	LH	R2,USECNT	: Number of ports in use
+	LI	R0,0220+0A	: 2 bytes, blank fill, decimal
+	LA	R1,USEDXX	: Address of XX in CONSTR
+	JAL	R6,OUTNUM,,
+	LH	R2,P.PORT,R13,
+	LA	R3,CONSTR	: Point to the configuration message
+	JAL	R5,OCS,,	: Send string
+
+: Show status of all lines
+
+	LA	R8,P.LAST	: Point to last port's data
+SYST1	LH	R2,P.PORT,R8,	: Get port number
+	TBT	R2,INUSE	: Check if port is in use
+	JE	SYST2
+	LI	R0,0220+10	: 2 digits, blank fill, hex
+	LA	R1,PORTXX	: Address in message
+	JAL	R6,OUTNUM,,	: Put port # in LINSTR
+	LI	R0,0440+08	: 4 digits, zero fill, octal
+	LA	R1,ONODXX
+	LH	R2,P.ONOD,R8,	: Origination node
+	JAL	R6,OUTNUM,,	: Put port # on LINSTR
+	LH	R2,P.PORT,R13,
+	LA	R3,LINSTR
+	JAL	R5,OCS,,	: Output port number and node number
+	LA	R3,P.NAMS,R8,	: Point to user name count field
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,
+	LA	R3,CRLF
+	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,	: Finish with CR LF
+SYST2	SH	R8,P.SIZE	: Point to previous port's data
+	CI	R8,P.BASE	: Check to see if at beginning already
+	JG	SYST1		: Output info for all lines
+	JR	R7		: End of SYSTAT
+: Input and echo routines
+
+	SEG	A.DATA
+HSECHO	HS	MAXPHW		: Bit map for ports needing echo
+NCOUNT	HC	0		: Count of characters in current input message
+ICOUNT	WC	0		: Count of data bytes input from IRING
+MCOUNT	WC	0		: Number of multi-byte messages
+ECHO1C	SC	/X/		: ISIS message to output one character
+ECHOR0	EQ	ECHO1C+1	: The character to echo is stored here
+ECHO2C	SC	/^X/		: ISIS message to output two characters
+ECHO2X	EQ	ECHO2C+2	: Converted character here
+ECHORB	SC	/^?/		: Echo RUBOUT as up-arrow questionmark
+	SEG	A.CODE
+
+: Routine to get a character, echoing it if necessary.  Link on R6.
+
+MYGETC	LH	R0,NCOUNT	: Number of bytes left to process
+	SIS	R0,1
+	JL	MYGET0		: End of this input string
+	STH	R0,NCOUNT
+	AIS	R6,4		: Set up for skip return
+	JAL	R4,GETCH,,	: Get next byte
+	LH	R2,P.PORT,R13,
+	TBT	R2,HSECHO	: Should the host (me) do echoing?
+	JER	R6		: No, return with character in R0
+	JFS	MYECHO		: Yes, echo character before returning
+
+MYGET0	JAL	R4,ELIR,,	: End of logical Input record
+	JR	R6		: Nonskip return from MYGETC
+
+: Routine to do host echo.  Character to be echoed in R0, link on R6
+
+MYECHO	STB	R0,ECHOR0	: Save character to be echoed
+	LA	R3,ECHORB
+	CHI	R0,07F		: Check for RUBOUT/DELETE
+	JE	MYECH1
+	CHI	R0,0FF		: (with parity)
+	JE	MYECH1
+	NI	R0,7F-1F	: Check if it looks like a printing char
+	JE	UPECHO		: Echo control chars in up-arrow mode
+	LA	R3,ECHO1C	: Echo the one character (in ECHOR0)
+	JFS	MYECH1
+UPECHO	LB	R0,ECHOR0	: Get the control character
+	XHI	R0,40+80	: Add 40 to make printing, toggle parity
+	STB	R0,ECHO2X
+	LA	R3,ECHO2C	: Echo two characters
+MYECH1	LH	R2,P.PORT,R13,
+	JAL	R5,OCS,,
+	LB	R0,ECHOR0	: Return character in R0
+	JR	R6		: Return from MYECHO/MYGETC
+: Echo processing:  When a new circuit arrives, we send a B10001 message to
+: turn on echo mode.  The CONSAT will send us a green ball, which we return.
+: It then sends use a LDEM when it takes over echoing.  When an unechoable
+: character is typed, the CONSAT preceeds it with a EDEM, telling us to enter
+: deferred echo mode (where we do echoing).  We return any red balls that
+: the CONSAT may send us.
+
+: Enter and Leave Deferred Echo Mode
+
+CTLEDE	SBT	R1,HSECHO	: Enter DEM - host must echo
+	J	BFLUSH		: (message type still in R2)
+
+CTLLDE	RBT	R1,HSECHO	: Leave DEM - CONSAT now doing echo
+	J	BFLUSH		: (message type still in R2)
+
+: Red and Green Balls (CONSAT uses these as part of echo processing)
+
+CTLRED	LB	R0,LENGTH,R2,	: Get size from table in SEG F
+	JAL	R4,FLUSH	: Skip past message (in R2)
+	LH	R2,P.PORT,R13,
+	LA	R3,REDMSG
+	JAL	R5,OCM,,	: Reflect red ball as red ball
+	J	BMAIN
+
+CTLGRE	LB	R0,LENGTH,R2,	: Get size from table in SEG F
+	JAL	R4,FLUSH	: Skip past message (in R2)
+	LH	R2,P.PORT,R13,
+	LA	R3,GREMSG
+	JAL	R5,OCM,,	: Reflect green ball as green ball
+	J	BMAIN
+
+: Yellow and Orange Balls:  Whenever we get a yellow ball, we send back
+: an orange ball so the CONSAT knows that all input has been received.
+: When we send a yellow ball, we set a bit in OBWAIT and wait for an
+: orange ball to come back from the CONSAT, indicating that it has
+: received all our output data.
+
+CTLYEL	LB	R0,LENGTH,R2,	: Get size from table in SEG F
+	JAL	R4,FLUSH	: Skip past message (in R2)
+	LH	R2,P.PORT,R13,
+	LA	R3,ORAMSG
+	JAL	R5,OCM,,	: Reflect yellow ball as orange ball
+	J	BMAIN
+
+CTLORA	RBT	R1,OBWAIT	: No longer waiting for an orange ball
+	J	BFLUSH		: (message type still in R2)
+
+: The bit 0002 in CNTRL says that ports are new reusable until they emit
+: disconnect, the Dispatcher wants us to return zappers.
+
+CTLZAP	RBT	R1,INUSE	: Turn off the in-use bit
+	LCS	R0,1		: One less port in use
+	AHM	R0,USECNT
+	LB	R0,LENGTH,R2,
+	JAL	R4,FLUSH,,	: Remove zapper from IRING
+	LH	R2,P.PORT,R13,
+	LA	R3,ZAPMSG	: The dispatcher wants to see a zap back
+	JAL	R5,OCM,,
+	J	BMAIN
+: Process control messages from the IRING.  Port in R1, type in R2.  R13 set up
+
+BCNTRL	LHI	R4,CTLLEN	: Size of table to check
+CTLCHK	SIS	R4,4		: Stop at end of table
+	JL	BFLUSH		: Ignore messages not in our table
+	LB	R0,CTLTAB,R4	: Get code
+	CR	R0,R2		: Match message type?
+	JN	CTLCHK		: Loop if not
+	L	R6,CTLTAB,R4	: Get dispatch address
+	NI	R6,00FFFFFF	: Mask off code, leave only 24-bit address
+	JR	R6		: Go to routine
+
+XX	MACRO(CH,ADDR)	[WC CH*01000000+ADDR]	: Combine CH and address
+
+XCTLX	MACRO	[
+	XX(09F,CTLZAP)		: Zapper
+:*:	XX(0A0,CTLBPN)		: Backpressure:*:	XX(0A1,CTLBPF)		: Backpressure oFf
+	XX(0A6,CTLEDE)		: Enter Deferred Echo Mode
+	XX(0A7,CTLLDE)		: Leave Deferred Echo Mode
+	XX(0AA,CTLGRE)		: Green Ball
+	XX(0AB,CTLRED)		: Red Ball
+	XX(0AC,CTLYEL)		: Yellow Ball
+	XX(0AD,CTLORA)		: Orange Ball
+:*:	XX(0B1,CTLTTY)		: Terminal parameters
+:*:	XX(0B9,CTLLIM)		: Set transmit Limit
+	]
+
+CTLTAB	WS	0		: Must start on a word boundary
+	XCTLX			: Create command table
+CTLLEN	EQ	.-CTLTAB	: Number of bytes in command table
+	KILL	XCTLX,XX
+
+: End of ..MAIN
+ 	SUBTTL	FMAIN - JS2033.F03 - This is the foreground for Joe's slot
+	
+	GL	FSTART,FCHECK	: Entry points (called from background)
+	GL	SCOUNT		: Global variables (defined here)
+	GL	LUASYN,LUSYNC,LUSIO	: Defined in slot's TYM file
+
+	SEG	A.CODE
+	MO	.,FMAIN		: Start of module FMAIN
+
+
+: Start up the foreground process
+
+FSTART	JAL	R13,INIASY	: Start up async
+	JAL	R13,INISYN	: Start up sync
+	JAL	R13,INISIO	: Start up SIO
+				: Fall into FMAIN
+
+: Main loop for foreground process
+
+FMAIN	LIS	R0,0		: Main foreground loop starts here
+	STH	R0,MORE		: Clear flag (nonzero means more to do)
+	JAL	R13,DOASYI	: Handle async input
+	JAL	R13,DOASYO	: Handle async output
+	JAL	R13,DOSYNI	: Handle sync input
+	JAL	R13,DOSYNO	: Handle sync output
+	JAL	R13,DOSIOI	: Handle SIO input
+	JAL	R13,DOSIOO	: Handle SIO output
+	LH	R0,MORE		: Did any routine indicate more to do?
+	JN	FMAIN		: Yes, loop back immediately
+	SVC	DISMIS,0	: No, don't be a foreground hog
+	J	FMAIN
+
+: Background routine.  Called from BMAIN whenever background runs.
+
+FCHECK	JAL	R12,CHKASY	: Check for async work
+	JAL	R12,CHKSYN	: Check for sync work
+	JAL	R12,CHKSIO	: Check for SIO work
+	JR	R13		: End of FCHECK
+
+INISIO	JR	R13		: No SIO initialization
+DOSIOI	JR	R13		: No SIO input yet
+DOSIOO	JR	R13		: No SIO output yet
+CHKSIO	JR	R12		: No SIO background
+
+	SEG	A.DATA
+MORE	HC	0		: Nonzero if more to do in foreground loop
+	SEG	A.CODE
+	SUBTTL	Sync routines
+	SEG	A.DATA		: SYNC buffers
+
+SYNIPT	HC	0		: SYNIBF empty pointer
+SYNISZ	EQ	200		: 512 input bytes (does not include index)
+SYNIBF	HS	1+(SYNISZ/2)	: Sync input buffer, halfword aligned
+	HC	5555		: (to verify buffer does not overflow)
+
+SYNOSZ	EQ	200		: 512 bytes for each output buffer
+SYNBF1	HS	SYNOSZ/2	: 1st output buffer
+SYNBF2	HS	SYNOSZ/2	: 2nd output buffer
+SYNBF3	HS	SYNOSZ/2	: 3rd output buffer
+SYNBF4	HS	SYNOSZ/2	: 4th output buffer
+
+CMD	EQ	0		: Offsets into rotor list below
+CNT	EQ	2
+ADR	EQ	4
+	BND	4		: This must start on a word boundary
+RTLST1	HC	1		: Output command
+	HC	SYNOSZ		: Byte count
+	WC	SYNBF1		: Address of buffer
+RTLST2	HC	1		: Output command
+	HC	SYNOSZ		: Byte count
+	WC	SYNBF2		: Address of buffer
+RTLST3	HC	2		: Jump command
+	HC	0
+	WC	RTLST1		: Where to jump to
+
+: Addresses of buffers to be put into the rotor list.
+: Foreground: put old buffer in EMPTY, grab new one from FULL.
+: Background: grab buffer from EMPTY, put in FILL and zero FILLPT.
+: Background: when FILLPT is full, put buffer in FULL.
+
+SCOUNT	WC	0		: Counter for sending sync data
+FULL	WC	0		: Next buffer to send
+FILL	WC	SYNBF3		: Buffer being filled
+EMPTY	WC	SYNBF4		: Next buffer to fill
+FILLPT	HC	0		: Pointer into FILL buffer
+
+	SEG	A.CODE
+: Start up SYNC line
+
+INISYN	LIS	R1,LUSYNC	: Logical unit number
+	LA	R2,SYNIBF,,	: Input buffer
+	LHI	R3,SYNISZ	: Size (including index)
+	SVC	IO,CSYNI.*10+R1	: Connect sync input
+	  J	CRASH		: Should never fail
+	SVC	DISMIS,0
+	LI	R0,1*10000+SYNOSZ : Make sure the rotor list
+	ST	R0,RTLST1+CMD,,	:  is properly set up,
+	ST	R0,RTLST2+CMD,,	:  incase slot is restarted
+	LIS	R0,2
+	STH	R0,RTLST3+CMD,,
+	LI	R0,SYNBF1	: Put buffer address in the right places
+	ST	R0,RTLST1+ADR,,
+	LI	R0,SYNBF2
+	ST	R0,RTLST2+ADR,,
+	LI	R0,SYNBF3
+	ST	R0,FILL,,
+	LI	R0,SYNBF4
+	ST	R0,EMPTY,,
+	LIS	R0,0
+	ST	R0,FULL		: No buffer is full yet
+	ST	R0,FILLPT	: Start at beginning of FILL buffer
+	ST	R0,SCOUNT	: Clear background count
+	
+	LIS	R1,LUSYNC	: Logical unit number
+	LA	R2,RTLST1,,	: Address of rotor list
+	SVC	IO,CSYNO.*10+R1	: Connect sync output
+	  J	CRASH		: Should never fail
+	JR	R13		: End of INISYN
+
+: Sync input routine
+
+DOSYNI	LH	R0,SYNIBF	: Get the index
+	STH	R0,SYNIPT	: Pretend that we read all the data
+	JR	R13		: End of DOSYNI
+: Resume sync output.  Link on R13
+
+DOSYNO	LH	R0,RTLST1+CMD,,	: Check if we are caught up
+	AH	R0,RTLST2+CMD,,
+	AH	R0,RTLST3+CMD,,
+	CHI	R0,1+1+2	: All values correct?
+	JER	R13		: Yes, all caught up, go dismiss
+
+: At least one of the commands in the rotor list needs to be reset
+
+	LIS	R1,2
+	STH	R1,MORE		: Set the "more" flag
+	STH	R1,RTLST3,,	: Fix the transfer command
+	LA	R1,RTLST1,,	: Check the first command
+	JAL	R2,SWAPSN	: Swap pointers
+	LA	R1,RTLST2,,	: Check the second command
+	JAL	R2,SWAPSN	: Swap pointers
+	J	DOSYNO		: Double check all 3 again before dismissing
+
+: Here to swap pointers between an empty pointer and a full one, link on R2.
+
+SWAPSN	LH	R0,CMD,R1	: Check the command HW
+	JNR	R2		: Proceed only if command is zero
+	L	R0,FULL		: Is there a full buffer read to go?
+	JE	SWAPNO		: Zero means no new buffer
+	L	R3,ADR,R1	: Get old buffer address
+	ST	R3,EMPTY	: This buffer is now empty
+	ST	R0,ADR,R1	: Store new buffer address
+	LIS	R0,0		: Zero means that
+	ST	R0,FULL		:  the full buffer has been taken
+SWAPOK	LIS	R0,1		: Reset the command code
+	STH	R0,CMD,R1
+	JR	R2		: Swap is done
+
+SWAPNO	LHI	R0,0FFFF	: No new buffer, reuse the old one
+	LHI	R3,SYNOSZ	:  after writing FF in all bytes
+	L	R4,ADR,R1	:  of the buffer
+SWAPFL	SIS	R3,2
+	JL	SWAPOK		: Reset command code when done
+	STH	R0,0,R4,R3	: Store 2 bytes of FF
+	JBS	SWAPFL
+: Enter here to do processing the in background on behalf of the foreground.
+: Called from the background's main loop, link on R12.
+
+CHKSYN	JAL	R3,CSROOM	: Check if room to do sync output
+	  J	0,R12		: Can't do anything at this time
+
+	LIS	R0,1		: Count number of times thru here
+	A	R0,SCOUNT
+	ST	R0,SCOUNT
+	JAL	R4,STOR0	: Store this number in the output buffer
+	J	CHKSYN		:*HACK* CONSTANTLY FILL UP OUTPUT BUFFERS
+
+: Check if room to do sync output.  Link on R3, skip if OK.
+: There are 4 buffers and 5 positions, RTLST1, RTLST2, FULL, FILL, EMPTY.
+: Exactly 1 of FULL, FILL, and EMPTY will always be zero.
+
+CSROOM	LH	R0,FILLPT	: Get current fill pointer
+	CHI	R0,SYNOSZ	: Check if current buffer is full
+	JL	4,R3		: Not full, ok to proceed (skip return)
+	L	R0,FULL		: Current buffer is full, check previous buf
+	JNR	R3		: Nonskip return if it is also full
+	L	R1,FILL		: Take the just filled buffer
+	ST	R1,FULL		:  and put it in the FULL position
+	L	R1,EMPTY	: Take the EMPTY buffer
+	ST	R1,FILL		:  and make it be the one to be filled
+	JE	CRASH		: EMTPY should not be zero when FULL is zero
+	STH	R0,FILLPT	: R0 still has a zero in it
+	ST	R0,EMPTY	: This buffer is taken
+	J	4,R3		: OK to proceed (skip return)
+
+: Put 2 bytes of R0 into output buffer.  Link on R4
+
+STOR0	L	R1,FILL		: Point to buffer to be filled
+	LH	R2,FILLPT	: Get the fill pointer
+	STH	R0,0,R1,R2	: Store in buffer that R1 points to
+	AIS	R2,2		: 2 bytes per halfword
+	STH	R2,FILLPT
+	JAL	R3,CSROOM	: Send buffer now if it is full
+	  NOP			: Don't care if no room
+	JR	R4		: Return from STOR0
+	SUBTTL	Async routines
+:-----------------------------------------------------------------------
+:  Start of Joe Smith's ASYNC LAB assignment.  9-Oct-88
+:  Set port 0 to 1200 baud, enable it, and output " OK ".
+:  Ignore all input from that port until a break is received.  Once the
+:  break signal has ended, output a welcome message and then enable echo.
+:  Be sure to echo CR as CR+LF.
+:-----------------------------------------------------------------------
+
+	GL	IZASYN,AGCI,AWCI,AWCP	: Routines in ARING.LIB
+	GL	NGRP,RBS,NAPORT		: Equates from ARING.LIB
+	GL	DSR,DTR,CP,TAM,TOPORT,FPORT,ARING	: Variables from ARING
+LUASYN	EQ	0		: Logical unit for 1st async group
+
+	SEG	A.DATA
+ASECHO	HS	NGRP		: Async echo needed when bit is set
+APORT	HC	0		: Port number that needs output
+ACOUNT	HC	0		: Count of bytes left to be output
+APOINT	WC	0		: Address of bytes left to be output
+	SEG	A.CODE
+
+: Start of program
+
+START	JAL	R13,INIASY	: Initialize and start async
+LOOP	SVC	DISMIS,0	: Give other slots a chance to run
+	JAL	R13,DOASYI	: Do async input
+	JAL	R13,DOASYO	: Do async output
+	J	LOOP
+
+: Messages to be sent
+
+ASINIT	SC /"00"95"00"B5"00"E0 OK / :IBAUD=1200, OBAUD=1200, connect
+WELCOM	SC /"8D"8AWelcome to Joe's ASYNC test slot.  This message is more than 14 bytes long."8D"8A/
+
+: Initialize ASYNC and start it.  Link on R13.
+
+INIASY	JAL	R0,IZASYN	: Init (zero) async variables
+	LIS	R1,0
+	STH	R1,ASECHO	: Mark port as not needing echo yet
+
+: Set up registers for the "connect async" SVC
+
+	LIS	R0,LUASYN	: Group #
+	LA	R1,ARING,,	: Array of rings
+	LA	R2,CP,,		: Bits of Carrier Present
+	LA	R3,DSR,,	: Bits of Data Set Ready (modem on-line)
+	LA	R4,DTR,,	: Bits of Data Term Ready (our ports)
+	LA	R5,TOPORT,,	: Bits of ports with output ready (set by us)
+	LA	R6,FPORT,,	: Bits of ports with input ready (set by ISIS)
+	LA	R7,TAM,,	: Bits of transmit activity
+	SVC	IO,030+R0	: Connect async (OP=3)
+	  JAL	R10,CRASH	: Die if no async defined in node's TYM file
+
+: Send an initialization message to set baud rates and enable I/O
+
+	LIS	R5,0		: Set port number
+	STH	R5,APORT
+	RBT	R5,DTR,,	: Clear DTR bit (which turns on the signal)
+	LB	R1,ASINIT	: Set byte count
+	STH	R1,ACOUNT
+	LA	R2,ASINIT+1	: Set message address
+	ST	R2,APOINT
+	JR	R13		: End of INIASY
+
+:--------------------------------------------------------------------------
+
+: Read input from the port.  Link on R13.
+
+DOASYI	LH	R5,APORT	: Check only port 0 in this assignment
+	JAL	R4,AGCI,,	: Get next byte (if any)
+	  J	0,R13		: Nothing there
+	CHI	R0,0		: Is it an escaped message?
+	JE	ESCIN		: Process escape on input
+	TBT	R5,ASECHO	: Are we supposed to echo on this port?
+	JER	R13		: Do nothing if BREAK has not been seen
+
+: Echo this input character.  Echo CR as CR+LF.  Since characters come in
+: relatively slowly, we do not expect the echo to fill the output ring.
+
+WAIT4	TBT	R5,TAM,,	: Is there room in the output ring?
+	JEBS	WAIT4		: No, spin here until ISIS sets the bit
+: The TAM bit gets set when there is room for 4 or more bytes in output ring
+	CHI	R0,0		: Test for null
+	JE	ECHNUL		: Because it has to be handled special
+	JAL	R4,AWCI,,	: Echo character by writing it to the oring
+	NHI	R0,7F
+	CHI	R0,0D		: Check for the carriage return character
+	JNR	R13		: Done if not
+	LHI	R0,8A		: Get a linefeed
+	JAL	R4,AWCI,,	: Echo this as well
+	JR	R13		: Done 
+
+ECHNUL	JAL	R4,AWCP,,	: Write NULL as an escaped character
+	JR	R13		: Done
+
+: Here to handle an escaped input character
+
+ESCIN	JAL	R4,AGCI,,	: Get char after the escape
+	  J	ESCIN		: Spin here until it arrives
+	CHI	R0,91		: End of break?
+	JNR	R13		: Ignore all other escaped characters
+	CBT	R5,ASECHO	: Toggle echo-enable at break end
+:Set up to output a welcome messsage
+	LB	R1,WELCOM	: Get byte count
+	LA	R2,WELCOM+1	: Address of message
+	STH	R1,ACOUNT	: Store this for DOASYO
+	ST	R2,APOINT	: (which will do it a few bytes at a time)
+	JR	R13		: End of DOASYI
+
+:--------------------------------------------------------------------------
+
+: Do async output
+
+DOASYO	LH	R5,APORT	: Do only port 0 in this assignment
+	TBT	R5,TAM,,	: Is there room do to anything?
+	JER	R13		: Wait until room for at least 4 bytes
+	LH	R1,ACOUNT	: Check if anything left to output
+	JER	R13		: Nothing waiting if count is zero
+	L	R2,APOINT	: Address where we left off
+	LB	R0,0,R2		: Get the next byte
+	SIS	R1,1		: Decrement count
+	STH	R1,ACOUNT
+	AIS	R2,1		: Increment pointer
+	ST	R2,APOINT
+	JAL	R4,AWCI,,	: Write normal character
+	J	DOASYO		: Check if OK to do more
+
+: Check for async work.  Called from background
+
+CHKASY	JR	R12		: Nothing to do
+
+: End of ASYNC lab problem.
+
+	EM			: End of module FMAIN
+ Q\>~
