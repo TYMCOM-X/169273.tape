@@ -1,0 +1,215 @@
+begin "Chunk"
+  require "(sailib)sail.def" source!file;
+
+! A knee-jerk reaction to a stupid problem.
+!
+! This hack maintains free space on disk at an artificially low
+! level, but within reasonable limits.
+;
+
+require "(sailib)redufd.req" source!file;
+
+require "(sailib)bitops.req" source!file;
+
+! Globals
+;
+
+! constants ;
+
+define ChunkSize = 1000;		! size of a file ;
+define ChunkDir = {"Billing10"};	! where to put the chunks ;
+
+! "Chunk file" management ;
+
+integer LargestChunkNumber;
+integer array ChunkBitMap[ 1 : 30 ];
+
+
+! Stuff set from the command file ;
+
+integer
+  LowBoundOnFreePages,
+  HiBoundOnFreePages,
+  DesiredFreePages;		! what to aim for if not in bounds ;
+
+! Misc ;
+
+integer
+  FreePages,
+  SleepTime;
+ ! Find all of our files
+;
+
+boolean procedure CountFile( integer array A );
+  begin "count"
+    string S;
+    integer I;
+print( ">> ",cv6str( A[0] ), crlf );
+    S := cv6str( A[0] )[3 for 3];
+    I := cvd( S );
+    if ( I > LargestChunkNumber ) then LargestChunkNumber := I;
+    SetBit( I, ChunkBitMap[1] );
+
+    return( false );
+  end "count";
+
+
+procedure FindChunks;
+  begin "find all of our chunks"
+    string S;
+
+    arrclr( ChunkBitMap );
+    LargestChunkNumber := -1;
+
+    S := "(" & ChunkDir & ")CH###.TMP";
+    RedUFD( CountFile, S, NULL );
+
+    print( "largest existing chunk file is ", LargestChunkNumber, crlf );
+
+  end "find all of our chunks";
+! Read our command file
+;
+
+procedure ReadCmdFile;
+  begin
+
+    ! ** hack ** ;
+
+    LowBoundOnFreePages := 6000;
+    HiBoundOnFreePages :=  9000;
+    DesiredFreePages  :=   8000;
+
+  end;
+! Detach ourselves
+;
+
+procedure Detach;
+  begin
+    
+  end;
+!  Return the number of pages currently free
+;
+
+integer procedure CalculateFreePages;
+  begin "free?"
+    integer array DSKChrBlk[ 0 : 3 ];
+
+    DSKChrBlk[ 0 ] := cvsix( "DSKB" );
+
+    start!code
+      Setom !Skip!;
+      hrri 1,access(DSKChrBlk[0]);
+      hrli 1,3;
+      calli 1,'45;
+	setzm !Skip!;
+    end;
+
+    print( "Free Pages = ", DSKChrBlk[ 2 ], crlf );
+
+    return( DSKChrBlk[ 2 ] );
+
+  end "free?";
+! Grab enough chunks to get free space close to DesireFreePages.
+! To keep things reasonable, just grab one chunk at a time.
+! This also prevents attention from being drawn to ourselves.
+;
+
+procedure GrabChunks;
+  begin "grab"
+    integer Chan, EOF, Flag, Hole;
+    string F;
+
+    for Hole := 0 upto ( LargestChunkNumber + 1 ) do
+      if ( SetBit( Hole, ChunkBitMap[1] )) then done;
+    if ( Hole > LargestChunkNumber ) then
+      LargestChunkNumber := LargestChunkNumber + 1;
+
+    F := "("&ChunkDir&")CH"&cvs(Hole)&".TMP";
+print( "[Grab "&F&"]", crlf );
+    open( Chan := getchan, "DSK", '17, 0,0,512,0, EOF );
+    enter( Chan, F, Flag );
+    useto( Chan, 4 * ChunkSize );
+    wordout( Chan, -1 );
+    close( Chan );  release( Chan );
+    print( ">> ", F, " created", crlf );
+
+  end "grab";
+! Free sufficient chunks to get our free space close to DesiredFreePages.
+! Since free space may be critical, we'll free the space up all at once.
+;
+
+procedure FreeChunks;
+  begin "free some space"
+    integer ChunksToFree, Hole;
+    integer Chan, EOF, Flag;
+    string F;
+
+    ChunksToFree := ( DesiredFreePages - FreePages ) / ChunkSize;
+
+    print( "ChunksToFree = ", ChunksToFree, crlf );
+
+    open( Chan := getchan, "DSK", '17, 0,0,512,0, EOF );
+
+    while ( ChunksToFree ) do
+      begin "free chunks"
+
+	for Hole := LargestChunkNumber downto -1 do
+	  begin
+	    if ( Hole = -1 ) then return;
+	    if ( ClrBit( Hole, ChunkBitMap[1] )) then done;
+	  end;
+	LargestChunkNumber := Hole - 1;
+
+	F := "("&ChunkDir&")CH"&cvs(Hole)&".TMP";
+print( "[Free"&F&"]", crlf );
+	lookup( Chan, F, Flag );
+	rename( Chan, NULL, 0, Flag );
+	print( ">> ", F, " freed", crlf );
+	LargestChunkNumber := LargestChunkNumber - 1;
+
+        ChunksToFree := ChunksToFree - 1;
+
+      end "free chunks";
+
+    close( Chan );  release( Chan );
+
+  end "free some space";
+! Sleep the desired amount of time.
+;
+
+procedure Snooze;
+  begin
+
+    calli( !XWD( '1, SleepTime ), '72 );
+
+  end;
+!  Top level logic.
+;
+
+  FindChunks;
+
+  while ( true ) do
+    begin "duty cycle"
+
+      ReadCmdFile;
+
+      FreePages := CalculateFreePages;
+
+      if ( FreePages < LowBoundOnFreePages ) then
+	begin
+	  FreeChunks;
+	  SleepTime := 10;
+	end
+      else if ( FreePages > HiBoundOnFreePages ) then
+	begin
+	  GrabChunks;
+	  SleepTime := 20;
+	end
+      else
+	SleepTime := 60;
+
+      Snooze;
+
+    end "duty cycle";
+
+end "Chunk";
