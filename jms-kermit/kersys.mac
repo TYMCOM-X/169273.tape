@@ -1,0 +1,744 @@
+	TITLE	KERSYS - System interface routines
+	SUBTTL	Robert C. McQueen, Nick Bush
+
+;[CSM] Make SY%LOGOUT detach job to implement ".KJOB/NOMESSAGES".
+;[CSM]   This is needed for VT180 with ZCPR so as not to fill up the
+;[CSM]   buffer with the "Job logged off" messages.
+
+; Universals
+
+	SEARCH	GLXMAC			; Galaxy definitions
+	SEARCH	KERUNV			; Kermit definitions
+
+; Directives
+
+	PROLOG	(KERSYS)
+	.DIREC	FLBLST			; List file line of binary only
+
+  ; Version number
+
+;[CSM] According to KERV3.MEM, this is KERMIT version 3(123)
+	SYSVER==3		;[CSM]	; Major version number
+	SYSMIN==0			; Minor version number
+	SYSEDT==123			; Edit level
+	SYSWHO==0			; Customer edit
+
+
+	TWOSEG	400K			; Make this a two segment program
+	RELOC	0			; Low segment
+	RELOC				; Back to the high segment
+	SUBTTL	Table of Contents
+
+;+
+;.pag.lit
+;                          Table of Contents of KERSYS
+;
+;
+;                                    Section                             Page
+;   1.   Table of Contents. . . . . . . . . . . . . . . . . . . . . . . .   2
+;   2.   Revision History . . . . . . . . . . . . . . . . . . . . . . . .   3
+;   3.   Operating system interface
+;      3.1.   SY%TIME . . . . . . . . . . . . . . . . . . . . . . . . . .   4
+;      3.2.   SY%LOGOUT . . . . . . . . . . . . . . . . . . . . . . . . .   5
+;      3.3.   SY%DISMISS. . . . . . . . . . . . . . . . . . . . . . . . .   6
+;   4.   End of KERSYS. . . . . . . . . . . . . . . . . . . . . . . . . .   7
+;
+;.end lit.pag
+;-
+	SUBTTL	Revision History
+
+COMMENT	|
+
+116	By: Nick Bush		On: 14-March-1984
+	Add parsing for all REMOTE commands.
+	Add support for some generic and local commands.
+	Fix wild card processing to handle pathological names correctly.
+	Modules: KERMIT,KERSYS,KERWLD
+
+117	By: Nick Bush		On: 14-March-1984
+	Add code to support changing default path.
+	Modules: KERSYS
+
+123	By: Nick Bush		On: 2-April-1984
+	Change SPACE generic command to use PPN of default path instead of users
+	PPN if no argument is supplied.
+	Make DIRECTORY and DELETE generic commands print out a header at the
+	top of the list, and print file size in both words and allocated blocks.
+	Add SPACE as synonym for DISK-USAGE command and ERASE as synonym for
+	DELETE.
+	
+	Modules: KERMIT,KERSYS
+|
+	SUBTTL	Initialization routine
+
+; This routine will initialize the operating system interface.
+
+SY%INIT::
+	MOVEI	S1,LOWSIZ		; Get size of low segment
+	MOVEI	S2,LOWBEG		; And start address
+	$CALL	.ZCHNK			; Clear it out
+
+; Now read default path
+
+	MOVX	S1,.PTFRD		; Get the function
+	MOVEM	S1,DEFPTH+.PTFCN	; Store it
+	MOVE	S1,[XWD .PTMAX,DEFPTH]	; Point at the block
+	PATH.	S1,			; And get the path
+	 JFCL				; Ignore errors
+	$RETT				; And return
+	SUBTTL	Operating system interface -- SY%TIME
+
+;+
+;.HL1 SY%TIME ()
+;This routine will return the current system uptime in milliseconds to
+;KERMSG.  This is used to calculate the effective baud rate for the sending
+;and receiving of messages.
+;-
+
+BLSRTN(SY%TIME)
+TOPS10<
+	$SAVE	<T1,T2,T3,T4>		; Save a few registers
+	MOVX	T1,%CNSUP		; Get the system uptime
+	GETTAB	T1,			; . . .
+	  SETZ	T1,			; Clear assume zero
+	MULX	T1,^D1000		; Convert to milliseconds
+	DIV	T1,JIFSEC##		; . . .
+	MOVE	S1,T1			; Move to the return location
+>; End of TOPS10 conditional
+	POPJ	P,			; Return to the caller
+	SUBTTL	Operating system interface -- SY%LOGOUT
+
+;+
+;.HL1 SY%LOGOUT ()
+;This routine will cause KERMIT-10 to log off the system.
+;-
+
+BLSRTN(SY%LOGOUT)
+TOPS20<
+	SETO	S1,			; Do it to me
+	LGOUT%				; Do it
+	BLSRET				; Just return
+>; End of TOPS20 conditional
+;[CSM] Change at BLSRTN(SY%LOGOUT)
+TOPS10<
+	MOVSI	S1,-1           ;[CSM]  ; -1 in LH means current terminal
+	ATTACH	S1,		;[CSM]	; 0 in RH means DETACH
+	  JFCL			;[CSM]
+	MOVEI	S1,S2			; Build arguments in the registers
+	MOVX	S2,<SIXBIT /SYS/>	; Run LOGOUT from SYS:
+	MOVX	T1,<SIXBIT /LOGOUT/>	; Get the program name
+	SETZB	T2,T3			; No extension and the zero
+	SETZB	T4,P1			; No PPN or core assignment
+	RUN	S1,UU.PHY		; Do the UUO
+	  HALT	.			; Fail.
+>; End of TOPS10 conditional
+	SUBTTL	Operating system interface -- SY%GENERIC
+
+;+
+;.HL1 SY%GENERIC (GCTYPE, STRADR, STRSIZ, GETRTN)
+;This routine is called with a generic command.
+;It will return either a pointer to a string to be returned to the
+;other Kermit (STRADR, STRSIZ),
+;or a routine address to call to get characters to be returned (GETRTN),
+;or a file name to be transferred (in FILE%NAME, FILE%SIZE).
+;-
+
+BLSRTN(SY%GENERIC,<GETRTN, STRSIZ, STRADR, GCTYPE>)
+	$SAVE	<T1,T2,T3,T4>		; Save T1-4
+	$SAVE	<TF,S2>			; And TF/S2
+	MOVE	S1,GCTYPE		; Get the command type
+	MOVE	S2,[XWD -GCTLEN,GCTAB]	; Get the table pointer
+SYGE.0:	MOVE	T1,(S2)			; Get the entry
+	CAIE	S1,(T1)			; Correct one?
+	 AOBJN	S2,SYGE.0		; No, keep looking
+	MOVS	T1,T1			; Point at correct routine
+	JUMPL	S2,(T1)			; And call it if we really found one
+	BLSCAL	KRM%ERROR##,<[EXP UNIMPLGEN]> ; Give the error
+	BLSRET	UNIMPLGEN		; Server command not implemented
+
+; Table of routines for generic commands
+
+	DEFINE ENT(FUNC,RTN)<XWD SY%'RTN,GC%'FUNC'##>
+
+GCTAB:	ENT	STATUS,STATUS
+	ENT	DISK%USAGE,DSK
+	ENT	DELETE,DEL
+	ENT	DIRECTORY,DIR
+	ENT	HELP,HLP
+	ENT	TYPE,TYP
+	ENT	CONNECT,CWD
+GCTLEN==.-GCTAB
+
+
+; Here for a type command.  This can only show up from LOCAL, since
+;KERMSG normally handles it in server mode
+
+SY%TYP:	MOVE	T1,[POINT 7,FILE%NAME##] ; Point at file name
+	MOVE	T2,[POINT 7,GEN%1DATA##] ; And argument
+	MOVE	S2,GEN%1SIZE##		; Get length
+	MOVEM	S2,FILE%SIZE##		; Store it
+TYPE.0:	ILDB	S1,T2			; Get a byte
+	IDPB	S1,T1			; Store it
+	SOJG	S2,TYPE.0		; Loop for all characters
+	IDPB	S2,T1			; And a null
+	BLSRET	NORMAL			; And return the file name
+
+; Here for connect command.  Either reset the path to what we had
+;when we started, or change to the new one supplied.
+
+SY%CWD:	SKIPN	GEN%1SIZE##		; Any argument?
+	 JRST	SCWD.3			; No, just use default
+	MOVX	S1,.FDSIZ		; Yes, get length
+	XMOVEI	S2,SYSFD		; Point at FD
+	$CALL	.ZCHNK			; Clear it out
+
+	MOVE	S1,[POINT 7,GEN%1DATA##] ; Point at the text
+	XMOVEI	S2,SYSFD		; And the FD
+	$CALL	PRSDIR##		; Parse the directory
+
+; Now copy the path to our PATH block, checking for wild-cards
+
+	MOVX	S1,.PTMAX		; Point at block
+	XMOVEI	S2,NEWPTH		; for new path
+	$CALL	.ZCHNK			; Clear it out
+	MOVX	S2,FD.DIR		; Did we get a directory?
+	TDNN	S2,SYSFD+.FDMOD		;  .  .  .
+	 JRST	SCWD.3			; No, use default
+	SETO	S2,			; Get a convenient minus 1
+	CAME	S2,SYSFD+.FDDIM		; Have a PPN?
+	 JRST	SCWD.E			; No, illegal wild-card
+	MOVE	S1,SYSFD+.FDPPN		; Get the PPN
+	MOVEM	S1,NEWPTH+.PTPPN	; Store in path block
+	MOVSI	T1,-<.PTMAX-.PTSFD-1>	; Get the number of possible directories
+
+SCWD.1:	MOVE	S1,SYSFD+.FDPAT(T1)	; Get an SFD
+	MOVEM	S1,NEWPTH+.PTSFD(T1)	; Store it
+	JUMPE	S1,SCWD.2		; Done?
+	CAME	S2,SYSFD+.FDPAT+.FDD2M(T1) ; Any wild-cards?
+	 JRST	SCWD.E			; Yes, complain
+	AOBJN	T1,SCWD.1		; No, loop
+	SETZM	NEWPTH+.PTSFD(T1)	; Ensure we have a zero
+
+SCWD.2:	SKIPA	S1,[EXP NEWPTH]		; Point at new path block
+
+SCWD.3:	 MOVEI	S1,DEFPTH		; Point at default path
+	MOVX	S2,.PTFSD		; Set default path
+	MOVEM	S2,.PTFCN(S1)		; Store function
+	SETZM	.PTSWT(S1)		; Clear the flags
+	HRLI	S1,.PTMAX		; Full block
+	PATH.	S1,			; Set the path
+	 JRST	SCWD.E			; Error, go give message
+	MOVX	S1,.PTFRD		; Get default path back
+	MOVEM	S1,NEWPTH+.PTFCN	; Store function
+	MOVE	S1,[XWD .PTMAX,NEWPTH]	; Get the current path
+	PATH.	S1,			;  .  .  .
+	 JFCL				; This better not happen
+	JSP	S1,RTNTXT		; Set up to return text
+	$TEXT	(<(S1)>,<Default path set to [^O/NEWPTH+.PTPPN,LHMASK/,^O/NEWPTH+.PTPPN,RHMASK/^A>)
+	MOVSI	T1,-<.PTMAX-.PTSFD-1>	; Get the number of SFDs possible
+SCWD.6:	SKIPN	NEWPTH+.PTSFD(T1)	; Finished?
+	 JRST	SCWD.7			; Yes, close off
+	$TEXT	(<(S1)>,<,^W/NEWPTH+.PTSFD(T1)/^A>) ; Type the SFD
+	AOBJN	T1,SCWD.6		; Loop for all SFDs
+SCWD.7:	$TEXT	(<(S1)>,<]^A>)		; Type the closing bracket
+	$RETT				; And return
+
+; Here on error
+
+SCWD.E:	KERERR	(<Cannot change default path to ^T/GEN%1DATA##/>)
+	BLSRET	RMS32			; Random error
+
+; Routine to handle help command.  Just return pointers to the help text.
+
+SY%HLP:	MOVEI	S1,REMHLP		; Get address
+	MOVEM	S1,@STRADR		; Save it
+	MOVEI	S1,REMHLL		; Get the length
+	MOVEM	S1,@STRSIZ		; Save it
+	BLSRET	NORMAL			; And return
+
+	DEFINE TXT (ADDR,LEN,TEXT)<
+	LEN==0			;; Start out at zero characters
+	IRPC <TEXT>,<LEN==LEN+1> ;; Count the character
+ADDR:	ASCII |'TEXT'|		;; Generate the text
+> ; End of TXT definition
+	TXT	(REMHLP,REMHLL,<Kermit-10 Server handles the following functions:
+
+Function                    Standard command
+--------                    ----------------
+
+Send a file                 SEND file-spec
+Retrieve a file             GET file-spec
+Log out from system         BYE or LOGOUT
+Exit from Kermit server     FINISH
+Type a file                 REMOTE TYPE file-spec
+List directory              REMOTE DIRECTORY file-spec
+Delete a file               REMOTE DELETE file-spec
+Show disk usage             REMOTE DISK
+Show disk usage for UFD     REMOTE DISK device:[PPN]
+Show status information     REMOTE STATUS
+Type this text              REMOTE HELP
+>) ; End of TXT macro call
+COMMENT |
+Change default directory    REMOTE CWD new-device/directory
+Reset default directory     REMOTE CWD
+Copy a file                 REMOTE COPY old-file-spec
+                                        New-file-spec
+Rename a file               REMOTE RENAME old-file-spec
+                                          New-file-spec
+Send message to user        REMOTE SEND terminal-name
+                                        message text
+Show who's logged in        REMOTE WHO
+Perform DCL command         REMOTE HOST DCL-command
+|
+
+
+; Routine to handle generic status command
+
+SY%STATUS:
+	MOVEI	S1,WRTSTS##		; Get routine which will generate the
+					; text
+	PJRST	RTNTXT			; And go return the text
+
+; Routine to handle disk usage
+
+SY%DSK:	MOVEI	S1,DSKUSE		; Get routine address
+;	PJRST	RTNTXT			; Go do it
+
+; Routine to handle any generic command which just generates text into
+;a buffer (less than a page worth).
+
+RTNTXT:	MOVE	T1,S1			; Save generation routine address
+	SKIPN	S1,TXTPAG		; Have a text page?
+	 $CALL	M%GPAG			; No, get one
+	MOVEM	S1,TXTPAG		; Save the address
+	MOVEM	S1,@STRADR		; Point at the string for later
+	HRLI	S1,(POINT 7,)		; Set up the byte pointer
+	MOVEM	S1,TXTPTR		; Save it
+	MOVX	S1,<5*PAGSIZ>-1		; Get the amount of data we can store
+	MOVEM	S1,TXTCTR		; Save the counter
+	MOVEI	S1,TXTOUT		; Get the output routine
+	$CALL	(T1)			; Write the text
+	SETZ	S1,			; Write a null to terminate the text
+	IDPB	S1,TXTPTR		; Store the null
+
+	MOVX	S1,<5*PAGSIZ>-1		; Get the max size
+	SKIPLE	TXTCTR			; Overfilled?
+	 SUB	S1,TXTCTR		; No, get amount actually used
+	MOVEM	S1,@STRSIZ		; Save the length
+	BLSRET	NORMAL			; And return happy
+
+; Handle directory command.
+
+SY%DIR:	MOVEI	S1,.FDSIZ		; Get length of block
+	MOVEI	S2,SYSFD		; And address
+	$CALL	.ZCHNK			; Clear it out
+	MOVX	S1,<<SIXBIT /*/>>		; Get an asterisk
+	MOVEM	S1,SYSFD+.FDNAM		; Save name
+	MOVEM	S1,SYSFD+.FDEXT		; And extension
+	MOVE	S1,[POINT 7,GEN%1DATA##] ; Point at file spec
+	XMOVEI	S2,SYSFD		; And at our block
+	$CALL	PRSFIL			; Parse the name
+	JUMPF	[KERERR	(<Illegal file specification ^T/GEN%1DATA##/>)
+		BLSRET	RMS32]		; And punt
+	SKIPN	SYSFD+.FDNAM		; Did we get some name?
+	 JRST	[MOVX	S1,<<SIXBIT /*/>>	; No, assume all
+		MOVEM	S1,SYSFD+.FDNAM		; Store it
+		SETZM	S1,SYSFD+.FDNMM		; And the name mask
+		JRST	.+1]			; Continue
+	$TEXT	(<-1,,GEN%1DATA##>,<^F/SYSFD/^0>) ; rewrite name with defaults
+	SETOM	GEN%1SIZE##		; Set up to count size
+	MOVE	S2,[POINT 7,GEN%1DATA##] ;  .  .  .
+DIR.1:	ILDB	S1,S2			; Get a character
+	AOS	GEN%1SIZE##		; Count it
+	JUMPN	S1,DIR.1		; If more to come, keep trying
+
+; Now process all the files
+
+DIR.0:	XMOVEI	S2,[ITEXT(<^T/DIRHDR/>)] ; Get header ITEXT
+	JSP	S1,PROFIL		; Set up for processing each file
+	SKIPE	ELB##+.RBTIM		; Have a date/time?
+	 $TEXT	(TXTOUT,<    ^H/ELB##+.RBTIM/^A>) ; Yes, type it
+	$TEXT	(TXTOUT,<>)		; And a CRLF
+	BLSCAL	(FILE%CLOSE##,<[EXP 0]>) ; Close the file
+	BLSRET	NORMAL			; And return
+
+; Header text
+
+DIRHDR:	ASCIZ	/
+File name            Size        Creation date
+                words  blocks      and time
+/
+
+
+; Handle delete command.  This will delete the file(s) specified in
+;the command string.
+
+SY%DEL:	XMOVEI	S2,[ITEXT(<^T/FILHDR/>)] ; Just use normal header
+	JSP	S1,PROFIL		; Call routine to process file
+;
+;Here from PROFIL to process one file.  S1 is zero if this is the
+;first file. Header (up to extension) is already stored.
+; File is open on channel FIL.  Generate the text for the file being
+;deleted, and then delete it.
+
+	SETZB	T1,T2			; No new name
+	RENAME	FIL,T1			; Delete the file
+	 JRST	DELE.F			; Failed, give the error
+	$TEXT	(TXTOUT,< [OK]>)	; Say we got it
+DELE.R:	BLSCAL	(FILE%CLOSE##,<[EXP BLSTRU]>) ; Close the file
+	$RETT				; And return
+
+; Here if a delete fails.  Give reasonable error message, but continue
+
+DELE.F:	$TEXT	(TXTOUT,< - ^T/FILERR##(S1)/>) ; Give the error
+	JRST	DELE.R			; And return
+
+
+
+; Routine to process a set of files.  This is used by both the delete and
+;directory commands
+; Usage:
+;	XMOVEI	S2,Address of ITEXT for first header
+;	JSP	S1,PROFIL		; Enter common routine
+;	<code to process file>
+;
+
+; Text for normal header
+
+FILHDR:	ASCIZ	\
+File name            Size
+                words  blocks
+\
+
+PROFIL:	MOVEM	S1,PRORTN		; Save the routine for later
+	MOVEM	S2,NXTHDR		; Dump this header before first file
+	SETZM	TXTCTR			; Set up as no data to return yet
+	MOVE	T1,[POINT 7,GEN%1DATA##] ; Point at argument
+	MOVE	T2,GEN%1SIZE##		; And the size
+	MOVEM	T2,FILE%SIZE##		; Save the size
+	MOVE	S2,[POINT 7,FILE%NAME##] ; Copy to file name
+PROF.0:	ILDB	S1,T1			; Get a character
+	IDPB	S1,S2			; Store it
+	SOJG	T2,PROF.0		; Copy the whole string
+	SETZ	S1,			; Make a null
+	IDPB	S1,S2			; Store at end of string
+
+; Now just open the first file (by calling FILE%OPEN), and return the
+;address of the routine to get characters.
+
+	$SAVE	<TY%FIL##>		; Save packet type out
+	SETZM	TY%FIL##		; Clear packet type out flag
+	BLSCAL	FILE%OPEN##,<[EXP 0]>	; Open the file
+	TXNN	S1,BLSTRU		; Find it ok?
+	 BLSRET	RMS32			; Return ok, error already issued
+
+	XMOVEI	S1,PROF.1		; Get the routine to fetch characters
+	MOVEM	S1,@GETRTN		; Store the so it gets called
+;
+; Set up place to store text
+;
+	SKIPN	S1,TXTPAG		; Have a text page?
+	 $CALL	M%GPAG			; No, get one
+	MOVEM	S1,TXTPAG		; Save the address
+	HRLI	S1,(POINT 7,)		; Set up the byte pointer
+	MOVEM	S1,TXTPTR		; Save it
+	MOVX	S1,<5*PAGSIZ>-1		; Get the amount of data we can store
+	MOVEM	S1,TXTCTR		; Save the counter
+;
+; Now process the first file
+;
+	SETZM	PRVSTR			; No previous structure
+	SETZM	PRVPTH+.PTPPN		; Or path
+	$CALL	PROHDR			; Generate the header
+	SETZ	S1,			; This is first call
+	$CALL	@PRORTN			; Process the first file
+	SETZ	S1,			; Write a null to terminate the text
+	IDPB	S1,TXTPTR		; Store the null
+	MOVX	S1,<5*PAGSIZ>-1		; Get the max size
+	SKIPLE	TXTCTR			; Overfilled?
+	 SUB	S1,TXTCTR		; No, get amount actually used
+	MOVEM	S1,TXTCTR		; Store the count for the fetch
+	MOVE	S1,TXTPAG		; Get the address back
+	HRLI	S1,(POINT 7,)		; Set up byte pointer
+	MOVEM	S1,TXTPTR		; So fetches work
+	BLSRET	NORMAL			; Return normal now.  The get-a-char
+					; routine will actually process this file
+
+; Routine called by KERMSG to get a character to return.  It will
+;process one file and return the text character by character.  When
+;the text for the file is finished, it will advance to the next file
+;by calling NEXT%FILE.  If there are no more, it will return EOF.
+;
+
+	BLSRTN	(PROF.1,<CHRADR>)	; This is called like GET%FILE
+	SKIPE	TXTPAG			; Really have a page?
+	 JRST	PROF.3			; Yes, no problem
+	BLSRET	EOF			; Return end of file if no page
+
+PROF.3:	SOSGE	TXTCTR			; Any characters left?
+	 JRST	PROF.2			; No, process file
+	ILDB	S1,TXTPTR		; Get a character
+	MOVEM	S1,@CHRADR		; Store it
+	BLSRET	NORMAL			; And return
+
+; Here when we run out of data to return.  Process the next file.
+
+PROF.2:	$SAVE	<TY%FIL##>		; Save file type out flag
+	SETZM	TY%FIL##		; And clear it
+	$CALL	NEXT%FILE##		; Get next file
+	TXNE	S1,BLSTRU		; Good return?
+	 CAIN	S1,NOMORFILES		; None left?
+	  JRST	[SETZ	S1,		; Clear S1
+		EXCH	S1,TXTPAG	; Get current page address
+		$CALL	M%RPAG		; Return it
+		BLSRET	EOF]		; All done, return EOF
+
+; Here when we get a new file.  Call the processing routine.
+
+	MOVX	S1,<5*PAGSIZ>-1		; Reset counter
+	MOVEM	S1,TXTCTR		;  .  .  .
+	MOVE	S1,TXTPAG		; Get address of page
+	HRLI	S1,(POINT 7,)		; Make it a byte pointer
+	MOVEM	S1,TXTPTR		; Save it
+
+	$CALL	PROHDR			; Generate the header
+	SETO	S1,			; Not first call
+	$CALL	@PRORTN			; Do it
+	SETZ	S1,			; Write a null to terminate the text
+	IDPB	S1,TXTPTR		; Store the null
+	MOVX	S1,<5*PAGSIZ>-1		; Get the max size
+	SKIPLE	TXTCTR			; Overfilled?
+	 SUB	S1,TXTCTR		; No, get amount actually used
+	MOVEM	S1,TXTCTR		; Store new count
+	MOVE	S1,TXTPAG		; Reset byte pointer
+	HRLI	S1,(POINT 7,)		;  .  .  .
+	MOVEM	S1,TXTPTR		;  .  .  .
+	PJRST	PROF.3			; And return the character
+
+; Routine to generate the start of the line for processing a file
+; It will generate a new device/path line only if it changes
+
+PROHDR:	SKIPN	NXTHDR			; Have a header to dump first?
+	 JRST	PROH.0			; No, continue
+	$TEXT	(TXTOUT,<^I/@NXTHDR/^A>) ; Yes, do it
+	SETZM	NXTHDR			; Done now
+PROH.0:	SETZ	T1,			; Assume we don't need path
+	SKIPN	S1,FPTH##		; Get structure file was on
+	 MOVE	S1,ELB+.RBDEV		; Try hard to find it
+	JUMPN	S1,.+2			; Get something?
+	 MOVE	S1,FLP##+.FODEV		; No, use device name from FILOP
+	CAMN	S1,PRVSTR		; Same structure as before?
+	 JRST	PROH.1			; Yes, check path
+	MOVEM	S1,PRVSTR		; No, save new structure
+	$TEXT	(TXTOUT,<^M^J^W/PRVSTR/:^A>) ; List the structure name
+	MOVEI	T1,1			; Need to list path
+
+PROH.1:	MOVSI	S2,-<.PTMAX-.PTPPN-1>	; Get number of words to check
+PROH.2:	MOVE	S1,FPTH+.PTPPN(S2)	; Get current item
+	CAME	S1,PRVPTH+.PTPPN(S2)	; Same?
+	 TRO	T1,2			; Need to list
+	MOVEM	S1,PRVPTH+.PTPPN(S2)	; Save the PPN
+	AOBJN	S2,PROH.2		; Loop for all entries
+
+	JUMPE	T1,PROH.5		; If nothing changed, continue on
+	TRNN	T1,1			; Need a leading CRLF?
+	 $TEXT	(TXTOUT,<>)		; Yes, do it
+	$TEXT	(TXTOUT,<[^O/PRVPTH+.PTPPN,LHMASK/,^O/FPTH+.PTPPN,RHMASK/^A>)
+
+	MOVSI	S1,-<.PTMAX-.PTSFD-1>	; Now some SFD's
+PROH.3:	SKIPN	PRVPTH+.PTSFD(S1)	; Have a SFD?
+	 JRST	PROH.4			; No, all done
+	$TEXT	(TXTOUT,<,^W/PRVPTH+.PTSFD(S1)/^A>) ; Yes, list it
+	AOBJN	S1,PROH.3		; Loop for all of them
+PROH.4:	$TEXT	(TXTOUT,<]>)		; End of path
+
+; Now list the file name and extension
+
+PROH.5:	$TEXT	(TXTOUT,<^W6L /ELB+.RBNAM/.^W3L /ELB+.RBEXT,LHMASK/^A>)
+	$TEXT	(TXTOUT,<    ^D8R /ELB##+.RBSIZ/ ^D6R /ELB##+.RBALC/^A>) ; List the file size
+	$RETT				; And return
+	SUBTTL	Operating system interface -- SY%DISMISS
+
+;+
+;.HL1 SY%DISMISS(seconds)
+;This routine will cause KERMIT to sleep the specified number of seconds.
+;-
+
+BLSRTN(SY%DISMISS,<SECONDS>)
+
+TOPS10<
+	SKIPLE	S1,SECONDS		; Get the number of seconds
+	SLEEP	S1,			; Go away for that many
+	  JFCL				; No error return
+	BLSRET	NORMAL			; Give a good return
+>; End of TOPS10 conditional
+	SUBTTL	Support routines -- DSKUSE
+
+; This routine will generate the text for the disk usage generic
+;command.
+;
+; Usage:
+;	S1/ output-a-character routine address
+;	GEN%1D - Argument <disk:><[ppn]>
+;	$CALL	DSKUSE
+;	 return here always
+;
+
+DSKUSE:	$SAVE	<P1,P2,P3>		; Save a register
+	MOVEI	P2,[ITEXT(<>)]		; String to output before
+	MOVE	P1,S1			; Save the pointer
+	MOVX	P3,.PTFRD		; Read current default path
+	MOVEM	P3,NEWPTH+.PTFCN	;  .  .  .
+	MOVE	P3,[XWD .PTMAX,NEWPTH]	;  .  .  .
+	PATH.	P3,			; From monitor
+	 SKIPA	P3,MYPPN##		; Can't get it, use PPN instead
+	  MOVE	P3,NEWPTH+.PTPPN	; Get PPN of current path
+	SETOM	JOBBLK+.DFJNM		; Initialize the structure name
+;
+; Once the defaults are set, now try to do a specific if given
+;
+	SKIPN	GEN%1SIZE##		; Have any characters?
+	 JRST	DSKU.0			; No, skip this
+	MOVX	S1,.FDSIZ		; Get the size of the block
+	XMOVEI	S2,SYSFD		; And the address
+	$CALL	.ZCHNK			; Clear it out
+	MOVEI	S1,GEN%1DATA##		; Point to the data
+	HRLI	S1,(POINT 7)		; Build a byte pointer to it
+	XMOVEI	S2,SYSFD		; Point to the FD
+	$CALL	PRSFIL##		; Parse the file
+	JUMPF	DSKU.0			; Failed, do them all
+	SKIPE	SYSFD+.FDPPN		; Have a PPN?
+	  MOVE	P3,SYSFD+.FDPPN		; Yes, get the PPN
+	MOVE	S1,SYSFD+.FDSTR		; Get the structure
+	CAXN	S1,<SIXBIT /DSK/>	; Is this DSK:?
+	 JRST	DSKU.0			; Do the looping
+	MOVEM	S1,JOBBLK+.DFJNM	; No, store for later
+	$TEXT	(<(P1)>,<^I/DSKHDR/>)	; Do the header
+	PJRST	DSKSUB			; Do the structure
+
+;
+; Here to loop over all of the file structures
+;
+DSKU.0:	$TEXT	(<(P1)>,<^I/DSKHDR/>)	; Do the header
+DSKU.1:	MOVE	S1,[XWD .DFJBL,JOBBLK]	; Get the argument block address
+	JOBSTR	S1,			; Get the structure information
+	 $RETT				; Just return at this point
+	MOVE	S1,JOBBLK+.DFJNM	; Get the structure name
+	CAXN	S1,-1			; Is this the end?
+	 $RETT				; Yes, just reutrn
+	JUMPE	S1,DSKU.2		; Jump if we have a fence
+	$CALL	DSKSUB			; Handle the single structure
+	JRST	DSKU.1			; Loop for the next
+
+DSKU.2:	MOVEI	P2,[ITEXT( -- Fence --^M^J)] ; Get the ITEXT to output
+	JRST	DSKU.1			; Loop for the next one
+
+;+
+;.hl2 DSKSUB
+;Routine to output the disk usage for a specific structure.
+;.literal
+;
+; Usage:
+;	P1/ Output routine to use
+;	P2/ ITEXT to output before structure name
+;	P3/ PPN to use
+;
+;.end literal
+;-
+
+DSKSUB:	MOVX	S1,.RBMAX		; Get the length
+	XMOVEI	S2,UFDELB		; Point to the block
+	$CALL	.ZCHNK			; Clear the block
+	MOVX	S1,.RBMAX		; Get the length
+	MOVEM	S1,UFDELB+.RBCNT	; Store as the count
+	MOVE	S1,P3			; Get the PPN
+	MOVEM	S1,UFDELB+.RBNAM	; Store the name
+	MOVX	S1,<SIXBIT /UFD/>	; Get the quotas from the UFD
+	MOVEM	S1,UFDELB+.RBEXT	; Store this
+	MOVE	S1,MFDPPN##		; Get the UFDPPN
+	MOVEM	S1,UFDELB+.RBPPN	; Store the PPN
+	MOVX	T1,UU.PHS!.IODMP	; Get the mode
+	MOVE	T2,JOBBLK+.DFJNM	; Get the structure
+	SETZM	T3			; Clear the buffer pointers
+	OPEN	0,T1			; Open the structure
+	  $RETF				; Failed, return failure
+	LOOKUP	0,UFDELB		; Look for the quotas
+	  JRST	DSKS.1			; Failed, clean up
+	MOVE	T1,JOBBLK+.DFJNM	; Get the name
+	MOVE	T2,P3			; Get my PPN
+	MOVX	S1,<XWD .DUFRE,T1>	; Point to the arguments
+	DISK.	S1,			; Get the quota
+	 JRST	[MOVE	S1,UFDELB+.RBQTF	; Get amount used
+		SUB	S1,UFDELB+.RBUSD	; Get amount free
+		JRST	.+1]		; Continue
+	PUSH	P,S1			; Save the amount FCFS free
+	MOVE	T1+.DCNAM,JOBBLK+.DFJNM	; Get the structure name
+	MOVX	S1,<XWD .DCFCT+1,T1>	; Point to the arguments
+	DSKCHR	S1,			; Get the information
+	  JRST	[POP	P,(P)		; Remove this
+		JRST	DSKS.1]		; Keep going
+	POP	P,S1			; Restore S1
+	MOVE	S2,T1+.DCFCT		; Get the amount free on the structure
+	MOVE	T1,UFDELB+.RBQTF	; Get the FCFS quota
+	SUB	T1,S1			; Determine the amount used
+	MOVE	T2,UFDELB+.RBQTO	; Get the logged out quota
+	SUB	T2,T1			; Determine the amount of logged out quota left
+
+	$TEXT	(<(P1)>,<^I/(P2)/^W9/JOBBLK+.DFJNM/^D8R /T1/ ^D13R /S1/ ^D12R /T2/ ^D13R /S2/>)
+	TRNA				; Skip $TEXT and return to caller
+
+DSKS.1:	$TEXT	(<(P1)>,<^I/(P2)/^W9/JOBBLK+.DFJNM/ - No directory on this structure ->)
+	MOVEI	P2,[ITEXT()]		; Nothing to output
+	RELEAS	0,			; Release the channel
+	$RETT				; Give a good return
+
+DSKHDR:	ITEXT(<User: ^P/P3/^M^J^T/DSKHD1/^M^J^T/DSKHD2/^M^J>)
+DSKHD1:	ASCIZ	|Structure  Blocks    Logged in    Logged out   System storage|
+DSKHD2:	ASCIZ	|           Used      quota left   quota left   left|
+	SUBTTL	Support routines -- Text writing
+
+; This routine is used as the output routine for $TEXT calls.  It
+;will write the characters into the page we have set up.
+
+TXTOUT:	SOSL	TXTCTR			; Count the character
+	 IDPB	S1,TXTPTR		; Store the character if we have room
+	$RETT				; And return
+	SUBTTL	Data storage
+
+	RELOC				; This is low segment
+
+LOWBEG:!
+;
+; Anything that parses file specifications uses this
+;
+SYSFD:	BLOCK	.FDSIZ			; File specification block
+;
+; For text writing routines
+;
+TXTPAG:	BLOCK	1			; Text page address
+TXTPTR:	BLOCK	1			; Byte pointer into page
+TXTCTR:	BLOCK	1			; Byte counter for page
+;
+; For file processing routines
+;
+PRORTN:	BLOCK	1		; Routine to process a file
+PRVSTR:	BLOCK	1		; Last structure seen
+PRVPTH:	BLOCK	.PTMAX		; Last path seen
+NXTHDR:	BLOCK	1		; ITEXT to put out as header before next file
+;
+; For CWD
+;
+DEFPTH:	BLOCK	.PTMAX			; Default path on startup
+NEWPTH:	BLOCK	.PTMAX			; New path desired
+;
+; For DSKUSE
+;
+UFDELB:	BLOCK	.RBMAX
+JOBBLK:	BLOCK	.DFJBL
+
+LOWSIZ==.-LOWBEG			; Size of data
+
+	SUBTTL	End of KERSYS
+
+	END
+    N On
