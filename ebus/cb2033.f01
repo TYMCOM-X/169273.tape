@@ -1,0 +1,528 @@
+
+	SUBTTL	FMAIN - CB2033.F01 - This is the foreground for Carl's slot
+
+	SEG	A.CODE
+	MO	.,FMAIN		: Start of module FMAIN
+
+ASY1	EQ	0		: LUN of async bank
+SYN1	EQ	1		: LUN of sync line
+SIO1	EQ	2		: LUN of sio channel
+
+RTLMAX	EQ	20		: Maximum size of buffer ring
+RECSIZ	EQ	100		: Size of X.GK records
+
+	GL	FSTART		: Entry point (called from background)
+	GL	SYNCBF		: Entry to Put/Get SYNC buffer
+	GL	XGKREQ		: Entry to request X.GK message
+	GL	XGKREC		: Entry to read any X.GK message lines
+	GL	XGKRDN		: Entry to finish X.GK message line
+	GL	STORHW		: Entry to fill buffer
+
+	GL	MOUTSC		: Move output string
+	GL	MVBYTE		: Byte Move routine
+
+
+
+	SEG	A.DATA			: Separate section for I/O data
+
+	WS	0			: same as BND 4
+
+RTLLST	WC	RTL001			: Address to check
+RTLCMD	HC	1,200			: Write, 200 bytes
+RTLSIZ	EQ	.-RTLLST		: Entry size
+	WC	RTL002			: Address of list entry 2
+	HC	1,200			: Write, 200 bytes
+	WC	RTL003			: Address of list entry 3
+	HC	2,0			: Transfer, no buffer
+RTLLEN	EQ	.-RTLLST
+
+RTLCNT	HS	1			: Count times found 0
+RTLONE	HS	1			: Count times found 1
+
+
+	BND	100			: Probably locate at <100>
+RTL001	HC	1,200			: Write, 200 bytes
+RTLBUF	WC	BUFPAD			: Buffer 1
+RTL002	HC	1,200			: Write, 200 bytes
+RTLALT	WC	BUFPAD			: Buffer 2
+RTL003	HC	2,0			: Transfer, 0 byte buffer
+	WC	RTL001			: Loop back to here
+
+	BND	100		: Make it a block boundary
+BUFPAD	HS	200			: Idle padding buffer
+BUFBUF	HS	200			: Normal buffer
+BUFALT	HS	200			: Alternate buffer
+BUF000	HS	200
+BUF001	HS	200
+BUF002	HS	200
+
+PTRIN	HS	1			: My pointer
+BUFIN	HS	1			: His pointer
+	HS	200			: Buffer to use ( 200 bytes )
+
+RTLPTR	HC	4*4,4*0,4*4,4*4			: ptr offsets
+	WC	BUFBUF,BUFALT,BUF000,BUF001	: buffer addresses
+RTLINL	EQ	.-RTLPTR			: length of table
+
+RTL.TF	HS	1			: BG wrote to here ==>   To FG
+RTL.FF	HS	1			: BG reads to here ==> From FG
+RTL.TB	HS	1			: FG wrote to here ==>   To BG
+RTL.FB	HS	1			: FG reads to here ==> From BG
+RTL.BF	WS	RTLMAX			: Buffer address ring for RTL
+
+XGK.RD	HC	0			: Read pointer used by BG
+XGK.WT	HC	0			: Write pointer used by FG
+XGK.RM	HC	0E			: Room indicator for SIO requests
+XGK.XX	HS	1			: -- Extra --
+XGKBUF	BS	RECSIZ*10		: Twice size of SIO buffer (16d)
+
+
+
+FATSIC	SC	\?"0A"0D?FATSIC Fatal -- Sync Input Connect failure"0A"0D\
+FATSOC	SC	\?"0A"0D?FATSOC Fatal -- Sync Output Connect failure"0A"0D\
+FATSRW	SC	\?"0A"0D?FATSRW Fatal -- Sync Ring Wrap failure"0A"0D\
+FATXGT	SC	\?"0A"0D?FATXGT Fatal -- eXception on GT pointer"0A"0D\
+
+WRNBSC	SC	\%"0A"0D%WRNBSC Warning -- Bad Sync output Command"0A"0D\
+
+
+
+: SIO - data area
+
+	BND	10
+SIOWIN	EQ	.		: Start of SIO window
+
+	BND	10
+SIOSIO	WC	30018		: Reset SIO chip
+	WC	31100		: Clear interrupts, set SDLC, clock x1
+	WC	303D8		: Setup input CRC, byte size, etc
+	WC	305EB		: Setup output CRC, enable transmit
+	WC	3877E		: Reset CRC, Set framing character 7E
+	WC	313D9		: Setup input byte size, enable receive
+	WC	    0		: Done
+
+	BND	10
+SIOOUT	HC	1,MSGOUT/10		: out- my buffer is MSGOUT
+	WC	0			: cmd- stop, end of list
+
+MSGLIN	HS	1			: Filler - How many lines in GK-MSG
+XGKHEL	HS	1			: Filler - Sent hello message
+XGKRDY	HS	1			: Filler - Are we ready to go
+XGKINP	HS	1			: Filler - Where to read input
+
+	BND	10
+SIOIN	HC	3,8*(RECSIZ+2)/2	: cmd- set buffer size
+	HC	1,SIOIBF/10		: inp- my buffer is SIOIBF
+	WC	0			: cmd- stop, end of list
+
+FxPORT	HS	1			: Filler - Port number
+	HS	1			: Filler - 
+
+	BND	10			: output buffer
+MSGOUT	HC	RECSIZ
+MSGHDR	WS	1			: holds AAAA,D3D3 or E4E4
+MSGBYT	BS	1			: holds byte count of data
+MSGDAT	BS	RECSIZ-5		: holds message data
+
+	BND	10			: input buffer
+SIOIBF	HC	0FFFF			: byte count filled in by SIO
+	BS	8*(RECSIZ+2)		: data bytes
+SIOIBE	EQ	.-2			: end of input buffer (last FFFF)
+
+	BND	10
+SIOSTS	WS	2			: status info for SIO
+
+	BND	10
+SIOEND	EQ	.			: end of SIO window
+
+
+XGKLIN	BS	MAXPRT			: One byte each of line-count
+XGKSND	WS	MAXBIT			: Bit array - Set when sending msg
+
+: Note: Since X.GK (mini) ignores the bytes following the header
+:	and message type field, I am depending on this to conserve
+:	space below.  All but the last message will overlap the
+:	header-type as part of the ignored data.
+
+MSGHEL	WC	0AAAAB1B1		: initial hello message
+MSGGET	WC	0AAAAD3D3		: get (next) line of message
+MSGONE	WS	1			: holds AAAA,E4E4 first line
+	BS	1			: holds byte count of data
+	BS	RECSIZ-5		: holds message data
+
+INPHDR	WS	1			: holds AAAA,D3D3 or E4E4
+INPBYT	BS	1			: holds byte count of data
+INPDAT	BS	RECSIZ-5		: holds message data
+
+
+
+	SEG	A.CODE
+
+FSTART	LA	R0,FATSIC,,		: An appropriate error message
+	LHI	R1,SYN1			: Load logical unit #
+	LA	R2,BUFIN,,		: And buffer
+	LHI	R3,2+200		: Header + buffer size
+	SVC	IO,01			: Begin input
+	  J	GIVEUP			: Hmm, something is wrong
+
+	LA	R1,BUFPAD,,		: Address of pad buffer
+	ST	R1,RTLBUF,,		: Store in main buffer
+	ST	R1,RTLALT,,		: Store in alternate buffer
+
+	LHI	R0,0FFFF		: What to store
+	STH	R0,RTLCNT,,		: Zero count
+	STH	R0,RTLONE,,		:  of finds
+	LA	R1,BUFPAD,,		: Where
+	LHI	R2,200			: Number of halfwords
+	JAL	R4,STORHW,,		: Store in buffer
+
+:  Use of R10 - R15 for this instruction to copy data to initial buffer
+	LM	R10,RTLPTR		: Get initial buffer constants
+	STM	R10,RTL.TF		: Store initial buffer constants
+
+	LA	R0,FATSOC,,		: An appropriate error message
+	LHI	R1,SYN1			: Load logical unit #
+	LA	R2,RTL001,,		: And beginning of rotor list
+	SVC	IO,11			: Begin output
+	  J	GIVEUP			: Hmm, something wrong!
+
+	JAL	R15,SIOINI		: Setup SIO motherboard
+	LIS	R0,0			: And clear out variables
+	STH	R0,MSGLIN		: Number of lines in message
+	STH	R0,XGKHEL		: Hello message sent
+	STH	R0,XGKRDY		: Ready to "GET" message
+	STH	R0,XGK.RD		: Reset XGK RD
+	STH	R0,XGK.WT		: Reset XGK WT
+	LHI	R0,0E			: Initialize to 14 messages (16)
+	STH	R0,XGK.RM		:  for communications buffer
+	LA	R0,SIOIBF		: Get SIO input buffer start
+	STH	R0,XGKINP		:  for my input scan ring
+	LHI	R0,0FFFF		: Set my initial port to -1
+	STH	R0,FxPORT		: until I've scanned the message
+
+
+FGLOOP	SVC	DISMIS			: Look at things next time
+	JAL	R15,XGKINI		: Setup X.GK and read message once
+					: - controlled by XGKHEL and XGKRDY
+	JAL	R15,XGKRED		: Read any input available
+	JAL	R15,XGKWRT		: Write any output (if not busy)
+
+: Look at sync input here!!!
+
+: Now for sync output
+
+	LIS	R1,0			: Get initial offset
+RTLOOP	CHI	R1,RTLLEN		: Are we done?
+	  JE	FGLOOP			: Seems so to me
+	L	R2,RTLLST,R1,		: Load address
+	LH	R0,0,R2			: Has sync finished with rotor entry?
+	  JN	RTLNXT			: Not as I can see
+	LH	R0,RTLCMD,R1,		: Get the command type
+	CHI	R0,1			: Is it a write?
+	  JN	CHKTRN			: No, check transfer
+
+	L	R0,4,R2,		: Pull address from rotor
+	CI	R0,BUFPAD		: Is it a padding buffer?
+	  JE	RTLNGT			: Yes, nothing to return
+
+	LH	R3,RTL.TB,,		: Get pointer
+	CH	R3,RTL.FB,,		: Does it match? cannot pass FB
+	  JE	FATSRW			: Yes, no room - should't happen
+	ST	R0,RTL.BF,R3,		: Put buffer address into list
+	AIS	R3,4*1			: Move to next entry
+	CHI	R3,4*RTLMAX		: At end of ring?
+	  JNFS	NWRPTB			: No, skip ahead
+	LIS	R3,0			: Yes, reset to top
+NWRPTB	STH	R3,RTL.TB,,		: Ok, remember the pointer
+
+	LA	R0,BUFPAD,,		: Default buffer if none available
+RTLNGT	LH	R3,RTL.FB,,		: Get pointer to next
+	CH	R3,RTL.TF,,		: Does it match?  cannot pass TF
+	  JEFS	SETPAD			: Yes, set padding and finish up
+	L	R0,RTL.BF,R3,		: Get buffer address from list
+	AIS	R3,4*1			: Move to next entry
+	CHI	R3,4*RTLMAX		: At end of ring?
+	  JNFS	NWRPFB			: No, skip ahead
+	LIS	R3,0			: Yes, reset to top
+NWRPFB	STH	R3,RTL.FB		: Store pointer
+SETPAD	ST	R0,4,R2,		: Store into rotor list
+	LH	R0,RTLCMD,R1,		: Get "write" command from RTLLST
+	STH	R0,0,R2,		: Set it in the rotor list
+RTLNXT	AHI	R1,RTLSIZ		: Bump to the next RTLLST entry
+	J	RTLOOP			: Check next rotor entry
+
+CHKTRN	CHI	R0,2			: Is it a transfer
+	  JN	ERRBSC			: Bad command type
+	L	R0,RTLLST,,		: Transfer, get beginning
+	J	SETPAD			:  address and store it
+
+
+: SYNCBF - Called from background to store a full sync buffer
+:	   Called from background to get an empty sync buffer
+:
+: call:
+:	R0 = 0	No buffer supplied, just get a free buffer
+:	R0 # 0	Buffer supplied, also get a new free buffer
+:	JAL	R4,SYNCBF
+:
+: non-skip return:
+:	R0 = 0	No buffers available, please wait
+:	R0 # 0	R0 contains what was passed
+:
+: skip return:
+:	R0 # 0	R0 contains a new empty buffer
+:
+
+SYNCBF	CHI	R0,0			: Test for 0
+	  JE	GSYNBF			: Nothing here, go get a buffer
+	LH	R3,RTL.TF,,		: Get pointer to next
+	CH	R3,RTL.FF,,		: Does it match?  cannot pass FF
+	  JER	R4			: No room for buffer, non-skip
+	ST	R0,RTL.BF,R3,		: Put buffer address from list
+	AIS	R3,4*1			: Move to next entry
+	CHI	R3,4*RTLMAX		: At end of ring?
+	  JNFS	NWRPTF			: No, skip ahead
+	LIS	R3,0			: Yes, reset to top
+NWRPTF	STH	R3,RTL.TF,,		: Store pointer
+
+	LIS	R0,0			: Set default for fall-through
+GSYNBF	LH	R3,RTL.FF,,		: Get pointer
+	CH	R3,RTL.TB,,		: Does it match? cannot pass TB
+	  JER	R4			: Yes, no buffers available
+	L	R0,RTL.BF,R3,		: Get buffer
+	AIS	R3,4*1			: Move to next entry
+	CHI	R3,4*RTLMAX		: At end of ring?
+	  JNFS	NWRPFF			: No, skip ahead
+	LIS	R3,0			: Yes, reset to top
+NWRPFF	STH	R3,RTL.FF,,		: Remember the pointer
+	AIS	R4,4			: Set skip return
+	JR	R4			:  and go
+
+
+
+: XGKRED - Called from forground to look at the SIO input buffer and
+:	   copy any records from it into the background ring buffer.
+:
+
+XGKRED	L	R2,XGKINP,,		: Get address where left off
+	LH	R0,0,R2,		: Get record byte count
+	CHI	R0,0FFFF		: Are we available?
+	  JER	R15			: No, nothing so far
+	LR	R1,R2			: Copy address for update
+	AR	R1,R0			: Update record using count
+	AIS	R1,2			: Add 2 for the byte count HW
+	CI	R1,SIOIBE		: Have we finished reading?
+	  JL	XGKRIP			: No, we are fine
+	LA	R1,SIOIBF,,		: Yes, start again at the top
+XGKRIP	ST	R1,XGKINP,,		: Remember where we left off
+
+	LH	R1,0,R2,		: Get the Header (X.GK)
+	CHI	R1,0AAAA		: Is it a good record?
+	  JNR	R15			: No, Ignore it
+	LH	R1,2,R2,		: Yes, get the message type
+	CHI	R1,0C2C2		: Is it an "I hear you"
+	  JE	XGKHER			: Yes, fall out of loop
+	CHI	R1,0E4E4		: Is it a data message
+	  JN	XGKERR			: No, Illegal data message
+	LH	R1,FxPORT		: Get port info
+	  JLE	NOPORT			: Not yet, must be doing scan
+
+: Here with R2 setup as address of message in input buffer
+	LH	R3,XGK.WT,,		: Get pointer
+	CH	R3,XGK.RD,,		: Does it match? cannot pass RD
+	  JE	ERRSRW			: Yes, no room - should't happen
+
+: Good record, count lines for each port
+	LHI	R1,FxPORT		: Get current SIO port
+	STH	R1,2,R2,		: Overwrite E4E4 with port id
+	LB	R0,XGKLIN,R1		: Get a line counter
+	AIS	R0,1			: Increment it
+	CH	R0,MSGLIN,,		: Do we have all the lines?
+	  JL	XGKRE4			: No, skip this
+	RBT	R1,XGKSND		: Yes, so reset line (we're done)
+XGKRE4	STB	R0,XGKLIN,R1		: Remember count
+
+: Good record, now move it to the background
+	LHI	R0,RECSIZ		: 100 bytes
+	LA	R1,XGKBUF,R3,		: Get address in background buffer
+					: R2 is already setup above
+	JAL	R6,MVBYTE		: Move the message
+
+: Now update pointer so background can read it
+	LH	R3,XGK.WT,,		: Get pointer
+	AHI	R3,RECSIZ		: Move to next entry
+	CHI	R3,10*RECSIZ		: At end of ring?
+	  JNFS	NWRPXP			: No, skip ahead
+	LIS	R3,0			: Yes, reset to top
+NWRPXP	STH	R3,XGK.WT,,		: Ok, remember the pointer
+	J	XGKRED			: Any more to read?
+
+: Come here if receive "I'm listening" when already listening
+XGKHER	LH	R0,XGKRDY		: Am I already ready?
+	  JN	XGKERR			: Error - go to ignore errors for now
+	LIS	R0,1			: Get set value
+	STH	R0,XGKRDY		:  for ready flag
+	JR	R15			: Return
+
+
+: Come here on input errors, right now XGKRED does NOT skip return, so ignore
+XGKERR	JR	R15			: Return
+
+
+: NOPORT - We're not readig for anyport at the moment
+
+NOPORT	JR	R15			: Return
+
+
+: XGKWRT - Routine to check to see if we need to send message to one
+:	   of the background ports.  XGKSND is a bit array of ports
+:	   waiting to send.
+
+XGKWRT	L	R1,XGKSND		: Get ports list
+	JFFO	R1,XGKWR0		: Any to send?
+	  JR	R15			: No, return
+
+: R1 now contains the port number
+XGKWR0	LH	R0,FxPORT		: Already have a port?
+	  JGE	XGKWR1			: Yes, keep using it
+	STH	R1,FxPORT		: We are working on one port
+XGKWR1	LH	R0,XGK.RM		: See if any room in ring
+	  JLER	R15			: No, try again later
+
+: Room is available, so send an XGK D3D3
+	LA	R1,MSGHDR,,		: Address of output message
+	LA	R2,MSGGET,,		: Address of message to send
+	JAL	R6,MVBYTE		: Move the record
+	LIS	R0,1			: Get "WRITE" command
+	STH	R0,SIOOUT,,		: Setup command
+	LHI	R0,RECSIZ		: Message is 100 bytes
+	STH	R0,SIOOUT+2,,		: Setup byte count
+	LIS	R0+0,SIO1		: Get logical unit for SIO port
+	LA	R0+1,SIOOUT,,		: Address of command list
+	SVC	IO,0B0+R0		: Call for output
+	  J	SIOCHK			: Not yet, see if we're busy
+	LCS	R0,1			: Get -1 to decrement
+	AHM	R0,XGK.RM,,		:  the room counter
+	JR	R15			: Return
+
+
+: XGKREQ - Called from background to request XGK message for port
+:
+: call:
+:	R1 = Port number to initiate message
+:	JAL	R4,XGKREQ
+:
+: non-skip return if port already processing message
+: skip return if request queued and ready
+:
+XGKREQ	TBT	R1,XGKSND		: Am I already sending? 
+	  JN	R4			: Yes, give error return
+:	CLB	XGKLIN,R1		: No, clear lines sent
+	SBT	R1,XGKSND		:  and set sending flag
+	AIS	R4,4			: Do skip return
+	JR	R4
+
+
+: XGKREC - Called from background to read a message for a port
+:	   coming from the SIO port
+: call:
+:	JAL	R4,XGKREC
+:
+: non-skip return if nothing to send
+: skip return:
+:	R1 = Address of message in the following format
+:	     .---.---.--------.-.-.-.-.-.-.
+:	     | port# | #bytes | data ...  |
+:	     |___:___|________|_:_:_:_:_:_|
+:
+XGKREC	LH	R2,XGKRDY		: Are we ready to go?
+	  JER	R4			: No, skip out
+	LH	R2,XGK.RD		: Get pointer
+	CH	R2,XGK.WT		: Does it match? cannot pass WT
+	  JER	R4			: Yes, no buffers available
+	LA	R1,XGKBUF,R2,		: Get buffer address
+	AIS	R4,4			: Set skip value
+	JR	R4			: Jump to skip return
+
+XGKRDN	LH	R2,XGK.RD		: Get pointer
+	AHI	R2,RECSIZ		: Move to next entry
+	CHI	R3,10*RECSIZ		: At end of ring?
+	  JNFS	NWRPXG			: No, skip ahead
+	LIS	R2,0			: Yes, reset to top
+NWRPXG	STH	R2,XGK.RD,,		: Remember the pointer
+	AIS	R4,4			: Set skip return
+	JR	R4			:  and go
+
+
+
+ERRBSC	LA	R0,WRNBSC,,		: Warn about bad command
+	SVC	SYS,SUDIA.		: Set diagnostic message
+	SVC	SYS,FREEZ.		: Now freeze the slot
+	J	FGLOOP			: Return to FG loop
+
+
+ERRXGT	LA	R0,FATXGT,,		: non-eXistant check on GT
+	JFS	GIVEUP
+ERRSRW	LA	R0,FATSRW,,		: Sync Ring wrap problem
+GIVEUP	SVC	SYS,SUDIA.		: Set diagnostic message
+	SVC	SYS,HALT.		: and halt the slot
+	JBS	GIVEUP			: Loop in case dummy says go
+
+
+: STORHW - Used to pre-fill a buffer with a given half-word
+:
+: call:
+:	R0 = byte/half-word to store
+:	R1 = address of buffer
+:	R2 = count of halfwords
+:	JAL	R4,STORHW
+STORHW	SLL	R2,1			: Convert HW to Bytes
+STORME	SIS	R2,2			: Decrement counter
+	  JLR	R4			: Return when out of data
+	STH	R0,0,R1,R2		: Store halfword
+	JBS	STORME			:  and loop till done
+
+
+
+SIOINI	LIS	R0+0,SIO1		: Get logical unit
+	LA	R0+1,SIOWIN,,		: Start of SIO window
+	LA	R0+2,SIOEND,,		: End of SIO window
+	LA	R0+3,SIOSTS,,		: SIO status bytes
+	SVC	IO,090+R0		: Connect motherboard
+	  SVC	SYS,FREEZ.		: No? --- Something wrong!!!
+	LA	R0+1,SIOSIO,,		: Initialization parameters
+	SVC	IO,0B0+R0		: Initialize!
+	  SVC	SYS,FREEZ.		: No? --- Something wrong!!!
+	LA	R0+1,SIOIN,,		: Start SIO input
+	SVC	IO,0A0+R0		: Start
+	JR	R15			: Return from initialization
+
+XGKINI	LH	R0,XGKRDY,,		: Is XGK talking to me?
+	  JNR	R15			: Yes, don't do this again
+	LH	R0,XGKHEL,,		: Have we sent Hello?
+	  JNR	R15			: Yes, XGKRDY gets set elsewhere
+	LHI	R0,100			: 100 byte messages
+	LA	R1,MSGHDR,,		: Store message here
+	LA	R2,MSGHEL,,		: Get hello message
+	JAL	R6,MVBYTE,,		: Setup message
+	LHI	R0+0,SIO1		: Get logical unit
+	LA	R0+1,SIOOUT,,		: And buffer address
+	SVC	IO,0B0+R0		: Do the output
+	  J	SIOCHK			: Check problem
+	LIS	R0,1			: Get flag
+	STH	R0,XGKHEL,,		: We have sent hello
+	LHI	R0,0FFFF		: Get magic port number
+	STH	R0,FxPORT		:  and store it
+	JR	R15			: Return for now
+
+
+SIOCHK	SRL	R0,10			: Get high byte of calling register
+	CHI	R0,0003			: 0003 = Motherboard busy
+	  JER	R15			: Try again later
+	SVC	SYS,FREEZ.		: Fatal error, freeze slot
+	JR	R15			: Now, Try again later
+
+
+
+	EM		: End of module FMAIN
+  
