@@ -1,0 +1,581 @@
+entry
+	Talk,   CTYLog, CvName
+,	RunSlf, RunJob, OnlyMe
+,	FrmXct, GetTRU, CChild, HaltStatus
+,	InfNam, InfJob, SetLog
+,	Logit,  LogWho, LogInfo
+,	ClubJoin, ClubInit
+;
+
+begin "XEXPKG"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(MPL)UUOSYM.DEF"  source!file;
+require "(CARL)JQUEUE.DEF" source!file;
+require "(CARL)JQUE.REQ"   source!file;
+require "(CARL)XEXINT.REQ" source!file;
+require "(CARL)VMFILE.REQ" source!file;
+require "(CARL)DAYTIM.REQ" source!file;
+
+Define LogTry  = 25;			! times to try logging to file ;
+Define LogWait = 200;			! ms to wait while trying ;
+
+Define !gtRDV = '135, !gtRDI = '136, !gtRFN = '137;
+Define Gettab(x,y) = { calli( !xwd( (x), (y) ), calli!GETTAB ) };
+Define !Job(x) = { ( (x) land '7777 ) };
+
+Define DayStamp  = { cvSDat( !lh( GetTDT ) ) };		! day  only ;
+Define TimeStamp = { cvSTim( !rh( GetTDT ) ) };		! time only ;
+Define DateStamp = { TymDay( GetTDT ) };		! date-time ;
+
+Internal string QueLog;			! (SUBMIT)YYMMDD.JQL ;
+Internal string DebLog;			! (SUBMIT)JDEBUG.LOG ;
+
+Own string  WhoAmI;			! Simplify my name ;
+Own integer OldZone, NewZone;		! Time Zone stuff  ;
+
+!	Initialization support
+;
+
+internal simple procedure SetLog;
+begin "set log name"
+    own string Today;
+    own integer Month;
+
+    Today_ TymDay( GetTDT );
+    Today_ Today[8 for 2] &
+	   ("0"&cvs( CMonth( Today[4 for 3] ) ))[inf-1 to inf] &
+	   Today[1 for 2];
+
+    QueLog_ "(SUBMIT)"& Today &".JQL";
+    DebLog_ "(SUBMIT)"& Today &".JQD";
+
+end "set log name";
+require SetLog initialization;
+
+
+simple procedure SetZone;		! set timezone to GMT ;
+begin
+
+    NewZone_ OldZone_ Gettab( -1,!gtPRV );
+    dpb( '20, point( 6,NewZone,7 ) );
+    calli( NewZone, calli!SETPRV );
+
+end;
+require SetZone initialization;
+
+
+simple procedure SetDetach;		! set NOATTACH ;
+begin
+
+    calli( jp!nat lor Gettab( -1,!gtPRV ), calli!SETPRV);
+
+end;
+require SetDetach initialization;
+
+
+Internal Simple procedure Talk( integer j; string s );
+! ----------------------------------------------------------------------;
+!									;
+!	Talk( Job, Text )						;
+!		Output the specified Text to the port connect to Job	;
+!		by executing the SETUUO call to talk to a frame.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Talk"
+    Own integer Tries;
+    Define T1=1, T2=2, !stTLK = '10;
+    Label Talk, TalkOk;
+
+    begin!code				! simulate OUTSTR to CTY ;
+	Move	T2,S;			! string byte pointer ;
+	Movei	T1,S;			! addr of byte pointer ;
+	Hrlz	T1,-1(T1);		! setup size variable ;
+	Hrr	T1,J;			!  to job J (0 = CTY ) ;
+	Setom	!skip!;			! set success flag ;
+	Movei	0,300;			! get 300 * 200ms = 60sec
+	Movem	0,Tries;		! clear loop counter ;
+Talk:	Hrri	0,T1;			! pointer to block ;
+	Hrli	0,!stTLK;		! function to talk ;
+	uuo!SETUUO;			! doit ;
+	  Setzm	!skip!;			! error clear flag ;
+	Skipe	!skip!;			! check error flag ;
+	  jrst	TalkOk;			! all ok, so leave ;
+	Sosg	Tries;			! is any more left ;
+	  jrst	TalkOk;			! no, so leave ;
+	Hrrzi	0,200;			! 200 ms wait ;
+	uuo!HIBER;			! then setup to ;
+	  jfcl;				!  try it all ;
+	jrst	Talk;			!  again ;
+TalkOk:
+    end;
+
+end "Talk";
+
+
+Internal Simple boolean procedure CTYLog( String Text; Boolean Date(false) );
+! ----------------------------------------------------------------------;
+!									;
+!	CTYLog		Routine to print a string on the system CTY	;
+!			stamped with the current GMT date and time.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+
+    Talk( 0, (if Date			! if date expected ;
+	      then DateStamp		!  today's daytime ;
+	      else TimeStamp		! else -time only- ;
+	      ) &
+	     " GMT " &			! mark it as GMT ;
+	     Text &			! add the message ;
+	     Crlf );			! and crlf ;
+
+    if ( !lh(Gettab(-1,!gtLIN)) = !lh(cvsix("TTY")) )
+     then Talk( calli(0,calli!PJOB), TimeStamp&" GMT "&Text&Crlf );
+
+    return( false );
+
+end;
+
+
+Internal simple string procedure HaltStatus( Integer array Status );
+! ----------------------------------------------------------------------;
+!									;
+!	str_ HaltStatus							;
+!		Routine to convert the halt status block passed as	;
+!		an integer array into a reasonable text suitable for	;
+!		human inspection.					;
+!									;
+! ----------------------------------------------------------------------;
+begin "halt status"
+
+    define Class  = { !lh( Status[1] ) };
+    define Type   = { !rh( Status[1] ) };
+    define Device = { Status[5] };
+    define File   = { Status[6] };
+    define Ext    = { Status[7] };
+
+    return( case Class of (
+	case Type of (
+	    "PCO PC Out of Bounds",
+	    "IMR Illegal Memory Reference",
+	    "WRV Write Violation",
+	    "ADC Address Check for Device "&cv6str( Device ),
+	    "IMU Illegal Memory reference in UUO",
+	    "IIA Illegal Interrupt Address",
+	    "ABK Address Break",
+	    "POV PDL Overflow"
+	    ),
+	case Type of (
+	    "PIO Page I/O Error",
+	    "DFL Disk Full during copy of C-O-W page",
+	    "PHE Paging Hardware Error",
+	    "TPL Too many Pages Locked",
+	    "CIO Context Page I/O Error",
+	    "PAR Parity Error(s), all core removed",
+	    "MED Monitor Error Detected"
+	    ),
+	case Type of (
+	    "OCI Output device "&cv6str(Device)&" Cannot do Input",
+	    "ICO Input device "&cv6str(Device)&" Cannot do Output",
+	    "IDM Illegal Data Mode for Device "&cv6str(Device),
+	    "IUC I/O to Unassigned Channel",
+	    "HDV Hung Device "&cv6str(Device),
+	    "DOP Device "&cv6str(Device)&" OPR action requested"
+	    ),
+	case Type of (
+	    "ILU Illegal UUO",
+	    "UUE UUO Error",
+	    "ILI Illegal Instruction",
+	    "HLT Halt"
+	    ),
+	case Type of (
+	    "EXI Exit",
+	    "EX1 Exit 1",
+	    "FEX Fail Exit '"&cvos(File)&", not continuable",
+	    "TLE Time Limit Exceeded",
+	    "JSU "&cv6str(File)&" Setup",
+	    "JSV "&cv6str(File)&" Saved",
+	    "FCL Frame Cleared",
+	    "FST Fail Stop '"&cvos(File)&", continuable"
+	    ),
+	case Type of (
+	    "TRE Transmission Error, Call AAMCO",
+	    "PGN N Pages Required, not enough memory",
+	    "DNA Device "&cv6str(Device)&" Not Available",
+	    "FNF "&cv6str(File)&" Not Found",
+	    "NSF Not a Save File",
+	    "EUF " & cv6str(File) & "." & cv6str(Ext) &
+		 " Enter UUO Failed",
+	    "CAN Core Argument Not Specified",
+	    "MHB Magnetic Highseg Format Bad",
+	    "RMF ReMap UUO Fatal Error",
+	    "MGF Magtape GET Failure",
+	    "NSA No Start Address"
+	    )
+	)
+    );
+
+end "halt status";
+
+
+internal simple boolean procedure CChild( integer Cradle );
+! ----------------------------------------------------------------------;
+!									;
+!	CChild		Routine to create a child frame from the	;
+!			information found at the address Cradle.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "birth procedure"
+    Own Integer frame!index;
+    Own safe integer array Frame[E!Runtime:E!License];
+
+    Redefine CF!LIC = !bit(16);		! until UUOSYM.DEF is right;
+    Redefine CF!LOG = 0;		! really !bit(17);
+
+    ArrBlt( Frame[E!Runtime+1], memory[Cradle+1], E!License-E!Runtime );
+    Frame[ E!Runtime ]_ CF!LIC lor CF!LOG lor (E!License - E!Runtime - 1);
+    Frame[ E!Privs ]_ Frame[ E!Privs ] lor jp!nat;
+
+    start!code				! take a trip to the hospital ;
+	Setom	!skip!;			! skip return;
+	Hrli	1,!foCFM;		! function: create frame;
+	uuo!FRMOP 1,Frame[E!Runtime];	! attempt to bear a child;
+	  Setzm	!skip!;			!   unbearable!;
+	Skipn	!skip!;			! successful birth? ;
+	  Exch	1,!skip!;		! no - swap error & skip ;
+    end;
+
+end "birth procedure";
+
+
+simple procedure LogAll( String Name, Text; Integer Tries(LogTry) );
+! ----------------------------------------------------------------------;
+!									;
+!	LogAll		Routine to make an entry to the appropriate	;
+!			job queue log file.  Automatically adds CRLF	;
+!			to the end of the message.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "Log Job Info"
+    Integer Chan, Timer;
+
+    for Timer_ 1 upto Tries
+     do begin "get file"			! get file in $Update ;
+	if ( 0 < Chan_ VMFile(Name, VM$Append lor VM$Update) )
+	 then done;
+	calli( !Xwd(0,LogWait), calli!HIBER );	! sleep a bit ;
+     end "get file";
+
+    if ( Chan leq 0 )				! all ok? ;
+     then CTYLog( WhoAmI&"No access: "&Name )	! not exactly... ;
+     else begin "setup file"			! yes! ;
+
+	VMText( Chan, TimeStamp & WhoAmI &	! write time & who ;
+		      Text & Crlf );		! and text message ;
+	VMFree( Chan );				! release  channel ;
+
+     end "setup file";
+
+    if ( !lh(Gettab(-1,!gtLIN)) = !lh(cvsix("TTY")) )
+     then Talk( calli(0,calli!PJOB), TimeStamp&WhoAmI&Text&Crlf );
+
+end "Log Job Info";
+
+
+internal simple procedure LogWho( String Who );
+WhoAmI_ " " & Who[1 for 1] & " ";
+
+
+internal simple procedure LogInfo( String Text );
+LogAll( QueLog, Text, LogTry );
+
+
+internal simple procedure LogIt( Integer Bits; String Text );
+begin "Log It"
+
+    if not( InQue land que$Map )		! non-zero must be open ;
+     then return;
+
+    if not( QQ( Feature ) land QFet$LogAll )	! not logging everything ;
+     then if not( QQ(Feature) land Bits )	! correct bits enabled? ;
+	   then return;
+
+    LogAll( DebLog, Text, LogTry*5 );		! copy the message ;
+
+end "Log It";
+
+
+internal simple boolean procedure RunSlf;
+! ----------------------------------------------------------------------;
+!									;
+!	RunSlf		Routine to figure out where you are and run	;
+!			the same program.  This assumes that we are	;
+!			NOT using a funny extension or were run with	;
+!			a load, start or execute command.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "run self"
+    Own Safe Integer Array RunBlock[0:5];
+
+    CtyLog( "Restarting by Feature-Test" );
+
+    RunBlock[0]_ Gettab( -1, !gtRDV );
+    RunBlock[1]_ Gettab( -1, !gtRFN );
+    RunBlock[4]_ Gettab( -1, !gtRDI );
+
+    Calli( location(RunBlock[0]), calli!RUN );
+    if not( !Skip! )
+     then return(false );
+
+end "run self";
+
+
+internal simple boolean procedure OnlyMe;
+begin "only me"
+    integer Name, PPN, Index, Top, Me;
+
+    Me_ calli( 0, calli!PJOB );		! my job number ;
+    Name_ Gettab( -1,!gtNAM );		! my name ;
+    PPN_  Gettab( -1,!gtFPN );		! run directory ;
+    if not( PPN )
+     then PPN_ Gettab( -1,!gtPPN );	! if none, use my ppn ;
+
+    Top_ Gettab( !cnNJB,!gtCNF );	! highest job ;
+    for Index_ 1 upto Top		! foreach frame ;
+     do if not( Index = Me )		!  if not me and same program ;
+	 then if ( Name = Gettab( Index,!gtNAM ) ) and
+		 ( PPN  = Gettab( Index,!gtFPN ) ) and
+		 ( Gettab( Index,!gtSTS ) < 0 )
+	       then return( false );	!    and running then return ;
+
+    return( true );
+
+end "only me";
+
+
+internal simple procedure
+  FrmXct(Integer Frame; Reference Integer Arg; Integer Funct);
+! ----------------------------------------------------------------------;
+!									;
+!	FrmXct		Routine to execute a frame operation.		;
+!			Results are returned in ac 1 and !skip!		;
+!									;
+! ----------------------------------------------------------------------;
+begin!code
+
+	Hrrz	1,Frame;		! Get frame number from array ;
+	Hrl	1,Funct;		! Get function ;
+	Movei	2,Arg;			! Get argument address ;
+	Setom	!skip!;			! Set skip return ;
+	uuo!FRMOP  1,(2);		! Do the work ;
+	  Setzm	!skip!;			! OOPS! too bad ;
+end;
+
+
+internal simple boolean procedure RunJob( integer Frame, ASlot; string Par );
+begin "run job"
+    preset!with cvsix("SAV"), cvsix("SHR"), cvsix("HGH"),
+		cvsix("SWR"), cvsix("LOW");
+    own safe integer array EXTS[ 1:5 ];
+    own safe integer array RunBlock[0:5];
+    integer C, Chan;
+    string  TempFile;
+
+    RunBlock[0]_ if ( LAPCclF( ASlot ) or	! CCL or parameters? ;
+		      memory[ ASlot+E!Parameters ] )
+		  then !Xwd( 1,5 ) else 5;	! setup run offset+count ;
+
+    RunBlock[1]_ memory[ ASlot+E!CmdFile+F!Device ];
+    RunBlock[2]_ ASlot+E!CmdFile+F!User;
+    RunBlock[3]_ memory[ ASlot+E!CmdFile+F!Name ];
+    Runblock[4]_ memory[ ASlot+E!CmdFile+F!Ext ] land (-1 lsh 18);
+
+    for C_ 1 upto 5				! for each extension ;
+     do if ( RunBlock[4] = EXTS[ C ] )		! does it match list? ;
+	  then begin "fix extension"
+	     RunBlock[4]_ 0;			! clear bad extension ;
+	     done;				! fall out of loop ;
+	  end "fix extension";
+
+    if ( !lh( RunBlock[0] ) )			! CCL entry expected? ;
+     then begin "write TMP file"		! create temp file ;
+
+	TempFile_ cvs(1000+!job( Frame ))[inf-2 to inf] &
+		  (if ( LAPCCLF( ASlot ) )
+		    then cv6str( LAPCCLF( ASlot ) lsh 18 )
+		    else cv6str( RunBlock[3] )[1 for 3]) & ".TMP";
+
+	if ( 0 < Chan_ VMFile( TempFile, VM$Write ) )
+	 then begin "write parameters"
+
+	    VMText( Chan, Par & crlf );		! finish text with crlf ;
+
+	    if not( VMFree( Chan, 0 ) )		! close temp file ;
+	     then begin "bad temp file"
+		VMFree( Chan, -1 );		! won't: try delete ;
+		return( false );		! then return false ;
+	     end "bad temp file";
+
+	 end "write parameters"
+	 else return( false );
+
+     end "write TMP file";
+
+    FrmXct( Frame, RunBlock[0], !foRUN );
+
+    EcfEnb( Frame );			! enable ECF ;
+    return( true );			! and return ;
+
+end "run job";
+
+
+internal simple string procedure CvNAME( integer AUN );
+! ----------------------------------------------------------------------;
+!									;
+!	CvName		Routine to get the username for a specific	;
+!			AUN by looking up the UFD.  Uses the .chNXT	;
+!			feature to get a channel and releases it to	;
+!			preserve outside file/channel integrity.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    integer NotEof, Chan;
+    Preset!with '17, cvSIX( "DSK   " ), 0;
+    Own safe integer array Dev[ 0 : 2 ];
+    Own safe integer array Look[ 0 : !RBUNM+1 ];
+
+    Look[ !RBCNT ]_ !RBUNM+1;		! PPN -> User;
+    Look[ !RBPPN ]_ !Xwd( 1,1 );	! (UFD)  ;
+    Look[ !RBNAM ]_ AUN;		! [user] ;
+    Look[ !RBEXT ]_ cvSIX("UFD   ");	! .UFD   ;
+
+    Chan_ -1;				! channel to use ;
+    Chnior( Chan, Dev[ 0 ], !chOPN );	! open DSK ;
+    start!code HRRZM '3,Chan end;	! remember channel ;
+    If ( NotEof_ !skip! )
+     then begin
+	Chnior( Chan, Look[!RBCNT], !chLK );
+	NotEof_ !skip!;
+	Chnior( Chan, memory[0], !chREL );
+     end;
+
+    If ( NotEof )
+     then return( Cv6str(Look[!RBUNM])&Cv6str(Look[!RBUNM+1]) )
+     else return( Cvos(!lh(aun))&","&Cvos(!rh(aun)) );
+end;
+
+
+internal simple string procedure InfNam( Integer Name );
+! ----------------------------------------------------------------------;
+!									;
+!	InfNam		Routine to return  DEV:(USER)NAME.EXT  as a	;
+!			string given the memeory address of a block.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Info File"
+
+    return(   Cv6str( memory[ Name + F!Device ] ) & ":" &
+	      "("& Cv6str( memory[ Name + F!User ] ) &
+	      Cv6str( memory[ Name + F!User+1 ] ) & ")" &
+	      Cv6str( memory[ Name + F!Name ] ) &
+	      (if ( memory[ Name + F!Ext] )
+	       then "."&cv6str( memory[ Name + F!Ext ] )[1 for 3]
+	       else "")
+	   );
+end "Info File";
+
+
+
+internal simple string procedure InfJob( Integer Name, Status(0) );
+! ----------------------------------------------------------------------;
+!									;
+!	InfJob		Routine to return the job information as a	;
+!			string given the memeory address of a block.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Info Job"
+
+    return(
+
+	"Req #" &
+	cvs( if Status
+	      then LPReq( Status )
+	      else LAPReq( Name )
+	    ) &
+
+	" " &
+
+	(if LAPLog( Name )
+	 then InfNam( Name + E!LogFile ) & "="
+	 else "") &
+
+	(if ( LAPRunF( Name ) )
+	 then " Running "
+	 else "") &
+
+	InfNam( Name + E!CmdFile )
+
+    );
+
+end "Info Job";
+
+
+internal simple boolean procedure ClubJoin( integer Page );
+! ----------------------------------------------------------------------;
+!									;
+!	ClubJoin	Routine to join a club on an existing page	;
+!			and act like you just joined if you already	;
+!			belong to the club.				;
+!									;
+! ----------------------------------------------------------------------;
+begin "join club"
+    integer Err;
+
+    Err_ calli( Page, calli!CLBADD );		! join club on a page ;
+    if not( !Skip! ) and ( Err = CBINC# )	! if already in club  ;
+     then return( true )			!  act like it worked ;
+     else return( !Skip! );			!  else return flag.  ;
+
+end "join club";
+
+
+internal simple boolean procedure ClubInit( reference integer Page );
+! ----------------------------------------------------------------------;
+!									;
+!	ClubInit	Routine to try to take the club interlock and	;
+!			return to the user without waiting.  If the	;
+!			interlock is unavailable, return false with	;
+!			the reason for failure in !SKIP!		;
+!									;
+! ----------------------------------------------------------------------;
+begin "init club"
+    integer Err;
+
+    Err_ calli( location(Page), calli!CLBINI );	! get interlock, nowait ;
+    if not( !Skip! ) and ( Err = CBHIL# )	! already have it? ;
+     then !Skip!_ true;				! make believe I got it ;
+
+    Err Swap !Skip!;				! switch flags ;
+    return( Err );				! return uuo success ;
+
+end "init club";
+
+
+internal simple integer procedure GetTRU( Integer Child );
+! ----------------------------------------------------------------------;
+!									;
+!	GetTRU		Routine to return the current TRUs for a child	;
+!			frame.  On error, 0 is returned.		;
+!									;
+! ----------------------------------------------------------------------;
+begin!code
+    HRL   1,access(Child);	! Child frame #;
+    HRRI  1,!GTTRU;		! Double word TRUs;
+    SETOM !skip!;		! Assume good;
+    uuo!GETTAB 1,;		! Get TRU's * 10^4;
+      SETZM !skip!;		! Error?;
+    DIVI  1,10000;		! Divide to get TRU's;
+end;
+
+end "XEXPKG";
