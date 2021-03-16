@@ -1,0 +1,336 @@
+begin	"XEXEC"	
+comment	
+
+    Kludge to get by until new PERP/INITIA/whatever:
+	Started by INITIA at system startup.  Runs forever.
+	Wakes once an hour and reads (SYS)XEXEC.CTL (format below).
+	Creates frames and runs programs as indicated in CTL file.
+	Programs may be run only once per system startup (interval
+	omited or 0), or may be run every N hours (interval specified).
+	If a child frame with matching UNM,FPN,NAM already exists, a
+	warning is logged and no action is taken.  This is to prevent
+	filling the system up with dead servers in case of a bug or such.
+	If a child frame exits, a log message is issued, and the frame
+	is killed.
+
+    expects (SYS)XEXEC.CTL consisting of lines of the form:
+	<n>,<username>,<program>
+	<n>,<username>,<program>,<command>
+	<n>+<o>,<username>,<program>
+	<n>+<o>,<username>,<program>,<command>
+    where
+	<n> is 0 to run at system startup only, or the interval in hours
+	<o> is optional offset, useful to run at a particular time of
+	    day when <n> is a multiple of 24, for example, 24+6 will
+	    cause the job to be run every day at 0600 local time.
+	<username> is user to log frame in to
+	<program> is the name of the program to run.  Default directory
+	    is (SYS), not the <username> directory!
+	<command> is optional string to pass to the program in TMP(core).
+	    If present, program will be run at start address plus one.
+
+    Known problems:
+	Should change .FOCFM stuff to run LOGINN in child.
+	Should log major failures to CTY.
+;
+require "(SAILIB)SAIL.DEF" source!file;
+require "(SAILIB)TYMINT.DEF" source!file;
+require "(WRS)LOGLIB.REQ" source!file;
+require "(MPL)UUOSYM" source!file;
+require "(SYS)PROCESS.DEF" source!file;
+require '10 version;
+require 25 polling!interval;
+require processes;
+require crlf& "license required: WC RC SY JL WF" message;
+
+integer procedure Gettab (integer J,T);
+begin!code
+	SETOM	!SKIP!;
+	HRL	1,J;
+	HRR	1,T;
+	uuo!GETTAB 1,;
+	 SETZM	!SKIP!;
+end;
+
+integer simple procedure frmopV( integer frame, arg, opcode );
+start!code	protect!acs 1; 
+	setom	!skip!;
+	move	1,frame;	! get address of arg;
+	hrl	1,opcode;	! get opcode;
+	frmop	1,arg;		! call by value (val on stack);
+	 setzm	!skip!;
+end;
+
+integer simple procedure frmopR( integer frame; 
+			reference integer arg; integer opcode );
+start!code	protect!acs 1;
+	setom	!skip!;
+	move	1,frame;	! get address of arg;
+	hrl	1,opcode;	! get opcode;
+	frmop	1,arg;		! call by reference (actually indirect);
+	 setzm	!skip!;
+end;
+
+
+simple integer procedure DayTime;
+return( calli( 0,-'143 ));	! secs past 1/1/64 00:00;
+
+string procedure haltStatus( integer array HSB );
+begin
+    case !lh(HSB[1]) of begin
+	[hc!MEM] return( "memory violation" );
+	[hc!SYS] return( "system error" );
+	[hc!DEV] return( "device error" );
+	[hc!ILL] return( "illegal instruction" );
+	[hc!EXI] return( case !rh(HSB[1]) of (
+	    [ht!EXI] "exit",
+	    [ht!EX1] "exit",
+	    [ht!FEX] "fail exit",
+	    [ht!TLE] "time limit exceeded",
+	    [ht!JSV] cv6str(HSB[6])&" saved",
+	    [else] "frame exit" ));
+	[hc!RUN] return( case !rh(HSB[1]) of (
+	    [ht!TRE] "transmission error",
+	    [ht!PGN] cvs(HSB[6])&" pages required",
+	    [ht!DNA] "device not available",
+	    [ht!FNF] cv6str(HSB[6])&" not found",
+	    [ht!NSF] "not a save file",
+	    [ht!RMF] "remap uuo failed",
+	    [ht!NSA] "no start address",
+	    [else] "run uuo failed" ));
+	[else] return( "unknown class" )
+    end;
+end;
+
+procedure HSBsvc;
+begin
+    integer J;
+    logOpen;
+    J := gettab( -1, !gtFTR ) land '777;		! FD of first child;
+    while J do begin
+	integer array HSB[0:7];
+	HSB[0] := 7;
+	frmopr( J, HSB[0], !foHST );
+	if !SKIP! and HSB[2] then begin "halted"
+	    print( logDate, crlf&
+		(if HSB[1]=!xwd(hc!EXI,ht!EXI) or HSB[1]=!xwd(hc!EXI,ht!EX1)
+		    then "Frame "
+		    else "?frame " ),
+		J,
+		" user ", cv6str( gettab( J, !gtUNM )),
+		cv6str( gettab( J, !gtUN1 )),
+		": ", cv6str( gettab( J, !gtNAM )),
+		" status ", cvos(!lh(HSB[1])),
+		",", cvos(!rh(HSB[1])), " ",
+		haltStatus( HSB ), crlf );
+	    calli( !xwd( 3, J ), calli!HANG );
+	    if not !SKIP! then print( "?HANG UUO failure"& crlf );
+	end "halted";
+	J := gettab( J, !gtFTR ) lsh -12 land '777;	! FD of next child;
+    end;
+    logClose;
+end;
+
+procedure NTQsvc;
+begin
+    logOpen;
+    print( logDate, " notice to quit"& crlf );
+    logClose;
+    calli( 0, calli!LOGOFF );
+end;
+
+item	INTPRO;
+simple procedure IntIni;
+begin "IntIni"
+    own safe integer array HSBblk[1:2];
+    own safe integer array NTQblk[1:2];
+    HSBblk[1] _ 2; 
+    HSBblk[2] _ !hl(-1)+location(HSBsvc);
+    NTQblk[1] _ 2; 
+    NTQblk[2] _ !hl(-1)+location(NTQsvc);
+    intset ( INTPRO, STRINGSTACK(4)+PSTACK(4) );
+    intmap ( intass(!IAFEX,10), dfrint, location(HSBblk[1]) );
+    enable ( newenb(10) );
+    intmap ( intass(!IANTQ,11), dfrint, location(NTQblk[1]) );
+    enable ( newenb(11) );
+end "IntIni";
+require IntIni initialization;
+
+comment		open CTL file - check for JL license
+;
+
+procedure Open!CTL( integer CHAN; reference integer EOF );
+begin
+    integer array X[0:!RBAUT];
+    X[0] := arrinfo(X,2);
+    X[1] := gettab( -1, !GTFPN );
+    X[2] := gettab( -1, !GTNAM );
+    X[3] := cvsix( "CTL" );
+    chnior( CHAN, X[0], !CHLK );
+    if not !SKIP! then begin
+	print( "?LOOKUP error ",cvos(!rh(X[3]))," for CTL file"& crlf );
+	EOF := true;
+	return;
+    end;
+    if not X[!RBLIC] land !lh(LC!JL) then begin
+	print( "?CTL file lacks JL license, RIBAUT=[",
+	    cvos(!lh(X[!RBAUT])), ",", cvos(!rh(X[!RBAUT])), "]"& crlf );
+	EOF := true;
+	return;
+    end;
+end;
+
+comment		Frame Manipulation Operations
+
+PPN   _	CvPPN ("user")		 - return PPN from user name
+;
+
+integer procedure cvppn(string user);
+begin
+    own integer U0,U1,CH,E;
+    own integer array X[0:3],U[0:1];
+    U0_ cvsix(user[1 for 6]);
+    U1_ cvsix(user[7 for 6]);
+    if U0 = U[0] and U1 = U[1] then return( X[2] );
+    X[0]_ 3;
+    X[1]_ '1000001;
+    X[2]_ location(U[0]);
+    X[3]_ cvsix("UFD");
+    U[0]_ U0;
+    U[1]_ U1;
+    open( CH_getchan,"DSK",0,0,0, 0,0,E );
+    if E then usererr(0,0,"?can't init disk");
+    chnior( CH,X[0],!CHLK );
+    if not !SKIP! then print( "%no UFD for ",user,crlf );
+    release( CH );
+    return( X[2] );
+end;
+
+integer procedure FindProg ( string User, Prog );
+begin
+    own integer J,UNM,UN1,NAM,T1,T2;
+    UNM_ cvsix( User[1 for 6] );
+    UN1_ cvsix( User[7 for 6] );
+    NAM_ cvfil( Prog, T1, T2 );
+    J := gettab( -1, !gtFTR ) land '777;		! FD of first child;
+    while J do begin
+	if Gettab( J,!GTUNM ) = UNM 
+	    and Gettab( J,!GTUN1 ) = UN1
+	    and Gettab( J,!GTNAM ) = NAM
+	    then return( J );
+	J := gettab( J, !gtFTR ) lsh -12 land '777;	! FD of next child;
+    end;
+    return( 0 );
+end;
+
+procedure RunProg ( string User, Prog, Args );
+begin "RunProg"
+    integer FD,I,E;
+    integer array X[0:6];
+    X[1] := X[3] _ cvppn(user);
+    X[2] := '20*!bit(7) + JP!NAT + JP!COR + JP!CRM;
+    X[4] := cvsix(user[1 for 6]);
+    X[5] := cvsix(user[7 for 6]);
+    E_ FD_ frmopv( 0, !xwd(-5,location(X[1])), !FOCFM );
+    if not !SKIP! then begin
+	print( "?cant create ",User," ",Prog," FOCFM ",cvos(E),crlf );
+	return;
+    end;
+    X[0] _ !xwd( if length(ARGS) then 1 else 0, 4 );
+    X[1] _ cvsix("DSK");
+    X[3] _ cvfil(Prog,X[4],X[2]);
+    if length( Args ) then begin
+	integer C,E;
+	string F;
+	F := "("& user& ")"&
+	    (cvs(1000+(FD land '7777))[2 to 4])&
+	    cv6str(X[3])[1 to 3]&
+	    ".TMP";
+	open(C_getchan,"DSK",0,0,4, 0,0,E);
+	enter(C,F,E);
+	cprint( C, Args );
+	if X[3] = cvsix("PCOM")		! PCOM kludge;
+	    then cprint( C, "/NODETACH" );
+	close(C);
+	release(C);
+	X[3] _ cvfil(Prog,X[4],X[2]);	! username clobbered by ENTER;
+    end;
+    E_ frmopr( FD,X[0],!FORUN );
+    if not !SKIP! then begin
+	print( "?cant run ",User," ",Prog," .FORUN ",cvos(E),crlf );
+	return;
+    end;
+    print("Frame ", FD land '777, " user ", User, ": ", Prog, " ", Args, crlf);
+end "RunProg";
+
+comment		Main Program Loop
+
+Executes loop "MAIN" every hour.  To eliminate need for keeping last
+run date/time for each job, a periodic job with an interval of
+<interval> is run if and only if:
+	<hours-since-1/1/64-00:00> mod <interval> = 0
+;
+boolean	Pass1;			! This is the first pass;
+integer Int;			! dummy integer;
+integer Hour;			! hour of eternity desired;
+integer BT,BL;			! break table;
+
+calli( gettab( -1,!GTPRV ) lor JP!NAT, calli!SETPRV );
+setbreak( BT_getbreak," ,+"&#lf," "&#cr,"TSINK");
+setbreak( BL_getbreak,#lf,#cr,"SINK");
+Pass1_ true;
+while DayTime < 60*60*24*365 do calli( 1, calli!SLEEP );
+while true do begin "MAIN"
+
+    integer C,B,E;		! channel vars;
+    integer J;			! job number?;
+
+    NOPOLL := 1;
+    logOpen;			! start log;
+    print( logDate, if Pass1 then " system startup"&crlf else crlf );
+    open( C_getchan,"DSK",0,4,0, 256,B,E_-1 );
+    Open!CTL( C, E );
+    while not E do begin
+	string S;
+	string User,Cmd,Arg;	! user name, command, argument;
+	integer Interval;	! hours between runs;
+	integer Offset;		! offset for run time (see header page 1);
+	Interval_ cvd( S := input( C,BT ));
+	if E then done;
+	if S=";" then begin
+	    if B neq #lf then input( C,BL );
+	    continue;
+	end;
+	if B="+"
+	    then Offset _ input( C,BT )
+	    else Offset _ 0;
+	if B=","
+	    then User_ input( C,BT )
+	    else begin
+		print( "?insufficient input",crlf ); continue end;
+	if B=","
+	    then Cmd_ input( C,BT )
+	    else begin
+		print( "?insufficient input",crlf ); continue end;
+	if B neq #lf
+	    then Arg_ input( C,BL )
+	    else Arg_ null;
+	if (Interval = 0) and
+		(Pass1) 
+	or (Interval neq 0) and
+		((DayTime/3600 + Offset) mod Interval = 0) then begin
+	    if Cmd neq "(" then Cmd := "(SYS)"& Cmd;
+	    if J := FindProg( User, Cmd )
+		then print("%already running ",User," ",Cmd," on job ",J,crlf)
+		else RunProg( User, Cmd, Arg );
+	end;
+    end;
+    release( C );		! release control file;
+    logClose( 10 );		! keep log to 10 pages;
+    NOPOLL := 0;
+    Pass1_ false;
+    Hour := DayTime % 3600 + 1;
+    while ( Int := Hour * 3600 - DayTime ) > 0 do
+	calli( !xwd( 1, Int ), calli!HIBER );
+end	"MAIN";
+end $
