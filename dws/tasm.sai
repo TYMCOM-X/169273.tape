@@ -1,0 +1,799 @@
+begin "TAsm - Tank Assembler"
+
+  require "(sailib)sail.def" source!file;
+
+  define DEBUG = {true};
+! Get the opcode table
+;
+
+require "mup.def" source!file;
+
+
+! Return the offset of a string into the opcode table.
+! Return 0 if not in table.
+;
+
+integer procedure OpLookup( string S );
+  begin "lookup opcode"
+    integer I;
+    for I := 1 upto arrinfo( OpT, 2 ) - 1 do
+      if ( kequ( S, OpT[ I ] )) then return( I );
+    return( 0 );
+  end "lookup opcode";
+! Chain & expression node stuff.
+;
+
+define expr = {record!pointer ( node ) };
+
+record!class Node (		! Expression node ;
+  integer Sym;				! Sym for this node ;
+  expr Left, Right;			! left, right kids ;
+  integer Info );			! Sym dependent information ;
+
+record!class ByteRec (		! Byte/PC node ;
+  record!pointer ( ByteRec ) Next;	! link to next on chain ;
+  integer PC, Val;			! PC, value of byte ;
+  expr E );				! iff non null, expr to resolve ;
+
+record!class LineRec (		! Source line node ;
+  record!pointer ( LineRec ) Next;	! next on list ;
+  integer Line#;			! corresponding source file line ;
+  boolean Error;			! true iff some error on this line ;
+  record!pointer ( ByteRec ) Link );	! link to byte chain ;
+! Globals
+;
+
+! Globals for the machine abstraction ;
+
+integer MuPC;			! PC while parsing ;
+
+! Global for the input file & token scanner ;
+
+string SourceFileName;
+integer Source!Chan, Source!BC, Source!EOF;
+
+integer Line!BT;	 	! break table for scanning lines ;
+string SourceLine;		! complete line from source file;
+string Line;			! line begin munged ;
+integer Line#;			! # of line ;
+integer ErrorCount;
+
+record!pointer ( LineRec ) LineRecHead, LineRecTail;
+
+! Globals for the listing file ;
+
+string ListingFileName;
+integer Listing!Chan, Listing!EOF;
+
+! Globals for the object File ;
+
+string ObjectFileName;
+! Token scanning stuff
+;
+
+integer	Token,			! enumerated token just scanned ;
+	Info;			! token dependent information ;
+
+define	EOLSym = 0,
+	BadSym = 1,
+	DollarSym = 10,
+	PlusSym = 11,
+	MinusSym = 12,
+	AndSym = 13,
+	CommaSym = 14,
+	ConstSym = 20,
+	IdentSym = 21, LabelSym = 22, OpSym = 23,
+	BLKSym = 24, EQUSym = 25, EXPSym = 26, LOCSym = 27,
+	UMinusSym = 30;
+! Symbol table stuff
+;
+
+define SYMMAX = 1024;
+
+integer SymTop;
+
+string array SymTxt[ 1 : SYMMAX ];
+integer array SymLine[ 1 : SYMMAX ];	! line defined ;
+integer array SymVal[ 1 : SYMMAX ];	! resolved value ;
+expr array SymExpr[ 1 : SYMMAX ];	! expr, if not yet resolved ;
+! Initialization
+;
+
+procedure Initialize;
+  begin "init"
+    string S;
+
+    ErrorCount := 0;
+
+    LineRecHead := LineRecTail := new!record( LineRec );
+    LineRec:Error[ LineRecTail ] := true;
+
+    SymTop := 0;		! clear out the symbol table ;
+    arrclr( SymTxt, NULL );
+    arrclr( SymLine, 0 );
+    arrclr( SymVal, 0 );
+    arrclr( SymExpr, null!record );
+
+    setbreak( Line!BT := getbreak, '15&'14&0, '12&0, "INS" );
+
+    print( "Source File: " );   SourceFileName := inchwl;
+
+    ! ** gross kludge ** ;
+
+    S := SourceFileName;
+    SourceFilename := S & ".TNK";    
+    ListingFileName := S & ".LST";
+    ObjectFileName := S & ".BIN";
+
+  end "init";
+! Routine to Emit an error message
+;
+
+procedure Error( string Msg );
+  begin "error"
+
+    print( crlf );
+    print( "*** ", SourceLine, crlf );
+    print( "*** ", Msg, crlf );
+
+    ErrorCount := ErrorCount + 1;
+
+    ! blow away the line so that we don't get further errors ;
+
+    Line := NULL;
+
+    ! Mark this line as having an error ;
+
+    LineRec:Error[ LineRecTail ] := true;
+
+  end "error";
+! Given a symbol name, return the index in the symbol table.
+! Insert the symbol if necessary.
+;
+
+integer procedure GetSym( string S );
+  begin "get symbol"
+    integer I;
+
+    for I := 1 upto SymTop do
+      if ( kequ( S, SymTxt[I] )) then return( I );
+
+    SymTop := SymTop + 1;
+    if ( SymTop > SYMMAX ) then
+      usererr( 0,0,"Symbol Table Overflow!!!","x" );
+
+    SymTxt[I] := S;
+    return( I );
+
+  end "get symbol";
+! Return true iff a symbol has a value bound to it
+;
+
+boolean procedure SymBound( integer Sym );
+  begin "bound?"
+
+    if ( not SymLine[ Sym ] ) then return( false );    
+    return( SymExpr[ Sym ] = null!record );
+
+  end "bound?";
+
+
+
+! Insert a value for a symbol.
+;
+
+procedure SetSymVal( integer Sym, Val );
+  begin "set value"
+
+    if ( SymLine[ Sym ] ) then
+      Error( "Redefining Symbol: " & SymTxt[ Sym ] )
+    else
+      SymLine[ Sym ] := Line#;
+
+    SymVal[ Sym ] := Val;
+    SymExpr[ Sym ] := null!record;
+
+  end "set value";
+
+
+
+! Insert an expression for a symbol.
+;
+
+procedure SetSymExpr( integer Sym; expr E );
+  begin "set expr"
+
+    if ( SymLine[ Sym ] ) then
+      Error( "Redefining Symbol: " & SymTxt[ Sym ] )
+    else
+      SymLine[ Sym ] := Line#;
+
+    SymExpr[ Sym ] := E;
+
+  end "set expr";
+! Open the source file for input
+;
+
+procedure OpenSourceFile;
+  begin "open file"
+    integer Flag;
+
+    open( Source!Chan := getchan, "DSK", 0, 1,0,512, Source!BC, Source!EOF );
+
+    lookup( Source!Chan, SourceFileName, Flag );
+
+    if ( Flag ) then
+      usererr( 0,0,"Lookup error "&cvos(Flag)&" for "&SourceFileName, "x" );
+
+    Line# := 0;
+    
+  end "open file";
+! Get a new line from the source file
+;
+
+boolean procedure GetLine;
+  begin "next line"
+
+    if ( Source!EOF ) then return( false );
+
+    SourceLine := Line := Input( Source!Chan, Line!BT );
+
+!   if ( DEBUG ) then print( "***"&#ht, SourceLine, crlf );
+
+    if ( Source!EOF ) then release( Source!Chan );
+
+    Line# := Line# + 1;
+
+    LineRec:Next[LineRecTail] := new!record( LineRec );
+    LineRecTail := LineRec:Next[LineRecTail];
+    LineRec:Line#[LineRecTail] := Line#;
+    LineRec:Error[LineRecTail] := false;
+
+  end "next line";
+! Scan a new token.
+;
+
+procedure GetToken;
+  begin "next token"
+    integer C;
+    string S;
+
+    boolean procedure IsIdent( integer C );
+      begin
+	if ( C >= "A" and C <= "Z" ) then return( true );
+	if ( C >= "a" and C <= "z" ) then return( true );
+	if ( C >= "0" and C <= "9" ) then return( true );
+	return( false );
+      end;
+
+    Info := 0;
+
+    while ( Line = " " or Line = '11 ) do lop( Line );
+    if ( Line = ";" ) then Line := NULL;
+
+    if ( length( Line ) = 0 ) then
+      begin
+	Token := EOLSym;
+	return;
+      end;
+
+    C := Lop( Line );
+
+    if ( C = "+" ) then
+      Token := PlusSym
+    else if ( C = "-" ) then
+      Token := MinusSym
+    else if ( C = "&" ) then
+      Token := AndSym
+    else if ( C = "$" ) then
+      token := DollarSym
+    else if ( C = "#" ) then
+      begin "const"
+	Token := ConstSym;
+	Info := 0;
+	while (( Line >= "0" ) and ( Line <= "7" )) do
+	  Info := Info * '10 + lop( Line ) - "0";
+      end "const"
+    else if (( C >= "0" ) and ( C <= "9" )) then
+      begin "const"
+	Token := ConstSym;
+	Info := C - "0";
+	while (( Line >= "0" ) and ( Line <= "9" )) do
+	  Info := Info * 10 + lop( Line ) - "0";
+      end "const"
+    else if (( C >= "A" ) and ( C <= "Z" )) then
+      begin "ident"
+	Token := IdentSym;
+	S := C;
+	while ( IsIdent( Line )) do
+	  S := S & lop( Line );
+      end "ident"
+    else
+      Token := BadSym;
+
+    if ( Token = IdentSym ) then
+      begin "ident"
+	if ( kequ( S, "BLK" )) then
+	  Token := BLKSym
+	else if ( kequ( S, "EQU" )) then
+	  Token := EQUSym
+	else if ( kequ( S, "EXP" )) then
+	  Token := EXPSym
+	else if ( kequ( S, "LOC" )) then
+	  Token := LOCSym
+	else if ( Info := OpLookup( S )) then
+	  Token := OpSym
+	else
+	  begin
+	    Info := GetSym( S );
+	    if ( Line = ":" ) then
+	      begin
+		lop( Line );
+		Token := LabelSym;
+	      end;
+	  end;
+      end "ident";
+
+  end "next token";
+! Top level routine to scan an expression.
+;
+
+recursive expr procedure ParseExpr;
+  begin "scan expr"
+    expr E;
+
+    E := new!record( Node );	! to be filled in below ;
+
+    GetToken;
+
+    if ( Token = IdentSym ) then
+      begin
+	Node:Sym[ E ] := IdentSym;
+	Node:Info[ E ] := Info;
+      end
+    else if ( Token = ConstSym ) then
+      begin
+	Node:Sym[ E ] := ConstSym;
+	Node:Info[ E ] := Info;
+      end
+    else
+      begin
+	Error( "Bad Expression" );
+	Node:Sym[ E ] := ConstSym;
+	Node:Info[ E ] := 0;
+      end;
+
+    GetToken;
+    if ( Token neq EOLSym ) then
+      Error( "Cannot yet handle complex expressions" );
+
+    return( E );
+
+  end "scan expr";
+! Return true iff we can evaluate the expression now.
+;
+
+recursive boolean procedure CanEvalExpr( expr E );
+  begin "can we evaluate e?"
+    integer S;
+
+    if ( E = null!record ) then return( false );
+
+    S := node:sym[ E ];
+
+    if ( S = ConstSym ) then
+      return( true )
+    else if ( S = IdentSym ) then
+      return( SymBound( node:Info[ E ] ))
+    else if ( S = PlusSym ) then
+      return( CanEvalExpr( node:left[ E ] ) and
+	      CanEvalExpr( node:right[ E ] ))
+    else if ( S = MinusSym ) then
+      return( CanEvalExpr( node:left[ E ] ) and
+	      CanEvalExpr( node:right[ E ] ))
+    else
+      begin
+	print( "? Unknown node type ",S," in CanEvalExpr", crlf );
+	return( false );
+      end;
+
+  end "can we evaluate e?";
+! Evaluate expression E and return a value
+;
+
+recursive integer procedure EvalExpr( expr E );
+  begin "eval"
+    integer S;
+
+    if ( E = null!record ) then return( 0 );
+
+    S := node:Sym[E];
+
+    if ( S = ConstSym ) then
+      return( node:Info[E] )
+    else if ( S = IdentSym ) then
+      return( SymVal[ Node:Info[E] ] )
+    else if ( S = PlusSym ) then
+      return( EvalExpr( Node:Left[E] ) + EvalExpr( Node:Right[E] ))
+    else if ( S = MinusSym ) then
+      return( EvalExpr( Node:Left[E] ) - EvalExpr( Node:Right[E] ))
+    else
+      begin
+	print( "% Unknown Sym ",S," in expr node - Eval", crlf );
+	return( 0 );
+      end;
+
+  end "eval";
+! Stuff for sticking things onto chains;
+;
+
+procedure ChainVal( integer PC, Val );
+  begin "chain a byte"
+    record!pointer ( ByteRec ) B;
+
+    B := new!record( ByteRec );
+    ByteRec:Next[B] := LineRec:Link[LineRecTail];
+    LineRec:Link[LineRecTail] := B;
+
+    ByteRec:PC[B] := PC;
+    ByteRec:Val[B] := Val;
+    ByteRec:E[B] := null!record;
+
+  end "chain a byte";
+
+
+! Chain an expression into the list ;
+
+procedure ChainExpr( integer PC; expr E );
+  begin "chain an expr"
+    record!pointer ( ByteRec ) B;
+
+    B := new!record( ByteRec );
+    ByteRec:Next[B] := LineRec:Link[LineRecTail];
+    LineRec:Link[LineRecTail] := B;
+
+    ByteRec:PC[B] := PC;
+    ByteRec:E[B] := E;
+    
+  end "chain an expr";
+! Handle a BLK pseudo op
+!
+! Form is:	BLK <expression>
+! Where <expression> is evaluated now.
+;
+
+procedure ParseBLK;
+  begin "blk"
+    expr E;
+    integer I;
+
+    E := ParseExpr;
+
+    if ( CanEvalExpr( E )) then
+      begin
+	I := EvalExpr( E );
+	MuPC := MuPC + I;
+      end
+    else
+      Error( "BLK expression cannot be evaluated" );
+
+  end "blk";
+! Handle a LOC pseudo op
+!
+! Format is:	LOC <expression>
+! Where <expression> must be evaluatable now.
+;
+
+procedure ParseLOC;
+  begin "loc"
+    expr E;
+    integer I;
+
+    E := ParseExpr;
+
+    if ( CanEvalExpr( E )) then
+      begin
+	I := EvalExpr( E );
+	MuPC := I;
+      end
+    else
+      Error( "LOC expression cannot be evaluated" );
+    
+  end "loc";
+! Parse an EQU pseudo op
+!
+! Form is:	EQU <ident> <expression>
+;
+
+procedure ParseEQU;
+  begin "equ"
+    expr E;
+    integer S, I, IdentInfo;
+
+    GetToken;
+    IdentInfo := Info;
+
+    if ( Token neq IdentSym ) then
+      Error( "Bad form for EQU pseudo-op" )
+    else
+      begin
+	E := ParseExpr;
+	if ( CanEvalExpr( E )) then
+	  begin
+	    I := EvalExpr( E );
+	    SetSymVal( IdentInfo, I );
+	  end
+	else
+	  SetSymExpr( IdentInfo, E );
+      end;
+
+  end "equ";
+! Handle an EXP pseudo op
+!
+! Form is:	EXP <expression> [ ',' <expression> ]*
+;
+
+procedure ParseEXP;
+  begin "exp"
+
+    Error( "EXP pseudo-op isn't yet implemented" );    
+
+  end "exp";
+! Parse an opcode statement
+!
+! Form is:	<opcode>
+!      or:	<opcode> <expression>
+! depending on the opcode.
+;
+
+procedure ParseOp;
+  begin
+    integer I, #Bytes;
+    expr E;
+
+    I := Info;		! I is an index into the opcode tables ;
+
+    ChainVal( MuPC, OpV[ I ] );
+
+    if ( OpV[ I ] land Op$2Byte ) then #Bytes := 2
+    else #Bytes := 1;
+
+    if ( #Bytes = 1 ) then
+      GetToken
+    else
+      begin "expression"
+
+	E := ParseExpr;
+
+	if ( CanEvalExpr( E ) ) then
+	  ChainVal( MuPC + 1, EvalExpr( E ) )
+	else
+	  ChainExpr( MuPC + 1, E );
+
+      end "expression";
+
+    MuPC := MuPC + #Bytes;
+
+  end;
+! Parse the source file.
+;
+
+procedure ParseTheSourceFile;
+  begin "parse"
+
+    OpenSourceFile;
+
+    MuPC := 0;
+
+    while ( GetLine ) do
+      begin "parse a line"
+
+	! Parse this line ;
+
+	GetToken;
+
+        if ( Token = LabelSym ) then
+	  begin "label"
+	    SetSymVal( Info, MuPC );
+	    GetToken;
+	  end "label";
+
+	if ( Token = BLKSym ) then
+	  ParseBLK
+	else if ( Token = EQUSym ) then
+	  ParseEQU
+	else if ( Token = EXPSym ) then
+	  ParseEXP
+	else if ( Token = LOCSym ) then
+	  ParseLOC
+	else if ( Token = OpSym ) then
+	  ParseOp
+	else if ( Token = EOLSym ) then
+	  begin end
+	else
+	  begin
+	    Error( "Bad Form" );
+	  end;
+
+        if ( Token neq EOLSym ) then Error( "Junk at end of line" );
+
+      end "parse a line";
+    
+  end "parse";
+! Look for undefined Symbols & resolve dangling expressions.
+;
+
+procedure ResolveExpressions;
+  begin "resolve"
+    integer I;
+    record!pointer ( LineRec ) L;
+    record!pointer ( ByteRec ) B;
+
+    for I := 1 upto SymTop do
+      begin "pass"
+	if ( SymLine[ I ] = 0 ) then
+	  begin
+	    print( "Undefined Symbol: ", SymTxt[I], crlf );
+	    ErrorCount := ErrorCount + 1;
+	  end
+	else if ( SymExpr[ I ] neq null!record ) then
+	  begin "resolve"
+	    if ( CanEvalExpr( SymExpr[ I ] )) then
+	      begin
+		SymVal[ I ] := EvalExpr( SymExpr[ I ] );
+		SymExpr[ I ] := null!record;
+	      end
+	    else
+	      begin
+		print( "? Cannot resolve ", SymTxt[ I ], crlf );
+		ErrorCount := ErrorCount + 1;
+	      end;
+	  end "resolve";
+      end "pass";
+
+! continued ... ;
+! continued ... ;
+
+    ! now walk the line chain looking for unresolved bytes ;
+
+    L := LineRecHead;
+    while ( L neq null!record ) do
+      begin "each line"
+
+	B := LineRec:Link[L];
+	while ( B neq null!record ) do
+	  begin "each byte"
+
+	    if ( ByteRec:E[B] neq null!record ) then
+	      begin "attempt to resolve"
+
+		if ( CanEvalExpr( ByteRec:E[B] )) then
+		  begin "fix"
+		    ByteRec:Val[B] := EvalExpr( ByteRec:E[B] );
+		    ByteRec:E[B] := null!record;
+		  end "fix"
+		else
+		  begin "fail"
+		    print( "? Can't eval exp in line ", LineRec:Line#[L] );
+		    print( crlf );
+		    ByteRec:Val[B] := 0;
+		    ByteRec:E[B] := null!record;
+		    LineRec:Error[L] := true;
+		  end "fail";
+
+	      end "attempt to resolve";
+
+	    B := ByteRec:Next[B];
+	  end "each byte";
+
+	L := LineRec:Next[L];
+      end "each line";
+
+  end "resolve";
+! Generate an assembly listing
+;
+
+procedure GenerateListing;
+  begin "listing"
+    integer Bytes, B0, B1, PC;
+    record!pointer ( LineRec ) L;
+    record!pointer ( ByteRec ) B;
+    string Header;
+
+    OpenSourceFile;
+    L := LineRecHead;
+
+    while ( GetLine ) do
+      begin "each line of source"
+
+	while (( L neq null!record ) and
+	       ( LineRec:Line#[ L ] < Line# )) do
+	  L := LineRec:Next[ L ];
+
+        Header := ("   "&cvs(LineRec:Line#[L]))[inf-3 to inf] & ". ";
+
+	if ( LineRec:Error[L] ) then Header := Header & "*"
+	else Header := Header & " ";
+
+	print( Header );
+
+	B := LineRec:Link[L];
+	Bytes := 0;
+	while ( B neq null!record ) do
+	  begin
+	    PC := ByteRec:PC[B];
+	    Bytes := Bytes + 1;
+	    B1 := B0;  B0 := ByteRec:Val[B];
+	    B := ByteRec:Next[B];
+	  end;
+
+	if ( Bytes = 0 ) then
+	  Header := "                 "
+	else if ( Bytes = 1 ) then
+	  Header := ("000"&cvos(PC))[inf-3 to inf] & "  " &
+		    ("000"&cvos(B0))[inf-3 to inf] & "       "
+	else
+	  Header := ("000"&cvos(PC))[inf-3 to inf] & "  " &
+		    ("000"&cvos(B0))[inf-3 to inf] & " " &
+		    ("000"&cvos(B1))[inf-3 to inf] & "  ";
+
+	print( Header, SourceLine, crlf );
+
+      end "each line of source";
+    
+  end "listing";
+! Emit the object file
+;
+
+procedure EmitObjectFile;
+  begin "emit"
+    integer array AddrSpace[ 0 : 1023 ];
+    record!pointer ( LineRec ) L;
+    record!pointer ( ByteRec ) B;
+    integer Chan, Err;
+
+    arrclr( AddrSpace, 0 );
+
+    L := LineRecHead;
+    while ( L neq null!record ) do
+      begin "each source line"
+
+	B := LineRec:Link[L];
+	while ( B neq null!record ) do
+	  begin
+	    AddrSpace[ ByteRec:PC[B] ] := ByteRec:Val[B];
+	    B := ByteRec:Next[B];
+	  end;
+
+	L := LineRec:Next[L];
+      end "each source line";
+
+    open( Chan := getchan, "DSK", '17,0,0,1024,0, Err );
+    enter( Chan, ObjectFileName, Err );
+    if ( Err ) then
+      usererr( 0,0, "Can't ENTER " & ObjectFileName, "x" );
+
+    arryout( Chan, AddrSpace[0], 1024 );
+    close( Chan );
+    release( Chan );
+    
+  end "emit";
+! Top level
+;
+
+  print( "Tank Assembler v", cvos( !LH( memory[ '137 ] )), ".",
+	  cvos( !RH( memory[ '137 ] )), crlf, crlf );
+
+  Initialize;
+
+  ParseTheSourceFile;
+  ResolveExpressions;
+
+  GenerateListing;
+
+  if ( ErrorCount = 0 ) then
+    EmitObjectFile;
+
+
+end "TAsm - Tank Assembler";
+ 
