@@ -1,0 +1,627 @@
+begin "BOX"
+  require "(sailib)sail.def" source!file;
+
+  require 1 version;
+
+  string Cmd;
+
+  string Box!Name;
+  boolean Box!Open;
+  integer Box!Chan, Box!EOF;
+
+  own safe integer array Box!Dir[ 1 : 512 ];
+! Record definitions ;
+
+record!class FileName
+  (
+    record!pointer ( FileName ) Link;	! link to next record ;
+    integer Info;			! info about this rec ;
+    string Name				! name of this file ;
+  );
+
+! FileName records hang off of several lists.  The wild list is used to
+! build up a list of templates for scanning the box directory.  The
+! file list is used on those occassions where we need to build a list
+! from the resulting matches ;
+
+record!pointer ( FileName ) WildList;
+record!pointer ( FileName ) FileList;
+! Initialize this mess ;
+
+procedure Initialize;
+  begin
+    Box!Open := false;
+    WildList := NULL!Record;
+  end;
+
+require Initialize initialization;
+! Restore the file whose header is at position I to disk;
+
+procedure Restore!File( integer I );
+  begin
+    integer idx, cnt, pagebase, length, chan, err;
+    own integer array buffer[ 1 : 512 ];
+    string F;
+
+    idx := 1;
+    cnt := 1;		! 1 page is eaten up by the headers ;
+    while ( idx neq I ) do
+      begin
+	idx := idx + 4;
+	cnt := cnt + (( BOX!Dir[ idx + 3 ] + 511 ) div 512 );
+      end;
+    pagebase := cnt;
+    length := Box!Dir[ I + 3 ];
+    F := cv6str( Box!Dir[ I ] ) & "." & cv6str( Box!Dir[ I+1] )[1 for 3];
+    print( F );
+    open( chan := getchan, "DSK", '17,0,0,512,0, err );
+    enter( chan, F, err );
+    if ( err ) then
+      begin
+	print( " ** unable to enter file **", crlf );
+	release( chan );
+	return;
+      end;
+
+    useti( Box!Chan, (((pagebase-1)*4)+1) );
+
+    while ( length ) do
+      begin
+	cnt := length min 512;
+	arryin( Box!Chan, Buffer[1], cnt );
+	arryout( chan, Buffer[1], cnt );
+	length := length - cnt;
+      end;
+
+    close( chan );
+    print( crlf );
+    release( chan );
+  end;
+! Routine to make a (possibly wild) mask from a filename ;
+
+string procedure Make!Mask( string S );
+  begin
+    string T;
+    boolean DotSeen;
+    integer C;
+
+    T := NULL;
+    DotSeen := false;
+    while ( true ) do
+      begin
+	if ( not S ) then done;
+	C := lop( S );
+	if (( C >= "a" ) and ( C <= "z" )) then C := C - '40;
+	if ( C = "." ) then
+	  begin
+	    if (( not T ) or ( DotSeen )) then return( NULL );
+	    while ( length( T ) < 6 ) do T := T & " ";
+	    DotSeen := true;
+	  end
+	else if ( C = "*" ) then
+	  begin
+	    if ( not DotSeen ) then
+	      while ( length( T ) < 6 ) do T := T & "#"
+	    else
+	      while ( length( T ) < 9 ) do T := T & "#";
+	  end
+	else
+	  begin
+	    if (( not DotSeen ) and ( length( T ) < 6 )) then
+	      T := T & C
+	    else if (( DotSeen ) and ( length( T ) < 9 )) then
+	      T := T & C;
+	  end;
+      end;
+    if ( not T ) then return( NULL );
+    while ( length( T ) < 9 ) do T := T & " ";
+    return( T );
+  end;
+! Routine to build the wild list from the remainder of the command
+!  string.  Returns false iff some error ;
+
+  forward string procedure Scan!Token( reference string S );
+
+boolean procedure Build!WildList( boolean DefaultWild );
+  begin
+    record!pointer ( FileName ) R1, R2;
+    string T;
+    boolean DotSeen;
+    integer safety;
+
+    ! R1 points to a dummy record that gets used by default ;
+
+    R1 := R2 := new!record( FileName );
+    FileName:Link[ R1 ] := NULL!Record;
+    if ( DefaultWild ) then
+      FileName:Name[ R1 ] := "#########"
+    else
+      FileName:Name[ R1 ] := "_________";
+
+    WildList := R1;
+
+    ! now try to build real records.  R1 points to the record to be
+    ! filled in. ;
+
+    safety := 10;
+    while ( true ) do
+      begin
+	safety := safety - 1;
+	if ( not safety ) then
+	  usererr( 0,0,"timeout in build!wildlist" );
+	T := Scan!Token( Cmd );
+	if ( not T ) then done;
+! print( "make!mask( '",T,"' ) -> " );
+	T := Make!Mask( T );
+! print( "'",T,"'", crlf );
+	if ( not T ) then return( false );
+	FileName:Name[ R1 ] := T;
+	if ( R1 neq WildList ) then
+	  FileName:Link[ R1 ] := WildList;
+	WildList := R1;
+	R1 := new!record( FileName );
+      end;
+    return( true );
+  end;
+! Routine to see if a file matches the wild list ;
+
+boolean procedure Wild!Match( string F );
+  begin
+    string W;
+    boolean P;
+    record!pointer ( FileName ) R;
+    integer i, C, safety;
+
+    R := WildList;
+    safety := 10;
+    while ( R neq Null!Record ) do
+      begin
+	P := true;
+	for i := 1 upto 9 do
+	  begin
+	    C := FileName:Name[ R ][i for 1];
+	    if ( C = "#" ) then continue;
+	    if ( C neq F[i for 1] ) then P := false;
+	  end;
+	if ( P ) then return( true );
+	R := FileName:Link[ R ];
+	safety := safety - 1;
+	if ( not safety ) then
+	  usererr( 0,0,"loop in wildmatch" );
+      end;
+    return( false );
+  end;
+! Routine to build FileList by applying WildList to the box directory ;
+
+procedure Build!FileList;
+  begin
+    record!pointer ( FileName ) R1, R2;
+    integer idx;
+    string F;
+
+    FileList := new!record( FileName );		! fake a list ;
+    FileName:Link[ FileList ] := NULL!record;
+
+    idx := 5;
+    while ( idx < 512 ) do
+      begin
+	F := (cvxstr( Box!Dir[idx] ) & cvxstr( Box!Dir[idx+1] ))[1 for 9];
+	if ( Wild!Match( F ) ) then
+	  begin
+	    R2 := new!record( FileName );
+	    FileName:Link[ R2 ] := NULL!record;
+	    FileName:Info[ R2 ] := idx;
+	    FileName:Name[ R2 ] := F;
+	    FileName:Link[ R1 ] := R2;		! link to chain ;
+	  end;
+	idx := idx + 4;
+      end;
+
+    FileList := FileName:Link[ FileList ];	! unlink dummy record ;
+  end;
+! Routine to read the directory from the file open on Box!Chan ;
+
+boolean procedure Read!Directory;
+  begin
+    useti( Box!Chan, 1 );
+    arryin( Box!Chan, Box!Dir[1], 512 );
+    if ( Box!EOF ) then return( false );
+    if ( Box!Dir[1] neq cvsix( "*BOX!*" )) then return( false );
+    return( true );
+  end;
+
+procedure Write!Directory;
+  begin
+    useto( Box!Chan, 1 );
+    arryout( Box!Chan, Box!Dir[1], 512 );
+  end;
+! Print a prompt and return the next line of input ;
+
+string procedure Prompt!Read( string Prompt );
+  begin
+    string T;
+    print( Prompt );
+    T := inchwl;
+    if ( !skip! = '33 ) then print( crlf );
+    return( T );
+  end;
+
+
+! Routine for scanning the next blank delimited token from a line ;
+
+string procedure Scan!Token( reference string S );
+  begin
+    string T;
+    T := NULL;
+    while ( S = " " ) do lop( S );
+    while ( length( S ) and ( S neq " " ) and ( S neq "," ) ) do
+      T := T & lop( S );
+    lop( S );
+    return( T );
+  end;
+! Routine to make a box file name from a string ;
+
+string procedure Make!Box!Name( string S );
+  begin
+    string T;
+    boolean DotSeen;
+    integer C;
+
+    DotSeen := false;
+    T := NULL;
+    if ( S = "(" ) then
+      begin "username"
+	while ( length( S ) and ( S neq ")" )) do
+	  begin
+	    C := lop( S );
+	    if (( C >= "a" ) and ( C <= "z" )) then
+	      C := C - '40;
+	    T := T & C;
+	  end;
+	T := T & lop( S );
+	if ( length( S ) = NULL ) then return( NULL );
+      end "username" ;
+
+    while( length( S ) ) do
+      begin
+	C := lop( S );
+	if (( C >= "a" ) and ( C <= "z" )) then
+	  C := C - '40;
+	T := T & C;
+	if ( C = "." ) then DotSeen := true;
+      end;
+
+    if ( not DotSeen ) then
+      T := T & ".BOX";
+
+    return( T );
+
+  end;
+! Open Command - open a box ;
+
+procedure Open!Command;
+  begin "Open Command"
+    integer ErrFlag, idx, cnt;
+    string F;
+
+    if ( Box!Open ) then
+      begin
+	print( "Already Open!", crlf );
+	return;
+      end;
+
+    F := Scan!Token( Cmd );
+    if ( not F ) then
+      begin
+	F := Prompt!Read( "Box: " );
+	if ( not F ) then return;
+      end;
+    F := Make!Box!Name( F );
+    if ( not F ) then
+      begin
+	print( "? Bad box name", crlf );
+	return;
+      end;
+
+    open( Box!Chan := getchan, "DSK", '17,0,0,512,0,Box!EOF );
+    lookup( Box!Chan, F, ErrFlag );
+    if ( ErrFlag ) then
+      begin
+	print( "? Can't open box - ", F, crlf );
+	release( Box!Chan );
+	return;
+      end;
+
+    if ( not Read!Directory ) then
+      begin
+	print( "? Bad directory for box - ", F, crlf );
+	release( Box!Chan );
+	return;
+      end;
+
+    Box!Open := true;
+    Box!Name := F;
+
+    idx := 5;
+    cnt := 0;
+    while ( idx < 512 ) do
+      begin
+	if ( Box!Dir[ idx ] = 0 ) then done;
+	cnt := cnt + 1;
+	idx := idx + 4;
+      end;
+
+    print( cnt, " files in ", Box!Name, crlf );
+
+  end "Open Command" ;
+! Close Command - close a box ;
+
+procedure Close!Command;
+  begin "Close Command"
+
+    if ( Not Box!Open ) then
+      begin
+	print( "Nothing Open!", crlf );
+	return;
+      end;
+
+    Box!Open := false;
+    print( "[Close]", crlf );
+
+  end "Close Command" ;
+! Direct Command - list the contents of a box ;
+
+procedure Direct!Command;
+  begin "Direct Command"
+    integer idx, cnt;
+    string S;
+
+    if ( not Box!Open ) then
+      begin
+	print( "Nothing Open!", crlf );
+	return;
+      end;
+
+    if ( not Build!WildList( true ) ) then
+      begin
+	print( "? Bad file list", crlf );
+	return;
+      end;
+
+    idx := 5;			! words 1..4 are reserved ;
+    cnt := 0;
+    while ( idx < 512 ) do
+      begin
+	integer p, i;
+	if ( Box!Dir[ idx ] = 0 ) then done;
+
+	S := (cvxstr(Box!Dir[idx]) & cvxstr(Box!Dir[idx+1]))[1 for 12];
+	if ( Wild!Match( S ) ) then
+	  begin
+	    cnt := cnt + 1;
+	    S := cv6str( Box!Dir[ idx ] ) & "." &
+		 cv6str( Box!Dir[ idx + 1 ] land '777777000000 );
+	    S := ( S & "          " )[1 for 12 ];
+	    p := Box!Dir[ idx + 2 ];
+	    for i := 1 upto 3 do
+	      begin
+		p := p rot 3;
+		S := S & ( case ( p land '7 ) of
+		 ("All ","Cp  ","Upd ","Ap  ","Rd  ","Run ","Lk  ","No  "));
+	      end;
+	    S := S & ( "      " & cvs( Box!Dir[ idx + 3 ] ))[ inf-5 to inf ];
+	    print ( S, crlf );
+	  end;
+	idx := idx + 4;
+      end;
+    if ( cnt = 0 ) then
+      print( "No Files", crlf );
+
+  end "Direct Command" ;
+! Some stub routines ;
+
+procedure Save!Command;
+  begin
+    print( "[Save]", crlf );
+  end;
+
+procedure Update!Command;
+  begin
+    print( "[Update]", crlf );
+  end;
+! Restore the named files to disk ;
+
+procedure Restore!Command;
+  begin
+    integer idx, cnt;
+    string S;
+
+    if ( not Box!Open ) then
+      begin
+	print( "Nothing Open!", crlf );
+	return;
+      end;
+
+    if ( not Build!WildList( false ) ) then
+      begin
+	print( "? Bad file list", crlf );
+	return;
+      end;
+
+    idx := 5;			! words 1..4 are reserved ;
+    cnt := 0;
+    while ( idx < 512 ) do
+      begin
+	integer p, i;
+	if ( Box!Dir[ idx ] = 0 ) then done;
+
+	S := (cvxstr(Box!Dir[idx]) & cvxstr(Box!Dir[idx+1]))[1 for 12];
+	if ( Wild!Match( S ) ) then
+	  begin
+	    cnt := cnt + 1;
+	    Restore!File( idx );
+	  end;
+	idx := idx + 4;
+      end;
+    if ( cnt = 0 )then
+      print( "No Files", crlf );
+  end;
+! *Really* restore the files to disk ;
+
+procedure Supersede!Command;
+  begin
+    integer idx, cnt;
+    string S;
+
+    if ( not Box!Open ) then
+      begin
+	print( "Nothing Open!", crlf );
+	return;
+      end;
+
+    if ( not Build!WildList( false ) ) then
+      begin
+	print( "? Bad file list", crlf );
+	return;
+      end;
+
+    idx := 5;			! words 1..4 are reserved ;
+    cnt := 0;
+    while ( idx < 512 ) do
+      begin
+	integer p, i;
+	if ( Box!Dir[ idx ] = 0 ) then done;
+	S := (cvxstr(Box!Dir[idx]) & cvxstr(Box!Dir[idx+1]))[1 for 12];
+	if ( Wild!Match( S ) ) then
+	  begin
+	    cnt := cnt + 1;
+	    ! real code goes here ;
+	    print( "Supersede: ", S, crlf );
+	  end;
+	idx := idx + 4;
+      end;
+    if ( cnt = 0 ) then
+      print( "No Files", crlf );
+  end;
+! Delete the named files from the box ;
+
+procedure Delete!Command;
+  begin
+    integer idx, cnt;
+    string S;
+
+    if ( not Box!Open ) then
+      begin
+	print( "Nothing Open!", crlf );
+	return;
+      end;
+
+    if ( not Build!WildList( false ) ) then
+      begin
+	print( "? Bad file list", crlf );
+	return;
+      end;
+
+    idx := 5;			! words 1..4 are reserved ;
+    cnt := 0;
+    while ( idx < 512 ) do
+      begin
+	integer p, i;
+	if ( Box!Dir[ idx ] = 0 ) then done;
+	S := (cvxstr(Box!Dir[idx]) & cvxstr(Box!Dir[idx+1]))[1 for 12];
+	if ( Wild!Match( S ) ) then
+	  begin
+	    cnt := cnt + 1;
+	    ! real code goes here ;
+	    print( "Delete: ", S, crlf );
+	  end;
+	idx := idx + 4;
+      end;
+    if ( cnt = 0 ) then
+      print( "No Files", crlf );
+  end;
+! Exit Command - do whatever cleanup needs done ;
+
+procedure Exit!Command;
+  begin "Exit Command"
+
+    if ( Box!Open ) then
+      Close!Command;
+
+    print( "[Exit]", crlf );
+
+  end "Exit Command";
+! Attempt to give help ;
+
+procedure Help!Command;
+  begin
+    print( "Valid commands here are:", crlf );
+    if ( not Box!Open ) then print("
+CREATE <filename>       create a new BOX file.
+OPEN <filename>         opens an existing BOX file.
+QUIT                    punt.
+
+More commands are valid once a BOX file is open.
+")
+   else print("
+CLOSE                   closes an open BOX file.
+DIRECTORY [<filelist>]  shows contents of BOX file.
+DELETE <filelist>       deletes files from the BOX.
+SAVE <filelist>         copies files into the BOX.
+RESTORE <filelist>      copies files from the BOX back to disk.
+QUIT                    punt.
+");
+    print( crlf );
+  end;
+! Top level command loop.  Read and process commands ;
+
+define ABREV = { [ 1 for (2 max length(Token))] };
+
+procedure Command!Loop;
+  begin "command loop"
+    string Prompt, Token;
+
+    while ( true ) do
+      begin "command scan"
+
+	if ( Box!Open ) then Prompt := "/" else Prompt := "*";
+	Cmd := Prompt!Read( Prompt );
+	if ( length( Cmd ) = 0 ) then continue "command scan";
+	Token := Scan!Token( Cmd );
+
+	if ( equ( Token, "?" )) then
+	  Help!Command
+	else if ( kequ( Token, "Open" ABREV )) then
+	  Open!Command
+	else if ( kequ( Token, "Close" ABREV )) then
+	  Close!Command
+	else if ( kequ( Token, "Direct" ABREV )) then
+	  Direct!Command
+	else if ( kequ( Token, "Save" ABREV )) then
+	  Save!Command
+	else if ( kequ( Token, "Restore" ABREV )) then
+	  Restore!Command
+	else if ( kequ( Token, "Delete" ABREV )) then
+	  Delete!Command
+	else if (( kequ( Token, "Exit" ABREV )) or
+		 ( kequ( Token, "Quit" ABREV ))) then
+	  begin
+	    Exit!Command;
+	    done;
+	  end
+	else
+	  begin
+	    print( "Eh?", crlf );
+	  end;
+
+      end "command scan";
+  end;
+! Top level of this mess ;
+
+  print( "Box v",cvos( memory[ '137 ] ), ".  Caveat User!", crlf );
+
+  Command!Loop;
+  call(1,"EXIT");
+
+end "BOX" ;
+    
