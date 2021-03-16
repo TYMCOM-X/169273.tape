@@ -1,0 +1,925 @@
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 1
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+1	comment 
+2	! NODLOD: - Node loader program for 2020
+3	! Author: - J.M.Stammers May 29, 1980
+4	! Revised:- J.M.Stammers July 1, 1980 ( include node adjacent load)
+5	!
+6	!
+7	!
+8	! Revised:- J.W.Rice August 21, 1980  ( remove completion time-out msg)
+9	! "  "  ":      Comment out 4th line from end of "LOAD" procedure.
+10	! "  "  ":      Add "outstr("[Process complete.]"&CRLF)"
+11	!
+12	! Revised:- D.R.Ernst June 1,1981: add message for acquiring PDP-11
+13	!	    Eliminate KMC question.
+14	!	    Changed resetting and loading messages.
+15	!	    Require confirmation for adjacent question and dr11 #.
+16	!	    Delay several seconds before declaring 11 active to KMC.
+17	!	    Changed quit to not set PDP-11 active if load did not succeed.
+18	!	    Added checks for existant pdp-11s and adjusted range of valid
+19	!		numbers to type or eliminated asking of question if one dr.
+20	!	    Fixed bug that sent zero length blocks as the last block
+21	!		of a load. A zero length message will cause the node to
+22	!		start prematurely.  When the real start message is sent,
+23	!		the node did not respond and gave the "Can't send word to node"
+24	!		error message.
+25	!	    Added code to send "leave load mode" message to load device and
+26	!		zap aux cir immediately.
+27	!	    Added check for oper license.
+28	!	    Changed "CINT" to remove all characters in circuit after an interrupt
+29	!		and to ignore line-feeds.
+30	!	    Added some help info in response to a typed "?".
+31	!	    Fixed terminal mode setting bug.
+32	!	    Added "cursor wiggling" to inform user of progress in loading.
+33	!
+34	!
+35	! Purpose:-
+36	!	   This program is intended to be used to down line
+37	!	   a node image into a node on a local network to the
+38	!	   host 2020, running TYMCOM - XX. It goes through a
+39	!	   question and answer period and then loads the data
+40	!	   into the specified node.;
+41	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 2
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+42	
+43	begin	"nodlod"
+44	require processes;
+45	require 25 polling!interval;
+46	require "(sys)proces.def" source!file;
+47	require "(sailib)tymint.def" source!file;
+48	item intpro;
+49	simple procedure intini; intset(intpro,0);
+50	require intini initialization[2];
+51	item cctblt;
+52	simple procedure eventini; mkevtt(cctblt);
+53	require eventini initialization[2];
+54	define	!	=	"COMMENT",	CRLF	=	"('15&'12)",
+55		TURNON	=	-1,		TURNOFF	=	0,
+56		USERIOT	=	'25,		DRCLI	=	0,
+57		DRSEL	=	1,		DRWIO	=	2,
+58		DRRIO	=	3,		DRDSL	=	4,
+59		PREFIX	=	'2307,		BLKLEN	=	10,
+60		ACK	=	'100307,	NAK	=	'140307,
+61		MSN	=	'400,		RESET	=	'177777,
+62		START	=	0,		YES	=	0,
+63		NO	=	1,		NOERR	=	'750010,
+64		BELL	=	'7,		ECHOFF	=	'210,
+65		AXI8S	=	'1,		AXO8	=	'3,
+66		LROK	=	'100,		LRINN	=	'101,
+67		LRNSN	=	'102,		LRNNI	=	'103,
+68		LRCSE	=	'104,		LRPOV	=	'105,
+69		LRPCE	=	'106,		LRFIN	=	'107,
+70		LRTIM	=	'110,		LRRFS	=	'111,
+71		LRNHW	=	'112,		AXCFS	=	'1000064,
+72		ZAPCIR	=	-'45,		HIBER	=	'72,
+73		CR	=	'15,		LF	=	'12,
+74		ESC	=	'33,		TAB	=	'11,
+75		BS	=	'10,		CTRLU	=	'25,
+76		DEL	=	'177,		CTRLC	=	'3,
+77		KMCCSR	=	'760540,	AVAIL	=	'4,
+78		ACTIV	=	'3,		TIMEOUT	=	'1000005,
+79		CREAUX	=	-'44,		RDIOB	=	"'722 ROT -9",
+80		TIOEB	=	"'720 ROT -9",	BSIOB	=	"'724 ROT -9",
+81		BCIOB	=	"'725 ROT -9",	UBA	=	'3,
+82		ECHON	=	'0,		CIOPR	=      -'140,
+83		DRDO	=	2,		DEFALT	=	128,
+84		DRKMCI	=	5,		GETTAB	=	'41,
+85		GTLIC	=	-'20;
+86	safe integer array intblock[1:2], zapblock[1:2];
+87	integer	drn,kmc11,dr11c,dskchn,dskeof,port,errflg,brchar,license;
+88	integer array buffer[1:DEFALT];		! pdp10 words;
+89	boolean adjacent,selected,connected;
+90	string	confirm,filnam,logstr,nodnam,auxstr,lognod,rawinp,imgfil;
+91	external 
+92	boolean	!SKIP!;
+93	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 3
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+94	! A couple of useful procedures;
+95	procedure userio(integer	mode);	! allow/disallow user level IO;
+96	begin	"userio" calli(mode,USERIOT);	end	"userio";
+97	
+98	
+99	integer procedure lh(integer word); ! return left halfword;
+100	start!code  hlrz 1,word; end;
+101	
+102	
+103	integer procedure rh(integer word); ! return right halfword;
+104	start!code  hrrz 1,word; end;
+105	
+106	
+107	simple boolean procedure cio(integer	fn,dr,arg,ciop);
+108	  start!code
+109		hrlz	3,fn;
+110		hrlz	2,dr;
+111		hrr	2,arg;
+112		hrri	3,2;
+113		move	4,ciop;
+114		setom	1;
+115		calli	3,0(4);
+116		  setzm	1;
+117	  end;
+118	
+119	
+120	simple procedure bclrb(integer	addr,byte);
+121	  start!code
+122		hrlzi	2,UBA;
+123		add	2,addr;
+124		hrrz	1,byte;
+125		BCIOB	1,@2;
+126	  end;
+127	
+128	
+129	procedure dsldr; ! release the selected dr11c;
+130	begin	"dsldr"
+131	if not cio(DRDSL,drn,DRDO,CIOPR) then 
+132		begin
+133		  outstr(CRLF&"[Can't deselect DR11C]");
+134		  return;
+135		end;
+136	if (not errflg) and kmc11 = YES then bclrb(KMCCSR+ACTIV,dr11c);  ! turn on KMC;
+137	end	"dsldr";
+138	
+139	
+140	procedure quit(string	arg); ! exit procedure, optional diag message;
+141	begin	"quit"
+142	errflg _ true;
+143	outstr(BELL&arg);			! give message;
+144	if selected then dsldr;			! turn off interrupts;
+145	if not adjacent then calli(port,ZAPCIR); ! kill the aux circuit;
+146	userio(TURNOFF);
+147	auxclv(-1,ECHON, AXCFS);
+148	call(1,"EXIT");
+149	end	"quit";
+150	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 4
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+151	! some macro assists for user level IO;
+152	simple boolean procedure teqb(integer	addr,byte);
+153	  start!code
+154	       hrlzi	2,UBA;
+155	       add	2,addr;
+156	       hrrz	3,byte;
+157	       setom	1;
+158	       TIOEB	3,@2;
+159		 setzm	1;
+160	  end;
+161	
+162	
+163	simple procedure bsetb(integer	addr,byte);
+164	  start!code
+165	      hrlzi	2,UBA;
+166	      add	2,addr;
+167	      hrrz	1,byte;
+168	      BSIOB	1,@2;
+169	  end;
+170	
+171	
+172	integer simple procedure breab(integer	addr);
+173	  start!code
+174	      hrlzi	2,UBA;
+175	      add	2,addr;
+176	      setzm	1;
+177	      RDIOB	1,@2;
+178	  end;
+179	
+180	
+181	simple integer procedure locn(reference integer	word);
+182	  start!code movei	1,word; end;
+183	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 5
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+184	string procedure getstr; ! general string input routine with editting;
+185	begin	"getstr"
+186	string chr,local;
+187	local _ NULL;
+188	while (chr _ inchrw) neq CR and chr neq LF do
+189	  begin if chr = DEL then 
+190		  begin local _ local[1 for INF-1];
+191			outstr(BELL&BS&" "&BS);
+192		  end
+193		else if chr = TAB then
+194		  begin outstr(" ");
+195			local _ local & chr;
+196		  end
+197		else if chr = CTRLU then
+198		  begin while length(local) > 0 do
+199			  begin local _ local[1 for INF-1];
+200				outstr(BS&" "&BS);
+201			  end;
+202			outstr(BELL);
+203		  end
+204		else if chr = ESC or
+205			chr = CTRLC then quit(NULL)
+206		else if chr < " " then outstr(BELL)
+207		else 
+208		  begin if "a" leq chr leq "z" then chr _ chr - '40;
+209			outstr(chr);
+210			local _ local & chr;
+211		  end;
+212	  end;
+213	return(local);
+214	end	"getstr";
+215	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 6
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+216	procedure getadj; ! ask whether a host/node adjacent load;
+217	begin	"getadj"
+218	string junk;
+219	while TRUE do
+220	  begin
+221	  outstr("Host adjacent load [Y/N]? ");
+222	  if (junk _ inchrw) = ESC or
+223	      junk = CTRLC then quit(NULL);
+224	  if junk = CR or
+225	     junk = "N" or
+226	     junk = "n" then
+227	     begin outstr("No. [Confirm]");
+228		   adjacent _ false;
+229	     end
+230	  else if junk = "Y" or junk = "y" then
+231	     begin outstr("Yes. [Confirm]");
+232		   adjacent _ true;
+233	     end
+234	  else if junk = "?" then
+235		begin
+236			outstr(CRLF&"Is the node to be loaded directly connected to"
+237					&CRLF&"the host you are running this program"
+238					&" on?"&CRLF&CRLF);
+239			continue;
+240		end
+241	  else begin
+242		outstr(CRLF&"[Answer `Y' or `N']"&CRLF);
+243		continue;
+244	       end;
+245	  if inchrw = CR then done else outstr(CRLF);
+246	  end;
+247	outstr(CRLF);
+248	end "getadj";
+249	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 7
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+250	procedure cint; ! character software interrupt routine;
+251	begin "cint"
+252	integer ch;
+253	
+254	while TRUE do
+255	begin
+256	    ch _ auxclv(port,0,AXI8S);
+257	    if not !SKIP! then return;
+258	
+259	    case ch of begin
+260		[LF] return; ! OK but ignore;
+261		[LROK][LRFIN] cause(cctblt,ANY);
+262		[LRINN] quit(CRLF&"[Illegal node name]");
+263		[LRNSN] quit(CRLF&"[No such node]");
+264		[LRNNI] quit(CRLF&"[Node not idle]");
+265		[LRCSE] quit(CRLF&"[Checksum error]");
+266		[LRPOV] quit(CRLF&"[Packet overflow]");
+267		[LRPCE] quit(CRLF&"[Protocol error]");
+268		[LRTIM] quit(CRLF&"[Node timed out]");
+269		[LRRFS] quit(CRLF&"[Refused by protocol module]");
+270		[LRNHW] quit(CRLF&"[No hardware present]");
+271	    else
+272		quit(CRLF&"[Unknown node error "&cvos(ch)&"]")
+273	    end;
+274	end;
+275	end "cint";
+276	
+277	procedure zint; ! circuit zapper software interrupt routine;
+278	begin "zint"
+279	if connected then quit(CRLF&"[Lost circuit to node "&lognod&"]");
+280	end "zint";
+281	
+282	item nulljob;
+283	procedure nulljobproc;
+284	begin "nulljobproc"
+285	 while TRUE do 
+286	  begin calli(TIMEOUT, HIBER);
+287		poll;
+288	  end;
+289	end "nulljobproc";
+290	
+291	simple procedure nulljobini;
+292	sprout(nulljob,nulljobproc,priority(15)+runme);
+293	require nulljobini initialization[2];
+294	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 8
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+295	procedure getaux; ! create aux cct to load device;
+296	begin "getaux"
+297	integer array foo[0:length(logstr)%5];
+298	integer i;
+299	outstr(CRLF&"Connecting to node "&lognod&"..");
+300	for i _ 1 step 5 until length(logstr)
+301	  do foo[i%5] _ cvasc(logstr[i for 5]);
+302	port _ calli(location(foo[0]) + (drn lsh 33), CREAUX);
+303	if !SKIP! then
+304	  begin connected _ true;
+305		intblock[1] _ 2;
+306		intblock[2] _ (-1 lsh 18) + location(cint);
+307		intmap(tinass(port,1,'10),dfrint,
+308		      (-2 lsh 18) + location(intblock[1]));
+309		enable(newenb('10));
+310		zapblock[1] _ 2;
+311		zapblock[2] _ (-1 lsh 18) + location(zint);
+312		intmap(tinass(port,7,'11),dfrint,
+313		      (-2 lsh 18) + location(zapblock[1]));
+314		enable(newenb('11));
+315	  end
+316	else
+317	  begin case lh(port) of begin
+318		     [0][7] case rh(port) of begin
+319				 [1] quit(CRLF&"[Format error]");
+320				 [2] quit(CRLF&"[Tymnet username error]");
+321				 [3] quit(CRLF&"[Tymnet mud error]");
+322				 [4] quit(CRLF&"[Can't access load device]");
+323				 [5] quit(CRLF&"[Tymnet downline request error]");
+324				 [6] quit(CRLF&"[Timeout]");
+325				 [7] quit(CRLF&"[Access barred]");
+326				 [8] quit(CRLF&"[Out of originating ports]");
+327				 [9] quit(CRLF&"[Aux circuit queue full]")
+328			    end;
+329		     [1][2] quit(CRLF&"[Insufficient license - AC not set]");
+330		     [3] quit(CRLF&"[No room for DDB]");
+331		     [4][5][6] quit(CRLF&"[No response from node "&lognod&"]");
+332		     [8] quit(CRLF&"[Node "&lognod&" or intervening node not up]")
+333		end;
+334	  end;
+335	end "getaux";
+336	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 9
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+337	procedure getnod; ! ask for node number to load;
+338	begin "getnod"
+339	open(dskchn _ getchan, "DSK", NOERR,5,0,0,0,dskeof);
+340	if dskeof then quit("[Can't open disk channel]");
+341	setbreak(1,",",null,"IS");
+342	while TRUE do
+343	  begin outstr("Specify node number to load: ");
+344		while equ((rawinp _ getstr), NULL) do
+345		   outstr(CRLF&"[Enter node number]"&CRLF&
+346			  "[Specify node number to load: ");
+347		nodnam _ scan(rawinp,1,brchar);
+348		if equ(nodnam,"?") then
+349		    begin
+350			outstr(CRLF&"Enter the node name of the PDP-11"&
+351				" you wish to load"&CRLF&CRLF);
+352			continue;
+353		    end;
+354		if brchar = 0 then
+355			imgfil _ "(SYS)SV"&nodnam&".IMG"
+356		    else
+357			begin
+358				imgfil _ rawinp;
+359				if equ(imgfil,"?") then
+360				   begin
+361					outstr(CRLF&"Type an alternate file to load"&CRLF);
+362					continue;
+363				   end;
+364			end;
+365		lookup(dskchn,imgfil,dskeof);
+366		if not dskeof then done
+367		else outstr(CRLF&"[Can't lookup "&imgfil&CRLF);
+368	  end;
+369	outstr(CRLF);
+370	end "getnod";
+371	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 10
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+372	procedure getdr; ! get dr11c logical number;
+373	begin "getdr"
+374	integer drbits,drmax;
+375	userio(TURNON);
+376	if kmc11 = YES and !SKIP! then
+377	    begin
+378		drbits _ breab(KMCCSR+AVAIL); ! get KMCCSR bits for available DRs;
+379		drmax _ -1;
+380		if (drbits land '200) = 0 then
+381			drmax _ 3
+382		else
+383			if (drbits land '20) = 0 then
+384				drmax _ 2
+385			else
+386				if (drbits land '2) = 0 then
+387					drmax _ 1
+388				else
+389					if (drbits land '1) = 0 then
+390						drmax _ 0;
+391		if drmax = -1 then quit("KMC reports no DR11Cs respond to bus requests!!"&
+392					CRLF&"Have the DR11C and KMC hardware checked!!");
+393		drn _ drmax;
+394	    end
+395	else
+396	    drmax _ 3;
+397	userio(TURNOFF);
+398	
+399	while drmax neq 0 do
+400	  begin
+401	  while TRUE do
+402	    begin
+403		outstr("Specify DR11C [0:"&cvos(drmax)&"]: ");
+404		drn _ inchrw;
+405		if drn neq CR and drn neq ESC and drn neq CTRLC
+406			and not (0 leq (drn - "0") leq drmax) then
+407			    if drn = "?" then
+408				outstr("?"&CRLF&"Enter the DR11C number of the node"
+409					&" directly connected"&CRLF&"to the host"
+410					&" computer which is being loaded,"&CRLF
+411					&"or the directly connected node from which"
+412					&" to build"&CRLF&"a circuit to the neighbor"
+413					&" node"&CRLF&CRLF)
+414			    else
+415				outstr(drn&CRLF&BELL&"[Invalid DR11C]"&CRLF)
+416		else done;
+417	    end;
+418	  if drn = CR then drn _ "0"
+419	     else if drn = ESC or drn = CTRLC then quit(NULL);
+420	  outstr(drn&" [Confirm]");
+421	  drn _ drn - "0";
+422	  confirm _ inchrw;
+423	  outstr(CRLF);
+424	  if confirm = CR then done;
+425	  end; 
+426	end "getdr";
+427	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 11
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+428	procedure getlog; ! ask for node to load from;
+429	begin "getlog"
+430	integer i,ch;
+431	
+432	while TRUE do
+433	    begin
+434		outstr("Specify neighbor node of "&nodnam&": ");
+435		if equ((lognod _ getstr), NULL) then
+436		    begin
+437			outstr(CRLF&"[Enter node number to load from]"&CRLF);
+438			continue;
+439		    end;
+440		if equ(lognod,"?") then
+441		    begin
+442			outstr(CRLF&"Enter the neighbor of "&nodnam&" which is"
+443				&" capable of loading "&nodnam&CRLF
+444				&"and is reachable from the host on which this"
+445				&" program is running."&CRLF&CRLF);
+446			continue;
+447		    end;
+448		done;
+449	    end;
+450	outstr(CRLF);
+451	logstr _ ":WD1@" & lognod & ";";
+452	getdr;
+453	getaux;
+454	auxstr _ nodnam & "      ";
+455	for i _ 1 step 1 until 6 do
+456	  auxclv(port,(ch _ lop(auxstr)), AXO8);
+457	interrogate(cctblt, wait);
+458	end "getlog";
+459	
+460	
+461	procedure getkmc; ! check whether there is a kmc;
+462	begin	"getkmc"
+463	if cio(DRKMCI,0,0,CIOPR) then
+464		kmc11 _ YES
+465	    else
+466		kmc11 _ NO;
+467	end	"getkmc";
+468	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 12
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+469	procedure seldr; ! latch onto the selected dr11c;
+470	begin	"seldr"
+471	integer j,z;
+472	if kmc11 = NO then 
+473	  begin if not cio(DRCLI,drn,DRDO,CIOPR) then 
+474		  quit(CRLF&"[Can't clear interface]");
+475	  end
+476	else
+477	  begin case drn of
+478		  begin [0] dr11c _ '1;
+479			[1] dr11c _ '2;
+480			[2] dr11c _ '20;
+481			[3] dr11c _ '200
+482		  end;
+483		if not teqb(KMCCSR+AVAIL,dr11c) then 
+484		  quit(CRLF&"[DR11C "&cvos(drn)&" does not exist]");
+485		z _ 1;
+486		while teqb(KMCCSR+ACTIV,dr11c)  and z leq 6 do
+487		  begin calli(TIMEOUT,HIBER);
+488			z _ z + 1;
+489		  end;
+490		if z > 6 then
+491		    begin 
+492			outstr(CRLF&"DR11C "&cvos(drn)&" status shows it is"&
+493				" in use by KMC!"&CRLF&
+494				"Are you sure the PDP-11 is ready for loading? [Y/N] ");
+495				confirm _inchrw;
+496			if confirm neq "Y" and confirm neq "y" then quit(BELL);
+497			outstr("Yes."&CRLF);
+498			bsetb(KMCCSR+ACTIV,dr11c);
+499			calli(TIMEOUT,HIBER);		! wait for KMC to see it;
+500		    end;
+501	  end;
+502	if not cio(DRSEL,drn,DRDO,CIOPR) then quit(CRLF&"[Can't select DR11C]");
+503	selected _ TRUE;
+504	end	"seldr";
+505	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 13
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+506	! some IO control primitives;
+507	integer procedure getbuf(integer	pdp10);
+508	begin	"getbuf"
+509	arryin(dskchn, buffer[1], pdp10);
+510	if not dskeof then
+511		return(pdp10)
+512	else
+513		return(dskeof land '777777);
+514	end	"getbuf";
+515	
+516	
+517	procedure send(integer	word);
+518	begin	"send" 
+519	if adjacent then
+520	  begin if not cio(DRWIO,drn,word,CIOPR) then
+521		   quit(CRLF&"[Can't send data to node]");
+522	  end
+523	else begin
+524	  auxclv(port,(word land '377),AXO8);
+525	  auxclv(port,(word lsh (-8)),AXO8);
+526	  end;
+527	end	"send";
+528	
+529	
+530	integer procedure recv;
+531	begin	"recv"
+532	integer word;
+533	if not adjacent then return(ACK);
+534	if not cio(DRRIO,drn,locn(word),CIOPR) then
+535		quit(CRLF&"[Timeout on node response!]");
+536	word _ word land (lnot MSN);
+537	if word = ACK or word = NAK then return(word);
+538	r(CRLF&"Unknown node response code: "&cvos(word)&CRLF);
+539	return(NAK);
+540	end	"recv";
+541	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 14
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+542	
+543	procedure load; ! down line load routine;
+544	begin	"load"
+545	integer i,j,k,word,cs;
+546	if getbuf(DEFALT) neq DEFALT or dskeof then
+547	  quit("[Node image too short]");
+548	if adjacent then
+549	  begin outstr("Resetting "&nodnam&".");
+550		send(PREFIX);	! here it comes;
+551		outstr(".");
+552		send(RESET);	! reset pdp-11 bootstrap;
+553		outstr(".");
+554		send(0);
+555		if recv neq ACK then quit(CRLF&"[Node nak on reset pattern]");
+556	  end;
+557	outstr("Loading "&nodnam&"..");
+558	i _ 1;			! start block;
+559	while not dskeof do
+560	  if (j _ getbuf(BLKLEN)) neq 0 then	! j is in pdp10 words;
+561	    begin cs _ 0;
+562		if not adjacent then
+563		  send(((j * 2) + 3) * 2); ! Packet size Pdp11 (bytes);
+564		send(PREFIX);
+565		send(j * 2);		! BLKLEN * 2 Pdp11 words;
+566		k _ 1;
+567		while k leq j do
+568		  begin send(word _ lh(buffer[k]));
+569			cs _ cs + word;
+570			send(word _ rh(buffer[k]));
+571			cs _ cs + word;
+572			k _ k + 1;
+573		  end;
+574		send(cs);	! send checksum;
+575		if recv neq ACK then quit(CRLF&"[Node nak on block "&cvs(i)&"]");
+576		i _ i + 1;
+577		if (i mod 5) = 0 then if (i mod 10) = 0 then outstr(bs)
+578							else outstr(" ");
+579	  end;
+580	if (i mod 10) > 4 then outstr(bs);
+581	if not adjacent then send(6);
+582	outstr(".");
+583	send(PREFIX);
+584	outstr(".");
+585	send(START);
+586	outstr(".");
+587	send(0);
+588	if adjacent then calli(TIMEOUT - 4, HIBER);
+589	outstr("Booting...");
+590	if adjacent then calli(TIMEOUT - 4, HIBER);
+591	if recv neq ACK then quit(CRLF&"[Nak response to startup]");
+592	if not adjacent then
+593		begin	send(-6);
+594			interrogate(cctblt,wait);
+595			connected _ false; ! say we are no longer connected;
+596			calli(port,ZAPCIR); ! kill the aux circuit;
+597		end;
+598	close(dskchn);
+599	release(dskchn);
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 14.1
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+600	outstr(BELL&"Done!"&CRLF&BELL);
+601	end	"load";
+602	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 15
+Program Listing     by CRFSYM %5 at 01-Dec-86 12:08
+
+603	! nodcod - main line code;
+604	
+605	auxclv(-1,ECHOFF,AXCFS);
+606	selected _ false;
+607	errflg _ false;
+608	connected _false;
+609	outstr(CRLF&"Nodlod - Tymshare V1.6"&CRLF);
+610	license _ calli(GTLIC,GETTAB);
+611	if (license land '100000) = 0 or !SKIP! = 0 then quit("[Insufficient license]");
+612	getnod;
+613	getadj;
+614	if adjacent then
+615	  begin userio(TURNON);
+616		if not !SKIP! then
+617		   quit("[Insufficient license]");
+618		getkmc;
+619		getdr;
+620		userio(TURNON);		! getdr turns if off;
+621		outstr(CRLF&"Connecting to node "&nodnam&"..");
+622		seldr;
+623	  end
+624	else begin
+625		getlog;
+626	     end;
+627	outstr(".done!"&CRLF);
+628	load;
+629	if selected then dsldr;			! officaly relesae dr and tell KMC;
+630	userio(TURNOFF);
+631	auxclv(-1,ECHON, AXCFS);
+632	call(1,"EXIT");
+633	end	"nodlod"
+634	
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 16
+Cross Reference     by CRFSYM %5 at 01-Dec-86 12:08
+
+!SKIP!                      92   257   303   376   611   616
+%5                         297
+ACK                        533   537   555   575   591
+ACTIV                      136   486   498
+ADD                        123   155   166   175
+ADDR                       120   123   152   155   163   166   172   175
+ADJACENT                    89   145   228   232   519   533   548   562   581
+                           588   590   592   614
+ANY                        261
+ARG                        107   111   140   143
+ARRYIN                     509
+AUXCLV                     147   256   456   524   525   605   631
+AUXSTR                      90   454   456
+AVAIL                      378   483
+AXCFS                      147   605   631
+AXI8S                      256
+AXO8                       456   524   525
+BCIOB                      125
+BCLRB                      120   136
+BELL                       143   191   202   206   415   496   600   600
+BLKLEN                     560
+BRCHAR                      87   347   354
+BREAB                      172   378
+BS                         191   191   200   200   577   580
+BSETB                      163   498
+BSIOB                      168
+BUFFER                      88   509   568   570
+BYTE                       120   124   152   156   163   167
+CALL                       148   632
+CALLI                       96   115   145   286   302   487   499   588   590
+                           596   610
+CCTBLT                      51    52   261   457   594
+CH                         252   256   259   272   430   456
+CHR                        186   188   188   189   193   195   197   204   205
+                           206   208   208   208   209   210
+CINT                       250   306
+CIO                        107   131   463   473   502   520   534
+CIOP                       107   113
+CIOPR                      131   463   473   502   520   534
+CLOSE                      598
+CONFIRM                     90   422   424   495   496   496
+CONNECTED                   89   279   304   595   608
+CR                         188   224   245   405   418   424
+CREAUX                     302
+CRLF                       133   236   237   238   238   242   242   245   247
+                           262   263   264   265   266   267   268   269   270
+                           272   279   299   319   320   321   322   323   324
+                           325   326   327   329   330   331   332   345   345
+                           350   351   351   361   361   367   367   369   392
+                           408   409   410   412   413   413   415   415   423
+                           437   437   442   443   445   445   450   474   484
+                           492   493   497   502   521   535   538   538   555
+                           575   591   600   609   609   621   627
+CS                         545   561   569   569   571   571   574
+CTRLC                      205   223   405   419
+CTRLU                      197
+CVASC                      301
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 17
+Cross Reference     by CRFSYM %5 at 01-Dec-86 12:08
+
+CVOS                       272   403   484   492   538
+CVS                        575
+DEFALT                      88   546   546
+DEL                        189
+DFRINT                     307   312
+DR                         107   110
+DR11C                       87   136   478   479   480   481   483   486   498
+DRBITS                     374   378   380   383   386   389
+DRCLI                      473
+DRDO                       131   473   502
+DRDSL                      131
+DRKMCI                     463
+DRMAX                      374   379   381   384   387   390   391   393   396
+                           399   403   406
+DRN                         87   131   302   393   404   405   405   405   406
+                           407   415   418   418   419   419   420   421   421
+                           473   477   484   492   502   520   534
+DRRIO                      534
+DRSEL                      502
+DRWIO                      520
+DSKCHN                      87   339   365   509   598   599
+DSKEOF                      87   339   340   365   366   510   513   546   559
+DSLDR                      129   144   629
+ECHOFF                     605
+ECHON                      147   631
+ENABLE                     309   314
+EQU                        344   348   359   435   440
+ERRFLG                      87   136   142   607
+ESC                        204   222   405   419
+EVENTINI                    52    53
+FILNAM                      90
+FN                         107   109
+FOO                        297   301   302
+GETADJ                     216   613
+GETAUX                     295   453
+GETBUF                     507   546   560
+GETCHAN                    339
+GETDR                      372   452   619
+GETKMC                     461   618
+GETLOG                     428   625
+GETNOD                     337   612
+GETSTR                     184   344   435
+GETTAB                     610
+GTLIC                      610
+HIBER                      286   487   499   588   590
+HLRZ                       100
+HRLZ                       109   110
+HRLZI                      122   154   165   174
+HRR                        111
+HRRI                       112
+HRRZ                       104   124   156   167
+I                          298   300   301   430   455   545   558   575   576
+                           576   577   577   580
+I%5                        301
+IMGFIL                      90   355   358   359   365   367
+INCHRW                     188   222   245   404   422   495
+INTBLOCK                    86   305   306   308
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 18
+Cross Reference     by CRFSYM %5 at 01-Dec-86 12:08
+
+INTINI                      49    50
+INTMAP                     307   312
+INTPRO                      48    49
+INTSET                      49
+J                          471   545   560   563   565   567
+JUNK                       218   222   223   224   225   226   230   230   234
+K                          545   566   567   568   570   572   572
+KMC11                       87   136   376   464   466   472
+KMCCSR                     136   378   483   486   498
+LF                         188   260
+LH                          99   317   568
+LICENSE                     87   610   611
+LOAD                       543   628
+LOCAL                      186   187   190   190   195   195   198   199   199
+                           210   210   213
+LOCN                       181   534
+LOGNOD                      90   279   299   331   332   435   440   451
+LOGSTR                      90   297   300   301   451
+LOOKUP                     365
+LRCSE                      265
+LRFIN                      261
+LRINN                      262
+LRNHW                      270
+LRNNI                      264
+LRNSN                      263
+LROK                       261
+LRPCE                      267
+LRPOV                      266
+LRRFS                      269
+LRTIM                      268
+MKEVTT                      52
+MODE                        95    96
+MOVE                       113
+MOVEI                      182
+MSN                        536
+NAK                        537   539
+NEWENB                     309   314
+NO                         466   472
+NODNAM                      90   347   348   355   434   442   443   454   549
+                           557   621
+NOERR                      339
+NULLJOB                    282   292
+NULLJOBINI                 291   293
+NULLJOBPROC                283   292
+OPEN                       339
+OUTSTR                     133   143   191   194   200   202   206   209   221
+                           227   231   236   242   245   247   299   343   345
+                           350   361   367   369   403   408   415   420   423
+                           434   437   442   450   492   497   538   549   551
+                           553   557   577   578   580   582   584   586   589
+                           600   609   621   627
+PDP10                      507   509   511
+PORT                        87   145   256   302   307   312   317   318   456
+                           524   525   596
+PREFIX                     550   564   583
+PRIORITY                   292
+QUIT                       140   205   223   262   263   264   265   266   267
+
+(DERNST)NODLOD.SAI  created 01-Apr-82 10:31                      Page 19
+Cross Reference     by CRFSYM %5 at 01-Dec-86 12:08
+
+                           268   269   270   272   279   319   320   321   322
+                           323   324   325   326   327   329   330   331   332
+                           340   391   419   474   484   496   502   521   535
+                           547   555   575   591   611   617
+RAWINP                      90   344   347   358
+RDIOB                      177
+RECV                       530   555   575   591
+RELEASE                    599
+RESET                      552
+RH                         103   318   570
+RUNME                      292
+SCAN                       347
+SELDR                      469   622
+SELECTED                    89   144   503   606   629
+SEND                       517   550   552   554   563   564   565   568   570
+                           574   581   583   585   587   593
+SETBREAK                   341
+SETOM                      114   157
+SETZM                      116   159   176
+START                      585
+TAB                        193
+TEQB                       152   483   486
+TIMEOUT                    286   487   499   588   590
+TINASS                     307   312
+TIOEB                      158
+TURNOFF                    146   397   630
+TURNON                     375   615   620
+UBA                        122   154   165   174
+USERIO                      95   146   375   397   615   620   630
+USERIOT                     96
+WAIT                       457   594
+WORD                        99   100   103   104   181   182   517   520   524
+                           525   532   534   536   536   537   537   537   538
+                           545   568   569   570   571
+YES                        136   376   464
+Z                          471   485   486   488   488   490
+ZAPBLOCK                    86   310   311   313
+ZAPCIR                     145   596
+ZINT                       277   311
+  y@;ñ
