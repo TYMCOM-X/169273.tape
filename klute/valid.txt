@@ -1,0 +1,743 @@
+
+-------------------------------------------------------------------------------
+
+LAYER:             VALID PACKET
+
+-------------------------------------------------------------------------------
+
+COMPONENTS:        Create Packet
+                   Create Data Class Byte
+                   Create Data Header
+                   Add Buffer to Packet
+                   Pass Completed Packet
+                   Get Incoming Application Record
+                   Fill Data Buffer
+                   Build Application Command
+
+-------------------------------------------------------------------------------
+
+DESCRIPTION:
+
+    The Valid Packet Layer is responsible for forming a packet to be sent to
+the micro and for decomposing a packet received from the micro.  In an
+outgoing transfer (to micro) commands or data and appropriate parameters
+received from the Application Layer are placed in the outgoing packet.
+When the packet is full it is passed off to the Binary Layer for further
+processing.  In an incoming transfer (to host) a packet received from the
+Binary Layer is broken down into commands or data and various parameters
+which are then sent on to the Application Layer for processing.
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+LAYER:             VALID PACKET
+PROCEDURE NAME:    Create a Packet
+PROCEDURE ID:      VA.create.pkt
+PROCEDURE TYPE:    untyped
+
+-------------------------------------------------------------------------------
+
+INPUT:             PARAMETERS:     application.record (reference)
+                                   application.parameters: (value)
+                                      record.type
+                                      link.type
+                                      who.sent
+                                      importance
+                                      cmd.type
+                                   EOF (value)
+                                   EOR.seen(value)
+                                   appl.rec.size (reference)
+
+OUTPUT:            application.record
+                   appl.record.ptr
+                   application.parameters
+                   DH.type
+                   bytes.to.add
+                   appl.rec.size
+
+GLOBALS:           outgoing.packet
+                   max.out.pkt.size
+                   previous.application.parameters
+                   room.in.packet
+
+-------------------------------------------------------------------------------
+
+CALLED BY:         Send Startup Cmds             !Application Layer
+                   Transfer Out                  !Application Layer
+                   Close Transfer                !Application Layer
+                   Abort Transfer                !System Utility
+
+CALLS:             Create Data Class Byte
+                   Create Data Header
+                   Add Buffer to Packet
+                   Pass Completed Packet
+
+-------------------------------------------------------------------------------
+
+DESCRIPTION:
+
+    This procedure accepts commands, data and parameters from the Application
+Layer and inserts them into an outgoing packet.  When a packet is full it is
+handed off to the Binary Layer. EOF is set on the last application.record
+passed to this layer.  If what is being passed in is a command, the record.type
+is command and the application.record contains the actual command number
+(TYMFTP Appendix A-4), otherwise, the record.type is data and the application.
+record contains file data.
+
+   (Note that data compression will not be handled in this release.)
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+PROCEDURE NAME:    Create a Packet
+PROCEDURE ID:      VA.create.pkt
+
+-------------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+Set appl.record.ptr to beginning of application.record
+
+Do while appl.rec.size > 0                            ! have more applic.record
+   if room.in.packet < 4 or (record.type is command and
+      room.in.packet - appl.rec.size < 0) then        !not enough rm for cmd
+         execute VA.pass.cmpl.pkt                     ! using outgoing.packet
+   if max.out.pkt.size > room.in.packet and           !pkt not empty
+      application.parameters <> previous.application.parameters then
+         set DH.type = 'EOD'
+         execute VA.create.DH using DH.type           !and outgoing.packet
+                                    appl.rec.size
+         execute VA.create.DCB using application.parameters     !out.pkt,too
+   if room.in.packet = max.out.pkt.size then  !pkt is empty
+         execute VA.create.DCB using application.parameters     ! "
+   set DH.type = 'data/cmd'
+   execute VA.create.DH using DH.type                           ! "
+                              appl.rec.size
+                        returning bytes.to.add
+   execute VA.add.buf.to.pkt using application.record           ! "
+                                   appl.record.ptr
+                                   bytes.to.add
+   decrement appl.rec.size by bytes.to.add
+   decrement room.in.packet by bytes.to.add
+End do
+
+If EOR.seen and room.in.packet < 2 then
+   execute VA.pass.cmpl.pkt
+   execute VA.create.DCB using application.parameters
+
+If EOR.seen then
+   Set DH.type = 'EOR'
+   Execute VA.create.DH using DH.type                           ! "
+                              appl.rec.size
+   if EOF then
+      set DH.type = 'EOF'
+      execute VA.create.DH using DH.type                        ! "
+                                 appl.rec.size
+      execute VA.pass.cmpl.pkt                                  ! "
+
+                                                 !save last set of parameters
+                                                   before reading new ones
+Set previous.application.parameters to new.application.parameters
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+LAYER:             VALID PACKET
+PROCEDURE NAME:    Create Data Class Byte
+PROCEDURE ID:      VA.create.DCB
+PROCEDURE TYPE:    untyped
+
+-------------------------------------------------------------------------------
+
+INPUT:             PARAMETERS:     application.parameters (value)
+
+OUTPUT:
+
+GLOBAL:            outgoing.packet
+                   room.in.packet
+                   outgoing.packet.ptr
+
+-------------------------------------------------------------------------------
+
+CALLED BY:         Create a Packet
+
+CALLS:             none
+
+-------------------------------------------------------------------------------
+
+DESCRIPTION:
+
+    A data class byte is constructed from the application parameters the
+procedure receives.  Using a 1-bit byte pointer, bits are placed in the
+data class byte (a 36-bit word).  Using an 8-bit byte pointer, the rightmost
+8-bits of the data class byte are inserted into either an empty packet or a
+partial packet.
+
+-------------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+Create DCB (data class byte) using application.parameters:
+    case record.type of:
+         [data]:        set bit 28 of DCB to 0
+         [command]:     set bit 28 to 1
+    case link.type of:                               !secondary, tertiary
+         [link]:        set bits 29-30 to 00            applications not supported
+         [prim.appl]:   set bits 29-30 to 01
+    case who.sent of:                                !will always be 0
+         [requestor]:   set bit 31 to 0
+         [server]:      set bit 31 to 1
+    case importance of:
+         [advisory]:    set bit 32 to 0
+         [important]:   set bit 32 to 1
+    case cmd.type of:
+         [not.a.command]: set bits 33-35 to 000
+         [reply opt]:     set bits 33-35 to 000
+         [reply req]:     set bits 33-35 to 001
+         [pos. reply]:    set bits 33-35 to 010
+         [neg. reply]:    set bits 33-35 to 011
+         [explan. reply]: set bits 33-35 to 100
+         [req. for info]: set bits 33-35 to 101
+Insert DCB into outgoing.packet using outgoing.packet.ptr
+Decrement room.in.packet
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+LAYER:             VALID PACKET
+PROCEDURE NAME:    Create Data Header
+PROCEDURE ID:      VA.create.DH
+PROCEDURE TYPE:    untyped
+
+-------------------------------------------------------------------------------
+
+INPUT:             PARAMETERS:     DH.type (value)
+                                   appl.rec.size (value)
+
+OUTPUT:            PARAMETERS:     bytes.to add (reference)
+
+GLOBAL:            outgoing.packet
+                   room.in.packet
+                   outgoing.packet.ptr
+
+-------------------------------------------------------------------------------
+
+CALLED BY:         Create a Packet
+
+CALLS:             none
+
+-------------------------------------------------------------------------------
+
+DESCRIPTION:
+
+    Depending upon the DH.type received an EOR, EOF, EOD or data/command byte-
+count data header is created and inserted as the next byte in the packet.
+The maximum value of a data/command data header is 31 because only the last
+5 bits of the byte represent the number of bytes of data or command to follow.
+(31 is the largest number that can be represented in 5 bits.)  So, for example,
+if a record of data is 51 bytes long, a DH whose rightmost 5 bits = 31 would
+be inserted, followed by 31 bytes of data, followed by a DH representing the
+remaining 20 bytes, followed by the 20 bytes of data.
+
+-------------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+Set bytes.to.add = 0
+Case DH.type of
+    data/cmd:
+         if (room.in.packet >= appl.rec.size and (appl.rec.size <= 31) then
+              set data header = appl.rec.size
+         else if room.in.packet >= appl.rec.size then
+              set data header = 31
+         else
+              set data header = room.in.packet
+         set bytes.to.add = data header                  (DH value lor ('040))
+    EOR:
+         set data header = EOR character                             = ('040)
+    EOF:
+         set data header = EOF character                             = ('100)
+    EOD:
+         set data header = EOD character                             = ('140)
+
+Insert data header into outgoing.packet using outgoing.packet.ptr
+Decrement room.in.packet
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+LAYER:             VALID PACKET
+PROCEDURE NAME:    Add Buffer to Packet
+PROCEDURE ID:      VA.add.buf.to.pkt
+PROCEDURE TYPE:    untyped
+
+-------------------------------------------------------------------------------
+
+INPUT:             PARAMETERS:     application.record (reference)
+                                   appl.record.ptr (reference)
+                                   bytes.to.add (value)
+
+OUTPUT:            PARAMETERS:     application.record (reference)
+                                   appl.record.ptr (reference)
+
+GLOBAL:            outgoing.packet
+                   outgoing.packet.ptr
+
+-------------------------------------------------------------------------------
+
+CALLED BY:         Create a Packet
+
+CALLS:             none
+
+-------------------------------------------------------------------------------
+
+DESCRIPTION:
+
+    8-bit bytes from the buffer are inserted into the packet according to the
+value of the previous data header byte (this would be a data/cmd data header).
+
+-------------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+Loop bytes.to.add times
+    take byte from application.record using appl.record.ptr
+    append byte to outgoing.packet using outgoing.packet.ptr
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+LAYER:             VALID PACKET
+PROCEDURE NAME:    Pass Completed Packet
+PROCEDURE ID:      VA.pass.cmpl.pkt
+PROCEDURE TYPE:    untyped
+
+-------------------------------------------------------------------------------
+
+INPUT:             none
+
+OUTPUT:            none
+
+GLOBAL:            outgoing.packet
+                   room.in.packet
+                   max.out.pkt.size
+                   outgoing.packet.ptr
+
+-------------------------------------------------------------------------------
+
+CALLED BY:         Create a Packet
+
+CALLS:             Finish Packet                 !Binary Layer
+
+-------------------------------------------------------------------------------
+
+DESCRIPTION:
+
+    This procedure hands off a completed packet (which has yet to be assigned
+a header, checksum, etc.) to the Binary Packet Layer.  It then returns a
+cleared packet for the Valid Packet Layer to again fill.
+
+-------------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+Execute BI.finish.pkt                        ! using outgoing.packet
+Clear outgoing.packet
+Set room.in.packet = max.out.pkt.size
+Set outgoing.packet.ptr to third byte of outgoing.packet
+     !allow room for PTC and PID at beginning of packet
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+LAYER:             VALID PACKET
+PROCEDURE NAME:    Get Incoming Application Record
+PROCEDURE ID:      VA.get.inc.app.rec
+PROCEDURE TYPE:    untyped
+
+-------------------------------------------------------------------------------
+
+INPUT:             data.record
+                   application.command
+                   data.record.ptr
+                   appl.rec.size
+
+GLOBAL:            EOD
+                   incoming.packet
+                   incoming.packet.pointer
+                   incoming.packet.size
+
+OUTPUT:            PARAMETERS:     application.record (reference)
+                                   application.parameters (reference)
+                                   EOF (reference)
+                                   EOR.seen (reference)
+                                   appl.rec.size (reference)
+
+                   data.record
+                   data.record.ptr
+                   appl.rec.size
+
+-------------------------------------------------------------------------------
+
+CALLED BY:         Get Micro Response            !Application Layer
+                   Transfer In                   !Application Layer
+
+CALLS:             Get Incoming Packet           !Binary Layer
+                   Fill Data Buffer
+                   Build Application Command
+
+-------------------------------------------------------------------------------
+
+DESCRIPTION:
+
+    A valid packet is taken from the Binary Packet Layer and broken into
+individual commands or data records.  Application parameters are set up from
+data class bytes in the packet. The length of the application.record in
+8-bit bytes is also returned.
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+PROCEDURE NAME:    Get Incoming Application Record
+PROCEDURE ID:      VA.get.inc.appl.rec
+
+-------------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+Set appl.rec.size to 0
+Set EOR.seen to false
+Do until EOR.seen or EOF or appl.rec.size >= 144
+    if incoming.packet.size = 0  then
+         execute BI.get.incoming.pkt          ! returning incoming.packet
+                                              !  and incoming.packet.size
+         set incoming.packet.pointer to beginning of incoming.packet
+         set EOD to true
+
+    if EOD then
+         read a byte from incoming.packet into DCB.char
+         set application.parameters to null
+
+         set up application.parameters:
+           case bit 28 of DCB.char of:
+              0:  record.type = data
+              1:  record.type = cmd
+           if record.type = cmd then continue:
+              case bits 29-30 of DCB.char of:
+                   00: link.type = link
+                   01: link.type = prim.appl.
+              case bit 31 of DCB.char of:                  !should always be 1
+                   0:  who.sent = requestor
+                   1:  who.sent = server
+              case bit 32 of DCB.char of:
+                   0:  importance = advisory
+                   1:  importance = important
+              case bits 33-35 of DCB.char of:
+                   000: cmd.type = cmd, reply opt.
+                   001: cmd.type = cmd, reply req.
+                   010: cmd.type = pos. reply
+                   011: cmd.type = neg. reply
+                   100: cmd.type = explan. reply
+                   101: cmd.type = request.for.info
+
+         increment incoming.packet.pointer
+         decrement incoming.packet.size
+         set EOD to false
+   !end if EOD
+
+continued next page
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+LAYER:             VALID PACKET
+PROCEDURE NAME:    Get Incoming Application Record
+PROCEDURE ID:      VA.get.inc.appl.rec
+
+-------------------------------------------------------------------------------
+continued:
+
+    case record.type of:
+         data: execute VA.fill.data.buffer using data.record
+                                                 data.record.ptr
+                                                 appl.rec.size
+                             !(and inc.pkt, inc.pkt.size, inc.pkt.ptr)
+                                           returning data.record
+                                                data.record.ptr
+                                                     appl.rec.size
+               set application.record to data.record
+         cmd:  execute VA.bld.appl.cmd using appl.rec.size
+                             !(and inc.pkt, inc.pkt.size, inc.pkt.ptr)
+                                       returning application.command
+                                                 appl.rec.size
+               set application.record to application.command
+
+    if incoming.packet.size > 0 then
+      read next byte from incoming.packet (do not increment incoming.pkt.ptr)
+      if byte is an EOR byte then         (00100000)
+         set EOR.seen to true
+         increment incoming.packet.pointer
+         decrement incoming.packet.size
+         if incoming.packet.size > 0 then
+            read next byte from incoming.packet (do not increment inc.pkt.ptr)
+            if byte is an EOF byte then      (01000000)
+                 set EOF to true
+                 increment incoming.packet.pointer
+                 decrement incoming.packet.size
+                 if incoming.packet.size > 0 then
+                     read next byte from incoming.packet (don't mv inc.pkt.ptr)
+                     if byte is an EOD byte then (01100000)
+                          set EOD to true
+                          increment incoming.packet.pointer
+                          decrement incoming.packet.size
+
+End do until EOR.seen or EOF or appl.rec.size >= 144
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+LAYER:             VALID PACKET
+PROCEDURE NAME:    Fill Data Buffer
+PROCEDURE ID:      VA.fill.data.buffer
+PROCEDURE TYPE:    untyped
+
+-------------------------------------------------------------------------------
+
+INPUT:             PARAMETERS:     data.record (reference)
+                                   data.record.ptr (reference)
+                                   appl.rec.size (reference)
+
+OUTPUT:            PARAMETERS:     data.record (reference)
+                                   data.record.ptr (reference)
+                                   appl.rec.size (reference)
+
+                   abort.type
+
+GLOBAL:            incoming.packet
+                   incoming.packet.pointer
+                   incoming.packet.size
+
+-------------------------------------------------------------------------------
+
+CALLED BY:         Get Incoming Application Record
+
+CALLS:             Abort Transfer      !System Utility
+
+-------------------------------------------------------------------------------
+
+DESCRIPTION:
+
+    This procedure parses out a record of data from an incoming packet.
+Expansion is done for binary zeroes, ASCII blanks, EBCDIC blanks, and ASCII
+characters if necessary.
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+PROCEDURE NAME:    Fill Data Buffer
+PROCEDURE ID:      VA.fill.data.buffer
+
+-------------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+    Read next byte of incoming.packet    !assume it is a DH
+    Increment incoming.packet.pointer
+    Decrement incoming.packet.size
+    Divide DH into its 2 fields (bits 28-30, 31-35)
+    Case field.1 of
+         000:   !invalid
+                execute AP.abort.transfer using abort.type = data.error(1)
+         001:   if field.2 = 0 then      (EOR)
+                   execute AP.abort.transfer using abort.type = data.error(2)
+                   !should not be reading EOR in this procedure
+                else
+                   append next field.2 # bytes from incoming.packet
+                                                     to data.record
+                                                     using data.record.ptr
+                   increment incoming.packet.pointer by field.2 # bytes
+                   decrement incoming.packet.size by field.2 # bytes
+                   appl.rec.size = appl.rec.size + field.2
+         010:   if field.2 = 0 then      (EOF)
+                   execute AP.abort.transfer using abort.type = data.error(3)
+                   !should not be reading EOF in this procedure
+                else
+                   append field.2 # bytes of binary zero to data.record
+                                                     using data.record.ptr
+                   appl.rec.size = appl.rec.size + field.2
+         011:   if field.2 = 0 then      (EOD)
+                   execute AP.abort.transfer using abort.type = data.error(4)
+                   !should not be reading EOD in this procedure
+                else
+                   append field.2 # ASCII blanks to data.record
+                                                 using data.record.ptr
+                   appl.rec.size = appl.rec.size + field.2
+         100:   if field.2 = 0 then
+                   !invalid
+                   execute AP.abort.transfer using abort.type = data.error(5)
+                else
+                   read next byte of incoming.packet into CHAR
+                   append field.2 # CHARs to data.record using data.record.ptr
+                   increment incoming.packet.pointer
+                   decrement incoming.packet.size
+                   appl.rec.size = appl.rec.size + field.2
+         101:   if field.2 = 0 then
+                   !invalid
+                   execute AP.abort.transfer using abort.type = data.error(6)
+                else
+                   append field.2 # EBCDIC blanks to data.record
+                                                     using data.record.ptr
+                   appl.rec.size = appl.rec.size + field.2
+         110:   execute AP.abort.transfer using abort.type = data.error(7)
+         111:   execute AP.abort.transfer using abort.type = data.error(8)
+    End case
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+LAYER:             Valid Packet
+PROCEDURE NAME:    Build Application Command
+PROCEDURE ID:      VA.bld.appl.cmd
+PROCEDURE TYPE:    untyped
+
+-------------------------------------------------------------------------------
+
+INPUT:             PARAMETERS:    appl.rec.size (reference)
+
+OUTPUT:            PARAMETERS:    application.command (reference)
+                                  appl.rec.size (reference)
+
+                   abort.type
+
+GLOBAL:            incoming.packet
+                   incoming.packet.pointer
+                   incoming.packet.size
+
+------------------------------------------------------------------------------
+
+DESCRIPTION:
+
+    A command is parsed out from the incoming packet and returned with its
+associated command data.  Expansion is done for binary zeroes, ASCII blanks,
+EBCDIC blanks, and ASCII characters if necessary for the command data.
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+PROCEDURE NAME:    Build Application Command
+PROCEDURE ID:      VA.bld.appl.cmd
+
+-------------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+Set application.command to 0
+Set appl.cmd.ptr to beginning of application.command
+Set appl.rec.size to 1
+Read next byte of incoming.packet  !data header byte
+Increment incoming.packet.pointer
+Decrement incoming.packet.size
+Divide data header into 2 fields (bits 28-30, bits 31-35)
+
+         case field.1 of
+              000: !invalid
+                   execute AP.abort.transfer using abort.type =command.error(1)
+              001: if field.2 > 0 then
+                        append field.2 # bytes from incoming.packet to
+                                                    application.command
+                                                    using appl.cmd.ptr
+                        increment incoming.packet.pointer by field.2 # bytes
+                        decrement incoming.packet.size by field.2 # bytes
+                        appl.rec.size = appl.rec.size + field.2
+                   else
+                        execute AP.abort.transfer using abort.type =
+                                                         command.error(2)
+              010: if field.2 = 0 then                     (EOF)
+                        execute AP.abort.transfer using abort.type =
+                                                        command.error(3)
+                        !should not be reading EOF here
+                   else
+                        if application.command > 0 then
+                             append field.2 # bytes of binary zero to
+                                                       application.command
+                                                       using appl.cmd.ptr
+                             appl.rec.size = appl.rec.size + field.2
+                        else
+                             execute AP.abort.transfer using abort.type =
+                                                             command.error(4)
+              011: if field.2 = 0 then                     (EOD)
+                        execute AP.abort.transfer using abort.type =
+                                                        command.error(5)
+                        !should not be reading EOD here
+                   else
+                        if application.command > 0 then
+                             append field.2 # ASCII blanks to
+                                                    application.command
+                                                    using appl.cmd.ptr
+                             appl.rec.size = appl.rec.size + field.2
+                        else
+                             execute AP.abort.transfer using abort.type =
+                                                             command.error(6)
+
+continued next page
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+PROCEDURE NAME:    Build Application Command
+PROCEDURE ID:      VA.build.appl.cmd
+
+-------------------------------------------------------------------------------
+continued:
+
+              100: if field.2 = 0 then
+                        !invalid
+                        execute AP.abort.transfer using abort.type =
+                                                        command.error(7)
+                   else
+                        if application.command > 0 then
+                             read next byte of incoming.packet into CHAR
+                             increment incoming.packet.pointer
+                             decrement incoming.packet.size
+                             append field.2 # CHARs to application.command
+                                                       using appl.cmd.ptr
+                             appl.rec.size = appl.rec.size + field.2
+                        else
+                             execute AP.abort.transfer using abort.type =
+                                                             command.error(8)
+              101: if field.2 = 0 then
+                        !invalid
+                        execute AP.abort.transfer using abort.type =
+                                                        command.error(9)
+                   else
+                        if application.command > 0 then
+                             append field.2 # EBCDIC blanks to
+                                                     application.command
+                                                     using appl.cmd.ptr
+                             appl.rec.size = appl.rec.size + field.2
+                        else
+                             execute AP.abort.transfer using abort.type =
+                                                             command.error(10)
+              110: execute AP.abort.transfer using abort.type =
+                                                   command.error(11)
+              111: execute AP.abort.transfer using abort.type =
+                                                   command.error(12)
+         endcase
+
+-------------------------------------------------------------------------------
+
+    FiT8
