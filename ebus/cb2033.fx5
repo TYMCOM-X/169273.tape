@@ -1,0 +1,222 @@
+
+	SUBTTL	FMAIN - CB2033.F01 - This is the foreground for Carl's slot
+
+	SEG	A.CODE
+	MO	.,FMAIN		: Start of module FMAIN
+
+SYN1	EQ	1		: LUN of sync line
+RTLMAX	EQ	20		: Maximum size of buffer ring
+
+	GL	FSTART		: Entry point (called from background)
+	GL	SYNCBF		: Put/Get SYNC buffer
+	GL	STORHW		: Fill buffer
+
+
+	SEG	A.DATA			: Separate section for I/O data
+
+	WS	0			: same as BND 4
+
+RTLLST	WC	RTL001			: Address to check
+RTLCMD	HC	1,200			: Write, 200 bytes
+RTLSIZ	EQ	.-RTLLST		: Entry size
+	WC	RTL002			: Address of list entry 2
+	HC	1,200			: Write, 200 bytes
+	WC	RTL003			: Address of list entry 3
+	HC	2,0			: Transfer, no buffer
+RTLLEN	EQ	.-RTLLST
+
+RTLCNT	HS	1			: Count times found 0
+RTLONE	HS	1			: Count times found 1
+
+
+	BND	100			: Probably locate at <100>
+RTL001	HC	1,200			: Write, 200 bytes
+RTLBUF	WC	BUFPAD			: Buffer 1
+RTL002	HC	1,200			: Write, 200 bytes
+RTLALT	WC	BUFPAD			: Buffer 2
+RTL003	HC	2,0			: Transfer, 0 byte buffer
+	WC	RTL001			: Loop back to here
+
+	BND	100		: Make it a block boundary
+BUFPAD	HS	200			: Idle padding buffer
+BUFBUF	HS	200			: Normal buffer
+BUFALT	HS	200			: Alternate buffer
+BUF000	HS	200
+BUF001	HS	200
+BUF002	HS	200
+
+PTRIN	HS	1			: My pointer
+BUFIN	HS	1			: His pointer
+	HS	200			: Buffer to use ( 200 bytes )
+
+RTLPTR	HC	4*4,4*0,4*4,4*4			: ptr offsets
+	WC	BUFBUF,BUFALT,BUF000,BUF001	: buffer addresses
+RTLINL	EQ	.-RTLPTR			: length of table
+
+RTL.TF	HS	1			: BG wrote to here ==>   To FG
+RTL.FF	HS	1			: BG reads to here ==> From FG
+RTL.TB	HS	1			: FG wrote to here ==>   To BG
+RTL.FB	HS	1			: FG reads to here ==> From BG
+RTL.BF	WS	RTLMAX			: Buffer address ring for RTL
+
+
+FATSIC	SC	\?"0A"0D?FATSIC Fatal -- Sync Input Connect failure"0A"0D\
+FATSOC	SC	\?"0A"0D?FATSOC Fatal -- Sync Output Connect failure"0A"0D\
+FATSRW	SC	\?"0A"0D?FATSRW Fatal -- Sync Ring Wrap failure"0A"0D\
+FATXGT	SC	\?"0A"0D?FATXGT Fatal -- eXception on GT pointer"0A"0D\
+
+WRNBSC	SC	\%"0A"0D%WRNBSC Warning -- Bad Sync output Command"0A"0D\
+
+
+	SEG	A.CODE
+
+FSTART	LA	R0,FATSIC,,		: An appropriate error message
+	LHI	R1,SYN1			: Load logical unit #
+	LA	R2,BUFIN,,		: And buffer
+	LHI	R3,2+200		: Header + buffer size
+	SVC	IO,01			: Begin input
+	  J	GIVEUP			: Hmm, something is wrong
+
+	LA	R1,BUFPAD,,		: Address of pad buffer
+	ST	R1,RTLBUF,,		: Store in main buffer
+	ST	R1,RTLALT,,		: Store in alternate buffer
+
+	LHI	R0,0FFFF		: What to store
+	STH	R0,RTLCNT,,		: Zero count
+	STH	R0,RTLONE,,		:  of finds
+	LA	R1,BUFPAD,,		: Where
+	LHI	R2,200			: Number of halfwords
+	JAL	R4,STORHW,,		: Store in buffer
+
+:  Use of R10 - R15 for this instruction to copy data to initial buffer
+	LM	R10,RTLPTR		: Get initial buffer constants
+	STM	R10,RTL.TF		: Store initial buffer constants
+
+	LA	R0,FATSOC,,		: An appropriate error message
+	LHI	R1,SYN1			: Load logical unit #
+	LA	R2,RTL001,,		: And beginning of rotor list
+	SVC	IO,11			: Begin output
+	  J	GIVEUP			: Hmm, something wrong!
+
+FGLOOP	SVC	DISMIS			: Look at things next time
+
+	: Look at sync input here!!!
+
+
+: Now for sync output
+
+	LIS	R1,0			: Get initial offset
+RTLOOP	CHI	R1,RTLLEN		: Are we done?
+	  JE	FGLOOP			: Seems so to me
+	L	R2,RTLLST,R1,		: Load address
+	LH	R0,0,R2			: Has sync finished with rotor entry?
+	  JN	RTLNXT			: Not as I can see
+	LH	R0,RTLCMD,R1,		: Get the command type
+	CHI	R0,1			: Is it a write?
+	  JN	CHKTRN			: No, check transfer
+
+	L	R0,4,R2,		: Pull address from rotor
+	CI	R0,BUFPAD		: Is it a padding buffer?
+	  JE	RTLNGT			: Yes, nothing to return
+
+	LH	R3,RTL.TB,,		: Get pointer
+	CH	R3,RTL.FB,,		: Does it match? cannot pass FB
+	  JE	FATSRW			: Yes, no room - should't happen
+	ST	R0,RTL.BF,R3,		: Put buffer address into list
+	AIS	R3,4*1			: Move to next entry
+	CHI	R3,4*RTLMAX		: At end of ring?
+	  JNFS	NWRPTB			: No, skip ahead
+	LIS	R3,0			: Yes, reset to top
+NWRPTB	STH	R3,RTL.TB,,		: Ok, remember the pointer
+
+	LA	R0,BUFPAD,,		: Default buffer if none available
+RTLNGT	LH	R3,RTL.FB,,		: Get pointer to next
+	CH	R3,RTL.TF,,		: Does it match?  cannot pass TF
+	  JEFS	SETPAD			: Yes, set padding and finish up
+	L	R0,RTL.BF,R3,		: Get buffer address from list
+	AIS	R3,4*1			: Move to next entry
+	CHI	R3,4*RTLMAX		: At end of ring?
+	  JNFS	NWRPFB			: No, skip ahead
+	LIS	R3,0			: Yes, reset to top
+NWRPFB	STH	R3,RTL.FB		: Store pointer
+SETPAD	ST	R0,4,R2,		: Store into rotor list
+	LH	R0,RTLCMD,R1,		: Get "write" command from RTLLST
+	STH	R0,0,R2,		: Set it in the rotor list
+RTLNXT	AHI	R1,RTLSIZ		: Bump to the next RTLLST entry
+	J	RTLOOP			: Check next rotor entry
+
+CHKTRN	CHI	R0,2			: Is it a transfer
+	  JN	ERRBSC			: Bad command type
+	L	R0,RTLLST,,		: Transfer, get beginning
+	J	SETPAD			:  address and store it
+
+: SYNCBF - Called from background to store a full sync buffer
+:	   Called from background to get an empty sync buffer
+:
+: call:
+:	R0 = 0	No buffer supplied, just get a free buffer
+:	R0 # 0	Buffer supplied, also get a new free buffer
+:	JAL	R4,SYNCBF
+:
+: non-skip return:
+:	R0 = 0	No buffers available, please wait
+:	R0 # 0	R0 contains what was passed
+:
+: skip return:
+:	R0 # 0	R0 contains a new empty buffer
+:
+
+SYNCBF	CHI	R0,0			: Test for 0
+	  JE	GSYNBF			: Nothing here, go get a buffer
+	LH	R3,RTL.TF,,		: Get pointer to next
+	CH	R3,RTL.FF,,		: Does it match?  cannot pass FF
+	  JER	R4			: No room for buffer, non-skip
+	ST	R0,RTL.BF,R3,		: Put buffer address from list
+	AIS	R3,4*1			: Move to next entry
+	CHI	R3,4*RTLMAX		: At end of ring?
+	  JNFS	NWRPTF			: No, skip ahead
+	LIS	R3,0			: Yes, reset to top
+NWRPTF	STH	R3,RTL.TF,,		: Store pointer
+
+	LIS	R0,0			: Set default for fall-through
+GSYNBF	LH	R3,RTL.FF,,		: Get pointer
+	CH	R3,RTL.TB,,		: Does it match? cannot pass TB
+	  JER	R4			: Yes, no buffers available
+	L	R0,RTL.BF,R3,		: Get buffer
+	AIS	R3,4*1			: Move to next entry
+	CHI	R3,4*RTLMAX		: At end of ring?
+	  JNFS	NWRPFF			: No, skip ahead
+	LIS	R3,0			: Yes, reset to top
+NWRPFF	STH	R3,RTL.FF,,		: Remember the pointer
+	AIS	R4,4			: Set skip return
+	JR	R4			:  and go
+
+
+ERRBSC	LA	R0,WRNBSC,,		: Warn about bad command
+	SVC	SYS,SUDIA.		: Set diagnostic message
+	SVC	SYS,FREEZ.		: Now freeze the slot
+	J	FGLOOP			: Return to FG loop
+
+ERRXGT	LA	R0,FATXGT,,		: non-eXistant check on GT
+	JFS	GIVEUP
+ERRSRR	LA	R0,FATSRW,,		: Sync Ring wrap problem
+GIVEUP	SVC	SYS,SUDIA.		: Set diagnostic message
+	SVC	SYS,HALT.		: and halt the slot
+	J	GIVEUP			: Loop in case dummy says go
+
+
+: STORHW - Used to pre-fill a buffer with a given half-word
+:
+: call:
+:	R0 = byte/half-word to store
+:	R1 = address of buffer
+:	R2 = count of halfwords
+:	JAL	R4,STORHW
+STORHW	SLL	R2,1			: Convert HW to Bytes
+STORME	SIS	R2,2			: Decrement counter
+	  JLR	R4			: Return when out of data
+	STH	R0,0,R1,R2		: Store halfword
+	JBS	STORME			:  and loop till done
+
+
+	EM		: End of module FMAIN
