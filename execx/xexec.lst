@@ -1,0 +1,1549 @@
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 1
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1	begin	"XEXEC"
+2	
+3	require "XEXEC.INF" source!file;
+4	
+5	Define XEXEC!VERSION = (XEXEC!!VER lsh 24) lor XEXEC!!EDIT;
+6	require XEXEC!VERSION version;
+7	
+8	require "
+9	
+10	XEXEC %"&CVOS(XEXEC!VERSION lsh -24)&"("&CVOS(XEXEC!VERSION land '777777)&")"&
+11	     " - TYMCOM-X Periodic Processing Scheduler
+12	
+13	Assembly: Load @XEXEC.CMD
+14	
+15	
+16	Sources:  XEXEC.SAI                 Main program source file
+17	          XEXEC.INF                 Main release information file
+18	          XEXEC.PAR                 Main parameter file
+19	          XEXEC.REQ                 Global declaration file
+20	          SAIL.DEF                  General macro definition file
+21	          GOGTAB.DEF                System offset definition file
+22	          UUOSYM.DEF                System call definition file
+23	          JQUEUE.DEF                Job queue definition file
+24	
+25	Library:  JQUE.REQ   [SAI] [REL]    Job queue manipulation package
+26	          NEXTIM.REQ [SAI] [REL]    Job reschedule daytime routine
+27	          XEXPKG.REQ [SAI] [REL]    Miscellaneous support package
+28	          VMFILE.REQ [SAI] [REL]    VM input file mapping pacakge
+29	          DAYTIM.REQ [SAI] [REL]    Date time conversion package
+30	          XEXINT.REQ [SAI] [REL]    Interrupt trapping package
+31		  XEXLIC.REQ [SAI] [REL]    License validation package
+32		  LICSUB.REQ [SAI] [REL]    License read and print package
+33	          FRMRUN.REQ [SAI] [REL]    Run a program in a new frame
+34	
+35	License:  ALL license bits!!!
+36	          WC RC SY OP GD TD ST JL AC XC HF RA WA
+37	          WC       - absolute frame access rights
+38	          SY       - reading info about jobs
+39	          HF QM JL - writing system queue and log files
+40	
+41	" message;
+42	
+43	require "(SAILIB)SAIL.DEF"    source!file;
+44	require "(EXECX)XEXEC.PAR"    source!file;
+45	require "(SYS)GOGTAB.DEF"     source!file;
+46	require "(MPL)UUOSYM.DEF"     source!file;
+47	
+48	require "(EXECX)JQUEUE.DEF"   source!file;
+49	require "(EXECX)JQUE.REQ"     source!file;
+50	require "(EXECX)XEXPKG.REQ"   source!file;
+51	require "(EXECX)XEXINT.REQ"   source!file;
+52	require "(EXECX)XEXLIC.REQ"   source!file;
+53	require "(SUBMIT)NEXTIM.REQ"  source!file;
+54	
+55	require "(CARL)VMFILE.REQ"    source!file;
+56	require "(CARL)DAYTIM.REQ"    source!file;
+57	require "(CARL)LICSUB.REQ"    source!file;
+58	require "(SAILIB)FRMRUN.REQ"  source!file;
+59	
+60	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 2
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+61	!	Definitions
+62	;
+63	
+64	Define
+65		Sys$Run   =  0		! normal operation ;
+66	,	Sys$Reset =  1		! system reset ;
+67	,	Sys$Abort =  2		! error indication ;
+68	;
+69	
+70	Define MailerName = { "(MAIL)MAILER.SAV" };
+71	
+72	Define VersionString = { "%"&CVOS(XEXEC!VERSION lsh -24) &
+73				 "("&CVOS(XEXEC!VERSION land '777777)&")" };
+74	Define Gettab(x,y)   = { calli( !xwd( (x), (y) ), calli!GETTAB ) };
+75	
+76	Define Minute  = 60;		! how many seconds in a minute ;
+77	Define Spaces  = { "                                                  " };
+78	Define !gtRDV  = '135, !gtRDI = '136, !gtRFN = '137;
+79	Define !Job(x) = { ( (x) land '7777 ) };
+80	Define cvj(x)  = { cvs( (x) land '7777 ) };
+81	Define XVS     = { ( if MyJob > E!RunMax
+82			      then "stream #" & cvs(MyJob-E!RunMax)
+83			      else "run #" & cvs(MyJob) &" job "& cvs(QRJ) ) };
+84	
+85	Define LPad(x,y) = { (Spaces[1 for y-1]&(x))[inf-(y-1) to inf] };
+86	Define SetFlg(x) = { x_ x lor MyBit };	! set bit ;
+87	Define ClrFlg(x) = { x_ x land NoBit };	! clr bit ;
+88	
+89	Define DayStamp  = { cvSDat( !lh( GetTDT ) ) };		! day  only ;
+90	Define TimeStamp = { cvSTim( !rh( GetTDT ) ) };		! time only ;
+91	Define DateStamp = { TymDay( GetTDT ) };		! date-time ;
+92	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 3
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+93	!	Variable definitions for outer block;
+94	
+95	Internal integer
+96		MyBit			! always 1 lsh myjob ;
+97	,	MyJob			! current job slot;
+98	,	NoBit			! always lnot 1 lsh myjob ;
+99	,	XEXJob			! my job number for interrupts ;
+100	;
+101	
+102	boolean
+103		NeedEscape		! flag whether waiting for escape;
+104	,	NeedReset		! flag whether this is a reset ;
+105	,	OverTime		! flag whether time has passed ;
+106	,	TRU!			! flag whether runtime expired ;
+107	,	HaveProcessor		! flag whether we think we have this ;
+108	;
+109	
+110	integer 
+111		JPri			! schedule priority level -1,0,1-9,10-15;
+112	,	JobType			! type of job, 2 = DET + RUN = RJob ;
+113	,	Minutes			! how many minutes we've been running ;
+114	,	Req			! current request number index;
+115	,	SlotAdr			! address of record slot in memory ;
+116	,	Status			! job status code from record ;
+117	,	SystemTDT		! copy of system startup time ;
+118	,	BannerTDT		! last time banner was printed ;
+119	;
+120	
+121	string
+122		S			! temporary string variable;
+123	,	RunProg			! place holder for program name ;
+124	;
+125	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 4
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+126	!	Record and array definitions
+127	;
+128	
+129	record!class job( Integer	Run	! next runtime for job ;
+130	, 				Ran	! previous runtime ;
+131	,				Aun	! username - aun ;
+132	,				Ppn	! path - ppn ;
+133	,				Nam	! jobname - cmdfile ;
+134	,				Req	! request number ;
+135	,				Sts	! status info ;
+136	,				Opt	! options info ;
+137	,				Tim	! time limit for %KSYS ;
+138	;		r!p (job)	Nxt	! pointer to next record ;
+139	);
+140	
+141	Safe r!p (job) Array JobPri[ JP$Run : JP$Max ]; ! job queue by priority ;
+142	r!p (job) Dormant;			! keep a dormant list ;
+143	
+144	Preset!with  [E!Length] 0;
+145	Safe Integer Array Del[ 0 : E!Length-1 ];	! For Delete ;
+146	Preset!with  [E!Length] 0;
+147	Safe Integer Array Rec[ 0 : E!Length-1 ];	! The Record ;
+148	
+149	Preset!with  ST$$Off;
+150	Safe Integer Array StatusOffset[ 0:ST$-1 ];
+151	Preset!with  ST$$Str;
+152	Safe String  Array ST$$Nam[ 0:ST$-1 ];
+153	Preset!with  ST$$All;
+154	Safe String  Array AllStatusString[ 0:ST$$Knt-1 ];
+155	
+156	Preset!with  JL$$Str;
+157	Safe String  Array JL$$Nam[ 0:JL$$Knt-1 ];
+158	Preset!with  JD$$Str;
+159	Safe String  Array JD$$Nam[ 0:JD$$Knt-1 ];
+160	Preset!with  JS$$Str;
+161	Safe String  Array JS$$Nam[ 0:JS$$Knt-1 ];
+162	Preset!with  JM$$Str;
+163	Safe String  Array JM$$Nam[ 0:JM$$Knt-1 ];
+164	Preset!with  JP$$Str;
+165	Safe String  Array JP$$Nam[ 0:JP$$Knt-1 ];
+166	Preset!with  JR$$Str;
+167	Safe String  Array JR$$Nam[ 0:JR$$Knt-1 ];
+168	Preset!with  JU$$Str;
+169	Safe String  Array JU$$Nam[ 0:JU$$Knt-1 ];
+170	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 5
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+171	!	Support routines
+172	;
+173	
+174	Internal Simple Procedure GetInt( reference integer Flag; integer Why );
+175	return;
+176	
+177	
+178	procedure SetTimeLimit( Integer TimeLimit );
+179	begin
+180	    own safe integer array Limit[0:2];
+181	    define calli!DAYTIM = -'143;
+182	
+183	    if TimeLimit = 0
+184	     then Limit[0]_ 0
+185	     else begin "new limit"
+186		Limit[0]_ Calli( '20,calli!DAYTIM ) + (60 * TimeLimit);
+187		Limit[2]_ !xwd( '600020,'500020 );	! old=TYM-SEC,,new=TYM-UDT ;
+188		calli( location(Limit[0]), calli!DATUUO );
+189	     end "new limit";
+190	
+191	    QRT_ Limit[0];
+192	
+193	end;
+194	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 6
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+195	
+196	Simple Boolean Procedure ClearFrame;
+197	begin "clear frame"
+198	
+199	    if ( QRF )				! anything here? ;
+200	     then begin "frame must die"
+201		QRF_ 0;				! clear frame position ;
+202	     end "frame must die";
+203	
+204	    return( false );			! give 'em what they came for ;
+205	
+206	end "clear frame";
+207	
+208	
+209	Simple procedure ClearSlot( Integer Address(0) );
+210	begin "Clear Slot"
+211	    Own integer Adr;
+212	
+213	    if ( Address )			! if one is specified ;
+214	     then Adr_ Address			!  then use it, else calculate ;
+215	     else Adr_ QueRun + (E!Length * (MyJob - 1 ));
+216	
+217	    memory[Adr]_ 0;			! clear active slot area ;
+218	    ArrBlt( memory[Adr+1], memory[Adr], E!Length );
+219	
+220	    QRS_ QRA_ QRF_ QRU_		! cleanup: status, options, frame, uid ;
+221	    QRR_ QRT_ QRL_ QRH_ 0;	! cleanup: tru, time, log, halt-count  ;
+222	
+223	end "Clear Slot";
+224	
+225	
+226	Simple procedure KillJob( Integer J );
+227	begin "Kill Job"
+228	
+229	    if not( J )				! don't try anything to job 0 ;
+230	     then return;			! it won't buy us much ;
+231	
+232	    if not( calli( !Xwd(1,!Job(J) ), calli!EVICT ) )
+233	     then begin "assinate"
+234		calli( !Xwd(3,!Job(J) ), calli!HANG );
+235		QQ( Running )_ 0 max ( QQ( Running ) - 1 );
+236	     end "assinate";
+237	
+238	end "Kill Job";
+239	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 7
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+240	
+241	Simple procedure EXIT( String Msg(Null) );
+242	! ----------------------------------------------------------------------;
+243	!									;
+244	!	Exit	Routine to print a message to the CTY and then exit.	;
+245	!									;
+246	! ----------------------------------------------------------------------;
+247	begin
+248	
+249	    EscDis;				! disable any interrrupts ;
+250	    NtqDis;				! for ESC, NTQ ;
+251	    SiaDis;				! and from frame ;
+252	
+253	    LogInfo( Msg );			! report the reason for leaving ;
+254	    CtyLog( "XEXEC: "& Msg, true );	! to the log and the CTY ;
+255	
+256	    if ( InQue land que$Map )		! check for logoff flag ;
+257	     then begin "finish up"		! time to check out? ;
+258	
+259		if ( calli(0,calli!PJOB) = QQ( Schedule ) )
+260		 then QQ( Schedule )_ QQ( HaveS )_ 0;
+261		QQ( Flags )_ QQ( Flags ) land
+262			    lnot ( QF$Log lor QF$Run lor QF$Act );
+263	
+264	     end "finish up";
+265	
+266	    calli(queact lsh -9, calli!CLBRLI);	! release ACT page interlock ;
+267	    calli(queact lsh -9, calli!CLBLEV);	! leave ACT page club ;
+268	    calli(querun lsh -9, calli!CLBRLI);	! release RUN page interlock ;
+269	    calli(querun lsh -9, calli!CLBLEV);	! leave RUN page club ;
+270	    ClsQue;
+271	
+272	    if not( !lh( Gettab(-1,!gtLIN) ) )	! if no terminal attached ;
+273	     then calli( 0, calli!LOGOFF )	!  then logout normally ;
+274	     else start!code uuo!EXIT end;	!  else just exit ;
+275	
+276	end;
+277	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 8
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+278	!	Initialization routines;
+279	
+280	simple procedure InitVMFileFlag;
+281	VMRECF_ true;				! keep a dormant recor list ;
+282	require InitVMFileFlag initialization;
+283	
+284	
+285	simple procedure WhoShouldIBe;
+286	begin
+287	    LogWho( "Scheduler" );		! label my messages ;
+288	    XEXJob_ calli( 0,calli!PJOB );	! remember my name  ;
+289	    RunProg_ cv6str( Gettab( XEXJob,!gtRFN ) );
+290	end;
+291	require WhoShouldIBe initialization;
+292	
+293	
+294	simple procedure LicenseCheck;
+295	! ----------------------------------------------------------------------;
+296	!									;
+297	!	LicenseCheck	Routine to check the license set on the frame	;
+298	!			and the program to determine if it is really	;
+299	!			sufficient to get any work accomplished.	;
+300	!									;
+301	! ----------------------------------------------------------------------;
+302	begin
+303	! '777617 ;
+304	    If ( Gettab( -1, !GTLIC )
+305	  Ifcr PRELIMINARY thenc
+306		land ( LC!SY lor LC!JL lor LC!WC )
+307		 neq ( LC!SY lor LC!JL lor LC!WC ) )
+308	  elsec
+309		land ( LC!SY lor LC!JL lor LC!WC lor LC!HF )
+310		 neq ( LC!SY lor LC!JL lor LC!WC lor LC!HF ) )
+311	  endc
+312	     then EXIT( "Insufficient License - SY JL WC HF -" );
+313	end;
+314	require LicenseCheck initialization;
+315	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 9
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+316	
+317	Simple boolean procedure FrontEnd( integer Adr );
+318	begin "FrontEnd"
+319	    own integer C, Chan;
+320	    own string Par;
+321	    own safe integer array RunBlock[0:5];
+322	
+323	    if ( ESC! or NTQ! )				! ^C or Notice-to-quit? ;
+324	     then return( false );			!  just return ;
+325	
+326	    if ( !rh( memory[Adr+E!License] ) )
+327	     then if not( C_ GetLic(memory[Adr+E!OperName], C_ -1) )
+328		   then begin "license error"
+329		      dpb( Abort$License, PStap( QRS ) );
+330		      dpb( LError, APFErr( Adr ) );
+331		      return( false );
+332		   end "license error"
+333		   else if not( LicChk( !rh( C ), !rh( memory[Adr+E!License] ) ) )
+334		         then begin "not enough"
+335			    dpb( Abort$License, PStap( QRS ) );
+336			    dpb( LError, APFErr( Adr ) );
+337			    return( false );
+338			 end "not enough";
+339	
+340	    if ( LAPRunF(Adr) )				! if RUN program  ;
+341	      and ( LAPDetF(Adr) )			!    and DETACH   ;
+342	     then begin "run detached job"		!  then do it.    ;
+343	
+344		if ( QRF )
+345		 then if ( Gettab(QRJ,!gtUID) = QRU )	! frame and uid's match ;
+346			 and ( Gettab(QRJ,!gtSTS) land jb!jna )
+347		       then begin "graft job"		! this incarnation ok ;
+348			  FrmXct( QRJ,QQ(Schedule),!foGFT );	! graft to self ;
+349			  LogInfo( XVS & (if ( !skip! )
+350					   then null else " not") & " grafted." );
+351		       end "graft job"
+352		       else begin "lost job"
+353			  LogInfo( XVS & " is lost." );	! put it in the log ;
+354			  if ( LPRestart( QRA ) )	! restartable job ;
+355			   then QRF_ 0			! force create frame ;
+356			   else return( false );	! truly lost job ;
+357		       end "lost job";
+358	
+359		if not( QRF )				! no frame yet ;
+360		 then begin "new job"			! set no-attach ;
+361		    memory[Adr+E!Privs]_ memory[Adr+E!Privs] lor jp!nat;
+362		    if ( QRF_ CChild(Adr) )		! create a child frame;
+363		     then QRU_ Gettab( QRJ, !gtUID )	! and remember uid ;
+364		     else begin "birth defect"
+365			dpb( ( if ( !rh( QRF ) < 2 )
+366				then Sched$Frame	! capacity error ;
+367				else Abort$Frame ), PStap( QRS ) );
+368			dpb( !rh( QRF ), APFErr(Adr) );	! what error was it? ;
+369			return( false );		! abort & give up! ;
+370		     end "birth defect";
+371		    QRH_ 0;				! clear halt count ;
+372		 end "new job";
+373	
+374		Par_ null;				! initialize parameters ;
+375		for C_ 0 upto (E!ParLength div 5)-1	! then each 5 ;
+376		 do if ( memory[Adr+E!Parameters+C] )	! copy any chars ;
+377		     then Par_ Par & cvAstr( memory[Adr+E!Parameters+C] )
+378		     else done;				! until all done ;
+379		Logit( QFet$Pars, "Parameters: "& Par );
+380	
+381		SetTimeLimit( LAPTimL(Adr) );		! set any time limit ;
+382	
+383		if ( RunJob( QRF, Adr, Par ) )		! can it run now ;
+384		 then dpb( Proc$Run, PStap( QRS ) )	! Processing, Run ;
+385		 else begin "no can do"
+386		    dpb( Abort$Run, PStap( QRS ) );	! run or ccl error ;
+387		    return( false );			! so, abort job ;
+388		 end "no can do";
+389	
+390	     end "run detached job"
+391	     else dpb( Sched$Wait, PStap( QRS ) );	! Scheduled, Wait ;
+392	XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 9.1
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+393	    LogInfo( "-S- "& XVS &" "& InfJob( Adr ) );
+394	    if ( LPCtyF( QRA ) )
+395	     then CtyLog( "Scheduling " & XVS & " " & InfJob( Adr ) );
+396	
+397	    return( true );
+398	
+399	end "FrontEnd";
+400	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 10
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+401	
+402	simple boolean procedure CommandMode;
+403	return( Gettab( QRJ, !gtSTS ) geq 0 );
+404	
+405	
+406	simple boolean procedure ErrorMode;
+407	return( Gettab( QRJ, !gtSTS ) land jb!jer );
+408	
+409	
+410	procedure ESCAPE;
+411	begin "Escape"
+412	
+413	    if ( CommandMode )			! if command mode ;
+414	     then ClrFlg( NeedEscape )		!  clear escape   ;
+415	     else begin "halt frame"
+416		DEFINE !FOSTP = '41;
+417		FrmXct( QRF, 0, !foSTP );	! stop the frame  ;
+418		SetFlg( NeedEscape );		!  set NeedEscape ;
+419	     end "halt frame";
+420	
+421	end "Escape";
+422	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 11
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+423	
+424	simple procedure CreateProcessor;
+425	begin "create a processor"
+426	    preset!with 5,cvSIX("SYS"),0,cvSIX("EXECX"),0,0;
+427	    own safe integer array RunBlock[0:5];
+428	    own safe integer array HSB[0:7];
+429	    own safe integer array Frame[E!Runtime:E!License];
+430	    integer HaltCount;
+431	
+432	    ArrClr( Frame );				! setup empty slate ;
+433	    Frame[ E!PPN ]_      Gettab( -1,!gtPPN );	! gfd'd ppn ;
+434	    Frame[ E!Privs ]_    Gettab( -1,!gtPRV );	! privileges ;
+435	    Frame[ E!AUN ]_      Gettab( -1,!gtAUN );	! login ppn ;
+436	    Frame[ E!Username ]_ Gettab( -1,!gtUNM );	! username - part 1 ;
+437	    Frame[E!Username+1]_ Gettab( -1,!gtUN1 );	! username - part 2 ;
+438	    Frame[ E!License ]_  Gettab( -1,!gtLIC );	! license ;
+439	
+440	    if ( QQ( Process )_ CChild( location(Frame[E!Runtime]) ) )
+441	     then begin "successful"			! create processor ;
+442	
+443		RunBlock[1]_ Gettab( -1,!gtRDV );
+444		RunBlock[2]_ Gettab( -1,!gtRDI );
+445	
+446		HSB[0]_ 7;				! get all data ;
+447		FrmXct( QQ( Process ),HSB[0], !foHST );	! from halt status ;
+448		HaltCount_ HSB[ 2 ];			! just need count ;
+449	
+450		FrmXct( QQ( Process ), RunBlock[0], !foGET );
+451		if not( !Skip! )
+452		 then LogInfo( "Job processor problem in frame "& cvj(QQ( Process )) );
+453	
+454		do begin "get status"
+455		    HSB[0				! get all data ;
+456		    FrmXct(QQ(Process),HSB[0],!foHST);	! from halt status ;
+457		end until HaltCount < HSB[ 2 ];		! until next halt ;
+458	
+459		if ( HSB[ 1 ] neq !xwd( 4,4 ) )		! HC.EXI,HT.JSU ;
+460		 then CtyLog( "Job Processor error in frame "&cvj(QQ(Process)) &
+461				" "& HaltStatus( HSB ) );
+462	
+463		FrmXct( QQ( Process ),HSB[0]_ -1,!foSVA );
+464	
+465		LogInfo( "Processor status "& HaltStatus( HSB ) &" in frame "&
+466				cvj( QQ( Process ) ) );
+467	
+468	     end "successful";
+469	
+470	end "create a processor";
+471	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 12
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+472	
+473	simple procedure StartProcessor;
+474	begin "startup a processor"
+475	    integer Page, Err;
+476	
+477	    if not( ClubInit( Page_ queAct lsh -9 ) )	! can we get interlock? ;
+478	     then begin "not mine"
+479		QQ( Flags )_ QQ( Flags ) land lnot QF$Act;
+480		if ( !skip! = CBAIL# )			! already allocated ;
+481		 then if ( QQ( Process ) ) and
+482			 ( Gettab( QQ( Process ) land '7777,!gtSTS) land jb!jna ) and
+483			 ( QQ( HaveP ) = Gettab( QQ( Process ) land '7777,!gtUID ) )
+484		       then begin "have processor"
+485			  LogInfo( "Job processor already in frame "&cvj(QQ( Process )) );
+486			  HaveProcessor_ QQ( Process );	! remember for myself ;
+487			  ClearFeature( RProc );	! starting processor! ;
+488			  return;			! yes, return. ;
+489		       end "have processor"
+490			else begin "wrong processor"
+491			  LogInfo( "Job processor says frame "&cvj(QQ( Process )) );
+492			  SetFeature( Shut );
+493			  QQ( HaveP )_ HaveProcessor_ false;
+494			  calli( 5,calli!SLEEP );
+495			end "wrong processor"
+496		 else begin "bad interlock"		! hmmm, indicate problem ;
+497		    LogInfo("Processor interlock problem ("&cvos(!skip!)&") check system");
+498		    LogInfo( "Processor= "&cvj(QQ( Process ))&" uid= "&cvs(QQ( HaveP ))
+499			&" not "&cvs( Gettab( QQ( Process ) land '7777,!gtUID ) ) );
+500		    SetFeature( Shut );
+501		    QQ( HaveP )_ HaveProcessor_ false;
+502		    calli( 5,calli!SLEEP );		! sleep for effect ;
+503		 end "bad interlock";
+504	     end "not mine";
+505	
+506	    ClearFeature( Shut );
+507	    if not( TestFeature( RProc ) )		! processor asking? ;
+508	     then CreateProcessor;			! no, create a processor job ;
+509	    SetTim( 300 );				! maximum of 5 minutes ;
+510	    while not( TIM! )
+511	     do if ( QQ( Process ) and			! if processor setup ;
+512		     ( Gettab( QQ( Process ) land '7777,!gtSTS) land jb!jna ) and
+513		     QQ( HaveP ) = Gettab( QQ(Process) land '7777,!gtUID ) )
+514		 then begin "give away interlock"
+515		    calli( Page, calli!CLBRLI );	! release interlock ;
+516		    if ( TestFeature( DSched ) )	! monitoring this stuff? ;
+517		     then LogInfo( "Given interlock" );	! give message ;
+518		    done;
+519		 end "give away interlock"
+520		 else calli( 1, calli!SLEEP );		! else sleep ;
+521	
+522	    if not( TIM! )
+523	     then begin "wait for interlock"
+524		SetTim( 300 );
+525		while not( TIM! )
+526		 do if ( QQ( HaveP ) neq QQ( ProcessUDT ) )
+527		     then calli( 1, calli!SLEEP )
+528		     else done;
+529	     end "wait for interlock";
+530	    if not( TIM! )
+531	     then begin "processor started"
+532		HaveProcessor_ QQ( Process );		! remember process ;
+533		QQ( ProcessUDT )_ GetTDT;		! set time process started ;
+534		LogInfo( "Starting job processor in frame "& cvj(QQ( Process )) );
+535	     end "processor started"
+536	     else calli( location(Page),calli!CLBINI );	! else take interlock ;
+537	
+538	    ClearFeature( RProc );			! starting processor! ;
+539	    SetTim( Minute );				! reset timer ;
+540	
+541	 end "startup a processor";
+542	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 13
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+543	
+544	r!p (job) Procedure NewRec;
+545	begin "new record"
+546	    own r!p (job) tjob;
+547	
+548	    if ( tjob_ Dormant )
+549	     then begin "need record"
+550	
+551		Dormant_ job:Nxt[ tjob ];	! take first record from list ;
+552		job:Nxt[ tjob ]_ null!record;	! zero out the link ;
+553	
+554	     end "need record"
+555	     else tjob_ new!record( job );
+556	
+557	    return( tjob );
+558	
+559	end "new record";
+560	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 14
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+561	
+562	Procedure Prune( Integer AReq  );
+563	begin "prune"
+564	    r!p (job) nj,tj;
+565	    integer Pri;
+566	
+567	    if ( TestFeature( DSched ) )
+568	     then LogIt( QFet$DSched, "Prune: "& cvs(AReq) &" "& XVS &" "& cvos(QRS) );
+569	
+570	    for Pri_ JP$Run upto JP$Max		! for each priority level ;
+571	     do begin "each level of priority"
+572	
+573		if not( nj_ JobPri[ Pri ] )	! if nothing at this level ;
+574		 then continue;			!  then try the next one ;
+575	
+576		while ( nj_ job:Nxt[tj_nj] )	! for each record ;
+577		 do if ( job:Req[nj] = AReq )	! if req match ;
+578		   then begin "process"
+579	
+580		      job:Nxt[tj]_ job:Nxt[nj];	! delete job from list ;
+581		      job:Nxt[nj]_ Dormant;	! put it into the dormant list ;
+582		      Dormant_ nj;		! at the head (FILO) ;
+583		      nj_ tj;			! continue where we left off ;
+584	
+585		   end "process";		! search for any multiples ;
+586	
+587	     end "each level of priority";
+588	
+589	end "prune";
+590	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 15
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+591	
+592	Procedure Prime( Integer AReq  );
+593	begin "prime"
+594	    r!p (job) nj,tj, rj;
+595	    integer Pri;
+596	
+597	    for Pri_ JP$Min upto JP$Max		! for each priority level ;
+598	     do begin "each level of priority"
+599	
+600		if not( nj_ JobPri[ Pri ] )	! if nothing at this level ;
+601		 then continue;			!  then try the next one ;
+602	
+603		while ( nj_ job:Nxt[tj_nj] )	! for each record ;
+604		 do if ( job:Req[nj] = AReq )	! if req match ;
+605		   then begin "process"
+606	
+607		    job:Nxt[tj]_ job:Nxt[nj];		! delete job from list ;
+608		    rj_ JobPri[ JP$Run ];		! get run list ;
+609	
+610		    if not( rj )			! no active records? ;
+611		     then begin "piece of cake"
+612			rj_ JobPri[ JP$Run ]_ NewRec;	! get a record ;
+613			job:Nxt[rj]_ nj;		! insert record ;
+614			job:Nxt[nj]_ null!record;	! and delete after ;
+615			return;
+616		     end "piece of cake";
+617	
+618		    while ( rj_ job:Nxt[tj_rj] )	! for each record ;
+619		     do if ( job:Run[nj] < job:Run[rj] )
+620		       then done;
+621	
+622		    job:Nxt[tj]_ nj;			!  insert in active list ;
+623		    job:Nxt[nj]_ rj;			! current record pointer ;
+624	
+625		    ! ** if we don't return here, nj needs to be old tj  ** ;
+626		    ! ** just prior to the while loop above, so it works ** ;
+627		    return;
+628	
+629		   end "process";		! search for any multiples ;
+630	
+631	     end "each level of priority";
+632	
+633	end "prime";
+634	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 16
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+635	
+636	Simple Boolean Procedure NextRecord;
+637	begin "next record"
+638	
+639	    arrclr( Rec );			! clear record fields ;
+640	
+641	    if ( ESC! or NTQ! )			! if ( ^C or Notice-to-quit ) ;
+642	     then return( false );		!  just return immediately ;
+643	
+644	    dpb( Req, PPReq( Rec ) );		! set request number to select ;
+645	    return( GetRec( Rec[E!Runtime] ) );	! oh, get on with it ;
+646	
+647	end "next record";
+648	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 17
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+649	
+650	Procedure SortQueue;
+651	begin "sort queue"
+652	    own r!p (job) njob, tjob;
+653	    own integer AReq;
+654	
+655	    Req_ 0;					! loop through them all ;
+656	    AReq_ LPPReq( Rec );			! remember this a while ;
+657	
+658	    if ( LPPStat(Rec) = ST$Cancel )		!  if cancel, remove it ;
+659	     then begin "cancel it"
+660		Prune( AReq );				! remove it from branch ; 
+661		ArrBlt( Del[E!Runtime], Rec[E!Runtime], E!Length );
+662		ModRec( Del[E!Runtime]_ 0, Rec[E!Runtime] );
+663		return;
+664	     end "cancel it";
+665	
+666	    if not( JobPri[ JP$RUN ] )			! check the run list ;
+667	     then njob_ JobPri[JP$Run]_ NewRec		!  null?  make a record ;
+668	     else njob_ JobPri[JP$Run];			! begin at top of list  ;
+669	
+670	    while ( njob_ job:Nxt[tjob_njob] )		! until the empty list  ;
+671	     do if ( job:Req[njob] = AReq )		! if same as record ;
+672		 then return;				!  it's running, ignore ;
+673	
+674	    JPri_ LPPJPri( Rec );			! get priority level ;
+675	    if ( JPri = JP$Min )			! absolute minimum says ;
+676	     then JPri_ LPJPri( QQ( Action) );		!  use default priority ;
+677	
+678	    if not( JobPri[ JPri ] )			! check this priority   ;
+679	     then njob_ JobPri[JPri]_ NewRec		!  null?  make a record ;
+680	     else njob_ JobPri[JPri];			! begin at top of list  ;
+681	
+682	    while ( njob_ job:Nxt[tjob_njob] )		! until the empty list  ;
+683	     do if ( Rec[E!Runtime] < job:Run[njob] )	!  if runtime < job:Run ;
+684		 then done;				!   then fall to insert ;
+685	
+686	    tjob_ job:Nxt[tjob]_ NewRec;		! create the new record ;
+687	    job:Nxt[tjob]_ njob;			! keep any forward ptrs ;
+688	    job:Opt[tjob]_ Rec[E!Action];		! copy all action flags ;
+689	    job:Tim[tjob]_ Rec[E!LogLim];		! copy limit info ;
+690	    job:Sts[tjob]_ Rec[E!Status];		! copy status field ;
+691	    job:Aun[tjob]_ Rec[E!AUN];			! copy username - aun ;
+692	    job:Ppn[tjob]_ Rec[E!PPN];			! copy path info - ppn  ;
+693	    job:Nam[tjob]_ Rec[E!CmdFile+F!Name];	! copy job name cmdfile ;
+694	    job:Ran[tjob]_ Rec[E!Rantime];		! copy any last runtime ;
+695	    job:Run[tjob]_ Rec[E!Runtime];		! copy runtime  & req # ;
+696	    job:Req[tjob]_ AReq;
+697	
+698	end "sort queue";
+699	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 18
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+700	
+701	Procedure TellAll;
+702	begin "Tell All"
+703	    r!p (job) nj,tj;
+704	    integer Pri, MyJob;			! use local variables ;
+705	
+706	    for Pri_ JP$Run upto JP$Max		! for each priority level ;
+707	     do begin "each level of priority"
+708	
+709		if not( nj_ JobPri[ Pri ] )	! if nothing at this level ;
+710		 then continue;			!  then try the next one ;
+711	
+712		while ( nj_ job:Nxt[tj_nj] )	! for each record ;
+713		 do LogInfo( "Rec:"& LPad( cvs(job:Req[nj]), 3 ) &
+714			" at " & Tymday(job:Run[nj]) &
+715			" pri " & LPad( cvs(Pri), 2 ) &
+716			" opt " & LPad( cvos(job:Opt[nj]), 12 ) &
+717			" sts " & cvos(job:Sts[nj])    );
+718	
+719	     end "each level of priority";
+720	
+721	    for MyJob_ 1 upto E!JobMax
+722	     do if ( QRS )
+723		 then LogInfo( XVS & " req" & LPad(cvs(LPReq( QRS )),3) &
+724			   " opt " & LPad( cvos( QRA ), 12 ) &
+725			   " sts " & cvos( QRS )  );
+726	
+727	end "Tell All";
+728	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 19
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+729	
+730	simple procedure ReBuildQueue( integer Level( JP$Min ) );
+731	begin "rebuild"
+732	    own r!p (job) ljob, tjob;
+733	    own integer JPri;
+734	
+735	    for JPri_ Level upto JP$Max
+736	     do if ( ljob_ JobPri[ JPri ] )
+737		 then while ( tjob_ job:Nxt[ ljob ] )
+738		       do begin "trim branch"
+739			  job:Nxt[ ljob ]_ job:Nxt[ tjob ];
+740			  job:Nxt[ tjob ]_ Dormant;
+741			  Dormant_ tjob;
+742		       end "trim branch";
+743	
+744	    Req_ -1;				! initialize sequencer  ;
+745	
+746	    While ( NextRecord )		! while records exist   ;
+747	     do SortQueue;			!  sort/insert in list  ;
+748	
+749	end "rebuild";
+750	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 20
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+751	
+752	Simple Integer Procedure SendMail( Integer Adr, Type );
+753	begin "sending mail"
+754	    Own string Mail, State, System;
+755	    Own integer Sts, Code;
+756	    Define LocalTime( x ) = {
+757		cvtDTM( memory[Adr+(x)], LAPZone( Adr ), '20 ) };
+758	
+759	    State_ ST$$Nam[ Sts_ LPStat( QRS ) ] & "-" &
+760		   AllStatusString[ LPProc( QRS ) + StatusOffset[ Sts ] ] &
+761		   (if ( Sts = ST$Abort )
+762		    then " ("& cvs( LAPFerr( Adr ) ) &")"
+763		    else null);
+764	
+765	    System_ cvstr( Gettab( 0,!gtCNF ) )[1 for 1] &
+766		    cvs( Gettab( !cnSYS,!gtCNF ) );
+767	
+768	    Mail_
+769		"From:  "& System &" Job Processor" & crlf &
+770		"Reply-to:  SUBMIT" & crlf &
+771		"To:  "& cv6str(memory[Adr+E!UserName]) &
+772			 cv6str(memory[Adr+E!UserName+1]) & crlf &
+773		"Subject:  Req #"& cvs( LPReq( QRS ) ) & " " &
+774			InfNam( Adr+E!CmdFile ) & " " & State & crlf &
+775		crlf &
+776		"; Processed:  "& InfJob( Adr ) & crlf &
+777		"; Scheduled:  "& TymDay( LocalTime( E!Runtime ) ) & crlf &
+778		"; Actual run: "& TymDay( LocalTime( E!Rantime ) ) & crlf &
+779		";" & crlf &
+780		"; Options: "&
+781		(if code_ LAPLog(Adr)     then " Log:"&     JL$$Nam[code] else null) &
+782		(if code_ LAPDisp(Adr)    then " Disp:"&    JD$$Nam[code] else null) &
+783		(if code_ LPMail(QRA)     then " Mail:"&    JM$$Nam[code] else null) &
+784		(if code_ LAPRestart(Adr) then " Restart:"& JR$$Nam[code] else null) &
+785		(if code_ LAPUniq(Adr)    then " Unique:"&  JU$$Nam[code] else null) &
+786		crlf &
+787		"; Limits:"&
+788		    "  Time "  & cvs( LAPTimL( Adr ) ) &
+789		    "  TRUs " & cvs( memory[ Adr+E!TruLim ] ) &
+790		    crlf &
+791		"; Flags: "&
+792		    (if LAPRunF( Adr ) then "  Run" else null) &
+793		    (if LAPDetF( Adr ) then "  Detach" else null) &
+794		    (if LAPHaltF( Adr ) then "  No-Halt" else null) &
+795		    (if LAPLogF( Adr ) then "  Logout" else null) &
+796		    (if LAPCtyF( Adr ) then "  CTY" else null) &
+797		    crlf &
+798		"; Status:  " & State &
+799		    "  at  "& TymDay( cvtDTM( GetTDT, LAPZone( Adr ), '20 ) ) &
+800		    crlf;
+801	
+802	    if ( LAPLog( Adr ) )
+803	     then Mail_ Mail &
+804		";" & crlf &
+805		"; Output recorded in file " & InfNam( Adr+E!LogFile ) &
+806		    (if ( LAPDisp( Adr ) = JD$DELETE ) or
+807			( LAPDisp( Adr ) = JD$ERROR and LAPStap( Adr ) = Done$End )
+808		     then "  (Deleted.)"
+809		     else ".") &
+810		    crlf;
+811	
+812	    Mail_ Mail & crlf & #EOT;
+813	
+814	    return( FrmRun( MailerName,
+815			    F.CCL lor F.NTTY lor F.NWAI lor F.NEOL,
+816			    Code, "MAI", Mail
+817			  )
+818		);
+819	
+820	end "sending mail";
+821	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 21
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+822	
+823	Simple Procedure ReSchedule( Integer Type( Sys$Run ) );
+824	begin "reschedule"
+825	    Own integer Adr, Sts, Mail;
+826	
+827	    arrClr( Rec );
+828	    Adr_ QueRun + E!Length * ( MyJob - 1 );
+829	    dpb( Req_ LPReq( QRS ), PPReq( Rec ) );
+830	
+831	    if ( TestFeature( DSched ) )
+832	     then TellAll;
+833	
+834	    if ( Req )
+835	     then begin "valid slot info"
+836		
+837		if ( Case ( LPMail( QRA ) ) of (
+838		    [JM$None]    false,		! ** never ** ;
+839		    [JM$Success] LPStat( QRS ) = ST$Done,
+840		    [JM$Error]   LPStat( QRS ) = ST$Abort,
+841		    [JM$Always]  true		! ** always ** ;
+842		   ) )
+843		 then SendMail( Adr, Type );	! send mail about job ;
+844	
+845		LogInfo( "-R- " & XVS & " " &
+846			 ST$$Nam[ Sts_ LPStat( QRS ) ] & "-" &
+847			 AllStatusString[ LPProc( QRS ) + StatusOffset[ Sts ] ] &
+848			 " <" & cvs(Type) & ">" );
+849	
+850		if ( GetRec( Rec[E!Runtime] ) )
+851		 then begin "valid queue entry"
+852	
+853		    Sts_ Queued$Wait;			! initial expected default ;
+854		    case ( LPStat( QRS ) )
+855		     of begin "new status"
+856		!     [ST$Done]				!  Sts_ Queued$Wait ;
+857		!     [ST$Sched]			!  Sts_ Queued$Wait ;
+858		      [ST$Proc]
+859			Sts_ if ( LPRestart( QRA ) )
+860			      then Queued$Wait
+861			      else case Type of (
+862				[Sys$Run]   Queued$Wait,
+863				[Sys$Reset] Queued$Crash,
+864				[Sys$Abort] Hold$Restart  );
+865		      [ST$Abort] Sts_ LPStap( QRS );
+866		      [else]
+867		     end "new status";
+868	
+869		    dpb( Sts, APStap( Adr ) );		! set new status ;
+870	
+871		    if ( Sts = Queued$Wait )		! job failed? ;
+872		     then begin "new entry"		!  no -- it was successful ;
+873			if ( memory[Adr+E!Runtime]_ NexTim( memory[Adr],GetTDT ) )
+874			 then begin "new request"
+875			    ArrBlt( Del[E!Runtime], Rec[E!Runtime], E!Length );
+876			    if not( ModRec( Del[E!Runtime]_ 0, Rec[E!Runtime] ) )
+877			     then LogInfo( XVS &" delete failure: "& cvs(QError) );
+878			    dpb( 0, APReq( Adr ) );	! zero req for new # ;
+879			 end "new request";
+880		     end "new entry";
+881	
+882		    if not( ModRec( memory[Adr+E!Runtime], Rec[E!Runtime] ) )
+883		     then LogInfo( XVS &" Reschedule failure: "& cvs(QError) );
+884	
+885		 end "valid queue entry";
+886	
+887		Prune( LPReq( QRS ) );			! prune old from JobPri tree ;
+888		if ( LPCtyF( QRA ) )
+889		 then CtyLog( "Finished " & XVS & " " & InfJob( Rec[E!Runtime] ) );
+890	     end "valid slot info";
+891	
+892	    ClearSlot( Adr );				! clear out slot ;
+893	
+894	end "reschedule";
+895	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 22
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+896	
+897	Simple Boolean Procedure Unique( r!p (job) r; integer type );
+898	begin "unique"
+899	    own r!p (job) j;
+900	
+901	    if not( j_ JobPri[ JP$Run ] )	! if nothing running ;
+902	     then return( true );		!  then must be unique ;
+903	
+904	    while ( j_ job:Nxt[ j ] )		! for each running job ;
+905	     do if ( case type of (		!  if a match ;
+906	
+907		      [JU$None] false,				! always ok ;
+908	
+909		      [JU$User] job:Aun[j] = job:Aun[r],	! same user ;
+910	
+911		      [JU$Dir]  job:Ppn[j] = job:Ppn[r],	! same dir  ;
+912	
+913		      [JU$Path] job:Aun[j] = job:Aun[r] and	! same user ;
+914				job:Ppn[j] = job:Ppn[r],	! same dir  ;
+915	
+916		      [JU$Job]  job:Aun[j] = job:Aun[r] and	! same user ;
+917				job:Ppn[j] = job:Ppn[r] and	!  and dir  ;
+918				job:Nam[j] = job:Nam[r]		!  and name ;
+919	
+920		   )  )
+921		 then return( false );		!   it is not unique ;
+922	
+923	    return( true );
+924	
+925	end "unique";
+926	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 23
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+927	
+928	Integer Procedure SlotsAvailable;
+929	begin "slots available"
+930	    Own r!p (job) rjob, njob, tjob;
+931	    Own integer Adr, Counter, Temp;
+932	
+933	    if ( ESC! or NTQ! )				! if ( ^C or Notice-to-quit ) ;
+934	     then return( 0 );				!  just go home now... ;
+935	
+936	    QQ( Daytime )_ GetTDT;			! specify schedule time ;
+937	
+938	    if ( QQ( New ) )				! if anything changed ;
+939	     then begin "un-mark queue"
+940		QQ( New )_ 0;				! clear change flag ;
+941		ReBuildQueue( JP$Min );			! and sort the queue ;
+942	     end "un-mark queue";
+943	
+944	    for JPri_ JP$Max downto JP$Min		! for each priority level ;
+945	     do begin "each level of priority"
+946	
+947		if not( njob_ JobPri[ JPri ] )		! if nothing at this level ;
+948		 then continue;				!  then try the next one ;
+949	
+950		while ( njob_ job:Nxt[tjob_njob] )	! for each record ;
+951		 do begin "process queue"
+952	
+953		    if ( ESC! or NTQ! )			! if ( ^C or Notice-to-quit ) ;
+954		     then return( 0 );			!  just go home now... ;
+955	
+956		    if ( LPStap(job:Sts[njob]) = Hold$Restart )		! make it ;
+957		     then dpb( Queued$Wait, LPStap(job:Sts[njob]) );	! useable ;
+958	
+959		    if ( LPStap(job:Sts[njob]) neq Queued$Wait )
+960		     then continue;			! only schedule queued jobs ;
+961	
+962		    if ( job:Run[njob] > GetTDT )	! scheduled for later? ;
+963		     then done;				! none left on this level ;
+964	
+965		    if ( job:Run[njob] = -1 )  and	! startup? ;
+966		       ( job:Ran[njob] > QQ( System ) )	! but run since startup ;
+967		     then continue;			! go to next in list ;
+968	
+969		    if not( Unique( njob, LPUniq( job:Opt[njob] ) ) )
+970		     then continue;			! only one allowed ;
+971	
+972		    if ( Gettab( 6,!gtNSW ) )		! if %KSYS set ;
+973		     then begin "time limit check"
+974			if not( Temp_ LPTimL( job:Tim[njob] ) )
+975			 then continue;			! don't schedule infinate ;
+976			if ( Temp > Gettab( 6,!gtNSW ) )
+977			 then continue;			! don't schedule long jobs ;
+978		     end "time limit check";
+979	
+980		    if ( LPRunF( job:Opt[njob] )	! if runnable job ;
+981		      and LPDetF( job:Opt[njob] ) )	!  and run detached ;
+982		     then begin "running job"
+983	
+984			if ( QQ( Running ) geq QQ( RJobs ) )
+985			 then continue;			! run slots available? ;
+986			for MyJob_ 1 upto QQ( RSlot )	! yes, find right slot ;
+987			 do if not( QRS )		!  in range 1 to Q!Rslot ;
+988			     then done;
+989			if ( QRS )			! find one? ;
+990			 then continue;			! no? ;
+991	
+992		     end "running job"
+993		     else begin "interactive job"
+994	
+995			if ( QQ( Active ) geq QQ( IJobs ) )
+996			 then continue;			! i slots available? ;
+997			for MyJob_ E!RunMax+1 upto QQ( ISlot )
+998			 do if not( QRS )		!  in range for Q!ISlot ;
+999			     then done;
+1000			if ( QRS )			! find one? ;
+1001			 then continue;			! no? ;
+1002	
+1003		     end "interactive job";XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 23.1
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1004	
+1005		    dpb( job:Req[njob], PPReq( Rec ) );	! store request ;
+1006		    if not( GetRec( Rec[E!Runtime] ) )	! get record from queue ;
+1007		     then begin "missing record"	! not there? oops! ;
+1008			job:Nxt[tjob]_ job:Nxt[njob];	!  delete NJOB from list ;
+1009			continue;			!  and go on to the next ;
+1010		     end "missing record";
+1011	
+1012		    NoBit_ lnot (MyBit_ 1 lsh MyJob);	! save bit values ;
+1013	
+1014		    ArrBlt(memory[Adr_querun+(E!Length*(MyJob-1))], Rec[0], E!Length);
+1015	            QRS_ memory[Adr+E!Status];		! copy status ;
+1016	            QRA_ memory[Adr+E!Action];		! copy options ;
+1017		    QRR_ memory[Adr+E!TruLim];		! copy tru limit ;
+1018		    QRL_ memory[Adr+E!LogLim];		! copy log,time limits ;
+1019	
+1020		    if not( FrontEnd( Adr ) )		! if unable to schedule it ;
+1021		     then begin "not ready"
+1022			if ( ESC! or NTQ! ) and ( Rec[E!Status] = QRS )
+1023	                 then done;			! don't bother if NTQ ;
+1024			Reschedule;			!  reschedule it ;
+1025			continue;			!  go to the next ;
+1026		     end "not ready";
+1027	
+1028		    if ( TestFeature( DSched ) )	! debug scheduler ? ;
+1029		     then TellAll;			! tell me everything ;
+1030	
+1031		    job:Nxt[tjob]_ job:Nxt[njob];	! delete job from list ;
+1032	
+1033		    tjob_ JobPri[ JP$Run ];		! to insert in active list ;
+1034		    while ( tjob_ job:Nxt[rjob_tjob] )	!  loop through the list ;
+1035		     do if ( job:Run[njob] < job:Run[tjob] )
+1036			 then done;			!  runtime < job:Run ;
+1037	
+1038		    job:Nxt[njob]_ tjob;		! current record pointer ;
+1039		    job:Nxt[rjob]_ njob;		!  insert in active list ;
+1040	
+1041		    job:Ran[njob]_ Rec[ E!RanTime ]_ GetTDT;	! remember ;
+1042		    ModRec( Rec[E!Runtime], memory[Adr] );	! time ;
+1043		    memory[ Adr+E!Rantime ]_ Rec[ E!Rantime ];	! started ;
+1044	
+1045		    counter_ Minutes;			! reset counter ;
+1046		    return( job:Req[njob] );		! return this record number ;
+1047	
+1048		 end "process queue";
+1049	     end "each level of priority";
+1050	
+1051	    return( 0 );				! nothing there to do ;
+1052	
+1053	end "slots available";
+1054	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 24
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1055	
+1056	Simple procedure ResetJobArea;
+1057	begin "scheduler restart"
+1058	    integer Act, Run, Adr;			! count of active jobs ;
+1059	
+1060	    Act_ Run_ 0;				! clear active job count ;
+1061	    for MyJob_ 1 upto E!RunMax			! for each running job ;
+1062	     do if ( QRS )
+1063		 then begin "capture jobs"
+1064	
+1065		NoBit_ lnot (MyBit_ 1 lsh MyJob);	! save bit values ;
+1066		Adr_ queRun + ( E!Length * (MyJob-1) );	! and slot address ;
+1067		if not( FrontEnd( Adr ) )		! if restart failure ;
+1068		 then begin "slot no good"
+1069		    Reschedule( Sys$Abort );		!  do reschedule ;
+1070		    QQ( Running )_ ( QQ( Running ) - 1 ) max 0;
+1071		 end "slot no good"
+1072		 else Prime( LPReq( QRS ) );		! put it in the list ;
+1073	
+1074	     end "capture jobs";
+1075	
+1076	    for MyJob_ 1 upto E!JobMax			! for each active job ;
+1077	     do begin "count active jobs"
+1078	
+1079		if ( QQS )				! with a valid entry ;
+1080		 then Act_ Act + 1;			! increment the counter ;
+1081	
+1082	     end "count active jobs";
+1083	
+1084	    if ( QQ( Active )_ Act )			! set active total now ;
+1085	     then StartProcessor;			!  maybe start processor ;
+1086	
+1087	end "scheduler restart";
+1088	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 25
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1089	
+1090	Simple procedure SetupJobTables;
+1091	begin "setup job tables"
+1092	    Own integer Err;
+1093	    External safe integer array GOGTAB[0:RGCOFF];
+1094	    ! define RGCOFF = '255 ;
+1095	
+1096	    GOGTAB[ RGCOFF ]_ true;			! Turn off record garbage ;
+1097	    Dormant_ null!record;			! Initialize dormant list ;
+1098	    ReBuildQueue( JP$Run );			! Initialize "my" queue ;
+1099	
+1100	    if not( ClubJoin( Req_queRun lsh -9 ) )	! join the scheduler club ;
+1101	     then Exit( "No Club for Scheduler" );	!  if there is one ;
+1102	    if not( ClubInit( Req ) )			! and init the interlock ;
+1103	     then Exit( "Scheduler interlock busy ("&cvos(!Skip!)&")" );
+1104	
+1105	    QQ( Flags )_ QQ( Flags ) lor QF$Run;	! have scheduler interlock ;
+1106	    QQ( ScheduleUDT )_ GetTDT;			! setup my start time ;
+1107	    QQ( Schedule )_ XEXJob;			! remember job number ;
+1108	    QQ( HaveS )_ Gettab( XEXJob,!gtUID );	! and universal ident ;
+1109	    LogInfo( "** "& DayStamp &" "& RunProg &" "& VersionString &
+1110		     " in frame "& cvs(QQ( Schedule )) &" ** user " &
+1111		     cv6str(Gettab(-1,!gtUNM)) & cv6str(Gettab(-1,!gtUN1)) &" **" );
+1112	    CtyLog( RunProg &" in frame "& cvs(QQ( Schedule )), true );
+1113	
+1114	    if not( ClubJoin( Req_ queAct lsh -9 ) )	! join club on ACT page ;
+1115	     then Exit( "No Club for Processor" );	!  or complain heavily ;
+1116	
+1117	    if ( ClubInit( Req_ queAct lsh -9 ) )	! can we get interlock? ;
+1118	     then begin "my interlock"
+1119		QQ( Flags )_ QQ( Flags ) lor QF$Act;
+1120		QQ( HaveP )_ HaveProcessor_ false;	!  yes, clear flags ;
+1121	     end "my interlock"
+1122	     else begin "not mine"
+1123		QQ( Flags )_ QQ( Flags ) land lnot QF$Act;
+1124		if not( !skip! = CBAIL# )		! already allocated ;
+1125		 then LogInfo( "Processor interlock error ("& cvos(!skip!) &")" )
+1126		 else if ( QQ( HaveP ) = Gettab( QQ( Process ) land '7777,!gtUID ) )
+1127			 and ( Gettab( QQ( Process ) land '7777,!gtSTS) land jb!jna )
+1128		       then HaveProcessor_ QQ( Process );
+1129	     end "not mine";
+1130	
+1131	    ResetJobArea;				! now, reset job area ;
+1132	
+1133	    NTQEnb;					! enable for system ksys ;
+1134	    ESCEnb;					! enable for escapes ;
+1135	    if ( TestFeature( Trigger ) )		! using frame interrupts? ;
+1136	     then SIAEnb;				! yes, enable them ;
+1137	
+1138	end "setup job tables";
+1139	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 26
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1140	
+1141	Simple procedure MonitorRunningJobs;
+1142	begin "monitor running jobs"
+1143	    preset!with  5, cvsix("SYS"), 0, cvsix("LOGOUT"), 0, 0;
+1144	    own safe integer array LOGOUT[0:5];
+1145	    own safe integer array HSB[0:7];
+1146	    integer HaltRead;
+1147	
+1148	    if ( ECF! or LCF! or FEX! )
+1149	     then LogIt( QFet$DSched,
+1150			 "ECF: "&cvos(ECF!)&" LCF: "&cvos(LCF!)&" FEX: "&cvos(FEX!));
+1151	
+1152	    if ( ECF! or LCF! )
+1153	     then for MyJob_ 1 upto E!RunMax
+1154		   do begin "check exit"
+1155	
+1156		NoBit_ lnot (MyBit_ 1 lsh MyJob);	! save bit values ;
+1157	
+1158		if ( ( ECF! lor LCF! ) land MyBit )
+1159		 then begin "stopped job"
+1160	
+1161		    if ( CommandMode ) and
+1162			( Gettab( QRJ,!gtSTS ) land jb!jna ) and
+1163			not( ( Gettab( QRJ,!gtSTS ) land '100 ) or
+1164			     ( Gettab( QRJ,!gtNAM ) = cvsix("LOGOUT") )
+1165			    )
+1166		     then begin "job finished"
+1167	
+1168			HSB[0]_ 7;				! get all data ;
+1169			FrmXct( QRJ, HSB[0], !foHST );	! from halt status ;
+1170	
+1171			if ( !skip! ) and ( HSB[2] > QRH )	! valid recording? ;
+1172			 then begin "valid halt"		!  or so it seems ;
+1173			    LogInfo( XVS &" halt#"& cvs(HSB[2]) &
+1174				     " "& HaltStatus( HSB )  );
+1175			    QRH_ HSB[ 2 ];			! increment my count ;
+1176			    ! ignore ;
+1177			    if ( HSB[ 1 ] = !Xwd( 2,5 ) ) or  	! OPR action ;
+1178			       ( HSB[ 1 ] = !Xwd( 4,4 ) )	! Job setup ;
+1179			     then continue "check exit";
+1180			 end "valid halt";
+1181	
+1182			if ( LPHaltF( QRA ) )			! check HALT flag ;
+1183			 then begin "restart"
+1184			    if ( FrontEnd( queRun+(E!Length*(MyJob-1)) ) )
+1185			     then begin "good start"
+1186				LogInfo( XVS &" Halted and restarted" );
+1187				continue "check exit";
+1188			     end "good start"
+1189			     else begin "may abort it"
+1190				dpb( if LPRestart( QRA )
+1191				      then Done$End
+1192				      else Abort$Halt, PStap( QRS ) );
+1193				ReSchedule;
+1194				QQ( Running )_ ( 0 max ( QQ( Running )-1 ) );
+1195			     end "may abort it";
+1196			 end "restart"
+1197			 else begin "finished"
+1198			    dpb( Done$End, PStap( QRS ) );
+1199			    Reschedule;
+1200			    QQ( Running )_ ( 0 max ( QQ( Running )-1 ) );
+1201			 end "finished";
+1202	
+1203		     end "job finished"
+1204		     else begin "frame went away"
+1205			if ( QRF )
+1206			 then begin "there was a frame"
+1207			    dpb( if LPLogF( QRA ) or LPRestart( QRA )
+1208				  then Done$End
+1209				  else Abort$Logout, PStap( QRS ) );
+1210			    ReSchedule;
+1211			    QQ( Running )_ ( 0 max ( QQ( Running )-1 ) );
+1212			 end "there was a frame"
+1213			 else LogInfo( XVS & " spurious ECF: " & cvos( ECF! ) );
+1214		     end "frame went away";
+1215	
+1216		    if ( Gettab( QRJ,!gtSTS ) land jb!jna )XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 26.1
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1217		     then begin "logout job"
+1218			FrmXct( QRJ, LOGOUT[0], !foRUN );
+1219			LogInfo( XVS & " running LOGOUT!" );
+1220		     end "logout job";
+1221	
+1222		    ClrFlg( ECF! );
+1223		    ClrFlg( LCF! );
+1224	
+1225		 end "stopped job";
+1226	
+1227	     end "check exit";
+1228	
+1229	    for MyJob_ 1 upto E!RunMax
+1230	     do begin "check running jobs"
+1231	
+1232		NoBit_ lnot (MyBit_ 1 lsh MyJob);	! save bit values ;
+1233	
+1234		if ( QRS )
+1235		 then begin "have a job"
+1236	
+1237		    if ( LPStat( QRS ) > ST$Sched )
+1238		     then begin "legal to check"
+1239	
+1240			if not( QRU = Gettab( QRJ,!gtUID ) ) or
+1241			   not( Gettab(QRJ,!gtSTS) land jb!jna )
+1242			 then begin "job went away"
+1243	
+1244			    LogInfo( XVS &" Uid "& cvs(QRU) &" neq "&
+1245				     cvs( Gettab( QRJ,!gtUID ) ) &
+1246				     " sts="& cvos( Gettab( QRJ,!gtSTS ) ) &
+1247				     " que="& cvos( QRS ) &
+1248				     " jna="& ( if Gettab(QRJ,!gtSTS) land jb!jna
+1249						 then "1" else "0" )
+1250				    );
+1251	
+1252			    dpb( if LPLogF( QRA )
+1253				  then Done$End
+1254				  else Abort$Logout, PStap( QRS ) );
+1255	
+1256			    ReSchedule( if LPLogF( QRA )
+1257					 then Sys$Run
+1258					 else Sys$Abort );
+1259	
+1260			    QQ( Running )_ ( 0 max ( QQ( Running ) - 1 ) );
+1261	
+1262			 end "job went away";
+1263	
+1264		     end "legal to check";
+1265	
+1266		 end "have a job";
+1267	
+1268	     end "check running jobs";
+1269	
+1270	 end "monitor running jobs";
+1271	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 27
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1272	
+1273	Simple procedure MonitorActiveJobs;
+1274	for MyJob_ E!RunMax+1 upto E!RunMax+E!JobMax
+1275	 do begin "monitor active jobs"
+1276	
+1277	    if not( QQ( HaveP ) )		! if there isn't a processor ;
+1278	     then StartProcessor;		!  then start one ;
+1279	
+1280	    if ( QRS )				! something in slot ;
+1281	     then begin "active slot"
+1282	
+1283		NoBit_ lnot(MyBit_1 lsh MyJob);	! save bit values ;
+1284		case ( LPStat( QRS ) )
+1285		 of begin
+1286	
+1287		[ST$Hold] ;			! hold user request - restart ;
+1288	
+1289		[ST$Done]			! complete, good termination ;
+1290		if ( LPProc( QRS ) = PSD$Restart )
+1291		 then dpb( Hold$Restart, PStap( QRS ) )
+1292		 else begin "complete and reschedule"
+1293		    ReSchedule;
+1294		    QQ( Active )_ ( 0 max ( QQ( Active )-1 ) );
+1295		 end "complete and reschedule";
+1296	
+1297		[ST$Abort]			! abort on error condition ;
+1298		 begin "abort and reschedule"
+1299		    ReSchedule;
+1300		    QQ( Active )_ ( 0 max ( QQ( Active )-1 ) );
+1301		 end "abort and reschedule";
+1302	
+1303		[else]
+1304		end;
+1305	
+1306	     end "active slot";
+1307	
+1308	end "monitor active jobs";
+1309	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 28
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1310	
+1311	simple procedure EveryMinute;
+1312	begin "once a minute"
+1313	    own integer Date;
+1314	
+1315	    SetTim( Minute );				! reset the "minute" counter ;
+1316	    Minutes_ Minutes + 1;			! increment the time ;
+1317	    if ( ( Minutes mod 60 ) = 0 )		! on an even hour ... ;
+1318	     then QQ( New )_ 1;				! mark the queue ;
+1319	
+1320	    if ( (Ldb( point( (18+3), GetTDT, (17+3) ) ) lsh (18-3)) > BannerTDT )
+1321	     then LogInfo( cvsDat( !lh( BannerTDT_ GetTDT ) ) );
+1322	
+1323	    if not( Date )				! if just started ;
+1324	     then Date_ !lh( GetTDT );			!  we have a banner ;
+1325	
+1326	    if ( !lh( GetTDT ) > Date )			! if new date, new files ;
+1327	     then begin "setup new log"
+1328		Date_ !lh( GetTDT );			! remember new date ;
+1329		SetLog;					! set new YYMMDD name ;
+1330		LogInfo( cvsDat( !lh( BannerTDT ) ) );	! put marker in file ;
+1331	     end "setup new log";
+1332	
+1333	    for MyJob_ 1 upto E!RunMax			! for each job ;
+1334	     do begin "time checks"
+1335	
+1336		NoBit_ lnot (MyBit_ 1 lsh MyJob);	! save bit values ;
+1337	
+1338		if ( 0 < QRT < QQ( Daytime ) )		! time limit passed? ;
+1339		 then SetFlg( OverTime );		!  then mark the job ;
+1340		if ( 0 < QRR < GetTru( QRJ ) )
+1341		 then SetFlg( TRU! );			! TRU limit passed? ;
+1342	
+1343	     end "time checks";
+1344	end "once a minute";
+1345	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 29
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1346	
+1347	simple procedure DebugOptions;
+1348	begin "Debug Options"
+1349	
+1350	    if ( TestFeature( Tell ) )
+1351	     then begin "dump table"
+1352		TellAll;			! dump the table ;
+1353		ClearFeature( Tell );		! clear feature flag ;
+1354	     end "dump table";
+1355	
+1356	    if ( TestFeature( RSched ) )
+1357	     then begin "finish up"
+1358	
+1359		ClearFeature( RSched );
+1360		ClsQue;				! close the queue ;
+1361		if not( RunSlf )		! attempt to run. ;
+1362		 then Exit( "Cannot run self" );
+1363	
+1364	     end "finish up";
+1365	
+1366	end "Debug Options";
+1367	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 30
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1368	
+1369	simple procedure CleanupJobs;
+1370	begin "time to leave"
+1371	    integer MyJob;			! use local on kill ;
+1372	
+1373	    for MyJob_ 1 upto E!RunMax		!  for each run job ;
+1374	     do if ( QRS )			!   if there is one ;
+1375		then KillJob( QRJ );		!    knock it off   ;
+1376	
+1377	    if ( HaveProcessor ) and		! if I think that I ;
+1378	       ( QQ( HaveP ) )  and		!  have a processor ;
+1379	       ( QQ( Process ) )		!  check him out..  ;
+1380	     then SetFeature( Shut );		!   shut him down   ;
+1381	
+1382	    SetTim( 150 );			! 2 1/2 minutes ;
+1383	    while ( QQ( Running ) )		! anything going on ;
+1384	     do if not ( TIM! )			! check time limit ;
+1385		 then MonitorRunningJobs	!  check them out   ;
+1386		 else done;
+1387	
+1388	    ESC!_ true;				!  set escape flag  ;
+1389	
+1390	end "time to leave";
+1391	
+XEXEC.SAI                       created 09-Apr-87 14:54                                  Page 31
+Program Listing                 by CRFSYM %5 at 13-Apr-87 18:34
+
+1392	
+1393	!	M A I N   program
+1394	;
+1395	
+1396	if not( SystemTDT_ SysTDT )		! no time set?  wrong monitor ;
+1397	 then Exit( "Monitor too OLD to run job processor system, please reload" );
+1398	
+1399	if ( 0 > SystemTDT )			! any date set yet ;
+1400	 then while ( 0 > SystemTDT_ SysTDT )	! waiting for date-time ;
+1401	       do calli( 5, calli!SLEEP );	! sleep for a few seconds ;
+1402	
+1403	if not( OnlyMe )			! if XEXEC is already running ;
+1404	 then Exit( "Scheduler already running" );
+1405	
+1406	if not( OpnQue( que$Real lor que$Run lor que$Act ) )	! we're in deep #### ;
+1407	 then Exit( "Serious startup error, check job queue" );
+1408	
+1409	QQ( System )_ SystemTDT;		! set current system startup time ;
+1410	SetupJobTables;				! set everything up ;
+1411	SetTim( Minute );			! set timer for once a minute ;
+1412	
+1413	while not( ESC! )			! while it's ok to proceed ;
+1414	 do begin "the system is running"	! *** working loop *** ;
+1415	
+1416	    if ( TIM! )				! check watchdog timer ;
+1417	     then EveryMinute;			!  time to look around ;
+1418	
+1419	    if ( QQ( Running ) )		! anything going ;
+1420	     then MonitorRunningJobs;		! yes, so check them out ;
+1421	    if ( QQ( Active ) )			! anything active ;
+1422	     then MonitorActiveJobs;		! yes, monitor activity ;
+1423	
+1424	    if ( Req_ SlotsAvailable )		! if any slots are available ;
+1425	     then begin "check availability"	!  try to schedule it ;
+1426	
+1427	        if ( MyJob > E!RunMax )		! increment proper counter ;
+1428	         then QQ( Active )_  QQ( Active )  + 1
+1429	         else QQ( Running )_ QQ( Running ) + 1;
+1430	
+1431	     end "check availability";
+1432	
+1433	    if ( NTQ! )				! if notice received ;
+1434	     then CleanupJobs;			! clean up stuff now ;
+1435	
+1436	    if ( QQ( Feature ) < 0 )		! if debug flag on ;
+1437	     then DebugOptions;			!  then check options ;
+1438	
+1439	    if ( TestFeature( RProc ) )		! if processor waiting ;
+1440	     then StartProcessor;		!  then answer the call ;
+1441	
+1442	    calli( Ldb( point(6,QQ( Feature ),23) ) max 5, calli!SLEEP );
+1443	
+1444	 end "the system is running";
+1445	
+1446	Exit( DayStamp &" Signing off." );	! time to leave ;
+1447	
+1448	end 	"XEXEC" $
+1449	
+ PNj3
