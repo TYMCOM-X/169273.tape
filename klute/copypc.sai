@@ -1,0 +1,965 @@
+begin "main"
+
+require "copypc.def" source!file;
+
+require "copypc.glo" source!file;
+
+require "sysutil" load!module;
+
+require "vpl" load!module;
+
+require "binary" load!module;
+
+require "trans" load!module;
+
+
+external procedure SU.abort.transfer (integer abort.type);
+
+external procedure VA.create.pkt (integer array appl.rec;
+                         integer record.type,
+                                 link.type,
+                                 who.sent,
+                                 importance,
+                                 cmd.type;
+                       reference integer  appl.rec.size;
+                        boolean  EOF.seen,
+                                 EOR.seen);
+
+
+external procedure VA.get.inc.app.rec (integer array appl.rec;
+                              reference integer record.type,
+                                                link.type,
+                                                who.sent,
+                                                importance,
+                                                cmd.type;
+                              reference integer appl.rec.size;
+                              reference boolean EOF.seen,
+                                                EOR.seen);
+
+external simple procedure BI.timer.interrupt;
+
+
+! Application Layer procedure declarations ;
+
+boolean procedure AP.get.cmdline.params (
+   reference string pc.filename,
+                    host.filename,
+                    file.type;
+   reference boolean replace;
+   reference integer startup.abort.type);
+begin "get.cmdline.params"
+
+string commandline;
+integer flag;
+
+boolean procedure AP.parse.cmdline ;         ! internal to AP.get.cmdline ;
+begin "parse"
+
+string str;
+integer  table.num,
+         brchar;
+
+setbreak ((table.num := getbreak), ";", null, "isk");
+str := scan (commandline, table.num, brchar);
+if brchar neq '073 then    ! the semicolon ;
+   return (false);
+
+setbreak (table.num, '040 & '011, null, "isk");      ! look for keyword ;
+str := null;
+while (length(str) = 0) and (length(commandline) > 0) do
+   str := scan (commandline, table.num, brchar);
+
+if equ (str, "FROMHOST") or equ (str, "TOPC") then
+   direction.of.transfer := "TOPC"
+else
+   begin
+   if equ(str, "FROMPC") or equ (str, "TOHOST") then
+      direction.of.transfer := "TOHOST"
+   else
+      return (false);
+   end;
+
+str := null;
+while (length(str) = 0) and (length(commandline) > 0) do
+   str := scan (commandline, table.num, brchar);      ! get the host.filename ;
+if equ( str, null) then
+   return (false);
+host.filename := str;
+
+setbreak (table.num, "/", " ", "isk");
+str := scan (commandline, table.num, brchar);      ! get pc.filename ;
+if equ (str, null) then
+   return (false);
+pc.filename := str;
+
+file.type := "AST";
+replace := false;
+if (brchar = '057) then         ! there are switches to process ;
+   begin
+   setbreak (table.num, " ", null, "isk");
+   while (length (commandline) > 0) do
+      begin
+      str := null;
+      while (length(str) = 0) do
+         str := scan (commandline, table.num, brchar);
+      if equ (str, "B") then
+         file.type := "BINARY"
+      else
+         if equ (str, "R") then
+            replace := true
+         else
+            return (false);
+      end;
+   end;
+
+return (true);
+end "parse";
+
+
+integer procedure AP.check.host.file ;
+
+! internal to AP.get.cmdline.params ;
+
+begin "check"
+integer  inchan,
+         inbrch;
+boolean  at.EOF,
+         flag;
+
+open ((inchan := getchan), "dsk", 0, 2, 0, 200, inbrch, at.EOF);
+lookup (inchan, host.filename, flag);
+if equ (direction.of.transfer, "TOPC") then
+   begin
+   if flag then
+      return (file.missing.error);
+   end
+else              ! "TOHOST" ;
+   if ((not flag) and (not replace)) then
+      return (replace.file.error);
+
+release (inchan, 0);
+return (0);
+
+end "check";
+
+
+
+
+! AP.get.cmdline.params ;
+
+start!code           ! rescan the commandline ;
+setob 1,flag;
+ttcall '6,1;
+tlnn 1,'100000;
+   setzm flag;    ! skip if everything OK ;
+end;
+
+if (not flag) then
+   return (false);
+
+start!code
+ttcall '10,;
+end;
+
+commandline := inchwl;
+if AP.parse.cmdline then
+   begin
+   case AP.check.host.file of
+      begin
+      [0] begin return (true); end;
+      [1] begin startup.abort.type := file.missing.error; end;
+      [2] begin startup.abort.type := replace.file.error end
+      end;
+   end
+else
+   startup.abort.type := syntax.error;
+return (false);
+end "get.cmdline.params";
+
+
+
+procedure AP.startup.abort (integer startup.abort.type);
+begin "start.abort"
+case startup.abort.type of
+   begin
+   [syntax.error] print
+   ("Syntax error.  Enter commandline in the following format:", crlf,
+    "COPYPC FROMHOST <host filename> <PC filename> / B R", crlf,
+    "       TOHOST", crlf);
+   [file.missing.error] print
+   ("No such host file.");
+   [replace.file.error] print
+   ("Host file already exists.  Specify replace.", crlf)
+   end;
+end "start.abort";
+
+   procedure AP.init.everything;
+begin "init"
+
+integer i;
+
+! init the terminal ;
+start!code
+   seto     1,;            ! refer to command port (-1) ;
+   ttcall   6,1;           ! read line characteristics ;
+   movem    1, T!LCHW;     ! save them for later ;
+   tlo      1, '220;       ! no free CR, no case mapping ;
+   ttcall   7,1;           ! set line characteristics word ;
+   hrroi    1, '64;        ! set port file status word on command port ;
+   auxcal   1, '714;       ! data mode = binary,
+                             full character set,
+                             no echo,
+                             no escape echo ;
+   setzm    T!XON;         ! 0 means sut off XON/XOFF backpressure control ;
+   hrroi    1, '55;        ! swap XON status for command port ;
+   auxcal   1, T!XON;      ! save the d/d value for later restoration ;
+      jfcl;                ! ignore error return ;
+end;
+
+! set up timer interrupt ;
+intmap (intass(!iatim, TimerInterruptChannel), BI.timer.interrupt, 0);
+enable (newenb (TimerInterruptChannel));
+
+EOF := false;
+EOR := false;
+EOD := true;
+need.reset := true;
+file.open := false;
+
+in.startup.mode := true;
+in.closeup.mode := false;
+timeout := false;
+incoming.timeout.counter := 0;
+outgoing.timeout.counter := 0;
+max.incoming.timeouts := 2;
+max.outgoing.timeouts := 2;
+number.of.seconds := 39;
+last.PID.ACKed := 0;
+
+top.of.PID.range := '172;
+bottom.of.PID.range := '040;
+current.incoming.PID := bottom.of.PID.range;
+greatest.outgoing.PID := bottom.of.PID.range;
+current.outgoing.PID := top.of.PID.range;
+
+! init out.pkt.ptr to third byte of the packet ;
+outgoing.packet.ptr := point(8, outgoing.packet[0], 15);
+
+max.incoming.packet.size := 2012;
+max.outgoing.packet.size := 996;
+room.in.packet := max.outgoing.packet.size;
+timeout.type := shut.off;
+arrclr (current.outgoing.packet);
+arrclr (last.outgoing.packet);
+
+! characters which must be encoded are set to true in the xlate table ;
+arrclr (xlatetb);
+xlatetb[cr] := true;
+xlatetb[lf] := true;
+xlatetb[escape] := true;
+xlatetb[shift.in] := true;
+xlatetb[shift.out] := true;
+xlatetb[xoff] := true;
+xlatetb[xon] := true;
+xlatetb[bel] := true;
+xlatetb[vt] := true;
+xlatetb[ht] := true;
+xlatetb[bs] := true;
+xlatetb[ff] := true;
+
+! hex encoded character set ;
+arrclr (hex.table);
+for i := '060 step 1 until '071 do
+   hex.table[i] := true;
+for i := '101 step 1 until '106 do
+   hex.table[i] := true;
+
+! command table initialization ;
+
+if equ (direction.of.transfer , "TOPC") then
+   begin
+   appl.cmd.table[1] := 2;
+   appl.cmd.table[2] := 6;
+   appl.cmd.table[3] := 7;
+   appl.cmd.table[4] := 9;
+
+   cmd.data.table[1] := null;
+   cmd.data.table[2] := pc.filename;
+   if replace then
+      cmd.data.table[3] := 1
+   else
+      cmd.data.table[3] := 3;       ! if not replace then error ;
+   if equ(file.type, "AST") then
+      cmd.data.table[4] := 3
+   else
+      cmd.data.table[4] := 1;
+
+   for i := 1 step 1 until 4 do
+      begin
+      link.type.table[i] := prim.appl;
+      who.sent.table[i] := requestor;
+      importance.table[i] := advisory;
+      cmd.type.table[i] := reply.opt;
+      end;
+
+   appl.cmd.table[5] := 3;
+   link.type.table[5] := prim.appl;
+   who.sent.table[5] := requestor;
+   importance.table[5] := important;
+   cmd.type.table[5] := reply.req;
+   cmd.data.table[5] := null;
+
+   number.of.cmds.in.table := 5;
+   end
+else                             ! TOHOST ;
+   begin
+   appl.cmd.table[1] := 1;
+   appl.cmd.table[2] := 6;
+   link.type.table[1] := prim.appl;
+   link.type.table[2] := prim.appl;
+   who.sent.table[1] := requestor;
+   who.sent.table[2] := requestor;
+   importance.table[1] := advisory;
+   importance.table[2] := advisory;
+   cmd.type.table[1] := reply.opt;
+   cmd.type.table[2] := reply.opt;
+   cmd.data.table[1] := null;
+   cmd.data.table[2] := pc.filename;
+
+   appl.cmd.table[3] := 3;
+   link.type.table[3] := prim.appl;
+   who.sent.table[3] := requestor;
+   importance.table[3] := important;
+   cmd.type.table[3] := reply.req;
+   cmd.data.table[3] := null;
+
+   number.of.cmds.in.table := 3;
+
+   end;
+
+
+end "init";
+procedure AP.send.startup.cmds;
+begin "send startup"
+
+integer cmd.table.pointer;          ! index into command table arrays ;
+integer record.type;
+integer appl.cmd;
+integer link.type;
+integer who.sent ;
+integer importance;
+integer cmd.type;
+integer array application.record[0:9];    ! allow 40 characters ;
+integer appl.rec.size;
+integer ap.bptr;     integer j;
+integer char;
+
+record.type := command;
+
+for cmd.table.pointer := 1 step 1 until number.of.cmds.in.table do
+   begin
+   ! set application parameters from command tables ;
+   link.type := link.type.table[cmd.table.pointer];
+   who.sent := who.sent.table[cmd.table.pointer];
+   importance := importance.table[cmd.table.pointer];
+   cmd.type := cmd.type.table[cmd.table.pointer];
+
+   ! create application.record from appl.cmd + cmd.data, form 8-bit bytes ;
+   ap.bptr := point (8, application.record[0], -1);
+   idpb (appl.cmd.table[cmd.table.pointer], ap.bptr);
+   appl.rec.size := 1;
+
+   while length(cmd.data.table[cmd.table.pointer]) > 0 do
+      begin
+      char := lop (cmd.data.table[cmd.table.pointer]);
+      idpb (char, ap.bptr);
+      appl.rec.size := appl.rec.size + 1;
+      end;
+
+   if cmd.table.pointer = number.of.cmds.in.table then
+      EOF := true;
+
+   VA.create.pkt (application.record, command, link.type, who.sent, importance,
+                      cmd.type, appl.rec.size, EOF, true);
+
+
+   end;        ! for loop ;
+
+end "send startup";
+
+
+internal procedure AP.handle.micro.response (integer array appl.rec;
+                                    integer importnt,
+                                            c.type;
+                          reference boolean EOF.seen);
+begin "handle"
+
+integer   appl.cmd,
+         reason.code,
+         b.ptr;
+
+b.ptr := point(8, appl.rec[0], -1);
+appl.cmd := ildb(b.ptr);
+
+if importnt then
+   begin
+   if (c.type > 5) or (c.type < 0) then
+      SU.abort.transfer (unknown.cmd.type)
+   else
+   case c.type of
+      begin
+      [reply.req]
+         begin
+         SU.abort.transfer (unimplemented.micro.cmd.received.error);
+         end;
+      [pos.reply]
+         begin
+         if not in.closeup.mode then
+            begin
+            if appl.cmd = 3 then
+               begin
+               positive.reply.received := true;
+               in.startup.mode := false;
+print(crlf,"positive reply received",crlf);
+               EOF.seen := true;    ! workaround for Rob Larson's code
+                                      which doesn't set EOF ;
+               end;
+            end
+         else        ! in.closeup.mode ;
+            if appl.cmd = 5 then
+               positive.reply.received := true;
+
+
+         end;
+      [neg.reply, req.for.info]
+         begin
+         if EOF.seen then     ! TYMCOMM sends neg.reply, then exp.reply ;
+            SU.abort.transfer (micro.cannot.continue.error);
+         end;
+      [exp.reply]
+         begin
+         reason.code := cvd (ildb(b.ptr));
+         SU.abort.transfer (reason.code + 9);
+         end
+      end;        ! case ;
+   end;     ! important ;
+
+end "handle";
+
+procedure AP.get.micro.response (reference boolean  reply);
+begin "get.response"
+
+boolean EOF.seen;
+boolean EOR.seen;
+integer array appl.rec[0:62];
+integer r.type;
+integer l.type;
+integer who.s;
+integer importnt;
+integer c.type;
+integer a.rec.size;
+
+EOF.seen := false;
+reply := false;
+while not EOF.seen do
+   begin
+   VA.get.inc.app.rec (appl.rec,
+                          r.type,
+                          l.type,
+                          who.s,
+                          importnt,
+                          c.type,
+                          a.rec.size,
+                          EOF.seen,
+                          EOR.seen);
+! debug ;
+print ("Micro's response:  important: ", importnt, "cmd type: ", c.type," r.type: ", r.type," EOF: ", eof.seen,crlf);
+   if r.type = command then
+      begin
+! handle sets positive.reply.received, if appropriate ;
+      AP.handle.micro.response (appl.rec, importnt, c.type, EOF.seen);
+      end
+   else     ! data received - really a protocol error ;
+      EOF.seen := false;      ! force a look again for micro's response ;
+   end;     ! while ;
+
+
+
+end "get.response";
+
+
+
+boolean procedure AP.get.positive.reply;
+begin "get"
+
+integer array appl.rec[0:1];
+
+AP.send.startup.cmds;
+
+AP.get.micro.response (positive.reply.received);
+if positive.reply.received then
+   return (true)
+else
+   return (false);
+
+end "get";
+procedure AP.transfer.out (string file.type,
+                                  host.filename);
+begin "out"
+
+integer br.table,
+        br.char,
+        kount,
+        mode,
+        number.left,
+        record.type,
+        link.type,
+        who.sent,
+        importance,
+        cmd.type,
+        appl.rec.size,
+        how.many;
+integer array appl.record[0:63];
+boolean EOR.seen;
+
+
+
+
+
+! internal to AP.transfer.out ;
+procedure AP.read.host.file (string file.type;
+                   integer array file.record;
+                   reference integer appl.rec.size;
+                   reference boolean EOF.seen,
+                                     EOR.seen);
+begin "read"
+
+integer rbptr,
+        char,
+        j,
+        i;
+string aline;
+
+if equ ( file.type , "AST") then
+   begin "text file"
+   aline := input (file.channel, br.table);
+   if EOF and ((EOF lsh -18) neq '20000) then
+      SU.abort.transfer (file.read.error);
+   EOR.seen := (br.char neq 0);     ! broke on <cr> ;
+   appl.rec.size := length (aline);
+   rbptr := point (8, file.record[0], -1);
+   for i := 1 step 1 until appl.rec.size do
+      begin
+      char := lop (aline);
+      idpb (char, rbptr);
+      end;
+   end "text file"
+else
+   begin "binary file"
+   j := 0;
+   if number.left = 0 then       ! need to read file ;
+      begin
+      arryin (file.channel, binary.record[0], how.many);
+! debug ;
+print ("read of binary file into binary.record OK", crlf);
+      if EOF then
+         begin
+         if (EOF lsh -18) neq ('20000 + mode) then    ! read error ;
+            SU.abort.transfer (file.read.error);
+         number.left := EOF land mask(18);   ! right half of flag contains
+                                               number of words read ;
+         EOF.seen := true;
+         end
+      else        ! not EOF ;
+         number.left := how.many;
+      end;
+
+! debug ;
+print ("number.left: ", number.left, crlf);
+
+! account for EOF with read of nothing ;
+   if number.left > 0 then
+      begin "do normal processing"
+      for i := 0 step 1 until number.left - 1 do
+         begin
+         j := binary.record[i] land mask(4);    ! look at last 4 bits of word ;
+         if j > 7 then
+            done;
+         end;
+
+! debug ;
+print ("finished 1st loop - j = ", j, " i = ", i, crlf);
+      if j > 7 then
+         begin
+         EOR.seen := true;
+         appl.rec.size := (4 * i) + (j land mask(3)); ! low-order 3 bits ;
+         number.left := number.left - i - 1;
+         end
+      else
+         begin
+         if EOF then
+            appl.rec.size :=
+               4 * number.left - (4 - (binary.record[i-1] land mask(3)))
+         else
+            appl.rec.size := 4 * number.left;
+! debug ;
+print ("set appl.rec.size: ", appl.rec.size, crlf);
+         EOR.seen := false;
+         number.left := number.left - i;
+! debug;
+print ("number left: ", number.left, crlf);
+         end;
+
+      for j := 0 step 1 until i do
+         file.record[j] := binary.record[j];
+! debug ;
+print ("transferred binary rec to file rec", crlf);
+
+      if number.left > 0 then
+         for j := 0 step 1 until number.left - 1 do
+            binary.record[j] := binary.record[j + i + 1];   ! left shift ;
+      end "do normal processing"
+   else
+      begin
+      appl.rec.size := 0;
+      EOR.seen := false;
+      end;
+   end "binary file";
+
+
+end "read";
+
+! code for AP.transfer.out ;
+print ("GOT TO TRANSFER OUT!!!", CRLF);
+
+if equ (file.type, "AST") then
+   begin
+   setbreak ((br.table := getbreak), '12 & null, '15 & null, "ins");
+   mode := 0;
+   end
+else
+   mode := '10;
+kount := 200;
+how.many := 60;
+number.left := 0;
+open ((file.channel := getchan), "dsk", mode, 2, 0, kount, br.char, EOF);
+lookup (file.channel, host.filename, EOF);
+if EOF then
+   SU.abort.transfer (cant.open.host.file)
+else
+   file.open := true;
+
+! set parameters for Valid Packet Layer ;
+record.type := data;
+link.type := prim.appl;
+who.sent := requestor;
+importance := advisory;
+cmd.type := not.a.command;
+
+prev.record.type := record.type;
+prev.link.type := link.type;
+prev.who.sent := who.sent;
+prev.importance := importance;
+prev.cmd.type := cmd.type;
+
+
+do
+   begin
+   AP.read.host.file (file.type, appl.record, appl.rec.size, EOF, EOR.seen);
+   if EOF and (number.left > 0) then
+      VA.create.pkt (appl.record, record.type, link.type, who.sent,
+                     importance, cmd.type, appl.rec.size, false, EOR.seen)
+   else
+    create.pkt (appl.record, record.type, link.type, who.sent,
+                     importance, cmd.type, appl.rec.size, EOF, EOR.seen)
+   end
+until EOF and (number.left = 0);
+
+close (file.channel, 0);
+release (file.channel, 0);
+
+end "out";
+
+
+procedure AP.transfer.in (string file.type,
+                                 host.filename);
+begin "in"
+
+integer  mode,
+         kount,
+         brchar,
+         record.type,
+         link.type,
+         who.sent,
+         importance,
+         cmd.type,
+         appl.rec.size;
+integer array appl.record[0:63];
+boolean  reply,
+         EOF.seen,
+         EOR.seen;
+string aline;
+
+
+procedure AP.write.host.file (integer array file.record;
+                                   string   file.type;
+                                   integer  file.rec.size;
+                                   boolean  EOF.seen,
+                                            EOR.seen);
+! internal to AP.transfer.in ;
+begin "write"
+
+integer bptr,        ! pointer to another.record ;
+        sptr,        ! pointer to saved.bytes ;
+        fptr,        ! pointer to file.record ;
+        i,
+        how.many,
+        spot;
+integer array another.record[0:63];
+
+if equ (file.type, "AST") then
+   begin "AST"
+   fptr := point (8, file.record[0], -1);
+   for i := 1 step 1 until file.rec.size do
+      aline := aline & ildb (fptr);
+   if EOR.seen then
+      begin
+      cprint (file.channel, aline, crlf);
+      aline := null;
+      end
+   else
+      begin
+      if EOF.seen then
+         cprint (file.channel, aline);
+      end;
+   end "AST"
+else
+   begin "binary"
+   fptr := point (8, file.record[0], -1);
+   bptr := point (8, another.record[0], -1);
+   sptr := point (8, saved.bytes, -1);
+   if left.over > 0 then
+      begin "replace saved bytes"
+! create another record rather than right shifting and accounting for the
+  4 bits at the end of each integer ;
+      for i := 1 step 1 until left.over do
+         begin
+         spot := ildb(sptr);        ! pick up saved byte ;
+
+         idpb (spot, bptr);         ! put it into another record ;
+         end;
+      end "replace saved bytes";
+   for i := 1 step 1 until file.rec.size do
+      begin
+      spot := ildb (fptr);       ! pick up new byte ;
+      idpb (spot, bptr);         ! put it into another record ;
+      end;
+
+   file.rec.size := file.rec.size + left.over;
+
+! determine whether we've got a full last integer to write ;
+   how.many := file.rec.size div 4;
+   left.over := file.rec.size mod 4;
+
+   if not EOR.seen then
+      begin
+      if left.over > 0 then
+         begin "save bytes"
+         sptr := point (8, saved.bytes, -1);
+         fptr := point (8, file.record[how.many], -1);
+         for i := 1 step 1 until left.over do
+            begin
+            spot := ildb (fptr);
+
+            idpb (spot, sptr);
+            end;
+         end "save bytes";
+      end         ! if not eor ;
+   else
+      begin
+      if (left.over > 0) or (file.rec.size = 0) then  ! acct for null EOR;
+         how.many := how.many + 1;
+      left.over := left.over + 8;         ! turn on bit 4 ;
+      bptr := point(4, another.record[how.many - 1], 31);
+      idpb (left.over, bptr);
+      left.over := 0;
+      end;
+
+
+   if EOF.seen and not EOR.seen then   ! save number of bytes in last integer ;
+      begin
+      if left.over > 0 then
+         how.many := how.many + 1
+      else     ! last word is full ;
+         left.over := 4;
+      bptr := point (4, another.record[how.many - 1], 31);
+      idpb (left.over, bptr);
+      end;
+
+! now we're ready to write another record ;
+   arryout (file.channel, another.record[0], how.many);
+! check to see if arryout failed ;
+   if EOF then
+      SU.abort.transfer (file.write.error);
+
+   end "binary";
+
+end "write";
+
+procedure AP.close.host.file (string host.filename);
+! internal to AP.transfer.in ;
+begin "close host"
+
+integer chan,
+        brchar;
+boolean at.eof;
+
+if replace then
+   begin
+   open ((chan := getchan), "dsk", '10, 2, 0, 200, brchar, at.eof);
+   lookup (chan, host.filename, at.eof);
+   rename (chan, null, 0, at.eof);
+   end;
+
+rename (file.channel, host.filename, 0, at.eof);
+close (file.channel, 0);
+release (file.channel, 0);
+
+end "close host";
+
+! code for AP.transfer.in ;
+! debug ;
+print ("GOT TO TRANSFER IN!!!", CRLF);
+
+if equ (file.type, "AST") then
+   begin
+   mode := 0;
+   aline := null;
+   end
+else
+   mode := '10;
+kount := 200;
+open ((file.channel := getchan), "dsk", mode, 0, 2, kount, brchar, EOF);
+enter (file.channel, "copypc.tmp", EOF);
+if EOF then
+   SU.abort.transfer (cant.open.host.file)
+else
+   file.open := true;
+
+left.over := 0;
+do
+   begin
+   VA.get.inc.app.rec (appl.record, record.type, link.type,
+            who.sent, importance, cmd.type, appl.rec.size, EOF.seen, EOR.seen);
+   if record.type = command then
+      begin
+      AP.handle.micro.response (appl.record, importance, cmd.type, EOF.seen);
+! account for status messages received during transfer ;
+      EOF.seen := false;
+      end
+   else
+      AP.write.host.file (appl.record, file.type, appl.rec.size, EOF.seen,
+                           EOR.seen);
+   end
+until EOF.seen;
+
+AP.close.host.file (host.filename);
+
+end "in";
+procedure AP.close.up;
+begin "close up"
+
+integer  record.type,
+         appl.cmd,
+         link.type,
+         who.sent,
+         importance,
+         cmd.type;
+integer  bptr;
+integer array appl.record[0:6];
+integer  appl.rec.size;
+integer  i;
+
+record.type := command;
+link.type := prim.appl;
+who.sent := requestor;
+if equ (direction.of.transfer, "TOPC") then
+   begin
+   importance := important;
+   cmd.type := reply.req;
+   end
+else
+   begin
+   importance := advisory;
+   cmd.type := reply.opt;
+   end;
+appl.rec.size := 1;
+
+bptr := point (8, appl.record[0], -1);
+idpb ('005, bptr);         ! command 5 ;
+
+in.closeup.mode := true;
+print ("In closeup mode", crlf);
+
+VA.create.pkt (appl.record, record.type, link.type, who.sent, importance,
+               cmd.type, appl.rec.size, true, true);
+
+if equ(direction.of.transfer, "TOPC") then
+   begin
+   positive.reply.received := false;
+   AP.get.micro.response (positive.reply.received);
+   end
+else        ! waste some time while Rob Larson sends some garbage ;
+   for i := 1 step 1 until 1000000 do ;
+
+! finish terminal ;
+start!code
+   move     1,T!LCHW;         ! restore d/d line characteristics ;
+   ttcall   7,1;              ! set line characteristics for command port ;
+   hrroi    1, '64;           ! set port file status word for command port ;
+   auxcal   1,0;              ! clear all bits we set before ;
+      jfcl ;                  ! ignore error return ;
+   hrroi    1, '55;           ! swap XON/XOFF status back ;
+   auxcal   1, T!XON;
+      jfcl ;                  ! ignore error return ;
+end;
+
+! clear input buffer ;
+start!code
+   hrroi    1,6;
+   auxcal   1,;
+end;
+
+if positive.reply.received then
+   print (crlf, "Transfer Completed Normally.", crlf);
+
+end "close up";
+
+
+
+!  mainline driver;
+if AP.get.cmdline.params (pc.filename,
+         host.filename, file.type, replace, startup.abort.type) then
+   begin
+   AP.init.everything;
+   if AP.get.positive.reply then
+      begin
+      if equ (direction.of.transfer, "TOHOST") then
+         AP.transfer.in (file.type, host.filename)
+      else
+         AP.transfer.out (file.type, host.filename);
+   AP.close.up;
+      end
+   else
+      SU.abort.transfer (no.positive.reply.received.error);
+   end
+else
+   begin
+   AP.startup.abort (startup.abort.type);
+   end;
+
+exit;           !  eliminates the end of SAIL execution msg ;
+end "main";
+
+
+, "º
