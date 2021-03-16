@@ -1,0 +1,340 @@
+entry;
+begin "transport layer"
+
+require "copypc.def" source!file;
+
+require "copypc.ext" source!file;
+
+external procedure BI.check.for.timeout;
+
+external integer procedure BI.calculate.checksum (integer array pkt;
+                                                  integer pkt.size);
+internal procedure TR.get.decoded.packet;
+begin "get decoded"
+
+boolean  searching.for.lead.in.character,
+         in.decode.mode,
+         first.char,
+         end.of.packet;
+integer  byte.read,
+         high.byte,
+         decoded.byte;
+
+
+! internal to TR.get.decoded.packet ;
+
+simple integer procedure TR.read.byte;
+begin "read"
+
+start!code
+   label L1, L2;
+   hrroi    2,1;        ! input char, skip if no char exists ;
+   auxcal   2,1;        ! place char in R1, causing it to become return value ;
+      jrst  L1;
+   andi     1, '377;    ! 8-bit mask ;
+      jrst  L2;
+L1:
+      seto  1,;         ! -1 if no char was there ;
+L2:
+end;
+
+end "read";
+! internal to TR.get.decoded.packet ;
+
+integer procedure TR.decode.bytes (integer high.order.byte,
+                                           low.order.byte);
+begin "decode"
+
+integer new.byte;
+
+
+! internal to TR.decode.bytes ;
+
+integer procedure TR.hex.decode (integer decode.byte);
+begin "hex decode"
+
+case decode.byte of
+   begin
+   ['060] return (0);      ! "0" ;
+   ['061] return (1);      ! "1" ;
+   ['062] return (2);
+   ['063] return (3);
+   ['064] return (4);
+   ['065] return (5);
+   ['066] return (6);
+   ['067] return (7);
+   ['070] return (8);
+   ['071] return (9);
+   ['101] return (10);     ! "A" ;
+   ['102] return (11);
+   ['103] return (12);
+   ['104] return (13);
+   ['105] return (14);
+   ['106] return (15)      ! "F" ;
+   end;     ! case ;
+
+end "hex decode";
+
+
+! code for TR.decode.bytes ;
+
+if hex.table[high.order.byte] AND hex.table[low.order.byte] then
+   begin
+   new.byte := TR.hex.decode (high.order.byte);
+   new.byte := new.byte LSH 4;
+   return (new.byte + TR.hex.decode(low.order.byte));
+   end
+else        ! drop packet - there's an error ;
+   begin
+   searching.for.lead.in.character := true;
+   in.decode.mode := false;
+   first.char := true;
+   return (-1);
+   end;
+
+end "decode";
+! code for TR.get.decoded.packet ;
+
+searching.for.lead.in.character := true;
+in.decode.mode := false;
+first.char := true;
+end.of.packet := false;
+
+while not end.of.packet do
+   begin
+   byte.read := TR.read.byte;
+   if byte.read = -1 then        ! no characeter there ;
+      begin
+      BI.check.for.timeout;
+      ! debug;
+! print ("Returned from check.for.timeout", crlf);
+      end
+   else
+      if searching.for.lead.in.character then
+         begin
+         if byte.read = lead.in.character then
+            begin
+            incoming.packet.size := 0;
+            arrclr (incoming.packet);
+            incoming.packet.ptr := point (8, incoming.packet[0], -1);
+            searching.for.lead.in.character := false;
+            end;
+         end
+      else        ! not searching ;
+         begin
+         incoming.packet.size := incoming.packet.size + 1;
+         if incoming.packet.size > max.incoming.packet.size then
+            begin
+            searching.for.lead.in.character := true;
+            in.decode.mode := false;
+            first.char := true;
+            end
+         else        ! size of packet is still okay ;
+            if byte.read = end.of.packet.char then
+               begin
+               end.of.packet := true;
+               incoming.packet.size := incoming.packet.size - 1;
+               end
+            else        ! not e.o.p ;
+               if in.decode.mode then
+                  if first.char then
+                     if byte.read NEQ shift.out then
+                        begin
+                        high.byte := byte.read;
+                        first.char := false;
+                        end
+                     else
+                        begin       ! shift out ;
+                        in.decode.mode := false;
+                        incoming.packet.size := incoming.packet.size - 1;
+                        first.char := true;
+                        end
+                  else        ! not first.char - assume second char ;
+                     begin
+                     decoded.byte := TR.decode.bytes (high.byte, byte.read);
+                     idpb (decoded.byte, incoming.packet.ptr);
+                     incoming.packet.size := incoming.packet.size - 1;
+                     first.char := true;
+                     end
+               else        ! not decoding ;
+                  if byte.read = shift.in then
+                     begin
+                     in.decode.mode := true;
+                     first.char := true;
+                     incoming.packet.size := incoming.packet.size - 1;
+                     end
+                  else        ! normal, non-encoded byte ;
+                     idpb (byte.read, incoming.packet.ptr);
+         end;
+   end;        ! while ;
+
+! debug ;
+incoming.packet.ptr := point (8, incoming.packet[0], -1);
+for byte.read := 1 step 1 until incoming.packet.size do
+   print(ildb(incoming.packet.ptr), " ");
+print (crlf);
+
+end "get decoded";
+
+
+simple procedure TR.send.byte (integer input.byte);
+begin "send byte"
+! debug;
+! print ( (input.byte), " ");
+! if input.byte = end.of.packet.char then print (crlf);
+
+start!code
+   move     1, input.byte;
+   hrroi    13, 3;
+   auxcal   13, 1;
+end;
+
+end "send byte";
+internal procedure TR.encode.and.send (integer array packet;
+                                       integer number.of.bytes);
+begin "encode and send"
+
+boolean  in.encode.mode;
+integer  packet.byte,
+         next.byte,
+         packet.ptr,
+         packet.counter;
+
+
+! internal to TR.encode.and.send ;
+
+procedure TR.hex.encode.and.send (integer input.byte);
+begin "hex encode"
+
+integer  high.order,
+         low.order;
+
+
+! internal to TR.hex.ecnode.and.send ;
+
+integer procedure TR.encode.bytes (integer in.byte);
+begin "encode"
+
+case in.byte of
+   begin
+   [0] return ('060);      ! "0" ;
+   [1] return ('061);
+   [2] return ('062);
+   [3] return ('063);
+   [4] return ('064);
+   [5] return ('065);
+   [6] return ('066);
+   [7] return ('067);
+   [8] return ('070);
+   [9] return ('071);
+   [10] return ('101);     ! "A" ;
+   [11] return ('102);
+   [12] return ('103);
+   [13] return ('104);
+   [14] return ('105);
+   [15] return ('106)      ! "F" ;
+   end;     ! case ;
+
+end "encode";
+
+
+! code for TR.hex.encode.and.send ;
+
+low.order := input.byte LAND mask(4);
+high.order := input.byte LSH -4;
+
+TR.send.byte (TR.encode.bytes (high.order));
+TR.send.byte (TR.encode.bytes (low.order));
+
+end "hex encode";
+! code for TR.encode.and.send ;
+
+in.encode.mode := false;
+packet.counter := 0;
+packet.ptr := point(8, packet[0], -1);
+TR.send.byte ('000);          ! a null ;
+TR.send.byte(escape);         ! micro's lead-in-char ;
+
+packet.byte := ildb(packet.ptr);
+packet.counter := packet.counter + 1;
+
+while packet.counter LEQ number.of.bytes do
+   begin
+   if xlatetb[packet.byte] then     ! not transmittable byte ;
+      begin
+      if not in.encode.mode then
+         begin
+         in.encode.mode := true;
+         TR.send.byte (shift.in);
+         end;
+      TR.hex.encode.and.send (packet.byte);
+      end
+   else        ! byte is transmittable without encoding ;
+      if in.encode.mode then
+            begin
+            TR.send.byte (shift.out);
+            in.encode.mode := false;
+            TR.send.byte (packet.byte);
+            end
+      else              ! not encoding - your normal, run-of-the-mill byte;
+         TR.send.byte (packet.byte);
+   packet.byte := ildb (packet.ptr);
+   packet.counter := packet.counter + 1;
+
+   end;           ! while ;
+
+TR.send.byte (end.of.packet.char);
+
+end "encode and send";
+internal procedure TR.send.reset;
+begin "reset"
+
+integer array initial.ACK[0:1];
+integer  a.ptr,
+         chksum,
+         high.chksum;
+
+! create reset packet ;
+! arrclr (initial.ACK);
+! a.ptr := point (8, initial.ACK[0], -1);
+! idpb ('165, a.ptr);
+
+! chksum := BI.calculate.checksum (initial.ACK, 1);
+! a.ptr := point (8, initial.ACK[0], 7);
+! high.chksum := chksum lsh -8;
+! chksum := chksum lsh 28;
+! chksum := chksum lsh -28;
+
+! idpb (high.chksum, a.ptr);
+! idpb (chksum, a.ptr);
+
+! TR.encode.and.send (initial.ACK, 3);
+
+! create initial ACK so micro can reset his PIDs ;
+
+arrclr (initial.ACK);
+a.ptr := point (8, initial.ACK[0], -1);
+
+idpb ('170, a.ptr);        ! "x" ;
+idpb ('040, a.ptr);        ! " " ;
+idpb ('040, a.ptr);        ! " " ;
+chksum := BI.calculate.checksum (initial.ACK, 3);
+
+a.ptr := point (8, initial.ACK[0], 23);
+high.chksum := chksum lsh -8;
+chksum := chksum lsh 28;
+chksum := chksum lsh -28;
+
+idpb (high.chksum, a.ptr);
+idpb (chksum, a.ptr);
+
+TR.encode.and.send (initial.ACK, 5);
+
+end "reset";
+
+
+
+end "transport layer";
+
+
+ 
