@@ -1,0 +1,779 @@
+begin "QueDpy - System Display Hack"
+
+  require '5 lsh 24 lor '0 version;
+
+  require "(sailib)sail.def"   source!file;
+  require "(mpl)uuosym.def"    source!file;
+  require "(execx)jqueue.def"  source!file;
+  require "(execx)jque.req"    source!file;
+  require "(carl)daytim.req"   source!file;
+  require "(carl)sydisp.req"   source!file;
+  require "(sailib)dul.req"    source!file;
+  require "(sailib)vmfile.req" source!file;
+
+define	MaxRow = 24;			! maximum row in screen array ;
+define	CmdRow = MaxRow;		! row to display commands ;
+define	MsgRow = MaxRow-1;		! row to display messages ;
+
+define	DpyJobs   = 0;			! screen for normal display ;
+define	DpyActive = DpyJobs   + 1;	! screen for active jobs ;
+define	DpyFile   = DpyActive + 1;	! screen for file display ;
+define	DpyQueue  = DpyFile   + 1;	! screen for queue map display ;
+
+define	DpyHelp   = DpyQueue  + 1;	! screen for help text ;
+define	DpyMax    = DpyHelp;		! maximum screen count ;
+
+define Msg(x,y,text) = {Install(BP_point(7,Buffer[x,y],-1),text)};
+define Node(x) = {( ((x lsh -10) land '7700) lor ((x lsh -8) land '77) )};
+
+define	NoSKIP = { if (not !skip! ) then return( false ) }
+,	PEEK(x) = { Calli( !bit(0) lor (x), calli!VPEEK ) }
+,	Gettab( idx, tbl ) = {( calli( !xwd( idx, tbl ), calli!GETTAB ) )}
+;
+
+! system internal definitions - subject to change
+;
+
+define
+	ddbNAM='0		! device name ;
+,	ddbJOB='1		! job in bits 0-6 ;
+,	ddbNXT='3		! lh=next ddb, rh=dispatch ;
+,	ddbMOD='4		! characteristics ;
+,	  dvTTY='10000000	! '10 in lh, is a tty ;
+,	  dvATT='20000000000	! '20000 in lh, tty attached ;
+,	ddbLDB='13		! lh=last ddb, rh=ldb pointer ;
+;
+
+
+! globals ;
+
+boolean	Special				! flag special bits on/off ;
+,	DisplayIdle			! true if showing idle time ;
+,	OnlyIdle			! true if showing only idle jobs ;
+,	OnlyActive			! true if showing only active jobs ;
+,	StillRunning			! true while we're still going ;
+;
+
+integer	MyJob, MyPort			! this frame number, port ;
+,	MyPriv				! this frame's privileges ;
+,	MyLic				! this frame's license ;
+,	MyAun				! this frame's logged in PPN ;
+,	MyLine				! this frame's line ;
+,	Row, Col			! current row, col within buffer ;
+,	BP, V, I			! byte pointer, value, index ;
+,	QueSlot				! slot for reading queue ;
+,	PageBase			! address for looking at queue ;
+,	BasePage			! base page of queue map-ent ;
+,	ThisScreen			! which display screen ;
+,	Offset, Page			! offsets for what to display ;
+,	IdleTime			! idle time cutoff variable ;
+,	LineCount			! counter for displayed lines ;
+,	StartRow			! row to start incrmental display ;
+,	CmdArg				! command argument value ;
+,	SleepTime			! seconds to sleep between scans ;
+,	Phy!Memory			! size of physical memory ;
+,	Mon!Memory			! size of monitor memory ;
+,	Mon!Ports			! maximum # ports on system ;
+,	Mon!Jobs			! maximum # jobs for system ;
+,	SerialNumber			! serial number this cpu ;
+,	CPU!Tics			! tics used last min ;
+,	CPU!TicsPerMin			! tics per min this cpu ;
+;
+
+string State!Codes;			! string of state codes ;
+string System, S;			! system name, scratch string ;
+string CmdLine, MsgLine;		! text of cmd and msg lines ;
+
+integer array Buffer[ 1:MaxRow, 1:27 ];	! screen buffer for redisplay ;
+
+preset!with ST$$Off;
+own safe integer array Stat[ 0:ST$-1 ];
+
+preset!with ST$$Str;
+own safe string  array SStat[ 0:ST$-1 ];
+
+preset!with ST$$All;
+own safe string  array SSStat[ 0:ST$$Knt-1 ];
+
+
+internal simple procedure EnaTRP;
+return;
+
+internal simple procedure DisTRP;
+return;
+
+
+internal simple boolean procedure RunSlf;
+! ----------------------------------------------------------------------;
+!									;
+!	RunSlf		Routine to figure out where you are and run	;
+!			the same program.  This assumes that we are	;
+!			NOT using a funny extension or were run with	;
+!			a load, start or execute command.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "run self"
+    Own Safe Integer Array RunBlock[0:5];
+    Define !gtRDV = '135, !gtRDI = '136, !gtRFN = '137;
+    Define Gettab(x,y) = { calli( !xwd( (x), (y) ), calli!GETTAB ) };
+
+    RunBlock[0]_ Gettab( -1, !gtRDV );
+    RunBlock[1]_ Gettab( -1, !gtRFN );
+    RunBlock[4]_ Gettab( -1, !gtRDI );
+
+    Calli( location(RunBlock[0]), calli!RUN );
+    if not( !Skip! )
+     then return(false );
+
+end "run self";
+
+! Some utility routines
+;
+
+simple string procedure CVHMS( integer HMS );
+begin
+    string S;
+
+    S_ cvs( HMS div 3600 ) & ":";
+    HMS_ HMS mod 3600;
+    S_ S & ( "0" & cvs( HMS div 60 ))[inf-1 to inf] & ":";
+    HMS_ HMS mod 60;
+    S_ S & ( "0" & cvs( HMS ))[inf-1 to inf];
+    return( S );
+
+end;
+
+
+simple string procedure TMin( Integer Min );
+begin "T Min"
+    String S;
+
+    S_ Null;
+    if Min > 24*60 then begin
+	S_ S& " "& cvs(Min%(24*60))& "d";
+	Min_ Min mod (24*60);
+    end;
+    if Min > 60 then begin
+	S_ S& " "& cvs(Min%60)& "h";
+	Min_ Min mod 60;
+    end;
+    if Min
+     then S_ S& " "& cvs(Min)& "m";
+
+    return( ("          " & S)[inf-9 to inf] );
+end "T Min";
+
+! Utility routine to put a string into the buffer
+;
+
+simple integer procedure Install( integer BP; string S );
+begin "install string"
+
+    while ( length( S )) do idpb( lop( S ), BP );
+    return( BP );
+
+end "install string";
+
+! screen section display routine
+;
+
+simple procedure Section( string Str, Head( NULL ); integer AddCol( 0 ) );
+begin "section"
+
+    if ( Offset < (LineCount_ LineCount+1) leq (Offset+(MsgRow-StartRow)) )
+     then begin "print string"
+
+	Msg( Row, Col, Str );
+
+	if ( MsgRow = Row_ Row + 1 )
+	 then if ( AddCol )
+		then begin "reset coordinates"
+
+		    Col_ Col + AddCol;
+		    Row_ StartRow;
+		    LineCount_ Offset;
+
+		    if ( length( Head ) )
+		     then Msg( StartRow-1, Col, Head );
+
+		end "reset coordinates";
+
+     end "print string";
+
+end "section";
+
+! display initialization ;
+
+simple procedure InitSysDpy;
+begin "initialization"
+
+    if ( not ( Gettab( -1, !gtLIC ) land !bit(3) ))
+     then usererr( 0,0,"Requires SY", "x" );
+
+    if not ( OpnQue( que$Run lor que$Act ) )
+     then usererr( 0,0,"Cannot open queue", "x" );
+
+    if not( QueSlot_ VMName( QueueFile, VM$Multi ) )
+     then usererr( 0,0, "Queue lost in space", "x" );
+
+    BasePage_ VMGetc( QueSlot, VM$Base );
+
+    MyPriv_ Gettab( -1, !gtPRV );
+    MyLic_  Gettab( -1, !gtLIC );
+    MyAun_  Gettab( -1, !gtAUN );
+
+    T!Init;
+    R!Init;
+
+    CPU!TicsPerMin_ Gettab( !CNJPS, !gtCNF ) * 60;
+
+    System_ cvstr( Gettab( 0,!gtCNF )) & cvstr( Gettab( 1,!gtCNF )) &
+	    cvstr( Gettab( 2,!gtCNF )) & cvstr( Gettab( 3,!gtCNF )) &
+	    cvstr( Gettab( 4,!gtCNF ));
+    while ( length( System ) and ( System[inf for 1] = 0 ) )
+     do System_ System[1 to inf-1];
+
+    SerialNumber_ Gettab( !CNSER, !gtCNF );
+    Mon!Jobs_     Gettab( !CNNJB, !gtCNF );
+    Mon!Ports_    Gettab( !CNPTS, !gtCNF );
+    Mon!Memory_   Gettab( !CNSIZ, !gtCNF ) div 512;
+    Phy!Memory_   Gettab( !NSMMS, !gtNSW ) div 512;
+
+    Offset_ 0;  Page_ 14;
+
+    StillRunning_ true;
+    Special_ false;
+    DisplayIdle_ false;
+    OnlyActive_ OnlyIdle_ false;
+    CmdArg_ IdleTime_ 0;
+    SleepTime_ 5;
+
+    ThisScreen_ DpyJobs;	! 0=queue, 1=files ;
+    CmdLine_ NULL;
+    MsgLine_ "Type ? for Help";
+
+    State!Codes_ Null;
+    I_ -1;
+    while ( true )
+     do begin "get state codes"
+	V_ Gettab( I_ I + 1, !gtWSC );
+	if not( !skip! )
+	 then done
+	 else State!Codes_ State!Codes & CvXstr( V );
+     end "get state codes";
+
+end "initialization";
+
+! Install information about the system
+;
+
+simple procedure InstallSystemInfo;
+begin "install system info"
+    string S;
+
+    S_ System;
+    if ( SerialNumber )
+     then S_ S & " #" & Cvs( SerialNumber );
+
+    S_ S & "  " & CVHMS( call( 0, "MSTIME" ) div 1000 )
+       & " Up " & CVHMS( Gettab(!NSUPT,!gtNSW) div 60 );
+    Msg( 1, 1, S );
+
+! Memory size ;
+
+    S_ Cvs( Phy!Memory ) & " pages, Sys(" & Cvs( Mon!Memory ) &
+	") User(" & Cvs( Phy!Memory - Mon!Memory ) & ")";
+    Msg( 1, 9, S );
+
+! ** Line 2 ** ;
+
+    Msg( 2, 1, "Total "& Cvs(QQ(Count)) );
+    Msg( 2, 3, "Run "& Cvs(QQ(Running)) &"/"& Cvs(QQ(RSlot)) );
+    Msg( 2, 5, "Act "& Cvs(QQ(Active))  &"/"& Cvs(QQ(ISlot)) );
+    S_   (if QQ(Lock)  then "L" else " ") & (if QQ(New)   then "*" else " ")
+       & (if QQ(HaveS) then "S" else " ") & cvos(QQ(Flags) lsh -33)
+       & (if QQ(HaveP) then "P" else " ") & cvos((QQ(Flags) lsh -15) land '7)
+       & " " & TymDay( GetTDT );
+
+    Msg( 2, 7, S );
+
+! CPU info ;
+
+    CPU!Tics_ CPU!TicsPerMin - Gettab( !NSNMN, !gtNSW );
+    V_ ( CPU!Tics * 100 ) div CPU!TicsPerMin;
+    S_ "CPU" & ("  "&cvs(V))[inf-2 to inf] & "% ";
+    V_ (CPU!Tics * 10) div CPU!TicsPerMin;
+    S_ S & ("::::::::::"[1 for V] & "..........")[1 for 10];
+    Msg( 2, 13, S );
+
+  end "install system info";
+
+
+! Install information about the queue
+;
+
+simple procedure DisplayActive;
+begin "display active info"
+    own safe integer array rec[ E!Runtime : E!Length-1 ];
+    integer Job, AllJob;    string S;
+    integer JobStatus, JobPriv, JobAUN, JobGFD, JobLog;
+
+    StartRow_ Row_ 4;  Col_ 1;
+
+    MsgLine_ "Type ? for Help";
+
+    LineCount_ AllJob_ 0;
+    Job_ -1;
+
+    while ( true )
+     do begin "each job slot"
+
+	arrClr( rec );				! clear record ;
+	dpb( Job, PPReq( rec ) );		! set -1 or 0  ;
+	if not( ActRec( rec[E!Runtime] ) )	! for sequential read ;
+	 then done;				! no records, done ;
+
+	Job_ 0;					! for next time ;
+
+	JobAUN_ rec[ E!AUN ];
+
+	if ( not( ( MyAun = JobAun )		! same ppn ;
+	     or   ( ( MyPriv land !bit(22) )	! acct-sup ;
+	      and ( !rh(MyAun) = !rh(JobAun) ))	! same gan ;
+	     or   ( !rh(MyLic) )
+!	     or   ( MyLic land '100 )		! QM for frame ;
+	        ) )
+	 then continue "each job slot";
+
+	AllJob_ AllJob + 1;
+
+	JobGFD_  rec[ E!PPN ];
+	JobPriv_ rec[ E!Privs ];
+	JobLog_  rec[ E!Network ];
+
+	! job program name ;
+
+	S_ (cvs(LPPReq(rec))&"       ")[1 to 7] &
+	   ("    "&Cvos( Node(JobLOG) ))[inf-4 to inf] &
+	   "-" & (Cvos(JobLOG land '177) & "     ")[1 for 5] &
+	   cvxstr( rec[E!CmdFile+F!Name] ) & "  ";
+
+	! status ;
+	S_ S & ("      "&SStat[LPPStat(rec)])[inf-5 to inf] & "$" &
+		(SSStat[Stat[LPPStat(rec)]+LPPProc(rec)]&"       ")[1 for 7] &
+		"  ";
+
+	! runtime ;
+	V_ -1;
+	for MyJob_ 1 upto E!RunMax + E!JobMax
+	 do if ( LPPReq(rec) = LPReq( QRS ) )
+	  then begin V_ MyJob; done end;
+	S_ S & (if V < 0
+		 then if ( rec[ E!Runtime ] = -1 )
+		       then "startup           "
+		       else TymDay( rec[ E!Runtime ] )
+		 else if ( V < E!RunMax )
+		       then "running           "
+		       else "active            ") & "  ";
+
+	! user name ;
+	
+	S_ S & cvxstr( rec[ E!UserName ] ) &
+		 cvxstr( rec[ E!UserName+1 ] );
+	while ( length( S ) and ( S[inf for 1] = " " )) do
+	  S_ S[1 to inf-1];
+
+	! GFD'd username ;
+
+	if ( JobAUN neq JobGFD ) then
+	  S_ S & " (" & CVUser( JobGFD ) & ")";
+	S_ S & " ";
+
+	! other misc stuff ;
+
+	if ( JobPriv land (!Bit(8)+!Bit(23))) then S_ S & "*";
+	if ( JobPriv land !bit(21)) then S_ S & "+";
+	if ( JobPriv land !bit(18)) then S_ S & "$";
+
+	if ( ( Special ) and ( MyLic land '100 ) )	! QM ;
+	 then begin "special stuff"
+	 end "special stuff";
+
+	Section( S );			! display the job info ;
+
+      end "each job slot";
+
+    if ( AllJob )
+     then Msg( MsgRow, 9, "Users: " & (Cvs(AllJob) & "    ")[1 for 4] );
+
+end "display active info";
+
+
+! Install information about the queue
+;
+
+simple procedure DisplayJobInfo;
+begin "display job info"
+    own safe integer array rec[ E!Runtime : E!Length-1 ];
+    integer Job, AllJob;    string S;
+    integer JobStatus, JobPriv, JobAUN, JobGFD, JobLog;
+
+    StartRow_ Row_ 4;  Col_ 1;
+
+    MsgLine_ "Type ? for Help";
+
+    LineCount_ AllJob_ 0;
+    Job_ -1;
+
+    while ( true )
+     do begin "each job slot"
+
+	arrClr( rec );				! clear record ;
+	dpb( Job, PPReq( rec ) );		! set -1 or 0  ;
+	if not( GetRec( rec[E!Runtime] ) )	! for sequential read ;
+	 then done;				! no records, done ;
+
+	Job_ 0;					! for next time ;
+
+	JobAUN_ rec[ E!AUN ];
+
+	if ( not( ( MyAun = JobAun )		! same ppn ;
+	     or   ( ( MyPriv land !bit(22) )	! acct-sup ;
+	      and ( !rh(MyAun) = !rh(JobAun) ))	! same gan ;
+	     or   ( !rh(MyLic) )
+!	     or   ( MyLic land '100 )		! QM for frame ;
+	        ) )
+	 then continue "each job slot";
+
+	AllJob_ AllJob + 1;
+
+	JobGFD_  rec[ E!PPN ];
+	JobPriv_ rec[ E!Privs ];
+	JobLog_  rec[ E!Network ];
+
+	! job program name ;
+
+	S_ (cvs(LPPReq(rec))&"       ")[1 to 7] &
+	   ("    "&Cvos( Node(JobLOG) ))[inf-4 to inf] &
+	   "-" & (Cvos(JobLOG land '177) & "     ")[1 for 5] &
+	   cvxstr( rec[E!CmdFile+F!Name] ) & "  ";
+
+	! status ;
+	S_ S & ("      "&SStat[LPPStat(rec)])[inf-5 to inf] & "$" &
+		(SSStat[Stat[LPPStat(rec)]+LPPProc(rec)]&"       ")[1 for 7] &
+		"  ";
+
+	! runtime ;
+	V_ -1;
+	for MyJob_ 1 upto E!RunMax + E!JobMax
+	 do if ( LPPReq(rec) = LPReq( QRS ) )
+	  then begin V_ MyJob; done end;
+	S_ S & (if V < 0
+		 then if ( rec[ E!Runtime ] = -1 )
+		       then "startup           "
+		       else TymDay( rec[ E!Runtime ] )
+		 else if V < E!RunMax
+		       then "running           "
+		       else "active            ") & "  ";
+
+	! user name ;
+	
+	S_ S & cvxstr( rec[ E!UserName ] ) &
+		 cvxstr( rec[ E!UserName+1 ] );
+	while ( length( S ) and ( S[inf for 1] = " " )) do
+	  S_ S[1 to inf-1];
+
+	! GFD'd username ;
+
+	if ( JobAUN neq JobGFD ) then
+	  S_ S & " (" & CVUser( JobGFD ) & ")";
+	S_ S & " ";
+
+	! other misc stuff ;
+
+	if ( JobPriv land (!Bit(8)+!Bit(23))) then S_ S & "*";
+	if ( JobPriv land !bit(21)) then S_ S & "+";
+	if ( JobPriv land !bit(18)) then S_ S & "$";
+
+	if ( ( Special ) and ( MyLic land '100 ) )	! QM ;
+	 then begin "special stuff"
+	 end "special stuff";
+
+	Section( S );			! display the job info ;
+
+      end "each job slot";
+
+    if ( AllJob )
+     then Msg( MsgRow, 9, "Entries: " & (Cvs(AllJob) & "    ")[1 for 4] );
+
+end "display job info";
+
+
+! Install information about the queue
+;
+
+simple procedure DisplayQueueInfo;
+begin "display queue info"
+    integer Page, HiPage, Job, JobPage, AllJob;    string S, Char;
+
+    simple string procedure APage( integer B; string Y("1"), N("0"), M("-") );
+    begin "a page"
+	Char_ Null;
+	for Job_ 0 upto E!RPPage-1
+	 do begin "check each entry"
+	    if ( memory[ B+(Job*E!Length)+E!Runtime ] )
+	     then begin
+		AllJob_ AllJob + 1;
+		Char_ Char & Y;
+	     end
+	     else if ( memory[ B+(Job*E!Length)+E!Aun ] )
+		   then Char_ Char & M
+		   else Char_ Char & N;
+	 end "check each entry";
+	return( Char );
+    end "a page";
+
+    StartRow_ Row_ 4;  Col_ 1;
+
+    MsgLine_ "Type ? for Help";
+
+    HiPage_ (((VMGetC( QueSlot,VM$Size ) div 5) lsh -9) - (QueueData - 1))
+	    max (( QQ(Count) + (E!RPPage-1) ) div E!RPPage );
+
+    Msg( 2, 3, "R"& APage( (BasePage+(QueueRun-1)) lsh 9,"+","." ) );
+    Msg( 2, 5, "A"& APage( (BasePage+(QueueAct-1)) lsh 9, "+","." )
+		  & APage( (BasePage+ QueueAct   ) lsh 9, "+","." ) );
+
+    LineCount_ AllJob_ JobPage_ 0;
+    S_ Null;
+    for Page_ 1 upto HiPage do
+      begin "each page"
+
+	if ( VMPMap( QueSlot, (QueueData-1)+Page ), QueueData )
+	 then S_ S & APage & " ";
+
+	if ( length( S ) geq 72 )
+	 then begin
+	    Section( S );		! display the job info ;
+	    S_ Null;
+	 end;
+
+      end "each page";
+
+    if ( length( S ) )
+     then Section( S );			! display the job info ;
+
+    if ( AllJob )
+     then Msg( MsgRow, 9, "Entries: " & (Cvs(AllJob) & "    ")[1 for 4] );
+    
+end "display queue info";
+
+! Install disk info
+;
+
+simple procedure DisplayFiles;
+begin "install file info"
+    own safe integer array DskChrBlk[ 0 : '22 ];
+    integer Unit, DskChrBits, FreePages;
+    string S, Head;
+
+    LineCount_ 0;  StartRow_ Row_ 5;  Col_ 1;
+
+    Msg( 4, Col, Head_ "File   Free % Full" );
+
+end "install file info";
+
+
+! display a help message
+;
+
+procedure DisplayHelp;
+begin "help me"
+
+    arrclr( Buffer, cvasc("     ") );	! fill in the display ;
+
+    Msg(  4,4, ["SY %2(6)  Command Summary"] );
+    Msg(  6,4, ["? or H    Display this text"] );
+    Msg(  7,4, ["A         Toggle active jobs display"] );
+    Msg(  8,4, ["D         Display disk information"] );
+    Msg(  9,4, ["F         Display FRECOR information"] );
+    Msg( 10,4, ["I         Toggle idle jobs display"] );
+    Msg( 11,4, ["L         Set page scroll size to ARG lines"] );
+    Msg( 12,4, ["N         Display normal frame information"] );
+    Msg( 13,4, ["S         Set sleep time to ARG seconds"] );
+    Msg( 14,4, ["T         Toggle Idle time / TRU display"] );
+    Msg( 15,4, ["Q or ^Z   Exit to monitor level (also ^C)"] );
+    Msg( 16,4, ["+ or ^V   Scroll screen forward"] );
+    Msg( 17,4, ["- or ^W   Scroll screen backward"] );
+    Msg( 19,4, ["0 thru 9  Set argument value"] );
+
+end "help me";
+
+
+! Fill the buffer with text to be displayed
+;
+
+procedure SetupBuffer;
+  begin "setup buffer"
+    integer BP;
+
+    arrclr( Buffer, cvasc("     ") );	! fill in the display ;
+
+    Row_ 1;  Col_ 1;	InstallSystemInfo;
+
+    Case ( ThisScreen )
+     of begin "do right screen"
+	[DpyJobs]   DisplayJobInfo;
+	[DpyActive] DisplayActive;
+	[DpyFile]   DisplayFiles;
+	[DpyQueue]  DisplayQueueInfo;
+	[DpyHelp]   DisplayHelp;
+	[Else]      begin
+		    end
+     end "do right screen";
+
+    Install( BP_ point( 7, Buffer[MsgRow,1], -1 ), MsgLine );
+    Install( BP_ point( 7, Buffer[CmdRow,1], -1 ), CmdLine );
+    
+  end "setup buffer";
+
+! Command Scanner
+;
+
+procedure CommandScan;
+begin "command scan"
+  integer C;
+
+  while ( T!ChrP )
+   do begin "get a character"
+
+    C_ T!GetC;
+
+    Case ( C )
+     of begin "each character"
+
+	[" "]
+	    begin end;
+
+	["C"-'100]["Z"-'100] ["Q"]["q"]
+	    StillRunning_ false;
+	[#CR][#Esc] begin
+		MsgLine_ Null;
+		CmdArg_ 0;
+	     end;
+	[#FF] begin
+		arrclr( Buffer, cvasc("     ") );
+		R!Disp( Buffer, true, 1, 1 );
+	     end;
+	["G"-'100]
+	    Offset_ 0;
+
+	["V"-'100] ["+"]
+	    Offset_ Offset + Page;
+	["W"-'100] ["-"]
+	    Offset_ (Offset - Page) Max 0;
+	["Y"-'100]
+	    Special_ not Special;
+
+	["?"]["H"]["h"]
+	    ThisScreen_ DpyHELP;
+
+]["1"]["2"]["3"]["4"]["5"]["6"]["7"]["8"]["9"]
+	    CmdArg_ (CmdArg * 10) + (C - "0");
+	["H"-'100]['177]
+	    CmdArg_ CmdArg div 10;
+
+	["A"]["a"] begin
+		ThisScreen_ DpyActive;
+		Offset_ 0;
+		OnlyActive_ true;
+	     end;
+	["B"]["b"] begin
+		ThisScreen_ DpyQueue;
+		Offset_ 0;
+	     end;
+	["D"]["d"] begin
+	     end;
+	["F"]["f"] begin
+		ThisScreen_ DpyFile;
+		Offset_ 0;
+	     end;
+	["I"]["i"] begin
+	     end;
+	["L"]["l"] begin
+		Page_ CmdArg Min 18;
+		CmdArg_ 0;
+	     end;
+	["N"]["n"] begin
+		ThisScreen_ DpyJobs;
+		OnlyActive_ OnlyIdle_ False;
+		Offset_ IdleTime_ 0;
+	     end;
+	["P"]["p"] begin
+	     end;
+	["S"]["s"] begin
+		SleepTime_ CmdArg;
+		CmdArg_ 0;
+	     end;
+	["T"]["t"] begin
+	     end;
+
+	[else] begin
+		T!Bell;
+		CmdArg_ 0;
+		MsgLine_ "Type ? for Help";
+	     end
+
+	end "each character";
+
+     end "get a character";
+
+    if ( CmdArg )
+     then CmdLine_ "Arg: " & Cvs( CmdArg )
+     else CmdLine_ NULL;
+
+  end "command scan";
+
+! Routine to sleep for the specifed amount of time or until a
+! break character arrives
+;
+
+procedure Snooze;
+  begin
+
+    if ( SleepTime ) then
+      calli( !xwd( '31, SleepTime ), '72 );	! hiber ;
+
+  end;
+! Top level logic
+;
+
+  InitSysDpy;
+
+  while ( StillRunning ) do    
+    begin "main loop"
+
+      SetupBuffer;
+
+      R!Disp( Buffer, true, 1, 1 );
+
+      if ( T!ChrP ) then
+	CommandScan
+      else
+	Snooze;
+
+      if ( QQ( Feature ) < 0 and TestFeature( RDpy ) )
+       then begin "restart"
+	  ClearFeature( RDpy );
+	  RunSlf;
+       end "restart";
+
+    end "main loop";
+
+  ClsQue;
+  T!Fini;
+
+  call(0,"EXIT");
+    
+end "QueDpy - System Display Hack";
+    T@O¸
