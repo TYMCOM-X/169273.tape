@@ -1,0 +1,1067 @@
+	TITLE	KERWLD - Wild card processing for KERMIT-10 under TOPS-10
+	SUBTTL	Robert C McQueen		22-June-1983
+
+; Universals
+
+	SEARCH	GLXMAC			; Galaxy library
+	SEARCH	KERUNV			; Kermit definitions
+
+; Directives
+
+	.DIRECT	FLBLST			; List first line of binary only
+	SALL				; Suppress macro expansions
+	PROLOG	(KERWLD)		; Generate the prologue
+
+  ; Version number
+
+;[CSM] According to KERV3.MEM, this is KERMIT version 3(123)
+	WLDVER==3			; Major version number
+	WLDMIN==0			; Minor version number
+	WLDEDT==124			; Edit level
+	WLDWHO==0			; Customer edit
+
+TOPS20<	END>				; Quick end for the -20
+
+	TWOSEG	400K			; Two segment code
+	SUBTTL	Table of Contents
+
+;+
+;.pag.lit
+;                          Table of Contents of KERWLD
+;
+;
+;                                    Section                             Page
+;   1.   Table of Contents. . . . . . . . . . . . . . . . . . . . . . . .   2
+;   2.   Revision History . . . . . . . . . . . . . . . . . . . . . . . .   3
+;   3.   Main routine . . . . . . . . . . . . . . . . . . . . . . . . . .   4
+;   4.   File found - Fill in the user data . . . . . . . . . . . . . . .   9
+;   5.   OPNDIR - Open the current directory if needed. . . . . . . . . .  10
+;   6.   NXTBLK - Routine to advance to the next block of the directory .  11
+;   7.   REREAD - Reread the current directory block. . . . . . . . . . .  12
+;   8.   RDBLK - Routine to read a directory block. . . . . . . . . . . .  13
+;   9.   Initialization routine . . . . . . . . . . . . . . . . . . . . .  14
+;   10.  DIRECTORY SUBROUTINES. . . . . . . . . . . . . . . . . . . . . .  15
+;   11.  STRUCTURE SUBROUTINES. . . . . . . . . . . . . . . . . . . . . .  17
+;   12.  Logical Name Subroutines
+;      12.1.   .INILN - Initialize logical name . . . . . . . . . . . . .  22
+;      12.2.   .NXTLN - Set up for the next name. . . . . . . . . . . . .  23
+;   13.  USEFUL SUBROUTINES . . . . . . . . . . . . . . . . . . . . . . .  24
+;   14.  TOPS-10 error codes. . . . . . . . . . . . . . . . . . . . . . .  27
+;   15.  End of KERWLD. . . . . . . . . . . . . . . . . . . . . . . . . .  29
+;
+;.end lit.pag
+;-
+	SUBTTL	Revision History
+
+COMMENT	|
+
+
+116	By: Nick Bush		On: 14-March-1984
+	Add parsing for all REMOTE commands.
+	Add support for some generic and local commands.
+	Fix wild card processing to handle pathological names correctly.
+	Modules: KERMIT,KERSYS,KERWLD
+
+120	By: Robert C. McQueen		On: 28-March-1984
+	Add bug fixes from WMU.  Many thanks to the people out in Kalamazoo.
+	Modules: KERMIT,KERWLD
+
+121	By: Robert C. McQueen		On: 28-March-1984
+	Add SET PROMPT command.  Start adding support for generic COPY and
+	RENAME commands.
+	Modules: KERUNV,KERMIT,KERWLD
+
+124	By: Robert C. McQueen		On: 8-May-1984
+	Fix KERMIT-10's handling of remote directories
+	Modules: KERWLD
+|
+	SUBTTL	Secondary wildcard routine
+
+;+
+;.hl1 SECWLD
+;This routine is used to fill wild card information into a secondary
+;file specification.
+;.literal
+;
+; Usage:
+;	MOVEI	S1,Length
+;	MOVEI	S2,Address of argument block
+;	PUSHJ	P,SECWLD
+;	(Return)
+;
+;--
+
+	ENTRY	SECWLD
+
+SECWLD:	$SAVE	<S1,S2>			; Save the arguments
+	$SAVE	<P1>			; Save this register also
+
+; First check and copy the arguments
+
+	CAIE	S1,$LKLEN		; Correct size?
+	 $RETF				; No, incorrect size
+	MOVEM	S2,SECBLK		; Save address of argument
+	LOAD	S1,$LKFLP(S2),LK$FLP	; Get the FILOP. block address
+	MOVEM	S1,SECFLP		; Store it
+	LOAD	S1,$LKFLP(S2),LK$FLN	; Get the length
+	MOVEM	S1,SECFLN		; Store it too
+	MOVE	S1,$LKFLG(S2)		; Get the flags
+	MOVEM	S1,SECFLG		; Store the flags
+	LOAD	S1,$LKFDB(S2)		; Get the .FD block address
+	LOAD	S2,.FDLEN(S1),FD.LEN	; Get the length of the .FD block
+	CAIE	S2,.FDSIZ		; Right size?
+	  $RETF				; No, error return
+	LOAD	S2,.FDLEN(S1),FD.TYP	; Get the type
+	CAIE	S2,.FDNAT		; Native file specification?
+	  $RETF				; No, error
+
+; At this point the arguments have been validated.
+
+	$RETF				; For now
+	SUBTTL	Main routine
+
+;+
+;.hl1 LOKWLD
+;This routine will look for a wild carded file specification on the
+;specified directory.
+;.literal
+;
+; Usage:
+;	MOVEI	S1,Length
+;	MOVEI	S2,Address of argument block
+;	PUSHJ	P,LOKWLD
+;	(Return)
+;
+; On a true return:
+;	- Found file, information stored
+;
+; On a false return:
+;	- File not found.  Error text in low segment area.
+;
+;
+;.end literal
+;-
+
+	ENTRY	LOKWLD			; Entry point into this module
+
+LOKWLD:	$SAVE	<S1,S2>			; Save the arguments
+	$SAVE	<P1>			; Save P1 also
+
+; First check and copy the arguments
+
+	CAIE	S1,$LKLEN		; Correct size?
+	 $RETF				; No, incorrect size
+	MOVEM	S2,ARGBLK		; Save address of argument
+	LOAD	S1,$LKFLP(S2),LK$FLP	; Get the FILOP. block address
+	MOVEM	S1,ARGFLP		; Store it
+	LOAD	S1,$LKFLP(S2),LK$FLN	; Get the length
+	MOVEM	S1,ARGFLN		; Store it too
+	MOVE	S1,$LKFLG(S2)		; Get the flags
+	MOVEM	S1,ARGFLG		; Store the flags
+	LOAD	S1,$LKFDB(S2)		; Get the .FD block address
+	LOAD	S2,.FDLEN(S1),FD.LEN	; Get the length of the .FD block
+	CAIE	S2,.FDSIZ		; Right size?
+	  $RETF				; No, error return
+	LOAD	S2,.FDLEN(S1),FD.TYP	; Get the type
+	CAIE	S2,.FDNAT		; Native file specification?
+	  $RETF				; No, error
+	HRLI	S1,FDB			; Place to store the information
+	MOVSS	S1			; Move to correct places
+	BLT	S1,FDB+.FDSIZ-1		; Move all the information
+
+; Now set up the initial depth and other information
+
+	MOVX	S1,LK$FRS		; First time?
+	TDNN	S1,ARGFLG		; . . .
+	  JRST	RESTART			; Continue processing
+	MOVEI	S1,ZERLEN		; Get the length
+	MOVEI	S2,ZERBEG		; Start of the area to clear
+	$CALL	.ZCHNK			; Clear it
+	$CALL	LOKINI			; Initialize the data base
+	$CALL	.INILN			; Initialize the logical name processing
+
+	MOVE	T1,FDB+.FDSTR		; Get the structure
+	SETZ	T2,			; Clear this
+	$CALL	.INIST			; Initialize the structure scanning
+	$CALL	.NXSTR			; Set up the first structure
+; Here to set the initial path that will be looked at in this
+; structure.  This is done after each scan of a structure.
+
+LOKW.0:	XMOVEI	P1,FDB			; Point to the structure
+	$CALL	SETDIR			; Set up the directory defaults
+	MOVSI	S1,-<D$MSFD+1>		; Build the AOBJx pointer
+	SETZ	T1,			; Clear the counter
+LOKW.1:	MOVE	S2,FDB+.FDPPN(S1)	; Get the PPN
+	JUMPE	S2,LOKW.2		; Finished?
+	AND	S2,FDB+.FDDIM(S1)	; Mask it
+	CAME	S2,FDB+.FDPPN(S1)	; Same?
+	 JRST	LOKW.2			; No, finished
+	MOVEM	S2,DPTH+.PTPPN(S1)	; Store the device
+	AOJ	T1,			; Count the levels
+	AOBJN	S1,LOKW.1		; Loop for all levels
+LOKW.2:	SUBI	T1,1			; Decrement the index
+	MOVEM	T1,TOP			; Get the current level	
+	MOVEM	T1,DEPTH		; Store the depth we are at
+	JRST	REST.1			; Start up again
+
+; Now open the directory and set up the pointers correctly
+;
+; Register usage:
+;
+;	T1 - AOBJx pointer into the data block
+
+RESTART:
+	MOVE	T1,DEPTH		; Get the depth we are working at
+	SKIPN	DIRCHN(T1)		; Have a channel open?
+	  $RETF				; No, give a failure return
+					;  This catches the case of calling
+					;  LOKWLD after we have processed
+					;  the last block of the UFD
+	JRST	REST.2			; Continue processing
+
+REST.1:	SKIPN	DIRCHN(T1)		; Have a channel for this level?
+	  JRST	REST.0			; Have to open the directory
+
+REST.2:	MOVE	T1,DIRIDX(T1)		; Reset the index into the block
+	MOVX	S1,LK$SFD		; Ignoring directories?
+	TDNE	S1,ARGFLG		; . . .
+	  JRST	NXTFIL			; Advance to the next file
+	JRST	TRYDIR			; Check to make sure we don't skip
+					;  the directory we may have passed back
+REST.0:	$CALL	OPNDIR			; Open the current level and set up
+					;  pointers
+	JUMPF	NXTDIR			; Try for the level above this one
+					;  if there is one
+
+FILELP:	SKIPN	S1,(T1)			; Get the file name
+	  JRST	NXTFIL			; No entry, skip it then
+	XOR	S1,FDB+.FDNAM		; XOR with the name
+	TDNE	S1,FDB+.FDNMM		; Is this it?
+	  JRST	NXTFIL			; No, advance to the next entry
+	HLLZ	S1,1(T1)		; Get the extension
+	XOR	S1,FDB+.FDEXT		; XOR with what was given
+	TDNE	S1,FDB+.FDEXM		; Is this ok?
+	  JRST	NXTFIL			; No, try for the next
+
+; We now have a file that we are going to pass back.  Check to see if this is
+; a directory and if we are allowed to pass it back.
+
+	HLRZ	S1,1(T1)		; Get the extension
+	MOVX	S2,LK$SFD		; Allowed to pass it back?
+	CAIE	S1,'UFD'		; UFD?
+	 CAIN	S1,'SFD'		; Or Sub File Directory?
+	  TDNE	S1,ARGFLG		; Directory, allowed to pass back?
+	JRST	FOUND			; Not directory or allowed to pass back
+
+; Now check to see if it is directory and if we must search it also
+
+TRYDIR:	HLRZ	S2,1(T1)		; Get the extension
+	CAIE	S2,'UFD'		; Is this a UFD?
+	 CAIN	S2,'SFD'		;  Or subfile directory?
+	  JRST	FNDDIR			; Found a directory
+; Here to advance to the next entry in a directory
+
+NXTFIL:	AOJ	T1,			; Point past the file name
+	AOBJN	T1,FILELP		; Loop for all files in the directory
+	$CALL	NXTBLK			; Get the next directory block
+	JUMPT	FILELP			; Loop for the file
+
+; Here if there are no more files in the correct directory, attempt to
+; go up a level
+
+NXTDIR:	MOVE	T1,DEPTH		; Get the current depth
+	CAMN	T1,TOP			; At the top?
+	  JRST	STRLOP			; Yes, try the next structure
+
+	SOS	DEPTH			; Decrement the depth
+	$CALL	REREAD			; Reread the directory block
+	JRST	NXTFIL			; And continue in the file processing
+
+STRLOP:	$CALL	.NXSTR			; Advance to the next structure
+	JUMPT	LOKW.0			; Open the directory and go
+
+; Here if we have run out of structures, attempt the next logical name if we
+; are doing logical name processing
+
+	SKIPN	LNMFLG			; Doing logical names?
+	  JRST	DONE			; No, finished
+	$CALL	.NXTLN			; Advance to the next
+	JUMPT	LOKW.0			; Set up to open the directory
+
+; Here if no more structures or logical names and we have finished reading the
+; directory.
+
+DONE:	$RETF				; Give a a failure return to the caller
+; Here if we have found a file directory in the directory we are currently
+; scanning.  We must determine if we are allowed to go into this directory
+; to look for files or it we must just skip it and do the normal file checks.
+
+
+FNDDIR:	MOVE	S1,DEPTH		; Get the level we are at
+	SKIPN	S2,FDB+.FDPAT(S1)	; Get the directory the user supplied
+	  JRST	NXTFIL			; Doesn't want this level
+	XOR	S2,(T1)			; XOR with the given name
+	TDNE	S2,FDB+.FDSFM(S1)	; Ok?
+	  JRST	NXTFIL			; No, advance to the next directory entry
+
+; Here if we must advance to the next level in the directory
+; processing.
+
+	MOVEM	T1,DIRIDX(S1)		; Save for later
+	MOVE	S2,(T1)			; Get the name again
+	MOVEM	S2,DPTH+.PTSFD(S1)	; Store the information
+	AOS	DEPTH			; One lower in the tree
+	$CALL	OPNDIR			; Open the directory
+	JUMPT	FILELP			; Got the directory
+	SOS	T1,DEPTH		; Back out the depth we are at
+	SETZM	DPTH+.PTSFD(S1)		; Clear what we just stored
+	MOVE	T1,DIRIDX(T1)		; Get the index we stored
+	JRST	NXTFIL			; And advance to the next file
+	SUBTTL	File found - Fill in the user data
+
+; Enter here with:
+;
+;	T1 - Address of the entry in the directory of the file
+
+FOUND:	MOVE	S2,DEPTH		; Get the depth we are at
+	MOVEM	T1,DIRIDX(S2)		; Store the index
+	MOVE	T2,ARGFLP		; Get the FILOP. block address
+	MOVE	T3,.FOLEB(T2)		; Get the address of the LOOKUP block
+	DMOVE	S1,(T1)			; Get the file information
+	MOVEM	S1,.RBNAM(T3)		; Store the name
+	HLLZM	S2,.RBEXT(T3)		; Store the extension
+	SKIPN	S1,LASSTR		; Get the last structure name
+	 MOVE	S1,FDB+.FDSTR		; Get the device
+	MOVEM	S1,.FODEV(T2)		; Store the device name
+	MOVE	S2,.RBPPN(T3)		; Get the address of the PATH. block
+	MOVEI	S2,.PTPPN(S2)		; Point to the first place
+	HRLI	S2,DPTH+.PTPPN		; Point to the PPN we are using
+	HRRI	S1,.PTMAX-.PTSFD(S2)	; End point
+	BLT	S2,(S1)			; Move the data
+	MOVE	S1,ARGBLK		; Point at original argument block
+	LOAD	S1,$LKFDB(S1)		; Get FDB address we were called with
+	HRLI	S1,FDB			; Set up to copy current data back
+	MOVEI	S2,(S1)			; Get copy of destination address
+	BLT	S1,.FDSIZ-1(S2)		; Copy entire FDB back to user
+	$RETT				; Give a good return
+	SUBTTL	OPNDIR - Open the current directory if needed
+
+; OPNDIR - This routine will open the current directory to read information
+; if needed.  It will return with the pointer to the current block set up
+; in T1 and the channel stored into the DIRCHN block indexed by the
+; depth we are currently at.  The current block we are reading will be stored
+; in DIRBLK.
+
+
+OPNDIR:	$CALL	SETOPN			; Set up the FILOP. block
+	MOVE	T1,DEPTH		; Get the depth we are working at
+	MOVX	S1,FO.ASC!FO.PRV!.FORED	; Get the function and other bits
+	MOVEM	S1,DFLP+.FOFNC		; Store the function info
+	MOVEI	S1,DLEB			; Point to the LOOKUP/ENTER block
+	MOVEM	S1,DFLP+.FOLEB		; Store it
+	SETZM	DFLP+.FOBRH		; No buffer headers
+	SETZM	DFLP+.FONBF		; No buffers
+	MOVE	S2,DPTH+.PTPPN(T1)	; Get the thing
+	MOVEM	S2,DLEB+.RBNAM		; Store as the name
+	SETZM	DPTH+.PTPPN(T1)		; Clear this
+	JUMPN	T1,OPND.0		; What we are looking for ?
+	MOVE	S1,MFDPPN		; Get the MFD PPN
+	MOVEM	S1,DPTH+.PTPPN		; Store as the PPN
+	SETZM	S1,DPTH+.PTSFD		; Clear the first SFD
+	SKIPA	S1,[SIXBIT /UFD/]	; Get the other directory
+OPND.0:	MOVX	S1,<SIXBIT /SFD/>	; SFDs
+	MOVEM	S1,DLEB+.RBEXT		; Store in the extension
+	MOVEI	S1,DPTH			; Get the path
+	MOVEM	S1,DLEB+.RBPPN		; Store it
+	MOVX	S1,.RBMAX		; Get the length
+	MOVEM	S1,DLEB+.RBCNT		; Store it
+	MOVE	S1,[XWD .FOMAX,DFLP]	; Point to the argument block
+	FILOP.	S1,			; Do it
+	  JRST	OPND.1			; Failed, determine why
+	MOVEM	S2,DPTH+.PTPPN(T1)	; Store the depth back
+	LOAD	S1,DFLP+.FOFNC,FO.CHN	; Get the channel number
+	MOVEM	S1,DIRCHN(T1)		; Store the channel number
+	SETZM	DIRBLK(T1)		; Clear the block we are processing
+	$CALL	NXTBLK			; Read a block
+	$RETIT				; Return if this worked
+
+; Now to back out of opening the directory
+
+	MOVE	T1,DEPTH		; Get the current depth
+	SETZ	S1,			; Clear this
+	EXCH	S1,DIRCHN(T1)		; Get the channel we just opened
+	RESDV.	S1,			; Make this go away
+	$RET				; Pass back the false return
+
+; Here if there was an error attempting to open the directory.
+
+OPND.1:	MOVEM	S2,DPTH+.PTPPN(T1)	; Store the thing we just opened back
+	LOAD	S2,DFLP+.FOFNC,FO.CHN	; Get the channel if one was assigned
+	RESDV.	S2,			; Get rid of it
+	  JFCL				; Don't care about error returns
+	$RETF				; Give a failure return
+	SUBTTL	NXTBLK - Routine to advance to the next block of the directory
+
+; NXTBLK - This routine will advance to the next block of the directory.  It
+; will return false when the end of the current directory is reached.  It will
+; release the channel for the directory and clear any other directory 
+; information.
+
+
+NXTBLK:	MOVE	S1,DEPTH		; Get the depth
+	AOS	S1,DIRBLK(S1)		; Increment the block
+	$CALL	RDBLK			; Read the specified block
+	$RETIF				; Return if that fails
+	MOVX	T1,<XWD -<D$BLKS/2>,DIR> ; Point to the information
+	$RETT				; Give a good return to the caller
+	SUBTTL	REREAD - Reread the current directory block
+
+; This routine is used when the directory scanning is backing out of a
+; lower level directory to this level.  We have to reread the current block
+; so that we can pick up where we were scanning.
+
+REREAD:	MOVE	S1,DEPTH		; Get the current depth
+	MOVE	S1,DIRBLK(S1)		; Get the directory block
+	$CALL	RDBLK			; Read the directory block
+	$RETIF				; Pass back errors
+	MOVE	S1,DEPTH		; Get the depth again
+	MOVE	T1,DIRIDX(S1)		; Get the index
+	$RETT				; Give a good return
+	SUBTTL	RDBLK - Routine to read a directory block
+;
+; This routine will read a block from the current directory.  This routine
+; assumes that the directory will already be open.
+;
+; Usage:
+;	S1/ Block number to read
+;	$CALL	RDBLK
+;	(Return)
+;
+; On a false return:
+;	EOF or reading error
+;
+; On a true return:
+;	Directory block read
+
+RDBLK:	MOVEM	S1,DFLP+.FOFNC+1	; Store the block number
+	MOVE	S1,DEPTH		; Get the depth that we are at
+	ZERO	DFLP+.FOFNC		; Clear the function word
+	MOVE	S2,DIRCHN(S1)		; Get the channel we are using
+	STORE	S2,DFLP+.FOFNC,FO.CHN	; Store the channel number
+	MOVX	S2,.FOUSI		; Do a USETI
+	STORE	S2,DFLP+.FOFNC,FO.FNC	; Store the function
+	MOVE	S2,[XWD .FOFNC+2,DFLP]	; Point to the arguments
+	FILOP.	S2,			; Point to the block
+	  JRST	RDBL.0			; Failed, see if EOF
+	MOVX	S2,.FOINP		; Get the function
+	STORE	S2,DFLP+.FOFNC,FO.FNC	; Store the function
+	MOVEI	S2,T1			; Point to the IOWD list
+	MOVEM	S2,DFLP+.FOFNC+1	; Store it
+	MOVX	T1,<IOWD D$BLKS,DIR>	; Point to the block
+	SETZ	T2,			; Clear the next word
+	MOVE	S2,[XWD .FOFNC+2,DFLP]	; Point to the arguments
+	FILOP.	S2,			; Get the block
+	  SKIPA				; Skip if failure
+	$RETT				; Give a good return
+
+; Here if the FILOP. failed, see why.
+
+RDBL.0:	TXNN	S2,IO.EOF		; End of file?
+	 JRST	RDBL.1			; No, problem
+RDBL.2:	SETZM	DIRBLK(S1)		; Clear the block number
+	MOVE	S2,DIRCHN(S1)		; Get the channel
+	RESDV.	S2,			; Make it go away
+	 JFCL				; Shouldn't fail
+	SETZM	DIRCHN(S1)		; This channel not used any more
+	SETZM	DPTH+.PTSFD(S1)		; Clear this so not to get confused.
+	$RETF				; Give a failure return
+
+RDBL.1:	KERERR	(<Error reading directory for ^F/FDB/>)
+	JRST	RDBL.2			; And return
+	SUBTTL	Initialization routine
+
+; This routine will initialize some system constants.
+
+LOKINI::MOVX	S1,-1			; Use this job number
+	MOVX	S2,JI.USR		; Get my user id
+	$CALL	I%JINF			; From the system
+	$RETIF				; Return if that failed
+	MOVEM	S2,MYPPN		; Store my PPN
+	MOVX	S1,%LDMFD		; Get the MFD PPN
+	GETTAB	S1,			; From the system
+	 MOVX	S1,<XWD 1,1>		; Use this as default
+	MOVEM	S1,MFDPPN		; Store it
+
+	MOVX	S1,%LDSYS		; Get the location of SYS:
+	GETTAB	S1,			; From the monitor
+	  MOVX	S1,<XWD 1,4>		; Get the default
+	MOVEM	S1,SYSPPN		; Store for later
+
+	MOVX	S1,.PTFRD		; Read user's default path
+	STORE	S1,PTH+.PTFCN,PT.FCN	; Store the information
+	ZERO	PTH+.PTFCN,PT.JBN	; Use my job number
+	MOVX	S1,<XWD .PTMAX,PTH>	; Point to the path block
+	PATH.	S1,			; Do it
+	  $RETF				; Failed?
+	$RETT				; Give a good return to the caller
+	SUBTTL	DIRECTORY SUBROUTINES
+
+;SUBROUTINE TO SUPPLY DEFAULTS FOR DIRECTORIES
+;CALL:	MOVEI	P1,POINTER TO SPECIFICATION
+;	PUSHJ	P,SETDIR
+;USES T1-4
+;
+;HANDLES [,] (IE, DEFAULT PROJECT, DEFAULT PROGRAMMER),
+;HANDLES [-] (IE, DEFAULT TO DEFAULT DIRECTORY)
+;HANDLES .UFD (IE, DIRECTORY IS REALLY FILE NAME)
+
+SETDIR:	MOVX	T1,FD.DFX	;GET FLAG
+	TDNE	T1,.FDMOD(P1)	;SEE IF HERE ALREADY
+	POPJ	P,		;YES--RE
+	IORM	T1,.FDMOD(P1)	;NO--SET FLAG FOR LATER
+	MOVX	T1,FD.DIR	;SEE IF DIRECTORY
+	SKIPN	FRCPPN		; PPN forced by something?
+	 TDNE	T1,.FDMOD(P1)	;  SPECIFIED
+	  JRST	SETDR2		;YES--GO HANDLE IT
+
+	MOVE	T1,[-D$MSFD+1,,PTH+.PTPPN]
+	MOVEI	T2,.FDPPN(P1)	;NO--COPY DEFAULT DIRECTORY
+SETDR1:	SKIPN	T3,(T1)		;GET NEXT LEVEL
+	SOS	T1		;BLANK--HOLD POINTER
+	MOVEM	T3,(T2)		;STORE IN ARGUMENT AREA
+	SKIPE	T3		;SEE IF BLANK
+	SETOM	T3		;NO--FULL MATCH
+	MOVEM	T3,.FDD2M(T2)	;STORE AWAY
+	AOJ	T2,		; Advance to the next word
+	AOBJN	T1,SETDR1	;LOOP UNTIL DONE
+	JRST	SETDR3		;AND PROCEED BELOW
+SETDR2:	MOVE	T1,.FDPPN(P1)	;GET DIRECTORY
+	MOVE	T2,MYPPN	;DEFAULT PPN--GET USER
+	TLNN	T1,-1		;SEE IF PROJECT PRESENT
+	HLLM	T2,.FDPPN(P1)	;NO--FILL IN MY PROJECT
+	TLNN	T1,-1		; ..
+	HRROS	.FDDIM(P1)	; AND NO WILDCARD
+	TRNN	T1,-1		;SEE IF PROGRAMMER PRESENT
+	HRRM	T2,.FDPPN(P1)	;NO--FILL IN MY PROGRAMMER
+	TRNN	T1,-1		; ..
+	HLLOS	.FDDIM(P1)	; AND NO WILDCARD
+SETDR3:
+SETDR4:	HLRZ	T1,.FDEXT(P1)	;GET EXTENSION
+	CAIE	T1,'UFD'	;SEE IF .UFD
+	POPJ	P,		;NO--ALREADY SETUP CORRECTLY
+	MOVE	T1,MFDPPN	;YES--GET CORRECT DIRECTORY
+	EXCH	T1,.FDPPN(P1)	;STORE (MFD)
+	SETO	T2,		;CLEAR WILDCARDS
+	EXCH	T2,.FDDIM(P1)	;SET INTO DIRECTORY
+	MOVEM	T1,.FDNAM(P1)	;MOVE DIRECTORY TO NAME
+	MOVEM	T2,.FDNMM(P1)	;MOVE DIRECTORY TO NAME
+	SETZM	.FDPAT(P1)	;CLEAR SUB DIRECTORY
+	SETZM	.FDSFM(P1)	; ..
+	POPJ	P,		;RETURN
+	SUBTTL	STRUCTURE SUBROUTINES
+
+;.INSTR -- ROUTINE TO INITIALIZE STRUCTURE SEARCH LOOP
+;.INIST -- SAME AS .INSTR BUT ALSO CAUSES FRCPPN TO BE SET.
+;CALL:	MOVE	T1,DEVICE
+;	MOVE	T2,1B0 IF /PHYSICAL
+;	PUSHJ	P,.INSTR
+;NON-SKIP IF NOT A DISK
+;SKIP WITH CODES PRESET FOR .NXSTR
+;  AND T1=0 IF NO SCANNING, =1B0 IF SCANNING
+
+.INIST:	SETZM	SUBSTR		;INDICATE .INIST CALL
+	SKIPA			;
+.INSTR:	SETOM	SUBSTR		;INDICATE .INSTR CALL
+	$SAVE	<P1>		; Save P1
+	MOVSI	T3,'SYS'	;SEE IF
+	DEVCHR	T3,UU.PHY	; PHYSICAL
+	TRNN	T3,-1		; POSSIBLE
+	TXZ	T2,UU.PHS	;NO--CLEAR ARGUMENT
+	LSH	T2,-^D35	;POSITION TO BIT 35
+	MOVEM	T2,PHYS		;STORE FOR UUO
+	SETOM	SY2RCH		;ASSUME AT LEAST 5.02
+	MOVEM	T1,FDB+.FDSTR		;SAVE DEVICE
+	SETZM	SYSRCH		;CLEAR
+	SETZM	STRMSK		; FLAGS
+	SETZM	STRMTH		; FOR .NXSTR
+	SETZM	SRCH		;CLEAR SEARCH MODE
+	MOVE	T2,T1		;COPY ARGUMENT DEVICE
+	PUSHJ	P,DOPHYS	;GET
+	  DEVCHR T2,		; ITS CHARACTERISTICS
+	MOVS	T1,FDB+.FDSTR		;GET NAME AGAIN
+	CAIN	T1,'NUL'	;SEE IF NUL:
+	TLO	T2,-1-<(DV.TTA)> ;YES--FAKE DEVCHR FOR OLD MONITORS
+	TLC	T2,-1-<(DV.TTA)> ;SEE IF NUL:
+	TLCE	T2,-1-<(DV.TTA)> ; ..
+	TXNN	T2,DV.DSK	;OR NOT DISK
+	 $RETF			; Failure return
+				;FALL INTO INSTR
+				;FALL HERE FROM ABOVE
+;INSTR -- INTERNAL ROUTINE TO INITIALIZE .NXSTR
+
+INSTR:	SKIPN	LNMFLG		; Processing a logical name ?
+	 SETZM	FRCPPN		;INDICATE NOT OVERRIDING PPN
+	MOVE	T3,FDB+.FDSTR		;GET STRUCTURE
+	MOVEI	T4,0		;CLEAR ANSWER
+	MOVE	T2,[3,,T3]	;SETUP CODE
+	PUSHJ	P,DOPHYS	;ASK MONITOR FOR
+	  PATH.	T2,		;  SYS IDENT.
+	    JRST INSTR3		;NOT IMPLEMENTED--TRY OLD WAY
+	MOVE	T1,P1		;SAVE DEVICE PPN
+	HLRZ	T2,T3		;GET GENERIC STR NAME
+	CAIE	T2,'SYS'	;LOOK FOR SYS:
+	TXNE	T4,PT.IPP	;NO--SEE IF IGNORE DIRECTORY ARGS
+	JRST	.+2		;YES--CLOBBER ARGUMENT
+	JRST	INSTR2		;NO--PROCEED
+	CAIN	T2,'SYS'	;IF SYS,
+	HRLI	T3,'DSK'	;SWITCH TO DSK TO GET RIGHT SUBSET
+	MOVEM	T3,FDB+.FDSTR		;  LIKE "SYSA:", ETC.
+	SKIPN	SUBSTR		;IF INTERNAL CALL,
+	PUSHJ	P,SETPPN	;  SET REQUESTED PPN
+	TXNN	T4,PT.IPP	;SEE IF IGNORE PPN
+	SETOM	SYSRCH		;NO--SET SYS FLAG
+
+;HERE TO SEE IF SPECIAL SEARCH LIST NEEDED
+
+INSTR2:	LDB	T1,[POINTR (T4,PT.SLT)]  ;GET S/L CODE
+	JUMPE	T1,INSTR3		;PROCEED IF NOTHING SPECIAL
+	SETZM	SY2RCH		;EXPLICIT INFO, SO CLEAR FLAGS
+	SETZM	SYSRCH		; ..
+	CAIE	T1,.PTSLA	;SEE IF ALL S/L
+	CAIN	T1,.PTSLS	;OR SYS S/L
+	SETOM	SYSRCH		;YES--FLAG FOR ALL OR SYS
+	CAIN	T1,.PTSLS	;SEE IF SYS S/L
+	SETOM	SY2RCH		;YES--FLAG FOR SYS
+	JRST	INSTR7		;AND SKIP AD HOC KLUDGERY
+INSTR3:	MOVE	T2,FDB+.FDSTR		;GET DEVICE NAME
+	MOVE	T3,[1,,T2]	;SET FOR DSKCHR
+	PUSHJ	P,DOPHYS	;DO PHYS I/O CALL
+	  DSKCHR T3,		;SEE IF SYS OR GENERIC
+	    JRST INSTR5		;FAILED--MUST BE SYS:
+	LDB	T1,[POINTR (T3,DC.TYP)]  ;GET NAME CLASS
+	JUMPE	T1,INSTR7		;JUMP IF DSK:
+	CAIN	T1,.DCTAB	;IF STR ABBR. (SE:)
+	JRST	INSTM1		;  GO SET MASK
+	CAIN	T1,.DCTCN	;IF CONTROLLER CLASS (DP:)
+	JRST	INSTM4		;  GO SET DSKCHR MASK
+	CAIN	T1,.DCTCC	;IF CONTROLLER (DPA:)
+	JRST	INSTM5		;  GO SET IT
+	JRST	INSTRX		;NOTHING SPECIAL--USE USER'S DEVICE
+;HERE WHEN STR ABBREVIATION FOUND (LIKE SE: FOR SEFI: AND SEMA:)
+
+INSTM1:	MOVE	T3,FDB+.FDSTR		;GET ABBREVIATION
+	DEVNAM	T3,		;CONVERT TO PHYSICAL IF WE CAN
+	  MOVE	T3,FDB+.FDSTR		;IF NOT DO THE BEST WE CAN
+	PUSHJ	P,.MKMSK	;GET MASK OF SIZE
+	JRST	INSTM8		;AND GO STORE
+
+;HERE WHEN CONTROLLER CLASS (DP:)
+
+INSTM4:	MOVX	T1,DC.CNT	;SET MASK FOR TYPE OF CONTROLLER
+	JRST	INSTM8		;AND GO STORE
+
+;HERE WHEN CONTROLLER (DPA:)
+
+INSTM5:	MOVX	T1,<DC.CNT!DC.CNN>	;SET MASK FOR TYPE AND NUMBER OF CONTROLLER
+
+;HERE WITH T1=MASK, T3=MATCH
+
+INSTM8:	MOVEM	T1,STRMSK	;STORE MASK
+	MOVEM	T3,STRMTH	;STORE MATCH
+	JRST	INSTR6		;AND FLAG FOR SYSSTR TYPE SEARCHING
+
+;HERE WHEN SYS SEARCH LIST IS SELECTED
+
+INSTR5:	SKIPN	SYSRCH		;SEE IF ALREADY SETUP
+	PUSHJ	P,SETSYS	;SETUP DIRECTORY FOR SYS:
+INSTR6:	SETOM	SYSRCH		;FLAG FOR SYSTEM SEARCH LIST (F/S LIST)
+
+;HERE WHEN ANY SEARCH LIST IS SELECTED
+
+INSTR7:	SETOM	SRCH		;FLAG TO USE A SEARCH LIST
+INSTRX:	SETZM	LASSTR		;CLEAR STRUCTURE TO START
+	SKIPE	T1,SRCH		;SEE IF SEARCHING
+	MOVX	T1,UU.PHS	;YES--RETURN /PHYSICAL
+	$RETT			; And give a good return
+; .NXSTR - Routine to get the next structure
+;
+; This routine will return the next structure in the search list in
+; FDB+.FDDEV.  It will give a true return if there was a next structure
+; and a false return if none.
+
+.NXSTR:	SKIPN	SRCH			;HERE FOR NEXT--SEE IF SEARCHING
+	  $RETF				; No more structures, return false
+NXSTR2:	MOVE	T1,LASSTR	;GET F/S NAME FOR LIST
+	SKIPE	SYSRCH		;NEED A NEW F/S
+	JRST	NXSTR3		;FROM SYSTEM F/S LIST
+	SKIPN	T1		;SEE IF FIRST PASS
+	SETOM	T1		;YES--BLANKETY-BLANK UUO
+	MOVE	T2,[1,,T1]	;SETUP POINTER
+	JOBSTR	T2,		;FROM JOB'S SEARCH LIST
+	  HALT	.RETF
+	JRST	NXSTR5		;GOT IT
+
+NXSTR3:	SKIPE	SY2RCH		;NEEDS SYS: S.L.
+	SKIPE	STRMSK		;IF MASK, NEEDS ALL STR LIST
+	JRST	.+2		;YES--USE IT
+	JRST	NXSTR4		;GO USE REAL SYS: SEARCH LIST
+	SYSSTR	T1,		;CAN'T--USE ALL STRS IN SYSTEM
+	  HALT	.RETF
+	JRST	NXSTR5		;GOT IT--GO PROCESS
+
+NXSTR4:	SKIPN	T1		;SEE IF AT START
+	SETOM	T1		;YES--FOOLISH UUO
+	MOVEM	T1,GOBST+.DFGNM	;STORE STR IN GOBSTR'S ARG LIST
+	SETZM	GOBST+.DFGJN	;SPECIFY JOB 0
+	MOVE	T1,SYSPPN	; Get the PPN for SYS:
+	MOVEM	T1,GOBST+.DFGPP	;STORE IN ARGUMENT
+	MOVEI	T1,GOBST	;SETUP SHORT BLOCK
+	GOBSTR	T1,		;ASK MONITOR
+	  HALT	.RETF		;GIVE UP IF ERROR
+	MOVE	T1,GOBST+.DFGNM	;GET ANSWER
+;HERE WITH RESULT FROM S/L IN T1
+
+NXSTR5:	CAMN	T1,[-1]		;LOOK FOR END
+	  $RETF			; Done, return false
+	JUMPE	T1,.RETF	;IF ZERO, ALL DONE
+	MOVEM	T1,FDB+.FDSTR
+	MOVEM	T1,LASSTR	;SAVE FOR SEARCH
+
+	MOVEM	T1,DSKBUF	;DO A DSKCHR
+	MOVE	T3,[.DCMAX,,DSKBUF]
+	$CALL	DOPHYS		; TO HANDLE
+	  DSKCHR T3,		; SINGLE ACCESS
+	    HALT .RETF		; ..
+	TXNE	T3,DC.SAF	;SEE IF SINGLE ACCESS
+	  JRST	[PJOB	T2,		;YES--GET OUR JOB
+		XOR	T2,DSKBUF+.DCSAJ ;COMPARE TO S.A. USER
+		TRNE	T2,-1		;SEE IF MATCH
+		JRST	NXSTR2		;NO--IGNORE STRUCTURE
+		JRST	.+1]		;YES--OK TO TRY IT
+	SKIPN	T2,STRMSK	;SEE IF MASKING RESULTS
+	  $RETT			; No, give a good return
+	SKIPL	T2		;SKIP IF NAME MASKING
+	 SKIPA	T1,T3		;POSITION DSKCHR FOR MATCH
+	MOVE	T1,FDB+.FDSTR		;YES--GET BACK NAME
+	XOR	T1,STRMTH	;SEE IF MATCHES
+	TDNE	T1,STRMSK	;WHERE IMPORTANT
+	 JRST	NXSTR2		;NO--GO GET NEXT STR
+	$RETT			; Give a good return
+	SUBTTL	Logical Name Subroutines -- .INILN - Initialize logical name
+
+;.INILN - This routine will initialize the logical name searching.  It will
+;	  do a PATH. to determine if the device name that was specified in
+;	  the device name is a logical name.  If it is it will set FRCPPN to
+;	  denote that there is a forced PPN, and set up FDB+.FDPPN to be correct.
+;
+; Usage:
+;	$CALL	.INILN
+;	(Return)
+
+.INILN:	MOVX	S1,.PTLLB		; Get the length
+	MOVEI	S2,LNMBLK		; Get the block address
+	$CALL	.ZCHNK			; Clear the block
+	MOVX	T1,.PTFRN		; Get the read function
+	STORE	T1,LNMBLK+.PTFCN,PT.FCN	; Store the function
+	MOVX	T1,PT.RCN		; Get the read name bit
+	MOVEM	T1,LNMBLK+.PTLNF	; Store the flag
+	MOVE	T1,FDB+.FDSTR		; Get the structure we are processing
+	MOVEM	T1,LNMBLK+.PTLNM	; Store the name
+	MOVE	T1,[XWD .PTLLB,LNMBLK]	; Get the length,,address
+	PATH.	T1,			; Is this a path
+	  JRST	NOTLNM			; Not a logical name
+	MOVEI	T3,LNMBLK+.PTLSB	; Get the start of the sub-block
+	MOVEM	T3,FRCPPN		; Store the address of the block
+	MOVEM	T3,LNMPTR		; Save as the pointer to the next
+	MOVE	T1,.PTLSL(T3)		; Get the device of the first logical name
+	MOVEM	T1,FDB+.FDSTR			; Store the name
+
+	MOVE	T1,.PTLPP(T3)		; Get the PPN
+	SETZ	T2,			; Initialize the counter
+.INIL0:	MOVEM	T1,FDB+.FDPPN(T2)	; Store the item
+	SETOM	FDB+.FDDIM(T2)		; Flag that the item is not wild
+	ADDI	T2,1			; POint to the next entry
+	ADDI	T3,1			; For both items
+	SKIPE	T1,.PTLSF-1(T3)		; Get the first of the SFDs
+	  JRST	.INIL0			; Loop for all of them
+	SETZM	FDB+.FDPPN(T2)		; Clear to mark the end of the list
+	SETZM	FDB+.FDDIM(T2)		; . . .
+	MOVEM	T2,LNMDEP		; . . .
+	SETOM	LNMFLG			; Logical name processing
+	MOVX	T1,FD.DIR		; Get the directory flag
+	ANDCAM	T1,FDB+.FDMOD		; Clear it
+	SKIPE	FDB+.FDPPN		; Have a PPN?
+	 IORM	T1,FDB+.FDMOD		; Yes, then set the flag
+	$RETT				; Give a good return
+
+; Here if the device is not a logical name
+
+NOTLNM:	SETZM	LNMFLG			; No logical name processing
+	SETZM	FRCPPN			; Clear the forced ppn
+	$RETF				; Return false
+	SUBTTL	Logical Name Subroutines -- .NXTLN - Set up for the next name
+
+;.NXTLN - This routine will set up for the next logical name.  It will
+;	  give a non-skip return if there is another name and a skip return
+;	  if the list has been expired.
+;
+; Usage:
+;	$CALL	.INILN
+;		.
+;		.
+;		.
+;	$CALL	.NXTLN
+;	(Another name all set to go)
+;	(No more names)
+
+.NXTLN:	SKIPN	LNMFLG		; Processing a logical name
+	  $RETF			; No logical name
+	MOVE	T1,LNMPTR	; Get the current pointer
+	MOVEI	T1,.PTLSF(T1)	; Point to the first of the SFDs
+	SKIPE	(T1)		; If this is zero then skip
+	 AOJA	T1,.-1		; Find the end of the SFD list
+	ADDI	T1,1		; Point one more down the road
+
+	SKIPN	(T1)		; End of the logical name ?
+	 SKIPE	1(T1)		; . . .
+	  JRST	.NXTL0		; No, finish up
+	$RETF			; No more
+
+; Here if we have another logical name
+
+.NXTL0:	MOVEM	T1,FRCPPN		; Store the updated pointer
+	MOVEM	T1,LNMPTR		; Store as the pointer for the logical names
+	MOVE	T2,.PTLSL(T1)		; Get the device name
+	MOVEM	T2,FDB+.FDSTR		; Store the structure name
+	SETZB	T3,T4			; Clear the counters
+
+	MOVE	T2,.PTLPP(T1)		; Get the PPN
+.NXTL1:	MOVEM	T2,FDB+.FDPPN(T3)	; Store into the two places
+	SETOM	FDB+.FDDIM(T3)		; Make this not wild
+	ADDI	T3,1			; Point to the next entry
+	ADDI	T1,1			; . . .
+	SKIPE	T2,.PTLSF-1(T1)		; End of the SFD list ?
+	 AOJA	T4,.NXTL1		; No, keep looping
+	ADDI	T4,1			; Increment the depth
+	MOVEM	T4,LNMDEP		; Store it
+	SETZM	FDB+.FDPPN(T3)		; Clear to mark the end
+	SETZM	FDB+.FDDIM(T3)		; . . .
+	MOVX	T1,FD.DIR		; Get the directory flag
+	ANDCAM	T1,FDB+.FDMOD		; Clear it
+	SKIPE	FDB+.FDPPN		; Is there a PPN?
+	IORM	T1,FDB+.FDMOD		; Yes, set the flag
+	$CALL	INSTR			; Initialize the structure search
+	$RET				; Pass the information back
+	SUBTTL	USEFUL SUBROUTINES
+
+;SETSYS -- SETUP DIRECTORY FOR SYS:
+;CALL:	PUSHJ	P,SETSYS
+;USES T1, T2
+
+SETSYS:	MOVE	T1,SYSPPN	; Get the SYS: PPN
+SETPPN:	CAMN	T1,MFDPPN	;IF MFD:,
+	JRST	[MOVE	T2,FDB+.FDPPN	;GET DIRECTORY
+		CAMN	T2,MFDPPN	;UNLESS MFD,
+		POPJ	P,		;(YES--RETURN)
+		MOVEM	T2,FDB+.FDNAM	; STORE AS NAME
+		MOVE	T2,FDB+.FDDIM	; Get the directory mask
+		MOVEM	T2,FDB+.FDNMM	; Store the mask also
+		JRST  .+1]		;PROCEED
+	MOVEM	T1,FRCPPN		;OVERRIDE DIRECTORY
+	MOVE	T2,MFDPPN		;GET MFD
+	CAMN	T2,FDB+.FDPPN		;SEE IF SAME
+	JRST	SETPP1			;YES--GO DIDDLE NAME
+	MOVEM	T1,FDB+.FDPPN		;AND OVERSTORE REQUEST
+	SETOM	FDB+.FDDIM		; Set the directory mask
+	SETZM	FDB+.FDPAT		; No path
+	SETZM	FDB+.FDSFM		; No mask for it either
+	MOVX	T1,FD.DIR		; Directory seen flag
+	IORM	T1,FDB+.FDMOD		; Light it
+	POPJ	P,			;RETURN
+SETPP1:	MOVEM	T1,FDB+.FDNAM		;STORE OVER NAME
+	SETOM	FDB+.FDNMM		; Clear wildcards in the mask
+	POPJ	P,			;RETURN
+;DOPHYS -- PERFORM A LOGICAL OR PHYSICAL CALLI AS NEEDED
+;CALL:	PUSHJ	P,DOPHYS
+;	CALLI TO BE EXECUTED
+;	CPOPJ RETURN POINT
+;	SKIP RETURN POINT
+;USES T1
+
+DOPHYS:	MOVE	T1,(P)			;FETCH CALLI
+	MOVE	T1,(T1)			; ..
+	AOS	(P)			;ADVANCE RETURN POINT
+	SKIPE	PHYS			;SEE IF PHYS I/O REQUESTED
+	TRO	T1,UU.PHY		;YES--TURN ON PHYSICAL BIT
+	XCT	T1			;DO THE CALLI
+	POPJ	P,			;OK RETURN
+CPOPJ1:	AOS	(P)			;SKIP
+CPOPJ:	POPJ	P,			;RETURN
+
+
+
+;SETOPN -- SETUP OPEN BLOCK WORD 1 AND 2
+;CALL:	PUSHJ	P,SETOPN
+;RETURNS WITH T1, T2 SETUP, T3=0
+;USES NO ACS
+
+SETOPN:	MOVX	S1,.IODMP		; Get the mode
+	SKIPN	PHYS			;SEE IF PHYS I/O REQUESTED
+	 SKIPE	SRCH			;OR IF USING A SEARCH LIST
+	  TLO	S1,(UU.PHS)		;YES--SET FOR PHYS OPEN
+	MOVEM	S1,DFLP+.FOIOS		; Store the status
+	SKIPN	S2,LASSTR		;GET STRUCTURE OR
+	 MOVE	S2,FDB+.FDSTR		;GET ARGUMENT DEVICE
+	MOVEM	S2,DFLP+.FODEV		; Store the device name
+	POPJ	P,			;RETURN
+;.MKMSK -- MAKE MASK CORRESPONDING TO NON-BLANKS IN SIXBIT WORD
+;CALL:	MOVE	T3,WORD
+;	PUSHJ	P,.MKMSK
+;RETURN WITH MASK IN T1
+;USES T2
+
+.MKMSK:	MOVEI	T1,0		;CLEAR MASK
+	MOVSI	T2,(77B5)	;START AT LEFT END
+MAKMS1:	TDNE	T3,T2		;SEE IF SPACE HERE
+	IOR	T1,T2		;NO--IMPROVE MASK
+	LSH	T2,-6		;MOVE RIGHT ONE CHAR
+	JUMPN	T2,MAKMS1	;LOOP UNTIL DONE
+	POPJ	P,		;RETURN
+	SUBTTL	TOPS-10 error codes
+
+TOPS10<
+
+	DEFINE ENTERR<
+ERR$(ERFNF%,FNF,<File not found>)
+ERR$(ERIPP%,IPP,<No UFD for Project-Programmer Number>)
+ERR$(ERPRT%,PRT,<Protection Failure>)
+ERR$(ERFBM%,FBM,<File being modified>)
+ERR$(ERAEF%,AEF,<File already exists>)
+ERR$(ERISU%,ISU,<Illegal sequence of UUO's>)
+ERR$(ERTRN%,TRN,<Transmission error>)
+ERR$(ERNSF%,NSF,<Not a SAVE file>)
+ERR$(ERNEC%,NEC,<Not enough core>)
+ERR$(ERDNA%,DNA,<Device not available>)
+ERR$(ERNSD%,NSD,<No such device>)
+ERR$(ERILU%,ILU,<Illegal UUO.  No two-register relocation>)
+ERR$(ERNRM%,NRM,<No room or quota exceeded on this file structure>)
+ERR$(ERWLK%,WLK,<File structure is write-locked>)
+ERR$(ERNET%,NET,<Not enough monitor table space>)
+ERR$(ERPOA%,POA,<Partial allocation>)
+ERR$(ERBNF%,BNF,<Block not free>)
+ERR$(ERCSD%,CSD,<Cannot supersede a directory>)
+ERR$(ERDNE%,DNE,<Cannot delete a non-empty directory>)
+ERR$(ERSNF%,SNF,<SFD not found>)
+ERR$(ERSLE%,SLE,<Search list empty>)
+ERR$(ERLVL%,LVL,<SFD nested too deeply>)
+ERR$(ERNCE%,NCE,<No create bit on on all structures>)
+ERR$(ERSNS%,SNS,<Segment not on swapping space>)
+ERR$(ERFCU%,FCU,<Cannot update file>)
+ERR$(ERLOH%,LOH,<Low segment overlaps high segment>)
+ERR$(ERNLI%,NLI,<Cannot run program when not logged in>)
+ERR$(ERENQ%,ENQ,<File still has outstanding locks set>)
+ERR$(ERBED%,BED,<Bad .EXE directory>)
+ERR$(ERBEE%,BEE,<Bad extension for .EXE file>)
+ERR$(ERDTB%,DTB,<Directory too big for .EXE file>)
+ERR$(ERENC%,ENC,<TSK - Exceeded network capacity>)
+ERR$(ERTNA%,TNA,<TSK - Task not available>)
+ERR$(ERUNN%,UNN,<TSK - Undefined network node>)
+ERR$(ERSIU%,SIU,<SFD is in use, cannot be renamed>)
+ERR$(ERNDR%,NDR,<File has an NDR lock, cannot delete>)
+ERR$(ERJCH%,JCH,<Job count too high (Access Table read count overflow)>)
+ERR$(ERSSL%,SSL,<Cannot rename SFD to a lower level>)
+ERR$(ERCNO%,CNO,<Channel not opened (FILOP.)>)
+ERR$(ERDDU%,DDU,<Device "Down" and unuseable>)
+ERR$(ERDRS%,DRS,<Device is restricted>)
+ERR$(ERDCM%,DCM,<Device controlled by MDA>)
+ERR$(ERDAJ%,DAJ,<Device allocated to another job>)
+ERR$(ERIDM%,IDM,<Illegal I/O data mode>)
+ERR$(ERUOB%,UOB,<Unknown/Undefined open bits set>)
+ERR$(ERDUM%,DUM,<Device in use on an MPX channel>)
+ERR$(ERNPC%,NPC,<No per-process space for extended I/O channel table>)
+ERR$(ERNFC%,NFC,<No free channels available>)
+ERR$(ERUFF%,UFF,<Unknown FILOP. function>)
+ERR$(ERCTB%,CTB,<Channel too big>)
+ERR$(ERCIF%,CIF,<Channel illegal for specified function>)
+
+>;end of enterr macro
+
+DEFINE	ERR$(CODE,PREFIX,TEXT)<XWD CODE,[ASCIZ |TEXT|]>
+FILERR::ENTERR
+ FILELN==.-FILERR
+>; End of TOPS10 conditional
+
+	XLIST	;LITERALS
+	LIT
+	LIST
+	RELOC	0
+
+.WILDZ:!		;START OF LOW CORE AREA
+
+; User arguments
+
+SECBLK:	BLOCK	1			; Secondary Argument block
+SECFLP:	BLOCK	1			; Secondary FILOP block address
+SECFLN:	BLOCK	1			; Secondary FILOP block length
+SECFLG:	BLOCK	1			; Secondary Flags
+
+ARGFLN:	BLOCK	1			; Length of user supplied FILOP. block
+ARGFLP:	BLOCK	1			; FILOP. block address
+ARGFLG:	BLOCK	1			; Flags given
+ARGBLK:	BLOCK	1			; Address of argument block
+
+FDB:	BLOCK	.FDSIZ			; User given specification
+
+ZERBEG:!
+
+; Directory processing information
+
+DEPTH:	BLOCK	1			; Current SFD/UFD depth
+TOP:	BLOCK	1			; Top of the depth
+
+DIRCHN:	BLOCK	D$MSFD+1		; Directory channels we are using
+DIRBLK:	BLOCK	D$MSFD+1		; Current block we are processing
+DIRIDX:	BLOCK	D$MSFD+1		; Index into DIR
+
+DFLP:	BLOCK	.FOMAX			; Directory FILOP. block
+DLEB:	BLOCK	.RBMAX			; LOOKUP/ENTER block for dik for directories
+DPTH:	BLOCK	.PTMAX			; Path block for LOOKUP of directories
+
+DIR:	BLOCK	D$BLKS			; UFD data block
+
+; INISTR/NXTSTR information
+
+SUBSTR:	BLOCK	1		;FLAG CALL TO SUBROUTINE .NXSTR
+LASSTR:	BLOCK	1		;LAST STR FROM SEARCH UUOS
+FRCPPN:	BLOCK	1		;PPN TO OVERRIDE WITH
+STRMSK:	BLOCK	1		;MASK FOR MATCHING STRS
+				;  BY NAME IF LT 0, BY DSKCHR IF GT 0
+STRMTH:	BLOCK	1		;MATCH FOR ABOVE
+PHYS:	BLOCK	1		;FLAG TO FORCE PHYSICAL I/O
+SRCH:	BLOCK	1		;FLAG FOR SEARCH LIST IN USE
+SYSRCH:	BLOCK	1		;FLAG FOR SYSTEM SEARCH LIST IN USE
+SY2RCH:	BLOCK	1		;FLAG FOR REAL SYS: SEARCH LIST
+
+DSKBUF:	BLOCK	.DCMAX		; DSKCHR block
+GOBST:	BLOCK	5		;GOBSTR PARAMETER AREA
+
+
+SYSPPN:	BLOCK	1			; PPN of SYS:
+MFDPPN::BLOCK	1			; MFD directory
+MYPPN::	BLOCK	1			; User's PPN
+PTH:	BLOCK	.PTMAX			; Default user's path
+
+LNMPTR:	BLOCK	1			; Pointer to the current logical name
+LNMDEP:	BLOCK	1			; Depth of the logical name
+LNMFLG:	BLOCK	1			; Flag for logical name processing
+LNMBLK:	BLOCK	.PTLLB			; Length of the logical name block
+
+FLP:	BLOCK	.FOMAX			; FILOP. block
+FPTH:	BLOCK	.PTMAX			; File found in block
+FLKP:	BLOCK	.RBMAX			; LOOKUP block
+
+ZERLEN==.-ZERBEG	; Length of the area to clear
+	SUBTTL	End of KERWLD
+
+	END
+ 8|J³
