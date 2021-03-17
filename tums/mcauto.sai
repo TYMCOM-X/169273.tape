@@ -1,0 +1,994 @@
+begin	"CMSNOTE"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "ARGS.REQ" source!file;
+require "AUXLIB.REQ" source!file;
+require "MAILIB.REQ" source!file;
+require "MAILOG.REQ" source!file;
+require '36 version;
+require 1024 system!pdl;
+require 512 string!pdl;
+!get!definitions(GOGTAB);
+
+! v36  9-Sep-88 RFM	Disable auto garbage collect and do at each poll;
+! v35  4-Nov-87 WRS	Added Received: line on send (on behalf of MCAUTO);
+!			Force at least one blank between address fields;
+! v34 25-Sep-87 WRS	Fixed bug in dupsup() hash algorithm always =0;
+! v33 28-Aug-87 WRS	Changed dupplicate suppress hash to exclude date;
+! v32 25-May-87 WRS	Don't crash on call cleared;
+! v31 19-Dec-86 WRS	Allow echo from gateway;
+! v30 19-Dec-86 WRS	Ignore message to Poll with no body;
+! v27 18-Dec-86 RFM     Remove host 8504 default, log in as vmcms;
+! v26 17-Dec-86 WRS	improved error log;
+! v25 19-Nov-86 WRS	don't clear RETRIES on crash so LOGON won't loop too
+			fast on crash.  Also check explicitly for
+				DMKLOG054E ALREADY LOGGED ON;
+! v24 20-Aug-86 WRS	added /HOST: /GATEWAY:, changed default to 8504 and F;
+! v23 21-Jun-86 WRS	added tabExpand to expand tabs in outbound msgs;
+! v22 19-Jun-86 WRS	cleanup for use with ROUTE.DAT;
+! v21			no history;
+
+comment
+	dupsup - define and allocate for duplication-suppression mechanism
+;
+define	dupsup!items = 200;
+require dupsup!items+50 new!items;
+require dupsup!items%8 buckets;
+list	dupsup!list;
+
+define	PostUserid = {"M178816"},
+	PostNode   = {"SLVM307"};
+
+item RUN;			! must specify or will logout;
+string item QUEUEFILE;
+string item LOGINSTRING;
+string item ID;
+string item PASSWORD;
+integer item POLL.SECS;
+integer item CONNECT.HRS;
+item PURGE;
+string item HOST;
+string item GATEWAY;
+item HOLD;
+item TRACE;
+item WAIT;
+
+define timeout = 600;
+
+label CrashRestart;
+string CRASH!LOG;
+
+procedure Crash( string MSG(null) );
+begin
+    auxZap;
+    if length(MSG) then
+	cprint( logChan, MSG, crlf );
+    if length(CRASH!LOG) then
+	cprint( logChan, CRASH!LOG, crlf );
+    cprint( logChan, "?CRASH at ", maiDate, crlf );
+    if logDirty then logOpen;
+    CRASH!LOG := null;
+    goto CrashRestart;
+end;
+
+integer labelBrk;
+integer tokenBrk;
+integer ignoreBrk;
+integer lineBrk;
+integer tabBrk;
+
+simple procedure brkini;
+begin
+    define ctls = {(0&1&2&3&4&5&6&7&9&11&14&15&16&17&18&19&20&21&22&23&24&
+	25&26&27&28&29&30&31&127)};
+    setbreak(labelBrk_getbreak," !@#%^&()+=~}|[]\:;""'<>?,/"," ","TIRK");
+    setbreak(tokenBrk_getbreak,crlf&" -;,",crlf&" ","TIR");
+    setbreak(ignoreBrk_getbreak,null,"!@$%^&*()_+~=}|[]\:""';<>?/,","I");
+    setbreak(lineBrk_getbreak,#lf&#ff,#cr&ctls,"SIN");
+    setbreak(tabBrk_getbreak,#ht&#ff&crlf,null,"SIN");
+end;
+require brkini initialization;
+
+boolean procedure lkequ( string S1,S2 );
+begin
+    return( kequ( S1[1 to length(S2)], S2 ));
+end;
+
+string procedure pad( string S; integer L );
+begin
+    define BLANKS = 
+      {"                                                                "};
+    return( S& BLANKS[length(S)+2 to L]& " " );
+end;
+
+string procedure trim( string S );
+begin
+    while S=" " do lop(S);
+    while S[inf for 1]=" " do S := S[1 to inf-1];
+    return( S );
+end;
+
+string procedure cvAdrIgnore( string A );
+begin
+    string S;
+    integer B;
+    S := scan( A, ignoreBrk, B );
+    if equ( S, " " ) then S := null;
+    return( S );
+end;
+
+string procedure tabExpand( string BUF );
+begin
+    integer B, NLPOS;
+    string SBUF;		! working buffer;
+    string XTEXT;		! expanded text;
+    XTEXT := null;
+    NLPOS := length( SBUF := BUF );
+    while length( BUF ) do begin
+	scan( BUF, tabBrk, B );
+	case B of begin	
+	    [#ht] begin
+		integer I;
+		NLPOS := NLPOS - 1 + ( I := 8-(NLPOS-length(BUF)+7) mod 8 );
+		XTEXT := XTEXT &
+		    SBUF[1 to inf-length(BUF)-1] &
+		    "        "[1 for I];
+		SBUF := BUF;
+	    end;
+	    [else]
+		NLPOS := length(BUF)
+	end;
+    end;
+    return( XTEXT & SBUF );
+end;
+
+comment
+	dupsup!hash - hash a message into a message ID
+;
+string procedure dupsup!hash( r!p(mai)M );
+begin
+    string MID, S;
+    integer CKSUM;
+    r!p(adr) A;
+    A := maiAParse( mai:From[M] );
+    CKSUM := 0;
+    S := mai:Text[M];
+    while length(S) do begin
+	integer C;
+	if " " < C := lop(S) then CKSUM := (CKSUM rot 1) + C;
+    end;
+    adr:User[A] := adr:User[A]& "."& cvos(CKSUM);
+    MID := maiAMake( A );
+    return( MID );
+end;
+
+boolean procedure dupsup( r!p(mai) M );
+begin
+    string MID;
+    boolean FLAG;
+    itemvar iv;
+    MID := dupsup!hash( M );
+    cvsi( MID, FLAG );
+    if not FLAG then return( true );
+    iv := new;
+    new!pname( iv, MID );
+    put iv in dupsup!list after inf;
+    if length( dupsup!list ) > dupsup!items then
+	delete( lop( dupsup!list ));
+    return( false );
+end;
+
+comment
+	defaultHost - parse an address and cause its host field to
+		      be defaulted to the specified value
+;
+string procedure defaultHost( string AS, Default );
+begin
+    string saveHost;
+    r!p(adr) PA;
+    saveHost := maiHost;
+    maiHost := Default;
+    PA := maiAParse( AS );
+    AS := maiAMake( PA );
+    maiHost := saveHost;
+    return( AS );
+end;
+
+comment
+	tokenize - fill the array with the tokens from the string
+
+	Tokens are seperated by whitespace, "<semicolon>", "," and "--"
+	force token breaks.  That is "aaa-bbb" is one token, but "aaa--bbb"
+	is three tokens.  The number of tokens scanned is returned
+	which will never exceed the size of the array.
+;
+
+integer procedure tokenize( string TEXT; string array A );
+begin	"tokenize"
+    integer I,B,N;
+    string T,T1;
+    N := 0;
+    T1 := null;
+    for I := arrinfo(A,1) upto arrinfo(A,2) do begin
+	T := scan( TEXT, tokenBrk, B );
+	while B = "-" and TEXT[2 for 1] neq "-" do
+	    T := T& lop(TEXT)& scan( TEXT, tokenBrk, B );
+	if B and length(T) = 0 then
+	    while B = TEXT do
+		T := T& lop(TEXT);
+	A[i] := T;
+	if length(T) then N := N + 1;
+    end;
+    return( N );
+end	"tokenize";
+
+procedure LOGON;
+begin	"LOGON"
+    own integer RETRIES;
+    label RETRY;
+    string S;
+    integer ST, READS;
+    while AuxPort leq 0 do begin
+	if maiHost = "B"	! Bubbnet? ;
+	    then creaux( '4 & datum(GATEWAY) )
+	    else creaux( '4 & datum(loginString)& #cr );
+	if !SKIP! then done;
+	cprint( logChan, "%LOGON: creaux failed ", maiDate, crlf );
+RETRY:	auxZap;
+	calli( !xwd(1,
+	    case RETRIES of (4,8,16,32,64,128,256,512,[else]1024)
+	    ), '72 );
+	RETRIES := RETRIES + 1;
+    end;
+    ST := 0;
+    READS := 0;
+    CRASH!LOG := null;
+    while true do case auxRead( S, timeout ) of begin
+	[aux!prompt] begin
+	    CRASH!LOG := CRASH!LOG& S;
+	    READS := READS + 1;
+	    if READS > 10 then Crash( "?LOGON: excessive reads" );
+	    if equ(S[inf for 1],".")
+		then case ST of begin
+		    [0] ;
+		    [1] Crash( "?LOGON: unexpected prompt" );
+		    [2] auxOut( #cr );
+		    [3] begin
+			auxOut( "IPL CMS PARM AUTOCR"& #cr );
+			CRASH!LOG := CRASH!LOG& "IPL CMS PARM AUTOCR";
+		    end;
+		    [4] done;
+		    [else] usererr(ST,2,"LOGON: unexpected state ","X")
+		end
+		else if lkequ(S,"please log in:")
+		    then begin
+			auxOut( '4 & datum(loginString)& #cr );
+			if not auxSync( #lf, timeout ) then goto RETRY;
+		    end
+		    else Crash( "?LOGON: bad prompt: """& S& """" );
+	    CRASH!LOG := CRASH!LOG& crlf;
+	end;
+	[aux!line] begin
+	    if length(S) then CRASH!LOG := CRASH!LOG& S& crlf;
+	    if lkequ(S,"host down")
+	    or lkequ(S,"host not available")
+	    or lkequ(S,"host shut") then begin
+		cprint( logChan, "%LOGON: ", S, " ", maiDate, crlf );
+		goto RETRY;
+	    end;
+	    if lkequ(S,"host: call clear") then begin
+		cprint( logChan, "%LOGON: call cleared ", maiDate, crlf );
+		goto RETRY;
+	    end;
+	    case ST of begin
+		[0] if lkequ(S,"MCAUTO") then begin
+		    calli( 1000, '72 );	! sleep 1 second;
+		    auxOut( "LOGON " );
+		    auxOut( datum(ID) );
+		    auxOut( " " );
+		    auxOut( datum(PASSWORD) );
+		    auxOut( #cr );
+		    CRASH!LOG := CRASH!LOG& "LOGON "& datum(ID)& " ..."& crlf;
+		    ST := 1;		! logon in progress;
+		end;
+		[1]
+		[2] if lkequ(S,"SUB AC") then
+		    ST := 2		! send sub account;
+		else if lkequ(S,"RECONNECTED AT") then begin
+		    cprint( logChan, S, crlf );
+		    ST := 3;		! send IPL;
+		end
+		else if lkequ(S,"LOGON AT") then begin
+		    cprint( logChan, S, crlf );
+		    ST := 4;		! done at prompt;
+		end
+		else if lkequ(S,"DMKLOG054E") then begin
+		    cprint( logChan, "%LOGON: ", S, crlf );
+		    goto RETRY;
+		end;
+		[3] if lkequ(S,"VM CMS") then
+		    ST := 4;
+		[4] ;
+		[else] usererr(ST,2,"?LOGON: unexpected state ST=","X")
+	    end;
+	end;
+	[aux!zap] Crash( "%LOGON: circuit zapped" );
+	[aux!timeout] Crash( "%LOGON: timeout" )
+    end;
+    if RETRIES then cprint( logChan,
+	"%LOGON: failure(s) durring logon, RETRIES = ", RETRIES, crlf );
+    RETRIES := 0;
+    CRASH!LOG := null;
+end	"LOGON";
+
+comment
+	CMS - return return code from remote CMS command
+	Expects dialog like:
+		.command
+		zero or more messages
+		R<semicolon> T=0.01/0.01 15:33:12
+		.
+	or
+		.command
+		zero or more messages
+		R(1234)<semicolon> T=0.01/0.01 15:33:26
+		.
+	Returns 0 if first form, else return code (1234).
+;
+
+integer procedure CMS( string CMD );
+begin
+    string S, LastLine;
+    CRASH!LOG := null;
+    if auxPort leq 0 then return( -1 );
+    CRASH!LOG := "."& CMD& crlf;
+    auxOut( CMD );
+    auxOut( #cr );
+    while true do case auxRead( S, timeout ) of begin
+	[aux!Line] if length(S) then begin
+	    LastLine := S;
+	    CRASH!LOG := CRASH!LOG& S& crlf;
+	end;
+	[aux!Prompt] begin
+	    if equ( LastLine[1 to 2],"R;" ) then
+		return( 0 );
+	    if equ( LastLine[1 to 2],"R(" ) then
+		return( cvd(LastLine[3 to inf]) );
+	    Crash( "?CMS: unexpected read during CMS command" );
+	end;
+	[else] Crash( "?CMS: zap or timeout during CMS command" )
+    end;
+end;
+
+comment
+	IDENTIFY - execute identify command
+
+	Sets globals:
+	    MyUserid
+	    MyNode
+	    MyZone
+;
+
+string MyUserid;
+string MyNode;
+string MyRSCSid;
+string MyZone;
+
+procedure IDENTIFY;
+begin
+    string array A[0:9];
+    CMS( "IDENTIFY" );
+    tokenize( CRASH!LOG, A );
+    if not kequ(A[2],"AT") or not kequ(A[4],"VIA") then begin
+	cprint( logChan, "%IDENTIFY: response format error"& crlf, CRASH!LOG );
+	return;
+    end;
+    MyUserid := A[1];
+    MyNode := A[3];
+    MyRSCSid := A[5];
+    MyZone := A[8];
+end;
+
+comment
+	scanFieldName - return (and remove) the field name portion of a field
+
+	Returns the upper-case field label from a line of the form
+		<blanks><field-name><blanks>:<field>
+	If the line is not of this form, both the return value and the
+	reference argument are set to NULL.
+;
+
+string procedure scanFieldName( reference string FIELD );
+begin	"scanFieldName"
+    integer B;
+    string FIELDNAME;
+    FIELDNAME := scan( FIELD, labelBrk, B );
+    if length( scan( FIELD, labelBrk, B ) ) then return( FIELD := null );
+    if lop(FIELD) neq ":" then return( FIELD := null );
+    while FIELD = " " do lop(FIELD);
+    return( FIELDNAME );
+end	"scanFieldName";
+
+comment
+	AdrComments - add comments to address field
+;
+
+procedure AdrComments(
+	reference string Adr;
+	string array A;
+	integer J (-999999);
+	integer K (+999999) );
+begin
+    string S;
+    integer I;
+    S := null;
+    if J < arrinfo(A,1) then J := arrinfo(A,1);
+    if K > arrinfo(A,2) then K := arrinfo(A,2);
+    for I := J upto K do begin
+	if length(A[i]) = 0 then done;
+	if A[i] = "," then continue;
+	if A[i] = ";" then done;
+	S := S& A[i]& " ";
+    end;
+    if length(S) and length(Adr) then
+	Adr := S& ( if Adr = "<" or Adr[inf for 1] = ">"
+	    then Adr
+	    else "<"& Adr& ">" );
+end;
+
+define	profs!type	= 1,
+	note!type	= 2;
+
+procedure ParseLine (
+	r!p(mai) M;
+	string LINE;
+	reference integer MsgState;
+	integer LINES );
+begin	"ParseLine"
+    boolean BLANK, INDENT;
+    own integer MsgType;
+    own list AdrField;
+    string FIELDNAME, FIELD;
+    label Dispatch;
+
+    procedure AdrParse( reference string FieldRef );
+    begin "AdrParse"
+	string SRC;
+	integer N;
+	string array A[1:40];
+	boolean NoRCPT;
+	NoRCPT := location(mai:From[M]) = location(FieldRef);	! (gag) ;
+	SRC := if FIELDNAME then FIELD else LINE;
+	N := tokenize( SRC, A );
+	if MsgType = profs!type then while N do begin "ProfsStyleAdr"
+	    integer I;
+	    for I := N downto 1 do
+		if equ( A[I], "--" ) then begin
+		    string ADR;
+		    if I+2=N and A[n] neq "(" and  (
+		      A[n]="<" and A[n][inf for 1]=">"
+		      or   kequ(A[I-1],MyUserid)   )
+			then begin
+			    if kequ(A[I-1],MyUserid) then begin
+				ADR := defaultHost( A[n], "Ontyme" );
+				if not NoRCPT then
+				    maiCatList( mai:RCPT[M], ADR );
+			    end;
+			    maiCatList( FieldRef, ADR );
+			end
+			else begin
+			    ADR := A[I-1]& "@"& A[I+1]& ".McAuto.Tymnet";
+			    AdrComments( ADR, A, I+2, N );
+			    if not kequ(A[I-1],MyUserid) then begin
+				maiCatList( FieldRef, ADR );
+			    end;
+			end;
+		    N := I - 2;
+		    continue "ProfsStyleAdr";
+		end;
+	    N := 0;
+	end "ProfsStyleAdr"
+	else begin "NoteStyleAdr"
+	    string ADR;
+	    integer I;
+	    I := N;
+	    while I geq 1 do begin
+		integer J;
+		string Node;
+		if I geq 3 and kequ(A[i-1],"AT") then begin
+		    Node := A[i];
+		    I := I - 2;
+		end
+		else
+		    Node := MyNode;
+		ADR := A[i]& "@"& Node& ".McAuto.Tymnet";
+		for J := I-1 downto 1 do begin
+		    if A[j] = "," then done;
+		    if A[j] = "<" and A[j][inf for 1] = ">" then begin
+			ADR := A[j];
+			if kequ(A[i],MyUserid) then
+			    defaultHost( ADR, "Ontyme" );
+			AdrComments( ADR := A[j], A, J+1, I-1 );
+			AdrComments( ADR, A, 1, J-1 );
+			if kequ(A[i],MyUserid) and not NoRCPT then
+			    maiCatList( mai:RCPT[M], ADR );
+			maiCatList( FieldRef, ADR );
+			return;
+		    end;
+		end;
+		AdrComments( ADR, A, J, I-1 );
+		if not kequ(A[i],MyUserid) then
+		    maiCatList( FieldRef, ADR );
+		I := J - 1;
+	    end;
+	end "NoteStyleAdr";
+    end   "AdrParse";
+
+    if MsgType = profs!type and LINE = " " then lop(LINE);
+    FIELDNAME := scanFieldName( FIELD := LINE );
+    BLANK := length(LINE) = 0 or equ(LINE," ");
+    INDENT := LINE = " " and not BLANK and not length(FIELDNAME);
+Dispatch:
+    case MsgState of begin
+	[0] if FIELDNAME then begin	! this state is initial state;
+	    MsgType := if equ(LINE[1 to 9],"MSG:FROM:")
+		then profs!type else note!type;
+	    AdrField := phi;
+	    MsgState := 1;
+	    goto Dispatch;
+	end;
+	[1] begin			! this state is parsing headings;
+	    if BLANK then
+		return;
+	    if lkequ(LINE," *** Reply to") then begin
+		mai:Other[M] := mai:Other[M]&
+		    "In-reply-to:"& LINE[14 to inf]& crlf;
+		return;
+	    end;
+	    if not FIELDNAME then begin
+		MsgState := 3;
+		goto Dispatch;
+	    end;
+	    if equ(FIELDNAME,"MSG") then begin
+comment
+    MSG:FROM: M211711 --SLVMCL1  TO: TUMSGATE--SLVMCL1        12/16/85 12:41:55
+        1     2       3 4        5   6       7 8              9        10
+;
+		string array A[1:10];
+		tokenize( FIELD, A );
+		mai:From[M] := A[2]& "@"& A[4]& ".McAuto.Tymnet";
+		mai:Date[M] := A[9]& " "& A[10];
+		return;
+	    end;
+	    if equ(FIELDNAME,"DATE") then begin
+		mai:Date[M] := FIELD;
+		return;
+	    end;
+	    if equ(FIELDNAME,"FROM") then begin
+		if MsgType = profs!type then begin
+		    string S;
+		    integer N,I;
+		    string array A[1:10];
+		    if mai:From[M][inf for 1] = ">" then return;
+		    N := tokenize( FIELD, A );
+		    S := null;
+		    for I := 1 upto N do begin
+			if A[i] = "," then continue;
+			if A[i] = ";" then done;
+			S := S& A[i]& " ";
+		    end;
+		    mai:From[M] := S& "<"& mai:From[M]& ">";
+		end
+		else if length(mai:From[M]) = 0 then begin
+		    AdrParse( mai:From[M] );
+		end;
+		return;
+	    end;
+	    if equ(FIELDNAME,"SUBJECT") then begin
+		mai:Subject[M] := FIELD;
+		return;
+	    end;
+	    if equ(FIELDNAME,"TO") then begin
+		if kequ( FIELD[inf-5 to inf], "(TUMS)" ) then begin
+		    maiCatList( mai:RCPT[M], FIELD[1 to inf-6] );
+		    maiCatList( mai:To[M], FIELD[1 to inf-6] );
+		end
+		else begin
+		    AdrField := {{ ref!item( mai:To[M] ) }};
+		    apply( AdrParse, AdrField );
+		    MsgState := 2;
+		end;
+		return;
+	    end;
+	    if equ(FIELDNAME,"CC") then begin
+		AdrField := {{ ref!item( mai:Cc[M] ) }};
+		apply( AdrParse, AdrField );
+		MsgState := 2;
+		return;
+	    end;
+	    mai:Other[M] := mai:Other[M]& FIELDNAME& ": "& FIELD& crlf;
+	    return;
+	end;
+	[2] begin	! this state for continued TO: CC: or BCC: fields;
+	    if BLANK then begin
+		delete( lop( AdrField ) );
+		MsgState := 1;
+		return;
+	    end;
+	    if FIELDNAME or not INDENT then begin
+		delete( lop( AdrField ) );
+		MsgState := 1;
+		goto Dispatch;
+	    end;
+	    apply( AdrParse, AdrField );
+	    return;
+	end;
+	[3] begin		! this state is to read text from the body;
+	    if MsgType = profs!type and LINES = 0 then return;
+	    mai:Text[M] := mai:Text[M]& LINE& crlf;
+	    return;
+	end;
+	[else] begin
+	    cprint( logChan,
+		"%ParseLine: illegal state ", MsgState, crlf );
+	    MsgState := 1;
+	    goto Dispatch;
+	end
+    end;
+end	"ParseLine";
+
+comment
+	TYPMSG - type a message, parse and send it, expects format as:
+
+.TYPMSG
+&LINES = 7
+ 
+MSG:FROM: M211711 --SLVMCL1  TO: TUMSGATE--SLVMCL1           12/16/85 12:41:55
+ To: TUMSGATE--SLVMCL1                     TUMSGATE--SLVMCL1
+     TUMSGATE--SLVMCL1                     TUMSGATE--SLVMCL1
+ FROM: WILLIAM R SOLEY      <semicolon> X007  CUPERTINO  408-446-6210
+ this is the text
+ of the first test message
+NO SUBJECT                                                       
+ 
+R<semicolon> T=0.01/0.02 16:09:04
+.
+;
+
+procedure TYPMSG;
+begin
+    string S, SUBJECT;
+    r!p(mai) M;
+    boolean TEXT;
+    integer LINES,MsgState;
+    TEXT := false;
+    LINES := 0;
+    MsgState := 0;
+    SUBJECT := "NO SUBJECT";
+    M := new!record( mai );
+    mai:Received[M] := "Received: from "&
+	MyNode& ".McAuto.Tymnet by "&
+	maiHost& "."& maiNet& "; "&
+	maiDATE& crlf;
+    auxOut( "TYPMSG"& #cr );
+    while true do case auxRead( S, timeout ) of begin
+	[aux!Line] begin
+	    if LINES = 0 begin
+		if lkequ(S,"&LINES =") then begin
+		    LINES := cvd(S[10 to inf]);
+		    auxRead( S, timeout );
+		end
+		else if lkequ(S,"R(") then begin
+		    cprint( logChan,
+			"?TYPMSG: error code ",cvd(S[3 to inf]),
+			" from 'TYPMSG'."& crlf,
+			CRASH!LOG,
+			".EXEC TYPMSG"& crlf&
+			S& crlf );
+		end
+		else if length(S) and not equ(S," ") and not lkequ(S,"R;")
+		then begin
+		    ParseLine( M, S, MsgState, 0 );
+		    cprint( logChan,
+			"%TYPMSG: extraneous record"& crlf, S, crlf );
+		end;
+	    end
+	    else begin
+		LINES := LINES - 1;
+		ParseLine( M, S, MsgState, LINES );
+	    end;	    
+	end;
+	[aux!Prompt] begin
+	    if not equ(S,".") then
+		Crash( "?TYPMSG: unrecognized prompt """& S& """" );
+	    if LINES then
+		Crash( "?TYPMSG: unexpected prompt" );
+	    done;
+	end;
+	[aux!Zap] Crash( "?TYPMSG: lost circuit" );
+	[aux!Timeout] Crash( "?TYPMSG: timeout" )
+    end;
+    if not dupsup( M ) then begin
+	if props(TRACE) or props(WAIT) then begin
+	    print( #cr&
+		"================================================"& crlf,
+		maiMMake( M ),
+		"================================================"& crlf );
+	    if props(WAIT) then begin
+		print( "<CR> to continue, ^C to abort, PURGE to discard: " );
+		if lkequ("PURGE",inchwl) then return;
+	    end;
+	end;
+	if length(mai:RCPT[M])
+	    then maiQueue( M )
+	    else begin
+		maiRTS( M,
+		    "No domain-style [RFC-819] address found;",
+		    "unable to forward message.  Address expected",
+		    "in extended name field or 1st line of body." );
+		if props(TRACE) then
+		    print( "%RTS: no addresses specified"& crlf );
+		cprint( logChan, "%RTS: no addresses specified"& crlf );
+	    end;
+	mai:Text[M] := null;
+	cprint( logChan, maiMMake( M ) );
+    end
+    else begin
+	cprint( logChan, "[duplicate suppressed]"& crlf );
+	if props(TRACE) then print( "[duplicate suppressed]"& crlf );
+	if props(WAIT) then begin
+	    print( "<CR> to continue, ^C to abort: " );
+	    inchwl;
+	end;
+    end;
+end;
+
+comment
+	RCVMSGs - call the RCVMSG and TYPMSG execs to receive all msgs
+
+	RCVMSG return codes are:
+		0	no messages - status okay
+		1	PROFS style note in RCVMSG NOTEBOOK A
+		2	NOTE style note in RCVMSG NOTEBOOK A
+		3	Acknowledgement in TUMSGATE NETLOG A
+		11	All READER files in HOLD status.
+		12	File 'RCVMSG NOTEBOOK A0' already exists.
+		13	File not a note or acknowledgement - purged.
+		1xxx	Error code xxx from 'RECEIVE' command.
+		2xxx	Error code xxx from 'EXECIO ... QUERY READER' command.
+;
+
+procedure RCVMSGs;
+begin
+    integer RC;
+    while RC := CMS( "RCVMSG" ) do case RC of begin
+	[1]
+	[2]
+	[12] begin
+	    if RC = 12 then cprint( logChan,
+		"%RCVMSGs: File 'RCVMSG NOTEBOOK A' already exists."& crlf );
+	    TYPMSG;
+	    if props(HOLD) then return;		! for debug;
+	    if CMS( "CLRMSG" ) then cprint( logChan,
+		"%RCVMSGs: error code from 'CLRMSG'."& crlf, CRASH!LOG );
+	end;
+	[3] cprint( logChan, "Acknowledgement received."& crlf );
+	[11] begin
+	    cprint( logChan, "%RCVMSGs: READER files in HOLD status."& crlf );
+	    done;
+	end;
+	[13] cprint( logChan, "%RCVMSGs: READER file purged."& crlf, CRASH!LOG );
+	[else] begin
+	    cprint( logChan,
+		"?RCVMSGs: error code ",RC," from 'RCVMSG'."&crlf, CRASH!LOG );
+	    Crash;
+	end
+    end;
+    maiSend;
+end;
+
+string SNDMSG!LOG, SNDMSG!MSG;
+boolean SNDMSG!E, SNDMSG!W;
+
+procedure SND( string S );
+begin
+    integer C;
+    if SNDMSG!E then return;
+    auxOut( S );
+    auxOut( #cr );
+    auxSync( #lf );
+    S := null;
+    while ( C := auxIn( timeout ) ) geq 0 do begin
+	C := C land '177;
+	if length(S) then begin
+	    if C = #lf then begin
+		SNDMSG!MSG := S;
+		SNDMSG!LOG := SNDMSG!LOG& S& crlf;
+		case  SNDMSG!MSG[10 for 1] of begin
+		    ["W"] SNDMSG!W := true;
+		    ["E"] if lkequ(SNDMSG!MSG,"SNDMSG")
+			then SNDMSG!E := true
+			else SNDMSG!W := true;
+		    [else]
+		end;
+		S := null;
+		continue;
+	    end;
+	    if " " leq C leq "~" then
+		S := S& C;
+	end
+	else if C = "." then return
+	else if " " leq C leq "~" then S := C;
+    end;
+    SNDMSG!LOG := SNDMSG!LOG& "?SNDMSG: circuit timeout/zapped"& crlf;
+    SNDMSG!E := true;
+end;    
+    
+comment
+	SNDadr - do SNDs as necessary for each address
+;
+
+procedure SNDadr( string LBL; reference string ADRS );
+begin
+    r!p(adr) A;
+    integer B;
+    while length(ADRS) do begin
+	r!p(adr) A;
+	string S;
+	S := maiAScan( ADRS, B );
+	if length(S) = 0 then continue;
+	A := maiAParse( S );
+	if kequ(adr:Net[A],"Tymnet") and kequ(adr:Host[A],"McAuto") then begin
+	    if length(adr:SubHost[A]) = 0 then
+		adr:SubHost[A] := MyNode;
+	    if kequ(adr:User[A],MyUserid) and kequ(adr:SubHost[A],MyNode) then
+		return;
+	    if kequ(adr:User[A],"Postmaster") then begin
+		adr:User[A] := PostUserid;
+		adr:SubHost[A] := PostNode;
+	    end;
+	end
+	else begin
+	    adr:User[A] := MyUserid;
+	    adr:Subhost[A] := MyNode;
+	end;
+	SND(
+	    pad( LBL, 6 )&
+	    pad( S, 50 )&
+	    pad( adr:User[A], 8 )&
+	    " at "&
+	    adr:SubHost[A]  );
+	LBL := null;
+    end;
+end;
+
+comment
+	SNDMSGs - check for queued messages and send them
+;
+procedure SNDMSG( reference string MSGTXT );
+begin
+    r!p(mai) M;
+    string RCPTs, S;
+    SNDMSG!LOG := SNDMSG!MSG := null;
+    M := maiMParse( MSGTXT );
+    RCPTs := S := mai:RCPT[M];
+    if kequ( maiBScan(S,!SKIP!)[1 to 6], "<POLL@" ) then begin
+	cprint( logChan, "[poll request ", mai:Date[M], "]"& crlf );
+	return;
+    end;
+    SND( "SNDMSG" );
+    SND( "Date: "& mai:Date[M] );
+    SNDadr( "From: ", mai:From[M] );
+    SNDadr( "To: ", mai:To[M] );
+    SNDadr( "Cc: ", mai:Cc[M] );
+    mai:RCPT[M] := mai:Date[M] := mai:Bcc[M] := null;
+    mai:Received[M] := "Received: from "&
+	maiHost& "."& maiNet& " by "&
+	MyNode& ".McAuto.Tymnet; "&
+	maiDATE& crlf&
+	mai:Received[M];
+    S := maiMMake( M );
+    while length(S) do begin
+	string REC;
+	integer B;
+	REC := tabExpand( scan( S, lineBrk, B ));
+	if equ(REC,".") then REC := "..";
+	SND( REC );
+    end;
+    SND( "." );
+    while length(RCPTs) do begin
+	r!p(adr) A;
+	integer B;
+	S := maiAScan( RCPTs, B );
+	if length(S) = 0 then continue;
+	A := maiAParse( S );
+	if kequ(adr:User[A],"Postmaster") then begin
+	    adr:User[A] := PostUserid;
+	    adr:SubHost[A] := PostNode;
+	end;
+	SND( adr:User[A]& " "& adr:Subhost[A] );
+    end;
+    SND( "." );
+    if SNDMSG!E then begin
+	if length(SNDMSG!LOG) and not !lh(auxPort) then begin
+	    M := maiMParse( MSGTXT );
+	    cprint( logChan,
+		"%SNDMSG: error(s) sending message:"& crlf,
+		SNDMSG!LOG,
+		"%return to sender: ", maiRPath( M ), crlf );
+	    maiRTS( M,
+		"Error response(s) from "& MyNode& ".McAuto.Tymnet ...",
+		SNDMSG!LOG );
+	    SNDMSG!W := SNDMSG!E := false;
+	end
+	else begin
+	    M := maiMParse( MSGTXT );
+	    if length(SNDMSG!LOG) then cprint( logChan,
+		"?SNDMSG: error(s) sending messages:"& crlf,
+		SNDMSG!LOG,
+		"[messages requeued]"& crlf );
+	    maiQueue( M );
+	end;	
+    end;
+    if SNDMSG!W then begin
+	cprint( logChan,
+	    "%SNDMSG: warning(s) sending messages:"& crlf,
+	    SNDMSG!LOG );
+	SNDMSG!W := false;
+    end;
+    M := maiMParse( MSGTXT );
+    mai:Text[M] := null;
+    cprint( logChan, maiMMake( M ) );
+end;
+
+procedure SNDMSGs;
+begin
+    SNDMSG!W := SNDMSG!E := false;
+    maiFEMessage( SNDMSG, datum(QUEUEFILE), props(PURGE) );
+end;
+
+
+    external integer array GOGTAB[0:ENDREN];
+    
+    GOGTAB[RGCOFF] := true;
+    auxRNC := true;		! don't read control characters;
+    datum(GATEWAY) := "F";
+    datum(ID) := "TUMSGATE";
+    datum(PASSWORD) := "PW";
+    datum(POLL.SECS) := 120;
+    datum(CONNECT.HRS) := 24;
+    ArgParse( ANY, QUEUEFILE, {RUN,ID,PASSWORD,POLL.SECS,CONNECT.HRS,PURGE,HOLD,HOST,GATEWAY,TRACE,WAIT}, ARGS );
+    if not props(RUN) then begin
+	print( "/RUN not specified." );
+	logExit;
+    end;
+    if not props(LOGINSTRING) then
+        if not props(HOST) then datum(LOGINSTRING) := "VMCMS;MCAUTO"
+        else datum(LOGINSTRING) :=
+	    "MAIL:"& datum(HOST)& ";I SPELL RELIEF TUMS";
+    if props(WAIT) then props(TRACE) := true;
+    auxEcho := auxTrace := props(TRACE);
+    if not props(QUEUEFILE) then begin
+	datum(QUEUEFILE) := "(MAIL)MCAUTO.Q";
+	props(PURGE) := true;
+    end;
+    MyUserid := datum(ID);	! default;
+CrashRestart:
+    while true do begin
+	integer ConnTime;
+        external procedure $RECGC;
+
+	LOGON;
+	IDENTIFY;
+	for ConnTime := 3600*datum(CONNECT.HRS) step -datum(POLL.SECS) until 0
+	do begin
+	    RCVMSGs;
+	    SNDMSGs;
+	    if logDirty then logOpen;
+            $RECGC;
+	    calli(!xwd(1,datum(POLL.SECS)),'72);
+	end;
+    end;
+
+end $
+(ce¦
