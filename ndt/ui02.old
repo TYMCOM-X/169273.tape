@@ -1,0 +1,284 @@
+ENTRY;
+BEGIN "UI02"
+COMMENT
+   ***************************************************************************
+   *                                                                         *
+   *                               LINE!OUT                                  *
+   *                                                                         *
+   *   FUNCTION:                                                             *
+   *                                                                         *
+   *       PROVIDES A GLOBAL PROCEDURE FOR ACCESSING A CANNED MESSAGE ARRAY  *
+   *       AND ADDDING USER DATA TO MESSAGES IN THE ARRAY.                   *
+   *                                                                         *
+   *       THE PROCEDURE ALSO ADDS THE COMPLETED MESSAGES TO THE USERCOR OUT-*
+   *       PUT QUEUE.                                                        *
+   *                                                                         *
+   *   ENTRY CONDITIONS:                                                     *
+   *                                                                         *
+   *       CALLED VIA THE FOLLOWING PROCEDURE CALL:                          *
+   *                                                                         *
+   *           LINE!OUT(CANNED!MSG#,USER!STRING,UCPTR)                       *
+   *                                                                         *
+   *       WHERE THE PROCEDURE PARAMETERS HAVE THE FOLLOWING MEANING:        *
+   *                                                                         *
+   *           CANNED!MSG#     = THIS PARAMETER IS SET TO EITHER THE NUMBER  *
+   *                             OF A CANNED MESSAGE OR TO -1.  IF IT IS SET *
+   *                             TO A MESSAGE NUMBER THE CORRESPONDING MES-  *
+   *                             SAGE IN THE CANNED MESSAAGE ARRAY IS COM-   *
+   *                             BINED WITH USER DATA IF ANY BEFORE BEING    *
+   *                             ADDED TO THE USERCOR QUEUE.                 *
+   *                                                                         *
+   *                             IF THE CANED!MSG# IS SET TO A MINUS 1, THE  *
+   *                             ONLY STRING QUEUED TO THE USERCOR RECORD IS *
+   *                             THE USER STRING.                            *
+   *           USER!STRING     = A STRING THE USER WISHES TO COMBINE WITH THE*
+   *                             CANNED MESSAGE OR SEND BY ITSELF.           *
+   *           UCPTR           = A RECORD POINTER TO THE CURRENT USERS USER- *
+   *                             COR RECORD.                                 *
+   *                                                                         *
+   *   EXIT CONDITIONS:                                                      *
+   *                                                                         *
+   *       AFTER THE PROCEDURE HAS COMBINED THE CANNED AND USER STRINGS,     *
+   *       RETURNS TO THE CALLER.                                            *
+   *                                                                         *
+   *   NOTES ON CANNED AND USER STRING FORMATS.                              *
+   *                                                                         *
+   *       THE CANNED MESSAGES AND USER STRINGS CAN BE FORMATED IN SUCH A WAY*
+   *       TO ALLOW THE INSERTION OF USER DATA IN UP TO TWO PLACES IN THE    *
+   *       CANNED STRING.  THIS IS DONE BY INSERTING CONTROL E CHARACTERS    *
+   *       (5) AT PLACES IN THE CANNED STRING THAT THE USER STRING IS TO     *
+   *       START AND AT PLACES IN THE USER STRING THAT THE CANNED STRING IS  *
+   *       START.                                                            *
+   *                                                                         *
+   *       AN EXAMPLE IS THE FOLLOWING:                                      *
+   *                                                                         *
+   *           CANNED STRING: USER ^E OF ACCOUNT ^E CANNOT BE FOUND          *
+   *                                                                         *
+   *           USER STRING: USER^EACCOUNT^E                                  *
+   *                                                                         *
+   *       THESE TWO STRINGS WILL PRODUCE THE FOLLOWING MESSAGE:             *
+   *                                                                         *
+   *           USER JONES OF ACCOUNT JONESACCT CANNOT BE FOUND               *
+   *                                                                         *
+   *       THE CANNED MESSAGES ARE KEPT IN AN ARRAY IN MEMORY.  THE ARRAY IS *
+   *       BUILT BY THE FILE PROCESSOR AT INITIALIZATION TIME.  THE FILE     *
+   *       PROCESSOR BUILDS THE ARRAY FROM A FILE CONTAINING CANNED MESSAGES *
+   *       THE FILE NAME IS SCANMS.ONT.                                      *
+   *                                                                         *
+   *       A DESCRIPTION OF HOW TO ADD NEW MESSAGES TO THE FILE IS FOUND AT  *
+   *       THE BEGINNING OF THE FILE.                                        *
+   *                                                                         *
+   ***************************************************************************
+   *                                                                         *
+   *   CONTENTS:                                                             *
+   *                                                                         *
+   *       OUTER BLOCK                                                       *
+   *           EXTERNAL VARIABLE DECLARATIONS                                *
+   *           LINE!OUT                                                      *
+   *               SEND!TO!USER                                              *
+   *               COMPLET!MESSAGE                                           *
+   *           MAINLINE                                                      *
+   *                                                                         *
+   ***************************************************************************
+   *                                                                         *
+   *   FILE NAME:          UI02.SAI                                          *
+   *   WRITTEN BY:         JIM ROACH                                         *
+   *   DATE WRITTEN:       24 - JUNE - 1977                                  *
+   *                                                                         *
+   ***************************************************************************
+   *                                                                         *
+   *   MODIFICATION RECORD:                                                  *
+   *                                                                         *
+   *  12/16/77  W.L. INHIBITED OUTPUT IF AN ESC CHAR. WAS RECEIVED.          *
+*                                                                      *
+*   16 JAN 78   Trouble Report #82:  maintain counts of characters     *
+*               transmitted -- DEG                                     *
+*                                                                      *
+*   05 APR 78   System Change Request #DEG038:  provide CR/LF padding  *
+*               for dialout terminals -- DEG                           *
+*                                                                      *
+*   21 APR 78   Put constant arrays in shared segment -- DEG           *
+*                                                                      *
+*   06 JUN 78   Deleted references to Output!In!Progress bit -- DEG    *
+*                                                                      *
+*   02 Jul 78   Replaced references to the systat record with macros   *
+*               referencing the new systat array -- WLF                *
+*                                                                      *
+*    28 AUG 78   REQUIRE 0 POLLING!INTERVAL IN SEND!TO!USER LOOP --JV  *
+*                                                                      *
+*   28 SEP 78   CHANGE FOR PORT MAPPING  --JV                          *
+*                                                                      *
+************************************************************************
+;
+   REQUIRE "MACROS.SAI"        SOURCE!FILE;
+   REQUIRE "RECORD.SAI"        SOURCE!FILE;
+   REQUIRE "TYMIO.DEF"         SOURCE!FILE;
+     
+   EXTERNAL RECURSIVE INTEGER PROCEDURE Await(
+       RECORD!POINTER(Usercor) UsercorPtr;
+       INTEGER Event, Seconds);
+    
+   EXTERNAL INTEGER              UI02!BT1;       \ BREAKS ON CTROL E;
+
+    EXTERNAL INTEGER ARRAY Port!Data[0:Max!users -1];
+
+   INTERNAL INTEGER                    #CANNED!MSG;
+
+   EXTERNAL STRING ARRAY               CANNED [0:NCANMSG];
+
+   INTEGER                             BREAK!CHAR;
+   STRING                              WORK!STRING,
+                                       CANNED!STRING;
+
+POLL!OFF;
+simple boolean procedure Some!AXOSF(reference string str; integer port);
+\ does the new .AXOSF output, outputting all characters in a string
+  that can be output, and removing those from the string that were sent.
+Returns TRUE iff more left to output,  If you are enabled for interrupt 
+  on "ready for output", a TRUE return also means the port will cause 
+  an interrupt when it (now full) buffer empties.  length(str) is > 0.
+A FALSE return simply means all the characters went out, thank you.
+  In this case, length(Str) will be 0.
+;
+start!code
+	hrl	port;		! set up for AUXCAL with port number;
+	hrri	!AXOSF;		! Output as much as will go;
+	setz	1,;		! returns FALSE if all chars went;
+	movei	2,str;		! convert to OS idea of where string is;
+	auxcal	1,-1(2);	! output as many as possible;
+	  seto	1,;		!  oops, some left, return TRUE;
+				!   [note: also means I/O ready coming];
+end;
+POLL!ON;
+
+INTERNAL RECURSIVE PROCEDURE                  LINE!OUT
+       (INTEGER CANNED!MSG#;
+        STRING USERS!STRING;
+        RECORD!POINTER (USERCOR) UC);
+
+   BEGIN "LINE!OUT"
+
+    INTEGER TermId;
+
+
+1
+RECURSIVE PROCEDURE SEND!TO!USER
+       (STRING COMPLETE!STRING;
+        INTEGER Line, TermId);
+
+        BEGIN "Output"
+
+            LABEL EXIT;
+            STRING  Strng;
+            INTEGER Char, I, L!Strng,BPTR, CR!CNT, LF!CNT, X, Y, Real!Port;
+
+     Real!Port _ Port#(Line);
+\
+   ***************************************************************************
+   *                                                                         *
+   *                               SEND!TO!USER                              *
+   *                                                                         *
+   *   FUNCTION:                                                             *
+   *                                                                         *
+   *       ADDS THE COMBINES USER AND CANNED STRINGS TO THE USERCOR OUTPUT   *
+   *       QUEUE.                                                            *
+   *                                                                         *
+   ***************************************************************************
+;
+2
+     Real!Port _ Port#(Line);
+   
+     IF Usercor:Icctrl[Uc] LAND Inhibit!Output NEQ 0
+		THEN crash(!system!)
+			\ why inhibit Output, send controls?;
+			\ used to pass all controls but CR,LF,NUL;
+     ELSE IF TermId geq 0 
+		THEN crash(!system!)  \ attempt to use DIALOUT;
+     ELSE if (L!Strng_ LENGTH(COMPLETE!STRING)) > 0
+	AND USERCOR:ICCTRL[UC] LAND (ICCTRL!ESCAPE + CIRCUIT!ZAPPED) = 0
+       THEN BEGIN
+               Inc(Usercor:Ictchout[UC], L!Strng);
+               Inc(SS!Ttout, L!Strng);
+		while Some!AXOSF(complete!string)
+		  do begin 
+			sleepMeOutput;
+			if USERCOR:ICCTRL[UC] LAND 
+				(ICCTRL!ESCAPE + CIRCUIT!ZAPPED) neq 0
+			 then begin	! some dropped on zap;
+		                L!Strng _ -LENGTH(complete!string);
+		                Inc(Usercor:Ictchout[UC], L!Strng);
+		                Inc(SS!Ttout, L!Strng);
+				done;
+			      end;
+		     end;
+           END;
+      END
+        END "Output";
+
+
+
+\
+   ***************************************************************************
+   *                                                                         *
+   *                           COMPLETE!MESSAGE                              *
+   *                                                                         *
+   *   FUNCTION:                                                             *
+   *                                                                         *
+   *       COMBINES THE USER STRING AND THE CANNED STRINGS.                  *
+   *                                                                         *
+   ***************************************************************************
+;
+   STRING PROCEDURE COMPLETE!MESSAGE;
+
+   BEGIN "COMPLETE!MESSAGE"
+
+       WORK!STRING _ NULL;
+       CANNED!STRING _ CANNED [CANNED!MSG#];
+       WHILE CANNED!STRING NEQ NULL
+       OR
+           USERS!STRING NEQ NULL
+       DO
+           WORK!STRING _ WORK!STRING &
+                         SCAN(CANNED!STRING,UI02!BT1,BREAK!CHAR) &
+                         SCAN(USERS!STRING,UI02!BT1,BREAK!CHAR);
+       RETURN (WORK!STRING)
+
+   END "COMPLETE!MESSAGE";
+
+\
+   ***************************************************************************
+   *                                                                         *
+   *                                   MAINLINE                              *
+   *                                                                         *
+   *   FUNCTION:                                                             *
+   *                                                                         *
+   *       DETERMINES IF THE USER IS SENDING A CANNED, USER OR COMBINATION OF*
+   *       CANNED AND USER STRINGS.  IF A CANNED STRING IS DESIRED IT IS COM-*
+   *       BINED WITH NULL USE STRINGS.  IF A USER STRING IS TO BE QUEUED IT *
+   *       IS COMBINED WITH A NULL CANNED STRING.                            *
+   *                                                                         *
+   ***************************************************************************
+;
+       IF USERCOR:ICCTRL[UC] LAND (CIRCUIT!ZAPPED + ICCTRL!ESCAPE)
+       THEN
+            RETURN;
+
+        TermId _    IF
+                        Usercor:IcUpar[UC] LAND Dial!Out!User
+                    THEN
+                        Usercor:IcCtrl[UC] LSH (29-35) LAND '17
+                    ELSE
+                        -1;
+
+       IF CANNED!MSG# < 1
+       OR
+           CANNED!MSG# > #CANNED!MSG
+       THEN
+           SEND!TO!USER(USERS!STRING, USERCOR:ICPNO[UC],TermId)
+       ELSE
+           SEND!TO!USER(COMPLETE!MESSAGE,USERCOR:ICPNO[UC],TermId);
+
+   END "LINE!OUT";
+
+END "UI02";
+  
