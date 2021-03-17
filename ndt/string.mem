@@ -1,0 +1,256 @@
+
+	STRING SPACE implementation notes for multi-width strings
+
+SAIL strings come in two parts: 
+-The two-word string descriptor used to describe the string
+-The string data space used to store the string characters
+No string may be longer than 2^18-1 bytes.
+No dynamic string should be longer than 1/3 the string space size.
+Strings are only considered to be identified by their length and data!
+    Comparisons of any other portion of the string area is ill-advised,
+    since the other areas are subject to change without notice.
+
+The 2-word string descriptor:
+   first word = word 0 = length word 
+	dynamicFlag ,, string length (in bytes)
+   second word = word 1 = pointer word 
+	"ILDB-style" byte pointer, no indexing,indirect, or "extend" *
+		(NOTE: POINT 7,FOO,-1 and POINT 7,FOO-1,34 are both OK)
+		(NEW restriction: POINT 7,FOO-1,35 is illegal)
+		(NOTE: different format for dynamic strings during GC)
+
+Cases:
+-Null strings		Definition: RH of length word is 0.  
+    Pointer word may be anything (including indirect loop).
+    If dynamicFlag is non-zero (indicating dynamic string), both
+	the dynamicFlag and the pointer field may be mangled by the GC.
+	NOTE: the dynamic flag may even be set to 0 (makes it constant).
+    Now: you may ONLY trust the length half of the word!!!! (even const)
+
+-Constant strings,	Definition: LH of length word =0, RH non-0
+    Pointer word should not have index, "extended", or indirect bits on.
+    The byte size in the string should be a legal size (1:36). 
+    Byte pointer should be properly "left-aligned" (ADJBP or a sequence
+	of IBPs may adjust the pointer in routines like SUBSTR).
+    It is assumed that the space pointed to by the descriptor is "well-
+	formed".  7-bit wide strings should NOT have B35 on.
+    It is further assumed that the space pointed to by the descriptor is
+	permanently set to its contents.  Many run-times may return
+	proper substrings of the strings passed to them, and these will
+	behave erratically if the ground is shifted under them.
+    Most often, constant strings are word-aligned.
+    
+-Dynamic strings,	Definition: LH of length word non-0, RH non-0
+    Compiler ONLY: GOGTAB[SGLIGN] true.  Strings are word-aligned.
+   Not during garbage collect:	pointer-word land -1b11 non-0
+    LH of length word may be any non-zero value.
+    Pointer word should not have index, "extended", or indirect bits on.
+    The byte size in the string should be a legal size (1:36). 
+    Byte pointer should be properly "left-aligned" (ADJBP or a sequence
+	of IBPs may adjust the pointer in routines like SUBSTR).
+    The space pointed to by the descriptor is "well-formed", and is
+	in a "string space" containing only string data for strings of
+	same width. (35-bit and 36-bit strings in seperate spaces.)
+    Both words of a dynamic string descriptor must be writeable, and may
+	be modified any time the string garbage collector is invoked,
+	including changes in address ordering of a pair of strings.
+
+  During garbage collect, string "enrolled": pointer-word land -1b11 = 0
+    pointer word: byte number of first byte of this string within its
+	string space (first byte is numbered 0).  The maximum value is
+	therefore less than 36 * (2^18 - 1) = XWD 43,,777734
+    LH length word: points to length word of another string descriptor
+	"collection phase" 
+	    another string in same string space
+	"sort phase"
+	    same string space, 
+		[ startLoc(next) > startLoc(this) ]
+		OR [ startLoc(next) = startLoc(this) 
+		    AND length(next) < length(this) ]
+	During the copying of string to new compressed area, a "nest" is
+	passed and copied.  [Once copied, the strings are back in 
+	standard form]. A "nest" is the smallest set of strings such
+	that they are the only strings to point to their area.  (IE a 
+	complete set of overlapped strings, no unused bytes).  The nests
+	are passed as length-of-nest, start-bytepointer, contents in the
+	same order as sorted with nest-relative (rather than space-
+	relative) start byte numbers.
+
+  Special notes:
+	-The "WIDTH" of a null string is undefined.
+	-Two strings may be "EQU" although they have different widths.
+Issues:
+
+-GC space expansion: 
+Previously, all spaces are identical, and expansion/contraction issues
+occur at "time to GC".  Now one size may need expansion while another
+is contracting -- what's a mother to do?
+In fact, sometimes, you may simply want to expand String Space rather 
+than GC.  [Is this related to a way to have interrupt strings?]
+
+-What info should a String Space hold?
+	Current: .topbyte, .size, .next, .list (for GC link of strings)
+	?Add?: .bySiz, .bypwd, .remchr
+
+-New string space handles: 
+How about POINT w,spaceaddr,-1 to simplify certain operations.
+
+-We probably need a quick way to find a space of a given size, or is
+a linear search of the STBUCK linkage OK (?how do we avoid full ones?)
+Perhaps each Width has a controlling block which behaves like GOGTAB
+entries for current string implementation -- is the cost too high?
+
+-Is the proposed EQU definition OK (are 9-bit and 8-bit identical?)
+Concepts (some new):
+
+
+
+(1) "String Space Handle"
+	Format: POINT width,CHARSPACE,-1
+
+	"Per String Space" information
+.CSIZE	Size of this space in bytes ("redundant")
+.NEXT	"String Space Handle" of next linked string space (same width?)
+.LIST	Header for linked list of strings in this space during GC
+.TOPBYT	"TOPBYTE when abandoned" (useless?) (to discard in GC)
+.STTOP	Top address of string space (? maybe could have 440700 in LH)
+!BYPWD	Bytes per word this width (?)
+!BYSIZ	Byte size of string space (?)
+
+	"Per Width" information
+ ?ST?	base of current space (removing?)
+ STTOP?	top of current space
+STLIST	Linked list of handles to same-width space (?)
+TOPBYT	*points to last usd character in current space
+REMCHR	*available characters in current space (hidden slop)
+ SGLIGN	true if word-aligned strings ONLY
+STREQD	charsize(SPACE)/8 ,, wordSize(SPACE)/8	(1/8 of size)
+STINCR	characters available ,, wordsize of space
+sgccws	I:Wasted space last GC in characters (information only)
+
+	"overall" String variables
+    in GOGTAB:
+STBUCK	used by GC for saving: 
+	(1) address of bucket table during space-sorts
+	(2) an OFFSET to move a bucket by (cut back checkerboard)
+SGROUT	String address generators
+SGCNUM	I:Number of times String GC called (negative during GC)
+SGCTIM	I:Timing values
+SGCCNT	I: Count of strings actually processed last GC
++SGNCNT	I: Count of string nests actually processed last GC
+SGCWAS	I: String space wasted (total in words) last GC
+
+    dedicated locations:
+.SGCIN	Address of STRNGC trap routine
+
+Organization:
+	width	--->	width	--->	width	--|
+	STLIST
+	TOPBYTE
+	REMCHR
+
+Garbage Collect
+(1) know whose fault it is [what width]
+
+3-Pass algorithm	[Identify, Sort, Compact]
+	1) Identify
+For all string descriptors
+    Ignore constant strings
+    Identify SPC for string
+    Convert byte-pointer to byte-within-SPC
+    Link Descriptor to SPC via LH of length-word of descriptor
+
+	2) Sort
+Allocate "bucket" for sort
+For each String Space, sort linked descriptors
+    [sort: S1 is before S2 
+	if start(s1) < start(s2)
+	orif start(s1) = start(s2) and length(s1) GEQ length(s2)]
+	** Query-- why the orif clause? **
+	3) Compact (move nests)
+For all Spaces do 
+ do for each "nest" in SPC (in order)
+    identify nest, convert byte-within-SPC to byte-within-nest
+    find room for entire nest
+    transfer nest to destination
+    convert byte-within-nest to byte-pointer
+    Drop empty spaces
+		-A "nest" is the smallest set of strings which overlap
+		[comment in code says "but not abut" since compiler
+		 may insist on alignment, but this is false because the
+		 alignment is preserved if abutment continues.  There is
+		 a good argument for "not abut": Spaces may be more 
+		 fully packed if the pieces (nests) are abutting]
+
+Presumptions
+
+Most SAIL programs will still only use 7-bit strings.
+Of those which use more than one byte size, 7-bit will still be most
+common strings.
+	[trade-off in GC: string in SPC by address part only, not
+	 by byte size]
+Only a few sizes will standardly be used.  7 then 7-8 then 7-8-6 ...
+
+Hence: "IDENTIFY" phase:
+	if constant(string) then continue
+	if length(string)=0 then [string_ NULL; continue]
+	t_ rh(byptr(string))
+	for spc_stlist, .next(spc) while spc
+	   do if t in spc
+		then [ byptr(string)_ (t-spc)*.bypwd + byteno(bytptr)
+			lh(lenwrd(string))_ .list(spc); .list(spc)_str
+			continue
+		else
+	error
+	INSET			[.WDSET(width)]
+Align to Full-word boundary, adjust REMCHR, * don't GC *
+Reason: alignment may follow space calculation (.SONTP example)
+Therefore at LEAST 1 full word of SLOP needed in String Space
+
+	.SONTP("str",free)	[.WSONT("str",free,width)]
+Put string on top of Space, insure N chars of free space 
+
+SUBSTR(to)
+SUBSTR(for)
+
+CHRCAT
+CATCHR
+CONCAT
+CAT.RV
+"SCAN"
+
+[.CHARN("str",index) {1:L => character, -1:-L => from INF]
+WIDTH
+STRCMP		(fast? slow? how slow?)
+		arbitrary: [length,width,vals]
+STRINGIT	cnt,byptr to string
+DUMPIT		string out through byptr (count?)
+TRNSTR		(allow bias and copy -- this gives UP and LOWER)
+		while length(s)
+		   do if (ch_lop(s)) < l then low.action
+			else if ch > u then high.action
+					 else inbounds.action
+	actions: 
+		Break
+		Ignore
+		r_r & (ch (op) v)  [+, LAND, LOR, XOR, EQV, LSH, index]
+
+NEWSTR(len,wid)	return a new unfilled string of given size
+		(for those who need IDPB-style construction)
+
+ADJUST( count, bytePointer )	decide on definition/restrictions
+				perhaps this is a UUO
+
+throw in ASSERT
+
+
+.SETWD(width)	Gets space handle for a given size (if there is one)
+.MAKWD(width)	As above, but constructs if none exists.  Values are
+		extrapolated from current values
+.NEWSP(width, CharSize, RequiredChars(0 => 1/8 CharSize), [SGLIGN])
+		^STINCR		^STREQD
+		 SGLIGN	true if word-aligned strings ONLY
+STREQD	charsize(SPACE)/8 ,, wordSize(SPACE)/8	(1/8 of size)
+STINCR	characters available ,, wordsize of space
+
+  
