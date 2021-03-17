@@ -1,0 +1,809 @@
+TITLE	KSFEFS - Set up KS10 front-end file system
+
+;This hack written by Daniel S. Blom in 1980
+;Modified by Joe Smith in 1986.
+
+; This program runs under Tymcom-X and creates the Front-End
+; file system used by the console processor.  The format of
+; the system is the same as that described in the TOPS-10 help file
+; SMFILE.TXT, except that the bootstrap program is pages 11 and 12 (octal)
+; of every disk formatted with P034P or earlier.  BOOTS has moved to pages
+; 3, 4, and 5 in P035 and later (COMMON/MONBTS and REFSTR have changed).
+
+;Accumulator names
+zz==0
+define loser(x)<
+irp x,<x=zz
+zz==zz+1>>
+loser <f,a,b,c,d,e,t,t1,pt,pt1,pt2,ch,fs,L,p>
+
+opdef	call	[pushj p,]
+opdef	ret	[popj p,]
+
+
+
+;Disk parameters.
+STR:	SIXBIT	/DSKB/
+lbplc:	0		;Logical blocks per logical cylinder (multiple of 4)
+bpt:	0		;Blocks per track
+
+;Filename: HOME.SYS     FEFILE.SYS
+;FFILEP:    ^O10        3*95 or 3*37    Now starts on 4th cylinder
+;NFILEP:   ^O100        ^D95 or ^D37    Assign entire cylinder (was 64 pages)
+;LFILEP:   ^D110        4*94 or 4*37    For checking if past last file page
+;NBOOTP:   2,,11        3,,3            Number of boot pages, starting page
+FFILEP:	0	;First file page
+NFILEP:	0	;Number of pages
+LFILEP:	0	;Last file page plus 1
+NBOOTP:	0	;Number and location of BOOTS pages
+
+pag:	block	1000
+fedir:	block	1000		;FE file directory built here
+pdl:	-30,,.
+	block	30
+
+dcblk:	block	30
+uniidx:	0
+
+nunits==8			;Up to 8. units on system.
+
+;Software I/O channels: channel 0 is used for file input;
+; channel 1 for absolute disk writes.
+SUBTTL	Main program
+
+start:	reset
+	move	p,pdl
+	call	initia			;Initialize core, disk channels.
+	CALL	FILES			;Get file names
+	movsi	a,-nunits		;For each unit do
+unilp:	movem	a,uniidx
+	call	iniuni			;Setup for new unit.
+	 jrst	unilp0			;Not accessible.
+	move	a,[pag,,pag+1]		;Setup page 0 pointers for 8080.
+	setzm	-1(a)
+	blt	a,pag+777
+	move	a,[sixbit/HOM/]		; TOPS-10 'HOM'
+	movem	a,pag+200		;   Block #1
+	MOVE	A,FFILEP		; First file page
+	LSH	A,2			; Convert to blocks
+;;;	hrli	a,100000		; TOPS-20 does this for some reason.
+					; TOPS-10 does not set 1B2
+	movem	a,pag+200+101		; Store for PDP-10.
+	call	lbtda
+	movem	a,pag+200+103		; Store for 8080.
+	MOVE	A,NFILEP		; Number of pages in FE file
+	LSH	A,2
+	movem	a,pag+200+102		; Store for PDP-10.
+	movei	pt,pag
+	movei	pt1,0			;Write PAG to absolute page 0
+	OUTSTR	[ASCIZ /Writing HOM block in page/]
+	call	wapag			;Set up pointers for the 8080
+	move	a,[fedir,,fedir+1]	;Zero out directory
+	setzm	-1(a)
+	blt	a,fedir+777
+	MOVE	PT1,FFILEP		;First file page
+	ADDI	PT1,1			;First free page is after directory
+	call	copy			;Copy the files.
+	move	a,pt1			;First free page after the copy
+	call	lptda
+	movem	a,fedir+0		;Disk address of first free page
+	SUB	PT1,FFILEP
+	hrlzm	pt1,fedir+1		;First logical free page
+	MOVE	A,LFILEP		;Last file page
+	subi	a,(pt1)
+	hrrm	a,fedir+1		;Number of free pages
+	movei	pt,fedir		;Write out the directory
+	MOVE	PT1,FFILEP		;Write directory in first file page
+	OUTSTR	[ASCIZ /
+Writing FEFILE directory to page/]
+	call	wapag
+	CALL	COPBTS			;Copy BOOTS to pages 3,4,5 if needed
+	OUTSTR	CRLF
+unilp0:	move	a,uniidx
+	aobjn	a,unilp
+quit:	reset
+	EXIT	1,
+	JRST	QUIT
+
+CRLF:	ASCIZ /
+/
+
+FILES:	MOVSI	L,-PTL
+FILES1:	hrrz	a,protab(L)		;Read the file name and open the file
+	move	pt,protab+2(L)
+	call	getfil
+	call	chklen			;Check that the length is reasonable.
+	 jrst	FILES1
+	hrrom	pt,protab+2(L)		;Flag to not ask next time
+	ADD	L,[2,,2]
+	AOBJN	L,FILES1
+	RET
+
+;Copy files to the front end file area.
+
+copy:	movsi	L,-PTL
+COPY1:	hrrz	a,protab(L)		;Read the file name and open the file
+	move	pt,protab+2(L)
+	call	opnfil			;Re-open file
+	 halt	.			;Oops
+	hrrz	pt,protab+2(L)
+	OUTSTR	[ASCIZ /
+File /]
+	CALL	PRTHDL
+	OUTSTR	[ASCIZ / to page /]
+	hlrz	pt2,protab(L)
+	call	copfil			;Copy file, set directory pointer
+	add	L,[2,,2]
+	aobjn	L,copy1
+	ret
+
+COPBTS:	MOVE	PT1,NBOOTP		;Check on location of BOOTS
+	CAME	PT1,[3,,3]		;In new location?
+	 RET				;No
+	OUTSTR	[ASCIZ /
+Duplicating BOOTS in page /]
+	MOVEI	PT,0			;Back to BOOTS.DMP
+	PUSHJ	P,OPNFIL		;  "   "
+	 HALT	.			;Got deleted?
+	HRRZ	PT1,NBOOTP		;Destination page
+	HLRZ	A,NBOOTP		;Positive number of pages
+	JRST	COPLP0			;Copy BOOTS to where COMMON expects it
+
+;Check length of file whose handle is in Pt, warn user if needed.
+; Single return if he decided he wants to use another file.
+
+chklen:	hlrz	b,protab+1(L)
+	camn	a,b
+	 jrst	cpopj1
+	outstr	[asciz/That file is /]
+	call	prtpag
+	outstr	[asciz/ long; we expected it to have /]
+	hlrz	a,protab+1(L)
+	call	prtpag
+	outstr	[asciz/./]
+	hrrz	a,protab+1(L)
+	skipe	a
+	 outstr	(a)
+	MOVE	C,LFILEP		;Last file page number
+	subi	c,(pt1)
+	camge	c,7(pt)
+	 outstr	[asciz/
+In addition, the file is too large to fit!/]
+	outstr	[asciz/
+Continue anyway (Y or N)? /]
+	inchrw	a
+	caie	a,"y"
+	 cain	a,"Y"
+	  jrst	cpopj1
+	outstr	[asciz/
+Ok, try again, then.
+/]
+	ret
+
+prtpag:	cain	a,1
+	 jrst	prtpa1
+	call	decprt
+	outstr	[asciz/ pages/]
+	ret
+prtpa1:	outstr	[asciz/1 page/]
+	ret
+
+
+;Print number in A in radix 10.
+decprt:	idivi	a,12
+	jumpe	a,decpr1
+	hrlm	b,(p)
+	call	decprt
+	hlrz	b,(p)
+decpr1:	addi	b,"0"
+	outchr	b
+	ret
+
+
+;This table controls which files are to be copied to the front end file
+; area.  For each file there is a three word entry which contains:
+; Word 0: Lh:Offset of the fe file sysem directory pointer to this file
+;	  Rh:Address of an ASCIZ string to use to prompt the user for
+;	     the file name.
+; Word 1: Lh:The expected length, in pages, of the file.
+;	  Rh:Address of an ASCIZ string to print if the expected length
+;	     doesn't match the actual length, or 0 if none.
+; Word 2: Lh:-1 if specification read.
+;	  Rh:Address of file handle.
+;Note that the bootstrap program must be first for P034P and earlier since
+;COMMON looks in page 11 and 12 when loading BOOTS during a crash.
+;With P035 and later, BOOTS is in pages 3, 4, and 6 just like on KI/KL/F3.
+
+protab:	14,,[asciz/Name of file containing bootstrap program {(SYS)BOOTS.DMP} : /]
+	2,,[asciz/
+The pre-boots program (KSBLOD) expects the bootstrap program
+be exactly 2 pages long./]
+	0
+	2,,[asciz/Name of file containing microcode {(SYS)MCODE} : /]
+	14,,0
+	0
+	4,,[asciz/Name of file containing pre-boot program: {(SYS)KSBLOD.DMP} : /]
+	1,,[asciz/
+The front-end expects the pre-boot program to be exactly 1 page long./]
+	0
+ptl==.-protab
+
+
+
+;Initialize some things.
+
+initia:	movei	fs,FSDATA
+	movsi	L,-PTL
+inilp:	setzm	protab+2(L)
+	add	L,[2,,2]
+	aobjn	L,inilp
+	ret
+
+
+;Copy a file into the front end file area.
+;Call PT/ File handle
+;     PT1/ First absolute page of destination.
+;     PT2/ Offset of directory entry for this file.
+;On return the file will have been copied and the directory entry
+; updated appropriately.
+
+copfil:	movei	a,(pt1)			;Set 8080 disk address of this file
+	call	lptda
+	movem	a,fedir(pt2)
+	movei	a,(pt1)			;Disk page number
+	SUB	A,FFILEP		;Relative page number
+	hrlzm	a,fedir+1(pt2)		;Set logical page number of this file
+	hrrz	a,7(pt)
+	hrrm	a,fedir+1(pt2)		;Set the length of the file in pages
+COPLP0:	movns	a			;A has file length
+	hrlzs	a
+	movei	pt,pag
+coplp:	call	rfpag			;Read page "A" from file
+	call	wapag			;Write page "PT1" to disk
+	aoj	pt1,
+	aobjn	a,coplp
+	ret
+
+
+;Read page number A of open file into PAG.
+rfpag:	movei	t,(a)
+	lsh	t,2			;Block number
+	useti	1(t)
+	input	[IOWD 1000,PAG
+		 0]
+	ret
+
+
+;Write core page starting at PT into absolute page PT1 of
+; currently selected unit.
+
+wapag:	jumpe	pt1,wapag0		;First make sure request is within the
+	CAML	PT1,FFILEP		; FE file area or page 0.
+	CAML	PT1,LFILEP
+	 jrst	waperr
+wapag0:	OUTCHR	[" "]
+	PUSH	P,A
+	HRRZ	A,PT1
+	PUSHJ	P,DECPRT
+	OUTCHR	[" "]
+	POP	P,A
+	movei	t,(pt1)
+	lsh	t,2
+	useto	1,(t)
+	movei	b,-1(pt)		;Addr of data
+	hrli	b,-1000
+	setz	c,
+WAPAG1:	OUT	1,b			;Put a JFCL here when debugging
+	  ret				;OK
+	OUTSTR	[ASCIZ /failed!
+Do you have WA (Write Absolute) license set?
+/]
+	jrst	quit
+waperr:	outstr [asciz/
+Sorry, illegal attempt to write into disk page /]
+	hrrz	a,pt1
+	call	decprt
+	outstr	[asciz/.  We give up.
+The front-end file area has not been completely initialized.
+/]
+	jrst	quit
+;Open channel, set unit type for unit # in Rh(A).
+;Skip if unit could be opened.  Single return otherwise.
+
+iniuni:	movei	d,'0'(a)		;2020 can only have DSKB0 thru DSKB7
+	lsh	d,6
+	ior	d,STR
+	movei	c,17
+	setz	e,
+	OUTSTR	CRLF
+	MOVEI	a,D
+	movei	b,6
+	call	sixprt
+	OUTSTR	[ASCIZ /:  /]
+	open	1,c
+          PUSHJ	P,inierr
+	movem	d,dcblk
+	move	a,[27,,dcblk]
+	dskchr	a,
+          PUSHJ	P,inierr
+	HRRZ	A,DCBLK+5		;Blocks per cylinder
+	CAIN	A,^D37			;Old monitor with RM03?
+	 LSH	A,2			;Yes, 148 usable blocks per cylinder
+	CAIN	A,^D95			;Old monitor with RP06?
+	 LSH	A,2			;Yes, 380 blocks per cylinder
+	movem	a,lbplc
+	LDB	B,[POINT 9,DCBLK+5,17]	;Blocks per track
+	movem	b,bpt
+	SKIPN	A,DCBLK+12		;New length ,, page for FE file
+	 MOVE	A,DCBLK+22		;If UNIFEP is zero, use UNIBSA
+	CAMGE	A,[20,,10]		;Must have at least ^D16 pages
+	 PUSHJ	P,INIERR
+	HRRZM	A,FFILEP		;First file page
+	HLRZM	A,NFILEP		;Number of pages
+	ADD	A,NFILEP		;Last file page + 1
+	HRRZM	A,LFILEP		;Number of first page after FE file
+	MOVE	A,DCBLK+22		;Number ,, first boot page
+	CAMN	A,[100,,10]		;Has the FE file been moved?
+	 MOVE	A,[2,,11]		;No, old boots is 2 pages at 11-12
+	MOVEM	A,NBOOTP		;New boots is 3 pages at 3-5
+	jrst	cpopj1
+
+inierr: outstr	[asciz/Does not exist/]
+	POP	P,ERRPC
+        ret
+ERRPC:	0
+
+
+;This diagram is from page 2 of SMFILE.TXT (see also DSQDF.LST on microfiche)
+;	          3-11              23-27            31-35
+;	------------------------------------------------------
+;	I 000 I           I 0'S I           I 000 I          I
+;	------------------------------------------------------
+;		  ^		     ^			^
+;		  I                  I			I
+;	       CYLINDER            TRACK              SECTOR
+
+;Convert logical page into 8080 style disk address.
+;  BYTE (3) 0 (9) CYL (8) 0,TRACK,SECTOR	;CYL must be 511. or less!
+;LPTDA = Logical page to disk address, call with page # in A.
+;LBTDA = Logical block to disk address, call with block # in A.
+;Returns 8080 disk address in A, uses B and C.
+
+lptda:	lsh	a,2			;Page to block number
+lbtda:	idiv	a,lbplc			;A gets cylinder
+	idiv	b,bpt			;B gets track, C gets sector
+	DPB	B,[POINT 8,C,27]	;Combine track & sector (DA word)
+	DPB	A,[POINT 12,C,11]	;Cylinder in LH
+	move	a,c			;Return pointer in A
+	ret
+
+
+;Parse a Tymcom-X file specification and open the file.
+; Returns with PT pointing to the file name.  Prints an error message
+; and quits if can't find the file.
+; block suitable for use by LOOKUP.
+
+getfil:	push	p,a
+getfi0:	move	a,(p)
+	call	parfn			;Parse the filename.
+	 jrst	getfi0
+	call	opnfil			;Open the file.
+	 jrst	getfi0
+	pop	p,(p)
+	ret
+
+;Parse a Tymcomp-X file specification.
+
+parfn:	outstr	(a)
+	hrli	a,(fs)
+	hrri	a,1(fs)
+	setzm	-1(a)
+	blt	a,7(fs)
+	call	getch
+pn4:	call	scan
+	caie	a,t.opar
+	 jrst	pn2
+	call	scan
+	caie	a,t.id
+	 jrst	synerr
+	dmovem	b,5(fs)
+	hrrzi	a,5(fs)
+	hrrzm	a,3(fs)
+	call	scan
+	caie	a,t.cpar
+	 jrst	synerr
+	call	scan
+pn2:	caie	a,t.id
+	 jrst	synerr
+	movem	b,0(fs)
+	call	scan
+	caie	a,t.dot
+	 jrst	pn3
+	call	scan
+	caie	a,t.id
+	 jrst	synerr
+	hllzm	b,1(fs)
+	call	scan
+pn3:	caie	a,t.eol
+	 jrst	synerr
+	movei	pt,(fs)
+	addi	fs,10
+	jrst	cpopj1
+synerr:	outstr	[asciz/
+Sorry, I can't parse that file specification.  Try again.
+/]
+	ret
+
+
+
+c.let==400000
+t.id==0
+t.dot==1
+t.semi==2
+t.opar==3
+t.cpar==4
+t.eol==5
+
+scntbl:	repeat 11-0+1,<scnign>
+	scneol
+	repeat "'"-13+1,<scnign>
+	scnop
+	scncp
+	repeat 4,<scnign>
+	scndot
+	scnign
+	repeat "9"-"0"+1,<c.let,,scnid>
+	scnign
+	scnsem
+	repeat 5,<scnign>
+	repeat "z"-"a"+1,<c.let,,scnid>
+	repeat 6,<scnign>
+	repeat "z"-"a"+1,<c.let,,scnid>
+	repeat 5,<scnign>
+
+
+scnign:	call	getch
+scan:	jrst	@scntbl(ch)
+
+scnid:	move	pt,[440600,,b]
+	setzb	b,c
+scnid3:	trze	ch,100
+	 troa	ch,40
+	  trz	ch,40
+	came	pt,[000600,,c]
+	 idpb	ch,pt
+	call	getch
+	hll	ch,scntbl(ch)
+	jumpl	ch,scnid3
+	movei	a,t.id
+	ret
+scnop:	skipa	a,[t.opar]
+scncp:	movei	a,t.cpar
+	jrst	getch
+scndot:	skipa	a,[t.dot]
+scnsem:	movei	a,t.semi
+	 jrst	getch
+scneol:	movei	a,t.eol
+	ret
+getch:	inchwl	ch
+	ret
+
+
+
+;If the LOOKUP on the file fails, return +1 after printing an error message.
+; Otherwise skip and return the number of pages in the file in A and LENGTH.
+
+opnfil:	open	[ 17
+		  sixbit/dsk/
+		  0 ]
+	 jrst	4,.
+	hllzs	1(pt)
+	push	p,3(pt)
+	lookup	(pt)
+	 jrst	opnerr
+	hlre	a,3(pt)			;set up size
+	jumpge	a,opnfi1
+	movns	a
+	soj	a,
+	trze	a,777			;Round up to pages
+	 addi	a,1000
+	lsh	a,-9
+	skipa
+opnfi1:	 lsh	a,2			;Convert from blocks to pages
+	movem	a,7(pt)
+	pop	p,3(pt)
+cpopj1:	aos	(p)
+cpopj:	ret
+
+opnerr:	pop	p,3(pt)
+	outstr	[asciz/
+Sorry, can't find /]
+	call	prthdl
+	outstr	[asciz/.  Try again.
+/]
+	ret
+
+;Print file handle in PT.
+
+prthdl:	skipn	a,3(pt)
+	 jrst	prthd1
+	outchr	["("]
+	movei	b,14
+	call	sixprt
+	outchr	[")"]
+prthd1:	movei	a,(pt)
+	movei	b,6
+	call	sixprt
+	hllzs	1(pt)
+	skipn	1(pt)
+	 ret
+	outchr	["."]
+	movei	b,3
+	movei	a,1(pt)
+	call	sixprt
+	ret
+
+;Print up to B sixbit characters pointed at by A.
+
+sixprt:	tlo	a,440600
+sixpr1:	ildb	c,a
+	jumpe	c,cpopj
+	addi	c,40
+	outchr	c
+	sojg	b,sixpr1
+	ret
+
+FSDATA:	BLOCK	^D9*10		;Room for 9 file specs
+SUBTTL	Disk pre-boot from SMFILE.LST (DSQDF)
+
+REPEAT 0,<
+DRM03P:	SKIPN	TOPS10		;If TOPS-20 or TYMCOM-X
+	 IDIVI	T1,^D<30*5>-2	; then only 148 blocks used per cyl (37 pages)
+	SKIPE	TOPS10		;But TOPS-10
+	 IDIVI	T1,^D<30*5>	; uses all 150 blocks per cylinder
+	AOS	(P)		;Skip over the RP06 idivi
+	POPJ	P,
+
+;Routine convert LBN to RH11 CYL and DA
+TBOOTB:	LSH	T1,2		;Convert page to logical block number
+TBOOTP:	TLZ	T1,77774		;Max block address is 37,,777777
+	SKIPE	RM03F		;If RM03
+	 PUSHJ	P,DRM03P	; divide by 148 or 150 and skip
+	  IDIVI	T1,^D<20*19>	;RP06 blocks per cylinder
+	PUSH	P,T1		;Save cylinder number
+	MOVE	T1,T2		;Position within cylinder
+	SKIPN	RM03F
+	 IDIVI	T1,^D20		;RP06 sector # in T2
+	SKIPE	RM03F
+	 IDIVI	T1,^D30		;RM03 sector # in T2
+	LSH	T1,^D8		;Head # in high byte
+	IOR	T1,T2		;Sector # in low byte
+	POP	P,T2		;Cylinder #
+	HRL	T1,T2		; in left half of word
+	POPJ	P,		;BYTE (2)0(16)CYL(2)0(8)HEAD,SECTOR
+
+;Disk pre-boot.  The 8080 loads this into page 1.  Starting address is 1000.
+
+;Low core definitions
+	KPALIV=31	;Keep alive fail counter and bits
+	MSRN=  36	;RH number to boot from
+	MSDRIV=37	;Disk drive to boot from
+
+;RH11 definitions
+	RPCS1==00	;Status word 1
+	  RIPST==    21	;Read-in preset function
+	  RDATA==    71	;Read data
+	  RDY==     200	;Ready bit
+	  MCPE==  20000	;Massbus Control parity error
+	  TRE==   40000	;Transfer error
+	RPWC== 02	;Word count
+	RPBA== 04	;Base address (UNIBUS addr of start of data)
+	RPDA== 06	;Disk address (track and sector)
+	RPCS2==10	;Status word 2
+	  RHCLR==40	;Clear RH11
+	RBDS== 12	;Drive status
+	RPER1==14	;Error status 1
+	RPDC== 34	;Desired cylinder
+	RPER2==40	;Error status 2
+	RPER3==42	;Error status 3
+
+
+
+
+BTSTR1:	PHASE	1000
+BTSTRT:!JRST	BTSTAR		;1000 Starting address
+BTHLT0:!HALT	.		;1001 Tried to overwrite pre-boot
+BTHLT1:!HALT	.		;1002 Disk/tape retry failure
+BTHLT2:!HALT	.		;1003 No RH11 base address
+BTHLT3:!HALT	.		;1004 Magtape skip EOF error
+
+BTSTAR:!MOVSI	17,-17		;Zero the ACs
+	SETZM	(17)
+	AOBJN	17,.-1
+	SETZM	17
+
+	MOVE	P1,MSRN		;Get RH address from location 36
+	MOVEM	P1,MSRNSV	;Preserve it
+	SKIPN	P1		;8080 should have set it up for us
+	 JRST	BTHLT2		;Halt at 1003 - no RH address specified
+	HLLM	P1,BTUBP0	;Select right UBA paging RAM
+	HLLM	P1,BTUBST	;Select right UBA status location
+
+	MOVE	T1,KPALIV	;Get keep-alive word from location 31
+	MOVEM	T1,MNKPAL	;Preserve it
+
+	MOVEI	T1,RHCLR
+	WRIO	T1,RPCS2(P1)	;Clear RH11 controller
+	MOVE	T1,MSDRIV	;Get drive number from location 37
+	MOVEM	T1,MSDRSV	;Preserve it
+	WRIO	T1,RPCS2(P1)	;Select drive
+	MOVEI	T2,RDY		;Wait for ready
+	TION	T2,RPDS(P1)	;Did it come up yet?
+	 JRST	.-1		;No, wait for it
+
+	MOVEI	T3,RPPAG	;Point to list of address pairs
+	MOVEI	T5,^D10		;Retry count
+
+RDAPAG:!MOVE	T4,0(T3)	;Get disk address <CYL,,DA>
+	JUMPL	T4,RDADON	;Sign bit set at end
+	AOS	T3		;Point to physical page number
+	WRIO	T4,RPDA(P1)	;Set disk address (track and sector)
+	MOVSS	T4		;Now the LH
+	WRIO	T4,RPDC(P1)	;Set desired cylinder
+	MOVNI	T4,1000_1	;512 PDP10 words = 1024 PDP11 words
+	WRIO	T4,RPWC(P1)	;Set word count
+	SETZ	T4,		;Clear base address
+	WRIO	T4,RPBA(P1)	; (to use UNIBUS address 0)
+	MOVE	T4,0(T3)	;Get KS10 physical page #
+	AOS	T3		;Point to next pair
+	CAIN	T4,1		;Attempting to write into page 1?
+	 JRST	RDBADR		;Error, store info and halt
+	IORI	T4,UBVBIT!UBV36X
+	WRIO	T4,@BTUBP0	;Set up UNIBUS adaptor page 0
+
+	MOVEI	T4,RDATA	;READ DATA command and GO bit
+	WRIO	T4,RPCS1(P1)	;Tell RH11 to go
+	RDIO	T4,RPCS1(P1)	;Wait for ready bit to come back on
+	TRNN	T4,RDY
+	 JRST	.-2
+
+	TRNN	T4,TRE!MCPE	;Check error condition summary
+	 JRST	RDAPAG		;OK, do next page
+	SUBI	T3,2		;Error, back up to same entry
+	SOJLE	T5,RDFAIL	;Fail if retry count exhausted
+
+RDRTRY:!MOVEI	T1,RHCLR	;Error, clear and try again
+	WRIO	T1,RPCS2(P1)	;Clear controller
+	MOVE	T1,MSDRIV
+	WRIO	T1,RPCS2(P1)	;Re-select drive
+	JRST	RDAPAG		;Try reading page again
+
+RDBADR:!MOVEI	17,BTHLT0	;Halt at 1001 if no RH11 address
+	SUBI	T3,2		;Point to failing entry
+	JRST	.+2
+
+RDFAIL:! MOVEI	17,BTHLT1	;Halt at 1002 if too many read errors
+	MOVE	0,0(T3)
+	MOVEM	0,100		;CYL,,TRACK*256+SECTOR
+	MOVE	0,1(T3)
+	MOVEM	0,101		;Memory page #
+	MOVEM	T3,102		;Save selection pickup pointer
+	RDIO	0,RPCS1(P1)
+	MOVEM	0,103		;Control and status 1
+	RDIO	0,RPCS2(P1)
+	MOVEM	0,104		;Control and status 2
+	RDIO	0,RPDS(P1)
+	MOVEM	0,105		;Drive status
+	RDIO	0,RPER1(P1)
+	MOVEM	0,106		;Error status 1
+	RDIO	0,RPER2(P1)
+	MOVEM	0,107		;Error status 2
+	RDIO	0,RPER3(P1)
+	MOVEM	0,110		;Error status 3
+	RDIO	0,@BTUBP0
+	MOVEM	0,111		;UBA paging translation for page 0
+	RDIO	0,@BTUBST
+	MOVEM	0,112		;UBA status reg
+	MOVE	0,BTVER
+	MOVEM	0,113		;Pre-boot version
+
+	MOVE	0,MSRHSV
+	MO,MSRH		;Reinstall RH-11 base address in location 36
+	MOVE	0,MSDRSV
+	MOVEM	0,MSDRIV	;Reinstall drive number
+	MOVE	0,MSKPAL
+	MOVEM	0,KPALIV	;Reinstall keep-alive
+
+	JRST	@17		;Jump to HALT at 1001 or 1002
+
+RDADON:!MOVE	0,1(T3)		;Get starting address
+	MOVEM	0,20		;Save
+
+	WRUBR	ACBLK7
+	MOVSI	17,-17
+	SETZM	(17)		;Zero ACs
+	AOBJN	17,.-1
+	SETZM	17
+
+	WRUBR	ACBLK6
+	MOVSI	17,-17
+	SETZM	(17)		;Zero ACs
+	AOBJN	17,.-1
+	SETZM	17
+
+	WRUBR	ACBLK5
+	MOVSI	17,-17
+	SETZM	(17)		;Zero ACs
+	AOBJN	17,.-1
+	SETZM	17
+
+	WRUBR	ACBLK4
+	MOVSI	17,-17
+	SETZM	(17)		;Zero ACs
+	AOBJN	17,.-1
+	SETZM	17
+
+	WRUBR	ACBLK3
+	MOVSI	17,-17
+	SETZM	(17)		;Zero ACs
+	AOBJN	17,.-1
+	SETZM	17
+
+	WRUBR	ACBLK2
+	MOVSI	17,-17
+	SETZM	(17)		;Zero ACs
+	AOBJN	17,.-1
+	SETZM	17
+
+	WRUBR	ACBLK1
+	MOVSI	17,-17
+	SETZM	(17)		;Zero ACs
+	AOBJN	17,.-1
+	SETZM	17
+
+	WRUBR	ACBLK0
+	MOVSI	17,-17
+	SETZM	(17)		;Zero ACs
+	AOBJN	17,.-1
+	SETZM	17
+	MOVE	0,MSRHSV
+	MOVEM	0,MSRH		;Reinstall RH-11 base address in location 36
+	MOVE	0,MSDRSV
+	MOVEM	0,MSDRIV	;Reinstall drive number
+	MOVE	0,MSKPAL
+	MOVEM	0,KPALIV	;Reinstall keep-alive
+	SETZ	0,		;Zero AC again
+	JRST	@20		;Now start BOOT
+
+ACBLK7:!	1B0!7B8		;WRUBR arguments
+ACBLK6:!	1B0!6B8
+ACBLK5:!	1B0!5B8
+ACBLK4:!	1B0!4B8
+ACBLK3:!	1B0!3B8
+ACBLK2:!	1B0!2B8
+ACBLK1:!	1B0!1B8
+ACBLK0:!	1B0!0B8
+
+MSKPAL:!	0		;Keep-alive and status word
+MSRHSV:!	0		;RH-11 base address
+MSDRSV:!	0		;Drive number
+
+	MCNVER==0
+	DECVER==3
+BTVER:!	MCNVER,,DECVER		;Pre-boot version
+
+BTUBP0:!	1,,76300	;Address of UBA translation for page 0
+BTUBST:!	1,,763100	;Address of UBA status
+  UBVBIT=040000		;Set the VALID bit
+  UBV36X=100000		;Use 36-bit transfers
+
+RDPAG:!	BLOCK	100		;Pairs for locating pages of BOOTS
+	DEPHASE
+RDPAGD=BTSTR1+RDPAG-1000	;Unphased address of BLOCK 100 above
+RDPAGX=RDPAGD+100		;End of BLT
+
+>  ;End REPEAT 0
+
+LITS:	end	start
+
+    v)Je
