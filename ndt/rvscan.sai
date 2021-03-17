@@ -1,0 +1,127 @@
+entry rvscan;
+begin "rvscan"
+define !="COMMENT";
+! this test just insures the offsets below are correct;
+	IFCR COMPILER!VERSION LSH -18 NEQ '102400
+	 THENC REQUIRE "BAD SAIL version!" MESSAGE; ENDC
+	REQUIRE "GOGTAB.DEF" SOURCE!FILE;
+	EXTERNAL INTEGER ARRAY GOGTAB[0:ENDREN];
+
+! offsets into "group table":;
+! copied from HEAD: ;
+define BRKTBL=0		! BREAK CHAR TABLE(entries = is.omit/is.break);
+,	BKOBND=BRKTBL-1 ! Break for chars not in table (=omit/break);
+,	BKDISP=BKOBND-1 ! BREAK CHAR DISPOSITION Word:0/0=S,1/0=A,0/1=R;
+,	BKOMCV=BKDISP-1 ! "must copy" WORD=OMIT speedup/Conversion used;
+,	BKLCZR=BKOMCV-1	! "lowerCase", "Z-mode"(use brktbl+0 on INPUT);
+,	BKTOKN=BKLCZR-1	! for "token" style scanning ;
+,	BKJFFO=BKTOKN-1	! RESERVATION WORD= RESERVED/INITIALIZED;
+,	LNMSTB=BKJFFO-19 ! LINE NUMBER DISPOSITION,,character mask;
+				! disposition: P=0, L=1, I=2, E=3;
+				! note: mask for 0 indicates group size;
+,      BKTOVH=-LNMSTB	! "overhead words" in table (fixed len);
+;
+simple integer procedure scnpts( string s; integer xwdbits;		
+			integer mask, letter.a, tbl;
+			reference integer l.norm );
+start!code
+	define sp='16, a=1,c=3, ch=2,bits=4,b.bits=5,o.bits=6,alpha=7;
+	label lstchr, nocnvl, endwrd, promot;
+COMMENT
+C:	(AC) characters remaining (0 when processing last character)
+CH:	(AC) indexing AC to hold character
+l.b:	[result: A Left] C at last "break" in token mode scan
+l.bo:	[result: A Right] C at last "break" in non-token mode scan
+BITS:	(AC) XWD table-bit, table-bit 
+B.BITS:	(AC) XWD table-bit, 0
+O.BITS:	(AC) XWD 0, table-bit
+ALPHA:	(AC) 0,,-1 if no conversion, otherwise letter A to be converted
+		[ie: for KonvertUp it is "a", convertDown is "A"]
+L.NORM:	C at last "normal" (non omit/break) character (dist from INF)
+	[an output]
+TBL:	XWD CH, table-Base
+MASK:	bits on wherever characters are not allowed to have bits
+;
+	movei ch,ch;  hrlm ch,tbl;	! just for testing;
+	HRRZ	ALPHA,LETTER.A;	! get case conversion type.;
+	MOVE	BITS,XWDBITS;	! get copy of word with both bits on;
+	HRLZI	B.BITS,(BITS);	! break bit.;
+	HRRZI	O.BITS,(BITS);	! omit bit.;
+	HRRZ	C,-1(SP);
+	HRRZI	A,(C);
+
+LSTCHR:	MOVNM	C,L.NORM;	! a real character, store its location;
+PROMOT:	HRLI	A,(A);		! promote last break/omit to true break;
+	
+NOCNVL:	SOJL	C,ENDWRD;	! all done?;
+	ILDB	CH,(SP);	! get character;
+	TDNE	CH,MASK;	! Check for bounds;
+	 HRROI	CH,BKOBND;	! outabounds char use this index;
+	CAIL	CH,(ALPHA);
+	 CAILE	CH,0+"Z"-"A"(ALPHA);
+	  CAIA;
+	  XORI	CH,'40;
+	TDNN	BITS,@TBL;	! classify the character;
+	 JRST	LSTCHR;		! normal character, promote break/omit;
+	TDNN	B.BITS,@TBL;
+	 JRST	NOCNVL;		! omit character, slide on by (...);
+	HRRI	A,(C);		! must be at least a break/omit;
+	TDNE	O.BITS,@TBL;
+	 JRST	NOCNVL;		! a break/omit, dont clear real count;
+	JRST	PROMOT;		! true break, save location; 
+ENDWRD:	HRRZ	C,-1(SP);
+	ADDM	C,L.NORM;
+	HRLI	C,(C);
+	SUBM	C,A;
+end;
+internal simple string procedure rvscan( reference string source; 
+				integer table; reference integer break);
+begin	string result;
+	integer g,sg, rbits,both!bits, breakDisp, 
+		brkLoc,brk, lastReal, conversion;
+	define lbits="(rbits lsh 18)";
+if not(-18<table<56)
+ then begin usererr(table,3,"Invalid break table: ");return("")end;
+break_0; 
+if table=0 or length(source)=0
+ then begin result_ source; source_ null; return(result); end;
+if 0 = g_ gogtab[ (table+17) div 18 + BKTPTR ]
+ then begin usererr(table,3,"Unallocated break table: ");return("")end; 
+sg_ (table+17) mod 18;
+rbits_ (1 lsh 17) lsh -sg;
+if 0 = rbits land memory[g+BKJFFO]
+ then begin usererr(table,3,"Uninitialized break table: ");return("")end;
+
+conversion_ if memory[g+BKOMCV] land rbits	!= if case converting;
+	 then if memory[g+BKLCZR] land lbits	!= if lowercasing;
+		 then "A" else "a" else -1;
+brkLoc_ scnpts( source, both!bits_ rbits lor lbits,
+	(-1 lsh 9) lor memory[g+sg+LNMSTB], conversion, g, lastReal );
+brkLoc_ if memory[g+BKTOKN] land rbits
+	 then brkloc lsh -18 else brkloc land (-1 lsh -18);
+
+brk_ source[brkLoc for 1];
+if 0 < conversion LEQ brk LEQ conversion+("z"-"a")
+ then brk_ brk xor '40;
+breakDisp_ if brkLoc then memory[g+BKDISP] land both!bits else 0;
+	! no break char: treat as "SKIP" mode;
+result_ source[brkLoc+1 to lastReal];
+if length(result)
+ then begin
+	if memory[g+BKOMCV] land both!bits	! has omits or converts;
+	 then result_ (if breakDisp land (-1 lsh 18)	! append mode;
+			 then char!w( brk, width(source) ) else null)
+			& scan(result, table, 0)
+	 else if breakDisp land (-1 lsh 18)	! append mode; 
+		 then result_ source[brkLoc to lastReal];
+      end
+ else if breakDisp land (-1 lsh 18)		! append mode;
+	 then if brk neq (result_ source[brkLoc for 1])
+		 then result_ char!w(brk,width(source));
+source_ source[1 for (if breakDisp land (-1 lsh -18)	! retain mode;
+			then brkLoc else brkLoc-1)];
+break_brk;
+return(result);
+end;
+end "rvscan"
+
