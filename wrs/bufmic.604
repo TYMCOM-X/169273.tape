@@ -1,0 +1,529 @@
+:  Scott's buffer package, experimental
+:
+: invisible replacement of consat's buffer.lib
+:
+: buffer structure -   first word points to address of next buffer
+:                      Halfword of fill cursor
+:                      Halfword of empty cursor
+:
+: Notes: Since to save the effort of grabbing and releasing
+:        ringlets the empty cursor is set positive to distinguish
+:        the difference from an empty and full buffer.
+
+        MO      .,BUFFER
+
+NBUF	EQ	3      
+        IF      X3ON
+NBUF    EQ      NBUF+2          :PAD echo and edit buffers
+        EI
+        IF      OUTDIA
+NBUF    EQ      NBUF+1          :.OTBUF BUFFER
+        EI
+
+NBUF    EQ      NBUF*NPORT      :actual number of buffers
+
+:	first NPORT buffers		 To-terminal buffers
+:	Next NPORT buffers		 From-terminal buffers
+:	Next NPORT buffers		 LOGON buffers
+
+:	If enhanced functions are enabled,
+:	Next NPORT buffers		 Editing buffers
+:	Next NPORT buffers		 Alternate echo buffers
+
+        GLOBAL(NBBFLT,10*NPORT)
+        GLOBAL(BFLTSZ,30)
+
+:   SGBFPT(segment, segment,,,) fills the specified segments
+:       with buffer rings.  An error msg is generated if not enough
+:       room for the buffer rings.
+
+.SGBFP  MACRO(QQQ)[
+  IF Q  :any buffer rings still to do
+     IF QQQ     :picked a segment
+QQ      EQ      $A QQQ
+        SEG     QQ
+        HS      0
+Q1      EQ      .-(10000*QQ)    :amount used in seg
+        IF      10000-(Q1+Q*BFLTSZ)  :TRUE if fit in seg
+BUFBG|QQ| BS    Q*BFLTSZ        :memory needed
+NBUFN|QQ| EQ    Q               :number of buffers in seg
+Q       EQ      0               :all buffer rings allocated
+      ELSE              :only some will fit
+NBUFN|QQ| EQ    (10000-Q1)/BFLTSZ :how many will fit
+Q       EQ      Q-NBUFN|QQ|
+BUFBG|QQ| BS    NBUFN|QQ|*BFLTSZ
+        EI
+      EI  :QQ
+  EI  :Q any buffer rings to do
+]
+
+SGBFPT  MACRO(S1,S2,S3,S4,S5,S6,S7,S8,S9)[
+Q       EQ      NBBFLT
+        .SGBFP(S1)
+        .SGBFP(S2)
+        .SGBFP(S3)
+        .SGBFP(S4)
+        .SGBFP(S5)
+        .SGBFP(S6)
+        .SGBFP(S7)
+        .SGBFP(S8)
+        .SGBFP(S9)
+        IF      Q
+  REMARK%%Buffers do not fit in allocated memory.  FATAL ERROR%
+        QUIT
+        EI
+]
+
+
+        GLOBAL(A.BRNG,3)
+        SEG     A.BRNG
+Q       EQ      .
+        ORG     0
+BCT     HS      1       :bit offset from FLAGS for data present
+BB      HS      2       :address of ring buffer to get data
+BE      HS      2       :address of ring buffer to put data
+BF      HS      1       :bit offset from FLAGS for data present
+SBB     HS      2       :scanning this ring
+SBBPNT  HS      1       :at this location
+BFTBSZ  EQ      .               :size of buffer table
+
+        ORG     Q
+        HS      0
+BUFTBL  BS      BFTBSZ*NBUF    :each buffer has the table
+
+: The actual structure of the bufferlet of data is orderred in such a
+: way as to be most efficient for the microcode.  It is
+: *---....----*------*-----*-----*-----*
+: | data bytes * PNC * GNC * buff chain*  where *-----* is a halfword of mem
+: *---....----*------*-----*-----*-----*   and buff chain is phys address of
+:                                              next bufferlet
+NXTBUF  EQ      4               :this order is easier on microode
+PNC     EQ      0               :put next char
+GNC     EQ      2               :get next char
+
+        SGBFPT(A.BUFF,5,6,7,8,10,11,12,13) :segmentts to put buffer rings
+
+:       RX1 DATA AREA
+        SEG     A.DATA
+
+REBL    HS      2       :start of reserve buffer chain
+BUFERS  HS      2       :start of buffer chain
+REBC1   HS      1       :number of times reserve chain used
+REBC2   HS      1       :number of buffer zaps
+BFZ     HS      2       :most recent zapped buffer
+
+        SEG     A.CODE
+
+:       GCI  get byte from ring
+:            RBF  is link
+:            RBP  is address of ring buffer
+:            RBC  gets the byte
+:            R0, R3, R4 are trashed
+
+GCI     HS      0
+GCIGCU  HC      7F12            :R1 gets char R2 is RBP XX for undef opcode
+        HC      8-BFLTSZ
+        HC      GCICRA-GCIGCU   :where to go to crash
+        HC      GCILA1-GCIGCU   :buffer ring was empty(BCT=0)
+        HC      GCILAs-GCIGCU   :last char in buffer 
+        JR      RBF             :done ok
+GCICRA  HS      0
+        ABORT(RBF,3)
+
+GCILAS  HS      0
+        L       R3,BB,RBP       :buffer ring is empty
+        L       R0,NXTBUF,R3    :get next buffer in chain
+        JLFS    GCILA1          :is no next buffer
+        ST      R0,BB,RBP       :what was next buff is now current buff
+        L       R0,BUFERS       :first free buffer
+        ST      R0,NXTBUF,R3    :is now second free buffer
+        ST      R3,BUFERS       :our released buff is now the first free buff
+        JR      RBF
+
+GCILA1  LHL     R0,BF,RBP       :bit to reset
+        RBT     R0,FLAGS
+        JR      RBF
+
+
+:   WCI  write byte to buffer
+:
+WCI     LH      R3,BE,RBP       :check to see if have bflet
+        JGFS    WCI1            :grab a buffer since have none
+        SEG 0
+WCI8TP  WS      1
+        SEG     1
+        LHL     R0,BF,RBP
+        JER     R8              :no data so no get buffer
+        ST      R8,WCI8TP,,
+        JAL     R8,WCI3
+        l       r8,wci8tp,,
+WCI1    HC      7E12            :RWCI rbc,rbp :write char to ringlet
+        HC      WCICRA-WCI1     :error
+        HC      8-BFLTSZ        :wrap index
+        HC      WCIFRS-WCI1     :first char in ring
+        HC      WCINEX-WCI1     :grab next buffer
+        JR      RBF             :done ok
+
+WCI3
+        L       R3,BUFERS       :address of free buffer
+        JGFS    WCI33           :is a buffer there
+        L       R3,REBL         :otherwise get reserve buffers
+        JL      WRECRA          :no buffers so crash
+        TS      REBL            :reserve is no gone
+WCI33   ST      R3,BB,RBP       :first bufferlet is both BE and BB
+        JFS     WCI9
+
+WCINEX  L       R0,BUFERS       :address of free buffer
+        JGFS    WCI4            :is a buffer there
+        L       R0,REBL         :otherwise get reserve buffers
+        JL      WRECRA          :no buffers so crash
+        TS      REBL            :reserve is no gone
+WCI4    
+        L       R3,BE,R2        :old buffer
+        ST      R0,NXTBUF,R3    :chain new onto old
+        LR      R3,R0
+WCI9    L       R0,NXTBUF,R3    :find next buffer in list
+        ST      R0,BUFERS       :next buffer is now 1st free buf
+        TS      NXTBUF,R3       :no more in our chain
+        ST      R3,BE,RBP       :new buffer is new ending buffer
+        LI      R0,10000*(8-BFLTSZ)+((8-BFLTSZ)&0FFFF)
+        ST      R0,PNC,R3       :init PNC and GNC
+        JR      R8              :back to put the byte
+
+WCIFRS  LHL     R0,BF,RBP       :get buffer flag
+        SBT     R0,FLAGS        :set bit
+        JR      RBF
+
+WCICRA  ABORT(RBF,5)
+WRECRA  ABORT(RBF,6)
+
+
+:  GCD   reads last char written into buffer (other end from GCI)
+:       links on RCH, RBC has char, R0, R3, R4 are all trashed
+:
+GCDCRA  ABORT(RCH,7)
+
+GCD     HS      0
+GCDALT  L       R3,BE,RBP       :buffer to delete from
+        LH      R4,PNC,R3       :pointer
+        CHI     R4,8-BFLTSZ    :at first position
+        JNFS    GCD3
+        LIS     R4,0            :then at last  (+1)
+GCD3    SIS     R4,1            :move back one position
+        LB      RBC,BFLTSZ,R3,R4 :character being deleted (for caller)
+        LCS     R0,1
+        AHM     R0,BCT,RBP      :one fewer char
+        JLE     GCDLAS          :it was the last one
+        STH     R4,PNC,R3       :and store it
+        CH      R4,GNC,R3       :did we empty ring buffer
+        JNR     RCH             :no so done
+        L       R0,BUFERS       :put this buffer in free chain
+        ST      R0,NXTBUF,R3    :1st free is going to be second free
+        ST      R3,BUFERS       :free buffer is now 1st free
+        L       R4,BB,RBP       :go from begining to find which chained from
+GCDSRH  C       R3,NXTBUF,R4    :our buffer?
+        JEFS    GCDFIX          :yes
+        L       R4,NXTBUF,R4    :go to next buffer
+        JBS     GCDSRH          :loop
+GCDFIX  ST      R4,BB,RBP       :new begining buffer
+        TS      NXTBUF,R4       :no next buffer
+        JR      RCH
+
+GCDLAS  JL      GCDCRA          :crash if removing from empty buf
+        LHL     R0,BF,RBP       :bit to reset since no data
+        RBT     R0,FLAGS
+        STH     R0,GNC,R3       :empty since get is positive
+        JR      RCH
+
+: WCD   write char at end normally for getting
+:
+WCD     LR      RBF,RCH         :maybe jumping to WCI if buffer empty
+        LHL     R0,BCT,RBP      :buffer empty?
+        JE      WCI             :yes, then end is the same as begining
+        L       R3,BB,RBP       :getting buffer
+        LH      R4,GNC,R3       :where to put
+        CH      R4,PNC,R3       :buffer full?
+        JE      WCD2
+        CHI     R4,8-BFLTSZ    :first position?
+        JNFS    WCD1
+        LIS     R4,0            :then put at end (+1)
+WCD1    SIS     R4,1            :back up one pos
+        STH     R4,GNC,R3       :where to get (but where we are putting)
+        STB     RBC,BFLTSZ,R3,R4 :store char
+        LIS     R0,1
+        AHM     R0,BCT,RBP      :another char
+        AHM     R0,GNC,R3       :get is bumped up
+        JNR     RCH             :done
+        LHI     R4,8-BFLTSZ    :cursor wrapped
+        STH     R4,GNC,R3
+        JR      RCH
+
+WCD2    L       R4,BUFERS       :chain a buffer to backward end
+        JGFS    WCD3            :buffer there
+        L       R4,REBL         :reserve buffers
+        TS      REBL
+WCD3    ST      R4,BB,RBP       :new begining buf
+        ST      R3,NXTBUF,R4    :old buf is after new buf
+        LR      R3,R4           :only care abot new buf
+        LHI     R4,08+1-BFLTSZ    :first location (+1 so can back up with ease)
+        STH     R4,PNC,R3       :put pointer
+        J       WCD2
+
+:  MCI  adds buffer chain (source buffer) in r5 to (destination buffer) r6
+:       links on rch
+
+MCI     LHL     R0,BCT,R5       :any source data?
+        JER     R7              :no data so nothing to do
+        LHL     R1,BF,R6        :destination cares about data?
+        JNFS    MCI1
+        LR      RBP,R5          :no care so this buffer is a sink
+        J       EMPTY
+MCI1    AHM     R0,BCT,R6
+        LHL     R0,BF,R5        :data flag for source
+        RBT     R0,FLAGS        :source has no data
+        LIS     R0,0
+        STH     R0,BCT,R5       :and zero chars
+        SBT     R1,FLAGS        :have data
+        JN      MCI3            :buffer has no data to chain to
+        L       R0,BB,R5        :so switch buffers
+        L       R1,BB,R6
+        ST      R1,BB,R5
+        ST      R0,BB,R6        :buffer begin
+        L       R0,BE,R5        :and now the buffer ends
+        L       R1,BE,R6
+        ST      R1,BE,R5
+        ST      R0,BE,R6
+        JR      RCH             :and done
+
+MCI3    L       R0,BB,R5        :chain buffer at end of dest buf
+        L       R1,BE,R6        :end of dest buffer
+        ST      R0,NXTBUF,R1    :added to end of chain
+        L       R0,BE,R5        :source end is new end
+        ST      R0,BE,R6
+        TS      BE,R5           :source has no buffers
+        TS      BB,R5
+        JR      RCH             :and done
+
+:  CPEEK        peeks at the next char in buffer
+:               normal return if no data or next char is not a signal
+:               +4 and signal in RBC if a signal
+
+CPEEK   LHL     RBC,BF,RBP      :assigned buffer?
+        JER     RCH             :nope so done
+        LH      RBC,BCT,RBP     :any data there?
+        JER     RCH             :nope so done
+        L       R3,BB,RBP       :address of buffer ring
+        LH      R4,GNC,R3       :pointer in ring
+        LB      RBC,BFLTSZ,R3,R4 :get char
+        JNR     RCH             :signals begin with a 00 null
+        AIS     R4,1
+        JLFS    CPEEK1          :next char
+        LHI     R4,8-BFLTSZ    :pointer was at end
+CPEEK1  LB      RBC,BFLTSZ,R3,R4 :get signal
+        JN      4,RCH           :was a signal
+        JR      RCH             :was really a null
+
+: IGCSCN        initializes for a scan through a buffer
+:               normal return if no data
+:               skip (+4) if data (does not return a char though)
+
+IGCSCN  LHL     R0,BCT,RBP
+        JER     RBF
+        L       R3,BB,RBP       :begining buffer
+        ST      R3,SBB,RBP      :buffer to start
+        LH      R3,GNC,R3       :first to get
+        STH     R3,SBBPNT,RBP   :remember it
+        J       4,RBF           :skip return
+
+: GCSCN         routine that scans through the buffer
+:               normal routine if no data
+:               skip (+4) with char in rbc
+:       note: this version trashes r3 unlike older verion
+
+GCSCN   L       RBC,SBB,RBP     :begining buffer
+        LH      R3,SBBPNT,RBP   :where we got last time
+        CH      R3,PNC,RBC      :finished with ring?
+        JNFS    GCSCN2          :nope scan the char
+        L       RBC,NXTBUF,RBC  :find linked buffer
+        JLR     RBF             :no buffer there so no data
+        ST      RBC,SBB,RBP     :scanning in different buffer ring
+        LH      R3,GNC,RBC      :get cursor
+GCSCN2  LB      RBC,BFLTSZ,RBC,R3 :get the char
+        AIS     RBF,4           :we are skip returning
+        LIS     R3,1            :update pointer
+        AHM     R3,SBBPNT,RBP   :the scan pointer
+        JLR     RBF             :skip return
+        LHI     R3,8-BFLTSZ     :then first pointer
+        STH     R3,SBBPNT,RBP
+        JR      RBF
+
+:  EMPTY        returns all buffer rings to the free list and
+:               clears all reminders of data (BCT, BF flag)
+:
+EMPTY   L       R3,BB,RBP       :get buffer
+        JLR     RCH             :no buffer assigned so done
+        L       R0,BUFERS       :get free list
+        ST      R3,BUFERS       :our buffer is now first free
+        L       R3,BE,RBP       :ending buffer to chain from
+        ST      R0,NXTBUF,R3    :old first free is now chained
+        LHL     R0,BF,RBP       :set no data
+        RBT     R0,FLAGS        :no data there
+        LIS     R0,0
+        STH     R0,BCT,RBP      :count zero chars there
+        TS      BB,RBP          :no buffer there
+        TS      BE,RBP          :not, even a end
+        JR      RCH
+
+:  BZAP         runs off timout list and makes sure 1/8 of the buffers
+:               are in reserve (better to zap the large than run out and
+:               crash)
+
+        GL      BZAP
+BZAP    L       R0,REBL         :reserve still there?
+        JG      EXDISM          :quit if have reserve
+        LIS     R0,1
+        AHM     R0,REBC1        :count another time reserve gone
+BZAP1   L       R1,BUFERS       :see how many are free
+        LHI     R0,NBBFLT/8     :number of free wanted
+BZAP2   L       R1,NXTBUF,R1    :next one
+        JLFS    BZAP3           :go zap one
+        SIS     R0,1
+        JGBS    BZAP2           :count until 1/8
+        L       R2,BUFERS       :bufers to R1 have 1/8 of buffers
+        ST      R2,REBL         :so move that chain segment to reserve
+        L       R2,NXTBUF,R1    :next buf goes to free list
+        ST      R2,BUFERS
+        TS      NXTBUF,R1       :end of reserve chain
+        J       EXDISM
+
+BZAP3   LHI     R0,NBUF-1
+        LI      R1,BUFTBL+(NBUF-1)*BFTBSZ :last entry in buffer table
+        LIS     R9,0            :r9 keeps largest count
+BZAP4   CLH     R9,BCT,R1       :biggest gets zapped
+        JLFS    BZAP5
+        LHL     R9,BCT,R1       :new big one
+        LR      RBP,R1          :and our big buffer
+BZAP5   SHI     R1,BFTBSZ       :previous buffer
+        SIS     R0,1
+        JGEBS   BZAP4           :search all counts
+        LIS     R0,1
+        AHM     R0,REBC2        :zapped another buffer
+        ST      RBP,BFZ         :the zapped buffer
+        JAL     RCH,EMPTY       :return the buffer chain to free list
+	LO	SIGNAL
+	LIS	R4,GOBSIG		:Put in a gobbler
+	JAL	RCH,PUTSIG
+	LHI	R4,BLBSIG		:...followed by a black-ball
+	JAL	RCH,PUTSIG
+	FO	SIGNAL
+	LIS	R0,9			: ** 5.00 LH ,9-byte messages to Sup.
+	LIS	R1,0			:...for slot 0
+	LIS	R2,3			:...type 3
+	JAL	R4,SLOR			:send diagnostic to sup.
+	LIS	R0,0
+	JAL	R4,PUTCH		:KEY = 00   
+	L	R0,BFZ		:buffer index (buffer pointer)
+	SRLS	R0,4			:convert address to halfword
+	JAL	R4,PUTH			:DATA2 = buffer number
+	LIS	R0,02			:R TYPE = 02 for buffer zapped
+	JAL	R4,PUTCH		:only one byte for report type
+	LR	R0,R9			:character count for data lost
+	SRLS	R0,8			:divided by 256 to fit one byte space.
+	JAL	R4,PUTCH		:DATA1 = data lost/256
+        LHI     R0,PRODID		:PRODID = 45 for ISCS
+	JAL	R4,PUTCH		:product id
+	JAL	R4,ELOR			:End-Logical-Output-Record
+	J	BZAP1			:try again to fill reserve-list
+
+
+        EM      :BUFFER.LIB
+	SUBTTL	(BUFFER) TIMEOUT PROCESSES
+
+:	This package contains the timeout routines
+:	The following parameters MUST be defined on entry:
+:	M.TOUT	number of timeout entries which may be active at any one time
+
+:	expects to JAL R10,CRASH if list overflows
+
+:	four symbols are declared:
+:	IZT	called at initilization, link on R0
+:	TIMOUT	to be called periodicaly, link on on R0
+:		will in turn jump to any routines which should be serviced:
+:		R0 = routine address
+:	EXDISM	routines called by TIMOUT should exit to here
+:	CSDISM  second label for EXDISM used in mods shared with standalone CONSAT
+:	TSCHED	any code may call this to place an entry on timeout list:
+:		link on R6...R7--R15 preserved
+:		R0 = address to transfer to
+:		R1 = when to call routine next
+:		R2 = how often to call routine
+:			(next time from each activiation)
+
+	 MO	.,TIMOUT
+
+	SEG	A.CODE
+
+CSDISM	HS	0			:second Label for shared modules
+					:with standalone CONSAT
+EXDISM	L	R0,TORET		:Timeout routines exit here
+:	Call next time-out routine (if any) that has become due
+TIMOUT	L	R5,T.ACT		:get active list pointer
+	JER	R0			:exit if no active entries
+	L	R1,FASTC,,		:get current clock time
+	CL	R1,T.ACTT,R5		:is 1st active-list timeout due?
+	JLR	R0			:no timeouts due to proceed
+	ST	R0,TORET		:routine must termiby jumping to
+					:	EXDISM
+	L	R3,T.NEXT,R5
+	ST	R3,T.ACT		:shorten active list
+	L	R0,T.ADDR,R5		:fetch routine address
+	A	R1,T.PER,R5		:period...when to call again
+	JAL	R6,QTOLNK		:put back onto list
+	JR	R0			:enter timed-out routine
+
+:	Put entry into timeout list
+:	R0 -	address
+:	R1 -	new time
+:	R2 -	interval
+:	R6 -	Link.
+TSCHED	L	R5,T.FREE		:get free-list entry
+	JGFS	QTPT1
+	JAL	R10,CRASH,,		:free-list exhausted
+	BC	0,0,4*R6,0F		:flag--link R6, type 15d crash
+QTPT1	L	R4,T.NEXT,R5
+	ST	R4,T.FREE		:shorten free list
+	ST	R2,T.PER,R5
+	ST	R0,T.ADDR,R5
+
+:	Link entry into timeout list
+:	R0 -	preserved
+:	R1 -	time to run new entry
+:	R5 -	pointer to entry
+QTOLNK	ST	R1,T.ACTT,R5		:plug in new time to run
+	LIS	R3,4			:find active list entry between
+					:	earlier, later timeout.
+QTLK1	LR	R4,R3
+	L	R3,T.NEXT,R3		:check next timeout entry
+	JEFS	QTLK2			:active list is empty
+	CL	R1,T.ACTT,R3		:is it earlier than argument due-time
+	JGBS	QTLK1			:yes, continue 'til R4 is earlier and
+					:	R3 is equal or later
+QTLK2	ST	R5,T.NEXT,R4		:make earlier active-list entry point
+					:	to new entry
+	ST	R3,T.NEXT,R5		:have new entry point to next greater
+					:	timeout entry
+	JR	R6			:store arguments and return
+
+HJKL    EQ      LSIZ
+:	Initialize timeout data
+:	R0 -	link register
+IZT	LHI	R1,M.TOUT*LSIZ		:initialize timeout free-list
+	LIS	R2,0			:0 terminates list
+	ST	R2,T.ACT		:active list is empty
+	ST	R2,T.NEXT,R1		:terminate free-list
+IZT1	ST	R1,T.FREE-LSIZ,R1
+	SHI	R1,LSIZ
+	JGBS	IZT1
+	JR	R0
+	 EM	:TIMOUT
+   f\]>
