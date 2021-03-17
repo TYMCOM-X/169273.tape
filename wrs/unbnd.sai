@@ -1,0 +1,911 @@
+begin	"UNBND"
+
+comment
+	UNBND - program to regenerate NIB files from BND files
+;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "ARGS.REQ" source!file;		! argument parsing stuff;
+require "DATIME.REQ" source!file;	! date and time routines;
+require "FLIB.REQ" source!file;		! file I/O stuff;
+!get!definitions(ASSERT);		! error checking stuff;
+
+require !xwd('0,'1) version;
+
+comment
+	Utility macros.
+;
+define	!hi(X)	= {( (X) lsh -16 land '177777 )}
+,	!lo(X)	= {( (X) land '177777 )}
+,	!24(X)	= {( (X) land '77777777 )}
+;
+
+comment
+	Convert hex constant to decimal at compile time.  Now THIS is
+	a real macro language!
+;
+define	hex(X)	= {(
+	redefine !!hex# = 0;
+	forc !!hex!i _ 1 stepc 1 untilc length("X") doc {
+		redefine !!hex# = !!hex# * 16 + "X"[!!hex!i for 1] - "0";
+		ifcr "X"[!!hex!i for 1] > "9"
+		    thenc redefine !!hex# = !!hex# + "0" - "A" + 10;
+		endc
+		ifcr "X"[!!hex!i for 1] > "Z"
+		    thenc redefine !!hex# = !!hex# + "A" - "a";
+		endc
+	} endc
+	!!hex#
+)};
+
+comment
+	Definitions for NIB/BND file format.  Byte pointer macros
+	index on the integer BLKp which is usually global.  id* define
+	field offsets in the ID record.
+;
+
+define	b!RTYPE	= {point(4,memory[BLKp+0],3)}
+,	 rtID	= 1
+,	 rtMEM	= 2
+,	 rtSYM	= 3
+,	b!BAD	= {point(12,memory[BLKp+0],15)}
+,	b!PAD	= {point(20,memory[BLKp+0],35)}
+,	b!BCNT	= {point(15,memory[BLKp+1],14)}
+,	b!U	= {point( 1,memory[BLKp+1],15)}
+,	b!VAD	= {point(20,memory[BLKp+1],35)}
+;
+
+define	idSTART = '1
+,	idDATE	= '2
+,	idTIME	= '3
+,	idUSER	= '4
+,	idFNAME	= '6
+,	idEXT	= '7
+,	idAUTH	= '10
+,	idINDEX	= '12
+,	idEND	= '176
+,	idLINK	= '177
+;
+
+
+
+comment
+	Locations used in ISIS lo memory.  Addresses are fullword addresses,
+	that is the low order two address bits are shifted off.  This
+	facilitates indexing into the array ISIS[].
+;
+
+define	isPBITS	= hex(2D0)%4	comment Presence bits, index by slot;
+,	 Present(S) = {( ISIS[isPBITS+(S)%32] land !bit(4+((S) mod 32)) )}
+,	isS0SIZ	= hex(2D8)%4	comment Extent of slot 0 in bytes;
+,	isMSIZE	= hex(2DC)%4	comment Size in bytes of configured memory;
+,	isSORG	= hex(300)%4	comment Physical slot origins;
+;
+define	isBeg	= isPBITS	comment Lowest data to collect from ISIS;
+,	isEnd	= isSORG + 63	comment Highest data to collect from ISIS;
+;
+
+
+comment
+	Locations used in slot's Segment E, CTA table.  Values are fullword
+	offsets from E0000 to facilitate indexing into CTA[].
+;
+
+define	ctCNTRL	= hex(00)%4
+,	ctCTASIZ= hex(04)%4
+,	ctAREA0	= hex(08)%4
+,	ctAREAn	= hex(3C)%4
+,	ctHOSTN	= hex(80)%4	comment hi halfword;
+,	ctNPORTS= hex(82)%4	comment lo halfword;
+,	ctSVERNO= hex(8A)%4	comment lo halfword;
+,	ctPID	= hex(94)%4	comment lo halfword;
+;
+define	ctBeg	= ctCNTRL
+,	ctEnd	= ctPID
+;
+
+
+comment
+	Slot type names.
+;
+preload!with
+	"normal slot",
+! 01;	"Supervisor",
+! 02;	"Probe",
+! 03;	"SysMsg slave",
+! 04;	"UN2 slave",
+! 05;	"Error Log slave",
+! 06;	"Account slave",
+! 07;	"RAccount slave";
+string array slotTypeName[0:7];
+
+
+comment
+	Selected Tymcom-X operating systems symbols for use in I/O.
+;
+
+define	!rbALC	= '11		comment File size in blocks;
+,	!chCFP	= '40		comment Create file page CHANIO fn code;
+;
+
+comment
+	Product ID table - this should be in a file, shouldn't it?
+;
+
+preload!with
+"0000","0001","0002","0003","0004","0005","0006","0007",
+"0008","0009","000a","000b","000c","000d","000e","000f",
+"0010","0011","0012","0013","0014","0015","0016","0017",
+"0018","0019","001a","001b","001c","001d","001e","001f",
+"0020","0021","0022","0023","0024","0025","0026","0027",
+"0028","0029","002a","002b","002c","002d","002e","002f",
+"0030",
+! 0031;	"ASAT",	! TYMSAT;
+! 0032;	"ACOM",	! TYMCOM;
+! 0033;	"XCOM",	! X25/X75 Combined;
+! 0034;	"PBH ",	! 3270 Host Interface;
+! 0035;	"PBT ",	! 3270 Terminal Interface;
+! 0036;	"MSAT",	! Micronode Kernel;
+! 0037;	"I2IS",	! ISIS Kernel;
+! 0038;	"TII ",	! Tymnet-2 Node Code;
+! 0039;	"XXB ",	! 2020 Base;
+! 003A;	"BBXS",	! X780/Multileaving;
+! 003B;	"ELF ",	! ELF;
+! 003C;	"I2G1",	! ISIS Gateway;
+! 003D;	"I2T1",	! ISIS Tymnet-1 Node Code;
+! 003E;	"LDII",	! LOADII;
+! 003F;	"MRLN",	! MERLIN;
+! 0040;	"ONTM",	! ONTYME;
+! 0041;	"PRB ",	! PROBE;
+! 0042;	"RAM ",	! Raw Accounting Merger;
+! 0043;	"SUP ",	! Supervisor;
+! 0044;	"NVAL",	! VAL/Netval;
+! 0045;	"ISCS",	! ISIS Consolidated Tymsat;
+! 0046;	"BOOT",	! Engine Boot;
+! 0047;	"KER ",	! Stand-alone Kernel;
+! 0048;	"SKER",	! Split stand-alone Kernel;
+! 0049;	"SDLC",	! SDLC Interface;
+! 004A;	"TNTT",	! TINET Terminal Interface;
+! 004B;	"UTSH",	! UTS 4000 Host Interface;
+! 004C;	"NTRH",	! NTR Host Interface;
+! 004D;	"VMB ",	! VMB Interface;
+! 004E;	"EWS ",	! Engine Work Station;
+! 004F;	"NEM ",	! Network Event Monitor;
+! 0050;	"TMCS",	! Tymnet Monitor & Control System;
+! 0051;	"OUT ",	! Outdial;
+! 0052;	"CMTI",	! 3270 Character Mode Terminal;
+! 0053;	"TRSW",	! Transaction Switch;
+! 0054;	"ITI ",	! Sligos Transaction Service;
+! 0055;	"UTST",	! UTS 4000 Terminal Interface;
+! 0056;	"TOM ",	! Tymcom Operations Monitor;
+! 0057;	"LEM ",	! Lemcom 370 Base;
+! 0058;	"MUX ",	! Multiplexor;
+! 0059;	"UTIL",	! Supervisor Utility Slave;
+! 005A;	"PBOM",	! Polled Bisync Operations Monitor;
+! 005B;	"SOM ",	! SDLC Operations Monitor;
+! 005C;	"PAOM",	! Polled Async Operations Monitor;
+! 005D;	"CRED",	! Circuit Redirect;
+! 005E;	"TLXG",	! Telex Gateway;
+! 005F;	"XOM ",	! X25/X75 Operations Monitor;
+! 0060;	"NTRT",	! NTR Terminal Interface;
+! 0061;	"XPC ",	! X.PC Server;
+! 0062;	"SNAT",	! SNA Terminal Interface;
+! 0063;	"SNAH",	! SNA Host Interface;
+! 0064;	"TNTH",	! TINET Host Interface;
+! 0065;	"CMTU",	! UTS Character Mode Terminal;
+! 0066;	"ACCT",	! Account Slave;
+! 0067;	"ELSV",	! ELF Slave;
+! 0068;	"ERLG",	! ERLOG Slave;
+! 0069;	"NAD ",	! NAD Assembler;
+! 006A;	"NTCN",	! Network Console;
+! 006B;	"SYSM",	! SYSMSG1 Slave;
+! 006C;	"UN2 ",	! UN2 Slave;
+! 006D;	"ISRM",	! ISIS System Recovery Module;
+! 006E;	"ONTR",	! Ontyme Database Restore Program;
+! 006F;	"OBJN",	! Pascal Object to Nib Convertor;
+! 0070;	"CPAS",	! Concurrent Pascal Compiler;
+! 0071;	"STAR",	! Pascal Statement Address Generator;
+! 0072;	"TMDM",	! TMCS Disk Maintenance Program;
+! 0073;	"TMRE",	! TMCS Resource Estimation Program;
+! 0074;	"NMDM",	! NEM Disk Maintenance Program;
+! 0075;	"NMRE",	! NEM Resource Estimation Program;
+! 0076;	"NCDM",	! Network Console Disk Maint Program;
+! 0077;	"NCRE",	! Network Console Resource Estimator;
+! 0078;	"NVDM",	! Netval Disk Maintenance Program;
+! 0079;	"MSRV",	! Menu Server;
+! 007A;	"SHMN",	! MXP Loader/Debugger;
+! 007B;	"XPI ",	! Extended Processor Interface;
+! 007C;	"CPPP",	! Concurrent Pascal Preprocessor;
+! 007D;	"ATC ",	! Asynchronous Terminal Concentrator;
+! 007E;	"ODNU",	! Outidal Concurrent Pascal Nucleus;
+! 007F;	"OPAS",	! Outdial Pascal Compiler;
+! 0080;	"ACUS",	! Outdial/Bisync Auto Call UNIT SERVER;
+! 0081;	"XCOM",	! XCOM - X.25;
+! 0082;	"XCOM",	! XCOM - X.75;
+! 0083;	"IHSA",	! IHSA;
+! 0084;	"DMAC",	! Universal Engine MAC Diagnostic;
+! 0085;	"MLI ",	! DOS/MLI-Multileaving Bisync -DOS/VSE;
+! 0086;	"ISRS",	! ISIS slot recover system;
+! 0087;	"MXPI",	! MXP;
+! 0088;	"CICL",	! ICL Protocol - ;
+! 0089;	"HICL",	! ICL Protocol - Host;
+! 008A;	"TICL",	! ICL Protocol - Terminal;
+! 008B;	"I2G2",	! Tymnet II Gateway;
+! 008C;	"DMEM",	! Engine Memory Diagnostic;
+! 008D;	"LHOS",	! Throughput (Load) Host;
+! 008E;	"MDT ",	! 2770 Terminal Interface;
+! 008F;	"MDH ",	! 2770 Host Interface;
+! 0090;	"IPI ",	! E-BUS Slot Interface;
+! 0091;	"EBUS",	! E-BUS Slot Interface;
+! 0092;	"PTI ",	! HSBC 3270 Terminal Interface;
+! 0093;	"CMH ",	! Tymnet Character Mode Host;
+! 0094;	"MBAS",	! Microdata Base;
+"0095","0096","0097","0098",
+! 0099;	"EXPE",	! EXPERIMENTAL;
+"009a";
+string array PID[0:hex(9a)];
+
+comment
+	GLOBALS item definitions for command line scanner (ARGPAR).
+;
+
+string item NIBFILE;
+string item BNDFILE;
+item QUIET, TRACE, VERBOSE;
+item ALLSLOTS;
+integer item SLOTNUMBER;
+
+
+comment
+	Miscelaneous globals.
+;
+
+r!p(FILE) BND;			! .BND file descriptor;
+integer BLKp;			! memory pointer to .BND file record;
+integer NIBcount;		! count of NIB files created;
+
+
+comment
+	Globals table for record index.  
+	The data in the table, id[], is a copy of the two word index entries
+	from the ID records.  Only MEMORY IMAGE record indexes are copied.
+	Ideally, this should be dynamic, but that would require two passes
+	through the file to extract the data.
+;
+
+define	maxidn	= 5000
+;
+integer nid;			! number of index words used;
+integer array ID[0:maxidn-1];	! index data - 2 words per entry;
+integer array IDH[0:idINDEX-1];	! ID record header information;
+integer NSLOT;			! number of slots;
+integer array ISIS[isBeg:isEnd];! data from ISIS lo memory;
+integer array CTA[ctBeg:ctEnd];	! CTA table from slot segment E;
+
+
+comment
+	Low level routines to return various parts of a file name.
+;
+
+string procedure namePart( string FILENAME );
+begin	"namePart"
+    return( cv6str( cvfil( FILENAME, !SKIP!, !SKIP! )));
+end	"namePart";
+
+string procedure extPart( string FILENAME );
+begin	"extPart"
+    integer EXT;
+    cvfil( FILENAME, EXT, !SKIP! );
+    return( cv6str( EXT ));
+end	"extPart";
+
+
+comment
+	Low level routine to print an unsigned integer in HEX.
+;
+
+string procedure cvh( integer X, LEN(0) );
+begin	"cvh"
+    string S;
+    S := null;
+    do begin
+	S := "0123456789abcdef"[(X land '17)+1 for 1]& S;
+	X := X lsh -4;
+    end until X = 0 and length(S) geq LEN;
+    return( S );
+end	"cvh";
+
+comment
+	getBlock procedure to map a block into memory and return the
+	number of words in the "buffer".  The global BLKp is set to
+	the memory address of the start of the block.  If this is not
+	an extension block (BAD=-1), the block is checked to make
+	sure it has the correct block address in the header.  To read
+	the next page, call with BAD = -1.
+;
+
+integer procedure getBlock( r!p(FILE) F; integer BAD );
+begin	"getBlock"
+    own integer VP;			! virtual page number;
+    own integer FP;			! current file page;
+    own integer FB;			! requested file block;
+    FB := if BAD geq 0
+	then BAD
+	else FB + 1;
+    if FP neq (FB lsh -2) + 1 then begin
+	if VP then fFree( VP );		! deallocate old stuff;
+	VP := fAlloc( 1 );		! allocate virtual memory;
+	assert( VP > 0, no memory );
+	FP := (FB lsh -2) + 1;		! compute page position in file;
+	fMap( F, VP, FP, 1 );		! map pages into memory;
+    end;
+    BLKp := (VP lsh 9) + ((FB land 3) lsh 7);! build memory pointer to block;
+    if BAD geq 0 and BAD neq ldb(b!BAD) then
+	fError( F, "?incorrect block address in block '"& cvos(BAD) );
+    return( 128 );			! return number of words;
+end	"getBlock";
+
+comment
+	Part of /VERBOSE - prints data from ID record.
+;
+
+procedure printID( integer array IDH );
+begin	"printID"
+    integer BLKp;
+    BLKp := location(IDH[0]);
+    assert( ldb(b!RTYPE) = rtID );
+    print( crlf&
+       "Kernel file:	",
+	    (if IDH[idUSER] neq 0
+		then "("& cv6str(IDH[idUSER])& cv6str(IDH[idUSER+1])& ")"
+		else null ),
+	    cv6str(IDH[idFNAME]),".",cv6str(IDH[idEXT] land !xwd(-1,0)),
+	    (if IDH[idUSER] = 0 and IDH[idUSER+1] neq 0
+		then "["& cvos(!lh(IDH[idUSER+1]))& ","&
+		    cvos(!rh(IDH[idUSER+1]))& "]"
+		else null ),
+	    crlf&
+       "Assembly date:	", cvDate( IDH[idDATE] ),
+	    " ", cvTime( IDH[idTIME] % 1000 ), crlf&
+       "Author:		", cv6str(IDH[idAUTH]),cv6str(IDH[idAUTH+1]), crlf&
+       "Start address:	",
+	    (if IDH[idSTART] neq -1
+		then cvh( IDH[idSTART] )
+		else "none" ),
+	    crlf
+    );
+end	"printID";
+
+procedure printHead;
+begin	"printHead"
+    string S;
+    print(
+	"BlockAdr='", S:=cvos(ldb(b!BAD) lsh 7),
+	"        "[length(S) to inf],
+	" Type=", ldb(b!RTYPE) );
+    case ldb(b!RTYPE) of begin
+	[rtID] print( "(ID)" );
+	[rtMEM] begin
+	    print( "(MEM)"&
+		"  PhysAdr=", cvh(ldb(b!PAD),5),
+		":", cvh(ldb(b!PAD)+ldb(b!BCNT)-1,5) );
+	    if not ldb(b!U) then print(
+		"  VirtAdr=", cvh(ldb(b!VAD),5),
+		":", cvh(ldb(b!VAD)+ldb(b!BCNT)-1,5) );
+	end;
+	[rtSYM] if !lh(memory[BLKp+1])
+	    then print( "(SYM)"&
+		" count=", ldb(b!PAD),
+		" module=", cv6str(memory[BLKp+1]) )
+	    else print( "(SYM/state)"&
+		" count=", ldb(b!PAD),
+		" words=", memory[BLKp+1] );
+	[else] print( "(?)" )
+    end;
+    print( crlf );
+end	"printHead";
+
+comment
+	Look for the next slot in order to compute the slot extent.
+	The slot extent is the difference between the origin of this
+	slot and the next existing slot.  Older versions of ISIS put
+	ASYNC rings between slot 0 and slot 1 so location isS0SIZ is
+	used for the extent of slot 0.  Note that some slots may not
+	appear in physical memory in slot number order.  For this
+	reason, we must scan the whole table to find the smallest
+	slot origin greater than the slot in question.
+;
+
+integer procedure Extent( integer SLOT );
+begin	"Extent"
+    integer ORG,nextOrg,I;
+    if SLOT = 0 then return( ISIS[isS0SIZ] );
+    Org := !24(ISIS[isSORG+SLOT]);
+    nextOrg := ISIS[isMSIZE];
+    for I := 0 upto NSLOT-1 do
+	if Org < !24(ISIS[isSORG+I]) < nextOrg then
+	    nextOrg := !24(ISIS[isSORG+I]);
+    return( nextOrg - Org );
+end	"Extent";
+
+integer procedure Memsize( integer SLOT );
+begin	"Memsize"
+    integer I, accuSize;
+    accuSize := 0;
+    if CTA[ctCTASIZ] < ctAREAn
+	then return( -1 );
+    for I := ctCTASIZ upto ctAREAn do
+	if CTA[i] land '777700000000 = 0
+	    then accuSize := ( accuSize + CTA[i] + 255 ) land -256
+	    else return( -1 );
+    return( accuSize );
+end	"Memsize";
+
+comment
+	Virtual( slot, PAD )
+	Return the virtual address within specified slot of the physical
+	address PAD.  If it does not fall inside the slot, return -1;
+;
+
+integer procedure Virtual( integer SLOT, PAD );
+begin	"Virtual"
+    integer I;
+    PAD := PAD - ISIS[isSORG+SLOT];
+    if PAD geq 0 then
+	for I := ctCTASIZ upto ctAREAn do begin
+	    integer AreaSize;
+	    AreaSize := ( CTA[i] + 255 ) land -256;
+	    if PAD < AreaSize then return(
+		( if I = ctCTASIZ then 14 else I-ctAREA0 ) lsh 16 + PAD
+	    );
+	    PAD := PAD - AreaSize;
+	end;
+    return( -1 );
+end	"Virtual";
+
+comment
+	GetIndex reads the ID blocks of the file and sets up a table of
+	memory image records in ID[].  NID is set to 2* the number of records
+	thus indexed (entries are two words long).  IDH[] is filled in.
+;
+
+procedure getIndex;
+begin	"getIndex"
+    integer BLK;
+    BLK := 0;
+    do begin "scanBlock"
+	integer save!BLKp;
+	getBlock( BND, BLK );
+	if BLK = 0 then begin "ID block 0"
+	    arrblt( IDH[0], memory[BLKp], arrinfo(IDH,0) );
+	end "ID block 0";
+	if props(TRACE) then printHead;
+	save!BLKp := BLKp;
+	for BLKp := save!BLKp+idINDEX step 2 until save!BLKp+idEND-2 do
+	begin "scanRecords"
+	    if memory[BLKp] = 0 then done;
+	    if props(TRACE) then printHead;
+	    if ldb(b!RTYPE) = rtMEM then begin
+		assert( nid < maxidn, Index overflow! Too many MEM records. );
+		id[nid+0] := memory[BLKp+0];
+		id[nid+1] := memory[BLKp+1];
+		nid := nid + 2;
+	    end;
+	end "scanRecords";
+	BLKp := save!BLKp;
+    end "scanBlock" until 0 = (BLK := memory[BLKp+idLINK]);
+end	"getIndex";
+
+comment
+	Fills the passed array with 32 bit words read from the address
+	specified.  The first argument specifies the physical address of
+	the word for array index 0, even though this element may not be
+	present in the array.  Data is packed in the low 32 bits.
+;
+
+procedure getTable( integer PAD; integer array BUF );
+begin	"getTable"
+    integer i, LIM1,LIM2;
+    procedure putByte( integer PBA, X );
+    if LIM1 leq PBA leq LIM2 then begin
+	dpb( X, point( 8, BUF[(PBA-PAD)%4], 11+8*((PBA-PAD)mod 4) ));
+    end;
+    LIM1 := PAD + arrinfo( BUF, 1 ) * 4;
+    LIM2 := PAD + arrinfo( BUF, 2 ) * 4 + 3;
+    for i := 0 step 2 until nid-2 do begin
+	integer BLK, PAD1,PAD2;
+	BLKp := location(id[i]);
+	BLK := ldb(b!BAD);
+	PAD1 := ldb(b!PAD);
+	PAD2 := PAD1 + ldb(b!BCNT) - 1;
+	if PAD1 leq LIM2 and LIM1 leq PAD2 then begin
+	    integer N;			! number of words left in buffer;
+	    integer P;			! physical address for current word;
+	    N := getBlock( BND, BLK ) - 2;
+	    assert( ID[i] = memory[BLKp] );
+	    BLKp := BLKp + 2;		! skip record header;
+	    P := PAD1;
+	    while P leq PAD2 and P leq LIM2 do begin
+		if memory[BLKp] geq 0
+		then begin "uncompressed"
+		    integer BP;
+		    BP := point( 9,memory[BLKp],-1 );
+		    putByte( P, ildb( BP ));  P := P + 1;
+		    putByte( P, ildb( BP ));  P := P + 1;
+		    putByte( P, ildb( BP ));  P := P + 1;
+		    putByte( P, ildb( BP ));  P := P + 1;
+		end
+		else begin "compressed"
+		    integer B0,B1,RC;
+		    B0 := memory[BLKp] lsh -27 land '377;
+		    B1 := memory[BLKp] lsh -18 land '377;
+		    RC := !rh(memory[BLKp]);
+		    while RC geq 0 do begin
+			putByte( P, B0 );  P := P + 1;
+			putByte( P, B1 );  P := P + 1;
+			RC := RC - 1;
+		    end;
+		end;
+		BLKp := BLKp + 1;
+		if 0 = ( N := N - 1 ) then
+		    N := getBlock( BND, -1 );
+	    end;
+	end;
+    end;
+end	"getTable";
+
+comment
+	GetISIS gets the data from ISIS into array ISIS[].
+	Counts the slots into NSLOT.
+;
+
+procedure getISIS;
+begin	"getISIS"
+    integer I;
+    if IDH[idStart] neq hex(70) then usererr(0,0,
+	"Start address implies non-ISIS configuration.","X");
+    getTable( 0, ISIS );
+    for NSLOT := 0 upto 63 do
+	if ISIS[isSORG+NSLOT] = 0 then done;
+    if ISIS[isMSIZE] land '777700000000
+    or ISIS[isS0SIZ] land '777700000000
+    or ISIS[isMSIZE] leq ISIS[isS0SIZ]
+    or ISIS[isMSIZE] leq hex(400)
+    or NSLOT leq 0
+    then usererr(0,0,
+	"Contents of low memory implies non-ISIS configuration.","X");
+end	"getISIS";
+
+comment
+	Fill array CTA[] with data from the CTA table in segment E
+	of the specified slot.  It is assumed (!!) that segment E is
+	loaded first into physical memory at the slot's origin adr.
+;
+
+procedure getSegE( integer SLOT );
+begin	"getSegE"
+    integer I, msize;
+    getTable( ISIS[isSORG+SLOT], CTA );
+    for I := ctBeg max CTA[ctCTASIZ] upto ctEnd do
+	CTA[i] := 0;	! clear unspecified entries, if any;
+    msize := Memsize( SLOT );
+    if CTA[ctCNTRL] lsh -24 then begin
+	! this is really a guess - need better way to recognize this;
+	if props(VERBOSE) then print       XPI/68k" );
+	arrclr( CTA );
+	return;
+    end;
+    if msize leq 0 then begin
+	if props(VERBOSE) then print( "         ?bad CTA" );
+	arrclr( CTA );
+	return;
+    end;
+    if props(VERBOSE) then begin
+	string S;
+!
+  msize  prod  vers  nhst  nprt
+     0k  xxxx  0000     0     0
+;
+	print(
+	    "     "[length(S:=cvs((msize+1023)%1024)) to inf], S, "k",
+	    "  ",
+	    if !lo(CTA[ctPID]) leq arrinfo(PID,2)
+		then PID[!lo(CTA[ctPID])]
+		else cvh(!lo(CTA[ctPID]),4),
+	    "  ",
+	    cvh(!lo(CTA[ctSVERNO]),4),
+	    "  ",
+	    "   "[length(S:=cvs(!hi(CTA[ctHOSTN]))) to inf], S,
+	    "  ",
+	    "   "[length(S:=cvs(!lo(CTA[ctHOSTN]))) to inf], S
+	    );
+    end;
+end	"getSegE";
+
+comment
+	MapBlock( F, BAD )
+
+	Map block BAD of file F into virtual memory.  If the block does not
+	exist, it is created.
+
+	The address in memory of the first word of the block is returned as the
+	value of the function.
+;
+
+integer procedure MapBlock( r!p(FILE) F; integer BAD );
+begin
+    integer VP;
+    VP := fAlloc( 1 );
+    assert( VP > 0, Out of memory - can't happen. );
+    if BAD geq file:LKB[F][!rbALC] then begin
+	if BAD land -4 geq file:LKB[F][!rbALC] then begin
+	    chniov( file:Chan[F], -1, !chCFP );
+	    assert( !SKIP!, !cfCFP failed to create file page );
+	end;
+	file:LKB[F][!rbALC] := BAD + 1;		! maintain file size;
+    end;
+    fMap( F, VP, (BAD lsh -2) + 1, 1 );
+    return( (VP lsh 9) lor ((BAD lsh 7) land '600) );
+end;
+
+comment
+	IDopen( F )
+	IDout( F, BLKp )
+	IDclose( F )
+
+	Output ID record(s) as appropriate.
+
+	IDopen is called to setup the first ID record.
+
+	IDout is called with a pointer to the record header.  The header is
+	added to the next field in the current ID record.  If the current ID
+	record becomes full, a new one is started and chained to the old one.
+
+	IDclose is called to cleanup before closing the file.
+;
+
+integer IDp;				! global sharred by ID routines;
+
+procedure IDopen( r!p(FILE) F; integer BAD(0) );
+begin	"IDopen"
+    assert( IDp = 0 );
+    IDp := MapBlock( F, BAD );		! map the block;
+    arrblt( memory[IDp], IDH[0], arrinfo(IDH,0) );
+    memory[IDp+idSTART] := -1;		! clear start address;
+    define BLKp = {IDp};		! so b!BAD will use IDp;
+    dpb( BAD, b!BAD );			! patch up the BAD in header;
+    IDp := IDp + idINDEX;
+end	"IDopen";
+
+procedure IDclose( r!p(FILE) F );
+begin	"IDclose"
+    assert( IDp );
+    fFree( IDp lsh -9, 1 );
+    IDp := 0;
+end	"IDclose";
+
+procedure IDout( r!p(FILE) F; integer BLKp );
+begin	"IDout"
+    assert( IDp );
+    if IDp land '177 = idEND then begin
+	integer BAD;			! address of new ID block;
+	BAD := file:LKB[F][!rbALC];	! next block after end of file;
+	memory[IDp-idEND+idLINK] := BAD;! make old block point to new one;
+	IDclose( F );			! unmap old block;
+	IDopen( F, BAD );		! setup new block;
+    end;
+    memory[IDp] := memory[BLKp];
+    memory[IDp+1] := memory[BLKp+1];
+    IDp := IDp + 2;
+end	"IDout";
+
+comment
+	MIout( F, BLKp )
+	MIclose( F )
+
+	MIout outputs a 128 word block starting at memory address BLKp to
+	the block past the end of file in file F.  The pointer BLKp is
+	changed to point to the new memory image which is R/W.  This allows
+	some values to be changed after the copy.
+;
+
+integer MIp;
+
+procedure MIclose( r!p(FILE) F );
+begin	"MIclose"
+    if MIp then
+	fFree( MIp lsh -9 );		! release page;
+    MIp := 0;
+end	"MIclose";
+
+integer procedure MIout( r!p(file) F; reference integer BLKp );
+begin   "MIout"
+    integer BAD;
+    if MIp then fFree( MIp lsh -9 );	! free old page, if any;
+    BAD := file:LKB[F][!rbALC];		! next block past end of file;
+    MIp := MapBlock( F, BAD );		! map block into memory;
+    arrblt( memory[MIp], memory[BLKp], 128 );
+    BLKp := MIp;			! return pointing to R/W copy;
+    return( BAD );			! return address of block written;
+end     "MIout";
+
+comment
+	MakeNIB creates the .NIB file for the specified slot.
+;
+
+procedure makeNIB( integer SLOT );
+begin	"makeNIB"
+    string FILENAME;		! NIB (output) file name;
+    r!p(FILE) NIB;		! NIB (output) file descriptor;
+    integer LIM1,LIM2;		! physical limits of slot memory;
+    integer I;
+    if Memsize( SLOT ) leq 0 then return;
+    LIM1 := !24(ISIS[isSORG+SLOT]);
+    LIM2 := LIM1 + Extent(SLOT) - 1;
+    FILENAME := if datum(NIBFILE)[inf-1 for 2] = "##"
+	then datum(NIBFILE)[1 to inf-2]& cvs(SLOT+100)[inf-1 for 2]
+	else datum(NIBFILE);
+    if props(VERBOSE) then print( "  ", FILENAME );
+    NIB := fOpen( FILENAME, "w4EM" );
+    IDopen( NIB );
+    for i := 0 step 2 until nid-2 do begin
+	integer BLKI, PAD1,PAD2;
+	BLKp := location(id[i]);
+	BLKI := ldb(b!BAD);
+	PAD1 := ldb(b!PAD);
+	PAD2 := PAD1 + ldb(b!BCNT) - 1;
+	if PAD1 leq LIM2 and LIM1 leq PAD2 then begin
+	    integer N;				! words left in buffer;
+	    integer P;				! physical address cursor;
+	    integer BLKO;			! output block address;
+	    integer VAD;			! virtual address of record;
+	    N := getBlock( BND, BLKI ) - 2;
+	    assert( ID[i] = memory[BLKp] );
+	    VAD := Virtual( SLOT, PAD1 );
+	    assert( VAD geq 0 );
+	    BLKO := MIout( NIB,  BLKp );	! output block;
+	    dpb( BLKO, b!BAD );			! fixup block address;
+	    dpb( VAD, b!PAD );			! put VAD in PAD as well;
+	    dpb( 0, b!U );			! VAD is defined;
+	    dpb( VAD, b!VAD );			! fixup virtual address;
+	    IDout( NIB, BLKp );			! output ID field;
+	    BLKp := BLKp + 2;			! advance past record header;
+	    P := PAD1;
+	    while P leq PAD2 do begin
+		if N leq 0 then begin		! if end of block, get next;
+		    N := getBlock( BND, -1 );
+		    MIout( NIB, BLKp );
+		end;
+		P := P + (  if memory[BLKp] geq 0
+		    then 4
+		    else 2 + 2 * !rh(memory[BLKp])  );
+		BLKp := BLKp + 1;
+		N := N - 1;
+	    end;
+	end;
+    end;
+    MIclose( NIB );
+    IDclose( NIB );
+    fRename( NIB );		! truncate file;
+    fClose( NIB );
+    NIBcount := NIBcount + 1;
+end	"makeNIB";
+
+comment
+	Do what is necessary to process a normal slot.
+;
+
+procedure processSlot( integer SLOT );
+begin	"processSlot"
+    if props(VERBOSE)
+    or props(ALLSLOTS)
+    or props(SLOTNUMBER) and SLOT = datum(SLOTNUMBER)
+	then getSegE( SLOT );		! get CTA table from segment E;
+    if props(ALLSLOTS)
+    or props(SLOTNUMBER) and SLOT = datum(SLOTNUMBER)
+	then makeNIB( SLOT );		! generate .NIB file;
+end	"processSlot";
+
+comment
+	MAIN program
+;
+
+integer SLOT;
+
+argparse( NIBFILE, BNDFILE, {ALLSLOTS,SLOTNUMBER,QUIET,TRACE,VERBOSE}, ARGS );
+
+!	if no arguments are given, prompt user long form...
+;
+if not props(BNDFILE) then begin
+    print( "UNBND v",
+	cvos(!lh(memory['137])),",,",cvos(!rh(memory['137])),
+	crlf );
+    print( "input (.BND) file name: " );
+    datum(BNDFILE) := inchwl;
+    props(BNDFILE) := length(datum( BNDFILE )) > 0;
+    print( "output (.NIB) file name or <CR> for none: " );
+    datum(NIBFILE) := inchwl;
+    props(NIBFILE) := length(datum( NIBFILE )) > 0;
+    if props(NIBFILE) and not length(extPart(datum(NIBFILE))) then begin
+	string S;
+	print( "slot number or <CR> for all: " );
+	datum(SLOTNUMBER) := cvd(S := inchwl);
+	props(SLOTNUMBER) := length(S);
+	props(ALLSLOTS) := not props(SLOTNUMBER);
+    end;
+    props(VERBOSE) := true;
+end;
+
+!	check compatibility and make defaults
+;
+if length(extPart(datum(BNDFILE))) = 0
+and datum(BNDFILE)[inf for 1] neq "." then
+    datum(BNDFILE) := datum(BNDFILE)& ".BND";
+if not props(NIBFILE) then
+    datum(NIBFILE) := namePart( datum(BNDFILE) );
+if length(extPart(datum(NIBFILE))) = 0
+and datum(NIBFILE)[inf for 1] neq "." then
+    datum(NIBFILE) := datum(NIBFILE)& ".N##";
+if not props(QUIET) then props(VERBOSE) := true;
+if props(QUIET) and props(VERBOSE) then
+    usererr(0,0,"?incompatible options: /QUIET /VERBOSE","X");
+if props(NIBFILE) and not props(ALLSLOTS) and not props(SLOTNUMBER) then begin
+    if "0" leq datum(NIBFILE)[inf-1 for 1] leq "9" then begin
+	datum(SLOTNUMBER) := cvd(datum(NIBFILE)[inf-1 for 2]);
+	props(SLOTNUMBER) := true;
+    end
+    else if equ( datum(NIBFILE)[inf-1 for 2], "##" ) then begin
+	props(ALLSLOTS) := true;
+    end
+    else usererr(0,0,"?must specify /ALLSLOTS or /SLOTNUMBER:n "&
+	"unless using standard file names","X");
+end;
+if props(ALLSLOTS) and props(SLOTNUMBER) then
+    usererr(0,0,"?incompatible options: /ALLSLOTS /SLOTNUMBER:n","X");
+if props(ALLSLOTS) and not equ( datum(NIBFILE)[inf-1 for 2], "##" ) then
+    usererr(0,0,"?output file name must contain wildcard for /ALLSLOTS","X");
+
+!	open .BND file, get index and slot origin table
+;
+BND := fOpen( datum( BNDFILE ), "r4E" );
+getIndex;
+if props(VERBOSE) then printID( IDH );
+getISIS;
+if props(VERBOSE) then print (
+	"Memory alloc:	", (ISIS[isMSIZE]+1023)%1024, "k"&
+	" (00000:", cvh(ISIS[isMSIZE]-1,5), ")
+
+slot type origin extent  msize  prod  vers  nhst  nprt  filename
+" );
+for SLOT := 0 upto NSLOT-1 do begin
+    integer STYP;
+    if props(VERBOSE) then begin
+	integer E;
+	string S;
+	print(
+	    "  "[length(cvs(SLOT)) to inf], SLOT, " "&
+	    " "&
+	    " ", cvh(ISIS[isSORG+SLOT] lsh -24,2), " "&
+	    " "&
+	    " ", cvh(!24(ISIS[isSORG+SLOT]),5),
+	    " "&
+	    " ", "   "[length(S:=cvs((Extent(SLOT)+1023)%1024)) to inf],S,"k"
+	);
+    end;
+    if Present(SLOT)			! if slot is marked present;
+    then case STYP := ISIS[isSORG+SLOT] lsh -24 of begin "TYPE"
+	[0] processSlot( SLOT );
+	[else] if STYP leq arrinfo(slotTypeName,2) and props(VERBOSE) then
+	    print( "         ", slotTypeName[STYP] )
+    end "TYPE";
+    if props(VERBOSE)
+	then print( crlf );		! end line;
+end;
+if props(SLOTNUMBER) and NIBcount < 1
+or props(ALLSLOTS) and NIBcount < NSLOT
+then usererr(0,0,
+    "No output created for slot(s) of wrong type or not present.","X");
+
+end	"UNBND"
+$
+@t
