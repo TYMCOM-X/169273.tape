@@ -1,0 +1,739 @@
+.TITLE TYMSHARE BOOTSTRAP FOR 9301
+.ASECT
+.ENABL	LC
+;-----
+;	9301 bootstrap to load a node using TYMNET protocol
+;	oct/79	leland
+;
+;	register definition:
+;	r0=	input data shift reg 0
+;	r1=	input data shift reg 1
+;	r2=	small loop counter
+;	r3=	decoded data buffer pointer
+;	r4=	device address
+;	r5=	inverted data buffer pointer
+;-----
+
+TRANAD=	1000				;transfer address for network node
+SYNCHR=	114				;inverted sync chr
+SYNWRD=	46114				;double sync chr
+
+RXDBUF=	2				;DUx read buffer
+PARCSR=	2				;DUx parameter reg
+TXCSR=	4				;DUx transfer control status regester
+TXDBUF=	6				;DUx output buffer
+;-----
+;	data buffers:
+;	SYNC -> inverted data buffer for retransmission
+;	DATCNT -> data buffer pending checksum verification
+;-----
+
+CHKSMV=	472				;computed vertical checksum
+CHKSMD=	474				;computed diagonal checksum
+SYNC=	476
+INVDAT=	500
+INVCKV=	574
+INVCKD=	576
+DATCNT=	600
+DATADR=	602
+DATA=	604
+CHKV=	674				;vertical checksum
+CHKD=	676				;diagonal checksum
+
+.IIF NDF RAM  RAM = 0
+.IF NDF LBOOT
+  LBOOT=1000
+  $LBOOT=165000
+.ENDC
+.IIF NDF $LBOOT  $LBOOT=LBOOT
+.=LBOOT
+
+;-----
+;	initialization code
+;	DU, DUV and DUP address convensions:
+;	160010	160020	160030	160040
+;	340	350	360	370
+;-----
+DU0:	.WORD	160010			;store device address
+	BR	ALLDU
+
+DU1:	.WORD	160020
+	BR	ALLDU
+
+DU2:	.WORD	160030
+	BR	ALLDU
+
+DU3:	.WORD	160040
+ALLDU:	MOV	R1,R4			;save device csr address
+	MOV	#400,TXCSR(R4)		;hit master reset
+	MOV	#SYNWRD,@#SYNC		;store sync word for retransmit
+	MOV	#36114,PARCSR(R4)	;initialize parameter csr
+	CMP	#377,TXDBUF(R4)		;test for DU
+	BEQ	NEWBLK
+	BIS	#400,TXDBUF(R4)		;IDENTIFY DEVICE TYPE
+	BIT	#400,TXDBUF(R4)
+	BEQ	NEWBLK
+	MOV	#101114,PARCSR(R4)
+NEWBLK:	BIC	#20,(R4)		;clear SEARCH sync
+	MOV	#26,(R4)		;set up recieve csr
+	CLR	@#CHKSMV		;clr checksums
+	CLR	@#CHKSMD		;
+	MOV	#INVDAT,R5		;init inverted data buffer pointer
+	MOV	#DATCNT,R3		;init decoded data buffer pointer
+
+
+;-----
+;	here we wait for data from the DUx
+;-----
+2$:	TSTB	(R4)
+	BPL	2$			;wait for data word
+	MOV	RXDBUF(R4),R1		;COPY DATA AND ERR BITS FROM DEVICE
+	BMI	NEWBLK			;BR ON READ ERR
+	CMPB	#114,R1			;TEST FOR SYNC CHR
+	BNE	NEWBLK			;BR IF NOT SYNC CHR
+INPUT:	TSTB	(R4)			;wait for reciever done
+	BPL	INPUT
+	MOV	RXDBUF(R4),R1		;copy data and err bits from device
+	BMI	NEWBLK			;br on read err
+	MOVB	R1,(R5)+		;save inverted byte
+	SWAB	R1			;save first byte in upper half
+4$:	TSTB	(R4)			;wait for next byte
+	BPL	4$			;
+	MOV	RXDBUF(R4),R0		;copy data and err bits from device
+	BMI	NEWBLK			;br on read err
+	MOVB	R0,(R5)+		;save inverted byte
+	BISB	R0,R1			;assemble word (bits are still inverted
+	SWAB	R1			;bits now read 0-16 (inverted bitwise)
+	CALL	INVRT$			;inverT bits end to end
+;-----
+;here the corrected word is stored in input buffer pending completion of frame
+;and verification of checksums
+;-----
+	MOV	R0,(R3)+		;store word
+	CMP	#CHKD+2,R3		;check for end of block
+	BEQ	CHKSUM			;br when frame complete
+	CLC				;calculate diagonal checksum
+	ROL	@#CHKSMD
+	ADC	@#CHKSMD
+	XOR	R0,@#CHKSMD
+	CMP	#CHKD,R3		;skip vertical checksum on last word
+	BEQ	INPUT
+	XOR	R0,@#CHKSMV		;calculate vertical checksum
+	BR	INPUT			;wait for more data
+
+;-----
+;block is now complete! lets see if the checksums match
+;-----
+CHKSUM:	CMP	@#CHKSMV,@#CHKV		;check vertical checksum
+	BNE	NEWBLK			;br if no match
+	CMP	@#CHKSMD,@#CHKD		;check diagonal checksum
+	BNE	NEWBLK			;br if no match
+;-----
+;block is good, process it
+;-----
+	MOVB	@#DATCNT+1,R2		;test for boot block
+	BEQ	LSTBLK			;br if boot block
+	MOV	#DATA+1,R0		;get data block addr
+	MOV	@#DATADR,R1		;get load addr
+	BIT	#1,R1
+	BEQ	2$
+	DEC	R1
+	BR	4$
+
+2$:	INC	R1
+4$:	CMP	#1000,R1		;do not allow data to be loaded in buff
+	BHI	FIXCKS			;skip data loading if < 1000
+.IF EQ RAM-1
+		CMP	#70000,R1	;******THIS IS A TEMP PATCH FOR RAM***
+		BLOS	FIXCKS
+.ENDC
+	BR	STORD$			;br to entry point in stor data
+
+;-----
+; load data in core with data decompression.
+;	204=	initiate zero fill of n bytes
+;	205=	initiate formfeed fill of n bytes
+;	200=	load next chr as a literal
+;	n=	byte following flag byte
+;-----
+
+STORDA:	DECB	R2			;dec byte count
+	BLE	FIXCKS			;br if done with this block
+STORD$:	CMPB	#200,(R0)		;test for literal flag
+	BNE	TSTZFL			;br if not
+	DECB	R2
+	CALL	PNTR0
+NORMDA:	MOVB	(R0),(R1)		;MOVE DATA BYTE
+	CALL	PNTR0
+	CALL	PNTR1
+	BR	STORDA			;br and check for more data
+
+TSTZFL:	CMPB	#204,(R0)		;test for zero fill
+	BNE	TSTFFL			;br if not
+	CLRB	R5			;clr fill chr
+	BR	FILL$			;br to fill entry point
+
+TSTFFL:	CMPB	#205,(R0)		;test for formfeed fill
+	BNE	NORMDA			;br if normal data
+	MOV	#377,R5			;load fill char
+FILL$:	CALL	PNTR0
+	DECB	R2			;dec byte count
+	CLR	R3
+	BISB	(R0),R3
+	CALL	PNTR0
+FILL:	MOVB	R5,(R1)			;load fill char
+	CALL	PNTR1
+	DEC	R3			;dec fill byte count
+	BGT	FILL			;br if more to fill
+	BR	STORDA			;br and check for more data
+
+;-----
+;here the inverted checksum is corrected for rexmit
+;-----
+FIXCKS:	CLRB	@#INVDAT		;clr data count for retransmittion
+	CLR	@#INVCKD
+	CLR	@#INVCKV
+	MOV	#INVDAT,R0
+CALCKS:	CMP	#INVCKD,R0		;test for end of block
+	BEQ	LSTBLK			;br if done
+	MOV	(R0)+,R1		;get data
+	CLC
+	ROR	@#INVCKD
+	BCC	2$
+	BIS	#100000,@#INVCKD
+2$:	XOR	R1,@#INVCKD		;calc diagonal checksum
+	CMP	#INVCKD,R0
+	BEQ	CALCKS
+	XOR	R1,@#INVCKV		;calc vertical checksum
+	BR	CALCKS
+
+LSTBLK:	MOV	#SYNC,R5		;point to beginning of data buffer
+	CALL	SNDBLK			;send data block
+	TSTB	@#DATCNT+1		;test for boot block
+	BEQ	BOOTND			;br if boot block
+	JMP	NEWBLK			;do next block
+
+BOOTND:	MOV	#TRANAD,PC		;boot node!
+
+SNDBLK:	MOV	#20,TXCSR(R4)		;set send bit in DUx
+	MOV	#577,TXDBUF(R4)		;set tsom bit for DUP
+SNDBCK:	MOVB	(R5)+,TXDBUF(R4)	;send byte
+2$:	TSTB	TXCSR(R4)		;wait till last chr sent
+	BPL	2$
+	CMP	#INVCKD+2,R5		;check for end of block
+	BNE	SNDBCK			;br if not done
+	MOVB	#377,TXDBUF(R4)		;pad chr
+4$:	TSTB	TXCSR(R4)		;wait for xmit done bit
+	BPL	4$
+	CLR	TXCSR(R4)
+	RETURN
+
+;-----
+;here the bits are flopped end to end since the T201 sends them backwards
+;-----
+INVRT$:	MOV	#16.,R2			;set up for invert bits loop
+INVERT:	ROR	R1			;shift one bit into carry
+	ROL	R0			;shift one bit from carry
+	DEC	R2			;loop till all 16. bits are done
+	BNE	INVERT
+	RETURN
+;-----
+;subroutines to make pointers read bytes left to right
+;-----
+PNTR0:	BIT	#1,R0
+	BNE	2$
+	ADD	#4,R0
+2$:	DEC	R0
+	RETURN
+
+PNTR1:	BIT	#1,R1
+	BNE	2$
+	ADD	#4,R1
+2$:	DEC	R1
+	RETURN
+
+;-----
+;	COMMAND TABLE AND OFFSET TABLE
+;-----
+
+MSG:	.ASCII	<CR><LF><'$><0>
+	.ASCII	/TT/
+	.ASCII	/D0/
+	.ASCII	/D1/
+	.ASCII	/D2/
+	.ASCII	/D3/
+	.ASCII	/U0/
+	.ASCII	/U1/
+	.ASCII	/U2/
+	.ASCII	/U3/
+	.ASCII	/S/<CR>
+	.ASCII	/E /
+	.ASCII	/D /
+	.ASCII	/L /
+	0
+
+VECTOR:	.BYTE	<DL11-HBOOT>/2
+	.BYTE	<D011-HBOOT>/2
+	.BYTE	<D111-HBOOT>/2
+	.BYTE	<D211-HBOOT>/2
+	.BYTE	<D311-HBOOT>/2
+	.BYTE	<U011-HBOOT>/2
+	.BYTE	<U111-HBOOT>/2
+	.BYTE	<U211-HBOOT>/2
+	.BYTE	<U311-HBOOT>/2
+
+NONBT=	.-VECTOR
+
+;-----
+;All following are cmds not preceeded by mem test
+;-----
+
+	.BYTE	<ST-HBOOT>/2
+	.BYTE	<EX-HBOOT>/2
+	.BYTE	<DE-HBOOT>/2
+	.BYTE	<LA-HBOOT>/2
+
+	.EVEN
+.IIF LT LBOOT+1000-. .ERROR ,;program exceedes lower ROM space
+
+;-----
+;DEC stuff for 9301 bootstrap.
+;-----
+
+
+TKS=	177560				;kbd status reg
+TKB=	177562				;kbd buffer reg
+TPS=	177564				;console printer status reg
+TPB=	177566				;console printer buffer reg
+
+CR=	15				;<cr>
+LF=	12				;<lf>
+
+DLCS=	177560				;control reg for DL11
+PCCS=	177550				;control reg for PC11
+U0CS=	170040				;control reg for DUx11 unit 0
+U1CS=	170050				;control reg for DUx11 unit 1
+D0CS=	170000				;control reg for DR11 unit 0
+D1CS=	170010				;control reg for DR11 unit 1
+
+	.SBTTL	ROM AREA 173000 - 173777
+	.IF NDF HBOOT
+	HBOOT=7000
+	$HBOOT=173000
+	.ENDC
+	.IIF NDF $HBOOT  $HBOOT=HBOOT
+
+.=	HBOOT
+
+NORMAL:	JMP	DSPLY			;do mem diagnostic first
+
+;-----
+;deposit in memory a value
+;-----
+DE:	MOV	PC,R1			;copy PC for return value
+	BR	GETNUM			;get value
+	MOV	R0,(R5)			;store value
+	BR	KBDDSP			;get next command
+
+;-----
+;load address
+;-----
+LA:	MOV	PC,R1			;copy PC for return
+	BR	GETNUM			;get octal number
+	MOV	R0,R5			;save new address
+	BR	KBDCLR			;get next cmd but dont save this one
+
+;-----
+;this is the auto load vector
+;-----
+OPTION:	.WORD	$HBOOT!776		;bits 8-1 in this location must be
+					;set to 1 bacause of hardware require-
+					;ments. the normal setting of the
+					;micro switches will cause these bits
+					;to be read as zeros only if they are
+					;set to ones in the ROM
+
+	.WORD	340
+
+;-----
+;	DISPLAY R0,R4,SP,R5
+;
+;	when either power-up or the boot button is pressed, the
+;switch regesterless CPU copies the contents of the PC into R5,
+;this gives the operator the capability of determining where a halt
+;occurred.
+;	If the power-up vector is set for "DSPLY", then no
+;diagnostics are executed.
+;-----
+
+DSPLY:	MOV	PC,R1			;print R0,R4,R5,SP
+	BR	PUTCR			;print <cr><lf>
+	NOP
+	BR	PUTNUM			;print R0
+	MOV	R4,R0
+	BR	PUTNUM			;print R4
+	MOV	SP,R0
+	BR	PUTNUM
+	MOV	R5,R0
+	BR	PUTNUM
+
+;-----
+;	KEYBOARD DISPATCHER
+;	regester usage
+;
+;R0	-used to pass arguments to and from PUTNUM and GETNUM.
+;	After a boot command is typed, it contained the unit number.
+;R1	-Subroutine linkage for the highest level subroutines until a
+;	bootstrap is initialized, then it points to the devices's main
+;	CSR.
+;R2	-Contains the address of the next command processor. Used as a
+;	scratch regester by non-boot subroutines. points to the
+;	address of the boot devices's main CSR after a boot command is
+;	typed and to the restart address after a boot is started.
+;R3	-Subroutine linkage for the lowest level subroutines and as a
+;	scratch regester.
+;R4	-Address of previous non-boot command. Address of current boot
+;	device CSR address before memory diagnostic is done.
+;R5	-Memory address pointer for non-boot commands. Memory
+;	diagnostic passes address of the last word of memory or 157776,
+;	whichever is less to the boot routine in R5.
+;-----
+
+KBDCLR:	CLR	R4			;forget last cmd, don't bump index
+KBDDSP:	MOV	#$LBOOT-LBOOT+MSG,R0	;-> <cr><lf><'$><0>
+PRINT:	MOVB	(R0)+,R2		;print a char
+	MOV	PC,R3			;copy PC for return
+	BR	PUTCHR			; print char
+	BNE	PRINT			;br if more to print
+READ:	MOV	PC,R3			;copy PC for return
+	BR	GETCHR			;get and echo char
+	SWAB	R2			;rotate char
+	BEQ	READ			;br if 2nd char not read
+
+	CLR	R1			;index to table of vectors
+SEARCH:	CMP	R2,(R0)+		;search for matching cmd
+	BEQ	MATCH			;br if match made
+	INC	R1			;bump index
+	TST	(R0)			;end of list?
+	BNE	SEARCH			;br if not
+	BR	KBDDSP			;ignore & restart
+MATCH:	MOV	#$HBOOT/2,R2		;(base addr of device boots)/2
+	BISB	$LBOOT-LBOOT+VECTOR(R1),R2  ;(offsets to device boots)/2
+	ASL	R2			;multiply by 2
+	CMP	R2,R4			;this cmd same as last?
+	BNE	DSPTCH			;br if not
+	TST	(R5)+			;inc last address
+DSPTCH:	MOV	R2,R4			;remember this command next time
+	CMP	R1,#NONBT		;do memory test?
+	BHIS	JMPR2			;br if not to specified cmd
+	TSTB	OPTION			;skip diagnostics?
+	BNE	BTSTWO			;br if so
+	JMP	MEMDO			;do memory diagnostics
+
+;-----
+;	GETNUM - get octal number into R4
+;subroutine to read an octal number from the console keyboard.
+;calling sequence:
+;	MOV	PC,R1
+;	BR	GETNUM
+;Regesters R2 & R3 are used and not restored.
+;4 is added to the contents of R1.
+;The result is returned in R0.
+;-----
+
+GETNUM:	CLR	R0			;initialize result
+2$:	CLR	R2			;clr for byte xfer
+	MOV	PC,R3			;copy PC for return
+	BR	GETCHR			;get & echo char
+	CMPB	R2,#CR			;terminated via CR?
+	BEQ	X1RTN			;return if so
+	SUB	#'8,R2			;check for octal
+	ADD	#'8-'0,R2		;	"
+	BCC	KBDCLR			;br if not
+	ASL	R0			;make room for it in result
+	ASL	R0			;	"
+	ASL	R0			;	"
+	BIS	R2,R0			;put it in result
+	BR	2$
+
+;-----
+;	GETCHR - get and echo charactor
+;subroutine to get and echo a charactor from the console keyboard
+;calling sequence:
+;	MOV	PC,R3
+;	BR	GETCHR
+;The result is returned in the low byte of R2 with the parity bit
+;cleared. The Z bit will be set if the charactor is a null.
+;The high byte of R2 is unchanged. 4 is added to R3.
+;-----
+
+GETCHR:	TSTB	@#TKS			;char ready
+	BPL	GETCHR			;br if not
+	CLRB	R2			;clear for xfer
+	BISB	@#TKB,R2		;xfer char
+
+;-----
+;	PUTCHR - type a charactor
+;subroutine to type a charactor
+;calling sequence:
+;	set R2 to contain the char to be typed
+;	MOV	PC,R3
+;	BR	PUTCHR
+;The parity bit of the charactor in R2 is cleared.
+;4 is added to R3.
+;-----
+
+PUTCHR:	TSTB	@#TPS			;printer ready
+	BPL	PUTCHR			;br if not
+	MOVB	R2,@#TPB		;print char
+	CMP	(R3)+,(R3)+		;index pointer to br + 4
+	BICB	#200,R2			;clear parity bit
+	JMP	-2(R3)			;return to br + 2
+
+;-----
+;	PUTCR - type <CR><LF>
+;subroutine to type <cr><lf>
+;calling sequence:
+;	MOV	PC,R1
+;	BR	PUTCR
+;Regesters R2 & R3 are used without restoring.
+;4 is added to R1
+;-----
+
+PUTCR:	MOV	(PC)+,R2		;load char codes
+	.BYTE	CR,LF			;this location is an operand
+					; of the preceeding instruction.
+
+;-----
+;	PUTTWO - type low & then high byte of R2
+;-----
+
+PUTTWO:	MOV	PC,R3			;copy PC for return
+	BR	PUTCHR			;print low byte
+	SWAB	R2			;get high byte
+	BR	PUTCHR			;print high byte
+					;return by falling through next
+					; routine.
+
+;-----
+;	X1RTN - common routine to return from subroutines
+;-----
+
+X1RTN:	CMP	(R1)+,(R1)+		;update pointer
+	JMP	-2(R1)			;return with R1 updated for next call
+
+;-----
+;	PUTNUM - output an octal value in R0
+;regesters R0,R2 & R3 are used without restoring
+;4 is added to R1
+;-----
+
+PUTNUM:	MOV	(PC)+,R2		;1st digit special case
+	.WORD	<'0>/2
+	SEC				;set last digit flag in R0
+2$:	ROL	R0			;get next octit
+	ROLB	R2			;final shift before print
+	MOV	PC,R3			;copy PC for return
+	BR	PUTCHR			;print octit
+	MOV	(PC)+,R2		;low byte to contain next octit
+	.BYTE	200!<'0/10>		;2nd shift flag & ascii 0 rt shft 3
+	.BYTE	<' >			;space printed after final octit
+4$:	ASL	R0			;shift operand bit to carry
+	BEQ	6$			;br if done
+	ROLB	R2			;carry to ascii octit, flag to carry
+	BCS	4$			;br if 2nd shift time
+	BR	2$			;go do 3rd shift
+6$:	CLRB	R2			;R2  <nul><space>
+	BR	PUTTWO			;print them and return
+
+;-----
+;	S<CR> - start at specified location
+;-----
+
+ST:	RESET				;clr word
+	JMP	@R5			;transfer to specified address
+
+;-----
+;	L<SPC> - examine a location
+;-----
+
+EX:	MOV	R5,R0			;location being examined
+	MOV	PC,R1			;copy PC for return
+	BR	PUTNUM			;print it
+	MOV	(R5),R0			;get contents of location
+	BR	PUTNUM			;print octal value
+	BR	KBDDSP			;get next command
+
+;-----
+;	BTERR - common bootstrap error routine
+;-----
+
+BTERR:	DEC	(SP)			;repeat boot?
+	BNE	BTRSTR			;br if so
+	HALT				;enough is enough!
+
+;-----
+;	AUTOBT - entry for automatic bootstraps w/o diagnostics
+;-----
+
+AUTOBT:	CLR	R0			;default to unit 0
+					; w/o diagnostics
+	MOV	OPTION,R4		;copy pointer to boot entry point
+	TST	(R4)+			;set R4 -> device main CSR
+
+;-----
+;	BTSTWO - ENTRY FOR KBD BOOT W/O DIAGNOSTICS
+;-----
+
+BTSTWO:	MOV	R4,R2			;copy ->main CSR
+	MOV	#17776,R5		;no memory sizing, so use 17776
+					; for stack
+
+;-----
+;	BTSTRP - KBD entry with diag
+;-----
+
+BTSTRP:	MOV	(R2)+,R1		;copy CSR & set R2 -> restart addr
+	MOV	R5,SP			;set for worlds largest stack
+
+;-----
+;note:
+;	the large number of retries is necessary to allow some
+;	peripherals time to come up to speed
+;-----
+
+	MOV	#4012,(SP)		;set max retries
+BTRSTR:	RESET				;clr the world
+JMPR2:	JMP	@R2			;do boot or process cmd
+
+.MACRO	DEVICE	DEVNAM,CSR,COMMEN
+.IRP	LOC,</<.-HBOOT+173000>>
+.LIST
+
+	BR	MEMDO			;auto boot with diag
+	BR	AUTOBT			;	"  w/o	 "
+DEVNAM:	.WORD	CSR			;-> devnam CSR
+.NLIST
+.ENDR
+.ENDM
+.NLIST	MC
+
+	DEVICE	D011,170000,<FIRST DR11>
+	BR	DRCOMM			;do DR11 boot
+
+	DEVICE	D111,170010,<SECOND DR11>
+	BR	DRCOMM
+
+	DEVICE	D211,170020,<THIRD DR11>
+	BR	DRCOMM
+
+	DEVICE	D311,170030,<FOURTH DR11>
+DRCOMM:	JMP	ALLDR
+
+	DEVICE	U011,170040,<FIRST DU11>
+	BR	DUCOMM			;do DUx11 boot
+
+	DEVICE	U111,170050,<SECOND DU11>
+	BR	DUCOMM
+
+	DEVICE	U211,170060,<THIRD DU11>
+	BR	DUCOMM
+
+	DEVICE	U311,170070,<FOURTH DU11>
+DUCOMM:	JMP	ALLDU
+
+	DEVICE	DL11,DLCS,<TERMINAL READER>
+
+;-----
+;the memory diag leaves 157776 or top of mem , whichever is less
+;-----
+
+CKDEV:	MOV	R1,(R5)			;reader CSR addr
+	BIC	#24,R5			;then drop to XX752
+	MOV	R5,(R5)			; and store in itself
+2$:	MOV	(R5),R3			;copy load pointer
+	INC	(R1)			;start reader
+4$:	TSTB	(R1)			;ready?
+	BPL	4$			;wait if not
+	MOVB	2(R1),(R3)		;store the data
+	INC	(R5)			;index pointer
+	CMPB	R3,#375			;br offset stored
+	BNE	2$			;br if not
+	INCB	(R3)+			;index the offset
+	JMP	-(R3)			;and go to the br
+
+;-----
+;	MEMDO - memory diagnostic
+;-----
+MEMDO:	CLR	SP			;starting addr
+	MOV	#17776,R5		;upper boundary for 4k
+	CLR	R3			;data
+	MOV	PC,R1			;subroutine call
+	BR	FLOAT			;verify lower 4k of memory
+
+; size memory: 28k or less only!
+
+	MOV	#160000,R5		;set max addr
+	MOV	#6,R2			;set pointer for timeout
+	MOV	#340,(R2)		;keep priority at 7
+	MOV	PC,-(R2)		;set stack
+	MOV	#502,SP			;set stack pointer
+	TST	-(R5)			;check if memory present
+	MOV	#$HBOOT-HBOOT+DSPLY,(R2)  ;set pointer for future timeouts
+	MOV	PC,R1			;subroutine call
+	BR	FLOAT			;verify remainder of memory to 28k
+
+; determine type of boot and set r2 -> main CSR
+
+	MOV	OPTION,R2		;copy pointer to boot entry point
+					;switch settings in bits 8-1
+					;determine course of action
+	BIT	#770,R2			;test for auto boot
+	BEQ	2$			;br if not
+	CMP	(R2)+,(R2)+		;set R2 -> device main CSR
+	BR	4$			;go boot device
+2$:	MOV	R4,R2			;copy -> boot code
+4$:	BR	BTSTRP			;go boot device
+;-----
+;	FLOAT - subroutine to verify memory
+;	calling sequence:
+;		set R3 = 0
+;		set SP = low addr for verification
+;		set R5 = high addr for verification
+;		MOV	PC,R1		;copy PC for subroutine return
+;		BR	FLOAT		;call subroutine
+;subroutine returns only if no error is detected.
+;the contents of R2 are lost. R1 becomes R1+4.
+;-----
+
+FLOAT:	MOV	SP,R2			;copy starting addr
+2$:	MOV	R3,(R2)+		;write background data
+	CMP	R2,R5			;finished with background?
+	BLOS	2$			;br if not
+	COM	R3			;invert test data
+4$:	CMP	R3,-(R2)		;check for correct background
+	BEQ	MEMERR			;err if no compare
+	MOV	R3,(R2)			;write test data
+	CMP	2)			;check for correct data
+	BNE	MEMERR			;br if not as expected
+	CMP	R2,SP			;finished test?
+	BHI	4$			;br if not
+	TST	R3			;done 1's and 0's?
+	BNE	FLOAT			;br if not
+	JMP	X1RTN			;use common subroutine return
+
+;-----
+;	MEMERR - save regesters for display
+;-----
+
+MEMERR:	MOV	R3,R0			;Save expected data
+	MOV	(R2),R4			;save recieved data
+	MOV	R2,SP			;save failing addr
+	HALT
+
+
+
+.IIF LT HBOOT+1000-. .ERROR ,	;program exceeds high ROM space
+
+	.END
+                                                                                                wb[=
