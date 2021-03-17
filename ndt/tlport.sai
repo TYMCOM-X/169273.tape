@@ -1,0 +1,495 @@
+begin "program teleport"
+require 23 version;
+require "(SAILIB)SAIL.DEF" source!file;
+!get!module(extend);
+require "FTPBIT.DEF" source!file;
+require "FTPDBG.DCL" source!file;
+require "OUTCOD.DCL" source!file;
+require "TRANSP.DCL" source!file;
+require "AUXLIB.DCL" source!file;
+	external string procedure dbgtrn( integer option!number );
+let routine=procedure;
+define eif="else if";
+define #E.BL='100;	! ebcdic blank;
+define !axslv='43;
+
+boolean	drop!blank!lines	! true to drop trailing blank lines;
+;				! on pages in AST files;
+integer	read!length		! max count of file chars per read;
+;
+
+! break tables;
+integer	aLine			! to read one line from a file;
+,	aWord			! pass one word and upper case it;
+,	retain!tabs		! for AST filtering a file.;
+;
+
+simple procedure setup!vbls;
+begin	string seps;
+seps := #sp & #ht & crlf & "|,;+&";
+setbreak( aLine := getbreak, #ff & #lf, #cr, "INS" );
+setbreak( aWord := getbreak, seps, seps, "iskt" );
+setbreak( retain!tabs := getbreak, #ht, null, "IR" );
+read!length := 40;
+end;
+require setup!vbls initialization[0];
+string procedure reply( string prompt, default(null); 
+			integer waiting!loc(0) );
+while true do
+begin	string reply; own string chan!stack; own integer reof;
+if length(chan!stack)
+ then begin
+	reply := input( chan!stack, aLine );
+	if reof
+	 then begin 
+		print("[eof]" & crlf);
+		release(lop(chan!stack)); 
+		reof := false;
+		if length(reply) then !skip! := #cr else continue;
+	      end;
+      end
+eif waiting!loc
+ then reply := inchsl(memory[waiting!loc])
+ else begin
+	print(prompt,": ");
+	reply := inchwl;
+      end;
+if reply = "\"
+ then begin
+	if kequ(reply[1 for 6],"\file:")
+	 then begin	integer inc;
+		if (inc := getchan)<0
+		 then begin usererr(0,1,"Out of channels");continue end;
+		open( inc, "DSK",'10000, 4,0, 100, !skip!, reof:=true );
+		if not reof then lookup( inc, reply[7 to inf], reof );
+		if reof
+		 then begin 
+			release(inc);
+			print("Cannot read DSK:", reply[7 to inf],crlf);
+		      end
+		 else begin
+			chan!stack := inc & chan!stack;
+			print("[using file ", reply[7 to inf],"]"&crlf);
+		      end;
+		continue;
+	      end
+	 else lop(reply);
+      end;
+if length(reply)=0 and !skip!=#esc then return(default);
+return( reply );
+end;
+boolean	is!Slave
+,	circuit!talk
+;
+routine become!slave; begin is!Slave:= true; circuit!talk:= false; end;
+routine become!dumb!slave; become!slave;
+
+procedure setOnZap; 
+begin print("<<KaZapp>>"); circuit!talk:=false; auxtrace := false; end;
+
+procedure become!port!master;
+begin	label noCircuit; 
+	item zit;
+	procedure onZap; begin print("<<ZAP>>"); goto noCircuit; end;
+	boolean empty; string line;
+circuit!talk := AUXTRACE := false;
+if creaux( reply("Where should I get my slave?") )<0
+ then begin 
+	noCircuit: 
+	AUXDEAD := ANY;
+	circuit!talk := AUXTRACE := false;
+	print( "...Oops. Sorry, no circuit.", crlf ); 
+	return; 
+      end
+ else assign(auxdead:=zit, onZap);
+do AUXIN(2) until not !skip!;
+AUXTRACE := true;
+print("Connect away. Lines that begin with a dot will not include the
+line terminator or the initial dot.  A line with only a dot means ready
+" );
+while true 
+   do if length(line := reply("","",location(empty))) or not empty
+	 then begin integer brk; brk := !skip!;
+		if line neq "."
+		 then begin auxout(line); auxout(brk); end
+		 else if length(line)>1
+			 then auxout(line[2 to inf]) 
+			 else done
+	      end
+	 else auxRead( line, 1 );
+AUXTRACE := false;
+circuit!talk := true;
+print("Code in place" & crlf);
+assign(auxdead, setOnZap);
+end;
+boolean	echo!blocks
+,	debugging
+;
+
+INTERNAL procedure x!packet( string packet );	! accessed in OUTCOD;
+begin	integer class;
+	string original!packet;
+if length(original!packet:=packet)=0 then return;
+class := lop(packet);
+if class land dataClass.isServer then usererr(0,1,"What a surprise");
+if is!Slave
+ then class := class lor dataClass.isServer
+ else class := class land lnot dataClass.isServer;
+if debugging
+ then ax!packet( original!packet )	! show meaning being sent;
+ else X!block( class, (packet&0)[1 to inf-1] );
+end;
+require "ftpcnv.dcl" source!file;
+require "tlgetf.dcl" source!file;
+! message destinations:
+! dataClass.isControl
+! dataClass.target.+{link | data | 2 | 3}
+! dataClass.isServer
+! dataClass.isVital
+! { !Reply.Optional | !Reply.Required | !Positive.Reply
+!	| !Negative.Reply | !Explanatory.Reply | !Information.Request }
+;
+define	target.file.description= dataClass.target.data 
+			+ dataClass.isControl
+			+ !reply.Optional
+,	target.file.data = dataClass.target.data
+			+ !reply.Optional
+;
+
+define CANFIND(n)=true;		! T, Page 6.130  if canFind (file) ;
+
+define guess!mode( fileName ) = file.type.Ast;
+
+routine s!record( string data; integer destination );
+	begin s!data( data, destination ); s!EOR( destination ); end;
+
+routine send!file!description(	string file!name;
+			integer size!in!bytes, file.type, creation );
+begin 	define target = target.file.description;
+s!record( ApplControl.op.is.name & file!name,		target );
+s!record( ApplControl.op.treatment & treatment.replace,	target );
+s!record( ApplControl.op.size.bytes & cvNumStr(size!in!bytes), target );
+s!record( ApplControl.op.File.type & file.type,		target );
+s!record( ApplControl.op.create & sWhen(creation),	target );
+end;
+
+routine sendEORs( integer n, target(target.file.data) );
+	while (n:=n-1) >= 0 do s!eor(target);
+simple string procedure clip( string s );
+begin!code	define r.ptr=1,r.len=2,r.ch=3, r.tmp=4;
+		label wexit, ploop, white, wloop, noChange;
+	hrrz	r.len,-1(sp);
+	jumpe	r.len,noChange;	! special case: null string;
+	move	r.ptr,0(sp);
+ ploop:	ildb	r.ch,r.ptr;	! first loop: while printing(lop) do;
+	caie	r.ch,'40;	! space;
+	 cain	r.ch,'11;	! or tab;
+	  jrst	white;		! whitespace seen, next loop;
+	sojg	r.len,ploop;
+noChange: popj	p,;		! ended with printing, no change;
+ white:	movni	r.tmp,(r.len);	! save -chars left in string ;
+	sojle	r.len,wexit;	! (counting this whitespace character);
+				! loop over white chars till end or prt;
+ wloop:	ildb	r.ch,r.ptr;
+	caie	r.ch,'40;	! space;
+	 cain	r.ch,'11;	! or tab;
+	  sojg	r.len,wloop;
+	jumpg	r.len,ploop; 	! if stopped due to length, go clip;
+				! otherwise go back into the print loop;
+ wexit:	addm	r.tmp,-1(sp);	! shorten result string by whitecount;
+	popj	p,;
+  end;	
+
+integer routine detab( reference string line; integer column(0) );
+begin	string copy, piece;
+	integer brk;
+copy := line;
+piece := scan(copy, retain!tabs, brk);
+column := column + length(piece);
+if length(copy)=0 then return(column);
+
+line := piece;
+  do  begin
+	  do  begin	integer len;
+		lop( copy );
+		len := 8 - (column land 7);
+		column := column + len;
+		line := line & ( (#sp&#sp & #sp&#sp 
+				& #sp&#sp & #sp&#sp)[1 for len] );
+	      end
+	 until copy neq #ht;
+	piece := scan(copy, retain!tabs, brk);
+	column := column + length(piece);
+	line := line & piece;
+      end
+ until length(copy)=0;
+return(column);
+end;
+string line!buffer;
+
+routine send.partial.Ast.Line( string partial.line; 
+				integer target(target.file.data) );
+begin
+line!buffer := line!buffer & partial.line;
+if length(line!buffer) >= 5*512
+ then begin
+	partial.line := clip( line!buffer );
+	s!Data( partial.line, target );
+	line!buffer := line!buffer[length(partial.line)+1 to inf];
+      end;
+end;
+
+routine send.final.Ast.Line( string partial.line;
+				integer target(target.file.data) );
+begin 
+s!Data( clip(line!buffer & partial.line), target );
+line!buffer := null;
+s!EOR(target); 
+end;
+
+routine send.Ast.Record( string full!line;
+				integer target(target.file.data) );
+	s!record( clip(full!line), target );
+
+integer inch;
+boolean ask!user!for!name;
+
+boolean procedure oneAST( integer array filDat );
+! handle a single file, return TRUE if don't want more from this group
+;
+begin "oneAST"	own string preamble, postamble, device;
+		own integer brk,eof;
+		string fn;
+		boolean flag;
+line!buffer := null;
+if inch < 0
+ then begin
+	open( inch := getchan, device := cv6str(filDat[-2]),0, 4,0,
+			read!length, brk, eof:=true );
+	if eof then begin release(inch); inch:=-1; return(true); end;
+		! stop since device cannot be opened.;
+	device := (if filDat[-2] = cvsix("DSK")
+		   then null else device & ":");
+	preamble := (if filDat[-4]
+		 then "("& cv6str(filDat[-4]) & cv6str(filDat[-3]) &")"
+		 else null);
+	postamble := (if filDat[-4]=0 and !lh(filDat[-1])
+			 then "[" & cvos(!lh(filDat[-1])) & ","
+				& cvos(!rh(filDat[-1])) & "]"
+			 else null);
+      end;
+fn:= preamble & cv6str(filDat[0]) & "." & cv6str(filDat[1]) & postamble;
+lookup( inch, fn, flag );
+if flag
+ then begin end ! file not found;
+ else begin	string dest!name, prompt;
+	dest!name := cv6str(filDat[0]) & "." & cv6str(filDat[1]);
+	if ask!user!for!name
+	 then begin	string prompt, default;
+		prompt := "Sending file " & device & fn & " as";
+		default := dest!name;
+		do dest!name := reply( prompt, default )
+		 until length( dest!name );
+	      end;
+
+	s!record( ApplControl.op.do.receive, target.file.description ); 
+	send!file!description(	dest!name
+	,			(fildat[2]-4)*128*5 ! -4=>-1 page rib;
+	,			file.type.ast
+	,			fildat[3] );
+	s!record( ApplControl.op.start.xfr, target.file.description ); 
+	   do begin	string line;
+		line := input(inch, aLine);
+		if (brk or eof) then line := clip(line);
+		if drop!blank!lines and length(line)=0 and brk = #lf
+		 then begin	integer blanklines;
+			for blanklines := 0 step 1
+				while brk = #lf and length(clip(line))=0
+			   do line := input(inch, aLine);
+			if length(line) ! ie NOT at EOPage or EOFile;
+			 then sendEORs( blankLines, target.file.data );
+		      end; ! blank line processing;
+		if brk = 0
+		 then begin	! long line: must have terminated on count.;
+				integer column;
+			column := detab( line );
+			  do  begin
+				send.partial.Ast.Line( line, 
+					target.file.data ); ! part line;
+				line := input(inch, aLine);
+				column := detab( line, column );
+			      end
+			until brk or eof;
+			send.final.Ast.Line( line, target.file.data );
+						! final part of line;
+		      end
+		 else if length(line) or brk neq #ff
+						! pagemarks look blank;
+			 then begin
+				line := clip(line);
+				detab( line );
+				send.Ast.record(line, target.file.data);
+			      end;
+		if brk = #ff then send.Ast.record(#ff,target.file.data);
+						! new page;
+	      end
+	 until eof;
+	s!EOF( target.file.data );
+	s!record( ApplControl.op.stop.xfr, target.file.description ); 
+      end;
+close(inch);
+return(false);	! just keep on going iteration through the files;
+end "oneAST";
+procedure sendAST( string fileGroup );
+begin
+inch := -1;
+redufd( oneAST, fileGroup, "#*BD" );
+if inch >= 0
+ then release(inch)
+ else begin print("<<<no files like that>>>"); end; ! no files matching group found;
+end;
+
+
+procedure sendfile( reference string rest!of!line; integer mode );
+begin	string file;
+file := scan( rest!of!line, aWord, !skip! );
+if canFind(file)
+ then begin	integer l.Mode;
+	l.Mode := (if mode < 0 then guess!mode(file) else mode);
+	if l.mode = file.type.bits or l.mode = file.type.bytes
+	 then begin
+		print("BINARY and a PDP-10, surely you jest!" & crlf );
+		l.mode := file.type.AST;
+	      end;
+	if file.type.AST neq l.mode
+	 then print("unknown file mode!!")
+	 else begin
+		! enter!ftp;
+		sendAST(file);
+		! end!ftp;
+	      end;
+      end
+ else print(" I really should send you PDP-10 file `", file, 
+	"'." & crlf&"... but I won't because I can't find it." & crlf );
+end;
+routine getfile( string file!name; integer transfer!type );
+begin 	define target = target.file.description;
+s!record( ApplControl.op.do.send, target.file.description ); 
+s!record( ApplControl.op.is.name & file!name,		target );
+s!record( ApplControl.op.File.type & transfer!type,	target );
+s!record( ApplControl.op.start.xfr, target.file.description ); 
+end;
+routine bool!switch( reference boolean switch; string name );
+print( name, #sp, (if switch:= not switch then "ON" else "OFF"), crlf );
+define bool#(name)={bool!switch(name,cvps(name))};
+
+routine go( integer target );
+begin	string s;
+while true
+   do begin "line"	integer brk;
+	do s := reply( "Teleport" ) until length(s);
+	brk := !skip!;
+	if kequ("exit",s) then begin end!buffer; return; end
+	eif s = ":" then begin lop(s); sendfile( s, file.type.AST ); end
+	eif s = "?" then begin lop(s);  getfile( s, file.type.AST ); end
+	eif s = "=" then s!Data( s[2 to inf], target ) 
+	eif s = "!" then setprint(s[3 to inf], s[2 for 1])
+	eif s = "*" then end!buffer
+	eif s = "~" or s="`" then begin
+			if length(s)>1 then lop(s);
+			while length(s) do case lop(s) of begin
+			["0"] bool#( debugging );
+			["1"] bool#( echo!blocks );
+			["2"] bool#( is!Slave );
+			["3"] bool#( drop!blank!lines );
+			["4"] bool#( auxtrace );
+			["5"] bool#( ask!user!for!name );
+			["6","7"] do!some!input("6"-s);
+			["8","9"] while do!some!input("8"-s) 
+					do outchr(".");
+			[else] print("
+0:debug, 1:echo!blocks, 2:slave, 3:drop_blanks, 4:auxtrace, 5: name_ask
+6:do!some!input(0), 7:do!some!input(-1) 
+8:repeat do!some!input(0), 9:repeat do!some!input(-1) 
+")
+			end end
+	eif s = """" then begin integer ch,q; 
+			q := lop(s);
+			if length(s) then q := lop(s);
+			s := s & brk;
+			while true
+			   do begin
+				if length(s)=0
+				 then s:= reply("(quoted)") & !skip!;
+				while length(s) 
+				   do if q = (ch := lop(s))
+					then continue "line"
+					else sendOne( ch, target );
+			      end;
+		      end
+	eif s = "#" then begin	integer new;
+			new := cvd(s[2 to inf]);
+			if new > 1 then read!length := new;
+			print( "read!length = ", read!length, crlf );
+		      end
+	eif s = "%" then print( "Transport option:" & crlf,
+				dbgtrn( cvd(s[2 to inf]) ), crlf )
+	eif s = "/" then while length(s) do sendOne( unHex(s), target )
+	eif s = "@" then begin lop(s); target := unHex(s); end
+	eif kequ(s,"EOR") then s!EOR(target)
+	eif kequ(s,"EOF") then s!EOF(target)
+	eif kequ(s,"SLAVE") then if auxport='777777
+				 then begin 
+					auxclr(auxport,auxport,!axslv);
+					become!slave;
+					outchr("!"); 
+					print("slave='", cvos(auxport));
+				      end
+				 else print("Already dangling a port!")
+	eif kequ(s,"ECHO") then become!dumb!slave
+	eif kequ(s,"MASTER") then become!port!master
+	eif kequ(s,"ZAP") then auxzap
+	eif kequ(s,"ALLZAP") then begin auxport:=-1; auxzap; return end
+	eif kequ(s,"SEND") then auxout( reply("Text to send") & !skip! )
+	eif kequ(s[1 to 5],"SEND ") then auxout( s[6 to inf] )
+	eif kequ(s[1 to 5],"SEND'") then auxout( cvo(s[6 to inf]) )
+	eif kequ(s,"PORTS") then print("Owned ports: ", auxlist, crlf)
+	eif kequ(s,"PORT") 
+	 or kequ(s[1 for 5],"PORT ") then begin	integer port;
+				port := cvo(s[6 to inf]);
+				if port < 1 then port := cvo(auxlist);
+				if port < 1
+				 then print("No " )
+				 else begin 
+					print("Now using ");
+					port!set(port);
+				      end;
+				print("port ", cvos(port));
+			      end
+	eif kequ(s,"BAIL") or kequ(s,"DDT") then usererr(0,1,s,s)
+	eif kequ(s,"STOPXFR") then s!record( ApplControl.op.stop.xfr, 
+					target.file.description ) 
+	eif kequ(s,"STOPFTP") then s!record( ApplControl.op.stop.ftp, 
+					target.file.description )
+	else print("
+* to flush, "" to spew to a matching quoting character. (eg: ""/frog/)
+\FILE:<file> to take input from a disk file
+!b<file> to record output, !t to report just to terminal, ...=setprint
+/ <hex characters>, =<data>, @<new target>, 
+:<text files to send>, ?<text file to retrieve>,
+~<num> toggles TLPORT switches, 
+%<num> toggles transport options,
+#<num> sets read!length,
+BAIL, EXIT, EOR, EOF, SLAVE, ECHO, MASTER, ZAP, ALLZAP, SEND
+PORTS, or PORT <portno>
+");   end;
+end;
+! MAIN PROGRAM
+
+debugging := true;
+print("Hi");
+go( target.file.data );
+end "program teleport"
+.
+
+    
