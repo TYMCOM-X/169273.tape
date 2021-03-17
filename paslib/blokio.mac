@@ -1,0 +1,472 @@
+;    +----------------------------------------------------------------+
+;    I                                                                I
+;    I                         D U M P I O                            I
+;    I                         - - - - - -                            I
+;    I                                                                I
+;    +----------------------------------------------------------------+
+;
+;    PURPOSE: DUMPIO  is  a  set  of   PASCAL-callable   routines   for
+;       performing  dump  mode  I/O.  This  module provides opening and
+;       closing of files,  and reading and writing of integral  numbers
+;       of blocks at one call.
+;
+;    USAGE:
+;       The calling sequences for the four routines are
+;       given as headers to the code.
+;
+;    REQUIREMENTS: DUMPIO  requires  the  PASCAL  run-time  GETCN.  and
+;       FRECN.,  and the file-name parsing routine GETIFN.
+;
+;    ALGORITHM: DUMPIO issues its own monitor calls.
+;
+;    ------------------------------------------------------------------
+	SEARCH	RTSYM
+	$MODULE	DUMPIO
+;
+;	First, a few equates etc.
+R0=0
+R1=1
+R2=2
+R3=3
+R4=4
+R5=5
+R6=6
+R7=7
+R10=10
+R17=17
+OFF1=6	;STACK OFFSET (Rn-OFF1 gives stored Rn value)
+	PAGE
+;*********************************************
+;
+;	JSP	R2,SETLOK
+;
+;	SETLOK does all the setup necessary for the LOOKUP monitor
+;	calls in this package.  Assuming that GETIFN returned ok, and
+;	that its data are contained in GIFNBK, this routine prepares
+;	ENTBLK as appropriate for the call, and sets up the instruction
+;	in XINSTR.  
+;
+;	INPUT:
+;	  R2--return address
+;	  R3--channel number
+;
+;	OUTPUT: NONE, but R1 gets blasted.
+;
+;
+SETLOK:	MOVE	R1,2+GIFNBK		;get filename from GETIFN block
+	MOVEM	R1,ENTBLK
+	HLLZ	R1,3+GIFNBK		;get extension left-justified
+	MOVEM	R1,1+ENTBLK
+	SETZM	R1,2+ENTBLK		;zero out third word
+	MOVE	R1,5+GIFNBK		;get PPN or zero default
+	MOVEM	R1,3+ENTBLK		;as fourth word
+	
+	MOVE	R1,[LOOKUP 0,ENTBLK]	;get instruction skeleton
+	MOVEM	R1,XINSTR		;put in execute cell
+	DPB	R3,ACXINS		;install channel number as AC
+	
+	JRST	(R2)			;and return
+	PAGE
+;********************************************
+;
+;	JSP	R2,SETNTR
+;
+;	SETNTR works a lot like SETLOK, except that the ENTER monitor
+;	call is prepared.  The calling sequence is the same.
+;
+;
+SETNTR:	MOVE	R1,2+GIFNBK		;get filename
+	MOVEM	R1,ENTBLK
+	HLLZ	R1,3+GIFNBK		;extension left-justified
+	MOVEM	R1,1+ENTBLK
+	MOVE	R1,4+GIFNBK		;get pro-code left-just'd
+	MOVEM	R1,2+ENTBLK		;and set other stuff zeroes
+	MOVE	R1,5+GIFNBK		;get specified PPN if one
+	MOVEM	R1,3+ENTBLK
+	
+	MOVE	R1,[ENTER 0,ENTBLK]	;get instruction skeleton
+	MOVEM	R1,XINSTR
+	DPB	R3,ACXINS		;put channel number as AC of ENTER
+	
+	JRST	(R2)			;and split
+	PAGE
+;********************************************
+;
+;	JSP	R2,SETIOW
+;
+;	SETIOW prepares the command words for dump mode I/O as needed
+;	for the parameters given to READPAGE and WRITEPAGE, assuming
+;	that the parameters are on the stack.
+;
+;	INPUT:
+;	  R2--return address
+;
+;	OUTPUT: NONE, but R1 gets blasted.
+;
+;
+;
+SETIOW:	MOVN	R1,R3-OFF1(R17)		;get -# blocks to write
+	IMULI	R1,^O200		;convert to # words
+	HRL	R1,R1			;put in left half too
+	HRR	R1,R2-OFF1(R17)		;get core addr in right half
+	SUBI	R1,1			;now (-n,,loc-1)
+	MOVEM	R1,IOWORD		;store command word
+	SETZM	R0,1+IOWORD		;and stop command
+
+	JRST	(R2)			;now go home
+	PAGE
+;**********************************************************
+;
+;	JSP	R1,PARSAVE
+;
+;	PARSAVE merely saves registers r2 - r6, adjusts the stack
+;	pointer, and gets the DUMPIO PSA pointer.
+;
+;*********************************************************
+
+PARSAVE:
+	PUSH	TOP,PSA		; SAVE CALLER'S PSA POINTER
+	ADJSP	TOP,5
+	HRLZI	R0,R2
+	HRRI	R0,-4(TOP)
+	BLT	R0,0(TOP)
+	$GETPSA	DUMPIO
+	JRST	0(R1)
+	PAGE
+;***********************************************************************
+;
+;	PROCEDURE OPENFILE (
+;		FN: string[30];
+;		var CHN: INTEGER;		(* return channel number *)
+;		var AOK: boolean;		(* return true--no error *)
+;		INPUTONLY: boolean;		(* true--open input only *)
+;		DELETECON: boolean );		(* true--delete contents *)
+;
+;
+;	OPENFILE will try to open the FN specified.  It assigns its own
+;	channel numbers through GETCN., and will return the number if
+;	the file was opened successfully as specified. If AOK returns
+;	false, the file could not be opened, and CHN will have been
+;	RELEASE'd and FRECN.'d. A successful OPENFILE is needed before
+;	any other public procedures in this package are called.
+;
+;
+	ENTRY	OPN$FI
+OPN$FI:
+	JSP	R1,PARSAVE	;save parms on stack
+
+	MOVE	R0,R5			;get in-only flag
+	AND	R0,R6			;and with delete flag
+	JUMPN	BADLV0			;input-only and delete no good.
+
+	PUSHJ	R17,GETCN.##		;get a channel from PASCAL
+	MOVEM	R0,@R3-OFF1(R17)	;install into var parameter
+	MOVEM	R0,R3-OFF1(R17)		;and local stor., zap var addr.
+	
+	MOVEI	R2,-^o12+GIFNBK		; ponied-up addr for PRFID.
+	MOVE	R3,R2-OFF1(R17)		; get string address
+	ADD	R3,[point 7,1]		; now byte pointer to first char
+	MOVE	R4,-1(R3)		; pick up length
+	PUSHJ	R17,PRFID.##
+	JRST	BADLV1			; nonsense
+	
+FILEOK:	MOVE	R1,[OPEN 0,OPENBK]	;get OPEN skeleton from hiseg
+	MOVEM	R1,XINSTR		;and put into loseg cell
+	MOVE	R1,R3-OFF1(R17)		;get channel number
+	DPB	R1,ACXINS		;for AC of OPEN monitor call
+	
+	MOVE	R1,DUMPST		;get dumpmode OPEN bits
+	MOVEM	R1,OPENBK		;as first word of OPEN block
+	MOVE	R1,GIFNBK		;get device name from GETIFN
+	MOVEM	R1,1+OPENBK		;as second word of block
+	SETZM	R0,2+OPENBK		;zeroes for buffer chain pointers
+	
+	XCT	R0,XINSTR		;do the OPEN
+	JRST	BADLV1			;can't get device???
+;
+;	First, do the easy(sic) case of open for input only
+;
+	SKIPN	R0,R5-OFF1(R17)		;skip if input-only flag TRUE=1
+	JRST	INOUTO			;else goto in/out setup
+	
+	MOVE	R3,R3-OFF1(R17)		;get channel number
+	JSP	R2,SETLOK		;set up the LOOKUP mon call
+	XCT	R0,XINSTR		;and do it
+	JRST	BADLV2			;error-RELEASE and FRECN.
+	JRST	OPENOK			;otherwise we're done
+;
+;	IN/OUT open code
+;
+INOUTO:	SKIPN	R0,R6-OFF1(R17)		;skip if DELETECON=true(1)
+	JRST	IOPRES			;else just do LOOKUP
+	
+FDEFIN:	MOVE	R3,R3-OFF1(R17)		;first get channel number
+	JSP	R2,SETNTR		;and prepare ENTER call
+	XCT	R0,XINSTR		;and do it
+	JRST	BADLV2			;error--RELEASE and FRECN.
+;
+;	Now CLOSE without writing for delete
+;
+	MOVE	R1,[CLOSE 0,0]		;get instr skeleton
+	MOVEM	R1,XINSTR		;and put it into cell
+	MOVE	R1,R3-OFF1(R17)		;get channel number to close
+	DPB	R1,ACXINS		;and put in instruction
+	
+	XCT	R0,XINSTR		;execute the CLOSE
+					;no error return
+;
+;	Do a LOOKUP to get file, whether deleted or no
+;
+IOPRES:	MOVE	R3,R3-OFF1(R17)		;get channel number
+	JSP	R2,SETLOK		;and set up LOOKUP
+	XCT	R0,XINSTR		;and do it
+	JRST	FDEFIN			;should only happen on in/out,
+					;preserve, file not found.
+	
+	JSP	R2,SETNTR		;set up ENTER, chnum in R3 already
+	XCT	R0,XINSTR		;and do the ENTER
+	JRST	BADLV3			;bad error--CLOSE,RELEAS,and FRECN.
+;
+;	AOK return (branch, or fall in from above)
+;
+OPENOK:	MOVEI	R1,1			;get a TRUE
+	MOVEM	R1,@R4-OFF1(R17)	;and install in var AOK
+	adjsp	top,-5			;get rid of our local storage
+	POP	TOP,PSA
+	POPJ	R17,0			;and return to caller
+;
+;	Error returns are on three levels-FRECN.; RELEAS and FRECN.;
+;	and finally CLOSE, RELEAS, and FRECN..  Do the worst first.
+;
+BADLV3:	MOVE	R1,[CLOSE 0,0]		;get CLOSE skeleton
+	MOVEM	R1,XINSTR		;put in loseg cell
+	MOVE	R1,R3-OFF1(R17)		;get channel to CLOSE
+	DPB	R1,ACXINS		;put in place
+	
+	XCT	R0,XINSTR		;do it--no error return
+	
+BADLV2:	MOVE	R1,[RELEAS 0,0]		;get RELEAS skeleton
+	MOVEM	R1,XINSTR		;put in execute cell
+	MOVE	R1,R3-OFF1(R17)		;get channel number
+	DPB	R1,ACXINS		;put it
+	
+	XCT	R0,XINSTR		;do the RELEAS--no error return
+	
+BADLV1:	MOVE	R0,R3-OFF1(R17)		;get channel in r0 for FRECN.
+	PUSHJ	R17,FRECN.##		;free channel
+
+BADLV0:	SETZM	R0,@R4-OFF1(R17)	;put FALSE return in AOK
+;
+; Common return point for OPENFILE, READPAGE, WRITEPAGE.
+;
+
+DMPRET:
+WROUT:
+RDOUT:
+	ADJSP	TOP,-5
+	POP	TOP,PSA		;RESTORE CALLER'S PSA POINTER
+	POPJ	TOP,0
+	PAGE
+;***********************************************************************
+;
+;	PROCEDURE WRITEPAGE (
+;		ADDR: INTEGER;		(* core address of buffer *)
+;		LEN: INTEGER;		(* number of blocks to write *)
+;		BLOCK: INTEGER;		(* block number to write to *)
+;		CHN: INTEGER;		(* channel # from OPENFILE *)
+;		var IOOK: boolean);	(* false iff error *)
+;
+;
+;	WRITEPAGE will write an integral number of disk blocks to the
+;	file on CHN at block address BLOCK.  It starts the write from
+;	core address ADDR.  IOOK will return false if an error occured,
+;	which means that a VERY STRANGE ERROR has occured.  If WRITEPAGE
+;	is called without first calling OPENFILE, the monitor will
+;	detect a fatal error with something like:
+;
+;	?I/O to unassigned channel at user PC 400000 (or whatever)
+;
+;	Also, if the file has been opened with the INPUTONLY option
+;	on OPENFILE, the monitor will bomb with:
+;
+;	?Request not allowed by SET SAFETY at user PC 400000.
+;
+;
+;
+	ENTRY	WRIT$P
+WRIT$P:
+	JSP	R1,PARSAVE		;save params on stack
+
+	JSP	R2,SETIOW		;set up dumpmode command words
+
+	MOVEI	R1,1			;set true OK code now
+	MOVEM	R1,(R6)
+
+	MOVEI	R1,1(R4)		;get 1+blockaddr
+	OR	R1,[USETO 0,0]		;because USETO uses 1-based blockaddr
+	MOVEM	R1,XINSTR		;put the instr. in low core
+	DPB	R5,ACXINS		;put channel in AC field of cell
+	XCT	R0,XINSTR		;do the USETO
+;
+;	USETO has no error return, and the monitor will bomb out the
+;	caller if the channel is not ENTER'ed.
+;
+	MOVE	R1,[OUT 0,IOWORD]	;skeleton OUT call
+	MOVEM	R1,XINSTR		;put in execute cell
+	DPB	R5,ACXINS		;channel # still in R5
+
+	XCT	R0,XINSTR		;do the OUT
+	JRST	WROUT			;good write
+	SETZM	R0,@R6-OFF1(R17)	;set false(0) in var IOOK
+
+	MOVE	R1,[GETSTS 0,R2]	;now clear error bits only
+	MOVEM	R1,XINSTR		;set up the GETSTS call
+	DPB	R5,ACXINS		;put in channel number
+	XCT	R0,XINSTR		;and do the GETSTS
+
+	TRZ	R2,740000		;clear error bits if on
+	MOVE	R1,[SETSTS 0,(R2)]	;and set up a SETSTS
+	MOVEM	R1,XINSTR
+	DPB	R5,ACXINS		;R5 still good
+	XCT	R0,XINSTR
+
+	JRST	WROUT
+	PAGE
+;*************************************************************************
+;
+;	PROCEDURE READPAGE (<same call as WRITEPAGE>)
+;
+;	READPAGE reads an integral number of disk blocks using dump-mode
+;	I/O.  If an end-of-file condition is recognize, the ENTIRE CORE
+;	buffer is zeroed.  When the user reads single disk blocks (i.e.
+;	128 words), this is accurate, but multiple block reads will
+;	not be performed if the EOF occurs during the read, even if one
+;	or more blocks could have been read before the end of the file.
+;
+;	Like WRITEPAGE, if the file has not been opened, the monitor will
+;	bomb the user with the message:
+;
+;	?I/O to unassigned channel at user PC 400000
+;
+;
+;
+	ENTRY READ$P
+READ$P:
+	JSP	R1,PARSAVE		;save parameters on stack
+
+	JSP	R2,SETIOW		;set up the dump-mode commands
+
+	MOVEI	R1,1			;set true return now
+	MOVEM	R1,(R6)
+
+	MOVEI	R1,1(R4)		;get block+1
+	OR	R1,[USETI 0,0]		;build USETI mon call
+	MOVEM	R1,XINSTR		;put in cell
+	DPB	R5,ACXINS		;put passed ch# in cell
+
+	XCT	R0,XINSTR		;do the USETI
+;
+;	Like USETO, USETI has no error return
+;
+	MOVE	R1,[IN 0,IOWORD]	;get skeleton IN call
+	MOVEM	R1,XINSTR		;and put in loseg
+	DPB	R5,ACXINS		;drop in channel number
+
+	XCT	R0,XINSTR		;do the IN call
+	JRST	RDOUT			;all went well
+;
+;	First, see if the error was an end-of-file.  If so, just reset
+;	it, and zero the buffer.  Any other error will not be reset.
+;
+	MOVE	R1,[GETSTS 0,R2]	;instr, use R2 for bits
+	MOVEM	R1,XINSTR		;put in cell
+	DPB	R5,ACXINS		;same channel
+	XCT	R0,XINSTR		;do the GETSTS
+
+	TRZE	R2,740000		;skip and clear if not EOF error
+	SETZM	R0,@R6-OFF1(R17)	;didn't skip, some non-EOF bit set
+	TRZ	R2,20000		;clear EOF bit now too
+
+	MOVE	R1,[SETSTS 0,(R2)]	;get instr, bits in R2 as E
+	MOVEM	R1,XINSTR
+	DPB	R5,ACXINS		;R5 still good as channel number
+	XCT	R0,XINSTR		;do the SETSTS
+
+	SKIPN	R0,@R6-OFF1(R17)	;had we had an error?
+	JRST	RDOUT			;yes, don't zero out buffer
+
+	HRRZ	R1,R2-OFF1(R17)		;get core addr of read
+	HRLS	R1,R1			;duplicate
+	ADDI	R3,-1(R1)		;R3 now has addr of last word
+	HRRI	R1,1(R1)		;increment right half as dest.
+	SETZM	R0,-1(R1)		;zero out first word
+
+	BLT	R1,(R3)			;and the rest of the buffer
+
+	JRST	RDOUT
+	PAGE
+;*************************************************************************
+;
+;	PROCEDURE CLOSEFILE (
+;		CHN: INTEGER;		(* channel number *)
+;		DELETE: boolean);	(* true means delete file *)
+;
+;	CLOSEFILE will close the file opened by OPENFILE on channel
+;	CHN.  If DELETE is true, CLOSEFILE will delete the file.
+;
+;
+;
+	ENTRY	CLOS$F
+CLOS$F:	PUSH	TOP,PSA	;SAVE CAALER'S PSA
+	PUSH	R17,R2			;save params on stack
+	PUSH	R17,R3
+	$GETPSA	DUMPIO
+
+	JUMPE	R3,CLOSEC		;R3=0 means don't delete
+;
+;	Here we use RENAME to delete and close the file
+;
+	SETZM	R0,ENTBLK		;zero out 1st word of LOOKUP block
+	MOVE	R1,[RENAME 0,ENTBLK]	;to tell RENAME to delete file
+	MOVEM	R1,XINSTR		;place skeleton in execute cell
+	DPB	R2,ACXINS		;put channel number in place
+
+	XCT	R0,XINSTR		;do the RENAME
+	JRST	CLOSEA			;error return--forget it
+	JRST	CLOSEA			;normal return
+
+CLOSEC:	MOVE	R1,[CLOSE 0,0]		;skeleton CLOSE call
+	MOVEM	R1,XINSTR		;put in place
+	DPB	R2,ACXINS		;put channel number
+	XCT	R0,XINSTR		;do the CLOSE
+
+CLOSEA:	MOVE	R1,[RELEAS 0,0]		;get RELEAS to free device
+	MOVEM	R1,XINSTR		;put instr
+	DPB	R2,ACXINS		;put in channel number
+	XCT	R0,XINSTR		;and do the RELEAS
+
+	MOVE	R0,R2			;put channel number in R0
+	PUSHJ	R17,FRECN.		;for FRECN.
+
+	ADJSP	TOP,-2			;restore stack
+	POP	TOP,PSA
+	POPJ	R17,0			;and go home
+	PAGE
+	LIT
+	PAGE
+;
+;	Constants used
+;
+ACXINS:	POINT	4,XINSTR,12
+DUMPST:	0,,17
+;
+;	The static storage
+;
+	$STATIC	GIFNBK,6
+	$STATIC	ENTBLK,4
+	$STATIC	OPENBK,3
+	$STATIC	XINSTR,1
+	$STATIC	IOWORD,2
+	$END	DUMPIO
+	END
+  
