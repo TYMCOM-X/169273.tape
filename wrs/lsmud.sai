@@ -1,0 +1,331 @@
+begin	"LSMUD"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "AUXLIB.REQ" source!file;
+require "ARGS.REQ" source!file;
+require "FLIB.REQ" source!file;
+define	nothing = null;
+
+string item LOGIN;
+string item OUTFILE;
+integer item STARTBLOCK;
+integer item STOPBLOCK;
+integer item TIMEOUT;
+item TRACE;
+string item USERNAME;
+item VERBOSE;
+integer item WINDOW;
+
+define RETRY!LIMIT = 25;
+r!p(file) fo;
+integer CNT, xSTART, xBLOCK, xWINDOW;
+boolean RangeSetup;
+integer RestartDelay;
+label Restart, Exit;
+
+define TwentyFourOnes = '000077777777;
+define ThirtyTwoOnes =  '037777777777;
+
+forward procedure Connect( string LOGSTR );
+
+procedure Fatal( string S );
+begin
+    print( crlf& S );
+    goto Exit;
+end;
+
+procedure Retry( string S );
+begin
+    own integer RETRIES;
+    integer N;
+    auxZap;
+    print( "?RETRY: ", S, crlf );
+    if ( RETRIES := RETRIES + 1 ) > RETRY!LIMIT then
+	Fatal( "?RETRY: limit exceeded" );
+    N := case RestartDelay of (5,5,10,15,20,25,30,45,60,90,[else]120);
+    if props(VERBOSE) then print( "[delaying ", N, " seconds]"& #cr );
+    calli( !xwd(1,N), '72 );
+    if RangeSetup then begin
+	xSTART := xBLOCK - xWINDOW;
+	print( "[restarting at block ", xSTART, "]"& crlf );
+    end;
+    goto Restart;
+end;
+
+simple string procedure cvhex( integer I,FMT(0) );
+begin
+    string S;
+    S := null;
+    do begin
+	S := "0123456789ABCDEF"[(I land 15)+1 for 1] & S;
+	I := I lsh (-4);
+    end until I = 0 and length(S) geq FMT;
+    return( S );
+end;
+
+simple string procedure requ( string S1,S2 );
+return( equ( S1[inf-length(S2)+1 to inf],S2 ));
+
+integer procedure UserHash( string User );
+begin
+    ! this is not right - must be changed ;
+    return( cvasc(User) lsh -1 );
+end;
+
+! cvhs - return string containing hex representation of integer
+;
+string procedure cvhs( integer X, N(1) );
+begin
+    string S;
+    S := null;
+    while X or length(S) < N do begin
+	S := "0123456789abcdef"[(X land '17)+1 for 1] & S;
+	X := X lsh -4;
+    end;
+    return( S );
+end;
+
+comment
+	Circuit input routines.
+;
+
+integer procedure rdbyte( integer N(1) );
+begin
+    integer B,I,X;
+    X := 0;
+    for I := 1 upto N do begin
+	X := (X lsh 8) lor ( B := auxIn(datum(TIMEOUT)) );
+	if B < 0 then usererr(0,0,"?timeout waiting for input","X");
+    end;
+    if props(TRACE) then print( "rd", N, " ", cvhs( X, N*2 ), crlf );
+    CNT := CNT - N;
+    return( X );
+end;
+
+procedure rdarry( integer array A );
+begin
+    integer I;
+    for I := arrinfo(A,1) upto arrinfo(A,2) do
+	A[I] := rdbyte(4);
+end;
+
+comment
+	Circuit output routines.
+;
+
+procedure wrbyte( integer X, N(1) );
+begin
+    redefine !axO8 = '3;
+    integer I;
+    for I := N downto 1 do
+	auxclv( auxPort, X lsh (8-I*8), !axO8 );
+    if props(TRACE) then print( "wr", N, " ", cvhs( X, N*2 ), crlf );
+end;
+
+procedure wrarry( integer array A );
+begin
+    integer I;
+    for I := arrinfo(A,1) upto arrinfo(A,2) do
+	wrbyte( A[I], 4 );
+end;
+
+procedure Connect( string LOGSTR );
+begin
+    string AccuMsg,S,GW;
+    own string Password;
+    auxTrace := auxEcho := props(TRACE);
+    if CreAux( 4& LOGSTR ) = -1 then Retry( "creaux failure" );
+    GW := LOGSTR; while length(GW) do if lop(GW) = ";" then done;
+    if length(GW) = 0 then auxOut( #cr );
+    AccuMsg := null;
+    while true do begin
+	AccuMsg := AccuMsg& auxIn( datum(TIMEOUT) );
+	if not !SKIP!
+	    then if !lh(auxPort)
+		then Retry( "circuit lost during login"& crlf& AccuMsg )
+		else Retry( "timeout during login"& crlf& AccuMsg );
+	if requ( AccuMsg, 1&2&3&4 ) then done;
+	if requ( AccuMsg, "please log in: " ) then begin
+	    if length(GW)
+	    then begin
+		auxOut( GW );
+		auxOut( #cr );
+		AccuMsg := AccuMsg& GW;
+		GW := null;
+	    end
+	    else Retry( "failure during login"& crlf& AccuMsg );
+	end;
+	if requ( AccuMsg, "password:" ) then begin
+	    if length(Password)=0 then begin
+		auxcli(-1,'200,'64);
+		print( "password:" );
+		Password := inchwl;
+		print( crlf );
+		auxcli(-1,0,'64);
+	    end;
+	    auxOut( Password );
+	    auxOut( #cr );
+	    AccuMsg := AccuMsg& crlf;
+	end;
+	if requ( AccuMsg, "name:" ) then
+	    Retry( "invalid user name during login"& crlf& AccuMsg );
+	if requ( AccuMsg, "no port available" ) then
+	    Retry( "no port available" );
+    end;
+    auxTrace := auxEcho := false;
+    wrbyte( 1 );
+    wrbyte( 2 );
+    wrbyte( 3 );
+    wrbyte( 4 );
+end;
+
+integer	CUDver
+,	CUDrev
+,	maxBlock
+,	nOvflBlocks
+,	SectorsPerBlock
+;
+
+procedure GetVersion;
+begin
+    integer N;
+    wrbyte( 9 );	! get version command;
+    wrbyte( 32 );	! end of command;
+    if 1 neq N := rdbyte then
+	Retry( "error response 0x"& cvhs(N)& " from command 9 (NETVAL_INFO)" );
+    N := rdbyte( 1 );
+    CUDver := rdbyte( 2 );
+    CUDrev := rdbyte( 2 );
+    maxBlock := rdbyte( 4 );
+    nOvflBlocks := rdbyte( 4 );
+    SectorsPerBlock := rdbyte( 4 );
+    while N > 16 do begin N := N - 1; rdbyte end;
+    if rdbyte neq 32 then Retry( "out of sync" );
+    print(
+	"MUD version ", CUDver, ".", CUDrev,
+	"; ", maxBlock + nOvflBlocks, " blocks.",
+	crlf );
+end;
+
+procedure Logout;
+begin
+    auxZap;
+end;
+
+string procedure cvctl( integer CTL );
+begin
+    string S;
+    S := null;
+    if CTL land !bit(4+3)  then S := S& " so";	! shut override;
+    if CTL land !bit(4+4)  then S := S& " op";	! operator;
+    if CTL land !bit(4+10) then S := S& " tl";	! transparent login;
+    if CTL land !bit(4+13) then S := S& " ih";	! ignore host;
+    if CTL land !bit(4+15) then S := S& " np";	! no password;
+    if CTL land !bit(4+17) then S := S& " na";	! network administrator;
+    if CTL land !bit(4+18) then S := S& " as";	! account supervisor;
+    if CTL land !bit(4+19) then S := S& " au";	! auditor;
+    return( S[2 to inf] );
+end;
+
+integer nUsers;
+
+integer procedure ReceiveRecord;
+begin
+    integer I,Word1, PWD,DOC,GAN,UUN,CTL,PCD;
+    string UNM;
+    Word1 := rdbyte( 4 );
+    if Word1 = 0 or Word1 = ThirtyTwoOnes then return( ThirtyTwoOnes );
+    CNT := Word1 lsh -24 - 4;
+    if CNT < 28 then usererr( CNT, 2, "?impossibly small count: ", "X" );
+    UNM := null;
+    do begin
+	integer C;
+	I := rdbyte( 4 );
+	if C := (I lsh -24 land '177) then UNM := UNM& C;
+	if C := (I lsh -16 land '177) then UNM := UNM& C;
+	if C := (I lsh -8 land '177) then UNM := UNM& C;
+	if C := I land '177 then UNM := UNM& C;
+    end until I land !bit(4+0);
+    PWD := rdbyte( 4 );
+    DOC := rdbyte( 4 );
+    GAN := rdbyte( 4 );
+    UUN := rdbyte( 4 );
+    CTL := rdbyte( 4 );
+    PCD := rdbyte( 4 );
+    while CNT > 0 do rdbyte;
+    UNM := UNM & "              "[length(UNM) to inf];
+    if CTL land !bit(4+15) then PWD := -1;	! no password;
+    wordout( file:Chan[fo], cvasc(UNM[1 for 5]) );
+    wordout( file:Chan[fo], cvasc(UNM[6 for 5]) );
+    wordout( file:Chan[fo], cvasc(UNM[11 for 5]) );
+    wordout( file:Chan[fo], PWD );
+    wordout( file:Chan[fo], DOC );
+    wordout( file:Chan[fo], !xwd(GAN, UUN) );
+    wordout( file:Chan[fo], CTL );
+    wordout( file:Chan[fo], PCD );
+    nUsers := nUsers + 1;
+!   if nUsers mod 20 = 0 then Retry( "test - nusers mod 20 = 0" );
+    return( Word1 lsh -24 );
+end;
+
+procedure RequestBlock( integer Block );
+begin
+    wrbyte( 8 );		! code 8 command, retrieve CUD data block;
+    wrbyte( Block, 2 );		! block number;
+    wrbyte( 32 );		! sync - end of command;
+end;
+
+procedure RetrieveBlock( integer Block );
+begin
+    integer X,I,ByteCnt;
+    if props(VERBOSE) then print( "[block ", Block, "]"& #cr );
+    if 1 neq X := rdbyte then
+if X = 32 then begin
+ print( "?error response from block ", Block, ": 0x", cvhs(X), crlf );
+ props(TRACE) := true;
+ while true do rdbyte;
+end else
+	Retry( "error response 0x"& cvhs(X)& " for block "& cvs(Block) );
+    if Block neq X := rdbyte(2) then
+	Retry( "wrong block number "& cvs(X)& " for block "& cvs(Block) );
+    ByteCnt := rdbyte( 2 );
+    while ByteCnt > 0 do
+	ByteCnt := ByteCnt - ReceiveRecord;
+end;
+
+    argparse( OUTFILE, USERNAME,
+	{LOGIN,STARTBLOCK,STOPBLOCK,TIMEOUT,TRACE,VERBOSE,WINDOW},
+	args );
+    if not props(LOGIN) then datum(LOGIN) := "NCUD1";
+    if not props(TIMEOUT) then datum(TIMEOUT) := 30;
+    if not props(WINDOW) then datum(WINDOW) := 16;
+    auxTrace := props(TRACE);
+    fo := fOpen( datum(OUTFILE), "wb14M4E:NET.MUD" );
+Restart:
+    RestartDelay := RestartDelay + 1;
+    Connect( datum(LOGIN) );
+    RestartDelay := 0;
+    if not RangeSetup then begin
+	GetVersion;
+	if not props(STARTBLOCK) then datum(STARTBLOCK) := 0;
+	if not props(STOPBLOCK) then
+	    datum(STOPBLOCK) := maxBlock + nOvflBlocks - 1;
+	if props(USERNAME) then begin
+	    datum(STARTBLOCK) :=
+	    datum(STOPBLOCK) := UserHash(datum(USERNAME)) mod (maxBlock + 1);
+	end;
+	xWINDOW := 0 max ( datum(WINDOW) - 1 );
+	xSTART := datum(STARTBLOCK);
+	print( "[starting at block ", xSTART, "]"& crlf );
+	RangeSetup := true;
+    end;
+    for xBLOCK := xSTART upto datum(STOPBLOCK)+xWINDOW do begin
+	if xBLOCK leq datum(STOPBLOCK) then RequestBlock( xBLOCK );
+	if xBLOCK-xWINDOW geq xSTART then RetrieveBlock( xBLOCK-xWINDOW );
+    end;
+    Logout;
+    print( file:Name[fo], ": ", nUsers, " records written." );
+Exit:
+    fClose( fo );
+
+end $  
