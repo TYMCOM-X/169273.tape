@@ -1,0 +1,467 @@
+begin "Auxspl"
+
+require '1 lsh 24 lor '20 version;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)DUL.REQ" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "(CARL)VMFILE.REQ" source!file;
+require "(CARL)LOGPKG.REQ" source!file;
+require "(CARL)DAYTIM.REQ" source!file;
+require "AUXINT.REQ" source!file;
+require "AUXBLK.REQ" source!file;
+require "FRMOPS.REQ" source!file;
+
+define TTBUG = {FALSE};
+define LPAUX = {":TR17@2770"};
+
+require crlf&"License: SY RF WF OP JL"&crlf message;
+
+External boolean RPGSW;
+
+Item ItemProcess;
+
+Own String Filename, HeadMessage, TailMessage, Author, Login!name, Host;
+Own String AuxDev;
+integer myppn, myjob, flag, eof, count, data!output, work!done;
+integer inbrk, ufdchn, dskchn, Aux, AuxWait;
+integer LogChan, LogEof, LogPages, LogPage, LogLine;
+own safe integer array filelookup[ !RBCNT : !RBUNM+2 ];
+
+preset!with cvsix("SYS"),cvsix("LOGOUT"),0,0,0,0;
+Integer array runblock[0:5];
+
+Define	Debug=False;
+
+Define	CSI = {#Esc & "["};
+
+Define	Top={AuxOut('15&'14)}, Spaces = {"        "};
+
+Define	Go!Away={ifc debug thenc Calli( 0, Calli!EXIT )
+	    elsec if myppn = '3000003
+	    then Calli( location(runblock[0]), Calli!RUN )
+	    else Calli( 0, calli!EXIT ) endc};
+
+preset!with
+  "Wednesday","Thursday","Friday","Saturday","Sunday","Monday","Tuesday";
+string array Weekdays[ 1:7 ];
+
+preset!with
+  "January","February","March","April","May","June",
+  "July","August","September","October","November" ,"December";
+string array Months[ 1:12 ];
+
+string procedure trailer( integer N );	! assumes positive N ;
+  begin
+    if ( ( N div 10 ) = 1 ) then return( "th" )
+    else if (( N mod 10 ) = 1 ) then return( "st" )
+    else if (( N mod 10 ) = 2 ) then return( "nd" )
+    else if (( N mod 10 ) = 3 ) then return( "rd" )
+    else return( "th" );
+  end;
+string DateTime, WeekDay, DayMonthYear, TimeOfDay, LongDate;
+
+procedure DateTimeStuff;
+  begin
+    integer Today, Day, Month, Year, Zone;
+
+    Zone_ ldb( point( 6, calli( 6,calli!GETTAB ), 7 ) );
+    DateTime_ TymDay( Today_ CvtDTM( GetTDT, Zone, '20 ) );
+    DayMonthYear_ DateTime[1 for 9];
+    TimeOfDay_ DateTime[11 for 8];
+
+    Day_ cvd( DayMonthYear[1 for 2] );
+    for Month_ 1 upto 12
+     do if ( kequ( DayMonthYear[4 for 3], Months[ Month ][1 for 3] ) )
+	 then done;
+    Year_ cvd( DayMonthYear[8 for 2] );
+
+    LongDate_ Months[ Month ] & " " &
+		cvs( Day ) & Trailer( Day ) & ", " &
+		cvs( Year+1900 );
+
+    WeekDay_ WeekDays[ ( !lh( Today ) mod 7 ) + 1 ];
+
+  end;
+
+
+Simple Boolean Procedure PrinterJob;
+Begin "PrinterJob"
+    integer Job,Jobs,Me;
+
+    Me _ Call(0,"PJOB");
+    Jobs _ Calli(!Xwd('15,'11), calli!GETTAB ) -1;
+    if not !SKIP! then Jobs_1024;
+
+    for Job _ Jobs step -1 until 1 do
+	if not Job = Me
+	    and Calli( !xwd(Job,!gtaun), calli!gettab ) = '3000003
+	    and Calli( !xwd(Job,0), calli!gettab) land !bit(15)	! JLOG ;
+	    and kequ( "AUXSPL", cv6str( calli(!Xwd(Job,3), calli!gettab) ) )
+	    and Calli( !xwd(Job,0), calli!gettab ) < 0		! Running ;
+	then return(Job);
+    return(False);
+
+end "PrinterJob";
+
+simple procedure MyInit;
+begin "my init"
+    myppn  _ call(0,"GETPPN");		! Get my logged-in ppn;
+    login!name _ cv6str(calli(!gtunm,calli!gettab)) &
+		 cv6str(calli(!gtun1,calli!gettab));
+    Host _ cvs(Calli('33000011,calli!GETTAB));
+
+    if myjob_PrinterJob
+     then begin
+	print(Crlf,"[%AUXSPL already allocated in frame ",myjob,"]",Crlf);
+	Go!Away;
+     end;
+
+    open(ufdchn_getchan,"DSK",'17, 0,0, 0,0,Eof_true);	! handle error;
+    if Eof then begin
+	usererr(0,0,"Serious Problem -- DSK not available","C");
+	Go!Away;
+     end;
+
+end "my init";
+require MyInit initialization;
+
+Simple procedure DrawBox( String Extension );
+Comment
+The LN03 uses 720 decipoints per inch when reset (as poopsed to 300 pixels
+per inch).  The standard print area is 8.0 by 10.65 out of 8.5 by 11.0 inches.
+The top margin varies between 0.11 and 0.20 inches depending on how well the
+paper feeds.  The left and right margins are 0.25 inches each if the paper
+feeds in straight.  Offsets of plus or minus 0.08 inches have been observed.
+One batch of 3-hole drilled paper has the holes extending to 0.52 inches from
+the left edge.  Therefore the box is indented 0.50 inches from from the image
+area, which is 0.75 inches from the left edge.
+Width of lines = 1/30 inch @ 720 decipoints per inch = 24 decipoints
+;
+
+begin "draw box"
+
+    if ( kequ( Extension, "LSW" ) )	! landscape listing ;
+     then begin "landscape"
+
+! Horizontal edges at -0.25 and +8.25 from start of image area  (8.00 usable) ;
+!   Vertical edges at -0.39 and 10.64 from start of image area (10.25 usable) ;
+! (00.00,0.50) = 0000,0360 = top left corner (5400-24=5376, 7380-24=7356) ;
+! (10.25,7.50) = 7380,5400 = bottom right corner (5400-360=5040) ;
+		!   dir, X, Y, length, width ;
+	AuxOut( CSI &"0;0000;0360;7379;24!|" );	! Top left to right (by holes) ;
+	AuxOut( CSI &"0;0000;5376;7379;24!|" );	! Bottom left to right ;
+	AuxOut( CSI &"1;0000;0360;5040;24!|" );	! Left is 0.39 from "bottom" ;
+	AuxOut( CSI &"1;7356;0360;5040;24!|" );	! Right is 0.36 from "top" ;
+	AuxOut( CRLF & CRLF );			! So header is inside box ;
+
+     end "landscape"
+     else begin "tall"			! normal "portrait" printing ;
+
+! Horizontal edges at -0.15 and 10.90 from start of image area (10.75 usable) ;
+!   Vertical edges at -0.25 and +8.25 from start of image area  (8.00 usable) ;
+! (0.50,00.00) = 0360,0000 = top left corner (5400-24=5376, 7740-24=7716) ;
+! (7.50,10.75) = 5400,7740 = bottom right corner (5400-360=5040) ;
+		!   dir, X, Y, length, width ;
+	AuxOut( CSI &"0;0360;0000;5040;24!|" );	! Top left to right ;
+	AuxOut( CSI &"0;0360;7716;5040;24!|" );	! Bottom left to right ;
+	AuxOut( CSI &"1;0360;0000;7739;24!|" );	! Left top to bottom (holes) ;
+	AuxOut( CSI &"1;5376;0000;7739;24!|" );	! Right top to bottom ;
+
+     end "tall";
+
+end "draw box";
+Simple procedure SetTypeSize( String Extension );
+begin "set type size"
+
+    if ( kequ( Extension, "LSW" ) )		! landscape listing ;
+     then begin "landscape"
+
+	AuxOut( CSI &"?21 J"& CSI &"15m" );	! at least 132 columns wide ;
+	AuxOut( CSI &" G" );			! Use normal font settings ;
+	AuxOut( CSI &"4;64r" );			! force 60 lines per page ;
+
+     end "landscape"
+     else if ( kequ( Extension, "LS8" ) )	! 8 lines per inch ;
+      then begin "8 LPI"
+
+	AuxOut( CSI &"?20 J"& CSI &"15m" );	! 8.5 lpi x 13.6 cpi ;
+	AuxOut( CSI &" G" );			! Use normal font settings ;
+	AuxOut( CSI &"9;0s" );			! 100 columns wide ;
+	Auxout( CSI &"4;0r" );			! allow 85 lines per page ;
+
+      end "8 LPI"
+     else begin "tall"				! normal "portrait" mode ;
+
+	AuxOut( CSI &"?20 J"& CSI &"14m" );	! 12 characters per inch ;
+	AuxOut( CSI &" G" );			! Use normal font settings ;
+	AuxOut( CSI &"9;0s" );			! 88 columns (80 centered) ;
+	AuxOut( CSI &"4;64r" );			! force 60 lines per page ;
+
+     end "tall";
+
+end "set type size";
+Simple procedure StartCircuit;
+begin "start circuit"
+
+    if ( kequ( AuxDev, "TTY" ) )
+     then AuxPort_ Aux_ -1
+     else while not( NTQ! ) and ( 0 > Aux_ CreAux( AuxDev ) )
+	   do Calli( !Xwd( '201,30 ), calli!HIBER );
+
+    if Aux > 0 then begin
+      AuxFlg_ 0;			! only send balls on pages ;
+      IntAux( Aux );			! setup interrupts for circuit ;
+      AuxOut( CSI &"!p" );		! soft reset ;
+      AuxOut( CSI &"?7l" );		! disable auto wrap ;
+    end;
+
+end "start circuit";
+
+
+Simple procedure StopCircuit;
+begin "stop circuit"
+
+    if Aux > 0 then AuxOut(CSI&"?7h");	! re-enable auto wrap ;
+    AuxZap;				! zap the circuit ;
+    calli( 1, calli!SLEEP);		! wait for zap interrupt to come in ;
+    IntZap;				! clear interrupts ;
+
+end "stop circuit";
+
+Boolean Procedure WantFile( Reference integer File, Ext );
+Return( not NTQ! );			! any file is OK ;
+
+
+Simple Procedure HeaderPage;
+Begin "Header Page"
+  If ( kequ( AuxDev, LPAUX ) )
+   then begin
+    AuxOut( HeadMessage );
+    AuxBlk( Author, 1,1, 0, 1,0, 3,0 );
+    AuxBlk( FileName, 1,1, 0, 1,0, 3,3 );
+    AuxOut( HeadMessage );
+    AuxBlk( WeekDay, 1,1, 0, 1,0, 3,3 );
+    AuxOut( HeadMessage );
+    AuxBlk( DayMonthYear, 1,1, 0, 1,0, 3,3 );
+    AuxOut( HeadMessage );
+    Top;
+   end
+   else begin
+    AuxOut( "HEADER" );
+    Print( "** Header **", Crlf )
+   end;
+End "Header Page";
+
+Simple Procedure TrailerPage;
+If ( kequ( AuxDev, LPAUX ) )
+ then Begin "Trailer Page"
+    AuxOut( TailMessage );
+    AuxBlk( Author, 1,1, 0, 1,0, 3,0 );
+    AuxBlk( FileName, 1,1, 0, 1,0, 3,3 );
+    AuxOut( TailMessage );
+    AuxBlk( "Finished", 1,1, 0, 1,0, 3,0 );
+    AuxBlk( DayMonthYear, 1,1, 0, 1,0, 3,0 );
+    AuxBlk( "   "&TimeOfDay, 1,1, 0, 1,0, 3,3 );
+    AuxOut( TailMessage );
+    Top;
+ End
+ Else Begin
+    AuxOut( "Trailer" );
+    Print( "Trailer", Crlf )
+ End;
+Procedure Each!file( Reference integer dskchn, S.Width, Brk, Eof;
+			integer array LKB );
+Begin "Each File"
+    Own Integer Decext, MoreText, Lines, Break, LastBrk, Eot;
+    Own String Extension, Ours, TextLine;
+
+    String procedure get!line;
+    begin	! warning: does not handle overprinted lines correctly ;
+	If not MoreText				! if buffer empty;
+	 then begin				!  then get more;
+	    Ours_ input( dskchn, inbrk );	!   read part of a line;
+	    While not Eof and			!   while not at Eof;
+	      Brk neq #LF and Brk neq #FF	!   and not a line-break;
+	     do Ours_ Ours &
+		      input( dskchn, inbrk );	!   add to line + more input;
+	 end
+	 else Ours_ Ours[S.Width+1 to INF];	!  else clip buffer;
+	MoreText_ Length( Ours ) > S.Width;	! if too many characters;
+	Break_ If MoreText then #LF else Brk;	! set break and;
+	Eot_ Eof and (not MoreText);		!  Eot flags appropriately;
+	Return( Ours[1 to S.Width]		! Return a line;
+		& (If Length( Ours ) or		!  ...if non-blank;
+		      Brk neq #FF		!      or not a FF;
+		    then Crlf else "") );	!  ...add a CRLF;
+    end;
+
+    If NTQ! then Return;			! Don't start when evicted ;
+
+    Eot_ data!output_ MoreText_ false;		! Clear file flags ;
+
+    Author_ CvUser( LKB[!RBAUT] );
+    Extension_ cv6str( LKB[!RBEXT] land '777777000000 );
+    Filename_ cv6str( LKB[!RBNAM] ) & "." &
+	(if ( kequ( Extension, "LS8" ) or kequ( Extension, "LSW" ) )
+	  then "LST"
+	  else Extension);
+
+    DateTimeStuff;
+    HeadMessage := "** " & "(" & Author & ":" & Host & ")" &
+		    Filename & ", printed " & WeekDay & ", " &
+		    LongDate & " at " & TimeOfDay & " **" & Crlf;
+
+    StartCircuit;			! setup device, wait if port is busy ;
+    If NTQ! then Return;		! evicted while waiting for printer ;
+
+    LogInfo( " Started ("& Author &")"& Filename );
+
+    SetTypeSize( Extension );		! default type size ;
+    DrawBox( Extension );		! draw a box on header page ;
+    HeaderPage;				! print headers - once ;
+    LogPages_ 1;			! count from 1 ;
+    LastBrk_ #FF;			! initialize to top ;
+
+    SetTypeSize( Extension );
+
+    do begin "reading and writing"
+
+	TextLine_ Get!line;		! get a line from the file;
+	If not Eot or length(TextLine)	! ? End of Text or null line;
+	 then begin "Counting breaks"
+	    if ( length(TextLine) )	! print a line of data if any ;
+	     then AuxOut( TextLine );
+	    If break = #LF		! for normal "or" overflow;
+	     then Lines_ Lines + 1;	!  then increment lines;
+	    If break = #FF		! if form-feed;
+	     then begin "do FF"		!  then do page-advance;
+		Break_ #FF;		! change break char;
+		Lines_ 0;		! reset line counter;
+		LogPages_ LogPages + 1;	! count pages printed;
+		If LastBrk neq #FF or	! if FF not after FF;
+		   (length(TextLine) and (Textline neq #CR))
+		 then begin
+		    AuxOut( #FF );	!  then advance the frame;
+		    If RPGSW
+		     then Print( Crlf, "<FF>", Crlf );
+		end
+	     end "do FF";
+	    LastBrk_ break		! copy breaks;
+	 end "Counting breaks"
+
+     end "reading and writing" until Eot or NTQ! or CZAP!;
+
+    DateTimeStuff;
+    TailMessage _ "** (" & Author & ":" & Host & ")" &
+		    Filename & " printed " & WeekDay & ", " &
+		    LongDate & " at " & TimeOfDay & " **" & Crlf;
+
+    If not CZAP! then
+     begin "printer still there"
+      if NTQ! then AuxOut(CRLF&CRLF&"**** Print job aborted ****"&CRLF);
+      if not NTQ! then data!output_ work!done_ true;
+      if break neq #FF then AuxOut( #FF );
+      SetTypeSize( extension );		! reset for trailer ;
+  !   TrailerPage;			! TrailerPage disabled for now ;
+    end "printer still there";
+
+    if NTQ! then LogInfo( " - Notice to quit - File aborted");
+    LogInfo( " Finished ("& Author & ")" & Filename &
+	     " Printed: "& cvs(LogPages) &" pages." );
+
+    if data!output
+     then begin
+	if decext_ cvd(extension) > 001
+	 then LKB[!RBEXT]_ Cvsix(cvs(decext-1)[1 for 3]) lor !rh(LKB[!RBEXT])
+	 else LKB[!RBNAM]_ 0;
+	LKB[!RBNAM]_ 0;		! Always delete file (for now) ;
+	Chnior( dskchn, LKB[!RBCNT], !chREN );
+     end;
+     close(dskchn);
+
+    StopCircuit;
+
+end "Each File";
+Procedure Create!Printer!Fork;
+begin "setframe"
+    Integer Frame, Framerror;
+    String FrameName;
+
+    FrameName_ "LPQ";
+    if not( kequ( FrameName, Login!Name ) )
+     then begin
+	Frame_ CreFrm(FrameName);
+	If not !SKIP!
+	 then begin
+	    CtyLog("[AuxSpl: Cannot login to "&FrameName&"]"&Crlf);
+	    usererr(0,0,"[AuxSpl: Cannot login to "&FrameName&"]","X");
+	 end;
+	Framerror_ RunFrm( Frame, "LPTSPL", "AUXSPL", 0 );
+	If not Framerror and !SKIP!
+	 then CtyLog("[AuxSpl: Started in frame "&Cvs(Frame land '777)&"]"&Crlf)
+	 else begin
+	    CtyLog("[AuxSpl: Run error for (LPTSPL)AUXSPL, Status: "&
+			Cvos(Framerror)&"]"&crlf);
+	    Framerror _ RunFrm(Frame,"SYS","LOGOUT",0);
+	    If not Framerror and !SKIP!
+	     then CtyLog("[AuxSpl: Frame "&Cvs(Frame land '777)&" logged out]"
+			&crlf)
+	     else
+		CtyLog("[AuxSpl: Run error for (SYS)LOGOUT, Status: "&
+			Cvos(Framerror)&" in frame "& cvs(frame land '7777)&
+			"]"&Crlf);
+	end;
+    End;
+
+    Go!Away;
+
+end "setframe";
+! Start of main program ;
+
+if ( myppn neq '3000003 )		! If not logged in as LPQ[3,3] ;
+ then Create!printer!fork;
+
+SetLog( "(CARL)AUXSPL.LOG" );
+
+setbreak(inbrk_getbreak,#LF&#FF,null,"FINS");
+IFCR TTBUG
+ thenc
+    Print( "What device to print on: " );
+    AuxDev_ Inchwl;
+ elsec
+    AuxDev_ LPAUX;
+ endc
+
+IntIni( ItemProcess );			! Initialize process item ;
+IntNTQ( true );				! Watch for notice-to-quit ;
+IntTrace( RPGSW );			! Trace balls  if start+1 ;
+DateTimeStuff;				! setup initial time clock;
+LogInfo(" ------- Started " & Weekday & ", " & LongDate);
+
+MfdSet( '0, 4, 0, 132*2 );		! Mode, Ibuf, Obuf, LineWidth ;
+
+while not NTQ!				!  then loop till done.   ;
+ do begin
+
+    work!done _ false;
+    UfdScn( myppn, cvsix("*"), cvsix("*"), -1, WantFile, Each!File );
+    If NTQ! then Done;			! Stop when evicted ;
+    If not work!done then
+      Calli(!XWD('201,30),calli!HIBER);	! sleep when UFD is empty ;
+
+end;
+
+DateTimeStuff;				! set time clock ;
+
+If NTQ!					! print shutdown message ;
+ then CtyLog( " Shutting down spooler for " &
+	    AuxDev & Crlf & DateTime &
+	    " Received notice to quit." & Crlf & Crlf );
+LogInfo( " ------- Stopped " & Weekday & ", " & LongDate & CRLF );
+
+Go!Away;
+
+end "Auxspl";
+     
