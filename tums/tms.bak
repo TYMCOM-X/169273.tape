@@ -1,0 +1,1264 @@
+begin        "TMS"
+
+
+
+comment 
+  fix RTS kludge
+  RTS to a telex station still can't work.
+;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "ARGS.REQ" source!file;
+require "AUXLIB.REQ" source!file;
+require "MAILIB.REQ" source!file;
+require "MAILOG.REQ" source!file;
+require '57 version;
+require 1024 system!pdl;
+require 512 string!pdl;
+
+! v57 31-Aug-88 RFM     Add dial digits capability for FAX
+! v56 22-Feb-88 RFM     Make e-mail max line length 63 in tums header
+! v55 22-Feb-88 RFM     Make e-mail max line length 75 in tums header
+! v54 28-Jul-87 RFM     Use timeout as basis for read end (in addition to
+                        expecting form feed) -- use original sender when
+                        message is forwarded from Long Beach;
+! v53 26-Jul-87 RFM     Fix RTS bug -- check if from is null when adding
+                        @tms.tymnet
+! v52 23-Jul-87 RFM     Change RTS to nobody test and blank line test;
+! v51 20-Jul-87 RFM     Fix to report usual "no domain..." instead of going 
+                        to badMsg when recipients are not found.
+                        Report only first to line of ATA/IATA with no recips;
+! v50  5-Jun-87 RFM     Screen out NNNN when sending msgs--this is a
+        delimiter;
+!                           correctly flush responses when message rejected; 
+!                           redo sndmsg retry to conform to TMS "enhancement"
+! v47  4-Jun-87 RFM     Make telex max line length 63 (in tums header)
+! v46 23-May-87 WRS	Use RCPT not fpath;
+! v45 18-May-87 WRS	Don't log if zap with no text received;
+! v44 18-May-87 WRS	Shortened default poll to prevent inactivity timeout;
+! v43                        no history;
+
+comment
+        dupsup - define allocations for duplication-suppression mechanism
+;
+define        dupsup!items = 200;
+require dupsup!items+50 new!items;
+require dupsup!items%8 buckets;
+list        dupsup!list;
+
+
+item RUN;                        ! must specify or will logout;
+string item QUEUEFILE;
+string item LOGINSTRING;
+string item ID;
+string item PASSWORD;
+integer item POLL.SECS;
+integer item CONNECT.HRS;
+item PURGE;
+item HOLD;
+item TRACE;
+item WAIT;
+
+define timeout = 60;
+define readtimeout = 15;
+define responseTimeout = 6;
+
+procedure Logit( string s1(null), s2(null), s3(null), s4(null), s5(null) );
+begin
+    if props(TRACE) then
+        print( s1, s2, s3, s4, s5 );
+    cprint( LogChan, s1, s2, s3, s4, s5 );
+end;
+
+label CrashRestart;
+procedure Crash( string MSG(null) );
+begin
+    auxZap;
+    if length(MSG) then
+        Logit ( MSG, crlf );
+    Logit ( "?CRASH at ", maiDate, crlf );
+    if logDirty then logOpen;
+    goto CrashRestart;
+end;
+
+integer labelBrk;
+integer tokenBrk;
+integer lineBrk;
+integer trimBrk;
+integer trimCrlfBrk;
+integer tabBrk;
+integer parenBrk;
+integer trimNoiseBrk;
+integer tlxTokBrk;
+integer dotBrk;
+integer upCaseBrk;
+define turnch = {(17)};
+
+simple procedure brkini;
+begin
+    define ctlat = {(0)};
+    define ctls = {(0&1&2&3&4&5&6&7&9&11&14&15&16&17&18&19&20&21&22&23&24&
+        25&26&27&28&29&30&31&127)};
+    setbreak(labelBrk := getbreak,":>"," -._|"&#ht,"SIK");
+    setbreak(tokenBrk := getbreak,crlf&" ",crlf&" ","TIR");
+    setbreak(lineBrk := getbreak,#lf&#ff&turnch,#cr,"SIN");
+    setbreak(trimBrk := getbreak," "&#ht&crlf&#ff&turnch,null,"RX");
+    setbreak(trimCrlfBrk := getbreak,crlf&#ff&turnch,null,"RX");
+    setbreak(tabBrk := getbreak,#ht&#ff&crlf&turnch,null,"SIN");
+    setbreak(parenBrk := getbreak,")",null,"SIN");
+    setbreak(trimNoiseBrk := getbreak,null,ctlat& 127,"SIN");
+    setbreak(tlxTokBrk := getbreak," "," "& 1,"TIR");
+    setbreak(dotBrk := getbreak,".",null,"RI");
+    setbreak(upCaseBrk := getbreak,null,null,"SIK");
+end;
+require brkini initialization;
+
+boolean procedure lkequ( string S1,S2 );
+comment
+    lkequ -- compares the two strings ignoring case.  
+             S1 can be longer than S2 (and still match) but not shorter.
+;
+begin
+    return( kequ( S1[1 to length(S2)], S2 ) )
+end;
+
+procedure telexFormat( reference string S );
+comment
+    telexFormat -- pull the telex header (everything up to the first 
+        control B) out from the message text and place it in front
+        of the label fields.  The effect is that the TUMS header is
+        considered text in the context of telex delivery.  This also
+        works for multiple address format.
+        Note: on TMS the sequence @@a, @@b or @@q will be converted
+            to control a, b or q.
+;
+
+begin
+    integer I, F;
+    r!p(mai) M;
+    M := maiMParse( S );
+    S := null;
+    for I := 1 upto length(mai:Text[M]) do begin
+        if kequ( mai:Text[M][I for 3], "@@B" ) then F := 3
+        else if equ( mai:Text[M][I for 1], 2 ) then F := 1
+        else continue;
+        S := mai:Text[M][1 to I+F-1];              ! get telex hdr;
+        mai:Text[M] := mai:Text[M][I+F to inf];    ! strip from text;
+        done;
+    end;
+    S := S& maiMMake( M, 63 );                     ! rearrange the msg;
+end;
+
+string procedure tabExpand( string BUF );
+comment
+    standard TUMS procedure for doing tab expansion DEC-10 style
+;
+
+begin
+    integer B, NLPOS;
+    string SBUF;                ! working buffer;
+    string XTEXT;                ! expanded text;
+    XTEXT := null;
+    NLPOS := length( SBUF := BUF );
+    while length( BUF ) do begin
+        scan( BUF, tabBrk, B );
+        case B of begin        
+            [#ht] begin
+                integer I;
+                NLPOS := NLPOS - 1 + ( I := 8-(NLPOS-length(BUF)+7) mod 8 );
+                XTEXT := XTEXT &
+                    SBUF[1 to inf-length(BUF)-1] &
+                    "        "[1 for I];
+                SBUF := BUF;
+            end;
+            [else]
+                NLPOS := length(BUF)
+        end;
+    end;
+    return( XTEXT & SBUF );
+end;
+
+comment
+        dupsup!hash - hash a message into a message ID
+;
+string procedure dupsup!hash( r!p(mai)M );
+begin
+    string MID, S;
+    r!p(adr) A;
+    A := maiAParse( mai:From[M] );
+    MID := adr:User[A]& ".";
+    S := mai:Date[M];
+    while length(S) do begin
+        integer C;
+        C := lop(S);
+        if "0" leq C leq "9"
+            then MID := MID& C
+            else if C = " " and MID[inf for 1] neq "."
+                then MID := MID& ".";
+    end;
+    if MID[inf for 1] neq "." then MID := MID& ".";
+    adr:User[A] := MID& length(mai:Text[M]);
+    MID := maiAMake( A );
+    return( MID );
+end;
+
+boolean procedure dupsup( r!p(mai) M );
+begin
+    string MID;
+    boolean FLAG;
+    itemvar iv;
+    MID := dupsup!hash( M );
+    cvsi( MID, FLAG );
+    if not FLAG then return( true );
+    iv := new;
+    new!pname( iv, MID );
+    put iv in dupsup!list after inf;
+    if length( dupsup!list ) > dupsup!items then
+        delete( lop( dupsup!list ));
+    return( false );
+end;
+
+comment
+        Tokenize - fill the array with the tokens from the string
+
+        Tokens are separated by spaces, cr, and lf.
+        Either a definite or indefinite number of tokens and/or lines
+        may be specified for processing.  The number of tokens obtained
+        is returned, 0 in case of an error.
+;
+
+integer procedure Tokenize( reference string TEXT; string array A; 
+                            integer num.of.tkn(0), num.of.l(0) );
+                                ! number requested, any number if 0;
+begin        "Tokenize"
+    integer I,B,N,L;
+    string LN,T;
+    for I := 1 upto arrinfo(A,2) do A[I] := null;
+    I := 0;
+    for L := 1 upto (if num.of.l then num.of.l else 9999999) do begin "F"
+        LN := scan( TEXT, lineBrk, B );
+        if B = 0 then 
+            if num.of.l = 0 
+                then L := 9999999   ! loop for rest of this cycle only;
+                else begin
+                    Logit ( "?Tokenize: not enough lines; "& cvs(L-1)
+                        & crlf);
+                    return( 0 )
+                end;
+        T := scan( LN, tokenBrk, B);
+        while length(T) do begin
+            if I = arrinfo(A,2) then done "F";
+            I := I + 1;
+            A[I] := T;
+            T := scan( LN, tokenBrk, B);
+        end;
+    end; "F"
+    if (I = num.of.tkn)  or (num.of.tkn = 0)
+        then return( I )
+        else begin  
+            Logit ( "?Tokenize: expected "& cvs(num.of.tkn)&
+                " tokens, received "& cvs(I)& crlf );
+            return( 0 )
+        end;
+end        "Tokenize";
+
+
+internal boolean procedure tmsSync( string endMark (#ff) );
+!
+    Expect reply ending as specified
+;
+begin        "tmsSync"
+    string Txt;
+    integer B;
+    while true do case AuxRead( Txt, timeout ) of begin
+        [aux!Line] begin
+            Txt := scan(Txt, trimNoiseBrk, B);
+            if lkequ (Txt, endMark) then return ( true );
+            if lkequ (Txt, turnch) then return ( true );
+        end;
+        [else] begin
+            Logit ( "?tmsSync: unable to sync"& crlf );
+            return ( false);
+        end
+    end;
+end        "tmsSync";
+
+
+boolean procedure SIGNON;
+begin        "SIGNON"
+    integer READS,B;
+    string S,LOGON!LOG;
+    boolean KEY.sent, flush.pswd.mask;
+    flush.pswd.mask := KEY.sent := false;
+    READS := 0;
+    LOGON!LOG := null;
+    while true do case auxRead( S, timeout ) of begin
+        [aux!prompt] begin
+            LOGON!LOG := LOGON!LOG& S;
+            READS := READS + 1;
+            if READS > 10 then begin
+                Logit ( "?SIGNON: excessive reads"& crlf );
+                return( false );
+            end;
+            if lkequ(S,"please log in: ") then continue;
+            if lkequ(S,"Name?") then Crash ( "?SIGNON: "& (if KEY.sent
+                            then "bad Password" else "bad Name")& crlf
+                            & LOGON!LOG)
+            else if flush.pswd.mask and lkequ(S[inf-16 for 17],
+                           "++++++++++++++++"& #cr) then begin
+                    Auxout(datum(PASSWORD));
+                    Auxout(#cr);
+                    KEY.sent := true;
+                 end
+            else begin
+                 LOGON!LOG := LOGON!LOG& crlf& "?bad prompt"& crlf;
+                 Logit ("?SIGNON: bad prompt: """,S,""""&crlf);
+                 return( false );
+            end;
+            LOGON!LOG := LOGON!LOG& crlf;
+        end;
+        [aux!line] begin
+            S := scan(S, trimNoiseBrk, B);
+            if length(S) > 2 
+                then LOGON!LOG := LOGON!LOG& S
+                else continue;
+            if lkequ(S,"network: call cleared") then begin
+                Logit ( "?SIGNON: call cleared"&crlf& LOGON!LOG );
+                return( false );
+            end; 
+            if lkequ(S,"PLEASE SIGN ON") then begin
+                LOGON!LOG := LOGON!LOG& datum(ID)& crlf;
+                AuxOut(datum(ID));
+                AuxOut(#cr);
+            end
+            else if lkequ(S,"Password?") then flush.pswd.mask := true
+            else if lkequ(S,"Press RETURN for the Main Menu") then begin
+                tmssync;
+                done
+            end
+            else if lkequ(S,"Already on") then begin
+                Logit ("?SIGNON: already signed on",crlf );
+                return( false )
+            end
+            else if lkequ(S,"WARNING - You still") then Auxout("YES"& #cr)
+        end;
+        [aux!zap] begin
+            if length(LOGON!LOG) then
+		Logit ( "?SIGNON: zapped", crlf, LOGON!LOG );
+            return( false );
+        end;
+        [aux!timeout] begin
+            Logit ( "?SIGNON: timeout", crlf, LOGON!LOG );
+            return( false );
+        end
+    end;
+end        "SIGNON";
+
+
+procedure LOGON;
+begin        "LOGON"
+    integer RETRIES;
+    label RETRY;
+    RETRIES := 0;
+    while AuxPort leq 0 do begin
+        if maiHost = "B"        ! Bubbnet? ;
+            then begin 
+                creaux( '4 & "f" & #cr );  
+                AuxOut( '4 & datum(loginString)& #cr );
+            end
+            else creaux( '4 & datum(loginString)& #cr );
+        if !SKIP! then done;
+RETRY:        auxZap;
+        calli( !xwd(1,
+            case RETRIES of (4,8,16,32,64,128,256,512,[else]1024)
+            ), '72 );
+        RETRIES := RETRIES + 1;
+    end;
+    if RETRIES then
+        Logit ( "[LOGON failed ", cvs(RETRIES), " times]"& crlf );
+    if not SIGNON then goto retry;
+end        "LOGON";
+
+
+comment
+        AdrComments - add comments to address field
+;
+
+procedure AdrComments(
+        reference string Adr;
+        string A);
+begin
+    if length(A) and length(Adr) then
+        Adr := A& ( if Adr = "<" or Adr[inf for 1] = ">"
+            then Adr
+            else "<"& Adr& ">" );
+end;
+
+procedure ParseMsg( reference string RawMessage );
+  
+  comment
+  
+       Parse the message, which may be in e-mail, ATA/IATA, or
+  ATA/IATA telex format.  Telex is defined as having a telex header, i.e.
+  a text area containing a service designator (e.g. TLX) and terminated by 
+  control-B.
+       The message may be a Western Union Infocom response message
+  indicating acceptance or rejection of a previous TUMS message for
+  telex.  If it is a rejection, an RTS is generated for the message.
+  Rejections have the word "rejected" on the beginning of a line before any 
+  tums labels or telex delimitors are seen, and are in ATA/IATA format.
+  This is followed by an infocom rejection reason, and then the rejected
+  message with its header framed by ctrl-a and ctrl-b.  This header is
+  used to generate an RTS.
+       Acceptances have "accepted" before any tums labels are seen.
+  Acceptances are ignored.
+       If the message does not fit one of the above formats an RTS
+  is generated for the message.
+       In ATA/IATA format, the address codes do not have a terminating
+  delimitor, so the appearance of the first user label (to, cc, or 
+  subject) is taken as the signal for the end of the address field.
+       In telex format, the end of the address codes is right before
+  the beginning of the telex header, which is framed by control-A
+  and control-B.
+  
+  
+  e.mail tokenize results         ATA/IATA tokenize results
+
+       MDC MAIL                   4466371 003  1247PM 22JUL86
+       1   2                      1       2    3      4
+    1804PM 15JUL86                TUMSGATE 0003  1303PM 22JUL86 MSQ 031250
+    3      4                      5        6     7      8       9   10
+    DOCUMENT # 017782             
+    5        6 7                  
+    4466371 SEQUENCE NBR 011      
+    8       9        10  11       
+
+;
+                
+begin
+    r!p(mai) M;
+    integer B,stepno,I,T,count;
+    string S,S1,Field,oldField,FieldId,Msg#,TXT,x,HostId;
+    string firstToLine;         ! report only the first to line if a bad  ;
+                                ! msg in ATA/IATA format ;
+    boolean e.mail;          comment e-mail message;
+    boolean more.addr.ok;    comment receiving e-mail addresses currently;
+    boolean ok;
+    string array A[1:40];
+    string array A2[1:100];
+    label noread, getAddr, badMsg, rejectMSG;
+    M := new!record( mai );
+    mai:Rcpt[M] := null;
+    firstToLine := null;
+    e.mail := false;
+    more.addr.ok := false;
+    stepno := 0;
+    TXT := RawMessage;
+    while true do begin
+        field := scan( TXT, lineBrk, B );
+        if length(field) and not lkequ("               ",field) then
+             noread: case stepno of begin
+                [0] begin
+                    e.mail := lkequ (Field, "--------");
+                    stepno := 1;
+                    if e.mail 
+                        then continue 
+                        else goto noread
+                end;
+                [1] begin
+                    TXT := Field& crlf& TXT;
+                    if e.mail 
+                        then ok := Tokenize( TXT,A,11,4 )
+                        else ok := Tokenize( TXT,A,10,2 );
+                    if not ok then begin
+                        Logit ( "?ParseMsg: Tokenize failed"& crlf );
+                        goto badMsg;
+                    end;
+                    if e.mail
+                        then mai:Message.ID[M] := A[7]& "@TMS.Tymnet"
+                        else begin
+                            mai:From[M] := A[1]; ! rest added later;
+                            mai:Date[M] :=  A[4]& " "& A[3];
+                            mai:Message.ID[M] := A[10]; ! rest added later;
+                            mai:Subject[M] := null;
+                        end;
+                    stepno := 2;
+                end;
+                [2] begin
+                    oldField := Field;  ! save the field because the     ;
+                                        ! action of looking for a label  ;
+                                        ! chops off the field's head     ;
+                    FieldId := scan( Field, labelBrk, B );
+                    if e.mail then begin
+                        lop(Field); 
+                        if kequ( FieldId, "FROM" ) then begin
+                            mai:From[M] := scan( Field, tokenBrk, B )
+                                & "@TMS.Tymnet";
+                            lop(Field);
+                            if Field = "(" 
+                                then begin
+                                    lop(Field);
+                                    oldField := null;
+                                    S := scan(Field,parenBrk,B);
+                                    while B do begin
+                                        oldField := Field;
+                                        S1 := scan(Field,parenBrk,B);
+                                        if B then S := S& ")"& S1;
+                                    end;
+                                    AdrComments(mai:From[M],S& " ");
+                                end 
+                                else oldField := Field;
+                            T := Tokenize( oldField, A );
+                            mai:Date[M] := A[T]& " "& A[T-1]; ! s/b 2 and 1;
+                            continue;
+                        end;
+                        if kequ(FieldId, "ADDRESS(S)"n begin
+                            more.addr.ok := true;
+                            goto getAddr;
+                        end;
+                        if kequ( FieldId, "REFERENCE" ) then begin
+                            more.addr.ok := false;
+                            ! mai:Subject[M] := Field[2 for 16];
+                            continue;
+                        end;
+                        if lkequ( FieldId, "******") 
+                            then done;
+                        if not more.addr.ok then begin
+                            Logit ( "?ParseMsg: unexpected label;",
+                                crlf, FieldId, crlf);
+                            goto badMsg;
+                        end;
+                    end
+                    else if kequ( FieldId,"SUBJECT" )  ! signals end of addr ;
+                        or kequ( FieldId,"SUBJ" )      ! (in ATA/IATA format);
+                        or kequ( FieldId,"SBJT" )
+                        or kequ( FieldId,"SBJ" )
+                        or kequ( FieldId,"RE" )
+                        or kequ( FieldId,"RECEIVED" )
+                        or kequ( FieldId,"TO" )
+                        or kequ( FieldId,"CC" )
+                        or lkequ( FieldId,"ZCZC" ) ! end of addr in telex fmt;
+                        or FieldId = 1     ! ctrl-a, end of addr in telex fmt;
+                        then begin
+                            TXT := oldField& crlf& TXT;
+                            done;
+                        end;
+                    Field := oldField;
+                    if lkequ( Field, "***" ) then continue;
+                    if lkequ( Field, "REJECTED" ) then begin
+                        stepno := 3;  ! steps 3 & 4 are for collecting ;
+                        S := null;    ! INFOCOM rejection info ;
+                        continue;
+                    end;
+                    if lkequ( Field, "ACCEPTED" ) then begin
+                        stepno := 99;  ! flush message, INFOCOM acceptance;
+                        continue;
+                    end;
+                        
+        getAddr:    T :=Tokenize (Field, A);
+                    for I := 1 upto T do
+                        if not kequ(A[I],"TUMSGATE") then
+                            maiCatList( mai:To[M], A[I]&"@TMS.Tymnet" );
+                    if length(firstToLine) = 0 then firstToLine := mai:To[M];  
+                end;
+                [3] if Field = 1 ! ctrl-a; 
+                    or lkequ(Field,"ZCZC")
+                    then begin
+                        S1 := Field& crlf;  ! start collecting telex hdr ;
+                        stepno := 4         ! of infocom response        ;
+                    end
+                    else S := S& Field& crlf;   ! collect infocom response;
+                [4] if Field = 2 then begin
+                        TXT := Field[2 to inf]& crlf& TXT;
+                        goto rejectMSG
+                    end
+                    else S1 := S1& Field& crlf;
+                [99]
+            end;   ! end of case stmt;
+        if length(TXT) = 0 then done; ! can happen if no field id found ;
+                                      ! (in ATA/IATA format), or if an  ;
+                                      ! INFOCOM rejection is not in the ;
+                                      ! expected format                 ;
+    end; ! while true;
+
+    if (stepno = 3) or (stepno = 4) then begin
+        Logit( "?ParseMsg: reject parse error..."& crlf& RawMessage);
+        return;
+    end;
+    
+    if stepno = 99 then return;
+    
+comment
+
+    Scan the text area for (1) indication of telex format (service
+    designator), (2) subject label, and (3) to or cc labels (required).
+    Up to the first 10 nonblank lines will be searched for a service desg.
+    as the first token.  If a svc. desg. is found, the sender's domain
+    (HostId) is set to TMSTLX.  The telex header is then flushed from
+    scanning for labels until control B is seen.  At this point a label
+    must appear or RTS "no domain-style address" is generated.
+    If no service designator or subject/to/cc label is found in 10
+    lines, the same RTS is generated.
+;
+
+    scan( TXT, trimCrlfBrk, B );
+    mai:Text[M] := TXT;
+    HostId := "TMS";
+    if lkequ(mai:Text[M][1 to 15],"Received: from ") then begin
+        M := maiMParse (TXT);
+        TXT := mai:Text[M];
+        mai:Received[M] := 
+            "Received: from "& HostId& ".Tymnet by "&
+            maiHost& "."& maiNet& "; "& maiDATE& crlf&
+            mai:Received[M];
+    end
+    else mai:Received[M] := null;
+    ! now if 4th from last token in text is slfox, make 8th from last the     ;
+    !  new from field  ;
+    if not e.mail then begin
+        S := TXT[inf - 199 for 200];           ! avoid destroying TXT;
+        I := tokenize( S, A2 );
+        if I geq 8 then if equ(A2[I - 3], "SLFOX") then
+            mai:From[M] := A2[I - 7];
+    end;
+    
+    count := 0;
+    while length( TXT ) and count < 10 do begin
+        string SaveTXT,Field2;
+        SaveTXT := TXT;
+        Field2 := Field := scan( TXT, lineBrk, B ); 
+        Field2 := scan( Field2, tlxTokBrk, B );
+        if e.mail and  
+          (kequ(Field2,"TLX") or            ! look for service designator;
+           kequ(Field2,"TWX") or
+           kequ(Field2,"ZIP") or
+           kequ(Field2,"PMS"))
+            then HostId := "TMSTLX";
+        if kequ( HostId , "TMSTLX") then
+            if Field neq 2 ! ctrl-B;
+                then continue      ! flush telex hdr fields so they don't ;
+                else begin         ! accidentally terminate hdr gathering ;
+                    lop(Field);
+                    lop(SaveTXT);  ! this is so ctrl-B will be retained when ;
+                                   ! savetxt is used below ;
+                    count := 9     ! set up for termination if no label found;
+                                   ! in the line AFTER the ctrl-B, but allow ;
+                                   ! a label on the same line as the ctrl-B. ;
+                end;           
+        
+        FieldId := scan( Field, labelBrk, B ); ! gather user labels in hdr;
+        if B then begin
+            if equ(FieldId,"SUBJECT")
+            or equ(FieldId,"SUBJ")
+            or equ(FieldId,"SBJT")
+            or equ(FieldId,"SBJ")
+            or equ(FieldId,"RE") then begin
+                count := 9;
+                scan( Field, trimBrk, B );
+                if length( Field )
+                    then mai:Subject[M] := (if length(mai:Subject[M])
+                        then mai:Subject[M]& crlf& #ht
+                        else null )& Field;
+            end;
+
+            ! if kequ(Field[inf-5 to inf],"(TUMS)") and   ** disabled;
+
+            if ( kequ(FieldId,"TO") or kequ(FieldId,"CC") ) then begin
+                count := 9;
+                mai:Text[M] := mai:Text[M][1 to inf-length(SaveTXT)]& TXT;
+                                ! join everything scanned so far (without  ;
+                                ! the current line) to everything after the;
+                                ! current line, i.e. delete current line   ;
+
+            !   Field := Field[1 to inf-6]   ** disabled;
+
+                while length(Field) do begin
+                    r!p(adr) A;
+                    string SA;
+                    A := maiAParse( SA := maiAScan( Field, B ));
+                    if not (lkequ(adr:user[A],"TUMSGATE")
+                        and lkequ(adr:host[A],"TMS")) then begin
+                        maiCatList( mai:RCPT[M], maiAMake( A ));
+                        case FieldId of begin
+                            ["T"]["t"] maiCatList( mai:To[M], SA );
+                            ["C"]["c"] maiCatList( mai:Cc[M], SA )
+                        end;
+                    end
+                end
+            end
+            else count := count + 1;  ! unrecognized label ;
+        end
+        else count := count + 1;      ! line without label ;
+    end; ! while length(TXT) ;
+    
+    if length(mai:Received[M]) = 0 then
+        mai:Received[M] := 
+            "Received: from "& HostId& ".Tymnet by "&
+            maiHost& "."& maiNet& "; "& maiDATE& crlf;
+
+    if not e.mail then begin
+        if length(mai:From[M])     
+            then mai:From[M] := mai:From[M]& "@"& HostId& ".Tymnet";
+        mai:Message.ID[M] := mai:Message.ID[M]& "@"& HostId& ".Tymnet";
+    end;
+    
+    if equ(mai:Text[M][inf-41 for 42],
+        "----------------------------------------"&crlf) then 
+        mai:Text[M] := mai:Text[M][1 to inf-42];
+
+comment
+
+    The following code covers debugging features and RTS generation
+
+;
+
+    if not dupsup( M ) then begin
+        if props(TRACE) or props(WAIT) then begin
+            print( #cr&
+                "================================================"& crlf,
+                maiMMake( M ),
+                "================================================"& crlf );
+            if props(WAIT) then begin
+                print( "<CR> to continue, ^C to abort, PURGE to discard: " );
+                x := inchwl;
+                if lkequ(x, "PURGE") then return;
+            end;
+        end;
+        if length(mai:RCPT[M])
+            then maiQueue( M )
+            else begin
+                if length(mai:From[M])
+                and not lkequ(mai:from[M],"TUMSGATE@TMS") 
+                and not lkequ(mai:from[M],"Postmaster") then begin
+                    if not e.mail then mai:To[M] := firstToLine;
+                    maiRTS( M, "No domain-style [RFC-819] address found;",
+                        "unable to forward message.  Address expected as",
+                        "'TO: [TUMS-address]' in first line of message body.");
+                end;
+                if props(TRACE) then
+                    print( "%RTS: no addresses specified"& crlf );
+                Logit ( "%RTS: no addresses specified by "& mai:from[M]& crlf);
+            end;
+        mai:Text[M] := null;
+        Logit ( maiMMake( M ) );
+    end
+    else begin
+        Logit ( "[duplicate suppressed]"& crlf );
+        if props(TRACE) then print( "[duplicate suppressed]"& crlf );
+        if props(WAIT) then begin
+            print( "<CR> to continue, ^C to abort: " );
+            inchwl;
+        end;
+    end;
+    return;
+    rejectMSG:
+        M := maiMParse( TXT );          ! parse without telex header ;
+        mai:Text[M] := S1& mai:Text[M]; ! put telex header back on ;
+        Logit ("%ParseMsg: INFOCOM rejection to "& mai:From[M]& crlf);
+        if mai:from[M] then maiRTS( M,
+            "The receiving mail station returned the "&
+            "following error message:"& crlf& S);
+    return;
+    badMsg: if mai:from[M] 
+            and not lkequ(mai:from[M],"TUMSGATE@TMS") 
+            and not lkequ(mai:from[M],"Postmaster") then begin
+                if not e.mail then mai:To[M] := firstToLine;
+                maiRTS( M, 
+                "The message was not in one of the expected formats -- "&
+                    "E-Mail or ATA/IATA.");
+            end;
+            Logit ( "?ParseMsg: bad message"& crlf, RawMessage);
+end;
+
+comment
+        RCVMSGs - collect output of TMS read and call msg parser
+
+;
+
+boolean procedure RCVMSGs;
+begin
+while true do begin        "RCVMSGS"
+    integer B;
+    string S, lastffline;
+    string MsgBuf;
+    AuxOut( ":READ"& #cr );
+    MsgBuf := null;
+    lastffline := null;
+    while true do
+        case AuxRead ( S, readtimeout ) of begin
+            [aux!Zap] begin
+                Logit ( "?RCVMSGS: lost circuit"&crlf );
+                return( false );
+            end;
+            [aux!Line] begin
+                if length(lastffline) then begin   ! not done yet, tack it on;
+                    msgbuf := msgbuf& lastffline;
+                    lastffline := null;
+                end;
+                S := scan(S, trimNoiseBrk, B);
+                if (S[inf for 1] = #ff)
+                or (S[inf for 1] = turnch)
+                    then lastffline := S
+                    else MsgBuf := MsgBuf& S;
+                if lkequ(S, "None at") then begin
+                    if props(TRACE)
+                        then Logit ( "%RCVMSGS: finished"& crlf );
+                    done "RCVMSGS";
+                end;
+            end;
+            [aux!Prompt] begin
+                AuxZap; 
+                Logit ( "?RCVMSGS: unexpected prompt"& crlf );
+                return( false );
+            end;
+            [aux!Timeout] begin
+                if length(lastffline) then done   ! ff plus timeout, done;
+                else begin                      ! timeout by itself is bad;
+                    AuxZap;
+                    Logit ( "?RCVMSGS: timeout"& crlf );
+                    return( false );
+                end
+            end
+        end;
+    while length(MsgBuf) and MsgBuf[inf for 1] leq " " do
+        MsgBuf := MsgBuf[1 to inf-1];
+    MsgBuf := MsgBuf& crlf;
+    Parsemsg( MsgBuf);
+end        "RCVMSGS";
+end;
+
+
+comment
+        SNDMSG - check for queued messages and send them
+;
+procedure SNDMSG( reference string MSG );
+begin
+    r!p(mai) M;
+    label ReQ;
+    label nextLine;
+    string S, S1, S2, FPath, SendList, Log;
+    string array A[1:10]; string array A2[1:40];
+    boolean MsgOK;
+    integer I, J, T, B;
+    string RTS!addrs, REQ!addrs;
+    string array dialStation[1:40]; string array dialDigits[1:40];
+    boolean array dialUp[1:40];
+    integer stcnt, stx, sttmp;
+    integer acnt;
+    boolean everyOther, deldial;
+    label NextRead, badprompt;
+
+    string CMD, FPath!;
+    label returnMsg;
+    r!p(adr) AD;
+    string RCPT, ota;
+
+    M := maiMParse(MSG);
+    FPath := mai:RCPT[M];
+    mai:RCPT[M] := mai:Bcc[M] := null;
+    Log := null;
+    RTS!addrs := null;
+    REQ!addrs := null;
+
+    while length( FPath ) do begin 
+
+        AuxOut( ":TEXT" & #cr );
+        AuxOut( mai:Subject[M] [1 for 16] & #cr );
+        S := maiMMake( M, 63 );
+        while length(S) do begin
+            string REC;
+            REC := tabExpand( scan( S, lineBrk, B ));
+            if equ( REC [inf-3 for 4], "NNNN" ) then   ! this is a kludge   ;
+                REC := REC [1 to inf-4];    ! (since we really want         ;
+                                            ! to find NNNNcr, not NNNNlf)   ;
+            AuxOut( REC& crlf );            
+        end;
+        AuxOut( "NNNN"& #cr );
+        if not tmsSync("Accepted at") then begin 
+            Logit ( "?SNDMSG: text mode error"& crlf);
+            goto ReQ;
+        end;
+
+        CMD := ":SEND";
+        SendList := null;
+        FPath! := FPath;
+        stcnt := 0;
+        acnt := 0;
+        while length( FPath! ) do begin
+            RCPT := maiAScan( S := FPath!, B );
+            AD := maiAParse( RCPT );
+            acnt := acnt + 1;
+            if length(adr:Subhost[AD]) then begin
+                ota := adr:Subhost[AD];
+                ota := scan(ota,upCaseBrk,B);   ! convert to upper case;
+                stcnt := stcnt + 1;
+                dialStation[stcnt] := ota;
+                dialDigits[stcnt] := adr:User[AD];
+                dialUp[acnt] := TRUE;
+            end
+            else begin 
+                ota := adr:User[AD];
+                ota := scan(ota,upCaseBrk,B);   ! convert to upper case;
+                dialUp[acnt] := FALSE;
+            end;
+            if length(CMD)+length(ota)+1 > 128 
+                then done;
+            FPath! := S;
+            CMD := CMD& " "& ota;
+            maiCatList( SendList, adr:User[AD] );
+        end;
+        MsgOK := false;
+        Log := Log& CMD& crlf;
+        AuxOut( CMD& crlf );
+        stx := 0;
+        everyOther := FALSE;
+        while true do 
+            NextRead: case AuxRead( S, timeout) of begin
+                [aux!Zap] begin
+                    maiQueue( M );
+                    Crash ( "?SNDMSG: lost circuit"& crlf& 
+                        "%delivery failed to "& mai:RCPT[M]& crlf& Log);
+                end;
+                [aux!Line] begin
+                    S := scan(S, trimNoiseBrk, B);
+                    if equ( S, #ff) or equ( S, turnch) then done;
+                    if length(S) leq 2 then continue;
+                    Log := Log & S;
+                    if lkequ( S, "Message rejected") then begin
+                        Logit ( "?SNDMSG: message rejected"& crlf,
+                            log );
+                        continue;
+                    end;
+                    if lkequ( S, "(" ) then begin  ! assume (gag) this is an ;
+                                                        ! invalid addr list ;
+                        S2 := S;
+                        tmsSync;         ! get thru noise here ;
+                        while AuxRead (S1, responseTimeout) = aux!Line do
+                            if length(S1) > 2 then S2 := S2& S1;
+                        Logit ( "?SNDMSG: extraneous rejection lines..."
+                            & crlf, S2 );
+                        log := log& S2;
+
+                        Tokenize(S, A);
+                        T := Tokenize(CMD, A2);
+                        if T > 1 then for I := 2 upto T do 
+                            if equ(A2[I][1 to 16],A[1][2 to inf]) then begin
+                                deldial := dialUp[I-1];
+                                CMD := ":SEND";
+                                for J := 2 upto I-1, I+1 upto T do begin
+                                    CMD := CMD& " "& A2[J];
+                                    ! bump dialup booleans down by 1 ;
+                                    ! cmd token I matches array entry I-1 ;
+                                    if J > I then 
+                                        dialUp[J-2] := dialUp[J-1];
+                                end;
+                                if deldial then begin
+                                    sttmp := 0;
+                                    ! get #of preceding dial stations in list ;
+                                    for J := 1 upto I-2 do
+                                        if dialUp[J] then sttmp := sttmp + 1;
+                                    for J := sttmp+1 upto stcnt-1 do begin
+                                        dialStation[J] 
+                                            := dialStation[J+1];
+                                        dialDigits[J] := dialDigits[J+1];
+                                    end;
+                                    stcnt := stcnt - 1;
+                                end;
+                                maiCatList( RTS!addrs, A2[I]& "@TMS.TYMNET" );
+                                log := log& CMD& crlf;
+                                AuxOut( CMD& crlf );
+                                stx := 0;
+                                everyOther := FALSE;
+                                goto NextRead;
+                            end;
+                        Logit ( "?SNDMSG: retry aborted"& crlf);
+                        goto nextLine;
+                    end;
+                    S1 := S;
+                    tokenize(S1,A);
+                    if lkequ(A[5] ,"accepted") and
+                        lkequ(A[6],"at") then continue;
+                    if lkequ( s[1 for 4], "Re:'") then begin
+                        MsgOK := true;
+                        T := Tokenize(s, A);
+                        Logit ( A[T-1]& " "& A[T]& "  ", SendList, crlf);
+                    end
+                    else if length(S) > 2 then Logit (
+                        "?SNDMSG: unrecognized response: """& S& """"& crlf, 
+                            Log);  
+                end;
+                [aux!Prompt] begin
+                    S := scan(S, trimNoiseBrk, B);
+                    Log := Log& S;
+                    T := Tokenize(S, A2);
+                    if T < 3  then goto badprompt;
+                    if not kequ(A2[2], "Dial") or not kequ(A2[3], "digits?")
+                    then begin
+                    badprompt:
+                        auxZap;
+                        Logit ( "?SNDMSG: unexpected prompt:"& crlf& S& crlf);
+                        RTS!addrs := FPath;
+                        goto returnMsg;
+                    end;
+                    if everyOther then begin
+                        everyOther := FALSE;
+                        log := log& crlf;
+                        AuxOut( crlf );
+                        goto nextRead;
+                    end; 
+                    everyOther := TRUE;
+                    stx := stx + 1;
+                    if stx > stcnt then begin
+                        auxZap;
+                        Logit ( "?SNDMSG: too many dial prompts"& crlf);
+                        RTS!addrs := FPath;
+                        goto returnMsg;
+                    end;
+                    if not equ(dialStation[stx], A2[1]) then begin
+                        auxZap;
+                        Logit ( "?SNDMSG: unexpected station in dial prompt"&
+                            crlf& "%expected "& dialStation[stx]& ", got "&
+                                A2[1]& crlf);
+                        RTS!addrs := FPath;
+                        goto returnMsg;
+                    end;
+                    log := log& dialDigits[stx]& crlf;
+                    AuxOut( dialDigits[stx]& crlf);
+                end;
+                [else] begin
+                    if length (S) then Log := Log & S & crlf;
+                    maiQueue( M );
+                    Crash ( "?SNDMSG: timeout"& crlf& 
+                        "%delivery failed to "& mai:RCPT[M]& crlf& Log);
+                end
+        end;
+        if not MsgOK then
+            maiCatList( RTS!addrs, FPath[1 to inf-length(Fpath!)] );
+    nextLine:
+        FPath := Fpath!;
+    end;
+    if length( RTS!addrs ) then begin
+    returnMsg:
+        Logit (
+            "%delivery failed to: "& RTS!addrs& crlf,
+            Log,
+            "[return to sender "& maiRPath(M)& "]"& crlf );
+        mai:RCPT[m] := RTS!addrs;
+        maiRTS( M,
+            "The request was rejected by TMS.Tymnet",
+            "The response was:",
+            Log );
+    end;
+    if length( REQ!addrs ) then begin
+        Logit (
+            "%delivery failed to: ", REQ!addrs, crlf,
+            Log );
+        mai:RCPT[m] := REQ!addrs;
+ReQ:        Logit ( "[requeued]"& crlf );
+        maiQueue( M );
+    end;
+end;
+
+comment
+        SNDTLX - check for queued telex messages and send them
+;
+procedure SNDTLX( reference string MSG );
+begin
+    r!p(mai) M;
+    label returnMsg, ReQ;
+    string S, S1, FPath, SendList, Log, msgText;
+    string array A[1:10]; string array A2[1:40];
+    boolean MsgOK;
+    integer I, J, T, B;
+    string RTS!addrs, REQ!addrs;
+
+    string CMD, FPath!;
+    r!p(adr) AD;
+    string RCPT, ota;
+
+    M := maiMParse(MSG);
+    FPath := mai:RCPT[M];
+    mai:RCPT[M] := mai:Bcc[M] := null;
+    Log := null;
+    RTS!addrs := null;
+    REQ!addrs := null;
+    SendList := null;
+    FPath! := FPath;
+    MsgOK := false;
+    while length( FPath! ) do begin
+        RCPT := maiAScan( S := FPath!, B );
+        AD := maiAParse( RCPT );
+        ota := adr:User[AD];
+        ota := scan(ota, dotBrk, B);
+        if B then begin
+            Log := Log& "Period not allowed in mailbox name: "
+                & ota& crlf;
+            maiCatList( RTS!addrs, adr:User[AD] );
+            continue;
+        end;
+        ota := scan(ota, upCaseBrk, B);
+        Log := Log& ota& crlf;
+        AuxOut( ota& crlf );
+        FPath! := S;
+        maiCatList( SendList, adr:User[AD] );
+    end;
+
+    if AuxRead( S, responseTimeout ) neq aux!Timeout then begin
+        Log := Log& S& crlf;
+        while AuxRead( S, responseTimeout ) = aux!Line do 
+            if length(S) > 2 then Log := Log& S;
+        Logit( "?SNDTLX: unexpected response..."& crlf& Log );
+        AuxZap;
+        RTS!addrs := FPath;
+        goto returnMsg;
+    end;
+
+    Log := Log& "."& crlf;
+    AuxOut( "."& crlf );
+    msgText := maiMMake( M, 63 );
+    telexFormat( msgText );
+    while length(msgText) do begin
+        string REC;
+        REC := tabExpand( scan( msgText, lineBrk, B ) );
+        if equ( REC [inf-3 for 4], "NNNN" ) then   ! this is a kludge   ;
+            REC := REC [1 to inf-4];    ! (since we really want         ;
+                                        ! to find NNNNcr, not NNNNlf)   ;
+        AuxOut( REC& crlf );
+    end;
+    AuxOut( "NNNN"& #cr );
+    while true do 
+        case AuxRead( S, timeout) of begin
+            [aux!Zap] begin
+                maiQueue( M );
+                Crash ( "?SNDTLX: lost circuit"& crlf& 
+                    "%delivery failed to "& mai:RCPT[M]& crlf& Log& 
+                    "[requeued]");
+            end;
+            [aux!Line] begin
+                S := scan(S, trimNoiseBrk, B);
+                if equ( S, #ff) or equ( S, turnch) then done;
+                if length(S) leq 2 then continue;
+                Log := Log & S;
+                if lkequ( S, "Message rejected") then begin
+                    Tmssync;
+                    while AuxRead ( S1, responseTimeout ) = aux!Line do
+                        if length(S1) > 2 then S := S& S1;
+                    Logit ( "?SNDTLX: message rejected"& crlf, Log );
+                    Log := S;   ! when returnMsg, quote the response only;
+                    AuxZap;
+                    RTS!addrs := FPath;
+                    goto returnMsg;
+                end;
+                S1 := S;
+                tokenize(S1,A);
+
+        comment
+        TUMSGATE 's message 013  accepted at 1907PM 13AUG86 .
+        1        2  3       4    5        6  7      8       9
+        ;
+
+                if lkequ(A[5] ,"accepted") and
+                    lkequ(A[6],"at") then continue;
+                if lkequ( S, "Nbr " ) then begin
+                    MsgOK := true;
+                    Tokenize(S, A);
+                    Logit ( A[1]& " "& A[2]& "  ", SendList, crlf);
+                    if lkequ(A[3], "not") and
+                        lkequ(A[4], "forwarded") then begin
+                            AuxRead(S, timeout);
+                            T := Tokenize( S, A );
+                            if T = 0 then Logit( 
+                                "?SNDTLX: RTS parse failed"& crlf );
+                            for I := 1 upto T do maicatList(
+                                RTS!addrs, A[I]& "@TMSTLX.Tymnet" );
+                    end;
+                end
+                else if length(S) > 2 then Logit (
+                    "%SNDTLX: unrecognized response: """& S& """"& crlf, 
+                        Log);  
+            end;
+            [else] begin
+                if length (S) then Log := Log & S & crlf;
+                maiQueue( M );
+                Crash ( "?SNDTLX: timeout"& crlf& 
+                    "%delivery failed to "& mai:RCPT[M]& crlf& Log);
+            end
+        end;  ! case;
+
+    if not MsgOK then
+        maiCatList( RTS!addrs, FPath );
+
+    if length( RTS!addrs ) then begin
+    returnMsg:
+        Logit (
+            "%delivery failed to: "& RTS!addrs& crlf,
+            Log,
+            "[return to sender "& maiRPath(M)& "]"& crlf );
+        mai:RCPT[m] := RTS!addrs;
+        maiRTS( M,
+            "The request was rejected by TMSTLX.Tymnet",
+            "The response was:",
+            Log );
+    end;
+    if length( REQ!addrs ) then begin
+        Logit (
+            "%delivery failed to: ", REQ!addrs, crlf,
+            Log );
+        mai:RCPT[m] := REQ!addrs;
+ReQ:        Logit ( "[requeued]"& crlf );
+        maiQueue( M );
+    end;
+end;
+
+procedure SNDMSGs;
+begin
+    integer B;
+    string S, S1;
+    if props(QUEUEFILE) 
+        then begin
+            maiFEMessage( SNDMSG, datum(QUEUEFILE), props(PURGE) );
+            S1 := datum(QUEUEFILE);
+            S := scan( S1, dotBrk, B);
+            S := S& "TLX"& S1;
+            maiFEMessage( SNDTLX, S, props(PURGE) );
+        end
+        else begin
+            maiFEMessage( SNDMSG, "(MAIL)TMS.Q", true);
+            maiFEMessage( SNDTLX, "(MAIL)TMSTLX.Q", true);
+        end;
+end;
+
+    auxRNC := false;
+    datum(LOGINSTRING) := "SLTMS;ST.LOUIS";
+    datum(ID) := "TUMSGATE";
+    datum(PASSWORD) := "SWITCHER";
+    datum(POLL.SECS) := 600;
+    datum(CONNECT.HRS) := 24;
+    ArgParse( ANY, QUEUEFILE,
+        {RUN,ID,PASSWORD,POLL.SECS,CONNECT.HRS,PURGE,HOLD,TRACE,WAIT},
+        ARGS );
+    if not props(RUN) then begin  
+        print( "/RUN not specified." );
+        logExit;
+    end;
+    if props(WAIT) then props(TRACE) := true;
+    auxEcho := auxTrace := props(TRACE);
+CrashRestart:
+    while true do begin "RUN"
+        integer ConnTime;
+        LOGON;
+        for ConnTime := 3600*datum(CONNECT.HRS)
+	    step -datum(POLL.SECS)
+	    until 0
+        do begin
+            RCVMSGs;
+            SNDMSGs;
+	    if datum(POLL.SECS) = 0 then done "RUN";
+	    if datum(POLL.SECS) geq 600 then AuxZap;
+	    if logDirty then logOpen;
+	    calli(!xwd(1,datum(POLL.SECS)),'72);
+	    if not CheckPort then LOGON;
+        end;
+    end "RUN";
+end $
+  -@
