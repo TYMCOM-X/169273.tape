@@ -1,0 +1,407 @@
+begin	"MAILER"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(SAILIB)REDUFD.REQ" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+internal string ARGS;		comment not using ARGS at this time;
+require "MAILIB.REQ" source!file;
+require "MAILOG.REQ" source!file;
+require "FLIMIT.REQ" source!file;
+require "FLIB.REQ" source!file;
+require "LICENS.REQ" source!file;
+!License!Required(WC OP SY JL WF);
+require !xwd( '1,'11 ) version;
+
+! v1.11	30-Sep-87 WRS	discard expired postmaster messages;
+! v1.10	23-May-87 WRS	use RCPT rather than maiFPath();
+! v1.7	15-May-87 WRS	added DAEMON facility;
+! v1.6	28-Dec-86 WRS	fix bug in test for server="-";
+! v1.5	17-Dec-86 WRS	don't run anything is server = "-" (for TMS,MCAUTO);
+! v1.4	25-Nov-86 WRS	modify log entry for MAI.TMP, fix ",," bug;
+! v1.3	 2-Sep-86 WRS	removed change to check for "already running";
+! v1.2	31-Aug-86 WRS	added code for expiration to reduce chance of glitch;
+! v1.1	23-Jul-86 WRS	changed to use LICENS.DCL library;
+! v1.0	19-Jun-86 WRS	added ROUTER.DAT;
+! v16	18-Jun-86 WRS	run TYMX for any numeric queue file;
+! v15	-------------	no previous history;
+
+define	EXPIRE	= 30		comment RTS mail unread for this many days;
+,	LOGSIZE	= 250		comment log file size limit in pages;
+;
+define	EXACT!EXPIRE!KLUDGE = true;   ! temporary;
+
+integer simple procedure frmopV( integer frame, arg, opcode );
+start!code	protect!acs 1; 
+	setom	!skip!;
+	move	1,frame;	! get address of arg;
+	hrl	1,opcode;	! get opcode;
+	frmop	1,arg;		! call by value (val on stack);
+	 setzm	!skip!;
+end;
+
+integer simple procedure frmopR( integer frame; 
+			reference integer arg; integer opcode );
+start!code	protect!acs 1;
+	setom	!skip!;
+	move	1,frame;	! get address of arg;
+	hrl	1,opcode;	! get opcode;
+	frmop	1,arg;		! call by reference (actually indirect);
+	 setzm	!skip!;
+end;
+
+define gettab( i,t ) =
+{ calli( !xwd( i,t ), calli!GETTAB ) };
+
+integer CommandBreak, StarBreak, SYSNO, TODAY;
+string JJJ;
+
+simple procedure INIT;
+begin
+    setbreak(CommandBreak:=getbreak,
+	" !@#$%^&*()_+~=`{}|[]\:"";'<>,./"&#ht," "&#ht,"TKIR");
+    setbreak(StarBreak:=getbreak,"\*",null,"SI");
+    SYSNO := calli(!xwd('33,'11),'41);	! system number;
+    TODAY := calli(!xwd('11,'11),'41);	! today's date;
+    JJJ := cvs(1000+calli(0,calli!PJOB))[2 for 3];
+end;
+require INIT initialization;
+
+define
+    MailUser = {"MAIL"},
+    MailPPN = !xwd('3,'167357);
+integer procedure EXEC( string PROGRAM, COMMAND(null) );
+begin "RunProg"
+    integer C,FD,I,E;
+    integer array X[0:5];
+    open(C_getchan,"DSK",0,0,0, 0,0,E);
+    lookup(C,"(MAIL)"&PROGRAM&".SAV",E);
+    release(C);
+    if E then begin
+	cprint( logChan, crlf& "%exec(",PROGRAM,"): no server", crlf );
+	return(-1);
+    end;
+    cprint( logChan, (if length(COMMAND) then COMMAND else PROGRAM) );
+    redefine jp!LOS = !bit(0);		! logout on stop;
+    redefine jp!INA = !bit(9);		! inactivity timeout;
+    X[1] := X[3] := MailPPN;		! PPN;
+    X[4] := cvsix(MailUser);		! user name;
+    X[5] := 0;
+    X[2] := JP!LOS + '50*!bit(7) + JP!INA + JP!NAT + JP!COR + JP!CRM + JP!RCM;
+    FD := frmopv( 0, !xwd(-5,location(X[1])), !FOCFM );
+    if not !SKIP! then begin
+	cprint( logChan,
+	    crlf& "?exec(",PROGRAM,"): .foCFM error '",cvos(FD),crlf );
+	return(FD);
+    end;
+    cprint( logChan, " [frame ", FD land '777, "] " );
+    if length(COMMAND) then begin
+	r!p(FILE) F;
+	string TFN;
+	TFN := "("& MAILUSER& ")" &
+	    cvs(1000+('777 land FD))[2 to inf] &
+	    PROGRAM[1 to 3] &
+	    ".TMP";
+	F := fOpen( TFN, "wb4E" );
+	cprint( file:Chan[F], COMMAND );
+	fClose( F );
+    end;
+    X[0] := 4;
+    X[1] := cvsix("DSK");
+    X[2] := MailPPN;
+    X[3] := cvsix(PROGRAM);
+    X[4] := 0;
+    E := frmopr( FD,X[0],!FORUN );
+    if not !SKIP! then begin
+	cprint( logChan,
+	    crlf& "?exec(",PROGRAM,"): .foRUN error '",cvos(E),crlf );
+	return(E);
+    end;
+    cprint( logChan, crlf );
+    return(0);
+end "RunProg";
+
+procedure CheckMyProtection;
+begin
+    integer C,E;
+    open(C_getchan,"DSK",0,0,0,0,0,E);
+    lookup(C,"(MAIL)MAILER.SAV",E);
+    if not E then rename(C,"(MAIL)MAILER.SAV",'055,E);
+    if E then cprint( logChan,
+	"?unable to set protection on (MAIL)MAILER.SAV"& crlf );
+    release(C);
+end;
+
+integer procedure MapRouter.Dat;
+begin
+    own integer Addr;
+    integer PG, NPG;
+    r!p(file) F;
+    if Addr then return( Addr );
+    F := fOpen( "(MAIL)ROUTER.DAT", "r4E" );
+    NPG := (file:LKB[F][5]+'777) lsh -9;
+    PG := fAlloc( NPG );
+    fMap( F, PG, 1, NPG );
+    fClose( F );
+    return( Addr := PG lsh 9 );
+end;
+
+string procedure Router( integer QFileName; reference string Command );
+begin
+    integer RP;
+    RP := MapRouter.Dat;
+    while memory[RP] do begin
+	if ( !lh(memory[RP]) = 0 or !lh(memory[RP]) = SYSNO )
+	and ( memory[RP+1] = 0 or memory[RP+1] = QFileName )
+	then begin
+	    integer I;
+	    string S;
+	    S := null;
+	    for I := 2 upto !rh(memory[RP])-1 do
+		S := S& cvstr(memory[RP+i]);
+	    Command := scan( S, StarBreak, I );
+	    while I do Command := Command&
+		(if I="\" then null&lop(S) else cv6str(QFileName))&
+		scan( S, StarBreak, I );
+	    return( scan( S := Command, CommandBreak, I ));
+	end;
+	RP := RP + !rh(memory[RP]);
+    end;
+    return( Command := null );
+end;
+
+simple boolean procedure IsRunning( integer NAME );
+begin
+    integer J,HIGHJB;
+    HIGHJB := gettab( !nsHJB, !gtNSW );
+    for J := 1 upto HIGHJB do begin
+	if  gettab( J, !gtPPN ) = MailPPN
+	and gettab( J, !gtNAM ) = NAME
+	then return( true );
+    end;
+    return( false );
+end;
+
+string UFDname;		! user name of UFD;
+string UFDdate;		! date/time of UFD;
+
+integer procedure CheckLogout( integer PPN );
+begin
+    integer C,E,D,T;
+    integer array L[0:'30];
+    open (C_getchan,"DSK",0,0,0, 0,0,E);
+    if E then return (0);
+    L[0] _ arrinfo(L,2);
+    L[1] _ !xwd(1,1);
+    L[2] _ PPN;
+    L[3] _ cvsix("UFD");
+    chnior (C,L[0],4);	! lookup;
+    if not !SKIP! then L['13] := L['27] := L['30] := 0;
+    release (C);
+    UFDname := cv6str(L['27])& cv6str(L['30]);
+    start!code
+	protect!acs 0,1,2,3;
+	MOVE	1,access(L['13]);
+	TLZ	1,'200000;
+	MOVE	3,['600020000000];
+	MOVEI	0,1;
+	CALLI	0,-'55;
+	 Setzb  1,2;
+	MOVEM	1,D;
+    end;
+    UFDdate := cvDate (D);
+    return( L['13] );
+end;
+
+boolean procedure MServer( integer array UFD );
+begin
+    integer AGE;
+    procedure RTS( reference string MSG );
+    begin
+	r!p(mai) M;
+	M := maiMParse( MSG );
+	if kequ(mai:From[M][1 to 10],"Postmaster") then begin
+	    cprint( logChan,
+		"discarded old mail from ", maiRPath(M),
+		" (", mai:Date[M], ")"& crlf );
+	    return;
+	end;
+	cprint( logChan,
+	    "RTS: ", maiRPath( M ),
+	    " (", mai:Date[M], ")"& crlf );
+	maiRTS( M,
+	    "User has not read mail in "&cvs(AGE)&" days: "& UFDname,
+	    "Last logout: "& UFDdate );
+    end;
+    AGE := TODAY - !lh(UFD[2]);
+ifcr EXACT!EXPIRE!KLUDGE
+thenc
+    if AGE > EXPIRE then
+	cprint( logChan,
+	    "?System date error suspected."& crlf&
+	    "?Mail for ", UFDname, " aged ", AGE, " days."& crlf&
+	    "?System date = ",TODAY,", File date = ",!lh(UFD[2])& crlf );
+    if AGE = EXPIRE then begin
+elsec
+    if AGE geq EXPIRE then begin
+endc
+	string QFile;
+	QFile := "(MAIL)'"& cvos(UFD[0])& "."& cv6str(UFD[1]);
+	checkLogout( UFD[0] );
+	cprint( logChan,
+	    "Expired mail ("&cvs(AGE)&" days), user: ", UFDname,
+	    ", Last logout: ", UFDdate, crlf );
+	maiFEMessage( RTS, QFile, true );
+    end;
+    return( false );
+end;
+
+procedure TServer( reference string MSG );
+begin
+    r!p(mai) M;
+    r!p(adr) ME;
+    M := maiMParse( MSG );
+    ME := maiMyAddress;
+    if not length(mai:From[M])
+	then mai:From[M] :=
+	    adr:User[ME]& "@"& adr:Host[ME]& "."& adr:Net[ME]& " (apparently)"
+	else begin
+	    r!p(adr) A;
+	    A := maiAParse( mai:From[M] );
+	    if not kequ( adr:User[A], adr:User[ME] )
+	    or not kequ( adr:Host[A], adr:Host[ME] )
+	    or not kequ( adr:Net[A],  adr:Net[ME]  )
+		then mai:Sender[M] := maiAMake( ME );
+	end;    
+    cprint( logChan, JJJ, "MAI.TMP: queued ", maiFPath( M ), crlf );
+    if not maiQueue( M ) then maiRTS( M, "maiQueue: error return" );
+end;
+
+comment
+	QServer: process *.Q
+
+	Looks up queue file name in ROUTER.DAT and sprouts appropriate server.
+	If no server is specified, mail is returned to sender.  If an error is
+	encountered sprouting the server, the mail is retained and a log entry
+	is made.
+;
+
+boolean procedure QServer( integer array UFD );
+begin
+    string Server,Command,QFile;
+    procedure RTS( reference string TEXT );
+    begin
+	r!p(mai) M;
+	M := maiMParse( TEXT );
+	cprint( logChan, "RTS: ", maiRPath( M ), crlf );
+	maiRTS( M, "No router table entry for """& QFile& """." );
+    end;
+    QFile := cv6str(UFD[0])& "."& cv6str(UFD[1]);
+    Server := Router( UFD[0], Command );
+    cprint( logChan, QFile, ": " );
+    if length(Server) = 0
+	then begin
+	    cprint( logChan, "[no router table entry]"& crlf );
+	    maiFEMessage( RTS, QFile, true );
+	end
+	else if Server="-"
+	    then cprint( logChan, "[no-op]"& crlf )
+	    else if IsRunning( UFD[0] )
+		then cprint( logChan, "[already running]"& crlf )
+		else EXEC( Server, Command );
+    return( false );
+end;
+
+boolean procedure FServer( integer array UFD );
+begin
+    integer J,HIGHJB;
+    string QFile;
+    procedure RTS( reference string TEXT );
+    begin
+	r!p(mai) M;
+	M := maiMParse( TEXT );
+	cprint( logChan, "REQ: ", mai:RCPT[M], crlf );
+	if not maiQueue( M ) then begin
+	  cprint( logChan, "?maiQuque: error return"& crlf&
+	     "RTS: ", maiRPath(M), crlf );
+	  maiRTS( M,
+	    "One of the TUMS programs terminated abnormally while processing",
+	    "the file "& QFile& ".  As a result, delivery of this",
+	    "message may not have been completed to the following addresses:",
+	    mai:RCPT[M] );
+	end;
+    end;
+    HIGHJB := gettab( !nsHJB, !gtNSW );
+    if not !SKIP! then usererr(0,0,"?Can't gettab HIGHJB","X");
+    for J := 1 upto HIGHJB do begin
+	if  !rh(gettab( J, !gtUID )) = !lh(UFD[0])
+	and !rh(gettab( J, !gtPNO )) = !rh(UFD[0])
+	then return( false );
+    end;
+    QFile := "(MAIL)'"& cvos(UFD[0])& "."& cv6str(UFD[1]);
+    cprint( logChan, "?abandonned temporary file: ", QFile, crlf );
+    maiFEMessage( RTS, QFile, true );
+    return( false );
+end;
+
+boolean procedure LServer( integer array UFD );
+begin
+    integer J,HIGHJB;
+    string LogFile;
+    HIGHJB := gettab( !nsHJB, !gtNSW );
+    if not !SKIP! then usererr(0,0,"?Can't gettab HIGHJB","X");
+    if UFD[0] = cvsix("MAIL") then return(false);
+    for J := 1 upto HIGHJB do begin
+	if !rh(gettab( J, !gtPNO )) = !rh(UFD[0])
+	and !rh(gettab( J, !gtUID )) = !lh(UFD[0])
+	then return( false );
+    end;
+    LogFile := "(MAIL)'"& cvos(UFD[0])& "."& cv6str(UFD[1]);
+    cprint( logChan, "?abandonned temporary file: ", LogFile, crlf );
+    logCopy( LogFile );
+    return( false );
+end;
+
+procedure DAEMON;
+begin
+    integer RP;
+    RP := MapRouter.Dat;
+    while memory[RP] do begin
+	if ( !lh(memory[RP]) = 0 or !lh(memory[RP]) = SYSNO )
+	and memory[RP+1] = cvsix("DAEMON")
+	then begin
+	    integer I;
+	    string S, Server, Command;
+	    S := null;
+	    for I := 2 upto !rh(memory[RP])-1 do
+		S := S& cvstr(memory[RP+i]);
+	    Command := scan( S, StarBreak, I );
+	    while I do Command := Command&
+		(if I="\" then null&lop(S) else cvs(SYSNO))&
+		scan( S, StarBreak, I );
+	    Server := scan( S := Command, CommandBreak, I );
+	    if not IsRunning( cvsix(Server) ) then begin
+		cprint( logChan, "DAEMON: " );
+		EXEC( Server, Command );
+	    end;
+	end;
+	RP := RP + !rh(memory[RP]);
+    end;
+end;
+
+begin	"MAIN"
+    CheckMyProtection;
+    maiFEMessage( TServer, JJJ&"MAI.TMP", true );
+    FLimit( "(MAIL)LOG", LOGSIZE );
+    do begin
+	maiNeedMailer := false;
+	RedUfd( QServer, "(MAIL)*.Q", null );
+	RedUfd( MServer, "(MAIL)*.MAI", "C" );
+	RedUfd( FServer, "(MAIL)*.FEM", null );
+	RedUfd( LServer, "(MAIL)*.LOG", null );
+    end until not maiNeedMailer;
+    DAEMON;
+    logExit;
+end	"MAIN"
+
+end	$
+  
