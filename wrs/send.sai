@@ -1,0 +1,282 @@
+begin "send - userface for sending mail"
+
+  require "(sailib)sail.def" source!file;
+  require "nbslib.req" source!file;
+
+  define DEBUG = {false};
+
+
+! Dave W. Smith,  July, '82.
+;
+
+
+
+  define MAXPAGESTOINCLUDE = 2;		! size of included file ;
+! Stuff global to this module
+;
+
+  string TextFromCommandLine;	! stuff after 'send', if any ;
+
+  NBS!Pointer NBS;		! pointer to record we're building ;
+  Name!Pointer NL;		! list of recipients ;
+
+
+  integer U!Chan, U!EOF;	! file variables ;
+  integer B!C, B!Crlf, B!Del;	! break table stuff ;
+! Initialization stuff
+;
+
+procedure Init;
+  begin
+
+    NL := null!record;
+
+    open( U!Chan := getchan, "DSK", !bit(23)+0, 1,0, 512, B!C, U!EOF );
+
+    setbreak( B!Crlf := getbreak, '12, '15, "INS" );
+    setbreak( B!Del := getbreak, '177, '0, "INS" );
+
+  end;
+
+require Init initialization;
+! Setup the packet and add our name to it.
+;
+
+procedure SetupPacket;
+  begin "setup packet"
+    string U;
+
+    NBS := new!record( NBS!Rec );
+
+    ! build "name:system" ;
+
+    U := cv6str( call( -'22, "GETTAB" )) &
+	  cv6str( call( -'21, "GETTAB" )) &
+	  ":" & cvs( call( '33000011, "GETTAB" ));
+
+    NBS!Rec:From[NBS] := U;
+
+  end "setup packet";
+! Return the first line of a file ;
+;
+
+string procedure LineFromFile( string FileName );
+  begin "text from file"
+    integer Flag; string L;
+
+    lookup( U!Chan, FileName, Flag );    
+    if ( Flag ) then
+      begin
+	print( "% Lookup error ", cvos( !rh( Flag )),
+	       " for file: ", FileName, crlf );
+	return( NULL );
+      end;
+
+    L := NULL;
+    while ( not U!EOF ) do  L := L & input( U!Chan, B!crlf );
+    close( U!Chan );
+
+    return( L );
+
+  end "text from file";
+! Return the entire file in a string ;
+;
+
+string procedure TextOfFile( string FileName );
+  begin "text from file"
+    integer Flag; string L;
+    integer array FInfo[0:5];
+
+    lookup( U!Chan, FileName, Flag );    
+    if ( Flag ) then
+      begin
+	print( "% Lookup error ", cvos( !rh( Flag )),
+	       " for file: ", FileName, crlf );
+	return( NULL );
+      end;
+
+    FileInfo( FInfo );
+    if ( FInfo[5] > ( MAXPAGESTOINCLUDE * 512 ) ) then
+      begin
+	print( "% File is too large to include", crlf );
+	close( U!Chan );
+	return( NULL );
+      end;
+
+    L := input( U!Chan, B!Del );
+    close( U!Chan );
+
+    print( "[" & FileName & " loaded]", crlf );
+
+    return( L );
+
+  end "text from file";
+! Return the command that called us
+;
+
+string procedure RescanLine;
+  begin "rescan command line"
+    integer Flag;
+
+    start!code
+      setom Flag;		! assume input ;
+      ttcall '10,;		! rescan ;
+      ttcall '14,;		! skpinl ;
+	setzm Flag;		!  no input ;
+    end;
+
+    if ( Flag ) then return( inchwl ) else return( NULL );
+
+  end "rescan command line";
+! Process commands from a rescanned command line. If the line starts
+! with "send" then we treat the rest of it as the "to:" field.
+;
+
+procedure RescanLogic;
+  begin "rescan logic"
+    string L, C;
+
+    if ( L := RescanLine ) then
+      begin "rescanned line"
+
+	C := NULL;
+	while ( L > " " ) do C := C & lop( L );
+	while ( length( L ) and ( L = " " )) do lop( L );
+
+	if ( kequ( C, "SEND" )) then
+	  TextFromCommandLine := L
+	else
+	  TextFromCommandLine := NULL;
+
+      end "rescanned line";
+
+  end "rescan logic";
+! Get the "To:" field.  If there is stuff left over from the command
+! line use it first, before prompting for any.
+;
+
+procedure GetTo;
+  begin "to"
+    string S;
+    Name!pointer N;
+
+    while ( true ) do
+      begin
+	if ( TextFromCommandLine ) then
+	  begin
+	    S := TextFromCommandLine;
+	    TextFromCommandLine := NULL;
+	  end
+	else
+	  begin
+	    print( "To: " );
+	    S := inchwl;
+	  end;
+	if ( S = "@" ) then S := LineFromFile( S[2 to inf] );
+	N := CVNList( S );
+	NBS!Rec:To[NBS] := CV0List( N );
+	NLCombine( NL, N );
+	if ( DEBUG ) then print( "--> ", CVList( CV0List( NL )), crlf );
+	if ( NL neq null!record ) then done;
+      end;
+
+  end "to";
+! Get the "Subject" field
+;
+
+procedure GetSubject;
+  begin "re"
+
+    if ( NBS!Rec:Subject[NBS] ) then return;
+
+    print( "Re: " );
+
+    NBS!Rec:Subject[NBS] := inchwl;
+
+  end "re";
+! Get the "Cc:" field
+;
+
+procedure GetCc;
+  begin "cc"
+    string S;
+    Name!pointer N;
+
+    if ( NBS!Rec:Cc[NBS] ) then return;
+
+    print( "Cc: " );
+    S := inchwl;
+    if ( S = "@" ) then S := LineFromFile( S[2 to inf] );
+
+    N := CVNList( S );
+    NBS!Rec:Cc[NBS] := CV0List( N );
+    NLCombine( NL, N );
+    if ( DEBUG ) then print( "--> ", CVList( CV0List( NL )), crlf );
+
+  end "cc";
+! Get the  "Text:" field
+;
+
+procedure GetText;
+  begin "text"
+    string M, L;
+
+    print( "Enter Message.  End with ^Z", crlf, crlf );
+
+    M := NULL;
+    while ( true ) do
+      begin "read text"
+	L := inchwl;
+	if ( L = "@" ) then
+	  begin
+	    M := M & TextOfFile( L[2 for inf] );
+	  end
+	else if ( L = "." ) then
+	  begin "cmd"
+	    if ( kequ( L[2 for 9], "reply-to ")) then
+	      NBS!Rec:ReplyTo[NBS] := L[11 to inf]
+	    else
+	      print( "% Bad command", crlf );
+	  end "cmd"
+	else
+	  begin
+	    M := M & L;
+	    if (( !skip! = '4 ) or ( !skip! = '32 )) then done;
+	    M := M & crlf;
+	  end;
+      end "read text";
+
+    NBS!Rec:Text[NBS] := M;
+
+  end "text";
+! Transmit the message
+;
+
+procedure TransmitPacket;
+  begin
+
+    ExpandNames( NL );
+
+    NBSXmit( NL, NBS );
+
+    print( crlf, "[Done]", crlf );
+
+  end;
+! Top level logic
+;
+
+  InitAliasList;
+
+  SetupPacket;
+
+  RescanLogic;
+  GetTo;
+  GetSubject;
+  GetCC;
+  GetText;
+
+  TransmitPacket;
+
+  call( 0, "EXIT" );
+
+end "send - userface for sending mail";
