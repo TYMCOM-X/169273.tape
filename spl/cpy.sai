@@ -1,0 +1,663 @@
+
+begin "CPY"
+
+require '5 lsh 24 lor '0 version;
+
+require "(SAILIB)SAIL.DEF"   source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "(SAILIB)CVPPN.REQ"  source!file;
+require "(SAILIB)CVNAME.REQ" source!file;
+require "(SAILIB)RHFILE.REQ" source!file;
+require "(SAILIB)FNDKEY.REQ" source!file;
+require "(SAILIB)ARGS.REQ"   source!file;
+require "(CARL)VMFILE.REQ"   source!file;
+
+label Hmmm;
+Define BrkString =
+    {(If Brk="*" then "######" else if Brk="?" then "#" else null)};
+
+Define !FILE = 0, !EXT = 1;		! Lookup block offset data ;
+
+Define Gettab(x,y) = { calli( !Xwd( (x),(y) ), calli!GETTAB ) };
+Define Printx(x) = { print( cvps(x)&" (",props(x),")  ",datum(x),crlf ) };
+
+redefine !Block(Group, Name, Size) = {
+    Ifcr Length(Cvps(Size)) = 0 thenc assignc Size = 1; Endc
+    Define Group}&{Name = Group;
+    Redefine Group = Group + Size;
+};
+
+Define	E! = 0;
+    !Block(E!,Count)			! count of arguments ;
+    !Block(E!,PPN)			! Gfd (connected) directory ;
+    !Block(E!,Privs)			! Privilege word ;
+    !Block(E!,AUN)			! Login directory ;
+    !Block(E!,Username,2)		! Username ;
+    !Block(E!,License)			! Frame License ;
+
+Define F! = 0;				! ** File positions ** ;
+    !Block(F!,Device)			! ** [0] Device name ;
+    !Block(F!,User,2)			! ** [1] Username ;
+    !Block(F!,Name)			! ** [3] File Name ;
+    !Block(F!,Ext)			! ** [4] File Extension ;
+
+
+String  FileLine, FileSpec, CopySpec;	! file spec strings ;
+String  Password;			! password to cross gateway ;
+String  AllHosts;
+String  TempFile;			! storage for temp file ;
+String  Text, Hosts, Host, Hostess;	! text line and host lists ;
+Integer Inbrk, InLst, Quest, Brk;	! various break table stuff ;
+Integer File, Ext, UserPPN, LastPPN;	! file information ;
+Integer ProcessedFiles, CIndex;		! file counter, cmd index ;
+Integer ThisHost, ThisCenter;		! host number, center number ;
+Integer Frame, TChan;			! frame, chan for telecopy ;
+Boolean Interactive, NeedHostFile;	! how run, needs JOBS.DAT ;
+
+Record!Class E( Integer Ext; r!p (E) Next );
+Record!Class F( Integer File; r!p (E) Ext; r!p (F) Next );
+Record!Class P( Integer Ppn; string User; r!p (F) File; r!p (P) Next );
+
+r!p (P) Users, ThisUser, ThatUser;
+r!p (F) Files, That, Name;
+r!p (E) Last, This;
+
+Safe Integer Array Child[ E!Count:E!License ];
+Safe Integer Array Spec[ S!Dev:S!Ext ];	! holds parsed file spec ;
+
+Preset!with "CPY";
+Safe String Array LegalCommands[ 1:1 ];
+
+Preset!with !Xwd( 1,5 ), cvsix( "SYS" ), 0, cvsix( "TELECO" ), 0, 0;
+Safe Integer Array Telecopy[0:5];
+Preset!with !Xwd( 1,5 ), cvsix( "DSK" ), '3324525, cvsix( "TELALP" ), 0, 0;
+Safe Integer Array TelALP[0:5];
+Preset!with 5, cvsix( "SYS" ), 0, cvsix( "LOGOUT" ), 0, 0;
+Safe Integer Array Logout[0:5];
+
+Preset!with '17, cvsix("DSK"), 0;	! open block for DSK: ;
+Safe Integer Array DSK[ 0:2 ];
+
+
+! item names
+;
+
+string item OutputFiles;		! output file(s) ;
+string item InputFiles;			! list of input files ;
+string item HostList;			! list of output hosts ;
+string item UserName;			! output username ;
+string item LoginName;			! login name for gateway ;
+string item Center;			! hosts in this data center ;
+string item GateWay;			! gateway host string ;
+
+integer item Days;			! number of days ;
+integer item Hours;			! number of hours ;
+integer item Minutes;			! number of minutes ;
+
+item Check;				! run telchk when done ;
+item Default;				! default missing values ;
+item Reverse;				! controls sorting order ;
+item Sticky;				! controls "sticky" username ;
+item Supersede;				! supersede files ;
+item Update;				! use update mode ;
+item Wait;				! wait for telecopy to end ;
+
+
+simple procedure InitSystem;
+begin "init system"
+
+    ThisHost_ Gettab( !cnSYS,!gtCNF );
+    Child[ E!PPN ]_        Gettab( -1,!gtPPN );
+    Child[ E!Privs ]_      Gettab( -1,!gtPRV ) lor !bit( 0 );
+    Child[ E!AUN ]_        Gettab( -1,!gtAUN );
+    Child[ E!Username ]_   Gettab( -1,!gtUNM );
+    Child[ E!Username+1 ]_ Gettab( -1,!gtUN1 );
+    Child[ E!License ]_ !rh( Gettab( -1,!gtLIC ) );
+
+end "init system";
+require InitSystem initialization;
+
+
+internal simple procedure
+  FrmXct(Integer Frame; Reference Integer Arg; Integer Funct);
+! ----------------------------------------------------------------------;
+!									;
+!	FrmXct		Routine to execute a frame operation.		;
+!			Results are returned in ac 1 and !skip!		;
+!									;
+! ----------------------------------------------------------------------;
+begin!code
+
+	Hrrz	1,Frame;		! Get frame number from array ;
+	Hrl	1,Funct;		! Get function ;
+	Movei	2,Arg;			! Get argument address ;
+	Setom	!skip!;			! Set skip return ;
+	uuo!FRMOP  1,(2);		! Do the work ;
+	  Setzm	!skip!;			! OOPS! too bad ;
+end;
+
+
+internal simple boolean procedure CChild( integer Cradle );
+! ----------------------------------------------------------------------;
+!									;
+!	CChild		Routine to create a child frame from the	;
+!			information found at the address Cradle.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "birth procedure"
+    Redefine CF!LIC = !bit(16);		! until UUOSYM.DEF is right;
+    Redefine CF!LOG = 0;		! really !bit(17);
+
+    memory[ Cradle ]_ CF!LIC lor CF!LOG lor (E!License - 1);
+
+    start!code				! take a trip to the hospital ;
+	Setom	!skip!;			! skip return;
+	Hrli	1,!foCFM;		! function: create frame;
+	uuo!FRMOP 1,@Cradle;		! attempt to bear a child;
+	  Setzm	!skip!;			!   unbearable!;
+	Skipn	!skip!;			! successful birth? ;
+	  Exch	1,!skip!;		! no - swap error & skip ;
+    end;
+
+end "birth procedure";
+
+
+simple boolean procedure ADot( string Str );
+begin "a dot"
+    boolean dot, user;
+
+    dot_ user_ false;
+    while length( Str )
+     do case lop( Str ) of begin	 
+	["("] user_ true;
+	[")"] user_ false;
+	["."] if not user then dot_ true;
+	else
+     end;
+
+    return( dot );
+
+end "a dot";
+
+
+boolean procedure WantFile( Reference Integer Filename, Extension );
+begin
+    Return( Extension neq CvSix("TMP") );
+end;
+
+procedure FileProc( Reference Integer Chan, Cnt, Brk, FileEof;
+		    Integer Array LKB );
+Begin "Each File"
+    Integer N;
+
+    Name_ P:File[ ThisUser ];			! Head of list   ;
+
+    While ( That_ F:Next[ Name ] )		! While ( more ) ;
+     do If ( LKB[!File] = N_ F:File[ That ] )	!  do if same    ;
+	 then begin "New extension"		!   then add ext ;
+	    Last_ F:Ext[ That ];		!   : first one  ;
+	    While ( This_ E:Next[ Last ] )	!   : scan list  ;
+	     do If ( !lh( LKB[!Ext] ) < !lh( E:Ext[This] ) )
+		 then if props(Reverse) = NOVAL	! test direction ;
+		       then Last_ This		!  loop for more ;
+		       else done		!   : insert it  ;
+		 else if props(Reverse) = NOVAL	! test direction ;
+		       then If ( !lh( LKB[!Ext] ) > !lh( E:Ext[This] ) )
+			     then done		!   : insert it  ;
+			     else Last_ This	!   : make ext!  ;
+		       else Last_ This;		!   : make ext!  ;
+	    If ( !lh(LKB[!Ext]) = !lh(E:Ext[Last]) )
+	     then return;			! skip identical ;
+	    E:Next[ Last_ E:Next[ Last ]_ new!record( E ) ]_ This;
+	    E:Ext[ Last ]_ LKB[!Ext];		!   : in place   ;
+	    Return;				! then return.   ;
+	 end "New extension"
+	 else If ( LKB[!File] < N )		!  else insert?  ;
+	       then if props(Reverse) = NOVAL	! test direction ;
+		     then Name_ That		! no, re do scan ;
+		     else done			!    yes, skip!  ;
+	       else if props(Reverse) = NOVAL	! test direction ;
+		     then If ( LKB[!File] > N )	!  else insert?  ;
+			   then done		!    yes, skip!	 ;
+			   else Name_ That	! no, re do scan ;
+		     else Name_ That;		! no, re do scan ;
+
+    F:Next[ Name_ F:Next[ Name ]_ new!record( F ) ]_ That;
+    F:File[ Name ]_ LKB[!File];
+    This_ F:Ext[ Name ]_ new!record( E );
+    E:Ext[ E:Next[ This ]_ new!record( E ) ]_ LKB[!Ext];
+
+end "Each File";
+
+
+simple procedure Package( String Host );
+begin "pack it in"
+    string Name;
+
+    ProcessedFiles_ ProcessedFiles + 1;		! increment counter ;
+
+    Name_ Cv6str( F:File[That] ) &		! let user see what ;
+	  (if !lh( E:Ext[This] )		! file we are doing ;
+	      then "." & Cv6str( E:Ext[This] )	!  at the moment.   ;
+	      else null);
+
+    VMTEXT( TChan,
+	"("& P:User[ ThisUser ] &		! username ;
+	":"& cvs( ThisHost ) & ")" &		! host ;
+	Name &					! file ;
+	",("& datum( UserName ) &		! output username ;
+	":"& Host & ")" &			! each host ;
+	Name &					! file ;
+	crlf
+    );
+
+end "pack it in";
+
+!	***  M A I N   P R O G R A M   L O O P  ***
+;
+
+setbreak(inbrk_getbreak,#LF&#FF,null,"INS");	! break on LF FF;
+setbreak(inlst_getbreak,",[ "," "&#HT,"KTINS");	! break on comma;
+setbreak(quest_getbreak,"?*",Null,"INS");	! break on qmark;
+MFDset( 0, 4, 0, 132 );				! ascii, in, out, count;
+
+if not( 0 < CIndex_ FndKey( ArgV[0], LegalCommands ) )
+ then Usererr( 0,0, "Illegal command: "&ArgV[0], "X" );
+
+LastPpn_ Calli(!Xwd(-1,!GtPPN), Calli!GETTAB);	! initially self ;
+Interactive_ true;			! default to interactive mode ;
+
+datum( Gateway )_ "Gatway-host;Login-name";
+datum( HostList )_ "Host-number or Host-number,host-number,...";
+
+if not( ArgParse( any, InputFiles,
+	  {Center,Check,Default,Reverse,Sticky,Supersede,Update,Wait,
+!	   Days,Hours,Minutes, ;
+	   GateWay,
+	   HostList,
+	   LoginName,
+	   UserName},
+	  ARGS ) )
+ then start!code uuo!EXIT 1,; uuo!EXIT end;
+
+while ( true )				! ** this loop ends on last page ** ;
+ do begin "!TRUE!"
+
+    if ( props(InputFiles) )		! if something specified ;
+     then Interactive_ false;		!   become non-interactive ;
+
+    If ( Interactive )			! non command line data ;
+     then begin "real session"
+
+	Print( "Spec(s): " );		! prompt for an input line, ;
+	FileLine_ Inchwl;		! and read it from terminal ;
+	If Length( FileLine ) = 0	! on a blank line from user ;
+	 then Calli(0,Calli!EXIT);	!  simply terminate session ;
+
+	if not( ArgParse( any, InputFiles,
+	  {Center,Check,Default,Reverse,Sticky,Supersede,Update,Wait,
+!	   Days,Hours,Minutes, ;
+	   GateWay,
+	   HostList,
+	   LoginName,
+	   UserName},
+	  FileLine ) )
+	 then continue "!TRUE!";	! failure, reprompt immediately ;
+
+     end "real session";
+
+    FileLine_ datum(InputFiles);		! simulate input line ;
+    Users_ new!record( P );			! initialize...;
+
+    While Length( FileLine )			! for each spec typed ;
+     do begin "line typed"
+	FileSpec_ Scan(FileLine,inlst,brk);	! gobble one file-spec ;
+	if ( brk = "[" )			! handle [,] ;
+	 then FileSpec_ FileSpec & "[" &
+		Scan(FileLine,inlst,brk) & brk
+		& Scan(FileLine,inlst,brk);
+	If Length( FileSpec )			! if it has substance ;
+	 then begin "file typed"
+	    CopySpec_ Null;			! init copy variables ;
+	    Brk_ 0;
+	    While ( length( FileSpec ) )
+	     do CopySpec_ CopySpec & BrkString & Scan( FileSpec, quest, Brk );
+	    CopySpec_ CopySpec & BrkString;		! translate *,? to # ;
+	    File_ cvfil( CopySpec, Ext, UserPpn );	! dissect into parts ;
+	    If ( 0 neq (File lor Ext lor UserPpn) )	! any non-null ok ;
+	     then begin "use GFD ppn"
+		If UserPpn = 0				! handle null ppn ;
+		 then if ( props(STICKY) neq NTVAL )	! use /STICKY here ;
+		       then UserPpn_ LastPpn		! previous username ;
+		       else UserPpn_ Calli( !Xwd(-1,!GtPPN), Calli!GETTAB );
+		If !lh( UserPpn ) = 0			! pointer to UNAME ;
+		 then UserPpn_ CvPPN( Cv6str( memory[ UserPpn   ] ) &
+				      Cv6str( memory[ UserPpn+1 ] ) );
+	     end "use GFD ppn";
+	    If File = 0 then File_ cvsix("*");		! handle null file ;
+	    If Ext = 0 and not( ADot( CopySpec ) )	! handle null ext ;
+	     then Ext_ cvsix("*");			! when no dot typed ;
+
+	    THisUser_ Users;				! While ( more ) ;
+	    While ( ThisUser_ P:Next[ ThatUser_ ThisUser ] )
+	     do If ( UserPpn = P:Ppn[ ThisUser ] )	!  do if same    ;
+		 then done;				!   have a match ;
+	    If not( ThisUser )				! Got one?       ;
+	     then begin "first time"			! No, set one up ;
+		ThisUser_ P:Next[ ThatUser ]_ new!record( P );
+		P:Ppn[ ThisUser ]_ UserPpn;		! store username ;
+		P:User[ ThisUser ]_ CvName( UserPpn );	! in both forms  ;
+		P:File[ ThisUser ]_ new!record( F );	! init file area ;
+	     end "first time";
+
+	    UfdScn( UserPpn, File, Ext, 1, WantFile, FileProc );
+	    LastPpn_ UserPpn;			! remember last user ;
+
+	 end "file typed"
+     end "line typed";
+
+    ProcessedFiles_ 0;				! none at first  ;
+    ThisUser_ Users;				! While ( more ) ;
+    While ( ThisUser_ P:Next[ ThatUser_ ThisUser ] )
+     do if ( F:Next[ P:File[ ThisUser ] ] )	!  do if same    ;
+	 then ProcessedFiles_ ProcessedFiles+1;	!   have a match ;
+
+    if not( ProcessedFiles )			! none found ??? ;
+     then begin "none found"
+	Print( crlf & "%No files satisfying request" & crlf );
+	if ( Interactive )
+	 then continue "!TRUE!"			! so go on...... ;
+	 else calli( 0, calli!EXIT );		! or just finish ;
+	start!code uuo!EXIT 0, end;		! stay finished. ;
+     end "none found";
+
+!	fall through from above -- option setting.
+;
+
+    if not( props( Default ) ) and	! if no /DEFAULT specified ;
+       not( Interactive )		!  and not interactive ;
+     then props( Default )_ NOVAL;	! default to /DEFAULT ;
+
+    if ( props( GateWay ) = NOVAL )
+     then do begin "want gateway"
+	print( "gateway login [host;name]: " );
+	if ( length( Text_ Inchwl ) )
+	    and ( Text neq "?" )
+	 then begin "gateway name"
+	    datum( GateWay )_ Text;
+	    props( GateWay )_ 1;
+	 end "gateway name"
+	 else print( "enter gateway host-number;login-name"& crlf );
+     end "want gateway" until props( GateWay ) neq NOVAL;
+
+    if ( props( GateWay ) )
+     then begin "get gateway data"
+
+	if not( props( HostList ) )
+	 then do begin "get net hosts"
+	    print( "other net host: " );
+	    if ( length( datum( HostList )_ Inchwl ) )
+	     then props( HostList )_ 1
+	     else print( "please enter a host number"& crlf );
+	 end "get net hosts" until props( HostList );
+
+	print( "password: " );
+	AuxClr( -1, memory[ '600 ], !axCFS );
+	Password_ Inchwl;
+	print( crlf );
+	AuxClr( -1, memory[ '0 ], !axCFS );
+
+     end "get gateway data";
+
+
+    if not( props( HostList ) )			! no host specified ;
+     then begin "need host list"		! see if we need one ;
+
+	if ( props( Default ) = NOVAL )		! default on? ;
+	 then datum( HostList )_ "*"		! yes, so use "all" ;
+	 else begin "get host list"		! no, ask the user ;
+	    print( "Host list [all]: " );	!  prompt user ;
+	    Text_ Inchwl;			!  read answer ;
+	    if ( length( Text ) = 0 )		!  if blank line ;
+	     then Text_ "*";			!   then use all ;
+	    if ( kequ( Text, "10s" ) )		!  accept MHX 10s ;
+	     then Text_ "*";			!   as if was all ;
+	    datum( HostList )_ Text;		! setup list of hosts ;
+	 end "get host list";
+
+     end "need host list";
+
+    NeedHostFile_ false;			! scan it once for * ;
+    Hosts_ datum( HostList );			! complete host list ;
+    while ( length( Host_ Scan( Hosts,inlst,Brk ) ) or Brk neq 0 )
+     do if ( kequ( Host, "*" ) )		! was "all" specified ;
+	 then NeedHostFile_ true;		! yes, mark it true ;
+HMMM:
+    if ( NeedHostFile )				! host file requested ;
+     then AllHosts_ RHFile( ( props( Center ) = NOVAL ) or	! /Center ;
+			    ( props( Center ) = 1 ),	! /Center:x ;
+			    (if ( props( Center ) = 1 )	! if specified use ;
+			      then datum( Center )	!  value else none ;
+			      else 0)  )	! yes. ;
+     else AllHosts_ null;			! no, clear fields ;
+
+    Hosts_ datum( HostList );			! complete host list ;
+    Hostess_ null;				! empty host list ;
+    while ( length( Host_ Scan( Hosts,inlst,Brk ) ) or Brk neq 0 )
+     do Hostess_ Hostess & (if length(Hostess) then "," else null) &
+		 (if ( kequ( Host, "*" ) )	! was "all" specified ;
+		   then AllHosts		! yes, use list ;
+		   else Host);			! now use host number ;
+
+    if not( length( datum( HostList )_ Hostess ) )	! any host list ;
+     then begin "no hosts found"
+
+	Print( crlf & "%No hosts for transfer request" & crlf );
+	if ( Interactive )
+	 then continue "!TRUE!"			! so go on...... ;
+	 else calli( 0, calli!EXIT );		! or just finish ;
+	start!code uuo!EXIT 0, end;		! stay finished. ;
+
+     end "no hosts found";
+
+
+    if ( props( UserName ) neq 1 )	! no /Username:Name specified ;
+     then datum( UserName )_ CvName( Gettab( -1,!gtPPN ) );
+
+    if ( props( UserName ) = NOVAL )	! was it just /Username ;
+     then props( UserName )_ 1;		! yes, fake :Name ;
+
+    if ( props( UserName ) neq 1 ) and	! no /Username specified ;
+       not( props( Default ) = NOVAL )	!     and not defaulting ;
+     then do begin "get username"
+
+	Print( "username" );		! prompt, showing default ;
+
+	if not( props( Default ) = NTVAL )
+	 then print( " [", datum( UserName ), "]: " )
+	 else print( ": " );		!  unless not allowed ;
+
+	if length( Text_ Inchwl )	! if anything typed ;
+	 then begin "set new name"
+
+	    datum( UserName )_ Text;	! set name ;
+	    props( UserName )_ 1;	! set props ;
+
+	 end "set new name"
+	 else if ( props( Default ) = NTVAL )
+	       then print( "username may not be defaulted"& crlf )
+	       else props( UserName )_ 1;
+
+     end "get username" until props( UserName );
+
+
+    if ( props( LoginName ) = NOVAL )
+     then begin "default to login"
+	datum( LoginName )_ CvName( Gettab( -1,!gtAUN ) );
+	props( LoginName )_ 1;
+     end "default to login"
+     else if not( props( LoginName ) )
+	   then datum( LoginName )_ datum( UserName );
+
+    if ( props( LoginName ) neq 1 ) and
+       not( props( Default ) = NOVAL )
+     then do begin "get login name"
+
+	Print( "login username" );
+	if not( props( Default ) = NTVAL )
+	 then print( " [", datum( LoginName ), "]: " )
+	 else print( ": " );
+	if length( Text_ Inchwl )
+	 then begin "set new name"
+	    datum( LoginName )_ Text;
+	    props( LoginName )_ 1;
+	 end "set new name"
+	 else if ( props( Default ) = NTVAL )
+	       then print( "username may not be defaulted"& crlf )
+	       else props( LoginName )_ 1;
+
+     end "get login name" until props( LoginName );
+
+    if not( props( GateWay ) ) and
+       not( kequ( datum( LoginName ),
+		cv6str(Child[E!Username]) & cv6str(Child[E!Username+1]) ) )
+     then begin "different username"
+	if ( ( Child[ E!License ] lsh 18 ) land (LC!JL lor LC!AC) )
+	 tegin "has access"
+	    Child[ E!UserName ]_   cvsix( datum( LoginName )[1 for 6] );
+	    Child[ E!UserName+1 ]_ cvsix( datum( LoginName )[7 for 6] );
+	    Child[ E!AUN ]_ cvPPN( datum( LoginName ) );
+	 end "has access"
+	 else print( "%no license" & crlf );
+     end "different username";
+
+    print( "[logging in as ", cv6str(Child[E!Username]),
+	    cv6str(Child[E!Username+1]),
+	    (if ( Child[E!PPN] neq Child[E!AUN] )
+	      then "("& cvName( Child[E!PPN] ) &")"
+	      else null),
+	    "]"& crlf );
+
+    Frame_ CChild( location( Child[ E!Count ] ) );
+    TempFile_ cvs(1000+(Frame land '7777))[inf-2 to inf] & "TEL.COM";
+
+    if ( 0 geq TChan_ VMFile( TempFile, VM$Write ) )
+     then usererr( 0,TChan,"?Cannot write telecopy temp file ","X" );
+
+
+    if not( props( Default ) = NOVAL )
+     then begin "check interactive"
+
+	if ( Interactive )
+	 then begin "get supersede"
+
+	    props( Supersede )_ NTVAL;		! default is "NO" ;
+	    Print( "supersede existing files [N]: " );
+
+	    if ( length( Text_ Inchwl ) )	! any response yet ;
+	     then if kequ( Text, "YES"[1 for length(Text)] )
+		   then props( Supersede )_ NOVAL
+		   else if not( kequ( Text, "NO"[1 for length(Text)] ) )
+			 then print( "?illegal response, defaulting to NO"& crlf );
+
+	 end "get supersede";
+
+     end "check interactive";
+
+
+    VMText( TChan,
+	(if ( props( Supersede ) neq NTVAL )	! user wants supersede ;
+	  then "REPLACE" & crlf			! explicit or default  ;
+	  else "KEEP" & crlf)  &		! no supersede explicit ;
+
+	(if ( props( Update ) = NOVAL )		! user wants update ;
+	  then "UPDATE" & crlf			!  then give set it ;
+	  else "NO UPDATE" & crlf) &		!  or clear it ;
+
+	"ONLC" & crlf				! make lower case ok ;
+    );
+
+!	fall through from above -- scanner sorting code.
+!	***  I N T E R E S T I N G   P A R T  ***
+;
+
+  ProcessedFiles_ 0;				! initialize count   ;
+
+  Hosts_ datum( HostList );			! complete host list ;
+  print( "Hosts:" );
+
+  while ( length( Host_ Scan( Hosts,inlst,Brk ) ) or Brk neq 0 )
+   do begin "each host"
+
+    Print( " ", Host );				! one host at a time ;
+
+    if ( props( Gateway ) )
+     then VMText( TChan,
+	    "PASSWORD"&crlf & Password & crlf &
+	    "GATEWAY "& datum( GateWay ) & ":"& Host & crlf );
+
+    ThatUser_ Users;				! one user at a time ;
+    while( ThisUser_ P:Next[ ThatUser ] )	! if any at all      ;
+     do begin "each user"			!  P:Ppn[ ThisUser ] ;
+
+	Name_ P:File[ ThisUser ];		! get name pointer   ;
+	While ( That_ F:Next[ Name ] )		! look one at a time ;
+	 do begin "each name"			!  F:File[ That ]    ;
+
+	    This_ F:Ext[ That ];		! get ext pointer    ;
+	    While ( This_ E:Next[ This ] )	! one at a time      ;
+	     do begin "each ext"		!  E:Ext[ This ]     ;
+
+		Case ( CIndex - 1 ) of
+		begin
+		  [0] Package( Host );		! oh no, do it to it ;
+		  [else] usererr( 0,0, "Bad command", "C" )
+		end;
+
+	     end "each ext";			! ran of end of list ;
+
+	    Name_ That;				! setup for next "F" ;
+
+	 end "each name";
+	ThatUser_ ThisUser;			! setup for next "P" ;
+
+     end "each user";
+
+   end "each host";
+
+  VMText( TChan, "QUIT" & crlf );		! finish command list ;
+
+  if not( VMFree( TChan, 0 ) )			! close temp file ;
+   then begin "bad temp file"
+	VMFree( TChan, -1 );			! won't: try delete ;
+	FrmXct( Frame, Logout[0], !foRUN );	!  and logout job ;
+	usererr( 0,TChan, "?cannot close telecopy command file", "X" );
+   end "bad temp file";
+
+  Print( crlf );			! at end of host list ;
+
+  if ( props( Check ) = NOVAL )		! /CHECK specified? ;
+   then FrmXct( Frame, TelALP[0],   !foRUN )	! Yes, run TELALP;
+   else FrmXct( Frame, Telecopy[0], !foRUN );	! no, run TELECOPY;
+
+  print( "[Telecopy in frame ", Frame land '7777,"]"&crlf );
+
+  if ( props( Wait ) = NOVAL )		! waiting? ;
+   then do begin "waiting"
+      Print( "%waiting not impemented" & crlf );
+      Done;
+   end "waiting" until false
+   else FrmXct( Frame, 0, !foGFT );	! graft frame away ;
+
+  if not( Interactive )			! if we were a command line ;
+   then calli(0,calli!EXIT);		!  then we are done. ;
+
+  Interactive_ true;			! in case user says continue ;
+
+ end "!TRUE!";
+
+start!code uuo!EXIT 0, end;		! really exit! ;
+
+end "CPY" $
+  t@da
