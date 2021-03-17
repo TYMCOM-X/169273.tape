@@ -1,0 +1,407 @@
+entry readbreak, rvscan;
+begin "break table functions"
+require "<><>" delimiters;
+require "(sailib)strngs.req" source!file;
+	define ! = <comment>, dscr = <comment>;
+
+external simple string procedure cat( string first, last );
+external simple string procedure putch( integer ch );
+
+simple procedure error( string s );
+start!code define sp='16, p='17;
+push sp,[0]; push sp,[0];	! a second (fake) string arg;
+push p,[1];			! simulate 0,1 call;
+push p,-1(p);			! move return address;
+setzm -2(p);			! the 0 part;
+jrst usererr;			! now go call it.;
+end;
+define bktprv='34, bktptr='35;
+! offsets into "user" area: (gogtab entries)
+  bktprv='34: 0 => normal user, else priviledged user (eg BAIL)
+  bktptr='35: (indexed by BGRP) pointer to group table area
+		0 => no tables in this group allocated yet
+  ttycvt='41: break table for terminal conversion?
+;
+define	dsptbl=0, lintbl=19, brktbl=38, brk!bits=166,
+	bkjffo=166, brkcvt=167, brkomt=168;
+! offsets into "group table":
+  dsptbl:	(indexed by LCLB) break character disposition
+  lintbl:	(LCLB) line number disposition
+  brktbl:	(indexed by ASCII code) break,,omit bits (bits as below)
+  brk!bits:	first of BKJFFO,BRKCVT,BRKOMT,zero-fl
+		!NOTE!: If order or spacing changes in SAIL, rewrite
+	all words are in two halves, with a bit in the break table
+	position (local 1 = '400000 ... local 18 = 1)
+	order by halves:
+	   BKJFFO:	reserved,	initialized,
+	   BRKCVT:	0,		convert to uppercase
+	   BRKOMT:	0,		has at least one omit (copy)
+	   zero-flAG:	0,		ZFL (believe break table'S NULL)
+;
+external safe integer array gogtab[0:bktptr];
+internal integer procedure readbr( integer table;
+				reference string break, omit, mode );
+comment given a valid break table number,
+	this returns a 3-bit flag
+	bit 33 (4) => break table copies string,
+	bit 34 (2) => break table has been reserved
+			(getbreak can't return this table)
+	bit 35 (1) => break table has been initialized
+			(break, omit, and mode are valid)
+			(this should not be on if bit 34 isn't)
+	If the break table has been initialized (bit 35), then the
+	three reference strings are set so that
+		setbreak( table, break, omit, mode )
+	will set table to exactly the same break table as it currently
+	contains.  If the first character of mode is either "x" or "X",
+	then the mode will begin with "X" (breaks by eXclusion),
+	otherwise the mode will begin with "I" (breaks by Inclusion).
+	Default modes are shown explicitly, ("IPSF", not "I"), and the
+	mode letters are always in the same order:
+	{I or X}, {P,N,L, or E}, {S,A, or R}, {F or K}, {Z (if applies)}
+	So, if this returns 3 or 7, then modes will be either 4 or five
+	characters long.
+;
+begin "readbr"
+! bgrp(bnum) is the break table group for bnum (0-3)
+  lclb(bnum) is the local break number for bnum (1-18)
+;
+integer group, locnum, table!bit, exclude, cdb, result;
+define	copies=4, reserved=2, initialized=1,
+	set(bit) = <result_result lor bit>;
+integer BCHAN, OCHAN, wrd, CHAR;
+define add(letter) = <mode_mode & "letter">;
+
+result_0;
+if not (-17 < table < 55)
+ then begin
+	error( "invalid break table" );
+	return( reserved );
+      end;
+if table = 0
+ then begin
+	break _ null; omit _ null;
+	if (lop(mode) land '137) = "X"
+	 then begin
+		mode _ "XPSF";
+		for char _ 0 step 1 until '177 do break _ break & char;
+	      end
+	 else mode _ "IPSF";
+	return( initialized + reserved );
+      end;
+
+group_ (table + 17) div 18;
+if (cdb_ gogtab[bktptr+group]) = 0  then return(0);
+			! ??? modes... entire group not allocated;
+define	grouptable(offset) = <memory[offset+cdb]>;
+
+locnum _ ((table + 17) mod 18) + 1;
+table!bit_ 1 lsh (18-locnum);
+
+if (lop(mode) land '137) = "X"
+ ! (uppercase if letter);
+ then begin		! show break characters by exclusion;
+	exclude_ table!bit;	! invert break bit when reading table;
+	mode_ "X";
+      end
+ else begin		! show break characters by inclusion;
+	exclude _ 0;		! keep break bit when reading table;
+	mode_ "I";
+      end;
+
+if wrd_grouptable(lintbl+locnum)
+ then	if	'777777000000 = wrd then add(E)
+	else if '000000777777 = wrd then add(N)
+	else if '777777777777 = wrd then add(L) else error("READBR: line")
+ else add(P);
+
+if wrd_grouptable(dsptbl+locnum)
+ then	if	'000000777777 = wrd then add(R)
+	else if '777777777777 = wrd then add(A) else error("READBR: break")
+ else add(S);
+wrd_ point( 18, grouptable(brk!bits), 17 );
+if  ldb(wrd) land table!bit then set(reserved);
+if ildb(wrd) land table!bit then set(initialized);
+if ildb(wrd)		    then   error("BRKCVT-lh?!");
+if ildb(wrd) land table!bit
+ then begin set(copies); add(K) end
+ else			 add(F);
+if ildb(wrd)		    then   error("BRKOMT-lh?!");
+if ildb(wrd) land table!bit then set(copies);
+if ildb(wrd)		    then   error("believes-LH?!");
+if ildb(wrd) land table!bit then add(Z);		! no inverse?;
+
+omit_ null; break_ null;
+
+wrd_ point( 18, grouptable(BRKTBL), -1 );
+for char _ '0 step 1 until '177
+ do begin
+    if exclude xor ildb(wrd) land table!bit	then break_ break & char;
+    if		   ildb(wrd) land table!bit	then omit_  omit  & char;
+    end;
+
+return( result );
+end "readbr";
+  string procedure invtab( reference string s; integer brktab;
+				reference integer brkchar );
+  begin error( "bad (or unset) break table" ); return(null); end;
+
+internal simple string procedure rvscan( reference string s;
+			integer brktab; reference integer brkchar );
+start!code "rvscan"
+	label	trubrk, bytldb, bytild, ulbrk,	notlow, inbrk,
+		nolop,	nobrk,	l.junk, retarg, alldon, atbrkc,
+		atbrk,	scnadd, brkret;
+	define	lstr=1, cnt=2, bbrk=4, chnd=5, chnl=6, bdsp=chnl+1,
+		bywd='10, byno = bywd+1, char='13, temp='14,
+		sp='16, p='17;
+	integer junk;
+	string stemp;
+! start: -3(p): address of sail string to be scanned (S)
+	 -2(p): break table number
+	 -1(p): address of break character variable
+	  0(p): return address
+;
+
+dscr	code entry [inline]	handle degenerate cases (null & break 0)
+	call:	-3(p): @S
+		-2(p): break table
+	sets:	LSTR: address of S,
+		CNT: length(S)
+	abort:	if length(s)=0 or chnl=0 ==> retarg
+	normal: sets CHNL: brktab (non-zero)
+		guarantee S non-null (so CNT > 0).
+;
+	move	lstr,-3(p);	! get the address of the string;
+	hrrz	cnt,-1(lstr);
+	jumpe	cnt,retarg;	! eliminate case of null string;
+
+	skipn	chnl,brktab;
+	 jrst	retarg; 	! break table 0, just pass entire string;
+
+
+dscr	chkbrk [inline] 	check break table number (BRKTAB)
+	call:	CHNL: brktab. (non-zero)
+	abort:	if not (-18 < chnl < 56)
+		or break group not allocated
+		or break table not inited	then error exit via invtab.
+	normal: sets	BBRK: bit mask for break table
+			CHND: [address] ascii.break.table(char)
+			 [ie:  tdnn bbrk,@chnd	skip iff (char) is a break]
+			CHNL:	tsnn bbrk,brkcvt(chnl) skip iff Konvert
+				tsne bbrk,brkomt(chnl) skip iff has omits
+			BDSP:	skipg (bdsp)  skip iff Retain mode,
+				skipl (bdsp)  skip iff Append mode,
+				skipe (bdsp)  skip iff Skip mode.
+;
+	addi	chnl,17;	! now get break table group;
+	cail	chnl,0;
+	caile	chnl,17+55;
+	 jrst	invtab; 	! invalid break table, bitch and moan;
+	idivi	chnl,18;
+	add	chnl,gogtab;
+	skipn	chnl,bktptr(chnl);
+	 jrst	invtab; 	! unallocated break group, bitch and moan;
+
+	movei	chnd,brktbl(chnl);
+	hrli	chnd,char;	! chnd is indirected to get char bits;
+
+	movn	temp,bdsp;	! now bbrk_ bit ((brktab+17) mod 18);
+	hrlzi	bbrk,'400000;
+	lsh	bbrk,(temp);
+
+	tsnn	bbrk,bkjffo(chnl);	! right half bit check;
+	 jrst	invtab; 	! break not INITed, bitch and moan;
+
+	addi	bdsp,1+dsptbl(chnl);	! break disposition code location;
+
+dscr	setupb [inline] 	set up for "dldb" loop.
+	call:	lstr: @S  [address of sail string descriptor] (non-null)
+		CNT:  length(s) (> 0)
+	abort:	none
+	normal: sets	BYNO: byte number w/in word for s[inf for 1] [0:4]
+			BYWD: address of word as above
+				[BYNO>0 =>  0(BYWD) contains actual byte
+				 BYNO<1 => -1(BYWD) contains actual byte]
+	"hidden" assumption: LH of sail string descriptor is one of 6
+				listed in the comment below.
+;
+	hllz	temp,(lstr);	! get lh(string byte pointer) (eg '260700);
+	move	0,[((((1 lsh 7 +2) lsh 7 +3) lsh 7 +4) lsh 7 +5) lsh 1];
+		! '440700,,... => 0,	'350700,,... => 1,
+		  '260700,,... => 2,	'170700,,... => 3,
+		  '100700,,... => 4,	'010700,,... => 5;
+	ldb	bywd,temp;
+	addi	bywd,(cnt);
+	idivi	bywd,5; 	! note: this sets BYNO;
+	addi	bywd,@(lstr);	! string.pointer effective addr;
+dscr	rbrk [inline] actual "scan back for break" loops.  Since SAIL break
+	tables behave differently for upper-casing, this separates the two
+	cases.	each loop has two exits,
+	1) exit if no break found [ie rvscan should match SCAN].
+		if forcing to upper case then just call SCAN,
+		otherwise decide if a simple substring will work (no omits).
+	2) exit with break found [CHAR: break, CNT: length(s through break)]
+;
+	tsne	bbrk,brkcvt(chnl);	! forcing up?;
+	 jrst	ulbrk;			! yup, use upper casing loop;
+			! otherwise drop into trubrk (no casing);
+trubrk:
+! CNT:	[>0]  length of S not examined yet;
+! BYNO: [0:4] BYTLDB(BYNO) points at then CNT'TH byte in S;
+	ldb	char,bytldb(byno);	! grab new byte to check;
+	tdne	bbrk,@chnd;		! skip if not break character;
+	 jrst	atbrk;		! found break character in string;
+! CNT:	[>0]  1 + length of S not examined yet;
+! BYNO: [0:4] BYTLDB(BYNO) points at byte just examined;
+	soje	cnt,nobrk;	! not break char, decrease count and leave ;
+				! if CNT=0 [scanned string w/o finding brk];
+! CNT:	[>0]  length of S not examined yet;
+! BYNO: [0:4] BYTLDB(BYNO) points at then (CNT+1)'TH byte in S;
+	sojge	byno,trubrk;	! decrease byno to match CNT.  go loop if ;
+				! top condition for BYNO [0:4] satisfied;
+! CNT:	[>0] length of S not examined yet;
+! BYNO: [-1] BYTLDB(BYNO) points at then CNT'TH byte in S;
+	movei	byno,4; 	! well, BYNO=-1, add 5 (ch's/word);
+! CNT:	[>0] length of S not examined yet;
+! BYNO: [4]  BYTLDB(BYNO) points one word past then CNT'TH byte in S;
+	soja	bywd,trubrk;	! reduce the word base by one, and loop;
+
+bytild: '100700777777(bywd);	! second to last char in previous word;
+bytldb: '010700777777(bywd);	! last char in previous word;
+	'350700000000(bywd);	! first  char in (bywd);
+	'260700000000(bywd);	! second char in (bywd);
+	'170700000000(bywd);	! third  char in (bywd);
+	'100700000000(bywd);	! fourth char in (bywd);
+	'010700000000(bywd);	! fifth  char in (bywd);
+
+ulbrk:
+! CNT:	[>0]  length of S not examined yet;
+! BYNO: [0:4] BYTLDB(BYNO) points at then CNT'TH byte in S;
+	ldb	char,bytldb(byno);	! grab new byte to check;
+	cail	char,"a";		! force to upper case character;
+	caile	char,"z";
+	 jrst	notlow;
+	 andi	char,'137;	! was lower case letter, make upper-case;
+notlow:
+	tdne	bbrk,@chnd;		! skip if not break character;
+	 jrst	atbrkc; 	! found break character in string;
+! CNT:	[>0]  1 + length of S not examined yet;
+! BYNO: [0:4] BYTLDB(BYNO) points at byte just examined;
+	soje	cnt,scan;	! not break char, decrease count and leave ;
+				! if CNT=0 [scanned string w/o finding brk];
+				! sail SCAN function correct if no break;
+				!	(to do ignores, upper-casing);
+! CNT:	[>0]  length of S not examined yet;
+! BYNO: [0:4] BYTLDB(BYNO) points at then (CNT+1)'TH byte in S;
+	sojge	byno,ulbrk;	! decrease byno to match CNT.  go loop if ;
+				! top condition for BYNO [0:4] satisfied;
+! CNT:	[>0] length of S not examined yet;
+! BYNO: [-1] BYTLDB(BYNO) points at then CNT'TH byte in S;
+	movei	byno,4; 	! well, BYNO=-1, add 5 (ch's/word);
+! CNT:	[>0] length of S not examined yet;
+! BYNO: [4]  BYTLDB(BYNO) points one word past then CNT'TH byte in S;
+	soja	bywd,ulbrk;	! reduce the word base by one, and loop;
+inbrk:
+dscr	post-scanning cleanup, final for S and BRKCHAR, "raw" return value.
+ call	-1(p): address to store break char.
+	char: value to store there (converted if necessary)
+	lstr: address of bytepointer to S (the reference argument)
+	cnt:  character number (within S) of break character
+	bdsp: address of brk char dispatch code
+	byno: byte number (0:5) for break char -- an index to bytldb
+	bywd: word address that goes with byno
+		ldb char,bytldb(byno) load char with the char within S
+			that was the actual char broken on.
+	then pushj p,inbrk
+ ret	S and BRKCHAR with proper final values for RVSCAN
+	one new string on stack
+	    (the return value as if the table has no conversion or omits)
+	temp: the first word of that string descriptor
+	bdsp: brk char dispatch code (NOT its address)
+	bbrk,chnl unchanged
+;
+	movem	char,@-1-1(p);	! save break character;
+	move	temp,-1(lstr);	! temp_ first word of original string;
+				! (constant/allocated),,size;
+	hrrm	cnt,-1(lstr);
+	! original string_ original string[1 through break.char#];
+	skipg	bdsp,(bdsp);	! if break table not in retain mode;
+	 sos	-1(lstr);	! then drop the break char;
+
+! now S has been properly stripped;
+! make a string: original string [break.char# to inf];
+	subi	temp,-1(cnt);	! length(result) _ old length - break.char#;
+	push	sp,temp;
+	move	bytild(byno);	! get byte pointer to just before brk char;
+	hrri	@0;		! eliminate indexing (get effective addr);
+	tlz	'37;		! and clear indirect and indexing fields;
+	push	sp,0;
+
+	jumpl	bdsp,nolop;	! if break table retain or skip mode;
+	 sos	temp,-1(sp);	! then lop off the break char;
+	 ibp	(sp);
+nolop:	popj	p,;		! and now ok;
+nobrk: tsne	bbrk,brkomt(chnl);	! any omits in table?;
+	 jrst	scan;			! yup, use scan (to do omits);
+retarg: push	sp,-1(lstr);	! result_ original string;
+	push	sp, 0(lstr);
+	setzm	-1(lstr);	! original string_ null;
+	setzm	@-1(p); 	! clear break character;
+alldon: sub	p,[4 lsh 18 +4];
+	jrst	@4(p);
+
+atbrk:	tsne	bbrk,brkomt(chnl);	! any omits in table?;
+	 jrst	atbrkc; 		! yup, scan may be vital (for omits);
+	pushj	p,inbrk;	! fiddles strings (see dscr for inbrk);
+			! inbrk is enough since no omits or casing to do.;
+	jrst	alldon; 		!   then return (result);
+
+atbrkc: pushj	p,inbrk;	! fiddles strings (see dscr for inbrk);
+				! p-stack ok, sp-stack is +2 (result);
+	trnn	temp,-1;	! if length(result) = 0;
+	 jrst	alldon; 		!   then return (result);
+	jumpl	bdsp,scnadd;	! separate append mode stuff;
+		! scan must be called (to do omits and/or casing);
+	movei	lstr,stemp;	! done w/ arg, now use string temp;
+	pop	sp,0(lstr);	! and place "result" in stemp;
+	pop	sp,-1(lstr);
+		! p-stack and sp-stack ok now, lstr points at stemp;
+	movem	lstr,-3(p);	! return( scan( @stemp, ;
+	movei	junk;		!	brktable, ;
+	movem	-1(p);		!	@junk );
+	jrst	scan;		!  );
+
+scnadd: ! was "Append" mode break, concatenate break character w/ SCAN;
+		! p-stack and sp-stack ok now, lstr points at stemp;
+	trnn	temp,-2;	! did it just contain a break char?;
+	 jrst	brkret; 	!  yup, return( makestring(breakchar) );
+	movei	lstr,stemp;	! done w/ arg, now use string temp;
+	pop	sp,0(lstr);	! and place "result" in stemp;
+	pop	sp,-1(lstr);
+	sos	-1(lstr);	! advance stemp past break char;
+	ibp	0(lstr);
+	push	p,lstr; ! set for scan( @stemp, ;
+	push	p,-2-1(p);	! breaktable, ;
+	push	p,l.junk;	! @junk );
+	push	p,char; 	! make a one-char string of break;
+	pushj	p,putch;	! and save it above the SP stack;
+	pushj	p,scan; 	! call scan (result goes just after break);
+	pushj	p,cat;		! concatenate top of SP (break & scan);
+	jrst	alldon; 	! and return that.;
+l.junk: 	junk;
+
+brkret: ! append mode, 1-character result (might have to be upper case);
+	move	(sp);		! examine the character in string;
+	ildb	0,0;
+	cain	0,(char);	! is it the same as the break?;
+	 jrst	alldon; 	! yup, just return it;
+	sub	sp,['2000002];	! nope, must have been case convert.;
+	push	p,char; 	! drop the string, and return( ;
+	pushj	p,putch;	! makestring(char) );
+	jrst	alldon;
+end "rvscan";
+
+end "break table functions" .
+
+  
