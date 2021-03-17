@@ -1,0 +1,281 @@
+begin "TAPXFR"
+require 2 version;
+
+require "{}{}" delimiters;
+define	lf={('12&null)}, ff={('14&null)}, cr={('15&null)},
+	tab={('11&null)}, space={('40&null)}, Esc={('33&null)},
+	crlf={(cr&lf)},
+	!={Comment},
+	tenx(x)={}, tymcom(x)={x}; 
+external integer !skip!, !JBVER;
+
+define NameStart=10, NameSize=120;
+integer logfile;
+define log(s)={cprint(logfile,s)}, debugp(s)={};
+! "magic" procedures strings <=> core;
+
+simple string procedure pickstr( reference integer loc; integer count );
+start!code	define sp='16,p='17,a=1,b=2,ret=3;
+pop p,ret; pop p,b; pop p,a; 
+hrli a,'440700; push sp,b; push sp,a; jrst(ret); 
+end;
+
+simple procedure putstr( reference integer loc; string s );
+start!code	define sp='16,p='17,a=1,b=2,c=3,ret=4;
+		label done,loop;
+	pop p,ret; pop p,a; pop sp,b; pop sp,c; 
+	hrli a,'440700; hrrz c,c;
+	sojl c,done;
+loop:	ildb b; idpb a; sojge c,loop;
+done:	movei '15; idpb a;
+	movei '12; idpb a;
+	setz;	   idpb a;
+	jrst (ret);
+end;
+
+! environmental setup (break tables);
+integer StopWhite, StopLine, EatWhite, StopNull;
+
+simple procedure brkset;
+begin
+define white={(tab&space&cr&lf&ff)};
+setbreak( StopNull_ getbreak,     0,     0, "ISZ" );
+setbreak( StopWhite_getbreak, white, white, "IS" );
+setbreak( EatWhite_ getbreak, white, white, "XR" );
+setbreak( StopLine_ getbreak, lf&ff, cr, "INS" );
+end;
+require brkset initialization;
+! single file => tape;
+integer tape,tapeof;
+safe integer array buffer[0:512];
+
+procedure tapefile(string descr; integer f;reference integer feof);
+! single file => tape, descr is the text line, f assumed buffered words;
+begin	integer count;
+arrclr(buffer); 
+buffer[0]_ !JBVER;
+putstr(buffer[NameStart],descr[1 for NameSize]);
+  do  begin 
+	arryout(tape,buffer[0],512);
+	arryin(f,buffer[0],512);
+      end
+ until feof;
+
+if count_(feof land '777777)
+ then begin
+	buffer[count]_0;
+	if count<511
+	 then arrblt( buffer[count+1], buffer[count], 512-count );
+	arryout(tape,buffer[0],512);
+      end;
+mtape(tape,"E");
+end;
+! single file <= tape;
+procedure readtape( integer f );
+! single file <= tape, f channel to output file to;
+begin
+neednext while not tapeof
+   do begin 
+	arryin(tape,buffer[0],512); next;
+	arryout(f,buffer[0],512);
+      end;
+if tapeof land '777777 then usererr(0,1,"Badly formatted Tape");
+end;
+! restore all files from tape;
+integer ochan;	! a disk channel for writing;
+define StyleConsult=0, StyleOverWrite=1, StyleNoOverwrite=2;
+
+procedure XfrTape( integer style );
+! restore all files from tape.  style tells what to do if file exists;
+while true do
+begin	string name,ext,baseName,fullName,action,fileLine;
+	integer flag; boolean NewName;
+	label drop;
+arryin(tape,buffer[0],512);
+if tapeof then begin mtape(tape,"B"); return end;
+NewName_ false;
+
+FileLine_pickstr(buffer[NameStart],NameSize);
+
+name_ scan(FileLine,StopWhite,!skip!);
+scan(FileLine,EatWhite,!skip!);
+ext_ scan(FileLine,StopWhite,!skip!);
+scan(FileLine,EatWhite,!skip!);
+FileLine_ scan(FileLine,StopNull,!skip!);
+
+baseName_fullName_ name & ext;
+TYMCOM({ lookup(ochan, fullName, flag ); })
+TENX({ if 0 leq (ochan_openfile(fullName_action,"ROE"))
+	 then begin release(ochan); ochan_-1; flag_false; end
+	 else flag_ true;
+})
+ while flag=false and style=StyleConsult
+   do begin	string action;
+	print(crlf, fullname, " exists: ");
+	action_inchwl; 
+	if !skip!=lf and length(action)=0 then done;
+	if !skip!=esc
+	 then begin NewName_ true; fullName_action; done end;
+	if length(action)=0 or action="?"
+	 then print(crlf," <LF> to overWrite, <ESC> to ignore,", crlf,
+	 " file<CR> to try another, or file<ESC> to overwrite a file" )
+	 else begin
+		TYMCOM({ lookup(ochan, fullName_action, flag ); })
+		TENX({	
+		if 0 leq (ochan_openfile(fullName_action,"ROE"))
+		 then begin release(ochan); ochan_-1; flag_false; end
+		 else flag_ true;
+		})
+		NewName_ true; 
+	      end;
+      end;
+TYMCOM({ close(ochan); })
+if length(fullName)=0 or (flag=false and style=StyleNoOverwrite)
+ then begin
+	drop: do arryin(tape,buffer[0],512) until tapeof;
+	log({"*ignored"&tab, Name,tab,Ext,tab,FileLine}) 
+      end
+ else begin
+	TYMCOM({ enter(ochan, fullName, flag); })
+	TENX({ flag_ 0 LEQ ochan_ openfile( fullName, "WC" ); })
+	if flag
+	 then begin usererr(0,1,"Cannot ENTER file"); go drop; end;
+	readTape(ochan);
+	log({fullName,tab, Name,tab,Ext,tab,FileLine})
+      end;
+TYMCOM({ close(ochan); })
+TENX({ if ochan geq 0 then release(ochan); })
+end;
+integer transferChannel, TransferEof;	! for binary disk reading;
+! save set of files on tape;
+recursive procedure saveFiles(string fileDSC);
+! saves "prune-style" specified files;
+begin	integer brk,cmdchn,cmdeof;
+	string file, FirstDsc;
+scan(filedsc,eatWhite,brk);
+if brk=";" or brk=0 then return;
+if length( file_scan(filedsc,StopWhite,!skip!) )=0 then return;
+if brk = "@"
+ then begin
+	brk_lop(file);
+TYMCOM({ 
+	open(cmdchn_getchan,"DSK",0, 1,0, 200,0,cmdeof_0);
+	if cmdeof
+	 then usererr(0,0,"Not enough Disk today")
+	 else lookup(cmdchn,file,cmdeof);
+	if cmdeof
+	 then begin
+		if cmdchn geq 0 then release(cmdchn);
+})
+TENX({	if 0 LEQ cmdchn_openfile(file)
+	 then setinput(cmdchn,200,0,cmdeof)
+	 else begin
+})
+		print(crlf,"Couldn't open indirect file `",file,"' ",
+			filedsc);
+		return
+	      end;
+	scan(filedsc,eatWhite,!skip!);
+	if length(filedsc) then print(crlf,file," => ",filedsc);
+	  do  begin
+		file_ input(cmdchn,stopLine);
+		scan(file,eatWhite,brk);
+		if ";" neq brk and length(file)
+		 then begin
+			DEBUGP({crlf,"->",file});
+			saveFiles(file);
+		      end
+	      end
+	 until cmdeof;
+	release(cmdchn);
+	return;
+      end;
+scan(filedsc,eatWhite,brk);
+if brk="."
+ then begin 
+	file_file & scan(filedsc,stopWhite,brk);
+	scan(filedsc,eatWhite,brk);
+      end;
+if length(file)
+ then begin
+	tenx({ transferChannel_openfile(file,"ROE");
+		transferEof_!skip!; })
+	tymcom({ lookup( transferChannel, file, TransferEof ); }) 
+	if TransferEof 
+	 then print(crlf,"Couldn't read `", file, "'.")
+	 else begin
+		tymcom({ fileDSC_ cv6str(cvfil(file,brk,!skip!)) &
+			 (tab & ".") & cv6str(brk) & tab & fileDSC;
+		})
+		tenx({ setinput( transferChannel,0,0,TransferEof );
+			fileDSC_ jfns(transferChannel, '001100.000003 )
+				 & tab & fileDSC;
+		})
+		tapeFile(fileDSC, transferChannel, TransferEof );
+		tenx({ release( fileDCS ) })
+	      end;
+	tymcom({ close( transferChannel ); })
+      end;
+end;
+simple procedure setupTape;
+begin	string driveName; 
+tymcom({ tape_getchan; })
+  do  begin
+	print(crlf,"Tape Drive:");
+tymcom({ open(tape,driveName_inchwl,'17, 0,0, 0,0,tapeof_true); })
+tenx({	tape_ openfile(null,"RWE"); tapeof_!skip!; })
+	if tapeof then print(" Sorry, no can do.");
+      end
+ until tapeof=0;
+tymcom({
+	chniov(tape,'100,'12);	! set 9-track DEC mode;
+	lookup(tape,"TAPE.IMG",!skip!);
+	enter(tape,"TAPE.IMG",!skip!);
+})
+tenx({	setinput( tape,0,0,tapeof ); 
+	mtopr(tape,'20, 3 lsh 2);
+})
+end;
+string command;
+
+ttyup(true);
+tymcom({
+open( transferChannel_getchan, "DSK",8, 1,0, 0,0,TransferEof_false );
+if TransferEof then usererr(0,0,"No disk today!");
+
+open( ochan_getchan, "DSK",'17, 0,0, 0,0,TransferEof_false );
+if TransferEof then usererr(0,0,"No disk today!");
+})
+tymcom({
+open( logfile_getchan, "DSK",0, 0,1, 0,0,TransferEof_false );
+if TransferEof then usererr(0,0,"No disk today!");
+enter(logfile,"TAPXFR.LOG",TransferEof);
+while TransferEof 
+   do begin 
+	print("Cant set log file, you try: ");
+	enter(logfile,"TAPXFR.LOG",TransferEof);
+      end;
+})
+tenx({ logfile_ openfile( "TAPXFR.LOG", "WA" ); })
+
+setupTape;
+while true
+   do begin
+	print(crlf,"=>");
+	command_inchwl;
+	scan(command,EatWhite,!skip!);
+	case lop(command) of begin
+	 ["="] while length(command) do mtape(tape,lop(command));
+	 ["*"] XFRtape(cvd(command));
+	 ["^"] saveFiles(command);
+	 ["Q"] done;
+	  ELSE print(crlf,"Commands are `=<tapeops>', `*'(read), " & 
+			"`^file'(write), or Quit" )
+	 end
+      end;
+release(logFile);
+release(tape);
+tymcom({ release(transferChannel); release(oChan); })
+require " [compiled] " message;
+end "TAPXFR" $
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
