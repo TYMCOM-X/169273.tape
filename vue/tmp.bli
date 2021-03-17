@@ -1,0 +1,258 @@
+module tmpcor(
+	entries=(tmpcor,dotmpcor,tmpdsk))=
+
+!Copyright 1979 by Michael L. Kazar
+
+
+begin
+
+macro lh = 18,18$,
+      rh =  0,18$;
+
+machop calli = #047,
+       ttcall = #051,
+       blt = #251;
+machop xct = #256;	! to execute random i/o routines
+
+
+macro
+	! some cleaner UUO definitions
+	devnam(ac) = calli(ac,#64)$,
+	pjob(ac) = calli(ac,#30)$,
+
+	! the basis of UUOs to a random channel.
+	execute(opcode,reg,location) =
+		begin
+		register temporary;
+		temporary _ location;
+		temporary<23,4> _ reg;
+		temporary<27,9> _ opcode;
+		ifskip xct(0,temporary)
+		     then 1
+		     else 0
+		end$,
+
+	! bogus UUOs:  use execute to do 'em.
+	open(ac,e) = execute(#50,ac,e)$,
+	in(ac,e) = execute(#56,ac,e)$,
+	out(ac,e) = execute(#57,ac,e)$,
+	release(ac) = execute(#71,ac,0)$,
+	lookup(ac,e) = execute(#76,ac,e)$,
+	enter(ac,e) = execute(#77,ac,e)$,
+	rename(ac,e) = execute(#55,ac,e)$;
+
+global routine tmpcor(name,code,buffer,buflen)=
+
+%
+performs random tmpcor function
+
+parameters:
+	name	sixbit tmpcor file name, left justified
+	code	tmpcor code number (0-5)
+	buffer	where the words should be placed
+	buflen	number of words requested
+
+results:  AC returned for a normal return, -AC for error return
+	  with the additional hack that an error return of 0
+	  is returned as "an arbitrarily large number", currently
+	  #200.
+
+%
+
+     begin
+     register temp;
+     local tmpblk[2];
+
+     ! set up a block for the tmpcor.
+     tmpblk[0] _ @name;	! note that it assures 3 chars
+     tmpblk[1]<lh> _ -@buflen;	! prepare length
+     tmpblk[1]<rh> _ .buffer<rh> - 1;	! into buffer
+
+     ! set up register
+     temp<lh> _ @code;
+     temp<rh> _ tmpblk<0,0>;
+
+     ifskip calli(temp,#44)	! tmpcor uuo
+     then @temp	! wins
+     else	! loses
+	  if @temp eql 0 then -#200  ! additional hack to distinguish
+				     ! an error 0 from an non-error 0
+			 else -@temp
+     end;
+
+global routine dotmpcor(name,func,buffer,buflen)=
+
+%
+does the appropriate tmpcor function, using disk if necessary
+
+parameters:
+	name is the tmpcor file name, sixbit, left justified
+	func is the tmpcor function.  those functions are:
+		1 - read the file
+		2 - read the file, then delete it.
+		3 - write a tmpcor file.
+	(note: this routine will do tmpcor functions 0,4 and 5,
+	 but it would be easier to use the routine TMPCOR directly.
+	 at any rate, i'm not going to describe them here.)
+	buffer is the location into which i can put the resulting
+	 information, or from which i get the output for a write.
+	 (this buffer MUST be in the lowseg, even for output, and is
+	 zeroed if this is an output function which is forced to use
+	 disk instead of tmpcor.)
+	buflen is the buffer length.  (did you guess?)  for output,
+	 it indicates the number of words to be written.  for input,
+	 it indicates how many words you're prepared to handle before
+	 i start throwing words out.
+
+results:
+  i generally return whatever TMPCOR and TMPDSK stuff down my
+  throat, so look at those routines for details.  briefly, though,
+  a negative number indicates failure, a 1 indicates that the function
+  was completed, but only after going to disk to do it, and
+  a non-negative number which is a multiple of four is the returned
+  AC in the successful TMPCOR UUO (do with it what you will.)
+
+%
+
+	begin
+	local temp;
+
+	external tmpcor,	! does a tmpcor uuo
+		 tmpdsk;	! does the disk fake for tmpcor
+
+	temp _ tmpcor(@name,@func,@buffer,@buflen);
+	if @temp geq 0	! did it work?
+	then @temp	! yes: return the ac (which was returned to us)
+	else	! no: try the disk
+	    tmpdsk(@name,@func,@buffer,@buflen)
+		! note that i just return the value, i don't look
+	end;
+
+
+
+global routine tmpdsk(name,func,buffer,buflen)=
+
+%
+gets the file DSK:nnnXXX.TMP, where nnn is this job and XXX is
+the parameter name.
+
+parameters:	same as tmpcor
+
+results:
+	1 if no errors
+	-2 if there are no available channels to use
+	-4 if "dsk" could not be opened.
+	-6 if nnnXXX.TMP could not be found
+	-8 if no input could be obtained.
+	-10 if nnnXXX.TMP could not be entered
+	-12 if an output error was encountered
+
+	if a file error occured (leq -6), the file name is returned
+in the first word of the buffer.
+
+
+RESTRICTION:
+	  the buffer must ALWAYS be in the lowseg, EVEN for output.
+	The buffer is zeroed by the dump mode output;  it does not
+	remain intact.
+
+%
+
+begin
+
+local chan,dsk[3];
+
+dsk[0] _ #17;	!  dump mode
+dsk[1] _ sixbit 'dsk';	! look on dsk:
+dsk[2] _ 0;
+
+if (chan _ incr inc to #17
+	   do
+	     begin
+	     register temp;
+	     temp _ @inc;
+	     ifskip devnam(temp)
+	     then else exitloop @inc
+	     end
+	) eql -1
+then -2	! no free channels
+else
+     if open(@chan,dsk)
+     then
+	begin
+	register ac;
+	local comlst[2],lookblk[4],retval;
+
+	retval _ 1;
+
+	! set up the command list for the input or output
+	comlst[0]<lh> _ -@buflen;	! negative word count
+	comlst[0]<rh> _ @buffer - 1;	! location for info
+	comlst[1] _ 0;			! end of list
+
+	pjob(ac);	! what's his number?
+
+	lookblk _ 0;
+
+	! put the job number into the first 3 char slots
+	incr inc to 2
+	do begin
+	   lookblk _ @lookblk + (@ac mod 10)^(@inc*6);
+	   ac _ @ac div 10;
+	   end;
+
+	! set up the name
+	lookblk<lh> _ .lookblk<rh> + sixbit "000";
+	lookblk<rh> _ .name<lh>;
+
+	! set up the rest of the lookup block
+	lookblk[1] _ sixbit 'tmp';
+	lookblk[2] _ lookblk[3] _ 0;
+
+	if @func eql 3	! is this the write a file function?
+	then 		! write a file
+	     if enter(@chan,lookblk<0,0>)
+	     then
+		  if out(@chan,comlst)	! output the info.
+		  then retval _ -12	! something fucked up.
+		  else	! ok.
+
+	      else retval _ -10
+	else
+
+	     ! must be a read:  read a file
+	     if lookup(@chan,lookblk<0,0>)
+	     then if in(@chan,comlst)	! get info
+		  then retval _ -8	! not cool.
+		  else
+		       ! we have the info
+		       if @func eql 2  ! if this is read & delete
+		       then begin ! then delete
+			    lookblk[0] _ 0;
+			    rename(@chan,lookblk)
+			    ! if we lose, we lose.  don't pay attention
+			    ! consider it deleted
+			    end
+		       else
+	     else retval _ -6;
+	release(@chan);
+	if @retval lss 0		! an error
+	then @buffer _ @lookblk;	! send back the file name
+	@retval
+	end
+     else -4
+end;
+
+global routine corecheck = begin
+    external hbot,lowend,hend,coresize,getchxr,setchar;
+
+    if (.hbot-.lowend) lss 20 then begin;
+	coresize(512); ! get more core
+	hend_.hend+2560; !n bytes
+	decr i from .hend-(.hbot-.lowend)-2561 to .lowend do
+		setchar(.i+2560,getchxr(.i));
+	hbot_.hbot+2560
+    end;
+end;
+
+end eludom
