@@ -1,0 +1,369 @@
+begin "UNDER"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(WRS)ARGS.REQ" source!file;
+require 6 version;
+
+integer C,B,E;		! channel variables;
+boolean QFF;		! queued form feed;
+integer	QNL;		! queued new-line count;
+integer	Quiet;		! if non-zero, no output, -1 on FF input;
+boolean	HP;		! true if HP terminal;
+boolean ABSPOS;		! true if absolute cursor positioning;
+boolean USEBS;		! true if okay to use BS;
+boolean ESCSEQ;		! true if to use esc seqs for underlining;
+string	BEGESC,ENDESC;	! escape sequences for underlining;
+integer LCH;		! line characteristics word;
+integer	ComBrk;
+
+string item	InFiles;
+string item	OutFile;
+integer item	BOLD;
+item		BACKSPACE;
+integer item	TMARGIN;
+integer item	LMARGIN;
+integer item	STARTPAGE;
+string item	TERMINAL;
+item		HELP;
+
+simple procedure BrkIni;
+begin
+    setbreak(ComBrk_getbreak,",",null,"IS");
+end;
+require BrkIni initialization;
+
+define HELP!MSG "{}" = {"
+    UNDER OutFile=InFile/BOLD:int/BACK/TMARG:int/LMARG:int/START:int/TERM:str 
+
+    /BOLD:integer	embolden by overstriking (integer) times
+    /BACKSPACE		use backspaces to overstrike
+    /TMARG:integer	leave (integer) blank lines at top of each page
+    /LMARG:integer	leave (integer) blanks at begining of each line
+    /START:integer	start printing on page (integer)
+    /TERM:string	prepare output for device (string)
+"};
+
+procedure SetupTerm;
+begin
+    if props(BOLD)=NOVAL then datum(BOLD) := 3;
+    if props(LMARGIN)=NOVAL then datum(LMARGIN) := 5;
+    if props(TMARGIN)=NOVAL then datum(TMARGIN) := 3;
+    ABSPOS := USEBS := ESCSEQ := false;
+    if equ(datum(TERMINAL),"444") then datum(TERMINAL) := "HP2621";
+    HP := kequ(datum(TERMINAL)[1 to 2],"HP") and (
+	props(TERMINAL) or not props(OutFIle) );
+    if HP then begin
+	ABSPOS := USEBS := ESCSEQ := true;
+	BEGESC := #esc&"&dA";
+	ENDESC := #esc&"&d@";
+    end;
+    USEBS := USEBS or props(BACKSPACE);
+end;
+
+integer array Under[1:256];
+string array Prefix[1:256];
+string array Image[1:256];
+integer II,IM,UM,XCUR,SpaceOK;
+
+simple procedure XcurIni;
+SpaceOK := XCUR := 1;
+require XcurIni initialization;
+
+simple procedure ProcessFF;
+begin
+    QFF := true;
+    QNL := if props(TMARGIN) then datum(TMARGIN) else 0;
+end;
+
+simple procedure ProcessLF;
+begin
+    QNL := QNL + 1;
+end;
+
+simple procedure ProcessTab( integer XPOS );
+if XCUR neq XPOS then begin
+    if ABSPOS then begin
+	if HP then begin
+	    integer RCcost;
+	    RCcost := if SpaceOK then 1 else 2;
+	    if XPOS > XCUR then begin
+		if ((XPOS-1)land(7))*RCcost + ((XPOS-1)%8) - ((XCUR-1)%8) < 6
+		then begin
+		    while (XCUR+7)land(-8) < XPOS do begin
+			print( #ht );
+			XCUR := (XCUR+7)land(-8)+1;
+		    end;
+		    while XCUR<XPOS do begin
+			print( if SpaceOK then " " else #esc&"C" );
+			XCUR := XCUR + 1;
+		    end;
+		end
+		else if (XPOS-XCUR)*RCcost < 6 then
+		    while XCUR<XPOS do begin
+			print( if SpaceOK then " " else #esc&"C" );
+			XCUR := XCUR + 1;
+		    end
+		else print( #esc&"&a", XPOS-1, "C" );
+	    end
+	    else begin
+		SpaceOK := false;
+		if XPOS=1 then
+		    print( #cr )
+		else if XCUR-XPOS<3 then
+		    while XCUR>XPOS do begin
+			print( #bs );
+			XCUR := XCUR - 1;
+		    end
+		else print( #esc&"&a", XPOS-1, "C" );
+	    end;
+	    XCUR := XPOS;
+	end
+	else begin
+	    usererr( 0,1,"?cant ABSPOS unknown terminal" );
+	    ABSPOS := false;
+	    ProcessTab( XPOS );
+	end;
+    end
+    else begin
+	if USEBS and XPOS-1 = XCUR then begin
+	    print( #bs );
+	    XCUR := XPOS;
+	end
+	else if XPOS < XCUR then begin
+	    print( #cr );
+	    XCUR := 1;
+	    SpaceOK := false;
+	end
+	else while (XCUR+7)land(-8) < XPOS do begin
+	    print( #ht );
+	    XCUR := (XCUR+7)land(-8)+1;
+	end;
+	while XCUR<XPOS do begin
+	    print( " " );
+	    XCUR := XCUR + 1;
+	end;
+    end;
+end;
+
+simple procedure ProcessText( integer XPOS; string Text; integer Width );
+begin
+    if QFF then begin
+	ProcessTab( 1 );
+	print( #ff );
+	QFF := false;
+	SpaceOK := true;
+    end;
+    if QNL then begin
+	ProcessTab( 1 );
+	while QNL do begin
+	    print( #lf );
+	    QNL := QNL - 1;
+	end;
+	SpaceOK := true;
+    end;
+    ProcessTab( XPOS );
+    print( Text );
+    XCUR := XPOS + Width;
+end;
+
+simple procedure ProcessUnder;
+begin
+    integer II,NM;
+    string S;
+    NM := 0;
+    for II := 1 upto UM do
+	if Under[II]
+	    then if length(Image[II]) or NM and NM = II-1
+		then NM := II
+		else begin
+		    Image[II] := Under[II];
+		    Under[II] := 0;
+		end;
+    UM := NM;
+    S := null;
+    if ESCSEQ then begin			! underline using escape seqs;
+	integer LastStat;
+	UM := UM + 1;
+	LastStat := 0;
+	for II := 1 upto UM do begin
+	    if LastStat neq Under[II] then begin
+		Prefix[II] := if LastStat then ENDESC else BEGESC;
+		IM := IM max II;
+	    end;
+	    LastStat := Under[II];
+	    Under[II] := 0;
+	end;
+    end
+    else if props(BOLD) then begin	! underline using overstrike;
+	integer X;
+	for II := 1 upto UM do
+	    if Under[II] then begin
+		S := Image[II];
+		for X := 1 upto datum(BOLD) do
+		    Image[II] := Image[II]& S;
+		Under[II] := 0;
+	    end;
+	UM := 0;
+    end
+    else begin					! underline using "_";
+	for II := 1 upto UM do
+	    if Under[II] then begin
+		Image[II] := "_"& Image[II];
+		Under[II] := 0;
+	    end;
+    end;
+end;
+
+simple procedure ProcessImage;
+begin
+    integer II,NM,CHR,XPOS,MD,ND;
+    ProcessUnder;
+    MD := 1;
+    if not ABSPOS then
+	for II := 1 upto IM do MD := MD max length(Image[II]);
+    while IM do begin
+	NM := ND := 0;
+	for II := 1 upto IM do begin
+	    XPOS := II + datum(LMARGIN);
+	    if length(Prefix[II]) then begin
+		ProcessText( XPOS, Prefix[II], 0 );
+		Prefix[II] := null;
+	    end;
+	    if length(Image[II]) geq MD then
+		do
+		    ProcessText( XPOS, lop(IMAGE[II]), 1 )
+		until not USEBS or length(IMAGE[II])=0;
+	    if length(Image[II]) then NM := II;
+	    ND := ND max length(Image[II]);
+	end;
+	IM := NM;
+	if not ABSPOS then MD := ND;
+    end;
+end;
+
+simple procedure ProcessFile;
+begin
+    IM := UM := 0;
+    II := 1;
+    ArrClr( Under );
+    ArrClr( Image );
+    ArrClr( Prefix );
+    while Quiet and not E do
+	if wordin( C ) = #ff or E
+	    then Quiet := Quiet - 1;
+    while not E do begin
+	integer CHR;
+	case CHR := wordin( C ) of begin
+	    [0] ;
+	    [#ht] II := (II+7)%8*8+1;
+	    [" "] II := II+1;
+	    [#bs] II := II-1;
+	    [#cr] II := 1;
+	    [#lf][#vt] begin
+		ProcessImage;
+		ProcessLF;
+	    end;
+	    [#ff] begin
+		ProcessImage;
+		ProcessFF;
+	    end;
+	    [#can]["_"] begin
+		Under[II] := "_";
+		UM := UM max (II := II +1);
+	    end;
+	    [else] if Image[II] = CHR
+		then begin
+		    Under[II] := "_";
+		    UM := UM max (II := II +1);
+		end
+		else begin
+		    Image[II] := Image[II]& CHR;
+		    IM := IM max (II := II +1);
+		end
+	end;
+    end;
+    ProcessImage;
+    ProcessFF;
+end;
+
+simple procedure SetLch (integer Port,Value,BitNo(-1));
+begin "SetLch"
+    own integer T,PTR;
+    if BitNo < 0 
+	then PTR _ point(36,T,35)
+	else PTR _ point(1,T,BitNo);
+    start!code
+    	define GETLCH = '051300000000;
+	define SETLCH = '051340000000;
+    	MOVE 1,port;
+    	MOVEM 1,T;
+    	GETLCH T;
+    	MOVE 1,value;
+    	DPB 1,PTR;
+    	SETLCH T;
+    end;
+end "SetLch";
+
+simple integer procedure GetLch (integer Port,BitNo(-1));
+begin "SetLch"
+    own integer T,PTR;
+    if BitNo < 0 
+	then PTR _ point(36,T,35)
+	else PTR _ point(1,T,BitNo);
+    start!code
+    	define GETLCH = '051300000000;
+    	MOVE 1,port;
+    	MOVEM 1,T;
+    	GETLCH T;
+    	LDB 1,PTR;
+    end;
+end "SetLch";
+
+! ----------------------------------------------------------------------------
+	MAIN
+-----------------------------------------------------------------------------;
+
+label	STPT,EXIT;
+
+STPT:
+datum(BOLD) := datum(TMARGIN) := datum(LMARGIN) := 0;
+datum(TERMINAL) := cv6str(auxclv(-1,-1,'100));	! get terminal type;
+if ARGC = 1 then begin
+    print( "*" );
+    Args := inchwl;
+end;
+if not ArgParse( OutFile, InFiles,
+    {BOLD,BACKSPACE,TMARGIN,LMARGIN,STARTPAGE,TERMINAL,HELP}, Args )
+    then goto EXIT;
+if props(HELP) then begin
+    print( HELP!MSG );
+    goto EXIT;
+end;
+LCH := GetLch( -1 );
+if not props(OutFile) then
+    SetLch( -1, 1, 10 );		! TTY NO CRLF;
+open( C:=getchan,"DSK",0,8,0, 256,B,E:=-1 );
+QUIET := if props(STARTPAGE) then datum(STARTPAGE)-1 else 0;
+SetupTerm;
+ProcessFF;				! set QNL;
+QFF := not props(OutFile);		! don't FF at beg of file;
+while length(datum(InFiles)) do begin
+    string FName;
+    FName := scan( datum(InFiles), ComBrk, B );
+    lookup( C,FName,E );
+    if E then usererr(E,2,"?lookup failure: "&FName&"  ","X");
+    if props(OutFile)
+	then setprint( datum(OutFile), "F" );
+    ProcessFile;
+    close( C );
+end;
+print( #ff );
+
+EXIT:
+release( C );
+setprint( null, "T" );
+if ARGC = 1 then goto STPT;
+if not props(OutFile) then SetLch( -1, LCH );
+call( 0,"EXIT" );
+end $
+   
