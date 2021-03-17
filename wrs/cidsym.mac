@@ -1,0 +1,296 @@
+TITLE CIDSYM, SAIL-CALLABLE SYMBOL TABLE SEARCHER
+
+EXTERN SYMFIL,SYMST
+
+COMMENT % ROUTINE SYMSRC
+DECLARED IN SAIL: BOOLEAN PROCEDURE SYMSRC(INTEGER SEARCHVALUE,
+		SPACE!POINTER);
+EXPECTS: -2(P)/ SEARCHVALUE
+	-1(P)/ POINTER TO BEGINNING OF 5 WORDS IN WHICH DATA
+		WILL BE RETURNED AS FOLLOWS:
+DATA[0] &
+DATA[1]/ ASCIZ OF MODULE NAME
+DATA[2] &
+DATA[3]/ ASCIZ OF SYMBOL NAME
+DATA[4]/ NAME VALUE
+
+
+Further expectations:
+SYMSRC expects SYMST to have the virtual address of
+the 1st symbol table entry.  This entry lives at the
+high-address end of the symbol-table.   The
+pointer SYMST must point at the lower address of
+the 2 words which constitute a symbol table entry.
+
+Naturally, SYMSRC also expects that the symbol table to
+be searched is present in contiguous VM from SYMST downwards.
+The SAIL program should load it into a 1-dimensional array
+and setup SYMST before calling SYMSRC.
+
+SYMSRC also expects the cell SYMFIL to be -1 if a symbol-table
+is loaded, and 0 otherwise.
+
+Say INTERNAL INTEGER SYMFIL,SYMST; in the SAIL program
+
+For a picture of the symbol-table format, see
+Info node SYMTAB on C37.
+
+SYMSRC also expects to be in readw-write memory; it keeps local
+data here from call to call.
+
+
+SEARCHVALUE IS THE INPUT ARGUMENT. THE PROCEDURE IS:
+1. FIND THE MODULE IN WHICH SEARCHVALUE BELONGS
+   (THE ONE WITH THE LARGEST START-ADDRESS .LE. SEARCHVALUE).
+   IF THERE IS NONE, GO TO STEP 3.
+2. FIND THE BEST LOCAL IN THIS MODULE (THE LARGEST LOCAL .LE.
+    SEARCHVALUE).
+3. FIND THE BEST GLOBAL.
+4. LET BEST:=LARGER OF (BEST LOCAL,BEST GLOBAL).
+   (IF NO LOCAL OR GLOBAL WAS GOOD, GOTO STEP 8)
+5. IF A MODULE WAS FOUND, RETURN MODULE:=ASCIZ NAME OF MODULE
+6. RETURN SNAME:=ASCIZ NAME OF BEST, NAMVAL:=VALUE OF BEST
+7. RETURN -1 (TRUE) TO CALLER
+8. RETURN 0 (FALSE) WITH NAMVAL:=SEARCHVALUE
+
+CLOBBERS: AC'S 0-11,13,14
+CALLED: PUSHJ 17,SYMSRC
+RETURN: POPJ P, NEVER SKIPS;  AC 1/-1(TRUE) OR 0(FALSE)
+%
+
+V=0
+SRC=1	;SEARCHVALUE
+R=2	;RETURN FOR JSP
+STR1=3	;STRING
+STR2=STR1+1 ;MORE STRING
+T1=5
+T2=6
+T3=7
+T4=10
+F=11	;FLAGS
+HOLY=12 ;THIS AC MAY NOT BE DESTROYED IF SAIL IS TO BE HAPPY
+EMOD=13 ;END-OF-MODULE SYMTAB ENTRY ADDR
+BMOD=14 ;BEG-OF-MODULE
+UNU=15  ;UNUSED
+ARGS=16	;MUST NOT BE DESTROYED (SAIL). ARGUMENT DISPLAY PTR
+P=17	;PUSHDOWN  SAIL EXPECTS THIS
+
+;RETURN ARGUMENT DEFNS  (INDICES IN DATA[X] ARRAY)
+MODULE==0
+SNAME==2
+NAMVAL==4
+
+;SYMBOL TABLE ENTRY DEFNS
+SYMNAM==0	;UPPER 4 BITS = TYPE CODE, LOW 32=RADIX50 NAME
+  GLOBAL==040000;THIS SYMBOL IS A GLOBAL
+  LOCAL==100000	;THIS SYMBOL IS A LOCAL
+  DELO==400000	;DELETE (SUPPRESS) OUTPUT (DONT PRINT THIS SYMBOL)
+SYMVAL==1	;36-BIT VALUE
+
+SYMFLG: EXP 0	;1B0 SET IF SYMGLX AND SYMEND SET UP
+SYMGLX:	EXP 0	;ADDR OF BEG OF GLOBALS, OR -1 IF NONE
+SYMEND:	EXP 0	;ADDR OF LAST SYMTAB ENTRY
+mdtbmx==^d50	;max number of modules recorded in auxiliary array
+modtab:	block mdtbmx
+modtbe:	exp 0	;last entry in modtab; set up by symmap
+BSTNAM:	BLOCK 2	;BEST NAME,BEST VALUE FOUND
+;FLAGS IN LH OF F
+	SYMSET==400000	;SYMMAP DONE
+	NOMOD==200000	;NO BEST MODULE FOUND
+	symbad==100000	;symbol table format bad
+
+
+SYMSRC::
+	SETOM BSTNAM
+	SETOM BSTNAM+1
+	HRRZ SRC, -2(P)		;THE VALUE FOR WHICH WE ARE SEARCHING
+	SKIPN SYMFIL
+	JRST SYMERR		;NO SYMTAB
+	JSP R,SYMMAP		;MAKE SURE THINGS ARE SET UP
+	tlne f,symbad		;table format ok?
+	jrst symerr		;sigh, return blanks
+	
+;get the module that src should live in.  search modtab for
+;entry whose module-beginning-location symbol value is the largest
+;less than or equal to SRC.
+
+	skipg t1,modtbe		;any modules in modtab?
+	 jrst	[tlo f,nomod	;no,say so
+		 jrst symsl3]	;and try for glabal
+	setob t3,t4	;t3/best t1 yet; t4/symval(best t1 yet)
+	skipa
+symsl0:	sojl t1,symsl2	;search modtab from max to 0
+	hlrz t2,modtab(t1)	;symtab loc of beg-of-mod entry
+	move t2,symval(t2)	;where module begins (was loaded)
+	camle t2,src
+	jrst symsl0		;src is in lower core addresses
+	camg t2,t4		;src is at or above beg of module; is
+	jrst symsl0		;this the best module. NO. look more
+	movem t1,t3		;yes, t3/test t1 yet
+	movem t2,t4		;yes,t4/symval(best t1)
+	jrst symsl0		;now look more
+
+symsl2:	;now t3/index in modtab of best module, or -1 if none found
+	jumpl t3, [tlo f,nomod
+		   jrst symsl3]
+	push p,t3		;save best module found
+	hrrz emod,modtab(t3)	;emod/addr of "no-more-locals" entry
+	hlrz bmod,modtab(t3)	;bmod/addr of "module" entry
+	JSP R,BESTSY		;EXPECTS SRC,EMOD,BMOD
+	DMOVEM T1,BSTNAM	;-1 OR BEST LOCAL
+SYMSL3:	SKIPG BMOD,SYMGLX	;ANY GLOBALS?
+	JRST SYMSL4
+	MOVE EMOD,SYMEND
+	JSP R,BESTSY	;GET BEST GLOBAL. EXPECTS SRC,EMOD,BMOD
+	CAMLE T2,BSTNAM+1	;WHICH IS BETTER?
+	DMOVEM T1,BSTNAM	;THE GLOBAL
+SYMSL4:	;IF A MODULE WAS FOUND, RETURN ITS NAME
+	TLNE F,NOMOD
+	JRST SYMSL5
+	pop p,emod		;modtab index of found best module
+	movs emod,modtab(emod)	;emod/end,,beg entry addresses
+	MOVE V,SYMNAM(EMOD)
+	JSP R,R50		;GET STR1,2 AS ASCIZ
+	HRRZ R,-1(P)		;R/SPACE!POINTER
+	DMOVEM STR1,MODULE(R)
+SYMSL5:	;RETURN BEST SYMBOL NAME AND VALUE
+	SKIPG T1,BSTNAM		;DID WE REALLY FIND ONE?
+	JRST SYMERR		;NO,ALL SYMBOLS>SRC
+	MOVE V,SYMNAM(T1)
+	JSP R,R50	;TRANSLATE V TO ASCIZ IN STR1,2
+	HRRZ R,-1(P)	;R/SPACE!POINTER, LOCATION(DATA[0])
+	DMOVEM STR1,SNAME(R)
+	MOVE V,BSTNAM+1	;BEST NAME'S VALUE
+	MOVEM V,NAMVAL(R)
+	SUB P,[3,,3]	;UNWIND PAST 2 ARGS & PUSHJ
+	SETO 1,		;RETURN (TRUE)
+	JRST @3(P)	;SAIL RETURN
+
+SYMERR:	;RETURN MODULE & SNAME AS ZEROES, NAMVAL:=SEARCHVALUE
+	HRRZ R,-1(P)	;SPACE!POINTER
+	HRRZ SRC,-2(P)
+	MOVEM SRC,NAMVAL(R)
+	SUB P,[3,,3]	;UNWIND PAST PUSHJ & 2 ARGS
+	SETZ 1,		;RETURN (FALSE)
+	JRST @3(P)	;SAIL RETURN
+
+comment ! routine symmap
+function: set up
+symglx/ addr of first global, or -1 if none
+symend/ addr of "-1" entry at end of table
+symflg/ 0 if this routine never done, 1b0 otherwise
+modtab[0 to n]/  beg-of-module,,end-of-module
+modtbe/ n = index of last modtab entry = number of modules found
+   (n max mdtbmx)
+expects: symst/ start of symtab
+	symflg/ 0 if symmap never done
+clobbers: t1-t4
+call: jsp r, symmap
+!
+
+symmap:	skipge f,symflg
+	 jfcl		;already done, just set up f
+	setom symglx	;begin assuming no globals
+	movsi f,symset	;say things set
+	movem f,symflg	;up now
+	setzb t3,modtbe	;t3/modtab index. say no modules found yet
+	skipa t1,symst
+symm1:	subi t1,2
+	hlrz t2,symnam(t1) ; get a local,global,0 or end-of-table
+	cain t2,-1
+	 jrst symmx
+	trne t2,global
+	jrst symm3
+	jumpe t2,	[tlo f,symbad	;flag sym tab bad
+			 movem f,symflg
+			 jrst (r)] ;and quit. shouldn't find "end-of-
+		;locals" entry before finding beg of module entry
+	trne t2,local
+	jrst symm1	;was a local..keep looking
+	hrlm t1,modtab(t3) ; beg-of-module entry addr in symbol table
+	subi t1,2
+	skipe symnam(t1)	;hunt for "no-more-locals" entry
+	jrst .-2
+	hrrm t1,modtab(t3)	;addr of entry in symbol table
+	movem t3,modtbe	;keep modtbe updated..last module found
+	caige t3,mdtbmx
+	addi t3,1	;enter modules in modtab up to max,
+	jrst symm1	;then overwrite last entry if more modules exist
+
+symm3:	;got a global
+	movem t1,symglx
+	subi t1,2
+	move t2,symnam(t1)	;hunt for "end-of-table" entry
+	came t2,[-1]
+	jrst .-3
+symmx:	hrrm t1,symend
+	jrst (r)
+
+
+COMMENT ! ROUTINE BESTSY
+FUNCTION: GET BEST SYMBOL VALUE IN GIVEN AREA OF SYMTAB
+EXPECTS:	SRC/SEARCHVALUE
+	BMOD/ ADDR OF "MODULENAME" ENTRY AT BEG OF MODULE'S AREA
+	EMOD/ ADDR OF "NO MORE LOCALS" ENTRY AT END OF THE AREA
+RETURN: NEVER SKIP, T1/ADDR BEST SYMBOL, OR -1 IF NONE
+		T2/ VALUE BEST SYMBOL, OR -1 IF NONE
+CALL: JSP R,BESTSY
+CLOBBER: T3,T4
+!
+
+BESTSY:	SETOB T1,T2		;reset our "best" accumulator
+	HRRZ T3,BMOD
+BESTS1:	SUBI T3,2		;update pointer
+	CAMGE T3,EMOD		;end of module yet?
+	JRST (R)		;return
+	MOVE T4,SYMVAL(T3)	;get value
+	CAML SRC,T4		;is it out of range?
+	CAMG T4,T2		;is it better than what we have?
+	JRST BESTS1		;no good - try next one
+	MOVE T4,SYMNAM(T3)	;get name+bits
+	TLNE T4,DELO		;is it suppressed?
+	JRST BESTS1		;ignore this - suppressed symbol
+	MOVE T1,T3		;save address of symbol
+	MOVE T2,SYMVAL(T3)	;save value
+	JRST BESTS1		;keep looking, might be one better still
+COMMENT ! ROUTINE R50 TRANSLATE RADIX50 TO ASCIZ
+EXPECTS: V/ <CODE><RADIX50 NAME>
+RETURNS: STR1,STR2/ ASCIZ NAME
+CALLED: JSP R,R50, NEVER SKIPS
+CLOBBERS: V+1=SRC,STR1,STR2,T2,T3
+!
+R50:	SETZB STR1,STR2
+	MOVE T2,[POINT 7,STR1]
+	MOVEI T3,6
+	TLZ 740000
+LOOP3:	IDIVI 50
+	JUMPE V+1,R5BLNK
+	CAIN V+1,46
+	JRST R5$
+	CAIN V+1,47
+	JRST R5%
+	CAIN V+1,45
+	JRST R5.
+	CAIGE V+1,13
+	JRST R5NUMB
+	ADDI V+1,266
+R51:	PUSH 17,V+1
+	SOJG T3,LOOP3
+	MOVEI T3,6
+LOOP4:	POP 17,V+1
+	IDPB V+1,T2
+	SOJG T3,LOOP4
+	JRST (R)
+
+R5BLNK:	MOVEI V+1,240
+	JRST R51
+R5$:	MOVEI V+1,244
+	JRST R51
+R5%:	MOVEI V+1,245
+	JRST R51
+R5.:	MOVEI V+1,256
+	JRST R51
+R5NUMB:	ADDI V+1,257
+	JRST R51
+END
+  
