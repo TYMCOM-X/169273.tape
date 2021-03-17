@@ -1,0 +1,292 @@
+VAXSTR.TXT, last modified 10/24/83, zw
+
+1.0 STRINGS
+
+   1.1 Representation
+
+      A fixed length string of length  n  will  be  represented  as  n
+      contiguous bytes.  A varying length string will be preceded by a
+      2 byte length word.  (The  string  instruction  length  operands
+      must  be  2 bytes.) A flexible (fixed or varying) string will be
+      preceded by a word containing  the  upperbound  of  the  string.
+      (Flex arrays will require a longword upperbound.) Varying string
+      length words are treated as unsigned.  In  theory  this  permits
+      strings  of  length up to (2**16)-1.  However, since word length
+      additions are done during concatenations, the effective  maximum
+      string length is (2**15)-1 (if the overflow condition code is to
+      be set correctly).
+
+   1.2 Flexible Strings and Arrays
+
+      The following discussion of flexible  strings  also  applies  to
+      flexible  arrays.  Generic  arrays and 'formal' flexible strings
+      or arrays would NOT  be  permitted.  'Formal'  flexes  are  flex
+      array  or  string formal parameters - the implication being that
+      the actual parameter need not have been  dynamically  allocated.
+      'Dynamic'  flexes,  flex arrays or strings allocated on the heap
+      with an upperbound specified at run time,  would  be  permitted.
+      They  would  be  declared as flex types using the '*' upperbound
+      notation currently used.  As  now,  a  flex  type  could  appear
+      either  as  the  target  type  of  a pointer or as the type of a
+      trailing field of a record which was itself the target type of a
+      pointer.  A  flex  type  could  also  be  the  type  of a formal
+      parameter.  However, for VAR parameters the corresponding actual
+      parameter  would have to be a dynamic flex array or string.  The
+      (single) argument word for a parameter with a flex type will  be
+      the  address  of  the bounds word preceding the array or string.
+      Note that the current PASS1 does not enforce  these  constraints
+      on the use of flex types.
+
+      The  CALLS  procedure  calling  convention  forbids  the  use of
+      dynamic temporaries.  Thus a maximum upperbound for flex strings
+      must be assumed.  It will be assumed that any flex string has an
+      upperbound less than or equal to 255.  See the section on string
+      parameters for more information on flex strings.
+
+   1.3 The String Code
+
+      All  the  fundamental string operations required by the language
+      have direct counterparts in the VAX instruction  set,  with  the
+      exception  of  SEARCH  and VERIFY.  Thus the string code will be
+      emitted in-line.  Runtime routines will be  necessary  only  for
+      SEARCH and VERIFY.  The string instructions use (all or some of)
+      registers R0 - R5; thus these registers will be specified in the
+      containing  procedures mask word (R0 and R1 may be omitted).  In
+      addition, any of R2 - R5 which are allocated  at  the  time  the
+      instruction is emitted will have to be saved and restored before
+      and after the string  instruction.  The  need  for  these  local
+      saves  will be minimized by allocating registers starting at R11
+      and going down.
+
+      Descriptions  of  the  code  generated  for  particular   string
+      constructs are given below.
+
+   1.3.1 String assignments
+
+      String  assignments  are in general done in three steps.  First,
+      the  RHS  string  is  moved  to  a  temporary.  This   step   is
+      unnecessary  if  the  RHS is already a temporary or if PASS1 has
+      not set the  OVERLAPS  flag  in  the  string  assignment  tuple.
+      Second,  if the LHS is a varying string, the length word will be
+      updated.  In general, a runtime computation of
+           MIN ( UPPERBOUND(LHS), LENGTH(RHS) )
+      must be done:
+              MOVW    <rhs length>,REG
+              CMPW    REG,<lhs bound>
+              BLEQU   L1
+              MOVW    <lhs bound>,REG
+      L1:     MOVW    REG,<lhs length word>
+      However, if neither the LHS or  RHS  string  is  flexible,  then
+      which  value  is used in the update can be determined at compile
+      time in the following two cases.  (1) If the maximum  length  of
+      the  LHS  is  greater than or equal to the maximum length of the
+      RHS, then the update is done with the RHS  length.  (2)  If  the
+      RHS string is nonvarying and has length greater than or equal to
+      LHS's maximum length, then the  update  is  done  with  the  LHS
+      strings upperbound.  In either of these two cases, a simple MOVW
+      suffices.  The third step in the move is the final move  of  the
+      RHS  string (possibly in a temp now) to the LHS string.  Both of
+      the string moves are done with the MOVC instruction (or possibly
+      the  MOVTC  instruction  -  see  the  section on the handling of
+      upper/lower case operations).
+
+      1.3.2 Concatenations
+
+      All concatenations are done by moving each operand to  a  single
+      temporary.  Note  that  because  a maximum length is assumed for
+      flex strings, all temporaries can be described via a length  and
+      stack  frame  offset,  both known at compile time.  Each operand
+      will be moved with a MOVC or MOVTC instruction.  As each operand
+      is  moved its actual length, if not a constant, will be added to
+      (or, initially, moved  to)  a  register  via  a  'ADDW  <operand
+      length>,REG'  instruction.  Constant lengths will be accumulated
+      at compile time and added to the register after  all  moves  are
+      done.
+
+      1.3.3 SUBSTR
+
+      A substring operation may or may not cause code to be generated.
+      Two things must be done - an address descriptor for the starting
+      address  of  the  substring  must  be  calculated and an address
+      descriptor for the  length  must  be  calculated.  If  a  length
+      operand  is  explicitly specified, then the length descriptor is
+      obtainable by simply calling FETCH.  If an  explicit  length  is
+      not present, then the value:
+           <base string length> - <start index> + 1
+      must  be  calculated.  Note that the start index must be present
+      and thus an address descriptor for it it available via a call to
+      FETCH.  Any  or  all  of the components of the length expression
+      given above may  be  compile  time  constants.  The  basic  code
+      sequence for the computation is shown below; note, however, that
+      constant caluclations will be done at compile time, making parts
+      or all of the following sequence unnecessary.
+              CVT?W   <start>,REG1            ; if done, then in subsequent
+                                              ; instrs, <start> is REG1.
+              SUBW    <start>,<len>,REG2      
+              INCW    REG2                    ; only if neither <start>
+                                              ; nor <len> constant.
+      The second step in the substring calculation is generation of an
+      address descriptor for the base address  of  the  substring.  If
+      the  starting  index  is constant then a utility routine will be
+      called to 'increment' the base string's  address.  This  routine
+      may  simply  transform the address descriptor or it may actually
+      generate code.  For example, if S is a string in static storage,
+      an  address  descriptor for S + n will be returned.  If the base
+      address is '@16(FP)', then a 'MOVAB  @16(FP),REG' instruction is
+      generated  and  an  address  descriptor  for  'n(REG)'  would be
+      generated.  If the starting  index  is  not  constant  then  the
+      utility routine for incrementing an address by a constant number
+      of bytes would be called witn an increment of -1, plus 2 or 4 if
+      the  base  string  was  varying  of  flex.  The  following  code
+      sequence would then be emitted:
+              MOVAB   <incremented base addr>,REG
+              ADDL    <start index>,REG
+      If  the  incremented  base  address  was   indexable   then   an
+      alternative  would  be  to simply load the index into a register
+      and treat the base address as indexed using the register.
+
+      1.3.4 String comparisons
+
+      String comparisons simply require emitting  a  CMPC  instruction
+      (and possibly the register save/restore instructions of course).
+      The result of the  comparison  is  reflected  in  the  condition
+      codes.  Whether the setting of the condition codes is sufficient
+      is dependent on the boolean expression  evaluation  conventions.
+
+      It  would  be  easy  to  generate  a boolean value if necessary.
+      Conditional branches would have to be generated elsewhere  since
+      the  target  of  the  branch  would  not  be known to the string
+      comparison code.
+
+      1.3.5 UPPERCASE and LOWERCASE
+
+      Case conversions would be done during string moves by using  the
+      MOVTC  instruction.  This  requires  a  256  byte  table  in the
+      runtime library for upper case operations and a second table for
+      lower  case  operations.  The  basic  strategy for handling case
+      conversions is to attempt to delay the conversion  until  it  is
+      'convenient',  i.e.,  until  a  string move must be done anyway.
+      The code generator will deal with strings via string  descriptor
+      records.   The   string   descriptors   will   include   address
+      descriptors for the base of the string and  the  length  of  the
+      string  and  a flag indicating whether a case conversion must be
+      done.  In most cases the case conversion can be done as part  of
+      a  move  for  a concatenation, assignment or parameter copy.  In
+      some cases however a move will have to be done just for the case
+      conversion, e.g., in a string comparison.
+
+      1.3.6 Subscripting strings
+
+      If  the  index  is  constant,  the  base  address  can simply be
+      incremented by the value of the index minus one.  The  increment
+      address  utility  described  earlier  would  be  used  for  this
+      purpose.  If  the  index  is  not  constant,  then   the   INDEX
+      instruction   is   used.  The  index_in  operand  of  the  INDEX
+      instruction  would  always  be  -1.  The  result  of  the  INDEX
+      instruction  will  then  be  the  byte  offset  of  the  desired
+      character  from  the  start  of  the  string's  characters.  The
+      formation  of  the address of the indexed character is then done
+      in a manner specific to the addressing mode used  in  addressing
+      the start of the string.  If the base address is not indexed but
+      could be then the address can  simply  be  transformed  into  an
+      indexed  address  and no code need be generated.  If the address
+      is indirect and not indexed then the base address is  in  memory
+      and  that  address  can  be  added  to  the  result of the INDEX
+      instruction.  All other cases can be handled via the sequence:
+              MOVAB   <base addr>,REG
+              ADDL    REG,<INDEX instr result>
+      Note that the base address may have  been  the  address  of  the
+      string  length word or upperbound.  These can be compensated for
+      in the INDEX instruction by adjusting the index_in operand by +2
+      or +4.
+
+      1.3.7 Predefined function INDEX
+
+      The  code  for  INDEX  is  emitted  in-line,  using  the  MATCHC
+      instruction.  The MATCHC instruction clears the Z condition code
+      if  a match is found and leaves the number of bytes remaining in
+      the  searched  string,  including  the  bytes  of  the   matched
+      substring,  in  R0.  The code emitted for an INDEX function call
+      would be:
+              MOVW    <default>,REG           ; possibly a CVT
+              PUSHR   <R2,R3>                 ; only if necessary
+              MATCHC  <len1>,<addr1>,<len2>,<addr2>
+              POP     <R2,R3>                 ; if necessary
+              BEQL    L1                      ; branch if not found 
+              SUBW    R0,<len1>,REG
+              INCW    REG                     
+      L1:
+      Note that a word result is returned (unlike SEARCH and VERIFY).
+
+      1.3.8 SEARCH and VERIFY
+
+      SEARCH and VERIFY will require runtime routine calls.  The exact
+      code  emitted  is  dependent on the calling sequence conventions
+      arrived at  for  runtime  routines.  The  following  conventions
+      apply  to  the  string  operand.  The  string  operand is always
+      specified by the address of the first character  of  the  string
+      and  by  the  length  of  the  string.  Any uppercase operations
+      necessary will be done separately before the runtime  call.  The
+      function  result  is returned in R0 and is a longword.  Thus the
+      emitted code would be:
+              MOVL    <default>,REG           ; possible a CVT.
+              <runtime calling sequence>
+              TSTL    R0
+              BEQL    L1
+              MOVL    R0,REG
+      L1:
+
+      1.3.9 String parameters
+
+      Strings may be partitioned into four  categories  based  on  the
+      physical  representaions  described  in section 1.1.  These four
+      categories are:  FIXED, VARYING, FLEX FIXED  and  FLEX  VARYING.
+      All  four  types of strings are value compatible.  The following
+      set of rules define  VAR  parameter  compatability  (we  do  not
+      simply  define  strict compatability because the following rules
+      are not symmetric):
+      1. FIXED formal - the actual must be a  FIXED  string  with  the
+         same length or a FLEX FIXED string.
+      2. VARYING formal - the actual must be a VARYING string with the
+         same upperbound or a FLEX VARYING string.
+      3. FLEX FIXED formal - the actual must be a FLEX FIXED string.
+      4. VARYING FLEX formal - the  actual  must  be  a  VARYING  FLEX
+         string.
+      PASS1  does  not  enforce  these  rules,  though  the  VAX  code
+      generator could by using the expression type descriptor  records
+      and the symbol table.
+
+      These  definitions  lead  to  the  following  parameter  passing
+      requirements.  A VAR parameter simply requires passing the  base
+      address  of  the  string,  with one exception (here base address
+      implies the address of the bounds word for a flex string, or the
+      length  word for a varying non-flex string).  If the actual is a
+      flex string and the type of the formal is not flex then the base
+      address is first incremented by 2.  Value parameters may have to
+      be copied.  A copy will be done whenever  the  expression  tuple
+      for  the  parameter  is  a  STRCVT_OP  tuple.  When  a  copy  is
+      necessary  it  proceeds  as  follows.  First,  a  temporary   is
+      allocated  on  the  stack.  The  length  of the temporary is the
+      upperbound of the type of the formal  (255  for  flex  strings),
+      plus 2 if the formal is varying and plus 2 more if the formal is
+      flexible.  Second, if the formal is flexible, a MOVW is  emitted
+      to  move  the actual's upperbound to the bound word of the temp.
+      Next if the formal is varying, then
+           MIN ( <actual's length>, <formal's upperbound> )
+      is calculated and moved  to  the  temp's  length  word.  If  the
+      actual's  length is known at compile time, this can be done with
+      a simple move.  Otherwise the following code sequence is used.
+              MOVW    #<actual's length>,REG
+              CMPW    REG,<formal's bound>
+              BLEQU   L1
+              MOVW    <formal's bound>,REG
+      L1:
+      Finally, a MOVC or MOVTC instruction is used  to  do  the  move.
+      THE  destination string's length is the length of the temporary,
+      minus  the  length  of  any  bound  and/or  length   word.   The
+      destination  string's  address  is  the temporary plus 2 or 4 if
+      bound and/or length  words  are  present.  The  source  string's
+      length  is  the  actual  parameter's current length.  The source
+      address is the actual's base address, incremented by 2 or 4 if a
+      bound and/or length words are present.
+  
