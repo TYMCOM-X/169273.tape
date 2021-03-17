@@ -1,0 +1,237 @@
+begin "randio"
+define !="Comment", maxChan='17, adjubp='20 rot -9;
+let routine=procedure;
+
+define c!wait='25, c!ugetf='10;		! chanio opcodes;
+
+define wordsPerBlock=128, machine=true;
+integer machine!set;
+Comment -- CDB, SIMIO INDICES FOR IOSER
+DES The I/O routines obtain their information from the user via a
+  channel number -- the same kind used by the system. In order to
+  find byte pointers, counts, file names, etc., the channel number is
+  used to index into a block of core called a CDB (Channel Data Block).
+  This CDB is filled with good data during the OPEN operation.
+ The CDB, and all I/O buffers, are obtained from CORGET.
+ The CHANS table in the GOGTAB area is a 20 word block containing
+  pointers to the appropriate CDB's.
+ Since channel numbers must appear in the AC field of IO instructions,
+  one must construct IO insts. in impure places to retain re-entrancy.
+  XCT INDEX,SIMIO executes the appropriate IO instruction with the
+  channel number from AC CHNL, used by all routines.  See SIMIO for
+  operational details.
+;
+COMMENT
+buffer header:
+w0: usebit,,current_buffer [usebit=1B0, on=> no I/O done yet]
+			   [current_buffer= 0 | w1 of active buffer]
+w1: bytepointer
+w2: bytecount
+
+buffer format:
+w0: 0,,file status
+w1: usebit + buffer_size,,next_buffer
+w2: checksum,,word_count
+w3: DATA
+w4: DATA
+...
+;
+Comment   FORMAT OF CDBs: ;
+DEFINE
+    CDB$DMODE	= '0,  Comment data mode;
+    CDB$DNAME	= '1,  Comment device;
+    CDB$BFHED	= '2,  Comment header pointers;
+    CDB$OBPNT	= '3,  Comment output buf. ptr;
+    CDB$OBP	= '4,  Comment output byte ptr;
+    CDB$OCOWNT	= '5,  Comment output byte cnt;
+    CDB$ONAME	= '6,  Comment output file nam;
+    CDB$OBUF	= '7,  Comment output buffer loc.;
+    CDB$IBPNT	='10,  Comment input buf. ptr;
+    CDB$IBP	='11,  Comment input byte ptr;
+    CDB$ICOWNT	='12,  Comment input byte cnt;
+    CDB$INAME	='13,  Comment input file nam;
+    CDB$IBUF	='14,  Comment input buffer loc.;
+    CDB$ICOUNT	='15,  Comment input data count limit address;
+    CDB$BRCHAR	='16,  Comment xwd ttydev flag, input break char addr;
+    CDB$TTYDEV  ='16,  Comment lh -1 if device is a tty -- used by out;
+    CDB$ENDFL	='17,  Comment input end of file flag addr;
+    CDB$ERRTST	='20,  Comment user error bits specification word;
+    CDB$LINNUM  ='21,  Comment addr of line number word (setpl);
+    CDB$PAGNUM  ='22,  Comment addr of page number word (setpl);
+    CDB$SOSNUM  ='23,  Comment addr of sos number word  (setpl);
+    CDB!IOTLEN	=CDB$SOSNUM+1;  Comment length of table entry;
+simple integer procedure inPendingBlocks( integer cdbloc );
+! returns the number of "blocks" that have not yet been read.
+! (including the current buffer, which may be only partially read.
+;
+start!code	define res=1, cdb=2,buf=3,cbf=4;
+		label cntbuf, return;
+	movei	res,0;		! clear count of used buffers;
+	skipe	cdb,cdbloc;
+	 skipg	cbf,cdb$ibpnt(cdb);	! get current buffer address;
+	  jrst	return;		! not currently in use at all;
+	movei	res,1;		! at least one buffer;
+	move	buf,0(cbf);	! start just after current;
+! now: while full(buf_next(buf)) and buf neq cbf do res_res+1;
+!  i.e. count full buffers from current+1 upto empty or current;
+cntbuf:
+	caie	cbf,0(buf);	! stop if reached first buffer;
+	skipl	buf,0(buf);	! or buf without data (advance buf);
+	 jrst	return;		! this buffer is not filled;
+	 aoja	res,cntbuf;	! wasn't full or current, count it;
+return:
+end;
+internal integer routine rchptr( integer chan );
+begin	integer cdbloc, bytesPerWord, pos, pending, Count, position!size;
+if 0 = cdbloc_chncdb(chan)
+ then begin print("Channel not even Open!"); return(-1) end;
+
+chniov( chan, 0, c!wait );	! wait for all I/O to finish;
+chnior( chan, position!size, c!ugetf ); ! read file postn;
+if position!size = -1
+ then begin print("File not on channel!"); return(-1); end;
+bytesPerWord_  (36*2) % ldb( BBPP(6+1, memory[CDB$IBP+cdbloc], 11+1) );
+		! this is a cute trick to get a divide by zero result;
+if not 0 < bytesPerWord leq 36
+ then begin print("Invalid Byte Size"); return(-1); end;
+
+pos_ position!size lsh -18;
+pending_ inPendingBlocks( cdbloc );
+Count_  memory[CDB$ICOWNT+cdbloc] max 0;
+
+if pending > 1 or pos leq (position!size land '777777)
+ then return( (pos - (pending max 1)) * BytesPerWord * WordsPerBlock 
+		- count );
+! return(fileSize * bytesPerWord - count);
+return( if count > 0
+ then ( (pos - 2) * WordsPerBlock 
+	+ (memory[CDB$IBP+cdbloc] - memory[CDB$IBPNT+cdbloc])
+	land '777777 - 1)
+      * bytesPerWord
+      - ldb( BBPP(6, memory[CDB$IBP+cdbloc], 5) )
+	% ldb( BBPP(6, memory[CDB$IBP+cdbloc], 11) )
+ else -1 );
+end;
+string routine describe( integer chan );
+begin	integer cdbloc, position!size, pos, size, e0,e1,e2,e3,e4, bpw;
+	integer passedBlocks, pending, inputPointer;
+if 0 = cdbloc_chncdb(chan) then return("No CDB");
+chniov( chan, 0, c!wait );		! wait for all I/O to finish;
+chnior( chan, position!size, c!ugetf ); ! read file postn;
+if position!size = -1 then return("No Position");
+inputPointer_  memory[CDB$IBP+cdbloc];
+passedBlocks_ position!size lsh -18 - inPendingBlocks( cdbloc ) - 1;
+pos_ position!size lsh -18;
+size_ position!size land '777777;
+bpw_ 36 % ldb(bbpp(6,inputPointer,11));
+print("
+( (pos - 2) * WordsPerBlock 
+  + (memory[CDB$IBP+cdbloc] - memory[CDB$IBPNT+cdbloc])
+  land '777777 - 1)
+* bytesPerWord
+- ldb( BBPP(6, memory[CDB$IBP+cdbloc], 5) )
+  % ldb( BBPP(6, memory[CDB$IBP+cdbloc], 11) )
+=( (", pos,"-2=", e0_pos-2, ") * ", WordsPerBlock, 
+	" = ", e0_e0*wordsperblock, "
+   + ('",cvos(memory[CDB$IBP+cdbloc]),"-'",cvos(memory[CDB$IBPNT+cdbloc]),
+	"='", cvos(e1_memory[CDB$IBP+cdbloc]-memory[CDB$IBPNT+cdbloc]), ")
+   land '777777 - 1=", e0_ e0 + e1 land '777777 - 1, ")
+ * ", bpw, "
+ - ", e1_ ldb( BBPP(6, memory[CDB$IBP+cdbloc], 5) ), "
+   % ", e2_ ldb( BBPP(6, memory[CDB$IBP+cdbloc], 11) ), "
+ = ", e0, "*", bpw, "-", e1, "%", e2, " = ",	e0 * bpw - e1 % e2 );
+print("
+Channel ", chan, ": size=", position!size land '777777,
+	", pos=", position!size lsh -18, 
+	", pend=", inPendingBlocks( cdbloc ),
+	", C=", MEMORY[cdbLoc+CDB$ICOWNT],
+	" at POINT ", ldb(BBPP(6, inputPointer, 11)),
+	",'", cvos((inputPointer-MEMORY[cdbLoc+CDB$IBPNT])land '777777),
+		"+'", cvos(MEMORY[cdbLoc+CDB$IBPNT] land '777777),
+	",", 35-ldb(BBPP(6, inputPointer, 5)) );
+return( " rc=" & cvs(rchptr(chan)) );
+end;
+internal routine schptr( integer chan, index );
+if index < 0
+ then if index=-1
+	 then useti(chan,-1)
+	 else usererr(0,1,"SCHPTR: negative arg just won't work")
+ else begin	integer byteSize, bytesPerBlock, cdbLoc;
+		integer tb, oldCountVariable;
+	if 0 = cdbLoc_ chncdb( chan )
+	 then begin usererr(0,1,"SCHPTR: channel not OPEN"); return end;
+	if 0 = byteSize_ ldb(BBPP(6, memory[CDB$IBP+cdbLoc], 11))
+	 then begin usererr(0,1,"SCHPTR: input byte size=0");return end;
+	bytesPerBlock_ (36 div byteSize) * wordsPerBlock;
+	useti( chan, index div bytesPerBlock + 1 );
+	index_ index mod bytesPerBlock;
+	if index = 0
+	 then begin	integer position!size;
+		chnior( chan, position!size, c!ugetf );
+		if position!size > position!size rot 18
+		 then usererr(0,1,"SCHPTR: past EOF");
+		return;
+	      end;
+IF machine!set THEN
+	start!code	define ac=1,acB=2, chnl='10,cdb='11,user='15;
+			define ioin=1, errUuo=5 rot -9;
+			protect!acs ac,chnl,cdb;
+			label error, movbyp, ok; 
+			external integer simio,gogtab;
+			preset!with cvasc("SCHPT"),cvasc("R err"),
+			  cvasc("or: p"),cvasc("ast E"),cvasc("OF");
+			own safe integer array errTxt[0:4];
+		move	chnl,chan;	! setup channel for SIMIO call;
+		move	user,gogtab;
+! damned OS, initial bytptrs are POINT W,BEG-1,35  want: POINT W,BEG,-1;
+! must advance them initially, hence keeping count-1;
+		xct	ioin,simio;	! do buffered input;
+		 sosge	ac,index;	! success, get bytes to pass;
+		  jrst	error;		! no adjust or fail: err|eof;
+		move	cdb,cdbLoc;	! address of channel data block;
+		movni	acB,1(ac);	! fix byte count;
+		addb	acB,cdb$icownt(cdb);	! by removing bytes;
+		ibp	cdb$ibp(cdb);		! advance by 1 (align);
+		ADJUBP	ac,cdb$ibp(cdb);	! advance by rest;
+		movem	ac,cdb$ibp(cdb);	! and store new ptr;
+		jumpge	acB,ok;		! there had better be enough;
+	error:	errUuo	1,errTxt[0];
+	ok:	end
+ELSE BEGIN
+		define CountVariable="memory[cdbloc+cdb$icount]";
+	setbreak(tb_getbreak,null,null,"1ISZ");
+		! read "index" characters forward into the block;
+		! with a break table with no breaks or ignores;
+
+	oldCountVariable_ CountVariable;
+	CountVariable_ location(index);
+
+	if length(input(chan,tb)) neq index		! read;
+	 then usererr(0,1,"SCHPTR ?? (attempt to pass EOF)");
+
+	CountVariable_ oldCountVariable;
+	relbreak(tb)
+END
+      end;
+simple string procedure ptr(integer bypt);
+	return("POINT " & cvs(ldb(bbpp(6,bypt,11))) & ",'"
+		& cvos(ldb(bbpp(24,bypt,35))) &  ","
+		& cvs(35-ldb(bbpp(6,bypt,5))) );
+simple procedure raid; start!code external integer $I; jsr $i; end;
+integer ch,cnt,brk,eof, pos;
+integer a,b,c,d,e,f,g,h,i,j,k,l,m,n;
+string s,t,u,v,w,x,y,z;
+
+procedure st; schptr(ch,pos);
+procedure sc(integer loc); schptr(ch,loc);
+integer procedure rc; return(rchptr(ch));
+string procedure dc; return(describe(ch));
+
+if false then begin a_b_c_d_e_f_g_h_i_j_k_l_m_n; s_t_u_v_w_x_y_z; end;
+setbreak(1,null,null,"1ISZ");
+open(ch_1,"DSK",1, 7,0, cnt,brk,eof); lookup(1,"ioshow.rel",eof);
+open(   2,"DSK",2, 2,0, cnt,brk,eof); lookup(2,"ioshow.rel",eof);
+
+usererr(0,1,"Go Bail","B");
+end "randio" .
+ 
