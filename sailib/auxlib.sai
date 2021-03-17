@@ -1,0 +1,311 @@
+entry;
+begin	"AUXLIB"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+
+internal boolean auxTrace;	! set to enable character trace on input;
+internal boolean auxEcho;	! if need local echo;
+internal boolean auxRNC;	! set to ignore controls on auxRead;
+internal boolean auxBCR;	! break on CR for auxRead;
+internal integer auxPort;	! port number, or lh<>0 if port gone;
+internal itemvar auxDEAD;	! assign procedure to call on zap or timeout;
+
+internal string auxUser;	! username;
+internal string auxHost;	! host;
+internal string auxMsg;		! error message;
+internal integer auxMode;	! error processing mode;
+internal integer auxTimeout;	! standard timeout;
+internal integer auxRetries;	! number of retries left;
+internal integer auxNetwork;	! T=tymnet, B=bubbnet;
+
+define ignoreControlsOnRead = true;
+
+define creauxError(auxPort) = {(
+	case !lh(auxPort) of (
+	    [CXSUP#] case !rh(auxPort) of (
+		[CXSFE#] " format error",
+		[CXSBU#] " user not in MUD",
+		[CXSBM#] " bad MUD",
+		[CXSHU#] " host unavailable",
+		[CXSDF#] " downline load failure",
+		[CXSTO#] " timeout",
+		[CXSAB#] " access barred",
+		[CXSIS#] " error in ISIS",
+		[CXSLQ#] " long queue",
+		[else] " network error '"& cvos(!rh(auxPort)) ),
+	    [CX2AX#] " too many circuits",
+	    [CXLOG#] " not your user name",
+	    [CXDCB#] " no room in monitor",
+	    [CXNRR#] " no reply to request",
+	    [CXNRL#] " no reply to login message",
+	    [CXNCH#] " no circuit supplied",
+	    [CXERR#] " error from request",
+	    [else] " monitor error '"& cvos(auxPort) ) )};
+
+integer LoginBreak;
+simple procedure BrkIni;
+begin
+    setbreak( LoginBreak:=getbreak,":;"," ","SIK" );
+    case calli(!xwd(0,!GTCNF),calli!GETTAB lsh -29 of begin
+	["B"] auxNetwork := "B";
+	[else] auxNetwork := "T"
+    end;
+end;
+require BrkIni initialization;
+
+comment
+	auxLogin( LoginString, Options )
+	Build a circuit described by LoginString.  The string may contain
+	multiple logins through gateways seperated by semicolons, including
+	any necessary passwords, also seperated by semicolons.  Options may
+	be omited, or include any of the following:
+		b=	look for banner (rest of string) - ctl chrs ignored
+		p=	look for prompt (rest of string) - ctl chrs ignored
+		w	issue warning messages on retries
+		0E	suppress error messages (default)
+		1E	auto continue after error message
+		2E	pause after error message (warning)
+		3E	pause after error message (error)
+		4E	terminate after error message
+		nR	Sets number of retries to n.  If datum(RETRIES) is
+			specified, its value overrides the one given here.
+			auxRetries contains the number of retries used.
+			If n is not given, 1 is assumed.
+		nT	Sets default timeout to n seconds.  If datum(TIMEOUT)
+			is specified, its value overrides the one given here.
+			auxTimeout contains the current timeout value.
+			If n is not given, 60 is assumed.
+
+	If the login string begins with BUB*; comment and the machine is in
+	bubbnet as evidenced by the system name of "B", the BUB*; comment is
+	stripped from the login string.  Likewise, if the login string begins
+	with TYM*; comment and the machine is not in bubbnet, it is stripped.
+	Note that "*" indicates any string including the null string.
+;
+
+internal integer procedure auxLogin(
+    string LogString;
+    string Options(null) );
+begin	"auxLogin"
+    integer RetryTime, I,B, SyncType, maxRetries;
+    boolean WarningOnRetry;
+    string auxHost,S, SyncString;
+    integer array X[0:5];
+    label Retry, Retry1;
+    while length(Options) do case C := lop(Options) of begin
+	["E"] begin
+	    auxMode := N;
+	    N := 0;
+	end;
+	["W"] begin
+	    auxWMode := N;
+	    N := 0;
+	end;
+	["T"] begin
+	    integer itemvar IIV;
+	    auxTimeout := if N then N else 60;
+	    IIV := cvsi( "TIMEOUT", N );
+	    if not N and props(IIV) then auxTimeout := datum(IIV);
+	    N := 0;
+	end;
+	["R"] begin
+	    integer itemvar IIV;
+	    maxRetries := if N then N else 1;
+	    IIV := cvsi( "RETRIES", N );
+	    if not N and props(IIV) then maxRetries := datum(IIV);
+	    N := 0;
+	end;
+	["b"]["p"] begin
+	    SyncType := "b";
+	    SyncString := Options;
+	    Options := null;
+	end;
+	["w"] WarningOnRetry := true;
+	["0"]["1"]["2"]["3"]["4"]["5"]["6"]["7"]["8"]["9"]
+	    N := N * 10 + C - "0";
+	[else] usererr( 0,0, "?auxLogin: Unrecognized option specified.", "X" )
+    end;
+    auxUser := scan( LogString, LoginBreak, B );
+    if B = ";"
+    and kequ( auxUser[1 to 3], (if auxNetwork="B" then "BUB" else "TYM") )
+	then auxUser := scan( LogString, LoginBreak, B );
+    if length(auxUser) = 0 then
+	auxUser := cv6str(calli(!xwd(-1,!GTUNM),calli!GETTAB))
+	    & cv6str(calli(!xwd(-1,!GTUN1),calli!GETTAB));
+    if B=":" then begin
+	auxHost := ":"& scan( LogString, LoginBreak, B );
+	if length(auxHost) = 1 then
+	    auxHost := ":"& cvs(calli(!xwd(!CNSYS,!GTCNF),calli!GETTAB));
+    end;
+    auxRetries := 0;
+Retry1:
+    LoginMemo := auxUser& auxHost& ";";
+    for I := 0 upto 5 do X[i] _ cvasc(LoginMemo[1+5*i for 5]);
+    auxPort := calli(location(X[0]),calli!CREaux);
+    if not !SKIP! then begin
+	auxMsg := "?auxLogin: failed to "& LoginMemo& creauxError(auxPort);
+Retry:	auxZap;
+	if auxRetries < maxRetries then begin
+	    RetryTime := case auxRetries of
+		(1,2,5,10,20,40,60,60,60,60,[else]300);
+	    if WarningOnRetry then print( auxMsg,
+		crlf& "[will retry in ", retryTime, " seconds]"& crlf );
+	    auxRetries := auxRetries + 1;
+	    goto Retry1;
+	end;
+	auxError( auxMsg );
+	!SKIP! _ false;
+	return( auxPort := -1 );
+    end;
+    auxcli(auxPort,'714,!axCFS);	! no echo image;
+	gateway stuff goes here!
+    !SKIP! := true;			! success return;
+    return(auxPort);
+end	"CREaux";
+
+internal integer procedure GETLCH( integer PORT );
+start!code
+	protect!acs 1;
+	HRRE	1,access(PORT);
+	TTCALL	6,1;		! GETLCH;
+end;
+
+internal boolean procedure CheckPort;
+begin
+    own integer J;
+    label Zapped;
+    if !lh(auxPort) then goto Zapped;
+    if not J then J := calli( 0, calli!PJOB );
+    if !rh(auxPort)='777777
+	then if !lh( calli( !xwd( -1, !GTLIN ), calli!GETTAB ) )
+	    then return( true )
+	    else begin end
+	else if J = calli( !xwd( auxPort, !GTJOB ), calli!GETTAB )
+	    then return( true )
+	    else begin end;
+Zapped:
+    auxPort _ !hl(1);
+    if typeit(auxDead)=8 then apply(datum(auxDead));
+    return( false );
+end;
+
+internal procedure auxOut( string S );
+begin "auxOUT"
+    own boolean Ignore1Lf;
+    while length(S) do begin
+	if auxEcho then begin
+	    if S neq #lf or not Ignore1Lf then auxclv( -1, S[1 to 1], !axO8 );
+	    if Ignore1Lf := S=#cr then auxclv( -1, #lf, !axO8 );
+	end;
+	auxclv( auxPort, lop(S), !axO8 );
+    end;
+    CheckPort;
+end "auxOUT";
+
+!   Note: that someday someone might fix auxcal !axOPC so that it
+    does image mode output for aux circuits.  Until then, we are faced
+    with this unfortunately inefficient method of output.
+;
+
+internal boolean procedure AuxWait( integer TIMEOUT(0) );
+begin	"AuxWait"
+    getlch( AuxPort );
+    calli( (if !rh(auxPort)='777777
+	    then 0
+	    else (auxPort lsh 27) + !hl('100)
+	) lor !hl('41) lor !rh(TIMEOUT), calli!HIBER );
+    if not CheckPort then return( false );
+    return( getlch( AuxPort ) land lc!OBS );
+end	"AuxWait";
+
+internal integer procedure auxIn (
+    integer TIM(0) );
+begin	"auxIN"
+    integer C;
+    auxclv( auxPort, 0, !axLDE );
+    calli( (if !rh(auxPort)='777777
+	    then 0
+	    else (auxPort lsh 27) + !hl('100)
+	) lor !hl('11) + TIM, calli!HIBER );
+    if CheckPort
+	then begin
+	    C _ auxclv(auxPort,0,!AXI8S);
+	    if !SKIP! then begin
+		if auxTrace then auxclv( -1, C, !axO8 );
+		!SKIP! := true;
+		return( C );
+	    end
+	    else
+		return( -1 );
+	end
+	else begin
+	    !SKIP! _ false;
+	    return( -1 );
+	end;
+end 	"auxIN";
+
+internal procedure auxZap;
+begin!code
+	MOVE 1,auxPort;
+	uuo!ZAPCIR 1,;
+	 JFCL;
+	SETOM auxPort;
+end;
+
+internal boolean procedure auxSync (
+    string CHS;
+    integer TIM(0) );
+begin
+    integer C,I;
+    while length(CHS) do begin
+	C _ lop(CHS);
+	do begin
+	    I _ auxIn(TIM) land '177;
+	    if not !SKIP! then return(false);
+	end until I=C or !lh(auxPort);
+    end;
+    return(not !lh(auxPort));
+end;
+
+! .DCL begin;
+define aux!Zap = 0;
+define aux!Line = 1;
+define aux!Prompt = 2;
+define aux!Timeout = 3;
+! .DCL end;
+
+internal integer procedure auxRead (
+    reference string S;
+    integer TIM(0), PTIM(3) );
+begin "auxRead"
+    integer C;
+    boolean PROMPT;
+    S := null;
+    PROMPT := false;
+    while true do begin
+	C := auxIn( if PROMPT then PTIM else TIM ) land '177;
+	if !lh( auxPort) then return( aux!Zap );
+	if !SKIP! 
+	    then begin
+		if not auxRNC or " " leq C leq "~" then
+		    S := S& C;
+		case C of begin
+		    [#cr] if auxBCR then
+			return( aux!line );
+		    [#lf][#ff]
+			return( aux!Line );
+		    ["!"]["@"]["#"]["$"]["%"]["^"]["&"]["*"]["("][")"]["_"]
+		    ["+"]["~"]["-"]["="]["`"]["{"]["}"]["|"]["["]["]"]["\"]
+		    [":"][";"]["'"]["<"][">"]["?"][","]["."]["/"]
+			PROMPT := true;
+		    [else] if "!" leq C leq "~" then
+			PROMPT := false
+		end;
+	    end
+	    else return( if PROMPT then aux!Prompt else aux!Timeout );
+    end;
+end "auxRead";
+
+end	"AUXLIB" $
+    
