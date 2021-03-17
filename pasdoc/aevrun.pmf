@@ -1,0 +1,1989 @@
+#document(ANC MicroEclipse Vehicle Runtime Specification,<:August 27, 1981:>,66)
+#footnotes(left)
+#title_page_1(ANC MicroEclipse Vehicle,Runtime Specification,#date)
+#sect(Introduction)
+This document describes the overall design and the interface
+specifications for the ANC microEclipse vehicle 
+Pascal runtime system.
+Implementors and maintainers of the runtime should also see
+the document ^UAEV Runtime Conventions And Standards|U.
+#sect(Stack Frame Format)
+The format of a stack frame is shown in the figure given
+below.
+Most of the fields are self-explanatory;
+however, the following section on procedure calling
+conventions describes the contents and maintenance
+of the stack in more detail.
+$tra '\' '\'
+#beginfigure(34)
+		|			|	^
+		+-----------------------+	|
+		|	static		|	|
+		| 	temps		|    higher
+		+-----------------------+   addresses
+		|	 local		|
+		|	variables	|  3(FP)
+		+-----------------------+
+		|  exception handling   |  2(FP)
+		+-----------------------+
+		|	old SP		|  1(FP)
+		+-----------------------+
+	      / |C|    ret addr		|<-- FP
+	     |  +-----------------------+
+	     |  |	old FP		| -1(FP)
+	     |  +-----------------------+
+    SAVE ----|  | static link(saved AC2)| -2(FP)
+    block    |  +-----------------------+
+	     |  | arg word 1 (saved AC1)| -3(FP)
+	     |  +-----------------------+
+	      \ | arg word 2 (saved AC0)| -4(FP)
+		+-----------------------+
+		|	arg word 3	| -5(FP)
+		|	   .		|
+		|	   .		|
+		|	arg word n	|
+		+-----------------------+
+      old SP -->|   'real' ret addr     | \ 
+		+-----------------------+  |  inter-overlay
+		| caller's ovly mod num | /   calls only
+		+-----------------------+ 
+		|   caller's dynamic    |
+		|	 temps		|
+#endfigure
+
+$tra
+#sect(Procedure Calling Conventions)
+This section describes both the compiler generated and the
+runtime code for procedure entry and exit.
+The impact of quick blocks and inter-overlay calls is also
+discussed.
+#beginlevel
+#sect(Parameter Passing)
+This section describes the conventions used in passing parameters
+to Pascal routines.
+#beginlevel
+#sect(VAR Parameters)
+All VAR parameters are passed by virtual address.
+Flex objects are preceded by an upperbound word.
+#sect(Value Parameters)
+For all parameters where the formal type is non-flex and
+where the size corresponding to the type of the formal is 64 bits or less,
+the parameter is passed by value.
+If the type of the formal is a flex, nonvarying string, then
+a virtual byte pointer is passed to the callee.
+Other value parameter types are passed by virtual address.
+If the formal is flex, an upperbound word will precede the
+virtual address or byte pointer in the argument block.
+#sect(Function Return Values)
+Floating point values are returned in FPAC0.
+For other types, the following rules apply.
+#par
+If the size of the return value is greater than 32 bits, then the
+return value is treated as an implicit first VAR parameter,
+but is passed by ^Udirect|U address.
+Note that for objects less than or equal to 64 bits, the code
+generator is free to treat the return value as a local variable and
+copy it to the location whose address was passed in when the function
+returns.
+If the size of the return value is less than or equal to
+32 bits, then the value is returned in AC0 or AC0 and AC1.
+#endlevel
+#sect(Procedure Entry Code)
+This section describes the procedure calling and procedure
+entry code for calls of non-quick subroutines.
+At a procedure call the code generator emits code to perform
+the following actions.
+#beginitem(4,0)
+#item()Push all the argument block words, except the first two,
+onto the stack.
+Note that any dynamic temporaries required for parameter evaluation
+must be allocated before any argument words are pushed
+onto the stack.
+#item&Move word two of the argument block to AC0, and
+move word one of the argument block to AC1.
+#item&Save any allocated floating point registers (note that they
+may not be pushed onto the top of the stack).
+#item&If the called procedure is not known to be a level one 
+procedure, then move the static link for the callee to AC2.
+#item&If AC3 is not free
+and contains a value other than the caller's frame pointer,
+ then save its contents in a stack 
+temporary.
+#item&Call the subroutine with either a JSR or EJSR instruction.
+#enditem
+The following five words must appear at the entry point of every
+non-quick level one Pascal subroutine:
+#beginfigure(3)
+SAVE    <stack frame size>
+JSR     @M.RTCALL
+M.ENTRY
+-MAX(<argument block size>,2) - 3
+#endfigure
+The SAVE instruction pushes a save block onto the stack and
+allocates all the space required for the stack frame.
+The stack frame size operand is a count of the number of words
+in the stack frame strictly above the word pointed at by
+the frame pointer.
+The value of the symbol M.ENTRY is the offset within the
+runtime's transfer vector of the entry for the 
+procedure entry routine.
+This routine will complete the initialization of the
+callee's stack frame.
+The JSR is followed by a data word giving the negation of the size of the
+called procedures argument block plus three.
+For this purpose, the argument block is considered to always be at
+least two words, since the SAVE instruction always creates
+two words of the argument block on the stack.
+#par
+A potential coding of the  entry routine is shown
+below.
+Note that AC3 contains the frame pointer upon exit from the
+routine.
+#beginfigure(13,3)
+SF.OLDSP=	 1		  ; offset of old SP
+SF.HBT=          2                ; offset of current hbt ptr
+
+M.ENTRY:
+	LDA	AC3,FP		  ; AC3 <-- new FP
+	SUB	AC0,AC0		  ; Clear and store handler
+        STA     AC0,SF.HBT,AC3    ;    branch table address
+	LDA	AC2,M.RETADDR	  ; Fetch the return address.
+	LDA	AC0,0,AC2	  ; Calculate and store
+	ADD	AC3,AC0		  ;    caller's SP in new
+	STA	AC0,SF.OLDSP,AC3  ;   frame
+	JMP	1,AC2		  ; Back to callee
+#endfigure
+#sect(Procedure Exit Code)
+At procedure exit the code generator generates a jump to
+the subroutine exit runtime routine.
+#beginfigure(2)
+JSR     @M.RTCALL
+M.RETURN
+#endfigure
+
+The corresponding runtime routine restores the previous
+stack and frame pointers.
+A possible coding of the routine is shown below.
+Note that AC3 is NOT assumed to contain the frame pointer
+on entry to the routine.
+
+On exit from the routine AC3 will contain the frame
+pointer for the routine being returned to.
+#beginfigure(13,3)
+SF.DLINK=	-1		  ; offset of dynamic link
+SF.OLDSP=	 1		  ; offset of old SP
+SF.RET=		 0		  ; offset of return address
+
+M.RETURN:
+	LDA	AC3,FP		  ; AC3 assumed uninitialized
+	LDA	AC2,SF.DLINK,AC3  ; Restore
+	STA	AC2,FP		  ;    old FP
+	LDA	AC2,SF.OLDSP,AC3  ; Restore
+	STA	AC2,SP		  ;    old SP
+	LDA	AC2,SF.RET,AC3	  ; Save the return address
+	LDA	AC3,FP		  ; AC3 has old FP on exit
+	JMP	0,AC2		  ; Return
+#endfigure
+#sect(Impact of Quick Blocking)
+The calling sequence and entry and exit code for quick routines
+are different from that described above.
+Argument blocks are part of the storage area for local variables
+(at positive offsets from the frame pointer) of the owner
+of the quick routine.
+Thus arguments are not pushed onto the stack, but rather
+are moved to the argument block in the owner's stack frame.
+After storing the argument words, AC0 or AC0 and AC1 must
+be saved if they are busy and the routine is a function
+returning its value in AC0 or AC0 and AC1.
+AC3 must be saved if it is busy and contains some value other
+than the owner's frame pointer.
+Any busy floating point registers must be saved.
+The routine is then called with a JSR or EJSR, just as for non-quick
+routines.
+At the entry point of the quick routine, any registers not
+used for the function return value are saved and the frame
+pointer is loaded into AC3.
+This can be accomplished with one of the following three code sequences:
+#beginfigure(10)
+PSH     AC3,AC2		; if no return value in AC0 or AC1
+LDA     AC3,FP
+
+PSH     AC3,AC3		; if AC0 used for return value
+PSH     AC1,AC2
+LDA     AC3,FP
+
+PSH     AC3,AC3		; if AC0 and AC1 used for ret value
+PSH     AC2,AC2
+LDA     AC3,FP
+#endfigure
+On return from the routine, the accumulators saved on entry, except
+AC3, must be restored, the frame pointer will be placed in
+AC3 (if not already in AC3) and the routine will return to
+the caller.
+Three possible code sequences to accomplish this, in an order
+corresponding to the three case shown above, are shown below:
+#beginfigure(11)
+POP     AC2,AC0
+LDA     AC3,FP
+POPJ
+
+POP     AC2,AC1
+LDA     AC3,FP
+POPJ
+
+POP     AC2,AC2
+LDA     AC3,FP
+POPJ
+#endfigure
+#sect(Inter-overlay Calls)
+Inter-overlay calls are intercepted by the overlay manager.
+The code emitted up to the actual call instruction is identical
+for the inter-overlay and intra-overlay cases.
+The code appearing at the point of the
+call varies for the two cases;
+the inter-overlay case is described in the section on the
+overlaying of user code.
+Note that the actual code generated for external 
+procedure calls must be resolved by the linker,
+since it is not known at compile time whether the call is
+inter-overlay or intra-overlay.
+#par
+The overlay manager forces the procedure to return to
+an overlay manager entry point by replacing the caller's
+return address with its own entry point address.
+In order to restore the caller's overlay and to return
+to the caller, the overlay manager inserts two words
+below the argument block.
+The first word contains the overlay module number
+of the caller.
+The second word contains the return address to the caller.
+In order to insert these two words the overlay manager
+must move any portion of the argument block already on
+the stack up two words.
+The overlay manager must first map the overlay containing
+the called subroutine;
+it must use the argument block count word at the beginning
+of the subroutine to determine the size of the called 
+routine's argument block.
+#par
+The entry point and exit point code for the called subroutine
+is (of necessity) identical to that described above for non-quick
+subroutines.
+#endlevel
+#sect(Packaging The Runtime)
+The runtime code will be linked separately from the user's program;
+all of the runtime routines will be available to any user program.
+A user will invoke his program by running the linked image
+of the runtime.
+The runtime will prompt the user for the name of a Pascal
+image file, create the necessary OZMOS segments, load the
+overlay containing the main routine of the user program,
+map the main routine overlay and
+then transfer control to the user program.
+The OZMOS segments which must be created include segments for
+virtual static and heap storage, user overlay areas and a
+segment for the non-directly-addressable runtime.
+#par
+Runtime calls will transfer control back into the runtime code;
+the runtime entry points will be specified via a transfer vector.
+The transfer vector occupies a large part of the direct
+runtime.
+The runtime calls all transfer control to a central runtime routine
+dispatcher.
+The caller passes an offset into the transfer vector to the dispatcher.
+The dispatcher determines from the transfer vector entry whether
+the runtime routine is in the direct or the overlaid runtime.
+If the routine is in the direct runtime, then the dispatcher jumps
+to it directly;
+otherwise, control is transfered to the runtime's internal
+overlay manager.
+#beginlevel
+#sect(Transfer Vector Generation and Format)
+Two representations of the transfer vector must exist;
+one which is linked with the runtime and one which is
+linked with the user program.
+The transfer vector linked with the user program consists
+of definitions of each runtime entry point as an offset
+from  the base of the 
+transfer vector.
+Thus a fragment of the vector linked with the user program
+might look like the following:
+#beginfigure(3)
+M.ENTRY=	2
+M.LNENTRY=	4
+M.RETURN=	6
+#endfigure
+Within the runtime, the transfer vector consists of a series of
+two word entries.
+The first word is the entry point address for the called routine.
+If the routine is in the overlaid runtime, then bit zero
+of the first word will be set to one;
+bit zero will be zero for entry points into the direct runtime.
+The second word will contain the runtime routine's overlay
+number in the high order byte and the overlay
+area number in the low order byte (overlay numbers
+and area numbers are discussed in detail in the next section).
+#sect(Overlaying The Runtime)
+Routines in the direct runtime are both always resident
+in main memory and always directly addressable.
+Routines in the overlaid runtime may reside in either
+"in-core overlays" or "disk overlays".
+Routines in in-core overlays are read into the OZMOS segment
+ created for the overlaid runtime
+when a routine in the overlay is first called and
+then remain in memory for the duration of program execution.
+Routines in disk overlays are read into the runtime segment
+whenever a routine is called and the corresponding overlay
+is not currently resident in the segment.
+#par
+Each 2Kb page of the OZMOS segment created for the runtime is known
+as a ^Uruntime overlay area|U, or, if the context is clear, simply as
+an ^Uarea|U.
+Areas may be referred to by their ^Uarea number|U - the zero based
+number of the corresponding page within the runtime segment.
+The runtime is linked using the OZMOS binder.
+All the overlaid runtime code is linked into a single binder
+overlay node.
+Overlays may be referred to by their binder assigned ^Uoverlay
+number|U.
+#par
+Management of the runtime overlays is accomplished by using both
+the OZMOS overlay mechanism and an explicit runtime overlay
+manager.
+The runtime overlay manager maintains a ^Uruntime overlay table|U.
+The table contains one entry for each runtime overlay area;
+each entry contains the overlay number of the overlay currently
+resident in that area, or, a zero if no overlay has been loaded
+into the area yet.
+#par
+The transfer vector entry for each overlaid runtime routine 
+contains both the overlay number and the area number corresponding
+to the called routine.
+The overlay manager determines if the overlay is currently resident
+in the runtime segment by comparing the overlay number of the called
+routine with the table entry for the area associated with the
+overlay.
+If the overlay is resident, the overlay manager maps the area
+using one or more scratch registers and then calls the
+routine using the entry point address contained in the transfer vector.
+If the routine is not currently resident then the overlay manager
+must perform the following actions:
+map the relevant area using the scratch registers,
+load the overlay into the segment using the OZMOS OVLLOD system
+call,
+update the overlay table,
+call the routine using the entry point address contained in the
+transfer vector,
+and, upon the routine's return, release the overlay using the OVLREL
+system call.
+#sect(Runtime Routine Calling Conventions)
+The runtime routine calling conventions relevant to the caller
+are described in this section.
+The following two words are required at the point of the call:
+#beginfigure(2)
+JSR	@M.RTCALL
+<Xfer vector offset>
+#endfigure
+"M.RTCALL" is the address of a page zero cell containing the
+address in the direct runtime of the runtime routine dispatcher.
+The second word contains the offset of the transfer vector
+entry for the called routine.
+Both M.RTCALL and the transfer vector offsets will be defined
+as global symbols in the transfer vector file linked with the
+user's program.
+The parameter passing conventions are described in the descriptions
+of the individual calls.
+However, in general the following conventions are used.
+Registers AC0 through AC2  are used for the first three argument
+words.
+The parameters passed on the stack are pushed in left to right order,
+rather than in the reverse order as is done with Pascal
+routines.
+Floating point arguments may be passed or returned in the
+floating point accumulators.
+Any additional argument words will be passed on the stack.
+The JSR instruction used in the call destroys AC3;
+upon return from the runtime routine AC3 will
+contain a copy of the caller's frame pointer.
+Other registers are generally preserved unless a result is
+returned in a register.
+#endlevel
+#sect(Debugging Aids)
+Two debugging aids will be provided in the initial
+implementation.
+A stack traceback will be provided after any fatal runtime
+error and when the predefined procedure TRACE is called.
+The current source line number will be printed in
+"module@file-page/line" format after any fatal runtime error.
+Both of these facilities will be available only if the
+user compiles his program with the appropriate compiler
+switch enabled.
+#par
+Both of these capabilities will be provided without adding
+any additional code or data to the user's program.
+Instead the linker will construct tables which will be
+added to the end of the image file.
+These tables contain many internal pointers which will be
+implemented as word offsets from given points within the tables.
+The tables have been carefully designed so that these offsets
+will fit within a 16 bit word in all cases but one.
+The tables necessary to support the traceback facility 
+are placed at the beginning of the table area of the image file.
+The tables required to support the line number facility are
+organized on a source module basis and follow the traceback
+tables.
+The tables for the traceback facility are contiguous in the
+image file as are each of the tables for each module
+which had line number tables generated.
+This structure is pictured below.
+#beginfigure(24)
+	|   user code and	|
+	|	 data		|
+	+-----------------------+
+	|    traceback tables   |
+	|  (overlay, module	|
+	|   and routine tables) |
+	|			|
+	+-----------------------+
+	|  line number tables   |
+	|   for module one	|
+	|  (file, page and	|
+	|   line tables)	|
+	|			|
+	+-----------------------+
+	|	    .		|
+	|	    .		|
+	|	    .		|
+	+-----------------------+
+	|  line number tables	|
+	|     for module n	|
+	|  (file, page and	|
+	|   line tables)	|
+	|			|
+	+-----------------------+
+#endfigure
+While the pr purpose of the traceback and line number
+facilities is to provide debugging information after a fatal error,
+the information present in the  tables is 
+sufficient to provide several other useful capabilities.
+It will be possible to provide an interactive inquiry
+capability in the runtime which would provide these
+additional functions.
+These inquires could be made before a users program was
+executed or after an error.
+The capabilites which could be provided are enumerated
+below.
+Some of these inquiries can only be supported by lengthy
+searches.
+This seems acceptable since the searches done automatically
+after a program error
+may be done efficiently and the other queries would
+be done infrequently.
+The following capabilities could be provided.
+#beginitem(4,0)
+#item()Given an overlay module number and an address,
+print the corresponding source line number in
+"module@file-page/line" format.
+#item&Print all overlay module numbers and the names
+of all modules composing each overlay.
+#item&Given an overlay module number and an address,
+print the corresponding module name and routine name.
+#item&Given a "module@file-page/line" string, print the
+corresponding overlay module number and statement start address.
+#item&Given a module name print the corresponding overlay
+module number.
+#item&Given an overlay module number, print the corresponding
+module names.
+#item&Given a module name and a routine name, print the
+overlay module number and start address of the routine.
+#enditem
+#beginlevel
+#sect(The Traceback Facility)
+A stack trace will be provided after any fatal runtime error
+and when the predefined procedure TRACE is called.
+The traceback will consist of a list of module name, procedure
+name pairs, with one list entry for each Pascal routine
+which was active at the time of the call to the trace routine.
+Unlike implementations on previous systems, no data or
+additional instructions will be added to a user's program
+to support the traceback facility.
+Instead, supporting data structures will be constructed in
+the image file for the user's program.
+When a traceback is required, these data structures will be accessed
+directly from the image file;
+they will never be loaded, in their entirety, into main memory.
+#beginlevel
+#sect(Compiler Generated Data Structures)
+The compiler must emit two types of object records in support
+of the traceback facility.
+First, the text of the module name must be included in
+the object file.
+Second, for each routine (procedure, function or main program),
+the compiler must emit an object record containing the
+routine name ("MAIN PROGRAM" for the main program) and
+the start address of the routine within the compilation unit.
+#par
+The routine object records must ^Ualways|U be emitted for every routine
+in a compilation unit.
+The NOTRACE option is ignored by the code generator.
+#sect(Linker Generated Data Structures)
+The linker uses the traceback information generated by the
+compiler  to construct a set of ^Utraceback tables|U.
+These tables are placed in the image file, but will not be loaded into
+main memory.
+They are accessed by the routine whenever a stack traceback is
+desired.
+#par
+One ^Uoverlay traceback table|U is generated by the linker.
+The image file offset of the overlay traceback table is stored
+in the image file header.
+The table begins with a word containing the size of the table in words.
+Following the size word, there are one word table entries for
+each overlay module in the user's program.
+The Nth entry corresponds to the overlay with overlay
+module index N.
+Each entry is the word offset from the start of the overlay traceback
+table to the ^Umodule traceback table|U for the corresponding overlay.
+#par
+There is one module traceback table for every overlay in the program.
+A module traceback table begins with a word giving the number of six
+word entries in the table.
+Each module traceback table has one entry for every separate compilation
+unit composing the corresponding overlay.
+The first word of each entry is the address of the start
+of the compilation unit's code in the overlay.
+The table entries are sorted into ascending module start 
+address order.
+The second word of each entry is the address of the last
+word of the compilation unit's code in the overlay.
+The third word of each entry is the word offset from the start of
+the overlay traceback table to the ^Uroutine traceback table|U
+for the module.
+The fourth and fifth words contain the word offset from the
+start of the overlay traceback table to the line number
+tables for the module.
+If the module was not compiled wtih the DEBUG option
+then these two words will be zero.
+The sixth word of each entry is the word offset from the start
+of the overlay traceback table to the text of the module's name.
+Each module name string begins on a word boundary;
+the high order byte of the first word contains the length
+of the string.
+#par
+There is one routine traceback table for each compilation unit
+in the program.
+A routine traceback table begins with a word giving the number
+of two word entries in the table.
+Each routine traceback table has one entry for each
+routine in the corresponding compilation unit.
+The first word of each entry is the address of the start of the
+routine's code.
+The table entries are sorted into ascending routine start
+address order.
+The second word of each entry is the word offset from the start
+of the overlay traceback table to the text of the
+procedure's name.
+Each procedure name string begins on a word boundary;
+the high order byte of the first word contains the length of
+the string.
+#par 
+Unlike the line number tables, the overlay, module and
+routine traceback tables are ^Ualways|U constructed
+and placed in the image file by the linker.
+#par
+This table structure is based on the assumption that all the code
+for a given compilation unit is allocated in a contiguous
+section of memory.
+#par
+An illustration of the traceback tables' structure is given below.
+#beginfigure(51,0)
+			MODULE TABLES
+
+			+---------------+
+		    +-->|num. of entries|	ROUTINE TABLES
+		    |	+---------------+
+OVERLAY TABLE	    |	| mod start addr|	+---------------+
+		    |	+---------------+   +-->|num. of entries|
++---------------+   |   | mod end addr  |   |	+---------------+
+|num. of entries|   |	+---------------+   |   |rout start addr|
++---------------+   |	| rout table ptr|---+	+---------------+
+| mod table ptr |---+	+---------------+	| rout name ptr |
++---------------+	|stmt list index|	+---------------+
+| mod table ptr |---+	|   table ptr   |	|	.	|
++---------------+   |	+---------------+	|	.	|
+|	.	|   |	| mod name ptr  |	|	.	|
+|	.	|   |	+---------------+	+---------------+
+|	.	|   |	|	.	|	|rout start addr|
+|	.	|   |	|	.	|	+---------------+
++---------------+   |	|	.	|	| rout name ptr |
+		    |	+---------------+	+---------------+
+		    |	| mod start addr|
+		    |	+---------------+
+		    |	| mod end addr  |
+		    |	+---------------+
+		    |	| rout table ptr|---+
+		    |	+---------------+   |	
+		    |	|stmt list index|   |
+		    |	|   table ptr   |   |
+		    |	+---------------+   |	+---------------+
+		    |	| mod name ptr  |   +-->|num. of entries|
+		    |	+---------------+	+---------------+
+		    |				|rout start addr|
+		    |				+---------------+
+		    |	+---------------+	| rout name ptr |
+		    +-->|num. of entries|	+---------------+
+			+---------------+	|	.	|
+			| mod start addr|	|	.	|
+			+---------------+	|	.	|
+			| mod end addr  |	+---------------+
+			+---------------+
+			| rout table ptr|
+			+---------------+
+			|stmt list index|
+			|   table ptr   |
+			+---------------+
+			| mod name ptr  |
+			+---------------+
+			|	.	|
+			|	.	|
+			|	.	|
+			+---------------+
+#endfigure
+#sect(The Runtime Traceback Algorithm)
+The traceback is printed by traversing the dynamic chain of
+stack frames, starting at the topmost.
+For each frame, the traceback algorithm requires two items
+of information: a code address in the routine corresponding
+to the stack frame and the overlay module number corresponding
+to the stack frame.
+#par
+For the topmost stack frame, the overlay module number may be
+obtained from the overlay manager.
+For user calls to TRACE, the code address is simply the return
+address.
+For tracebacks resulting from errors detected in the runtime,
+the address is the return address to the Pascal routine which
+called into the runtime.
+Note that this may have some impact on the structure on
+the runtime, e.g., it may be necessary to have separate
+entry points into the runtime for external calls (from Pascal code)
+and for internal calls.
+#par
+For frames below the topmost, the code address is simply the
+return address field of the frame above the current frame.
+The overlay module number corresponding to the current frame
+may be determined with the following algorithm.
+At the topmost frame set the variable CURRENT_OVERLAY_MODULE_NUMBER
+to the value obtained from the overlay manager.
+For a given frame, the corresponding overlay module number
+is the value of CURRENT_OVERLAY_MODULE_NUMBER.
+Examine the return address field of the current frame.
+If the return address is to the overlay manager, then set
+CURRENT_OVERLAY_MODULE_NUMBER to the value stored on the
+stack at the base of the current frame.
+#par
+For each frame, the overlay module number is used
+to index into the overlay traceback table to find
+the appropriate module table.
+The code address is used to search the module table to
+find the module name and the appropriate routine table.
+The routine table is seached to find the routine name.
+Note that the module and routine tables may be searched with 
+either a linear search or a binary search.
+#endlevel
+#sect(The Line Number Facility)
+The primary purpose of the line number facility is to provide
+a printout of the current Pascal statement's location in
+"module@file-page/line" format whenever a fatal error is
+detected in the runtime.
+Like the traceback facility, line number printing will be
+supported by tables added to the image file which are
+not loaded into main memory with the user's program.
+Thus using this capability will not disrupt a user's 
+overlay structure.
+This facility will be available only for modules which
+the user compiles with the DEBUG option.
+#beginlevel
+#sect(Compiler Generated Data Structures)
+The compiler must emit three object record types in support of the
+line number facility whenever the DEBUG option is used.
+First, for each source file in the compilation unit for which
+executable code is generated, 
+a file record containing the text of the file name
+must be emitted.
+Second, for each source page for which code is generated,
+a page record containing the text of the page name
+and the ordinal number of the corresponding file record must
+be emitted.
+Third, for each Pascal source statement,
+a statement record containing the source line number, the
+start address of the code for the statement
+and the ordinal number of the corresponding page record
+ must be emitted.
+Note that the file and page records are identified by their ordinal
+number.
+The file and page records are considered to be numbered starting at
+one;
+page records are numbered globally, not within file.
+#sect(Linker Generated Data Structures)
+The linker uses the file, page and statement records generated by 
+the compiler to construct a set of ^Uline number tables|U.
+The line number tables for a given source module are placed
+contiguously in a section of the image file.
+All the line number tables are placed in the image
+file following the traceback tables.
+#par
+Five types of tables are constructed by the linker:
+the statement list, the statement list index table, the file line
+number table, page line number tables and page/statement
+cross-reference tables.
+#par
+The 32 bit offset in the module traceback tables points
+to the first word of the statement list index table.
+The ^Ustatement list index table|U begins with a word giving the number
+of (one word) entries in the table.
+The table entries follow the size word.
+Each entry is a pointer into the statement list.
+The pointers are represented as word offsets from the start of
+the statement list index table.
+The number of entries in the index table is determined by dividing
+the number of statements in the source module by some 
+constant (e.g., 100).
+The entries are sorted into ascending order.
+#par
+One ^Ufile line number table|U is emitted for the source module;
+it immediately follows the corresponding statement list index table in 
+the image file.
+The table has one entry for every source file of the module for
+which executable code has been generated.
+The file line number table begins with a word giving the number of two
+word entries in the table.
+The first word of each entry is the word offset from the
+start of the statement list index table to the page line 
+number table for the file.
+The second word of each entry is the word offset from the
+start of the statement list index table to the text of
+the file's name (six character file name only).
+Each file name string begins on a word boundary;
+the high order byte of the first word contains the length
+of the string.
+#par
+There is one ^Upage line number table|U for every entry in
+the file line number table.
+The table begins with a word giving the number of two word
+entries in the table.
+Each page line number table has one entry for every page of
+the corresponding source file for which executable code has
+been generated.
+The first word of each entry is the word offset from the 
+start of the statement list index table to the
+page/statement cross-reference table for the page.
+The second word of each entry is the word offset from
+the start of the statement list index table to the
+text of the page name.
+Each page name string begins on a word boundary;
+the high order byte of the first word contains the
+length of the string.
+#par
+A ^Upage/statement cross-reference table|U is emitted for every page
+line number table entry.
+The table begins with a word giving the number of one word entries in the table.
+Each page/statement cross-reference table has one entry for each
+contiguous block of statement list entries for the corresponding page.
+Each entry consists of a word offset from the start of the statement
+list index table to the start of the block of statement list entries.
+The construction of the cross-reference tables will be described in more
+detail after the statement list has been described.
+#par
+The statement list index table, file line number table,
+page line number tables and statement/page cross-reference tables 
+are shown below:
+#beginfigure(34,0)
+Stmt List Index/				Statement/page
+  File Table		Page Tables		Cross-reference
+
++---------------+	+---------------+	+---------------+
+| num of entries|   +-->| num of entries|   +-->| num of entries|
++---------------+   |	+---------------+   |	+---------------+
+| stmt list ptr |   |	| xref table ptr|---+	| stmt list ptr |
++---------------+   |	+---------------+	+---------------+
+| stmt list ptr |   |	| page name ptr |	| stmt list ptr |
++---------------+   |	+---------------+	+---------------+
+|	.	|   |	|	.	|	|	.	|
+|	.	|   |	|	.	|	|	.	|
+|	.	|   |	|	.	|	|	.	|
++---------------+   |	+---------------+	+---------------+
+| num of entries|   |	| xref table ptr|---+
++---------------+   |	+---------------+   | 	+---------------+
+| page table ptr|---+	| page name ptr |   +-->| num of entries|
++---------------+	+---------------+	+---------------+
+| file name ptr |				| stmt list ptr |
++---------------+	+---------------+	+---------------+
+|	.	|   +-->| num of entries|	|	.	|
+|	.	|   |	+---------------+	|	.	|
+|	.	|   |	| xref table ptr|---+	|	.	|
++---------------+   |	+---------------+   |	+---------------+
+| page table ptr|---+	| page name ptr |   |
++---------------+	+---------------+   |	+---------------+
+| file name ptr |	|	.	|   +-->| num of entries|
++---------------+	|	.	|	+---------------+
+			|	.	|	| stmt list ptr |
+			+---------------+	+---------------+
+						|	.	|
+						|	.	|
+						|	.	|
+						+---------------+
+#endfigure
+A single ^Ustatement list|U is generated for the source
+module.
+The statement list has one entry for every source statement in the
+module for which executable code is generated.
+The entries are variable length;
+they consist of one, two or three words.
+The first word consists of two fields.
+If the high order bit (bit zero) of the word is zero,
+then the entry consists of a single word only.
+If bit zero is one, then the second word
+is present also.
+Bits one through 15 contain the starting address of the code for the
+corresponding Pascal statement.
+The high order bit (bit zero) of the second word is zero if the
+third word is not present and is one if the
+third word is present.
+Bits one through 15 of the second word contain the line number of
+the corresponding Pascal statement.
+The high order byte of the third word contains the ordinal
+number of the file table entry for the file containing the
+corresponding Pascal statement.
+The low order byte contains the ordinal number of the page
+table entry for the page containing the statement.
+The format of a statement list entry is pictured below.
+#beginfigure(13)
++-----------------------+
+|L|      address	|
++-+---------------------+
+|F|	line number	|
++-+---------------------+
+|   file    |   page    |
++-----------------------+
+
+L:  = 0  ==>  line word and file/page word are NOT present
+    = 1  ==>  line word is present
+
+F:  = 0  ==>  file/page word is NOT present
+    = 1  ==>  file/page word is present
+#endfigure
+The statement list entries are sorted into ascending order
+by address.
+If the second word of a statement list entry is not 
+present, then the line number is one greater than the line
+number of the previous entry in the list.
+If the third word is not present,
+then the file and page are the same as those for the
+previous entry.
+#par
+The linker will force all statement list entries pointed
+at from the statement list index table to be three
+word entries.
+#par
+The table format imposes a limit on the number of statements
+on a page of 32767;
+the number of pages within a file must be no greater than 255;
+the number of files within a module must be no greater
+than 255.
+Both the compiler and the linker can enforce these limits.
+#par
+The page/statement cross-reference entries may be constructed during
+a single, linear scan of the statement list, after it
+has been sorted by address.
+While traversing the statement list, the linker must create a
+page statement cross-reference table entry whenever the
+file or page changes.
+Note that the statement list entries pointed at from the cross
+reference tables will automatically be three word entries.
+To verify this, first observe that a three word entry is necessary
+whenever a file/page break occurs.
+Second, by definition a cross-reference table entry points to the largest
+possible contiguous block of statement list entries which are all
+for statements falling on the same page.
+This implies that the cross-reference table entries point at a statement list
+entry which follows a change in page or file.
+Thus by the first observation, they must point at three word entries.
+#sect(The Line Number Algorithm)
+Like the traceback facility, the line number facility requires both
+an overlay module number and an address as input.
+The output of the process is a string of the form 
+"module@file-page/line".
+The overlay number is used to index into the overlay traceback
+table to obtain a module table pointer.
+The address is used to determine which module table entry is the correct
+one.
+The module table entry contains a pointer to the module name
+string.
+The entry also contains the file offset of the statement list
+index table for the module (or zero if the module was not
+compiled with the DEBUG option).
+The statemnt list index table is searched linearly.
+The statement list entries pointed at by the index table are
+examined; the search continues until the largest address
+which is less than or equal to the input address is found.
+The statement list is then searched sequentially until,
+once again, the largest address which is less than or equal
+to the input address is found.
+As this search progresses the current line number and
+file and page are kept track of.
+Recall that all statement list entries pointed at from the statement
+list index table are three word entries.
+When the appropriate statement list entry is found, the file field
+of the entry is used to index into the file line number table.
+The file table entry contains the file name string and a pointer
+to the corresponding page line number table.
+The page field of the statement list entry is used to index
+into the page line number table.
+The page line number table contains a pointer to the page name string.
+The line number required was calculated during the statement list
+search.
+
+#par
+The page/statement cross-reference tables permit the reverse
+mapping as well;
+that is, given a "module@file-page/line" string, the corresponding
+overlay module number and statement start address may be found.
+The module tables must be searched linearly until the
+module name is found.
+The overlay traceback table is used to find the module tables
+and, once the matching module name is found, gives the
+desired overlay module number.
+The module table entry found contains a pointer to the
+statement list index table and file table for the module.
+The file table is seached sequentially until a matching file
+name is found.
+The file table entry found contains a pointer to the corresponding
+page table.
+The page table is seached sequentially unitl a matching page name
+is found.
+The page table entry found contains a pointer to the corresponding
+page/statement cross-reference table.
+For each entry in the cross-reference table, the statement
+list is seached until the line number is found or a page
+file break is encountered.
+The statement list entry found, assuming the line number exists,
+gives the address within the overlay.
+#endlevel
+#endlevel
+#sect(Exceptional Condition Handling)
+This section describes the implementation of the TYM-Pascal
+exceptional condition handling facility.
+The implementaion is similar to the previous DEC10 and
+VAX implementations.
+The presentation consists of four major sections.
+The first section presents the terminology used throughout
+the discussion and defines the data structures used.
+The second section gives pseudo-code descriptions of
+each of the runtime routines.
+The third section describes the data structures and
+runtime routine calling sequences generated by the compiler.
+Finally, several miscellaneous issues are discussed.
+#beginlevel
+#sect(Data Structures)
+Descriptions of each of the major data structures used by the
+exception handling system are given in this section.
+#beginlevel
+#sect(Exception Blocks)
+Exception blocks contain read-only information which is
+specific to a subcondition.
+For user conditions, subcondition codes and messages are not
+meaningful;
+the exception block for a given user condition includes all information
+relevant to that condition.
+In contrast, a standard condition may have many corresponding
+exception blocks.
+An additional data structure, the condition cell,
+contains information about standard conditions which is
+invariant for all the corresponding subconditions.
+The format of an exception block is shown below;
+note that only the first word is present for user
+conditions.
+$TRA '\' '\'
+#beginfigure(16)
+     +-----------+-----------+
+     |   condition address   |
+     +-----------+-----------+
+     |  sub cond |C| msg len | \
+     +-----------+-----------+  |
+     |       text of         |  |
+     |    error message      |  |-- standard
+     |           .           |  |   conds only
+     |           .           |  |
+     |           .           | /
+     +-----------+-----------+
+
+     C = 0  ==>  may not continue after exception
+       = 1  ==>  may continue after exception
+#endfigure
+$TRA '\' ' '
+The first word of an exception block contains a direct address
+known as the ^Ucondition address|U.
+For user conditions, the condition address is the address of
+the exception block for the condition.
+Thus user exception blocks consist of a single word
+which contains its own address.
+For standard conditions, the condition address is the
+address of the condition cell.
+Condition cells are discussed in the next section.
+#par
+The information in an exception block for a user condition serves 
+only to distinguish it from standard conditions;
+the primary purpose of the existance of an exception block
+for a user condition is to provide, via the exception block
+address, a unique name for the condition.
+#par
+Exception blocks for user conditions are allocated in the
+direct static segment.
+Exception blocks for standard conditions are  allocated
+in an in-core overlay of the OZMOS segment for the overlaid
+runtime.
+The runtime overlay area containing the exception blocks will be mapped
+to by the exception handling runtime routines whenever necessary.
+Note that user and standard exception blocks may be
+distinguished by determining if the first word contains its
+own address.
+#sect(Condition Cells)
+Condition cells exist for standard conditions only;
+they contain information specific to a given condition.
+The first word of the condition cell is always present.
+Word two is present only for maskable conditions.
+The format of a condition cell is shown below.
+$TRA '\' '\'
+#beginfigure(13)
+     +-----------+-----------+
+     |M|P|  masking count    |
+     +-----------+-----------+
+     | exception block addr  | -- present for maskable
+     +-----------+-----------+    conditions only
+
+     M = 0  ==>  condition is not maskable
+       = 1  ==>  condition is maskable
+
+     P = 0  ==>  exception not pending for condition
+       = 1  ==>  exception is pending for condition
+#endfigure
+$TRA '\' ' '
+The condition cell address serves as a unique identifier for
+standard conditions, much as the exception block address
+does for user conditions.
+The exception block address is the address of the exception
+block for the last signaled exception for the condition;
+this address is set when an exception occurs and the
+corresponding condition is masked.
+#par
+Condition cells are allocated in page zero at fixed addresses.
+#sect(Handler Branch Tables)
+A handler branch table (HBT) is generated by the compiler
+for each handler clause in the compilation unit.
+They are read-only and are generated in the code area.
+The format of a handler branch table is shown below.
+#beginfigure(21)
+     +-----------+-----------+
+     |handler entry code addr|
+     +-----------+-----------+
+     |  next outer hbt addr  |
+     +-----------+-----------+
+     | hsb stack frame offset|
+     +-----------+-----------+
+     |   condition address   |
+     +-----------+-----------+
+     |    handler address    |
+     +-----------+-----------+
+     |           .           |
+     |           .           |
+     |           .           |
+     +-----------+-----------+
+     | -1(others) or -2(all) |
+     +-----------+-----------+
+     | handler address or 0  |
+     +-----------+-----------+
+#endfigure
+The first word of the table is the address of the common
+entry code for the handler clause.
+The second word is the address of the HBT for  the next outer handler
+clause within the procedure or zero if no outer handler
+exists.
+The third word is the offset within the corresponding
+stack frame of the handler state block (described in the
+next section) for the handler.
+Starting with the fourth word is a list of address pairs.
+The first address is the condition address,
+as defined in the section on exception blocks,
+for the condition.
+The second word of the pair is the address of the handler
+corresponding to that condition.
+The list is terminated by a two word pair.
+The first word contains a -1 if the handler clause contains
+an others handler, a -2 if an allconditions handler is present
+and a -1 if neither is present.
+The second word contains either the address of the others or
+allconditions handler or a 0 if neither was present.
+#par
+The address of the current handler branch table (or zero if
+no handler is current) is stored at offset two from the
+frame pointer in the current stack frame.
+The compiler emits runtime calls to update this location.
+#sect(Handler State Blocks)
+Handler state blocks (HSB) are used to contain read/write state information
+associated with a given handler clause.
+One HSB exists for each handler clause;
+the compiler insures that they will be allocated on the stack
+as statically-sized temporaries.
+The format of a handler state block is shown below.
+#beginfigure(7)
+     +-----------+-----------+
+     |   exception address   |
+     +-----------+-----------+
+     | overlay module number |
+     +-----------+-----------+
+     |  exception block addr |
+     +-----------+-----------+
+#endfigure
+The first word of the block contains the address at which the last
+exception occurred if the corresponding handler clause is active.
+This cell is used by the runtime as a "handler active" flag;
+it will be zero if the correspondng handler clause is not active.
+The next two words are meaningful if the first word of
+the block is non-zero, i.e., if the corresponding handler
+clause is active.
+The second word contains the overlay module number of the overlay
+in which the exception occured, or, zero if the exception occured
+while the runtime was executing.
+The final word contains the address of the exception
+block corresponding to the condition whose signaling activated
+the handler clause.
+#sect(The Manager Active Flag)
+The manager active flag is a one word flag maintained by the
+runtime to indicate when the exception manager is active.
+If the exception manager is active it will contain the 
+address of the exception block for the exceptional condition
+which was signaled;
+otherwise, it will be zero.
+The exception block address, rather than a simple boolean, is
+used so that the runtime can determine what condition the manager
+is handling when an asynchronous interrupt occurs.
+#endlevel
+#sect(Exception Handling Runtime Routines)
+#figure_default(3)
+This section describes the exceptional condition handling
+runtime routines.
+The routines are presented in an informal pseudo-code.
+While these descriptions are not necessarily detailed,
+they are intended to be complete and accurate at the
+given level of presentation.
+Thus any details lacking should be clearly a part of an
+unelaborated routine used in the pseudo-code descriptions.
+#beginlevel
+#sect(MASK)
+MASK is called with a single parameter - the address of a condition
+cell for a standard condition.
+MASK is in the direct runtime since it is called from many places
+throughout the runtime.
+#beginfigure(12)
+procedure mask ( std_cond );
+
+begin
+  assert ( std_cond^.maskable );
+  if std_cond^.masking_count = #O37777 then begin
+    writeln ( tty, 'Masking count overflow' );
+    call debugger ( <mask return address> );
+  end
+  else begin
+    std_cond^.masking_count := std_cond^.masking_count + 1;
+  end;
+end;
+#endfigure
+#sect(UNMASK)
+The one argument to UNMASK is the address of a condition cell
+for a standard condition.
+UNMASK is in the direct runtime since it is called
+from many places in the runtime.
+#beginfigure(16)
+procedure unmask ( std_cond )
+
+begin
+  assert ( std_cond^.maskable );
+  if std_cond^.masking_count = 0 then begin
+    writeln ( tty, 'Improperly nested call to UNMASK.' );
+    call debugger ( <unmask ret addr> );
+  end
+  else begin
+    std_cond^.masking_count := std_cond^.masking_count - 1;
+    if (std_cond^.masking_count = 0) and
+       (std_cond^.pending) then begin
+      std_cond^.pending := false;
+      except_mgr ( std_cond^.exc_block, <unmask ret addr> );
+    end;
+  end;
+end;
+#endfigure
+#sect(MASKED)
+The one parameter to MASKED is the address of a condition cell for
+a standard condition.
+#beginfigure(6)
+function masked ( std_cond ): boolean;
+
+begin
+  assert ( std_cond^.maskable );
+  masked := (std_cond^.masking_count > 0);
+end;
+#endfigure
+#sect(PENDING)
+The one parameter to PENDING is the address of the condition
+cell for a standard condition.
+#beginfigure(8)
+function pending ( std_cond ): boolean;
+
+begin
+  assert ( std_cond^.maskable );
+  assert ( not ( (std_cond^.pending ) and 
+		 (std_cond^.masking_count = 0) ) );
+  pending := std_cond^.pending;
+  std_cond^.pending := false;
+end;
+#endfigure
+#sect(EXCEPTION_MESSAGE)
+The pseudo-code description of EXCEPTION_MESSAGE is at
+a somewhat higher level than the descriptions given earlier.
+In particular, the first action described is a search of the
+stack for the topmost active handler.
+This search procedure must be executed from several places in
+the runtime and will be a separate routine.
+The outline of the search is straightforward;
+the handler branch table pointer at offset two in each
+stack frame is used to find the current innermost handler branch
+table.
+The handler branch table contains the offset of the corresponding
+handler state block.
+A handler is active if the exception address field of the handler
+state block is non-zero.
+The outer HBT address field of the handler branch table is
+followed when the current handler is not active.
+If the outer HBT address is zero, then the dynamic link
+is followed and the procedure is repeated for the next stack 
+frame.
+#par
+The presence of overlays will complicate this process 
+since handler branch tables are generated in the code area.
+The runtime must load overlays as it follows the dynamic
+chain down the stack and must restore the caller's overlay
+before returning.
+The algorithm for determining the overlay module number
+corresponding to a stack frame is discussed in the
+section on debugging aids and will not be described 
+here.
+#beginfigure(15)
+procedure exception_message;
+
+begin
+  top_ovl_mod_num := current_overlay_mod_num;
+  hsb := find_top_active_handler;
+  if hsb = 0 then begin
+    writeln( tty, 'Exc msg called with no handler active' );
+  end 
+  else begin
+    if hsb^.exc_block^.cond_cell = hsb^.exc_block
+      then writeln ( tty, 'User signaled condition' )
+      else writeln ( tty, hsb^.exc_block^.message );
+    write ( tty, 'Overlay:', hsb^.ovl_mod_num );
+    writeln ( tty, '   PC:', hsb^.exc_addr:6:O );
+  end;
+  load_overlay ( top_ovl_mod_num );
+end;
+#endfigure
+#sect(The Status Routines)
+The status routines are all parameterless functions which return
+a subcondition code for a standard condition.
+The pseudo-code description of the MATH_STATUS routine is
+given below.
+The other status routines are almost identical (in fact they
+may be implemented as multiple entry points to a common 
+routine).
+#beginfigure(16)
+function mathstatus: math_status;
+
+begin
+  mathstatus := 0;
+  top_ovl_mod_num := current_overlay_mod_num;
+  hsb := find_top_active_handler;
+  if hsb = 0 then begin
+    writeln ( tty, 'Error - no handler active' );
+  end
+  else begin
+    if hsb^.exc_block^.cond_cell = math_error_cond_cell
+      then mathstatus := hsb^.exc_block^.sub_cond
+      else writeln ( tty, 'Top handler not for math error' );
+  end;
+  load_overlay ( top_ovl_mod_num );
+end;
+#endfigure
+#sect(SIGNAL)
+This section describes the routine for signaling a user
+condition.
+The one parameter to the routine is the address of the
+exception block for the user condition.
+The exception manager runtime routine, EXCEPT_MGR, is 
+described in a later section.
+#beginfigure(5)
+procedure signal ( user_cond );
+
+begin
+  except_mgr ( user_cond, <signal return address> )
+end;
+#endfigure
+#sect(Resignal)
+This section describes the parameterless version of SIGNAL,
+i.e., the routine for resignaling the last signaled condition.
+#beginfigure(14)
+procedure signal();
+
+begin
+  top_ovl_mod_num := current_overlay_mod_num;
+  hsb := find_top_active_handler;
+  if hsb = 0 then begin
+    writeln ( tty, 'Resignal with no active handler' );
+    call debugger ( <signal return address> );
+  end
+  else begin
+    with hsb^.exc_block^ do begin
+      masked := (cond_cell <> hsb^.exc_block) andif
+                (cond_cell^.maskable) andif
+                (cond_cell^.masking_count <> 0);
+      if masked then begin
+        cond_cell^.pending := true;
+        cond_cell^.exc_block := hsb^.exc_block;
+      end
+      else except_mgr ( hsb^.exc_block, hsb^.exc_addr );
+    end  (* with *) ;
+  end;
+  load_overlay ( top_ovl_mod_num );
+end;
+#endfigure
+#sect(Establish A Handler)
+This section describes the runtime routine for establishing
+a new handler.
+The compiler emits calls to this routine whenever the
+scope of a handler is first entered.
+The one parameter to the routine is an handler branch table
+address.
+#beginfigure(7)
+procedure set_handler ( hbt_addr );
+
+begin
+  frame_pointer^.hbt_addr := hbt_addr;
+  hsb := frame_pointer + hbt_addr^.hsb_offset;
+  hsb^.exc_addr := 0;         (* flag handler inactive *)
+end;
+#endfigure
+#sect(Restore A Handler)
+This section describes the runtime routine for reestablishing
+a handler when the scope of the handler is reentered.
+The compiler emits calls to this routine whenever
+necessary.
+"Reestablishing" a handler may include calling this
+routine with a parameter of zero when leaving the scope of a handler
+and entering a block of code which is not in the scope of a handler.
+The one parameter to the routine is an handler branch table
+address.
+#beginfigure(5)
+procedure reestablish_handler ( hbt_addr );
+
+begin
+  frame_pointer^.hbt_addr := hbt_addr;
+end;
+#endfigure
+#sect(Nonmaskable Exception Intercept Routines)
+This section describes the runtime routines which intercept
+nonmaskable standard conditions, e.g., floating overflow.
+The pseudo-code below is based on several assumptions.
+First, the address of the instruction causing the exception,
+or of the instruction following the exception, is assumed
+to be passed to the intercept routine (generally by the
+operating system).
+The assertion that the exception manager is not active is
+based on the assumption that nonmaskable exceptions
+occuring when the exception manager is active may be
+considered to be bugs in the runtime and that generation
+of a fatal error is appropriate.
+Finally, the intercept routines are specific to a subcondition
+of a given standard condition and thus the appropriate exception
+block address is available to the intercept routine.
+#beginfigure(7)
+procedure nonmaskable_intercept ( exc_addr );
+
+begin
+  assert ( mgr_active = 0 );
+  mgr_active := exc_block_addr;
+  except_mgr ( exc_block_addr, exc_addr );
+end;
+#endfigure
+#sect(Maskable Exception Intercept Routines)
+The only maskable condition will be attention;
+thus this section describes the intercept routine
+for attention.
+Currently, the specifics of the attention handling facilities
+provided by OZMOS are unknown.
+For now, we assume that attentions may be intercepted and
+that further attentions are ignored or delayed until attention
+interception is reenabled.
+The stack search procedure referenced in the pseudo-code below
+is different from previous active handler search routines in
+that it does not necessarily stop at the first active handler.
+The routine will search until either a handler is found which
+is active for an attention or until the entire stack has
+been searched.
+Note that the "ATTN_INTERCEPT_ACTIVE" variable referred to is
+a static variable.
+#par 
+This routine is in the direct runtime so that an interception
+of an attention will never cause an active runtime routine
+to be unmapped
+#beginfigure(10)
+procedure attention_intercept ( exc_addr );
+ 
+begin
+  if attn_intercept_active then begin
+    reenable attentions;
+    return;
+  end;
+  attn_intercept_active := true;
+  reenable attentions;
+
+  mgr_active_for_attn := mgr_active = attn_exc_block;
+  if not mgr_active_for_attn
+    then found := search_for_handler_active_for_attn;
+
+  if mgr_active_for_attn orif found then begin  (* ignore *)
+    attn_intercept_active := false;
+    return;
+  end
+  else if (mgr_active <> 0) or		(* pend *)
+          (attn_cond_cell.masking_count > 0) then begin
+    attn_cond_cell.pending := true;
+    attn_cond_cell.exc_block := attn_exc_block;
+    attn_intercept_active := false;
+    return;
+  end
+  else begin                          (* signal *)
+    mgr_active := attn_exc_block;
+    attn_intercept_active := false;
+    except_mgr ( attn_exc_block, exc_addr );
+  end;
+end;
+#endfigure
+#sect(The Exception Manager)
+The exception manager is the central runtime routine
+called by all the intercept routines.
+It has two parameters,
+the exception block address for the condition being signaled
+and the address associated with the exception.
+#par
+Note that the common entry code for a handler clause is branched
+ to with the specific handler address on top of the stack.
+#beginfigure(7)
+procedure except_mgr ( exc_block, exc_addr );
+
+begin
+  find the topmost inactive handler for either the
+    signaled condition or allconditions.
+    set FOUND equal to true if such a handler is
+    found and to false otherwise.
+    As the search proceeds, set variable HBT to
+    the handler branch table for the first hbt
+    found for the signaled condition or others
+    or allconditions.
+  if found then begin
+    unwind any frames above one corresponding to hbt;
+    frame_pointer^.hbt_addr := hbt;
+    hsb := handler state block corresponding to HBT;
+    if exc_addr is in the runtime
+      then hsb^.ovl_mod_num := nil_ovl_mod_num
+    else if not called by resignal
+      then hsb^.ovl_mod_num := current_overlay_mod_num;
+    hsb^.exc_addr := exc_addr;
+    hsb^.exc_block := exc_block;
+    if (attn_cond_cell^.pending) and
+       (attn_cond_cell^.masking_count = 0) then begin
+      exc_block := attn_exc_block;
+      exc_addr := <label 100>;
+      attn_cond_cell^.pending := false;
+      goto except_mgr;
+    end;
+100:
+    mgr_active := 0;
+    push handler address onto stack;
+    goto handler common entry code;
+  end
+  else begin
+    if exc_block^.cond_cell = exc_block
+      then writeln ( tty, 'Unhandled user condition' )
+      else writeln ( tty, exc_block^.message );
+    call debugger ( exc_addr );
+  end;
+end;
+#endfigure
+#endlevel
+#figure_pop
+#sect(Compiler Interface)
+The data structures and runtime calls which the compiler
+must generate are described in this section.
+#beginlevel
+#sect(Data Structures Generated)
+The compiler must generate and completely initialize the
+handler branch table corresponding to each handler clause in
+the compilation unit.
+For standard conditions, the condition cell address field
+is initialized to the value of an external symbol.
+The runtime transfer vector which is linked with the user's
+program will define the value of the symbol to be the
+appropriate page zero address.
+The names of these symbols are given in the final section on
+miscellaneous topics.
+The HBT is generated in the code area.
+#par
+The compiler must allocate stack space for, but need not
+initialize, the handler state block corresponding to each
+handler clause.
+#par
+For each user condition, the compiler must emit an exception
+block in the direct static area.
+The exception blocks must be initialized with their own address.
+Public user conditions must also have a global definition emitted
+which defines the value of the symbol to be the address of
+the exception block.
+#sect(Runtime Routine Calls Generated)
+This section describes the interface to the exception handling
+runtime routines which are called from compiler generated code.
+#define(#rt_name,id,&
+#item(id)
+#literal(#emit_input,1)&
+#literal(#emit_output,1))
+
+#define(#call,name,&
+$PAR -7  $VER
+CALL:\\JSR\\\\\@M.RTCALL
+#upc(name)
+$JUS)
+
+#define(#input,label,desc,&
+#if("#eqc("#emit_input,1),&
+$ski   $par -7  $need 2
+INPUTS:
+#assign(#emit_input,0))&
+$par -5
+label:\\desc)
+
+#define(#output,label,desc,&
+#if("eqc("#emit_output,1),&
+$ski  $par -7  $need 2
+OUTPUTS:
+#assign(#emit_output,0))&
+$PAR -5
+label:\\desc)
+#beginitem(12,3)
+#rt_name(MASK)
+#call(e.mask)
+#input(AC0,Condition cell address)
+#rt_name(UNMASK)
+#call(e.unmask)
+#input(AC0,Condition cell address)
+#rt_name(MASKED)
+#call(e.mskd)
+#input(AC0,Condition cell address)
+#output(AC0,boolean return value)
+#rt_name(PENDING)
+#call(e.pend)
+#input(AC0,Condition cell address)
+#output(AC0,boolean return value)
+#rt_name(EXCEPTION_MESSAGE)
+#call(e.msg)
+#rt_name(MATHSTATUS)
+#call(e.mathst)
+#output(AC0,Value of enumerated type MATH_STATUS.)
+#rt_name(EXIOSTATUS)
+#call(e.iost)
+#output(AC0,Value of enumeraed type IO_STATUS.)
+#rt_name(PROGRAMSTATUS)
+#call(e.progst)
+#output(AC0,Value of enumerated type PROGRAM_STATUS.)
+#rt_name(SPECIALSTATUS)
+#call(e.spcst)
+#output(AC0,Value of enumerated type SPECIAL_STATUS.)
+#rt_name(SIGNAL(<user condition>))
+#call(e.signal)
+#input(AC0,User exception block address.)
+#rt_name(SIGNAL())
+#call(e.resig)
+#rt_name(Establish A Handler)
+#call(e.hset)
+#input(AC0,Handler branch table address)
+#rt_name(Restore A Handler)
+#call(e.hrest)
+#input(AC0,Handler branch table address or zero)
+#rt_name(Signaling Program Errors)
+$SKI
+$ind -7
+The specific entry point names for signalling program errors
+(i.e., CHECK option errors) are given in the next section.
+$ind +7
+$SKI
+#call(<error specific entry point>)
+#enditem
+#endlevel
+#sect(Miscellaneous)
+This section discusses several miscellaneous issues concerning
+exceptional condition handling.
+#beginlevel
+#sect(Link Management Interaction)
+The information required by the exception handling system
+is either passed to the runtime directly or is found
+via pointers in the stack;
+thus the link management system has virtually no impact on
+the exception handling system.
+The standard restrictions on PUBLIC declarations do apply, however.
+PUBLIC conditions may only be defined in MAIN, i.e., outside
+of LINKs.
+Like public variables, public conditions referenced from a LINK
+must be declared in the transfer vector and the compiler must
+access them with an extra level of indirection.
+#sect(Compiler Options)
+The compiler options to control underflow handling and attention
+masking will be implemented if the hardware and OZMOS permit.
+These options will be conveyed to the runtime through an options
+set placed in the image file header by the linker.
+#sect(Status Enumerated Types)
+Initially, the enumerated status types will be identical to those
+of the VAX implementation.
+Additional values will be added at the end of the enumeration
+lists if necessary.
+#sect(Standard Condition Cell Names)
+The external symbol names by which the compiler may refer to
+standard condition cells are given below.
+The compiler uses these symbols in initializing handler
+branch tables and in calls to MASK, UNMASK, MASKED and PENDING.
+#beginfigure(7)
+MATH_ERROR		E.CMATH
+IO_ERROR		E.CIO
+PROGRAM_ERROR		E.CPROG
+ATTENTION		E.CATTN
+STORAGE_OVERFLOW	E.CHEAP
+STACK_OVERFLOW		E.CSTACK
+SPECIAL_ERROR		E.CSPEC
+#endfigure
+#sect(Program Error Entry Points)
+The following are the entry point names for each of the possible
+subconditions of the standard condition PROGRAM_ERROR.
+#beginfigure(8)
+PROGRAM_ASSERTION	E.ASSERT
+PROGRAM_CASE		E.CASE
+PROGRAM_COMPATIBILITY	E.COMPAT
+PROGRAM_FILE		E.FILE
+PROGRAM_POINTER		E.PTR
+PROGRAM_SUBSTRING	E.SUBSTR
+PROGRAM_SUBSCRIPT	E.INDEX
+PROGRAM_VALUE		E.VALUE
+#endfigure
+#endlevel
+#endlevel
+  
+#sect(Program Initialization)
+This section describes the initial format of certain runtime data
+structures, e.g., the initial stack, and also describes
+the functions performed by the runtime initialization routine.
+#beginlevel
+#sect(The Initial Stack)
+The format of the stack frame for the main routine,
+as it appears immediately after the execution of the 
+runtime initialization routine, is shown below.
+#beginfigure(16)
+	|			|
+	+-----------------------+
+	|			|
+	|       main's static	|
+	|	  temps		|  3(FP)
+	+-----------------------+
+  SP -->|	    0		|  2(FP)
+	+-----------------------+
+	|	    0		|  1(FP)
+	+-----------------------+
+	|	    0		|<-- FP
+	+-----------------------+
+	|	    0		| -1(FP)
+	+-----------------------+
+	|	    0		| -2(FP)
+	+-----------------------+
+#endfigure
+The static link, old frame pointer, return address and old stack
+pointer fields are zero and should remain zero at all times.
+The handler branch table address is initially zero but
+may be set to an HBT address if the main
+routine contains a handler clause.
+#par
+Note that the stack pointer points at location 2(FP) upon
+completion of the initialization routine.
+Thus the static temporaries required by the main routine have
+not yet been allocated.
+The main routine must begin with instructions to allocate
+space for its static temps.
+For example,
+#beginfigure(2)
+LEF\\\\\AC0,k
+MSP\\\\\AC0
+#endfigure
+#sect(The Initialization Routine)
+The program initialization runtime routine must perform the
+following actions:
+#beginitem(4,0)
+#item()Issue the OZMOS ?IFPU system call to initialize the
+hardware floating point unit.
+#item()Create an OZMOS segment for the overlaid runtime.
+#item()Create an OZMOS segment for the virtual heap.
+#item()Create an OZMOS segment for the virtual static area and
+initialize it from the image file.
+#item()Create an OZMOS segment for each user overlay area.
+#item()Initialize the direct static from the image file.
+#item()Initialize the direct and virtual heaps.
+#item()Initiate interception of the standard conditions.
+#item()Load and map the overlay containing the main routine.
+#item()Initialize the stack frame for the main routine.
+#item()Begin execution of the user program.
+#enditem
+#endlevel
+#sect(Instrumentation)
+The runtime system will maintain counts of several activities.
+These counts will be printed out at the end of program execution
+if the "/S" option was given following the image file name.
+The counts which will be maintained are:
+#beginitem(4,0)
+#item()the number of times each disk record is read from disk,
+#item()the number of times each user overlay is mapped,
+#item()the number of times the virtual static area is mapped,
+#item()the number of times the virtual heap is mapped,
+#item()the number of times each runtime overlay module is
+mapped.
+#enditem
+#sect(Overlaying Of User Code)
+The basic concepts of the overlay system will be very briefly reviewed
+here.
+However, the user should review the discussion of the
+overlay system in the ^UANC MicroEclipse Vehicle Design Notes|U.
+Familiarity with the ^UAEV Linker Design Notes|U and the
+^UAEV Image File Specification|U will be helpful.
+#par
+The AEV overlay system permits two levels of overlaying.
+The user program is subdivided into units known as ^Udisk records|U.
+User code is read in from disk in units of disk records.
+Physical memory is divided into ^Uareas|U.
+Each area is created as an OZMOS segment.
+Each area has one or more disk records associated with it;
+the size of each area is determined by the size of the
+largest disk record associated with it.
+Disk records are subdivided into ^Uoverlays|U.
+Overlays are the units of code which are directly addressable at a
+given time.
+When an inter-overlay call occurs, the disk record containing
+the overlay is read into the corresponding area if it is not
+currently in the area.
+The overlay is then mapped to with the mapping registers dedicated
+to user code.
+A specific area, disk record or overlay may be referred to by
+an identifying integer known as an area number, disk record
+number or overlay number.
+Each of these numbers is one based.
+#beginlevel
+#sect(Inter-Overlay Calls)
+The following code appears in the image file for an inter-overlay
+call.
+#beginfigure(2)
+JSR\\\\\@O.CALL
+<control block address>
+#endfigure
+The JSR instruction transfers control (indirectly through page
+zero) to the overlay manager in the runtime.
+Calls to the overlay manager are unique in that they do not
+go through the common runtime call entry point (labelled
+by "M.RTCALL").
+The control block address is the address of a two word
+block.
+The first word of the block is the overlay number of the
+overlay containing the called routine.
+The second word contains the entry point address for the
+called routine.
+#par
+The call instruction, the control block address and the
+control block itself are all generated by the linker.
+This is necessary since the code generator cannot
+distinguish between inter-overlay and intra-overlay calls
+when generating a call to an external procedure.
+Use of the control block address at the point of the call
+permits both inter-overlay and intra-overlay calls to be
+resolved with two words of code at the point of the call.
+#sect(Data Structures)
+This section describes the data structures used by the overlay
+system runtime routines.
+These data structures are created at program initialization time
+from information contained in the image file.
+The read only tables are allocated in the direct runtime;
+read write tables are allocated on (low or high) page zero.
+#beginlevel
+#sect(Area Table)
+The area table is indexed by area number.
+The first word of the table gives the number of entries in the
+table, i.e., the number of areas in the program.
+Each of the following entries are one word in length and contain the number
+of the disk record currently resident in the area.
+An additional table may be necessary to translate from
+area numbers to OZMOS segment numbers.
+The area table format is pictured below.
+#beginfigure(9)
+	+---------------+
+	| num of entries|
+	+---------------+
+	| cur disk recd	|
+	+---------------+
+	|	.	|
+	|	.	|
+	|	.	|
+	+---------------+
+#endfigure
+#sect(Disk Record Table)
+The disk record table is indexed by disk record number.
+The first word of the table gives the number of entries
+in the table, i.e., the number of disk records in the entire
+program.
+The following table entries each consist of three words.
+The first word contains the area number of the area corresponding
+to the disk record.
+The second word contains the zero-based disk block number
+of the start of the disk record within the image file.
+The third word contains the length of the disk record in disk blocks.
+#beginfigure(13)
+	+-----------------------+
+	|   number of entries   |
+	+-----------------------+
+	|     area number 	|
+	+-----------------------+
+	|  starting disk block  |
+	+-----------------------+
+	|   length in blocks	|
+	+-----------------------+
+	|	    .		|
+	|	    .		|
+	|	    .		|
+	+-----------------------+
+#endfigure
+#sect(Overlay Table)
+The overlay table is indexed by overlay number.
+The first word of the table gives the number of entries
+in the table, i.e., the number of overlays in the
+entire program.
+The following entries are each two words long.
+The first word contains the number of the disk record
+containing the overlay.
+The high order byte of the second word contains the zero-based
+2Kb page offset of the start of the overlay within its area.
+The low order byte of the second word contains the length
+in pages of the overlay.
+The overlay table is pictured below.
+#beginfigure(11)
+	+-----------------------+
+	|   number of entries   |
+	+-----------------------+
+	|   disk record number	|
+	+-----------+-----------+
+	|page offset|page length|
+	+-----------------------+
+	|	    .		|
+	|	    .		|
+	|	    .		|
+	+-----------------------+
+#endfigure
+#sect(Current Overlay Number)
+The number of the currently mapped overlay will be maintained
+in a static cell.
+#sect(Instrumentation Tables)
+Two instrumentation tables will be maintained.
+One table will be indexed by disk record number;
+each entry will contain a count of the number of times
+the corresponding disk record has been read in from disk.
+The second table will be indexed by overlay module number;
+each entry will contain a count of the number of times the
+corresponding overlay has been mapped to.
+#endlevel
+#sect(Overlay Manager Algorithms)
+The overlay manager is composed of three major routines:
+a routine to handle inter-overlay calls, a routine to
+handle a return from one routine to another routine in
+a different overlay and a helper routine which will
+load and map a given overlay.
+Some number of minor routines are also required,
+for instance, a routine to return the overlay number of
+the currently mapped routine.
+The three major routines are described below.
+#par
+The routine to load and map an overlay has one parameter,
+the overlay number of the relevant overlay.
+The overlay number is used to index into the overlay table
+to find the number of the containing disk record.
+The disk record number is used to index into the disk
+record table to find the number of the relevant area.
+The area table is used to determine if the containing disk record
+is currently in main memory.
+If not then the disk record is read into memory.
+The disk record table gives the location of the disk record
+within the image file;
+the area number determines the OZMOS segment which the disk record
+should be read into.
+The overlay is then mapped.
+The overlay table gives the starting page and length of the overlay
+within the disk record.
+The image file indicates at which process page the mapping
+should begin.
+This routine also updates the area table contents,
+updates the instrumentation tables and sets the static cell 
+containing the number of the currently mapped overlay.
+#par
+The inter-overlay call routine fetches the overlay number
+of the callee from the overlay control block whose address follows
+the JSR to this routine.
+The load routine is called to load, if necessary, and map the
+overlay.
+The caller's overlay number and the user return address is
+placed on the stack below the pushed arguments.
+This may require shifting the argument block two
+words up the stack.
+The callee's stack frame is then constructed just as for a 
+normal intra-overlay call.
+However the return address stored in the frame is the address
+of an overlay manager entry point for restoring the  caller's
+overlay.
+Control is then transferred to the callee.
+#par
+Control is passed to the inter-overlay return routine after
+the callee's stack frame has been unwound.
+The user return address and the caller's overlay module
+number are the top two words on the stack.
+These are popped from the stack and the overlay number is
+passed to the routine to load and map an overlay.
+Control is then transferred to the user return address.
+#endlevel
+#sect(Use of Page Zero)
+#sect_default(4)
+#sect(Virtual Addressing Routines)
+#sect(Mathematics Routines)
+#sect(Memory Allocation Routines)
+#sect(Environmental Routines)
+#sect(Miscellaneous Routines)
+#sect(String Routines)
+#sect(Set Routines)
+$ver
+$ski 3
+(pasdev14)aevrun.pmf
+#toc
+  .)
