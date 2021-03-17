@@ -1,0 +1,569 @@
+Module Justify = begin
+!Copyright 1979 by Michael L. Kazar and David S. Touretzky
+!Left margin,,right margin added by Carl Baltrunas.
+
+!----------------------------------------------------------------
+!
+! This module contains code to fill and justify a paragraph.
+! It also contains the move screen a notch commands, the case
+! inversion commands, and other random things loosely associated
+! with Dave Touretzky.  The name is just to deceive people.
+!
+! Routines of interest:
+!
+!	pbreak(i)	returns 1 if the ith character is the start 
+!			of a legal paragraph break
+!
+!	apbreak(i)	returns 1 if the ith character appears
+!			immediately after a legal paragraph break
+!
+!	findbreak(i)	finds nearest paragraph break at or before i
+!
+!	chopline(lb,cp,lm)
+!			chops a line by inserting a carriage return.
+!			lb is a pointer to the last break seen so far;
+!			cp is the current position on the line.
+!			lm is the left-justification margin
+!
+!	just(lft,rgt)	justifies text starting at the current cursor
+!			position between columns lft and rgt.
+!
+!	metaj		the justify command
+!
+!	metalb		up paragraph:  meta-[
+!
+!	metarb		down paragrpah:  meta-]
+!
+!	ctrlz		down line
+!
+!	metaz		up line
+!
+!	ctrlar		shift case of character
+!
+!	metaar		shift case of word
+!
+!	metcar		shift case from point to mark
+!
+!	metak		kill whitespace
+
+macro iudent=(owns)$;
+
+external hbot,hend,lowend,curline,ctrln2,ctrlp2,ctrla,ctrle,scrsze;
+external ctrlf,ctrlg,whitespace,wbreak,zapmac,allmod,curbuf;
+external moveforward,moveback,getchxr,setchar,insertchar,delforward;
+external delbackward,updatecursor;
+external scrmod,muline,physpos,physline,repcount,ttywid;
+external mark,metacn,metacp,ctrlxx;
+external toprompt,getIndent,setIndent,owns,bsback,indent;
+
+forward metarb;
+
+! ----------------------------------------------------------------------
+! A paragraph break occurs at:
+!	the beginning of the buffer
+!	the end of the buffer
+!	a formfeed
+!	two successive carriage returns
+!	a carriage return followed by @ or .  (SCRIBE or PUB command)
+! ----------------------------------------------------------------------
+
+global routine pbreak (i) = begin
+	register char;
+	if (.i leq 1) or (.i geq .hend-1+.lowend-.hbot)	! b-o-b / e-o-b
+	 then return 1;
+	char _ getchxr(.i);
+	if .char eql "?L" then return 1;		! ff
+	if .char eql "?M"
+	 then if .i eql .hend-.hbot+.lowend-1
+		then return 1
+		else begin 
+		   if blankline(.i+1) then return 1;	! cr [wh] cr/e-o-b
+		   char _ getchxr(.i+1);
+		   if .char eql "@"  or			! cr @
+		      .char eql "."			! cr .
+		    then return 1
+		    else return 0;
+		end
+	 else return 0
+    end;
+
+
+! aebreak returns 1 if the given character is an "@" or "."
+
+routine aebreak (i) = begin
+	register char;
+	char _ getchxr(.i);
+	if .char eql "@" or .char eql "."
+	 then return 1
+	 else return 0
+	end;
+
+! ----------------------------------------------------------------------
+! apbreak returns 1 if the given character position is the end of
+! a legal paragraph break
+! ----------------------------------------------------------------------
+
+global routine apbreak (i) = begin
+	register char;
+	if (.i leq 1) or (.1 geq .hend-1+.lowend-.hbot)	! beg-end of buffer
+	 then return 1;
+	char _ getchxr(.i);
+	if .char eql "?L" then return 1;		! at ff
+	if getchxr(.i-1) neq "?M" and			! prev not cr
+           getchxr(.i-1) neq "?L"			! prev not ff
+	 then return 0;
+	if .char eql "@" or .char eql "."		! cr/ff  @/.
+         then return 1
+	 else if .i gtr 2
+		then if getchxr(.i-2) eql "?M" or	! cr cr/ff
+			getchxr(.i-2) eql "?L"		! ff cr/ff
+                      then return 1
+                      else return 0
+		else if getchxr(1) eql "?M"		! cr cr/ff
+                      then return 1;
+	return 0
+    end;
+
+
+! findbreak is called with a character position.  it returns the position
+! of the first character following the paragraph break at or before the
+! given argument.
+
+routine findbreak (i) = 
+	decr j from .i to 1 do
+		if apbreak(.j) then return .j;
+
+! ----------------------------------------------------------------------
+! chopline is called when JUST notices that the word it is currently
+! building exceeds the right margin.  the first arg to chopline
+! is the location of the last word break seen.  chopline will insert a
+! carriage return at the appropriate place, and trim trailing blanks
+! from the preceding line.  the left-margin is preserved assuming the
+! value of ldent.  it returns the new value of linpos.
+! ----------------------------------------------------------------------
+
+routine chopline (lastbreak, linpos, ldent) = begin
+    if .lastbreak eql -1 then return .linpos;		! cant't break yet
+    moveback(.lowend - .lastbreak);			! move after break
+    while getchxr(.lowend - 1) eql " " or		! delete spaces
+	  getchxr(.lowend - 1) eql "?I"			!  or tabs
+     do delbackward();					!  preceeding break
+    insertchar("?M");					! insert <cr>
+    setIndent(.ldent);					! insert any margin
+    return if .ldent geq 0 then .ldent+1 else 1		! return margin+1
+end;
+
+
+routine emptyline (i) = begin
+	local temp;
+	temp _ getchxr(.i);
+	if .temp eql "?M" or .temp eql "?L" then return 1
+	else return 0
+	end;
+
+
+routine blankline (i) = begin
+    local temp, flag;
+    if .i lss 1 or .i geq .hend-.hbot+.lowend-1
+     then return 0;
+    flag _ 1;
+    temp _ getchxr(.i);
+    while .temp neq "?M" and .temp neq "?L"
+     do begin
+        if .i lss 1 or .i geq .hend-.hbot+.lowend-1
+         then exitloop;
+        if .temp neq " " and .temp neq "?I"
+         then begin flag _ 0; exitloop end;
+        i _ .i + 1;
+        temp _ getchxr(.i)
+     end;
+    return .flag
+end;
+
+! ----------------------------------------------------------------------
+! Return the type of the character.
+! Types are:
+!	0 - break chars (other)
+!	1 - alphabetic-numeric
+!	2 - sentence breaks
+!	3 - close-parens breaks
+!	4 - a "real" space
+!	5 - convert to space
+!	6 - special backspace
+!	7 - not possible - unused
+
+routine Justtype( ch ) = begin
+    Bind typetab = plit(		! (table is reversed 35-0 order)
+	#005600000000,	#000000000050,	! ^K.......nul	 ^W........^L
+	#032400000000,	#020000303000,	! #"! ......^X	 /.-,+*)('&%$
+	#221111111111,	#111111102300,	! ;:9876543210	 GFEDCBA@?>=<
+	#111111111111,	#003001111111,	! SRQPONMLKJIH	 _^]\[ZYXWVUT
+	#111111111113,	#111111111111,	! kjihgfedcba`	 wvutsrqponml
+	#777700300111  );		! ..del~}|{zyx
+    .Typetab[.Ch/12]<(.Ch mod 12)*3, 3>
+end;
+
+
+! ----------------------------------------------------------------------
+! JUST is called with the cursor pointing to the start
+! of a paragraph.  JUST will fill and justify text from
+! that point up to the next paragraph break.  the justification
+! width is passed as an argument.
+!
+! method of justification:
+!	tabs and carriage-returns are converted to single spaces
+!	multiple blanks are compressed to one
+!	sentence breaks followed by zero or more )>]'"}
+!		will be followed by exactly two blanks
+!	blank is the only word separator
+!	final trailing whitespace will be deleted
+
+global routine just (linlft,linrgt) = begin
+    register char;		! a temp to save getchxr calls.
+    own blankctr;		! how many blanks can slip by
+    own linpos;			! where we are on the line
+    own lastbreak;		! where to break on overflow
+    own lft,rgt;		! hack since can't access in gathertoken
+
+    routine gathertoken( arg ) = begin			! common split code
+	moveforward(1);					! pass the character
+	linpos _ updatecursor(.char,.linpos);		! update position
+	if .linpos gtr .rgt				! if too large
+	 then begin					!  then break it
+	    linpos_chopline(.lastbreak,.linpos,.lft);	!  returning position
+	    lastbreak _ -1				!  set break flag
+	 end;
+	 if .arg gtr 0					! if nonzero, then
+	  then blankctr _ .arg;				! set blank count.
+    end;
+
+
+    blankctr _ 0;			! initially zap spaces.
+    lastbreak _ -1;			! can't break until after first item
+    lft _ .linlft;			! hack for gathertoken
+    rgt _ .linrgt;			! hack for gathertoken
+
+    while blankline(.lowend)		! skip over any initial blank lines
+     do ctrln2();
+    linpos _ GetIndent( 1 );		! get current indenture
+    if .linpos lss .linlft		! if smaller, then add
+     then linpos_ .linpos+.linlft;	!   otherwise use current
+    SetIndent( .linpos );		! set crown of paragraph
+
+    until pbreak(.lowend) and		! justify through next par-break
+	not (.lowend eql 1 and		!   but ignore the beginning of
+	     .hend-.hbot neq 0)		!   the buffer if it's not empty.
+     do begin				! main justify loop
+	char _ getchxr(.lowend);	! look at a buffer character
+	case justtype( .char ) of set	! perform necessary operations
+
+	    gathertoken( 1 );		! [0] control - punctuation
+	    gathertoken( 1 );		! [1] alpha numerics
+	    gathertoken( 2 );		! [2] terminal punctuation
+	    gathertoken( 0 );		! [3] enclosing punctuation
+
+	    begin			! [4] space logic
+		if .blankctr eql 0
+		 then delforward()		! delete multiple spaces
+		 else while .blankctr gtr 0	!   or allow as many
+		  do begin			!   as necessary
+		    blankctr _ .blankctr - 1;
+		    if getchxr( .lowend ) = " "
+		     then moveforward(1)	! skipping existing ones
+		     else insertchar(" ");	! or creating needed ones.
+		    linpos _ .linpos + 1;	! count characters on line
+		    lastbreak _ .lowend		! remember as last break
+		 end
+	    end;
+
+	    setchar(.lowend," ");	! [5] convert character to space
+	    
+	    if .bsback			! [6] special backspace logic
+	     then begin			!     for when ^H doesn't count
+		moveforward(1);			! pass the position
+		if .linpos gtr 1		! and decrement
+		 then linpos _ .linpos - 1;	! if anything there
+		blankctr _ 1			! set spacing flag
+	     end
+	     else gathertoken( 1 );	!     else treat as normal break
+
+	tes
+     end;
+    if getchxr(.lowend) eql " "		! remove extra spaces
+     then delforward();			!  at the end
+    while getchxr(.lowend-1) eql " "	! in both directions.
+     do delbackward();
+ end;
+
+! metaj is the code for the META-X JUSTIFY TEXT command.  this routine
+! positions the cursor to the start of the paragraph, and calls JUST to
+! justify it.
+
+global routine metaj = begin
+	local leftmar,rightmar,topara,fbr;
+	rightmar _ (if .repcount gtr 1 then .repcount else .iudent);
+	leftmar  _ (if .indent geq 0 then .indent else 0);
+	repcount _ 1;
+	if .lowend eql 1 and (.hend-.hbot eql 0) then
+		return ToPrompt(plit asciz 'Empty File');
+	topara _ .lowend;
+	ctrla();
+
+	while 1 do begin			! so we can exitloop
+	 if emptyline(.lowend) then begin
+	    do ctrln2() while emptyline(.lowend) and .hbot lss .hend;
+	    while aebreak(.lowend) do ctrln2();
+	    if emptyline(.lowend) or aebreak(.lowend) then begin
+		 moveback(.lowend-.topara);
+		 return ToPrompt(plit asciz 'Nothing to Justify')
+		 end
+	    else exitloop
+	    end;
+	 if aebreak(.lowend) then begin
+		do ctrln2() while aebreak(.lowend) and .hbot lss .hend;
+		if apbreak(.lowend) or emptyline(.lowend) then begin
+		     moveback(.lowend-.topara);
+		     do ctrlp2() while aebreak(.lowend) and .lowend gtr 1;
+		     if emptyline(.lowend) or aebreak(.lowend) then begin
+			   moveforward(.topara-.lowend);
+		  	   return ToPrompt(plit asciz 'Nothing to Justify')
+			   end
+		     end
+		end;
+	 fbr _ findbreak(.lowend);
+	 if .fbr lss .lowend then moveback(.lowend - .fbr);
+	 while aebreak(.lowend) and .hbot lss .hend do ctrln2();
+	 if emptyline(.lowend) then begin
+		moveforward(.topara-.lowend);
+		return ToPrompt(plit asciz 'Nothing to Justify')
+		end
+	 else exitloop
+	end;
+
+	just(.leftmar,.rightmar);
+
+	if .hend - .hbot eql 1 then
+	    if getchxr(.lowend) neq "?M" then ctrlf();
+	muline _ 1;
+	scrmod _ 1
+	end;
+
+! fwdtovis moves forward until it hits a visible character
+
+routine fwdtovis =
+	until .hend eql .hbot or not
+		(getchxr(.lowend) eql "?M" or getchxr(.lowend) eql " " or
+		 getchxr(.lowend) eql "?I" or getchxr(.lowend) eql "?L") do
+	   moveforward(1);
+
+routine tostartpar = begin
+	until apbreak(.lowend) do ctrlp2();
+	if aebreak(.lowend) then ctrln2();
+	fwdtovis()
+	end;
+
+routine uponepar = begin
+	local blanksw,omark;
+	blanksw _ 0;
+	while 1 do begin
+	  if .lowend eql 1 then return
+	  else if aebreak(.lowend) then ctrlp2()
+	  else if emptyline(.lowend) eql 0 then return (ctrle())
+	  else if .blanksw eql 1 then return(moveforward(.omark-.lowend))
+	  else begin
+	  	blanksw _ 1;
+	  	do ctrlp2() while emptyline(.lowend) and .lowend gtr 1;
+	  	if aebreak(.lowend) eql 0 then return(ctrle());
+	  	ctrle();
+	  	omark _ .lowend;
+		ctrlp2()
+	       end
+	  end
+	end;
+
+! meta left bracket moves back to a paragraph break if within a paragraph,
+! or up to the end of the preceding paragraph if at a break.
+
+global routine metalb = begin
+	local temp,atleft,breakleft,comleft;
+	if .lowend eql 1 then return
+	   else if .lowend eql 2 then return(moveback(1));
+
+	atleft _ 0;		!cursor at first printing char of line ?
+	while 1 do begin
+	     moveback(1);
+	     temp _ getchxr(.lowend);
+	     if .temp eql "?M" or temp eql "?L" then begin
+		  atleft _ 1;
+		  moveforward(1);
+		  exitloop
+		  end
+	     else if .lowend eql 1 or (.temp neq "?I" and .temp neq " ")
+	     	     then exitloop
+	     end;
+
+	ctrla();			!start on a paragraph break?
+	breakleft _ apbreak(.lowend);
+
+	comleft _ aebreak(.lowend);	!start on a Scribe command ?
+
+	if .atleft eql 0 then	!inside a line?
+	   if .comleft eql 0 then return(tostartpar())
+	   else begin
+	   	 do ctrlp2() while aebreak(.lowend) and .lowend gtr 1;
+		 if emptyline(.lowend) then begin
+		 	ctrln2();
+		 	return(fwdtovis())
+		 	end
+		 else return(ctrle())
+		end;
+	if .breakleft eql 0 then begin		!inside a paragraph?
+	   ctrlp2();
+	   if aebreak(.lowend) eql 0 then return(tostartpar())
+	   else return(uponepar());
+	   end;
+	if .comleft eql 0 then begin ctrlp2(); return(uponepar()) end;
+	ctrlp2();
+	if aebreak(.lowend) or emptyline(.lowend) then return(uponepar())
+	else return(ctrle())
+	end;	!the routine
+
+
+routine toendpar = begin
+	do ctrln2() until apbreak(.lowend) or emptyline(.lowend) or
+				 .hend eql .hbot;
+	if .hbot lss .hend then ctrlp2();
+	ctrle()
+	end;
+
+routine downonepar = begin
+	local blanksw,omark;
+	blanksw _ emptyline(.lowend);
+	while 1 do begin
+	    ctrln2();
+	    if .hend eql .hbot then return
+	    else if emptyline(.lowend) then
+		    if .blanksw eql 2 then return(moveback(.lowend-.omark))
+		    else if .blanksw eql 0 then blanksw _ 1
+		    else 0
+	    else if aebreak(.lowend) eql 0 then return(fwdtovis())
+	    else if .blanksw eql 1 then begin
+		omark _ .lowend;
+		blanksw _ 2
+	    	end
+	    end
+	end;
+
+
+! meta right bracket moves down to the end of a paragraph, if within a
+! paragraph, or to the beginning of the next one if already at the end
+
+global routine metarb = begin
+	local opos,editp;
+	opos _ .lowend;
+	ctrla();
+	while emptyline(.lowend) and .hbot lss .hend do ctrln2();
+	editp _ aebreak(.lowend);
+	ctrle();
+
+	if .lowend gtr .opos then	!not at line end ?
+	    if .editp eql 0 then return(toendpar())
+	    else begin
+		ctrla();
+		while aebreak(.lowend) and .hend neq .hbot do
+		    ctrln2();
+		if .hend eql .hbot then return (ctrle())
+		else if emptyline(.lowend) then begin
+		    ctrlp2();
+		    return(ctrle())
+		    end
+		else return (fwdtovis());
+		end;
+	ctrln2();
+	if apbreak(.lowend) or emptyline(.lowend) then downonepar()
+	    else toendpar()
+	end;
+
+global routine ctrlz = begin
+	local orepcount,omark,ocurline;
+	orepcount_.repcount;
+	omark_.mark;
+	ocurline_.curline;
+	repcount_1;
+	mark_.lowend;
+	metacp();		!go down to the end of the screen.
+	incr i from 1 to .orepcount do ctrln2();
+	curline_1;
+	scrmod_1;
+	muline_1;
+	if .ocurline-.orepcount gtr 0 then ctrlxx();
+	mark_.omark;
+end;			!for the global routine
+
+global routine metaz = begin
+        local orepcount,omark,ocurline;
+        orepcount_.repcount;
+        omark_.mark;
+        ocurline_.curline;
+        repcount_1;
+        mark_.lowend;
+        metacp();		!go down to the end of the screen.
+        incr i from 1 to .orepcount do ctrlp2();
+        curline_1;
+        scrmod_1;
+        muline_1;
+        if .ocurline+.orepcount leq .scrsze then ctrlxx();
+        mark_.omark;
+end;			!for the gloroutine.
+
+! ctrlar is the control-uparrow command, for inverting the case
+! of alphabetic characters
+
+global routine ctrlar = begin
+    local char;
+    if .hend eql .hbot then return ctrlg();
+    char _ getchxr(.lowend);
+    if .char geq "a" and .char leq "z"
+	then setchar(.lowend,.char-32)
+    else if .char geq "A" and .char leq "Z"
+	then setchar(.lowend,.char+32);
+    ctrlf();
+    allmod[.curbuf]_1;		       !mark buffer as changed.
+    scrmod _ 1
+end;
+
+! metaar is the meta-uparrow command, for case inversion of words
+!
+
+global routine metaar = begin
+	while .hend neq .hbot and whitespace(getchxr(.lowend)) do ctrlf();
+	while 1 do begin
+		ctrlar();
+		if .hbot eql .hend then return zapmac();
+		if wbreak(getchxr(.lowend)) then exitloop;
+		end;
+	end;
+
+! metcar inverts case between the point and the mark
+!
+
+global routine metcar = begin
+    if .mark eql 0 then return ctrlg();
+    if .mark leq .lowend then ctrlxx();
+    incr i from .lowend to .mark-1 do ctrlar();
+    mark_0
+end;
+
+! metak kills blankspace (blanks and tabs) up to a cr or a printing character
+!
+
+global routine metak = begin
+	if .hend eql .hbot then return ctrlg();
+	while .hend neq .hbot and
+		(getchxr(.lowend) eql " " or getchxr(.lowend) eql "?I")
+	    do delforward();
+	scrmod _ 1
+end;
+
+end eludom
+   
