@@ -1,0 +1,258 @@
+(***************************************
+
+
+TYPE ALLOCATION.
+    Type allocation is the making of decisions about how values of various
+    types are to be represented in memory.  Allocation decisions are concerned
+    with the size and the alignment of the allocated types.
+
+
+ALIGNMENTS.
+    If the alignment for a data item is X, then the data item must begin
+    at a bit whose address is a multiple of X, counting from the first
+    bit in memory, which is bit 0.  For example, on an IBM 370, the
+    alignment for a character in a packed record might be 1 (allowing
+    it to begin at any bit), while the alignment for an integer variable
+    might be 32 (requiring it to begin on a fullword boundary).
+
+    All of the algorithms in this allocator assume that whenever they have
+    to deal with two alignment values, one of them will be a multiple of
+    the other.  For example, {1, 6, 18, 36} would be a legal collection of
+    possible alignment values, as would {1, 4, 8, 32, 64}.  However, it
+    would not be legal to work with alignments {1, 6, 12, 16, 24, 32},
+    since the allocation algorithms would not function correctly when
+    confronted with a pair of alignments such as 12 and 16.
+
+
+PACKING CONTEXTS.
+    Data may be allocated in one of five contexts.  Variables are allocated
+    with the NoPacking context.  Parameters are allocated with the ParmPacking
+    context.  Components of unpacked arrays, records, and files are allocated
+    with the FieldPacking context.  Components of packed aggregates are initially
+    allocated with the MinimalPacking context.  However, if it doesn't increase
+    the total size of the aggregate, such components may be allocated with the
+    SlackPacking or FieldPacking context.  It is assumed that allocation with
+    these contexts causes greater space requirements or stricter alignment
+    restrictions, but results in more efficient access to the data.  For example,
+    on the PDP-10, a simple three-bit scalar may be allocated in three bits in
+    MinimalPacking contexts (requiring byte instructions to access it), in a
+    halfword in SlackPacking contexts (allowing it to be accessed with halfword
+    instructions), and in a full word in FieldPacking contexts (allowing it to
+    be accessed by any instruction, and also letting it be indexed).
+$PAGE
+ALLOC_TYPE.
+    Every type node created by the type semantics routines must be submitted
+    to AllocType, which performs the preliminary allocation analysis for it.
+    This analysis has several aspects:
+
+    AllocType always sets the BaseSize field of the allocated type node.  The
+    value stored in this field is the minimum number of bits in which a value
+    of the type may be represented in memory.  The BaseSize field of a record
+    type is the size of the largest variant of the record.  The size of a
+    particular variant may be found in the BaseSize field of the variant type
+    node.  The BaseSize field of a tag type node contains the size for any
+    variants under that tag which do not have any field list.  The BaseSize
+    field of a flexible or generic array or string is zero.  For a record or
+    variant which ends with a flexible array or string, it is the size of the
+    record or variant, including the hidden length word, but not including any
+    of the array or string itself.
+
+    In general, routines in the first pass use AlcData to find out about
+    type allocation, and therefore have no need to access the BaseSize field
+    directly.  An exception occurs when the type semantics routines process
+    a packed scalar type.  They must then check to make sure that the user-
+    specified size is at least as great as the allocated size in the BaseSize
+    field, and replace the allocated BaseSize field value with the user-
+    specified value.
+
+	When it allocates an array type, AllocType will also set the Element-
+    Size and ElementAlignment fields.  ElementSize is the number of bits to
+    be occupied by each element of the array.  This is used in computing the
+    size of a flexible array, and also in determining the location of a given
+    element within an array.  ElementAlignment is the required alignment for
+    the array's element type, within the context of the array.  It is used
+    only within PackInContext, for determining the alignment of the array
+    itself.
+
+	When it allocates a file type, AllocType will also set the CompSize
+    field.  For a text or binary file, this will be zero; for all other files,
+    it will be the size in bits of each component in the file.
+$PAGE
+ALLOC_TYPE (cont.)
+	When AllocType processes a record type node, it sets the FldOffset
+    and FldWidth fields for each field symbol node in the record's field
+    list.  FldOffset is the location, in bits, of the start of the field,
+    relative to the start of the record.  FldWidth is the number of bits
+    occupied by the field.  AllocType also sets the RecordAlignment field in
+    the record type node.  This is the maximum alignment requirement of any
+    field within the record, and is used only within PackInContext, for
+    determining the alignment of the record itself.
+
+
+PACK_IN_CONTEXT.
+    This is one of the central routines of the entire type allocation process.
+    Where AllocType is concerned with determining context-independent informa-
+    tion about the size and alignment of a type, PackInContext determines the
+    specific requirements of the type in a particular context.  PackInContext
+    is an internal routine of the type allocation module.  This is because it
+    is called with contexts other than NoPacking only when determining the
+    allocation of components of other types, during their type allocation.
+    When used externally, it is always for the allocation of variables, which
+    always occur in an unpacked context; therefore, it may be called via the
+    wrapper routine AlcData.
+
+
+ALC_DATA.
+    This wrapper routine for PackInContext is called with a type node, and
+    returns the size and alignment that will be required for a variable of
+    that type.  Thus, the caller of AlcData need have no awareness of the
+    multiplicity of packing contexts which can be accepted by PackInContext.
+$PAGE
+SIZE_OF.
+    SizeOf is a public routine which may be used in computing the size of a
+    variable (particularly for calls to the standard function Size, and for
+    allocating variables on the heap with New).  It is called with a type;
+    the type may be a variant or tag type, to indicate a particular variant
+    of a record type.  It returns integer values A, B, C, and D, and a boolean
+    flag GRUESOME.  Let X be the number of elements in the flexible array or
+    string component of the type, if there is a flexible component, or 0
+    otherwise.  In the normal case, when Gruesome is false, the runtime
+    size may be computed as
+
+	( (X * A) + B ) DIV C .
+
+    Gruesome will be true only for the very special case in which EFA = EFW,
+    EFW > ByteSize, ElemSize < EFW, and EFW is not a multiple of ElemSize.
+    (This is a good reason to avoid specifying allocation tables which can
+    lead to such a result.)  The runtime size can then be computed as
+
+	( ((X - D) DIV (A DIV B)) * A +
+	  ((X - D) MOD (A DIV B)) * B + C ) DIV ByteSize .
+
+    There is also a boolean parameter AllocSize.  Normally, this is false,
+    and the size of the pure type is computed.  When AllocSize is true, and
+    the type is a flexible array or string, then the parameters returned will
+    compute the size of the type, along with its descriptor (hidden length
+    word).  This option is used for computing the amount of space on the heap
+    that must be allocated by a NEW call.
+$PAGE
+EXTRACTION FIELDS.
+    The allocation of components in packed aggregate types is constrained
+    by the extraction field characteristics of the target implementation.
+    These characteristics are specified by two constants:  the extraction
+    field width EFW, and the extraction field alignment EFA.
+
+    EFW is the largest value such that, for 1 <= N <= EFW, the operations
+    of loading a contiguous N-bit field from memory into a register and
+    storing an N-bit field into memory from a register are (efficiently)
+    supported by the implementation.  (The support may be at the hardware
+    level, as with the byte instructions of the PDP-10, or at the software
+    level, with shifting and masking.)  Furthermore, EFW-bit "words" may
+    presumably be loaded and stored.
+
+    If bit field access will not be available in a target implementation,
+    then EFW should simply be some reasonable word size, and the Packing-
+    Values in the allocation tables must be specified so that no data will
+    ever be allocated in fewer bits than can be loaded and stored at once.
+    For example, in a PDP-11 implementation that didn't support bit field
+    access, EFW might be 8 or 16, and no PackingAttributes in the allocation
+    tables could have any width other than a multiple of 8, even in Minimal-
+    Packing contexts.
+
+    For word-oriented machines such as the PDP-10, EFA must be equal to EFW.
+    This indicates that the target machine memory is made up of EFW-bit
+    words, and that a bit field may be accessed only if it falls entirely
+    within a single word.  For more accomodating machines such as the VAX-11,
+    EFA may be less than EFW.  This indicates that any field of no more than
+    EFW bits may be accessed, regardless of "word" boundaries.  In any case,
+    when a field more than EFW bits long occurs in a packed aggregate, the
+    allocator will align it so that it starts at a multiple of EFA bits.
+
+    It is absolutely necessary that EFW and EFA be multiples of ByteSize (the
+    number of bits in an addressable unit); they may be equal to ByteSize,
+    of course.
+$PAGE
+STR_LW_WIDTH and STR_CHAR_SIZE.
+    StrLwWidth is the number of bits required for the length word of a varying
+    string.  StrCharSize is the number of bits required for each character in
+    a string.
+
+
+BASE SIZES.
+    The initial base size of a type, as computed by AllocType, may depend both
+    on attributes of the type and on a base size constant which is a character-
+    istic of the target machine.  RealBaseSize is an array which specifies the
+    base size for a real type of each possible real precision.  PointerBaseSize
+    is the base size for all pointer types.  FileBaseSize is the base size for
+    all file types.  SubrBaseSize is the base size for all procedure and function
+    types.  The base size of a boolean, character, scalar, or integer type depends
+    only on the upper and lower bounds of the type; the base size of a set type
+    is computed from the upper and lower bounds of its element type.  Base sizes
+    for aggregate types are computed by MapArray and MapRecord.
+
+
+PACKING TABLES.
+    Target machine dependent packing rules for PackInContext are specified by
+    PackingTables.  A PackingTable is a vector of rule lists, one for each
+    PackingContext.  A rule list is simply a list of entries of the form
+
+	<limit, width factor, alignment>.
+
+    When allocating a type according to a rule list, PackInContext finds the
+    first entry in the list whose "limit" field is at least as large as the
+    base size of the type.  The alignment of the type is then the "alignment"
+    field of the rule list entry (or, for an array or record, the intrinsic
+    alignment of the type, if that is larger).  The size of the type, in that
+    particular context, is the base size of the type, rounded up to a multiple
+    of the "width factor" field from the rule list entry.
+
+    The target machine constant AllocationTables is an array which contains a
+    PackingTable for each type kind.  In most cases, the rules from these tables
+    are sufficient.  However, the AllocationTables entry for integer (Ints)
+    types is only for unsigned integers; the special SignedIntegerRules table
+    must be used for integer types whose Minval is less than zero.  Also, the
+    entry for string types is only for non-varying strings; the special Var-
+    StringRules table must be used for varying string types.
+$PAGE
+PACKING TABLES (cont.)
+    Two special tables are ArrDescRules and StrDescRules.  These tables describe
+    the descriptors ("hidden length words") that must be allocated for flexible
+    arrays and strings.  The MinimalPacking and FieldPacking entries describe
+    the descriptors for flexible arrays and strings in records on the heap; the
+    NoPacking entries describe the descriptors for flexible arrays and strings
+    which are allocated independently on the heap; and the ParmPacking entries
+    describe the separate descriptors which must be allocated in a parameter
+    list for a flexible or generic array or string parameter.
+
+    Due to the language requirement that aggregate components of packed
+    aggregates must be passable as var parameters, all rules in a packing
+    table for an aggregate type (array, record, or string) must have the
+    same width factor.
+
+
+PARAMETER LIST ALLOCATION.
+    In general, the allocation of the parameter list for a subroutine is very
+    much like the allocation of a field list for an record.  The major difference
+    is that the context is ParmPacking rather than FieldPacking.  In addition,
+    the offsets for parameters start with the target machine constant PlBase,
+    rather than with zero.
+
+    Many parameters are passed by address rather than by value.  For such
+    parameters, it is only necessary to allocate space for the address of the
+    parameter, rather than for the parameter itself.  The required size and
+    alignment for parameter address words are given by the target machine
+    constants AdrPrmSize and AdrPrmAlignment.
+
+    Finally, in some implementations, it may be necessary to allocate space in
+    the parameter list for the return value of a function.  This is controlled
+    by the target machine constants RvAddrLoc, for functions which are passed
+    the address of their return value location, and RvValueLoc, for functions
+    which must allocate space for their return value.  These two constants may
+    be RvAtStart, indicating that such return values or addresses must be
+    allocated at the start of the parameter list; RvAtEnd, indicating that
+    they must be allocated at the end of the parameter list; or RvNowhere,
+    indicating that they don't go in the parameter list at all.
+
+
+****************************************)
+  
