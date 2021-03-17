@@ -1,0 +1,126 @@
+ENTRY READBR;
+begin "readbr"
+define !="COMMENT";
+
+simple procedure error( string s );
+start!code define sp='16, p='17;
+push sp,[0]; push sp,[0];	! a second (fake) string arg;
+push p,[1];			! simulate ?,1 call;
+push p,-1(p);			! move return address;
+jrst usererr;			! now go call it.;
+end;
+IFCR declaration(WIDTH)=0 or compiler!version lsh -18 neq '202400
+THENC require "needs sail version A" message; .; ENDC
+
+require "GOGTAB.DEF" source!file;
+external safe integer array gogtab[0:endren];
+! offsets into "user" area: (gogtab entries)
+  bktprv='34: 0 => normal user, else priviledged user (eg BAIL)
+  bktptr='35: (indexed by BGRP) pointer to group table area
+		0 => no tables in this group allocated yet
+;
+
+! offsets into "group table":;
+! copied from HEAD: ;
+define BRKTBL=0		! BREAK CHAR TABLE(entries = is.omit/is.break);
+,	BKOBND=BRKTBL-1 ! Break for chars not in table (=omit/break);
+,	BKDISP=BKOBND-1 ! BREAK CHAR DISPOSITION Word:0/0=S,1/0=A,0/1=R;
+,	BKOMCV=BKDISP-1 ! "must copy" WORD=OMIT speedup/Conversion used;
+,	BKLCZR=BKOMCV-1	! "lowerCase", "Z-mode"(use brktbl+0 on INPUT);
+,	BKTOKN=BKLCZR-1	! for "token" style scanning ;
+,	BKJFFO=BKTOKN-1	! RESERVATION WORD= RESERVED/INITIALIZED;
+,	LNMSTB=BKJFFO-19 ! LINE NUMBER DISPOSITION,,character mask;
+				! disposition: P=0, L=1, I=2, E=3;
+				! note: mask for 0 indicates group size;
+,      BKTOVH=-LNMSTB	! "overhead words" in table (fixed len);
+;
+internal integer procedure readbr( integer table;
+				reference string breaks, omits, modes );
+COMMENT given a valid break table number,
+	this returns a 3-bit flag
+	bit 33 (4) => break table copies string,
+	bit 34 (2) => break table has been reserved
+			(getbreak can't return this table)
+	bit 35 (1) => break table has been initialized
+			(break, omit, and mode are valid)
+			(this should not be on if bit 34 isn't)
+	If the break table has been initialized (bit 35), then the
+	three reference strings are set so that
+		setbreak( table, break, omit, mode )
+	will set table to exactly the same break table as it currently
+	contains.  
+	Default modes are shown explicitly, ("7IPSFB", not "I"), and 
+	the mode letters are always in the same order:
+	{size (1-9)}, {I or X}, {P,N,L, or E}, {S,A, or R}, 
+	{F, C, or K}, {T or B}, {Z (if it applies)}, {U (if it applies)}
+;
+begin "body"
+define	COPIES=4, RESERVED=2, INITIALIZED=1;
+integer group, tableRight, flopMask, cdb, result, LineDispAndCharMask; 
+integer maxByte, Byte, byteSize, subTable, TableBits, tableLeft;
+
+if not (-17 < table < 55)
+ then begin error( "invalid break table" ); return( reserved ); end;
+if table=0
+ then begin	! break table 0 is very special;
+	if gogtab[bktptr]=0 then scan(modes_"I",0,cdb);! force allocate;
+	LineDispAndCharMask := if gogtab[bktptr]=0 then 0
+				else memory[gogtab[bktptr]+LNMSTB];
+	breaks_ null; 
+	omits_ null;
+	modes_ case LineDispAndCharMask lsh -18
+		of ([0]"0IPSFB",[1]"0ILSFB",[2]"0INSFB",[3]"0IESFB",
+			    [ELSE]"0I?SFB");
+	return(reserved+initialized);
+      end;
+group_ (table + 17) div 18;		! calculate the break group;
+if (cdb_ gogtab[bktptr+group]) = 0  then return(0);
+define groupTable(offset)= "MEMORY[offset+cdb]";
+
+subTable := (table + 17) mod 18; 
+LineDispAndCharMask := memory[cdb+LNMSTB+subTable+1];
+tableBits := '400000400000 lsh - subTable;
+tableRight := tableBits land '777777;
+tableLeft := tableRight lsh 18;
+
+for byteSize_ 0 step 1 until 17
+   do if (1 lsh byteSize) land LineDispAndCharMask then done;
+flopMask := groupTable(BKOBND) land tableBits;
+modes := ("0" + byteSize)
+	& (if flopMask land (-1 lsh 18) then "X" else "I")
+	& (case LineDispAndCharMask lsh -18
+	   of ([0]"P", [1]"L", [2]"N", [3]"E"))
+	& (if tableBits land groupTable(BKDISP)
+	    then if tableRight land groupTable(BKDISP) then "R" else "A"
+	    else "S")
+	& (if tableRight land groupTable(BKOMCV)
+	    then if tableLeft land groupTable(BKLCZR)
+		 then "C" else "K"
+	    else "F")
+	& (if tableRight land groupTable(BKTOKN) then "T" else "B");
+if tableRight land groupTable(BKLCZR) then modes := modes & "Z";
+if flopMask land (-1 lsh -18) then modes := modes & "U";
+result := 0;
+if groupTable(BKOMCV) land tableBits then result := copies;
+
+omits := breaks := char!w(-1,byteSize);
+maxByte := breaks;
+for byte := 0 step 1 until maxByte
+   do if (memory[cdb+byte] xor flopMask) land tableRight
+	then omits := omits & byte;
+
+for byte := 0 step 1 until maxByte
+   do if (memory[cdb+byte] xor flopMask) land tableLeft
+	then breaks := breaks & byte;
+lop(breaks); lop(omits);
+
+if groupTable(BKJFFO) land tableRight
+ then result := result lor initialized;
+if groupTable(BKJFFO) land tableLeft
+ then result := result lor reserved;
+
+return( result );
+end "body";
+
+end "readbr"
+
