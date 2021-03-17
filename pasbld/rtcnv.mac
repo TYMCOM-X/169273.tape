@@ -1,0 +1,421 @@
+	search	rtsym
+	$module	dflt
+	entry	d.flt
+
+	$temp	rsave,1
+	$temp	destreg,1
+	$temp	isave,1
+
+d.flt:
+	aos	r1,0(top)
+	ldb	r0,rt.reg##	;get register for result
+	movem	r0,destreg	;and save it
+	move	r0,@-1(r1)	;get integer to float
+	movem	r0,isave	;save the correctly signed value
+	movm	r0,r0		;absolute value
+	tlne	r0,377000	;check for possible overflow
+	jrst	d.flt2
+	fsc	r0,233		;else can float as single precision
+	movei	r1,0		;and extend to double
+d.flt1:
+	skipge	r0,isave	;make correct sign
+	dmovn	r0,r0
+	dmovem	r0,@destreg	;store is destination registers
+	popj	top,
+d.flt2:
+	jffo	r0,.+1		;find amount to shift
+	movem	exp1,rsave	;free a reg
+	move	exp1,r1
+	movei	r1,0
+	ashc	r0,-11(exp1)	;shift away from exponent
+	movn	exp1,exp1
+	fsc	r0,233+11(exp1)	;insert exponent
+	move	exp1,rsave	;restore temp register
+	jrst	d.flt1
+	prgend
+	search	rtsym
+	$module	dtrc
+	entry	d.trnc
+
+	$temp	rsave,2
+	$temp	destreg,1
+
+d.trnc:
+	aos	r1,0(top)	;bump return address
+	ldb	r0,rt.reg##	;get dest reg
+	movem	r0,destreg
+	dmove	r0,@-1(r1)	;get double real
+	movem	r0,rsave	; save sign in high order
+	movem	exp1,1+rsave	; get work register
+	jumpge	r0,.+2
+	dmovn	r0,r0		;absolute value
+	ldb	exp1,[point 8,r0,8]	;get exponent
+	tlz	r0,377000	;clear exponent
+	ashc	r0,-233(exp1)
+	move	exp1,1+rsave	;restore used reg
+	skipge	rsave
+	movn	r0,r0		;restore sign
+	movem	r0,@destreg
+	popj	top,
+	prgend
+	search	rtsym
+	$module	drnd
+	entry	d.rnd
+
+	$temp	rsave,2
+	$temp	destreg,1
+
+d.rnd:
+	aos	r1,0(top)	;bump return address
+	ldb	r0,rt.reg##	;get dest reg
+	movem	r0,destreg
+	dmove	r0,@-1(r1)	;get double real
+	movem	r0,rsave	; save sign in high order word
+	movem	exp1,1+rsave	; save work register
+	jumpge	r0,.+2
+	dmovn	r0,r0		;absolute value
+	ldb	exp1,[point 8,r0,8]	;get exponent
+	tlz	r0,377000	;clear exponent
+	ashc	r0,-233+1(exp1)
+	addi	r0,1
+	ash	r0,-1
+	move	exp1,1+rsave	;restore used reg
+	skipge	rsave
+	movn	r0,r0		;restore sign
+	movem	r0,@destreg
+	popj	top,
+	prgend
+	search	rtsym
+	$module	rrnd2
+	entry	r.rnd2
+	extern	d.rnd2,dr.rnd
+
+;
+; R.RND2 rounds a single precision real number to a specified
+; decimal significance. Actually, it is converted to double
+; precision prior to the round and back to single precision afterward.
+;
+
+	$temp	rsave,3
+	$temp	x,1
+	$temp	target,1
+
+	n==2	; register parameter for double round
+	r==3	;    ""
+
+r.rnd2:
+	aos	r1,0(top)	; bump return address
+	move	r0,@-1(r1)	; get the number to be rounded
+	movem	0,x		; and save it
+	aos	r1,0(top)
+	ldb	r0,rt.reg##	; get register for result
+	movem	r0,target
+	$save	rsave,n,r+1
+	move	n,@-1(r1)	; get decimal places to round to
+	move	r,x
+	movei	r+1,0		; fake double precision
+	skipge	r
+	hrlzi	r+1,400000
+	adjsp	top,$maxtemp
+	pushj	top,d.rnd2
+	arg	r,r		; target, source
+	arg	r,n		; target, decimal precision
+	pushj	top,dr.rnd	; round result to single precision
+	arg	r,r
+	adjsp	top,-$maxtemp
+	move	r0,r		; copy result
+	$restore rsave,n,r+1
+	movem	r0,@target	; store result
+	popj	top,
+	prgend
+	search	rtsym
+	$Module	drnd2
+	entry	d.rnd2
+
+;
+; D.RND2 rounds a double precision real number to a specified number
+; of decimal digits. 
+;
+; The definition of this round function is
+;
+;	ROUND (X, N) = TRUNC (X/(10**N)+0.5)*(10**-N) if X >= 0
+;		     = TRUNC (X/(10**N)-0.5)*(10**-N) if X <  0
+;
+; Since floating point numbers on the PDP-10 have a maximum magnitude
+; on the order of 10**38, a number rounded to an N greater than 38 is
+; rounded to zero. Similarly, the minimum exponent is -38, which with
+; 17 significant fractional digits yields a minimum possible round to
+; 10**-55. An attempt to round to an N < -55 does not change X at all.
+; Some contortions are required in handling the powers of 10 for
+; -39 >= N >= -55, since they are represented multiplied by 2**100b.
+;
+; In order to prevent overflow and loss of significance at the extreme
+; ranges, some analysis of the number to be truncated is performed
+; before the division of X by (10**N). If X is nonzero, let
+;	X = A * 2**B, and
+;	10**N = C * 2**D.
+; In PDP-10 floating point, A and C are binary fractions such that
+;	1/2 <= ABS (A) < 1, and
+;	1/2 <= C < 1.
+; Thus (for positive X)
+;	TRUNC (X/(10**N)+0.5) = TRUNC ((A/C)*2**(B-D)+0.5).
+; Since the fraction A/C is always less than 2 the truncation will
+; always yield zero if 
+;	B - D <= -2, or
+;	B < D - 1.
+; If the binary exponent of the expression to be truncated is greater
+; than or equal to 62 (the number of significant fraction bits) the
+; truncation will have no effect. Consider that A/C has a minimum of
+; 1/2 or 2**-1, and that if
+;	B - D - 1 >= 62, or
+;	B >= D + 63,
+; the truncation need not be performed. Similar arguments hold for a
+; negative X.
+;
+; Thus the division and truncation need be done if and only if
+;	D - 1 <= B < D + 63.
+;
+
+; Register usages
+
+	q==2		; r2 and r3 are the primary quotient registers
+	v==4		; r4 and r5 are the divisor registers
+	b==6		; quotient exponent
+	d==7		; divisor exponent
+	t==10		; temp
+	mask==11	; r11 and r12 used to set up bit mask
+
+	$temp	rsave,11
+	$temp	x,2
+	$temp	target,1
+	$temp	n,1
+	$temp	vorig,2
+
+d.rnd2:
+	setom	$inrt(pda)	; keep overflows local
+	$save	rsave,q,1+mask	; preserve registers
+	aos	r1,0(top)
+	dmove	r0,@-1(r1)	; gets X
+	dmovem	r0,x
+	aos	r1,0(top)
+	ldb	r0,rt.reg##
+	movem	r0,target	; register for result
+	move	r0,@-1(r1)	; gets N
+
+;
+; If X = 0 or N > 38, return zero
+;
+	dmove	q,x
+	jumpe	q,retzero
+	caile	r0,^d38
+	jrst	retzero
+;
+; If N < -55, return X
+;
+	camge	r0,[exp ^d-55]
+	jrst	retx
+
+;
+; Get 10**N for determination of binary exponent, saving 10**abs(N)
+; and N for selection of DFMP or DFDV, based on the exponent's sign.
+;
+	movem	r0,n
+	movm	r1,r0		; abs (N)
+	lsh	r1,1
+	dmove	v,table(r1)
+	dmovem	v,vorig
+	jumpge	r0,l1
+	dmove	v,f1.0
+	dfdv	v,vorig
+l1:	movm	r1,r0
+;
+; Extract binary exponents of quotient and divisor for comparison
+;
+	ldb	b,[point 8,q,8]
+	skipge	q		; If q negative exponent is one's
+	xori	b,377		;   complement - make positive again
+	ldb	d,[point 8,v,8]
+	dmove	v,vorig		; Use 10**abs(N) for rest of calculation
+;
+; If N < -38 exponent is offset by 100b
+;
+	caile	r1,^d38
+	subi	d,100
+
+;
+; If B < D - 1 return zero
+;
+	hrrei	t,-1(d)
+	camge	b,t
+	jrst	retzero
+;
+; If B >= D + 63, return X
+;
+	hrrei	t,63(d)
+	caml	b,t
+	jrst	retx
+
+;
+; Must actually perform the division and truncation
+;
+	skipge	n
+	dfmp	q,v
+	skipl	n
+	dfdv	q,v
+	dmove	mask,f0.5
+	caile	r1,^d38		; if scaled then
+	fsc	mask,-100	; so must constant be
+	skipge	q		; By definition,
+	dmovn	mask,mask	;   add 0.5 to positive number but
+	dfad	q,mask		;   subtract 0.5 from negative number
+;
+; Extract exponent of result for truncation
+;
+	ldb	t,[point 8,q,8]
+	skipge	q		; If negative exponent is one's
+	xori	t,377		;   complement - make positive
+	caile	r1,^d38		; if N < -38
+	addi	t,100		;   then offset by scale factor
+	subi	t,200		; Normalize
+;
+; If exponent is <= 0, result is zero
+;
+	jumple	t,retzero
+;
+; Otherwise set up shift mask and off least significant bits
+;
+	hrloi	mask,777	; One's mask for all 62 fraction bits
+	hrloi	1+mask,377777
+	movn	t,t		; Will shift mask right
+;
+; The truncation must be performed on a POSITIVE fraction or
+; significance will be lost. If it is negative take the absolute
+; value and negate the power of 10 multiplier for a correctly
+; signed result.
+;
+	jumpge	q,shift
+	dmovn	q,q
+	dmovn	v,v
+shift:
+	ashc	mask,0(t)
+	tdz	q,mask
+	tdz	1+q,1+mask
+	skipge	n		; Re-scale
+	dfdv	q,v
+	skipl	n
+	dfmp	q,v
+ret:
+	dmovem	q,x
+retx:				; here if X itself is result
+	$restore rsave,q,1+mask
+	dmove	r0,x
+	dmovem	r0,@target
+	setzm	$inrt(pda)	; normal overflow handling, now
+	popj	top,
+
+retzero:setzb	q,1+q
+	jrst	ret
+
+f0.5:	dec	0.5
+	exp	0
+
+;
+; Powers of 10 for normalization prior to and after truncation.
+;
+
+table:
+f1.0:	byte	(18)201400,000000,000000,000000	; 10**0
+	byte	(18)204500,000000,000000,000000	; 10**1
+	byte	(18)207620,000000,000000,000000	; 10**2
+	byte	(18)212764,000000,000000,000000	; 10**3
+	byte	(18)216470,400000,000000,000000	; 10**4
+	byte	(18)221606,500000,000000,000000	; 10**5
+	byte	(18)224750,220000,000000,000000	; 10**6
+	byte	(18)230461,132000,000000,000000	; 10**7
+	byte	(18)233575,360400,000000,000000	; 10**8
+	byte	(18)236734,654500,000000,000000	; 10**9
+	byte	(18)242452,013710,000000,000000	; 10**10
+	byte	(18)245564,416672,000000,000000	; 10**11
+	byte	(18)250721,522450,200000,000000	; 10**12
+	byte	(18)254443,023471,120000,000000	; 10**13
+	byte	(18)257553,630407,244000,000000	; 10**14
+	byte	(18)262706,576511,215000,000000	; 10**15
+	byte	(18)266434,157115,370100,000000	; 10**16
+	byte	(18)271543,212741,166120,000000	; 10**17
+	byte	(18)274674,055531,323544,000000	; 10**18
+	byte	(18)300425,434430,044236,400000	; 10**19
+	byte	(18)303532,743536,055306,100000	; 10**20
+	byte	(18)306661,534465,270567,520000	; 10**21
+	byte	(18)312417,031701,223352,622000	; 10**22
+	byte	(18)315522,640261,370245,366400	; 10**23
+	byte	(18)320647,410336,166316,664100	; 10**24
+	byte	(18)324410,545213,012001,220450	; 10**25
+	byte	(18)327512,676455,314401,464562	; 10**26
+	byte	(18)332635,456171,077502,001717	; 10**27
+	byte	(18)336402,374713,307611,201141	; 10**28
+	byte	(18)341503,074076,271553,441371	; 10**29
+	byte	(18)344623,713116,150106,351667	; 10**30
+	byte	(18)347770,675742,002130,044245	; 10**31
+	byte	(18)353473,426555,101267,026547	; 10**32
+	byte	(18)356612,334310,221544,634301	; 10**33
+	byte	(18)361755,023372,266076,003361	; 10**34
+	byte	(18)365464,114134,261646,602127	; 10**35
+	byte	(18)370601,137163,336220,342555	; 10**36
+	byte	(18)373741,367020,325664,433310	; 10**37
+	byte	(18)377454,732312,205520,661075	; 10**38
+;
+; The following powers of 10 are scaled by 2**-100b to avoid overflow.
+;
+	byte	(18)302570,120775,047045,035314	; 10**39
+	byte	(18)305726,145174,160656,244577	; 10**40
+	byte	(18)311445,677215,306414,746757	; 10**41
+	byte	(18)314557,257061,070120,140553	; 10**42
+	byte	(18)317713,132675,206144,170706	; 10**43
+	byte	(18)323436,770626,163676,513434	; 10**44
+	byte	(18)326546,566774,020656,236343	; 10**45
+	byte	(18)331700,324573,025031,706034	; 10**46
+	byte	(18)335430,204754,355120,133622	; 10**47
+	byte	(18)340536,246150,050344,162567	; 10**48
+	byte	(18)343665,717602,062435,217325	; 10**49
+	byte	(18)347421,541661,137462,231505	; 10**50
+	byte	(18)352526,072235,267376,700026	; 10**51
+	byte	(18)355653,510705,045276,460034	; 10**52
+	byte	(18)361413,215433,067267,076022	; 10**53
+	byte	(18)364516,060742,005144,715427	; 10**54
+	byte	(18)367641,475132,206376,100735	; 10**55
+	$lit
+	prgend
+	search	rtsym
+	$module	drrnd
+	entry	dr.rnd
+;
+;	DR.RND rounds a double-precision real number to a
+;	single-precision real number.
+
+	$temp	target,1
+
+dr.rnd:	aos	r1,0(top)	; bump return address
+	ldb	r0,rt.reg##	; get register for result
+	movem	r0,target
+	dmove	r0,@-1(r1)	; get the number to be rounded
+	jumpl	r0,argneg 	; negative argument?
+	tlne	r1,200000	; no.  rounding required?
+	tron	r0,1		; yes. bump hi-order word.
+	jrst	return		; no. truncate and exit.
+	move	r1,r0		; fancier increment needed.
+	and	r0,[777000,,1]	; get word with only ls bit.
+	fadr	r0,r1		; add into hi-order word.
+	jrst	return
+argneg:	dmovn	r0,r0		; negative argument - take abs.
+	tlne	r1,200000	; rounding required?
+	tron	r0,1		; yes. bump hi_order word.
+	jrst	negate		; no. truncate and exit.
+	movn	r1,r0		; fancier increment needed.
+	orca	r0,[777,,-1]	; get neg word with only ls bit.
+	fadr	r0,r1		; add into hi-order word.
+	jrst	return
+negate:	movn	r0,r0		; renegate rounded result.
+return:	movem	r0,@target	; store the single-precision result
+	popj	top,		; return
+	end
+ 
