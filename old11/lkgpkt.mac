@@ -1,0 +1,1525 @@
+	.TITLE	LKGPKT		- X.25 packet level translation
+	.SBTTL			- Definitions
+
+	XLPAR
+
+
+;-----
+; Packet "class" identification bits
+;-----
+$DATA	=! $BIT00			; Data packet indicator bit
+$SUPV	=! $BIT01			; Supervisory packet indicator bit
+
+;-----
+; SDB flag bits (in SDLGS1)
+;-----
+$X1JTX	=! $BIT14			; Junk data packets to X.25 port
+$X1JFX	=! $BIT13			; Junk data packets from X.25 port
+$X1LOG	=! $BIT07			; TYMNET "LOGIN" mode
+$X1WCA	=! $BIT06			; Waiting for connect ACK
+$X1CLN	=! $BIT05			; ":" found in TYMNET login string
+$X1AUX	=! $BIT04			; AUX CIRCUIT
+
+;-----
+; Constants - base for modulus arithmetic and bit mask for remaindering
+;-----
+.MODP	=! 10				; Modulus base for arith on P(R), P(S)
+$MASKP	=! ^C<.MODP-1>			; Mask for performing modulus arith on
+					;   P(R), P(S)
+;-----
+; Constants - shift counts
+;-----
+.SHFPR	=! 5				; Shift count to position P(R) in pkt
+
+;-----
+; Constants - 1st X.25 header byte value
+;-----
+.LCG	=! $BIT04			; X.25 pkt logical channel group byte
+					;   00010000 len = 1, LCG = 0
+
+;-----
+; X.25 packet type values
+;-----
+.XDATA	=! 000				; X.25 data packet "type"
+.XRR	=! 001				; X.25 RR packet type
+.XRNR	=! 005				; X.25 RNR packet type
+.XREJ	=! 011				; X.25 DTE REJ packet type
+.XCARQ	=! 013				; X.25 Call Request packet type
+.XCACF	=! 017				; X.25 Call Confirmation packet type
+.XCLRQ	=! 023				; X.25 Clear Request packet type
+.XCLCF	=! 027				; X.25 Clear Confirmation pkt type
+.XRERQ	=! 033				; X.25 Reset Request packet type
+.XRECF	=! 037				; X.25 Reset Confirmation packet type
+.XINTR	=! 043				; X.25 Interrupt packet type
+.XITCF	=! 047				; X.25 Interrupt Confirmation pkt type
+.XRSRQ	=! 373				; X.25 Restart Request packet type
+.XRSCF	=! 377				; X.25 Restart Confirmation packet type
+
+;-----
+; Constants - packet send ahead window size
+;-----
+.W	=! 2				; Packet level flow control window
+
+	CODE
+.PAGE
+	.SBTTL	LKGNXT - Get NEXILIS packet, translate to X.25 and send
+;-----
+; LKGNXT - Subroutine to get the next packet from the node to send on the link
+;
+; Linkage:
+;	C(R4) = Address of DDB
+;
+;	CALL LKGNXT
+;
+; Unpreserved registers:
+;	R0, R1, R2, R3
+;-----
+LKGNXT::MOV	DDLGAH#(R4),R1		; Get send back message header
+	BEQ	3$			; Nothing there - get next packet
+
+	MOV	(R1),DDLGAH#(R4)	; Update send back message head
+	BNE	1$			; Another message pending
+	CLR	DDLGAT#(R4)		; List empty - clear tail
+1$:	CLR	(R1)
+	CALL	XMTPKT			;TRANSMIT THIS MESSAGE
+	CALL	LKGSTT			;SEE IF SHOULD DO MORE
+	BCS	LKGNXT			;YES
+	RETURN				;NO-FINISHED FOR NOW
+;-----
+; No messages were buffered for send back - get next packet from packet service
+;-----
+3$:	CALL	NXTPKT#			; Get next packet from pkt service
+	BCS	27$			; Quit if nothing to get
+	BNE	6$			;IF HAVE A NORMAL PACKET
+	CALL	LKGSTR			;FLAG PACKET-SEND IT
+	BCS	3$			;IF CAN SEND MORE NOW
+	RETURN				;OTHERWISE FINISHED
+
+;HERE FOR A NORMAL PACKET (NOT FLAG PACKET)
+
+6$:	CALL	CHKOUT			;CAN WE REALLY DO IT NOW?
+	BPL	3$			;NO-FORGET ABOUT IT FOR NOW
+	CALL	REMOVE#			;REMOVE PACKET FROM DST LIST
+	CLR	(R1)			;CLEAR LINK WORD
+	CALL	DECPCN#			;REDUCE THE SENDER'S PACKET COUNT
+	CALL	LKGSTR			;START OUTPUT
+	BCC	16$			;IF FINISHED NOW
+	CALL	LGPOKX			;CAN SEND MORE NOW-PUT THIS SDB BACK
+					;  ON THE SEND LIST IF IT HAS MORE TO
+					;  SEND - WILL TAKE IT OFF IN NXTPKT
+	BR	3$			;CONTINUE
+
+16$:	CALL	LGPOKX			; Can't send more now - put this SDB
+					;   back on send list if it has more
+					;   to send
+	RETURN				; All done for now
+;------
+; Here when NXTPKT fails to return a packet (send list empty)
+;-----
+27$:	BIC	#$D1ACT,DDSTS1#(R4)	; Declare link inactive
+	RETURN				; Return to caller
+.PAGE
+	.SBTTL	LGPOKE - Poke entry for link type G
+;-----
+; LGPOKE - called when packet linked to empty destination list
+;-----
+LGPOKE::TBBE	$D1DWN,DDSTS1#(R4),LGPOK1 ; Is link up?
+	JMP	LKPDWN#			; Link down - fail
+
+;-----
+; Here to poke socket (or put it on send list) if packet level window open and
+; non-empty dest list
+;-----
+LGPOKC:	MOV	SDPKDH#(SD),R1		; Get destination list header
+	BEQ	RTN004			; Return if nothing there
+LGPOK1:	CALL	CHKOUT			;OUTPUT OK NOW?
+	BPL	RTN004			; No - forget about it
+	CALL	LKPOKE#			; Yes - go start it out
+	BCS	LGPOKC			;TRY AGAIN IF IT CAN TAKE MORE
+					;NO MORE-FALL INTO LGPOKX TO MAKE SURE
+					;  SDB IS LEFT ON THE SEND LIST IF
+					;  IT CURRENTLY HAS ITS WINDOW OPEN
+;-----
+; Subroutine to put socket back on send list if packet level window open
+;-----
+LGPOKX:	MOV	SDPKDH#(SD),R1		; Get destination list header
+	BEQ	RTN004			; Return if nothing there
+	CALL	CHKOUT			;OUTPUT OK NOW?
+	BPL	RTN004			;NO
+	JMP	LKPOK0#			;YES
+
+;SUBROUTINE TO SEE IF OUTPUT IS OK
+;	C(R1) = ADDRESS OF NEXT PACKET TO OUTPUT
+;	CALL	CHKOUT
+;	N:SET = OUTPUT IS OK NOW
+;	N:CLR = OUTPUT MUST BE DEFERRED
+
+
+CHKOUT:	MOVB	PKTYPE(R1),R0		; Get packet type
+	TSTB	TYPBTS(R0)		; Test the bits
+	BMI	2$			; If no flow control
+	CMPB	SDACNT#(SD),SDPMAX#(SD)	; Room for another packet?
+2$:	RETURN				;RETURN WITH N SET CORRECTLY
+
+;-----
+; Table of packet type status bits
+;
+;	200 = No flow control at all
+;	000 = Full flow control
+;-----
+	PURE
+
+TYPBTS:	.BYTE	000		; .PTDAT =  0 - Data
+	.BYTE	200		; .PTCON =  1 - Connect
+	.BYTE	200		; .PTACK =  2 - Connect ACK
+	.BYTE	200		; .PTNAK =  3 - Connect NAK
+	.BYTE	000		; .PTFUN =  4 - Function
+	.BYTE	000		; .PTINT =  5 - Interrupt
+	.BYTE	000		; .PTEAT =  6 - Eat
+	.BYTE	200		; .PTDIS =  7 - Disconnect
+	.BYTE	200		; .PTKIL = 10 - Kill
+	.BYTE	200		; .PTDAK = 11 - Disconnect ACK
+	.BYTE	200		; .PTRVR = 12 - Recover
+	.BYTE	200		; .PTRTY = 13 - Retry
+	.BYTE	000		; .PTPAC = 14 - Packet ACK
+
+	CODE
+.PAGE
+	.SBTTL	LGRSUM - Resume entry for link type G
+;-----
+; LGRSUM - called to resume packet output
+;-----
+LGRSUM::TSTB	SDLGRR#(SD)		; Any pending RR's?
+	BEQ	RTN004			; No
+
+	DECB	SDLGRR#(SD)		; Yes - reduce RR count
+	INCB	SDFCNT#(SD)		; Bump flag count
+	CMP	#-1,SDLKFL#(SD)		; Already in flag list?
+	BNE	RTN004			; Yes - nothing more needed
+
+	MOV	DDLKFT#(R4),R2		; No - get last SDB in list
+	BNE	1$			; Not empty
+
+	MOV	SD,DDLKFH#(R4)		; Empty - put on head
+	BR	2$
+
+1$:	MOV	SD,SDLKFL#(R2)		; Link on tail of list
+2$:	MOV	SD,DDLKFT#(R4)		; Update tail pointer
+	CLR	SDLKFL#(SD)		; Clear forward link
+	TBBN	$D1ACT,DDSTS1$(R4),RTN004 ; Thats all if link is active now
+
+	CALL	NXTCFR#			; Find a flag packet to send
+	BCC	3$			; Go on if got one
+	FSTOP	CFF			; [Can't Find Flag] but just set one!
+
+3$:	CJMP	@DDLKST#(R4)		; Start the link and return
+
+RTN004:	RETURN				; Thats all
+.PAGE
+	.SBTTL	LKGFLG - Flag packet processing for NXTPKT
+;-----
+; LKGFLG - subroutine called by NXTPKT to generate an X.25 RR packet equivalent
+;
+;	C(R1) = address of packet to use
+;	C(R4) = address of DDB
+;	C(SD) = address of first SDB on flag list
+;
+;	CALL	LKGFLG
+;
+;	C:set = nothing to send
+;	C(R1) = address of packet to send
+;	C(SD) = address of SDB for packet
+;-----
+LKGFLG::MOV	SDLKFL#(SD),DDLKFH#(R4)	; Update flag list head pointer
+	BNE	1$			; Anything left on list?
+	CLR	DDLKFT#(R4)		; No - clear tail pointer
+
+1$:	MOV	#-1,SDLKFL#(SD)		; Remove SBD from flag list
+	MOVB	SDFCNT#(SD),R0		; Get flag count - non-zero?
+	BNE	2$			; Yes - make an RR equivalent packet
+
+	MOV	DDLKFH#(R4),SD		; No - try next SDB
+	BNE	LKGFLG			; Continue until flag list all checked
+
+	SEC				; No more - indicate no packet
+	RETURN				; Return to caller
+
+;-----
+; Here on SDB with non-zero flag count
+;-----
+2$:	CLRB	SDFCNT#(SD)		; Clear flag count
+	MOV	#.PTXRR*400+1,PKCNT(R1)	; Store packet type and count
+	MOVB	R0,PKDATA(R1)		; Store flag count in packet
+	CLC				; Indicate there is a packet
+	RETURN				; Return to caller
+.PAGE
+	.SBTTL	LKGSTR - Inactive link startup entry point
+;-----
+; LKGSTR - Subroutine to start link output when inactive
+;-----
+LKGSTR::CMP	#-1,SDLKLK#(SD)		;IN SEND LIST NOW?
+	BEQ	1$			;NO-OK
+	CMPB	#.PTXRR,PKTYPE(R1)	;YES-IS THIS AN RR PACKET?
+	BEQ	1$			;YES-THATS OK!
+	FSTOP	SND			;[SEND LIST ERROR]
+
+1$:	CALL	LKGSTX			; Call actual start routine
+LKGSTT:	CMPB	DDLGVT#(R4),DDLGK0#(R4)	; Frame window closed?
+	BLO	4$			;NO-RETURN WITH C SET
+	BIS	#$D1ACT,DDSTS1#(R4)	;YES-INDICATE DEVICE IS BUSY (C IS CLR)
+4$:	RETURN
+
+;-----
+; Local subroutine to provide single entry / single exit for start routine
+;-----
+LKGSTX:	MOVB	PKTYPE(R1),R0		;GET PACKET TYPE
+	ASL	R0			; convert to word index
+	JMP	@NEXDSP(R0)		; Dispatch on NEXILIS packet type
+
+;-----
+; Packet dispatch for translating NEXILIS packets to X.25 packets
+;-----
+	PURE
+	.EVEN
+
+NEXDSP:	.WORD	DATPKT			; .PTDAT =  0 - Data
+	.WORD	CONPKT			; .PTCON =  1 - Connection Request
+	.WORD	ACKPKT			; .PTACK =  2 - Connection ACK
+	.WORD	KILPKT			; .PTNAK =  3 - Connection NAK
+	.WORD	FNCPKT			; .PTFUN =  4 - Function
+	.WORD	INTPKT			; .PTINT =  5 - Interrupt
+	.WORD	EATPKT			; .PTEAT =  6 - Eat
+	.WORD	KILPKT			; .PTDIS =  7 - Disconnect
+	.WORD	KILPKT			; .PTKIL = 10 - Kill
+	.WORD	DAKPKT			; .PTDAK = 11 - Disconnect ACK
+	.WORD	JNKLKG			; .PTRVR = 12 - Recover
+	.WORD	JNKLKG			; .PTRTY = 13 - Retry
+	.WORD	JNKLKG			; .PTPAC = 14 - Packet ACK
+	.WORD	JNKLKG			; .PTXXX = 15 - Undefined
+	.WORD	JNKLKG			; .PTXXX = 16 - Undefined
+	.WORD	JNKLKG			; .PTXXX = 17 - Undefined
+	.WORD	JNKLKG			; .PTXXX = 20 - Undefined
+	.WORD	XRRPKT			; .PTXRR = 21 - X.25 RR Equivalent
+
+	CODE
+.PAGE
+	.SBTTL	NEXILIS to X.25 packet translation
+;-----
+; Here on ill-typed, non-translateable, or junked packets
+;-----
+JNKLKG::CJMP	GIVPKT#
+
+;-----
+; Here on function packet
+;-----
+FNCPKT:	TBBN	$X1WCA,SDLGS1#(SD),JNKLKG ; Junk func pkts when waiting for
+					;   call accepted
+	CJMP	FNCLKG#			; Dispatch to q packet code
+
+;-----
+; Here on interrupt packet
+;-----
+INTPKT:	TBBN	$X1WCA,SDLGS1#(SD),JNKLKG ; Junk int pkts when waiting for
+					;   call accepted
+	CJMP	INTLKG#			; Dispatch to q packet code
+
+;-----
+; Here on eat packet
+;-----
+EATPKT:	TBBN	$X1WCA,SDLGS1#(SD),JNKLKG ; Junk eat pkts when waiting for
+					;   call accepted
+	CJMP	EATLKG#			; Dispatch to q packet code
+
+;-----
+; Here on X.25 RR equivalent packet
+;-----
+XRRPKT:	MOVB	PKDATA(R1),R0		; Get number of packets to acknowledge
+	MOVB	SDLGPR#(SD),R2		; Get P(R) for channel
+	ADD	R2,R0			; Add # ACK's to P(R)
+	BIC	#$MASKP,R0		; Perform modulus arithmetic
+	MOVB	R0,SDLGPR#(SD)		; Update P(R)
+
+	CLRB	PKCNT(R1)		; No data bytes in RR packet
+	ASHI	.SHFPR,R0		; Shift P(R) into position for RR pkt
+	BIS	#.XRR,R0		; Get RR packet type
+	MOVB	R0,PKSEQ(R1)		; Store RR packet type byte
+	JMP	INSER1			; Go send packet (pkt type alrdy done)
+
+;-----
+; Here on data packet
+;-----
+DATPKT:	TBBE	$X1LOG,SDLGS1#(SD),1$	;Skip if not in login made
+	JMP	CONLOG			; Go process if in "LOGIN" mode
+
+1$:	TBBN	$X1JTX,SDLGS1#(SD),JNKLKG ; Discard packet if junking to X.25
+	MOVB	#.LCG,PKTYPE(R1)	; Store logical channel group byte
+
+LKGDT1::MOVB	SDFCNT#(SD),R0		; Get socket flag count
+	CLRB	SDFCNT#(SD)		; Clear flag count
+
+	MOVB	SDLGPR#(SD),R2		; Get P(R) for channel
+	ADD	R2,R0			; Add to # of new ACK's
+	BIC	#$MASKP,R0		; Perform modulus arithmetic
+	MOVB	R0,SDLGPR#(SD)		; Update P(R)
+
+	ASHI	<.SHFPR-1>,R0		; Partially align P(R) for data pkt
+	BISB	SDLGPS#(SD),R0		; Get P(S) for channel
+	ASL	R0			; Position P(S) & P(R) in pkt type byte
+	MOVB	R0,PKSEQ(R1)		; Store data packet type byte
+
+	INCB	SDLGPS#(SD)		; Bump P(S)
+	BICB	#$MASKP,SDLGPS#(SD)	; Perform modulus arithmetic
+	INCB	SDACNT#(SD)		; Bump send ahead count
+	JMP	INSER2			; Go send packet (pkt type and LCG
+					;   already done)
+;-----
+; Here on connection request packet
+;-----
+CONPKT:	CALL	CLRLOG			; Clear previous login mode for socket
+					;   and clear SBD control counters
+	MOV	R1,SDLGPH#(SD)		; Store connect packet list head ptr
+	MOV	R1,SDLGPT#(SD)		; Store packet list tail ptr
+
+	BIS	#<$X1LOG!$X1WCA>,SDLGS1#(SD) ; Indicate now in "LOGIN" mode
+					;   and waiting for connection ACK
+	BIC	#$X1CLN,SDLGS1#(SD)	; Clear ":" seen in login string flag
+
+	MOV	#S#,R0			; Get pointer to scratch area
+.REPT	4
+	CLR	(R0)+			; Clear scratch area to be used
+.ENDR
+
+	BIS	#$X1AUX,SDLGS1#(SD)	; ASSUME AUX CIRCUIT
+	TSTB	PKDATA+14(R1)		; Host or terminal connection?
+	BEQ	1$			; Host
+	INCB	S#+1			; Terminal - indicate it
+	BIC	#$X1AUX,SDLGS1#(SD)	; INDICATE NOT AUX CIRCUIT
+
+1$:	CLR	R3			; Clear residue
+	BISB	PKDATA+2(R1),R3		; Pick up length of dest extension
+	BEQ	4$			; Bypass if nothing there
+
+	CLR	R2			; Clear residue
+	BISB	PKDATA+1(R1),R2		; Pick up connect data area length
+	ADD	#PKDATA+24,R1		; Point at connect data area
+	ADD	R2,R1			; Point at destination extension
+
+	MOV	#S#+2,R2		; Point at scratch area
+;-----
+; Temporarily store default system number string in scratch area
+;-----
+2$:	MOVB	(R1)+,(R2)+		; Get byte from dest extension
+	INCB	S#			; Bump host number byte count
+	CMPB	S#,#6			; Holding area full?
+	BHIS	4$			; Yes - escape
+
+3$:	SOB	R3,2$			; Continue until host number stored
+
+;-----
+; Transfer system number to holding area at beginning of packet data area
+;-----
+4$:	MOV	#S#,R0			; Get pointer to scratch area
+	MOV	SDLGPH#(SD),R1		; Get packet pointer
+	MOVB	#6,PKCNT(R1)		; Store initial packet byte count
+	ADD	#PKSOC,R1		; Point at pkt temp storage area
+
+.REPT	4
+	MOV	(R0)+,(R1)+		; Move word from scratch to packet
+.ENDR
+	MAKPKT	.PLSTP#			; Get a new packet
+	BCC	5$			; Got a packet
+
+	MOV	SDLGPH#(SD),R1		; Retrieve connect packet pointer
+	CLR	SDLGPH#(SD)		; Clear SDB packet list head ptr
+	CLR	SDLGPT#(SD)		; Clear SDB packet list tail ptr
+	MOV	#.ERBFF,R0		; Indicate buffer space full
+	CJMP	REFUSE#			; Refuse connection (REFUSE returns
+					;   with carry bit set)
+
+5$:	MOVB	#177,SDACNT#(SD)	; Make sure window is closed now
+	MOVB	#2,SDPMAX#(SD)		; Store warning value for socket
+	CLR	R0			; Accept all connections
+	MOV	#<140+<P.TYMS*400>>,R2	; Indicate terminal in deferred echo,
+					;   need more data for connection,
+					;   and set TYMSHARE terminal profile
+	CALL	ACCEPT#			; "Accept" the connection
+
+	CLRB	SDACNT#(SD)		; Open window for data
+	MOV	SDPKDH#(SD),R1		; Get next packet on destination list
+	BEQ	7$			; Skip if nothing there
+
+	CALL	REMOVE#			;Remove packet from DST list
+	CLR	(R1)			; De-link packet
+	CALL	DECPCN#			; Decrease packet count
+	JMP	LKGSTR			; Try to start output again
+
+7$:	SEC				; Indicate output not started
+	RETURN				; Return to caller
+
+;-----
+; Here in "LOGIN" mode with data packet to put login string in call request pkt
+;-----
+CONLOG:	PUSH	R4			; Save DDB pointer
+	PUSH	R1			; Save packet pointer
+
+	MOV	SDLGPT#(SD),R0		; Pick up last packet in call request
+	CLR	R2			; Clear residue
+	BISB	PKCNT(R0),R2		; Pick up connect packet byte count
+
+	ADD	#PKDATA,R0		; Point at packet data area
+	ADD	R2,R0			; Point at next available byte
+
+	CLR	R3			; Clear residue
+	BISB	PKCNT(R1),R3		; Get new packet byte count
+	BEQ	6$			; Discard packet if empty
+
+	ADD	#PKDATA,R1		; Point at new packet data area
+;-----
+; Accumulate login string
+;-----
+1$:	CMPB	R2,#PKCMAX		; Call request packet full?
+	BLO	2$			; Not yet
+
+	CALL	CONNXT			; Yes - link another packet into list
+
+2$:	MOVB	(R1)+,R4		; No - get byte from new packet
+	BIC	#^C177,R4		;JUST 7 BITS
+	CMPB	R4,#';			; Semicolon?
+	BNE	3$			; No
+	TBBN	$X1AUX,SDLGS1#(SD),CONEO2; YES-AUX CIRCUIT?
+
+	CALL	CONHST			; NO - insert host number if needed
+	BR	5$			; Continue getting characters
+
+3$:	CMPB	R4,#CR			; Carriage-return?
+	BEQ	CONEOL			; Yes
+	CMPB	R4,#LF			; Line-feed?
+	BEQ	CONEOL			; Yes
+
+	CMPB	R4,#':			; Colon?
+	BNE	4$			; No
+	BIS	#$X1CLN,SDLGS1#(SD)	; Yes - flag it
+;-----
+; Put byte into call request packet from data packet
+;-----
+4$:	MOVB	R4,(R0)+		; Stuff byte into call request pkt
+	INC	R2			; Bump call request pkt byte count
+5$:	SOB	R3,1$			; Continue until new packet empty
+
+;-----
+; Here on empty data packet before login string terminated
+;-----
+6$:	MOV	SDLGPT#(SD),R0		; Get last packet on list
+	MOVB	R2,PKCNT(R0)		; Update byte count
+
+	POP	R1			; Restore packet pointer
+	POP	R4			; Restore DDB pointer
+	CALL	GIVPKT#			; Discard empty packet
+	SEC				; Indicate output not started
+	RETURN				; Return to caller
+
+;-----
+; CONNXT - local subroutine to link another packet into call request packet
+;-----
+CONNXT:	PUSH	R1			; Save register
+
+	MAKPKT	.PLOPT#			; Get a packet
+	BCS	1$
+	MOV	R1,@SDLGPT#(SD)		; Link new packet to last on list
+	MOV	R1,SDLGPT#(SD)		; Update tail pointer
+	MOV	R1,R0			; Copy pointer into byte pointer
+
+.REPT	3
+	CLR	(R0)+			; Clear packet header
+.ENDR
+
+	CLR	R2			; Init byte count
+1$:	POP	R1			; Restore register
+	RETURN
+
+;-----
+; CONHST - local subroutine to insert host number into login string if needed
+;-----
+CONHST:	TBBN	$X1CLN,SDLGS1#(SD),5$	; If host number already there
+	BIS	#$X1CLN,SDLGS1#(SD)	; Flag host number there
+
+	PUSH	R1			; Save registers
+	PUSH	R0
+
+	MOV	SDLGPH#(SD),R0		; Get 1st packet on list
+	TSTB	PKSOC(R0)		; Is there a host number?
+	BNE	1$			; Yes
+
+	POP	R0			; No
+	BR	4$			; Insert final byte and return
+
+1$:	ADD	#PKSOC,R0		; Get pointer to host number string
+	MOV	#S#,R1			; Get pointer to scratch area
+
+.REPT	4
+	MOV	(R0)+,(R1)+		; Move count & string to scratch area
+.ENDR
+
+	MOV	#S#,R1			; Get pointer to scratch area
+	INCB	(R1)+			; Adjust byte count for ":"
+	MOVB	#':,(R1)		; Put ":" before host number
+
+	POP	R0			; Restore byte pointer
+
+2$:	CMP	R2,#PKCMAX		; Packet full?
+	BLO	3$			; Not yet
+
+	CALL	CONNXT			; Yes - link another packet into list
+
+3$:	MOVB	(R1)+,(R0)+		; Store byte of host number in pkt
+	INC	R2			; Bump byte count
+	DECB	S#			; Decrease host number byte count
+	BGT	2$			; Continue until host number stored
+
+4$:	POP	R1			; Restore register
+
+5$:	CMP	R2,#PKCMAX		; Packet full?
+	BLO	6$			; Not yet
+
+	CALL	CONNXT			; Yes - link another packet into list
+
+6$:	MOVB	R4,(R0)+		; Store byte following host number
+	INC	R2			; Bump byte count
+
+	RETURN
+
+;-----
+; Here on login string termination (<CR> found)
+;-----
+CONEOL:	MOV	#CR,R4			; Make sure terminator is <CR>
+CONEO2:	CALL	CONHST			; Get host number if needed
+
+	MOV	SDLGPT#(SD),R0		; Get last packet in list
+	MOVB	R2,PKCNT(R0)		; Store byte count
+
+	DECB	R3			; Bump new packet byte count last time
+	BNE	1$			; if packet non-empty
+
+	POP	R1			; Restore packet pointer
+	CALL	GIVPKT#			; Discard empty packet
+	BR	3$			; Merge with end of call request pkt
+;-----
+; Here if bytes left in data packet
+;-----
+1$:	MOV	(SP),R0			; Pick up current packet pointer
+	MOVB	R3,PKCNT(R0)		; Store new byte count
+	ADD	#PKDATA,R0		; Point at data area
+
+2$:	MOVB	(R1)+,(R0)+		; Move byte to beginning of packet
+	SOB	R3,2$			; Continue until packet normalized
+
+	POP	R1			; Restore packet pointer
+	CALL	PKTAGN#			; Return packet to destination list
+;-----
+; Here to finish translating call request packet before sending
+;-----
+3$:	POP	R4			; Restore DDB pointer
+
+	MOV	#JIFX20#,R0		;GET # OF TICKS IN 20 SECONDS
+	MOV	#CONTIM,R1		; Get timer request dispatch address
+	CALL	TIMREQ#			; Make timer request
+
+	MOV	SDLGPH#(SD),R1		; Get call request pkt head ptr
+	MOV	R1,R0			; Copy pointer
+	ADD	#PKDATA,R0		; Point at pkt data area
+
+.REPT	3
+	CLR	(R0)+			; Clear packet word
+.ENDR
+
+	MOVB	PKSEQ(R1),PKDATA+2(R1)	; Store host/terminal flag
+
+	CLR	SDLGPH#(SD)		; Clear SDB packet list head ptr
+	CLR	SDLGPT#(SD)		; Clear SDB packet list tail ptr
+	BIC	#<$X1LOG!$X1CLN>,SDLGS1#(SD) ; Clear "LOGIN" mode flags
+	MOVB	SDPMAX#(SD),SDACNT#(SD)	; Close pkt window for data pkts
+	BR	INSERT			; Go transmit call request packet
+
+;-----
+; Here if other end does not respond before timer goes off
+;-----
+CONTIM:	MOV	#.ERTIM,R0		; Error code = timer expired
+	CALL	MAKKIL#			; Get a KILL packet
+	CALL	LKGSND			; Send KILL packet into node
+
+	MAKPKT	.PLSTP#			; Get a packet
+	BCC	1$			; Ok if got a packet
+	RETURN				; Return if none available
+
+1$:	MOV	#<1+<400*.LCG>>,PKCNT(R1); Store byte count, X.25 l.c.g.
+	MOVB	SDSOC#(SD),PKSOC(R1)	; Store channel number
+	MOVB	#.XCLRQ,PKSEQ(R1)	; Store Clear Request packet type
+	MOVB	#021,PKDATA(R1)		; X.25 clear reason = remote proc err
+	CJMP	SNDBA1			; Send Clear Request back to other side
+
+;-----
+; Here on Connection ACK packet
+;-----
+ACKPKT:	CALL	INSERT			;SEND THE CALL CONFIRMATION
+	MOV	SDLGPH#(SD),R1		;GET LOGIN STRING POINTER
+	CLR	SDLGPH#(SD)		; Clear login string pointer
+	CALL	PKTUN1			;SEND LOGIN STRING
+	CJMP	CLRLOG			; Clear login mode for socket
+					;   and clear SBD control counters
+
+;-----
+; Here to send X.25 Restart Request packet
+;-----
+RSTLKG::CALL	LKGDWN#			; Declare link down to restart it
+	CALL	LNKUP#			; Declare link up for restart
+
+	MAKPKT	.PLSTP#			; Make a packet
+	BCC	1$			; If got a packet
+	RETURN				; Can't send packet if can't get packet
+
+1$:	MOV	#<.LCG*400>,PKCNT(R1)	; Count = 0, channel group = 0
+	MOV	#<.XRSRQ*400>,PKSOC(R1)	; Type = Restart Request, channel = 0
+	BR	XMTPKT			; Transmit the packet
+
+;-----
+; Here to translate Kill & Disconnect packets
+;-----
+KILPKT:	CALL	CLRLOG			; Clear login mode for socket
+					;   and clear SBD control counters
+	BIC	#<$X1JTX!$X1JFX>,SDLGS1#(SD) ; Clear I/O supress bits
+	CLR	R0			; Clear residue
+	BISB	PKDATA(R1),R0		; Pick up clear reason
+	CMP	R0,#X25R		; Valid reason?
+	BLO	1$			; Yes
+	CLR	R0			; No - indicate system error in network
+1$:	MOVB	X25RSN(R0),PKDATA(R1)	; Pick up X.25 clear reason
+	MOVB	#1,PKCNT(R1)		; Packet byte count = 1
+	BR	INSERT			; Go insert packet into transmit ring
+;-----
+; NEXILIS Disconnnect to X.25 Call Clearing reason translation table
+;
+; X.25 has the following Call Clearing reasons:
+;	000	DTE clearing
+;	001	number busy
+;	003	invalid facility request
+;	005	network congestion
+;	011	out of order
+;	013	access barred
+;	015	not obtainable
+;	021	remote procedure error
+;	023	local procedure error
+;	025	RPOA out of order
+;	031	number refuses reverse charging
+;	041	incompatable destination
+;-----
+	PURE
+
+X25RSN:	.BYTE	021			; .ER??? =  0 - undefined
+	.BYTE	005			; .ERLKF =  1 - link full
+	.BYTE	005			; .ERBFF =  2 - buffer space full
+	.BYTE	021			; .ERTIM =  3 - time-out
+	.BYTE	021			; .ER??? =  4 - undefined
+	.BYTE	011			; .ERLKD =  5 - link down
+	.BYTE	013			; .ERLKO =  6 - link disabled(by status device)
+	.BYTE	013			; .ER??? =  7 - link locked(no new connections)?
+	.BYTE	021			; .ER??? = 10 - undefined
+	.BYTE	021			; .ER??? = 11 - undefined
+	.BYTE	021			; .ER??? = 12 - undefined
+	.BYTE	021			; .ER??? = 13 - undefined
+	.BYTE	021			; .ER??? = 14 - undefined
+	.BYTE	005			; .ERNSA = 15 - no sockets avail on dst
+	.BYTE	021			; .ERSIU = 16 - socket in use on dst
+	.BYTE	015			; .ERNSN = 17 - no such node
+	.BYTE	015			; .ERNSH = 20 - no such host
+	.BYTE	015			; .ERNSD = 21 - no such device
+	.BYTE	015			; .ERNSS = 22 - no such socket on device
+	.BYTE	011			; .ERHSD = 23 - host down
+	.BYTE	015			; .ERHNA = 24 - host not available
+	.BYTE	015			; .ERCRF = 25 - connection refused
+	.BYTE	015			; .ERPNF = 26 - gateway down
+	.BYTE	021			; .ER??? = 27 - undefined
+	.BYTE	013			; .ERPRV = 30 - priviledge failure
+	.BYTE	021			; .ERISP = 31 - illegal seq of pkts
+	.BYTE	021			; .ER??? = 32 - undefined
+	.BYTE	021			; .ER??? = 33 - undefined
+	.BYTE	000			; .ERREQ = 34 - request
+	.BYTE	021			; .ERHNG = 35 - hangup
+	.BYTE	021			; .ERILD = 36 - inconsistent link data
+	.BYTE	023			; .ERDER = 37 - device service error
+	.BYTE	021			; .ERNSJ = 40 - no space for job data
+	.BYTE	021			; .ERJCX = 41 - job capacity exceeded
+	.BYTE	003			; .ERCRJ = 42 - network command reject
+	.BYTE	015			; .ERUNE = 43 - user name error
+	.BYTE	021			; .ERSPR = 44 - tymnet supervisor error
+	.BYTE	021			; .ERMUD = 45 - Tymnet MUD error
+	.BYTE	021			; .ERFER = 46 - TYMnet format error
+	.BYTE	021			; .ERRCC = 47 - recconnect seq complete
+	.BYTE	021			; .ERTRM = 50 - process terminated
+	.BYTE	021			; .ERRLS = 51 - device released
+	.BYTE	021			; .EROOP = 52 - out of originating ports
+	.BYTE	021			; .ERAQF = 53 - aux circut queue full
+	.BYTE	015			; .ERSVR = 54 - supervisor request 
+X25R	=! .-X25RSN
+
+	CODE
+
+;-----
+; Here on Disconnect ACK packet
+;-----
+DAKPKT:	CALL	CLRLOG			; Clear login mode for socket
+					;   and clear SBD control counters
+	BIC	#<$X1JTX!$X1JFX>,SDLGS1#(SD) ; Clear I/O supress bits
+	CALL	FRESOC#			; Put socket back on free list
+
+;-----
+; Fall through into the code to insert the X.25 packet into the frame level
+; transmit ring to be sent across the gateway
+;-----
+.PAGE
+	.SBTTL	INSERT - Insert X.25 packet into frame level transmit ring
+;-----
+; Here to insert packet into frame transmit ring
+;-----
+INSERT:	CLR	R0			; Clear residue
+	BISB	PKTYPE(R1),R0		; Pick up packet type
+	MOVB	X25PKT(R0),PKSEQ(R1)	; Store X.25 packet type
+
+;-----
+; Here to insert pkt into transmit ring without setting packet type
+;-----
+INSER1:	MOVB	#.LCG,PKTYPE(R1)	; Store X.25 logical channel group byte
+
+;-----
+; Here to insert pkt into transmit ring only setting socket #
+;-----
+INSER2:	MOVB	SDSOC#(SD),PKSOC(R1)	; Store socket # (X.25 channel #)
+
+;-----
+; Here to really insert packet into transmit ring
+;-----
+XMTPKT:	TST	R1			; Null packet pointer?
+	BNE	47$			; No
+
+	FSTOP	ZPI			; [ZERO PACKET INSERTED]
+
+47$:	MOV	DDLGLT#(R4),R0		; Pick up frame transmit ring tail
+
+	MOV	R1,(R0)+		; Store packet addr in ring
+	CMP	R0,DDLGLE#(R4)		; End of ring?
+	BLO	1$			; No
+	MOV	DDLGLB#(R4),R0		; Yes - reset ring tail
+
+1$:	INCB	DDLGVT#(R4)		; Bump transmit ring frame count
+	MOV	R0,DDLGLT#(R4)		; Update ring tail ptr
+	CJMP	LKGSTO#			; Start output if idle
+
+;-----
+; NEXILIS to X.25 packet type translation table
+;-----
+	PURE
+
+X25PKT:	.BYTE	000			; Data
+	.BYTE	.XCARQ			; Connection Request
+	.BYTE	.XCACF			; Connection ACK
+	.BYTE	.XCLRQ			; Connection NAK
+	.BYTE	000			; Function
+	.BYTE	.XINTR			; Interrupt
+	.BYTE	.XRERQ			; Eat
+	.BYTE	.XCLRQ			; Disconnect
+	.BYTE	.XCLRQ			; Kill
+	.BYTE	.XCLCF			; Disconnect ACK
+	.BYTE	000			; Recover
+	.BYTE	000			; Retry
+	.BYTE	000			; Packet ACK
+	.BYTE	000			; Undefined
+	.BYTE	000			; Undefined
+	.BYTE	000			; Undefined
+	.BYTE	000			; Undefined
+	.BYTE	000			; X.25 RR equivalent
+
+	CODE
+.PAGE
+	.SBTTL	LKGMOV - Translate X.25 packet to NEXILIS and move into node
+;-----
+; LKGMOV - Subroutine to move an X.25 packet into the node
+;
+; Linkage:
+;	C(R1) = address of packet
+;	C(R4) = address of DDB
+;
+;	CALL LKGMOV
+;
+; Returns:
+;	C(SD) = address of SDB
+;
+; Unpreserved registers:
+;	R0, R2, R3
+;-----
+LKGMOV::CLR	R0			; Clear residue
+	BISB	PKSOC(R1),R0		; Get logical channel # (socket #)
+	BNE	1$			; Ok if non-zero channel
+
+	CMPB	PKSEQ(R1),#.XRSRQ	; Is this a Restart Request?
+	BEQ	1$			; Yes - ok
+	CMPB	PKSEQ(R1),#.XRSCF	; No - is it a Restart Confirmation?
+	BEQ	1$			; Yes - ok
+	JMP	LKGFRE			; No - discard this packet
+
+1$:	ASL	R0			; Convert socket # to word index
+	ADD	DDSX#(R4),R0		; Add socket base for this link
+	MOV	-(R0),SD		; Pick up SDB ptr
+
+	MOVB	PKSEQ(R1),R0		; Get X.25 packet type (sign extend)
+	TBBE	$DATA,R0,PKTDAT		; Go process if data packet
+	TBBE	$SUPV,R0,PKTSUP		; Go process if supervisory
+
+	ASR	R0			; Unnumbered packet - shift out
+					;   rightmost bit
+	ADD	#3,R0			; Adjust for 0 base, not -4 (1 is still
+					;   in rightmost bit)
+	CMP	R0,#X25D		; Valid index?
+	BHIS	PKTILL			; No
+
+	MOV	X25DSP(R0),R2		; Yes - get dispatch addr from pkt type
+	ASR	R0			; Convert index to byte index
+	MOVB	NEXPKT(R0),PKTYPE(R1)	; Get NEXILIS pkt type
+	JMP	(R2)			; Dispatch on X.25 packet type
+
+;-----
+; Dispatch table for translating X.25 packets to NEXILIS packets
+;-----
+	PURE
+	.EVEN
+
+X25DSP:	.WORD	PKTRST			; Restart Request
+	.WORD	PKTRSC			; Restart Confirmation
+	.WORD	PKTILL			; Undefined
+	.WORD	PKTILL			; Undefined
+	.WORD	PKTCON			; Call Request
+	.WORD	PKTACK			; Call Accepted
+	.WORD	PKTDIS			; Clear Request
+	.WORD	PKTDAK			; Clear Confirmation
+	.WORD	PKTRES			; Reset Request
+	.WORD	PKTREC			; Reset Confirmation
+	.WORD	PKTINT			; Interrupt
+	.WORD	PKTITC			; Interrupt Confirmation
+X25D	=! .-X25DSP
+
+;-----
+; X.25 to NEXILIS packet translation table
+;-----
+NEXPKT:	.BYTE	0			; Restart Request
+	.BYTE	0			; Restart Confirmation
+	.BYTE	0			; Undefined
+	.BYTE	0			; Undefined
+	.BYTE	.PTCON			; Call Request
+	.BYTE	.PTACK			; Call Accepted
+	.BYTE	.PTDIS			; Clear Request
+	.BYTE	.PTDAK			; Clear Confirmation
+	.BYTE	0			; Reset Request
+	.BYTE	0			; Reset Confirmation
+	.BYTE	.PTINT			; Interrupt
+	.BYTE	0			; Interrupt Confirmation
+NEXP	=! .-NEXPKT
+
+	CODE
+.PAGE
+	.SBTTL	X.25 to NEXILIS packet translation
+;-----
+; Here on bad packet type translation
+;-----
+PKTILL:	INC	SDLGBP#(SD)		; Bump bad packet count
+	BR	LKGFRE			; Junk the packet
+
+;-----
+; Here on reset confirmation packet
+;-----
+PKTREC:	CALL	CLRLOG			; Clear login mode for socket
+					;   and clear SBD control counters
+
+;-----
+; Here on Restart Confirmation packet
+;-----
+PKTRSC:
+
+;-----
+; Here on Interrupt Confirmation packet
+;-----
+PKTITC:
+
+;-----
+; Here when unnumbered packet sent from here is acknowledged
+;-----
+PKTUAK:
+
+;-----
+; Here to free the packet list pointed to by R1
+;-----
+LKGFRE::PUSH	(R1)			; Save forward packet link
+	FREPKT				; Free a packet
+	POP	R1			; Retrieve forward packet link
+	BNE	LKGFRE			; Continue until packet list freed
+
+	RETURN				; Return to caller
+
+;-----
+; Here on X.25 data packet
+;-----
+PKTDAT:	INCB	SDLGRR#(SD)		; Bump pending RR count
+	CLR	R2			; Clear residue
+	BISB	SDLGPR#(SD),R2		; Pick up P(R) for logical channel
+	CLR	R3			; Clear residue
+	BISB	SDPMAX#(SD),R3		; Pick up warning value (window size)
+	ADD	R2,R3			; Add P(R) to get top of window
+
+	ASR	R0			; Right justify P(S) from packet
+	BIC	#$MASKP,R0		; Isolate P(S) from packet
+	CMP	R0,R2			; New P(S) inside window?
+	BHIS	1$			; Maybe - check high end
+	ADD	#.MODP,R0		; No - too low, add modulus so it is
+
+1$:	CMP	R0,R3			; New P(S) still inside window?
+	BLOS	PKTFLW			; Yes - go check P(R)
+					; No - fall into channel reset code
+
+;-----
+; Here to reset the logical channel and return
+;-----
+CRESET:	CMPB	#.SSCON,SDSTS1#(SD)	;ARE WE REALLY CONNECTED NOW?
+	BNE	PKTQAL			;NO-FORGET ABOUT THIS ERROR!
+	CALL	CLRSDX			; Clear SBD control counters
+
+	PUSH	R1			; Save a packet for send back
+	MOV	(R1),R1			; Get pointer to rest of packet list
+	BEQ	1$			; Skip if nothing there
+
+	CALL	LKGFRE			; Discard all but 1st packet on list
+
+1$:	POP	R1			; Retrieve packet for sendback
+	MOV	#<.LCG*400>,PKCNT(R1)	; Count = 0, logical channel group = 0
+	MOVB	#.XRERQ,PKSEQ(R1)	; X.25 packet type = Reset Request
+	JMP	SNDBA1			; Send this packet back to other side
+
+;-----
+; Here on supervisory packets
+;-----
+PKTSUP:	ASR	R0			; Convert SUPV function to word index
+	BIC	#$MASKP,R0		; Isolate supervisory function code
+	JMP	@PKSUDT(R0)		; Dispatch on SUPV function
+;-----
+; Supervisory function dispatch table
+;-----
+	PURE
+	.EVEN
+
+PKSUDT:	.WORD	PKTFLW			; RR packet
+	.WORD	PKTFLW			; RNR packet
+	.WORD	PKTFLW			; REJ packet
+	.WORD	CRESET			; Undefined supervisory function
+
+	CODE
+
+;-----
+; Here to do flow control update from P(R) of supervisory and info frames
+;
+; Note: P(R) contained in the new packet MUST be greater than or equal to the
+;	last P(R) received (last acknowledged packet number) AND less than
+;	P(S) for the channel (the next packet to be sent from this side)
+;
+;	P(S), P(R), and the previous P(R) are compared in a circular fashion
+;	using modulus arithmetic
+;-----
+PKTFLW:	MOVB	PKSEQ(R1),R0		; Get X.25 packet type
+	ASHI	-.SHFPR,R0		; Right justify P(R)
+	BIC	#$MASKP,R0		; Isolate P(R)
+
+	CLR	R2			; Clear residue
+	BISB	SDLGVR#(SD),R2		; Pick up last P(R) received
+	MOVB	R0,SDLGVR#(SD)		; Store newly received P(R)
+
+	CLR	R3			; Clear residue
+	BISB	SDLGPS#(SD),R3		; Pick up P(S) for channel
+
+	CMP	R3,R2			; Channel P(S) >= last P(R) received?
+	BHIS	1$			; Yes
+	ADD	#.MODP,R3		; No - too low - add modulus so it is
+
+1$:	CMP	R0,R2			; New P(R) >= last P(R) received?
+	BHIS	2$			; Yes
+	ADD	#.MODP,R0		; No - too low - add modulus so it is
+
+2$:	CMP	R0,R3			; New P(R) <= channel P(S)?
+	BHI	CRESET			; No - reset channel
+;-----
+; Update socket send ahead count
+;-----
+	SUB	R2,R0			; Yes - get # of packets to acknowledge
+	BEQ	4$			; Bypass if nothing ACK'd
+
+	CMPB	R0,SDACNT#(SD)		; Greater than send ahead count?
+	BLOS	3$			; No
+	MOVB	SDACNT#(SD),R0		; Yes - now it isn't
+	INC	DDERBF#(R4)		; Count buffer error
+3$:	MOVB	SDACNT#(SD),R3		; Get send ahead count
+	SUB	R0,R3			; Adjust by # packets ACK'd
+	MOVB	R3,SDACNT#(SD)		; Update send ahead count
+
+	PUSH	R1			; Save packet pointer
+	CALL	LGPOKC			; See if window opened now
+	POP	R1			; Restore packet pointer
+
+4$:	BITB	#$DATA,PKSEQ(R1)	; Data packet?
+	BNE	LKGFRE			; No - discard supervisory packet
+
+;-----
+; Here to check for qualified and unqualified data packets
+;-----
+PKTQAL:	TSTB	PKTYPE(R1)		; Qualified data packet?
+	BPL	PKTUNQ			; No - go Xlate unqualified data pkt
+	CJMP	LKGQAL#			; Yes - go translate it
+
+;-----
+; Here to send unqualified data packet into node
+;-----
+PKTUNQ:	TBBN	$X1JFX,SDLGS1#(SD),LKGJNK ; Discard packet if junking from X.25
+
+PKTUN1:	PUSH	(R1)			; Save next pkt ptr on list
+	TSTB	PKCNT(R1)		; Anything in packet?
+	BNE	1$			; Yes
+
+	FREPKT				; No - discard packet
+	BR	2$
+
+1$:	CLRB	PKTYPE(R1)		; Store data packet type
+	CALL	LKGSND			; Send packet into node
+
+2$:	POP	R1			; Retrieve linked pkt ptr
+	BNE	PKTUN1			; Continue until all packets sent
+
+	RETURN				; Return to caller
+
+;-----
+; Here to discard data packets while junking input from X.25 port
+;-----
+LKGJNK::CALL	LKGFRE			; Discard packet list
+	INCB	SDPCNT#(SD)		; Bump packet count for socket
+	CJMP	DECOWN#			; Now decrement it and return
+
+;-----
+; Here on Call Request packet
+;-----
+PKTCON:	PUSH	R1			; Save call req pkt ptr
+
+	TST	PKDATA(R1)		; DTE addr lens & fac fld len = 0?
+	BNE	1$			; No - not talking to right interface!
+	CMPB	PKCNT(R1),#7		; At least 1 login char?
+	BLO	1$			; No
+	TST	SDLGPH#(SD)		; In middle of login mode?
+	BEQ	2$			; No - ok
+
+1$:	JMP	BADCO1			; Blow off incoming conection
+
+2$:	MAKPKT	.PLSTP#			; Get a new packet
+	BCS	BADCO1			; NO PACKET AVAILABLE-REFUSE CONNECT
+
+;-----
+; Construct connect request packet in new packet - clear background first
+;-----
+	MOV	R1,R0			; Get packet pointer
+	MOV	#25,R2			; Get # words to clear
+
+3$:	CLR	(R0)+			; Clear packet word
+	SOB	R2,3$			; Continue until whole section cleared
+
+;-----
+; Store fixed bytes in connection request packet
+;-----
+	MOV	(SP),R0			; Point to X.25 call request packet
+
+	MOV	#<37+<.PTCON*400>>,PKCNT(R1) ; Store count, type
+	MOV	#<200+<11.*400>>,PKDATA(R1) ; Store version, data area count
+
+	TSTB	PKDATA+2(R0)		; Is source a terminal or a host?
+	BEQ	4$			; Host
+	MOVB	#.IDTR#,PKDATA+14(R1)	; Terminal
+
+4$:	MOVB	SDSOC#(SD),PKDATA+15(R1); Store source socket number
+	MOVB	#200,PKDATA+24(R1)	; Store priority level
+	MOVB	#4,PKDATA+31(R1)	; Store maximum packet count value
+	MOV	#<1*400>,PKDATA+32(R1)	; Store "terminal type"
+	MOV	#R.1200,PKDATA+34(R1) ; Store "baud rate", password
+					;   already checked
+
+	PUSH	R1			; Save connect packet pointer
+	PUSH	R4			; Save DDB pointer
+
+	CMPB	PKCNT(R0),#10		; At least 2 login chars?
+	BLO	6$			; No
+	MOVB	PKDATA+7(R0),R2		; Get 2nd login char
+	BIC	#^C177,R2		; Just 7 bits
+	CMP	#'X,R2			; Special login char?
+	BNE	6$			; No
+
+	MOVB	PKDATA+6(R0),R2		; Get 1st login char
+	BIC	#^C177,R2		; Just 7 bits
+	CMP	#'X,R2			; Special login char?
+	BEQ	5$			; Yes
+	CMP	#'!,R2			; Maybe
+	BNE	6$			; No
+
+	CMPB	PKCNT(R0),#11		; At least 3 login chars?
+	BLO	6$			; No
+	MOVB	PKDATA+10(R0),R2	; Get 3rd login char
+	BIC	#^C177,R2		; Just 7 bits
+	CMP	#'X,R2			; Is this really a special name?
+	BNE	6$			; No
+
+5$:	ADD	#4,R4			; Yes - point to special dest name
+6$:	ADD	#DDLGD1#,R4		; Get pointer to destination name
+	ADD	#PKDATA+6,R1		; Point at destination area
+	CALL	RD50XX#			; Convert 1st half to ASCII
+	CALL	RD50XX#			; Convert 2nd half to ASCII
+
+	MOV	2(SP),R1		; Get packet pointer
+	ADD	#PKDATA+16,R1		; Set pointer for source spec area
+
+	MOV	(SP),R4			; Get stored DDB ptr
+	ADD	#DDLKN1#,R4		; Get ptr to gateway name
+	CALL	RD50XX#			; Convert 1st half to ASCII
+	CALL	RD50XX#			; Convert 2nd half to ASCII
+
+	POP	R4			; Restore DDB ptr
+	POP	R1			; Restore connect pkt ptr
+	POP	R0			; Retrieve call req packet
+
+	CALL	CLRSDX			; Clear SBD control counters
+	BIC	#<$X1JTX!$X1JFX>,SDLGS1#(SD) ; Clear I/O supress bits
+
+	PUSH	R1			; Save connect packet pointer
+	MOV	R0,SDLGPH#(SD)		; Store login string pointer
+	MOV	R0,R1			; Copy pointer
+	CLRB	PKTYPE(R1)		; Convert to data packet
+	CLR	R2			; Clear residue
+	BISB	PKCNT(R1),R2		; Pick up packet byte count
+
+	SUB	#6,R2			; Get remaining byte count
+	MOVB	R2,PKCNT(R1)		; Store new byte count
+
+	INC	R2			; Round up to word boundary
+	ASR	R2			; Convert to word count
+
+	ADD	#PKDATA,R1		; Point to beginning of data area
+	ADD	#PKDATA+6,R0		; Point to beginning of login string
+
+7$:	MOV	(R0)+,(R1)+		; Compress data to beginning of pkt
+	SOB	R2,7$			; Continue until data compressed
+
+	POP	R1			; Retrieve connect packet pointer
+	BR	LKGSND			; All done - send connect packet into node
+;-----
+; Here on errors in call request packet
+;-----
+BADCON:	FREPKT				; Discard connect packet
+
+BADCO1:	MOV	@(SP),R1		; Get 2nd thru last packet of call req
+	BEQ	1$			; Skip if only 1 pkt on chain
+	CALL	LKGFRE			; Free all but 1st pkt
+
+1$:	POP	R1			; Restore call request packet pointer
+	CLR	(R1)			; De-link 1st pkt from rest
+	MOVB	#.XCLRQ,PKSEQ(R1)	; Change packet to call clearing
+	MOVB	#1,PKCNT(R1)		; Store byte count
+	MOVB	#021,PKDATA(R1)		; Indicate "remote procedure error"
+
+	JMP	SNDBA1			; Go send call clearing packet back
+
+;-----
+; Here on call connected packet
+;-----
+PKTACK:	CALL	LKGFRE			; Discard incoming call connected pkt
+	CALL	CLRLOG			; Clear login mode for socket
+					;   and clear SBD control counters
+	BIC	#$X1WCA,SDLGS1#(SD)	;NO LONGER WAITING FOR CALL ACCEPTED
+	CJMP	LGPOKC			; Window open - see if pkts waiting
+
+;-----
+; Here on interrupt packet
+;-----
+PKTINT:	MOV	#.XITCF,R0		; Send back pkt type = intrpt confirm
+	CLR	R2			; Data area is empty
+
+	PUSH	R1			; Save R1
+	CALL	SNDBAK			; Send interrupt confirmation back
+	POP	R1			; Restore packet pointer
+
+	MOVB	#2,PKCNT(R1)		; Data area has 2 bytes
+	CLR	PKDATA(R1)		; Null marker is noop function
+
+
+	.SBTTL	LKGSND - Subroutine to send translated packet into node
+;-----
+; Here to send translated packet into node
+;-----
+LKGSND::INCB	SDPCNT#(SD)		; Bump packet count
+	CJMP	SNDPKT#			; Go send pkt into node
+
+;-----
+; Here on clear request packet
+;-----
+PKTDIS:	CALL	CLRLOG			; Clear login mode for socket
+					;   and clear SBD control counters
+	BIC	#<$X1JTX!$X1JFX>,SDLGS1#(SD) ; Clear I/O supress bits
+
+	MOVB	PKDATA(R1),R0		; Get X.25 clearing reason
+	CMP	R0,#NEXR		; Valid reason?
+	BLO	1$			; Yes
+	MOVB	#.ERILD,PKDATA(R1)	; No - indicate system error in network
+	BR	2$			; Go put gateway name into packet
+
+1$:	MOVB	NEXRSN(R0),PKDATA(R1)	; Pick up NEXILIS equivalent reason
+
+2$:	PUSH	R1			; Save packet pointer
+	PUSH	R4			; Save DDB address
+
+	MOV	#1,R0			; Already 1 byte in packet
+	ADD	#PKDATA+1,R1		; Get pointer to packet data area
+	ADD	#DDLKN1#,R4		; Get pointer to gateway name
+
+	CALL	RD50XX#			; Convert 1st half of name to ASCII
+	CALL	RD50XX#			; Convert 2nd half of name to ASCII
+
+	POP	R4			; Restore DDB address
+	POP	R1			; Restore packet pointer
+
+	MOVB	R0,PKCNT(R1)		; Store packet byte count
+	BR	LKGSND			; Send pkt into node
+
+;-----
+; X.25 Call Clearing to NEXILIS Disconnect reason translation table
+;-----
+	PURE
+
+NEXRSN:	.BYTE	.ERREQ			; DTE clearing(0)
+	.BYTE	.ERSIU			; Number busy(1)
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERNSH			; Invalid call(3)
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERBFF			; Network congestion(5)
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERLKD			; Out of order(11)
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERCRF			; Access barred(13)
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERGWD			; Not obtainable(15)
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Remote procedure error(21)
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Local procedure error(23)
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERCRF			; RPOA out of order
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERCRF			; Number refuses reverse charging(31)
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERILD			; Undefined
+	.BYTE	.ERCRF			; Incompatable destination(41)
+NEXR	=! .-NEXRSN
+
+	CODE
+
+;-----
+; Here on clear confirmation packet
+;-----
+PKTDAK:	CALL	CLRLOG			; Clear login mode for socket
+					;   and clear SBD control counters
+
+	CLRB	PKCNT(R1)		; Null data area
+	BIC	#$X1WCA,SDLGS1#(SD)	;CLEAR FLAG
+	BR	LKGSND			; Send pkt into node
+
+;-----
+; Here on restart request packet
+;-----
+PKTRST:	PUSH	R1			; Save packet pointer
+	CALL	LKGDWX			; Declare link down for now
+	CALL	LNKUP#			; Declare link up to reset this side
+	POP	R1			; Restore packet pointer
+	CLRB	PKCNT(R1)		; No data in packet
+	MOVB	#.XRSCF,PKSEQ(R1)	; Send back packet = restart confirm
+	BR	SNDBA1			; Send back restart confirmation pkt
+
+;-----
+; Here on reset request packet
+;-----
+PKTRES:	CALL	CLRLOG			; Clear login mode for socket
+					;   and clear SBD control counters
+
+	PUSH	R1			; Save first packet for sendback
+
+	MOV	(R1),R1			; Get rest of list
+	BEQ	1$			; Skip if nothing there
+
+	CALL	LKGFRE			; Discard all but 1st pkt on list
+1$:	CALL	LGPOKC			;SEE IF WINDOW IS OPEN NOW
+	POP	R1			; Retrieve packet pointer
+
+	CLRB	PKCNT(R1)		; Packet byte count = 0
+	MOVB	#.XRECF,PKSEQ(R1)	; Store X.25 clear confirm pkt type
+	BR	SNDBA1			; Send back the prepared packet
+.PAGE
+	.SBTTL	SNDBAK - Subroutine to send generated response back
+;-----
+; SNDBAK - Subroutine to send a packet back to the other end of the channel
+;
+; Linkage:
+;	C(R0) = X.25 packet type
+;	C(R2) = # bytes in data field
+;	S (transient scratch area) = data field bytes
+;
+; Unpreserved registers:
+;	R0, R1, R2
+;-----
+SNDBAK:	MAKPKT	.PLSTP#			; Get a packet
+	BCC	1$			; Ok if got a packet
+	RETURN				; Forget it if none available
+
+1$:	MOVB	#.LCG,PKTYPE(R1)	; Store logical channel group byte
+	MOVB	SDSOC#(SD),PKSOC(R1)	; Store logical channel number
+	MOVB	R0,PKSEQ(R1)		; Store packet type byte
+	MOVB	R2,PKCNT(R1)		; Store packet byte count
+	BEQ	SNDBA1			; Bypass if nothing to do
+
+	PUSH	R1			; Save packet pointer
+	ADD	#PKDATA,R1		; Add offset to packet data area
+	MOV	#S#,R0			; Pick up pointer to scratch area
+	ASR	R2			; Convert byte count to word count
+
+2$:	MOV	(R0)+,(R1)+		; Move scratch word to packet
+	SOB	R2,2$			; Continue until packet data stored
+
+	POP	R1			; Restore packet pointer
+
+;-----
+; Send packet directly back or buffer it in send back list
+;-----
+SNDBA1:	TBBN	$D1ACT,DDSTS1#(R4),1$	; If active - buffer packet
+	JMP	XMTPKT			; Inactive - go send packet
+
+1$:	TST	DDLGAT#(R4)		; Anything on send back list?
+	BEQ	2$			; No
+	MOV	R1,@DDLGAT#(R4)		; Yes - link this packet into list
+	BR	3$			; Go update tail pointer
+2$:	MOV	R1,DDLGAH#(R4)		; Update send back list header
+3$:	MOV	R1,DDLGAT#(R4)		; Update send back list tail
+	RETURN				; Return to caller
+.PAGE
+	.SBTTL	CLRLOG	- Clear login mode for socket
+;-----
+; CLRLOG - subroutine to clear login mode timer and status bits
+;
+; Linkage:
+;	SD - SDB pointer
+;
+;	CALL	CLRLOG
+;-----
+CLRLOG:	PUSH	R0			; Save registers
+	PUSH	R1
+	PUSH	R2
+	PUSH	R3
+
+	MOV	#CONTIM,R1		; Get time-out dispatch address
+	CALL	TIMKIL#			; Kill timer request
+
+	MOV	SDLGPH#(SD),R1		; Get call request pkt list head
+	BEQ	1$			; Skip if nothing there
+
+	CALL	LKGFRE			; Discard previous call request
+	CLR	SDLGPH#(SD)		; Clear packet list pointers
+	CLR	SDLGPT#(SD)
+
+1$:	POP	R3			; Restore registers
+	POP	R2
+	POP	R1
+	POP	R0
+
+	BIC	#<$X1LOG!$X1WCA>,SDLGS1#(SD) ; Clear login mode flags
+;-----
+; Drop through into CLRSDX to clear SDB control counters
+;-----
+
+
+	.SBTTL	CLRSDX	- Clear SDB control counters
+;-----
+; CLRSDX - Subroutine to clear control counters in SDB
+;
+; Linkage:
+;	SD - SDB pointer
+;
+;	CALL	CLRSDX
+;-----
+CLRSDX:	CLRB	SDLGVR#(SD)		; Clear last received P(R)
+	CLRB	SDLGPR#(SD)		; Clear this end's P(R)
+	CLRB	SDLGPS#(SD)		; Clear this end's P(S)
+	CLRB	SDLGRR#(SD)		; Clear this end's pending RR count
+	CLRB	SDFCNT#(SD)		; Clear socket flag count
+	CLRB	SDACNT#(SD)		; Clear socket send ahead count
+
+	RETURN
+.PAGE
+	.SBTTL	LKGDWX	- Clean up sockets on Restart Request
+;-----
+; LKGDWX - subroutine to clean up socket data for restart request packet
+;
+; Linkage:
+;	R4 - DDB pointer
+;
+;	CALL	LKGDWX
+;-----
+LKGDWX:	PUSH	R0			; Save registers
+	PUSH	R1
+	PUSH	R2
+
+	CALL	LNKDWN#			; Declare link down
+	BIC	#$D1ACT,DDSTS1#(R4)	; Declare link inactive
+
+	MOV	DDSX#(R4),R0		; Get 1st SX table entry addr
+	MOVB	DDSOC#(R4),R2		; Get # sockets on link
+	TST	-(R0)			; Decrement SDB pointer
+
+1$:	MOV	(R0)+,SD		; Get SDB address
+	CLR	SDLGS1#(SD)		; Clear packet level status word
+	CALL	CLRLOG			; Clear login mode for socket
+					;   and clear SBD control counters
+	SOB	R2,1$			; Continue until all sockets reset
+
+	MOV	DDLGAH#(R4),R1		; Get send back list head
+	BEQ	3$			; Bypass if nothing there
+
+2$:	PUSH	(R1)			; Save forward packet link
+	FREPKT				; Free the packet
+	POP	R1			; Retrieve forward packet link
+	BNE	2$			; Continue until list freed
+
+	CLR	DDLGAH#(R4)		; Clear send back list head
+	CLR	DDLGAT#(R4)		; Clear send back list tail
+
+3$:	POP	R2			; Restore registers
+	POP	R1
+	POP	R0
+	RETURN				; Return to caller
+
+	PURE
+	.EVEN
+
+	.END
+ 1@w¢
