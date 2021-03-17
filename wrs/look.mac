@@ -1,0 +1,333 @@
+;	Fortran-4 compatable macro routines to:
+;		Build a circuit,
+;		Tear down a circuit,
+;		Get one char in,
+;		Get one char out,
+;		Get an A5 string out,
+;		Convert an A5 string to upper-case,
+;		Check if a any circuits exist,
+;		Check status of all circuits,
+;		get system name,
+;		get system number,
+;		get origination node number,
+;		Detach a job.
+
+;	Written by Bill Sheible
+;	Enhanced by John Kopf (15/May/81)
+;	Enhanced by Bill Soley (25-Oct-83)
+;	    add timeouts to GTCHAR
+;	    handle yellow balls in GTCHAR
+;	    handle circuit zaps in GTCHAR
+;	    *MUCH* faster OUTSTR
+
+;	NOTE	"#" in argument descriptions indicates function return too.
+;		(that is, this argument is also returned in AC 0, and thus this
+;		routine may be declared a function).
+
+
+$FOR=^D4	;which FORTRAN?
+
+.AXI8S==1
+.AXLDE==11
+.AXOPC==67
+.GTLIN==-27
+.GTJOB==-26
+
+;	Generate Fortran-4 / Fortran-10 compatable macros
+;	expects symbol $FOR to have value 4 or ^D10...
+;		others default to 4 with error message
+;	DEFINES:
+;		$ENTRY	LABEL	Define routine entry point.
+;		$RET	N	SKIP-N Return (exit from routine) (N=No. args)
+;		$END		END assembly (takes care of LIT and VAR)
+;		$DATA		Declare data area.
+;		$CODE		Declare code area.
+;	("LOOK" in TITLE is module name)
+
+	IFN	<$FOR-4>*<$FOR-^D10>,< PRINTX '$FOR ill-defined, using 4'>
+    IF2,<
+	IFE	<$FOR-4>,< printx Assembling for FORTRAN-IV >
+	IFE	<$FOR-12>,< printx Assembling for FORTRAN-10 >
+    >
+
+	IFE	$FOR-^D10,<	;	FORTRAN-10
+	TITLE	LOOK10
+	TWOSEG
+	RELOC	400000
+
+	DEFINE	$ENTRY(LABEL)<
+	ENTRY	LABEL
+LABEL:	>
+
+	DEFINE	$RET(N)<
+	POPJ	17,>
+
+	DEFINE	$END<
+	LIT
+	RELOC	0
+	VAR
+	END>
+
+	DEFINE	$DATA<
+	RELOC	0>
+
+	DEFINE	$CODE<
+	RELOC	400000>
+
+>
+
+	IFN	$FOR-^D10,<	;	FORTRAN-4
+	TITLE	LOOK4
+
+	DEFINE	$ENTRY(LABEL)<
+	ENTRY	LABEL
+LABEL:	0>
+
+	DEFINE	$RET(N)<
+	JRA	16,N(16)>
+
+	DEFINE	$END<
+	END>
+
+	DEFINE	$DATA<>
+
+	DEFINE	$CODE<>
+
+>
+
+;	BCIR (LOGIN_STRING,PORT,#ERROR)
+;	------------------------------
+;	Routine to build a circuit...
+;		Passes back the port,
+;		Or the reason for the failure
+;	If ERROR 0 then circuit built...then PORT has the base port #
+	$ENTRY	BCIR
+	HRRZ	1,0(16)			;Get the login-string pointer
+	CREAUX	1,			;Build the circuit
+	JRST	BCIR1			;Error
+	HRRZM	1,@1(16)		;Send back the port number
+	SETZB	0,@2(16)		;Set no error
+	$RET	3			;Normal return
+BCIR1:	MOVEM	1,@2(16)		;Send back error code
+	MOVE	0,1			;Put in AC 0 too
+	$RET	3			;And return
+
+
+;	Routine to zap a circuit
+;	Call as ZAP(PORT)
+	$ENTRY	ZAP
+	MOVE	1,@0(16)
+	ZAPCIR	1,
+	$RET	1	
+
+
+
+;	CHECK (#RESPONSE)
+;	----------------
+;	Routine to see if job has any aux circuits
+;	RESPONSE is set to -1 if any aux circuits exist, otherwise 0
+;
+	$ENTRY	CHECK
+	HRROI	0,1			;[-1,,1]...read an entry into 1
+	AUXRED	0,
+	 JRST	[SETOB	0,@0(16)	;there is >= 1 aux cir, return -1
+		JRST .+2]
+	 SETZB	0,@0(16)		;there is 0 aux cir, return 0
+	$RET	1	
+
+
+
+;	GETCH (PORT,#CHAR)
+;	GETCH (PORT,#CHAR,TIME)
+;	-----------------
+;	Returns one of following:
+;		#CHAR .GE. 0		#CHAR is a received 8 bit character
+;		#CHAR .EQ. -1		no character or time out
+;		#CHAR .EQ. -2		no circuit (zapped)
+;
+;	TIME is an INTEGER constant or variable indicating the time in
+;	seconds to wait for a character.  0 means to wait for ever.
+;	This argument may be omited in which case it will not wait at all
+;	(-1 returned unless character is already waiting in buffer).
+
+	$ENTRY	GTCHAR
+GTCHA0:	HRLZ	1,@0(16)	;get the port number
+	HRRI	1,.AXI8S
+	AUXCAL	1,0		;if chr rdy then put in 0 and skip
+	 JRST	GTCHA2		;go decide why no character
+GTCHA1:	MOVEM	0,@1(16)	;return character (or error code)
+	$RET	2
+GTCHA2:	HRLO	1,@0(16)	;port # in left half
+	JUMPL	1,GTCHA3	;check for command port reference
+	;check for aux port zapped
+	PJOB	0,		;job # in 0
+	HRRI	1,.GTJOB	;get job who owns port
+	GETTAB	1,
+	 JRST	RETM2
+	CAMN	0,1		;owned by this job?
+	 JRST	GTCHA4
+RETM2:	HRROI	0,-2		;return -2 (port zapped)
+	JRST	GTCHA1
+GTCHA3: ;check for TTY port zapped
+	HRROI	1,.GTLIN
+	GETTAB	1,		;get sixbit TTY name (lh = 0 if detached)
+	 JRST	RETM2
+	JUMPGE	1,RETM2		;(sixbit TTYxxx is negative)
+GTCHA4:	;simulate input wait - reflect yellow balls
+	HRLZ	1,@0(16)	;get port number
+	HRRI	1,.AXLDE	;leave deferred echo mode
+	AUXCAL	1,
+	;check for 3rd argument
+    ife $FOR-^D4,<
+	LDB	0,[point 9,2(16),8]
+	CAIE	0,320		;opcode F4 uses for arguments (JUMP)
+	 JRST	RETM1		;no time specified - return -1
+    >
+    ife $FOR-^D10,<
+	MOVE	0,-1(16)	;get # of args from F10 call
+	CAIGE	0,3		;3 or more means time out specified
+	 JRST	RETM1
+    >
+	;do hiber for character ready
+	HRLZI	0,11		;wait for character in seconds
+	SKIPL	1,@0(16)	;get port number - skip if TTY:
+	 TLO	0,100		;set aux circuit flag
+	DPB	1,[point 9,0,8]	;setup port number field
+	HRR	0,@2(16)	;setup time limit field
+	HIBER	0,		;wait for character or such
+	 JRST	GTCHA0		;due to interrupt?
+	HRLZ	1,@0(16)	;get the port number
+	HRRI	1,.AXI8S
+	AUXCAL	1,0		;if chr rdy then put in 0 and skip
+	 JRST	RETM1		;no character now means time out
+	JRST	GTCHA1		;return the character
+RETM1:	HRROI	0,-1		;return -1 to say time out - no char
+	JRST	GTCHA1	 
+
+
+
+;	OUTONE(PORT,DATA)
+;	-----------------
+;	Output a single char...
+	$ENTRY	OUTONE
+	HRL	1,@0(16)		;The port number
+	HRRI	1,3			;[PORT,,3]...Pack in the request type
+	AUXCAL	1,@1(16)		;Send char out
+	$RET	2			;Don't send anything back
+
+
+
+
+;	OUTSTR(PORT,DATA)
+;	-----------------
+;	Output a character string...
+;		start at word boundary;
+;		terminate with '$' or null.
+	$ENTRY	OUTSTR
+	SETZ	0,		;clear character counter
+	HRLI	1,(POINT 7,0)	;build byte pointer
+	HRR	1,1(16)
+OS1:	ILDB	2,1		;get the next byte
+	CAIE	2,0		;exit if null,
+	 CAIN	2,"$"		;or if "$"
+	  JRST	OS2
+	AOJA	0,OS1		;count characters up to $ or \0
+OS2:	HRLI	1,(POINT 7,0)	;build byte pointer
+	HRR	1,1(16)
+	HRLZ	2,@0(16)	;get port number
+	HRRI	2,.AXOPC	;output string with pointer and count
+	AUXCAL	2,0
+	$RET	2
+
+
+;	UPCASE(#A5)
+;	-----------
+;	Convert an A5-format value to Upper-case.
+	$ENTRY	UPCASE
+	MOVE	0,[ASCII '@@@@@']	;mask for characters 100-177
+	AND	0,@0(16)		;find those characters with bit set
+	LSH	0,-1
+	ANDCAB	0,@0(16)		;do the conversion...141 --> 101, etc.
+	$RET	1			;then exit
+
+
+
+
+;	CIRCK (N,ARRAY,#CIRCNT)
+;	Check status of all circuits
+	$ENTRY	CIRCK
+	HRL	0,@0(16)		;Count to left half of AC 0
+	HRR	0,1(16)			;Table addr to right-half
+	AUXRED	0,			;Read aux-cir state table
+	JRST	[SETOM 0,@2(16)		;No circuits
+		 $RET 3]
+	MOVEM	0,@2(16)		;Cir into CIRCNT
+	$RET	3			;Return
+
+
+
+;	CALL GETSYS(#A5)
+;	---------------
+;	This routine gets the system name as an A5 character string.
+;	Output  A5 - System number in A5 like "C33xx"
+	$ENTRY	GETSYS
+	MOVE	0,[ASCII '     ']	;Init area
+	MOVEM	0,@0(16)
+	HRRZI	0,11			;[0,,11]==[%CNFGO,,.GTCNF]
+	GETTAB	0,			;Get sysno
+	$RET	1			;Error, return blanks
+	MOVEM	0,@0(16)		;Set in A5
+	$RET	1			;Return
+
+
+
+;	CALL GETSYN(#II)
+;	---------------
+;	This routine gets the system number as an integer.
+	$ENTRY	GETSYN
+	MOVE	0,[33,,11]		;[.CNSYS,,.GTCNF]
+	GETTAB	0,			;Get sysno
+	SETZ	0,			;Error, return 0
+	MOVEM	0,@0(16)		;Set in II
+	$RET	1			;Return
+
+
+
+;	CALL GETNOD(#NODE)
+;	-----------------
+;	Get originating node number for this job
+;	OUTPUT  NODE - node number, 0 if error in access
+
+	$ENTRY	GETNOD
+	HRROI	1,-24			;[-1,,-24]==[THIS PORT,,.GTLOG DATA]
+	GETTAB	1,			;Fetch xxxxxxxxxxxxxxHHHH HHxxLLLLLLxxxxxxxx
+	SETZ	1,			;Error in access
+	SETZ	0,			;Build value in ACC 0
+	LSH	1,-10			;..HHHHHHxxLLLLLL
+	DPB	1,[ POINT 6,0,0]	;Low order 6-bits
+	LSH	1,-10			;...HHHHHH
+	DPB	1,[ POINT 6,0,6]	;High order 6-bits
+	MOVEM	0,@0(16)		;Deposit node number
+	$RET	1			;Return
+
+
+
+;	CALL DETJOB
+;	-----------
+;	Detach the job and continue running
+	$ENTRY	DETJOB
+	SETZ	1,			;Detach
+	ATTACH	1,
+	$RET	0	
+
+
+
+;	CALL RCLINE
+;	-----------
+;	Next data accepted will be Command_line buffer
+	$ENTRY	RCLINE
+	RESCAN				;Allow command_line to be read
+	$RET	0			;Return
+
+	$END
+    
