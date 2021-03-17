@@ -1,0 +1,1232 @@
+begin "ftp controller"
+define version!string = """* DEC-10 TYMLINK 0.06  """, DebugSW = TRUE;
+
+COMMENT *** beginning of SAIL extensions: ;
+require "(SAILIB)SAIL.DEF" source!file;
+  !get!module(EXTEND);
+  !get!module(BRKFNS);
+
+define #E.BL = '100;	! EBCDIC blank.;
+define eif = "else if";
+define inc(var,val) = { IFCR length(cvps(val))=0 or equ(cvps(val),"1")
+			THENC increment(var) ELSEC addto(var,val) ENDC};
+define dec(var,val) = { IFCR length(cvps(val))=0 or equ(cvps(val),"1")
+			THENC decrement(var) ELSEC addto(var,-val)ENDC};
+	simple integer procedure increment(reference integer var); 
+		start!code aos 1,var; end;
+	simple integer procedure decrement(reference integer var); 
+		start!code sos 1,var; end;
+	simple integer procedure addto(reference integer var; integer val); 
+		start!code move 1,val; addb 1,var; end;
+
+IFCR declaration(easy)=0
+ THENC IFCR DebugSW
+	 THENC define easy=""; let routine=procedure;
+	 ELSEC let easy=simple; define routine="easy procedure";
+	ENDC
+ENDC
+! end of SAIL extensions.;
+
+define dead!transport!minimum = 72, this!checksum!version = 1;
+
+! commands: ;
+define c.unknown=0;
+forlc nam=(noop, quit, send, receive, size, status, blockRead,
+	blank, tail, itab, starOk, noCheck, assumeAck)
+   doc {define c.}&{nam=c.unknown; redefine c.unknown=c.unknown+1;} endc
+
+! program transfer modes: ;
+define m.AST=1, m.BIN=2, m.guess=3;
+
+
+boolean did!something		! set true so illegal can pop out.;
+				! true if a real command processed;
+,	drop!blank!lines	! true to drop trailing blank lines;
+				! on pages in AST files;
+,	clipping!tail		! true if ...ppp<sp><cr> -> ...ppp<cr>;
+,	adding!tabs		! true if tabs inserted on reception;
+				! later this may be expanded to include;
+				! tab suppression of <Tenex>clean;
+,	starOk			! (WILDCHECK) Allow checksum `**';
+,	noCheck			! Don't do the checksum part on input;
+,	assumeAck		! Don't wait for Ack messages;
+;
+
+integer transfer!mode		! general mode for file transfers;
+,	read!length		! max count of file chars per read;
+;
+define min#code = 0; define max#code = min#code-1;
+define #code(name) = {redefine max#code = max#code + 1;
+			define name = max#code};
+! transport level:;
+	#code(#header);
+	#code(#trailer);
+	#code(#shift!in);
+	#code(#shift!out);
+! PTC (in transport):	body ::= encoded( [PTC] ...text... [Checksum] );
+	#code(#data!PTC);
+! link PSC:; 
+	#code(#ack!PSC); ! positive acknowledge (data: topOk,botNeed);
+	#code(#nak!PSC); ! negative acknowledge (data: dead PID);
+	#code(#rfr!PSC); ! request for response (null data);
+
+	#code(#link!PTC);
+	#code(#rrq!PSC); ! Reset request (data: reset table);
+	#code(#rrp!PSC); ! Reset response (data: reset table);
+	#code(#com!PSC); ! unused;
+! data PSC:; 
+
+! PID -- Packet ID;
+! [header] ...body... [trailer]
+! ...body... ::= encoded( [PTC] ...text... [Checksum] )
+! PTC = Link:
+!	...text... ::= [PSC] data
+!	PSC = ACK:	data ::= [PID.lastgood] [PID.maxSend] 
+!	PSC = NAK:	data ::= [PID.guessed.bad]
+!	PSC = RFR:	data ::= <<nothing>>
+!	PSC = COM:	<undefined as of yet>
+!	PSC = RRQ:	data ::= Reset.Table
+!	PSC = RRP:	data ::= Reset.Table
+! PTC = Data:
+!	...text... ::= [PID] [PSC] data
+!	{{PID is the Packet identifier}}
+!	{{PSC is Data class header without the Link bit.}}
+;
+
+COMMENT ******* Appendix A-1 *******; 
+
+define	dataClass.isData	= '200
+,	dataClass.target.mask	= '140
+,	  dataClass.target.link	= '000
+,	  dataClass.target.data	= '040
+,	  dataClass.target.2	= '100
+,	  dataClass.target.3	= '140
+,	dataClass.isServer	= '020
+,	dataClass.isVital	= '010
+,	dataClass.meaning.mask	= '007
+,	  !Reply.Optional		= '000
+,	  !Reply.Required		= '001
+,	  !Positive.Reply		= '002
+,	  !Negative.Reply		= '003
+,	  !Explanatory.Reply		= '004
+,	  !Information.Request		= '005
+;
+COMMENT ******* Appendix A-1 *******; 
+define	dataHeader.opcode.mask	= '340
+,	dataHeader.op0.EOR	= '040
+,	dataHeader.opx.AsIs	= '040
+,	dataHeader.op0.EOF	= '100
+,	dataHeader.opx.Zero	= '100
+,	dataHeader.op0.EOD	= '140
+,	dataHeader.opx.SPACE	= '140
+,	dataHeader.opx.COPY	= '200
+,	dataHeader.opx.BLANK	= '240
+,	dataHeader.count.mask	= '037
+;
+
+COMMENT ******* Appendix A-3 *******; 
+
+define	LinkControl.isYours	= '200
+,	LinkControl.op.mask	= '177
+,	LinkControl.op.header	= '001
+,	LinkControl.op.trailer	= '002
+,	LinkControl.op.nonSpec	= '003
+,	LinkControl.op.setACK	= '004
+,	LinkControl.op.setNAK	= '005
+,	LinkControl.op.setRFR	= '006
+,	LinkControl.op.setSI	= '007
+,	LinkControl.op.setSO	= '010
+,	LinkControl.op.Xmt.bits	= '011
+,	LinkControl.op.timeout	= '012
+,	LinkControl.op.MaxPacket ='013
+,	LinkControl.op.Config	= '014
+,	LinkControl.op.nameIt	= '015
+,	LinkControl.op.PID.range ='016
+;
+
+COMMENT ******* Appendix A-4 *******; 
+
+define	ApplControl.op.do.send	= '001
+,	ApplControl.op.do.receive ='02
+,	ApplControl.op.start.xfr ='003
+,	ApplControl.op.stop.xfr	= '004
+,	ApplControl.op.stop.FTP	= '005
+,	ApplControl.op.is.name	= '006
+,	ApplControl.op.treatment ='007
+,		treatment.replace	= 1, 
+,		treatment.append	= 2, 
+,		treatment.must.exist	= 3, 
+,	ApplControl.op.size.bytes='010
+,	ApplControl.op.File.type ='011
+,		file.type.Bytes		= 1, 
+,		file.type.Bits		= 2, 
+,		file.type.AST		= 3, 
+,	ApplControl.op.rec.size	= '012
+,	ApplControl.op.size.recs ='013
+,	ApplControl.op.Author	= '014
+,	ApplControl.op.create	= '015
+,	ApplControl.op.update	= '016
+,	ApplControl.op.now	= '017
+;
+integer	other!ftp!Version	! of FTP spoken;
+,	other!window!size	! this is ignored, so why send;
+,	other!checksum!type	! who knows? means this style;
+,	max!transport!out	! max to send (after encoding). 0:64K-1;
+,	timeout!seconds		! clock the other end suggested;
+;
+boolean	timer!there 	! the other end has a clock on the circuit.;
+;
+! Reset.table: [2] Version
+!	[32] Bit vector of receivable character set
+!	[2] Max Transport packet length after encoding
+!	[1] Window size << implied by the protocol, so what the... >>
+!	[1] Header character
+!	[1] Trailer character
+!	[1] Link Packet type character (PTC)
+!	[1] Shift-to-Encoding character
+!	[1] Shift-from-Encoding character
+!	[1] Checksum type identifier
+!	[1] # of seconds till timeout (How about exponent:4, val:4?)
+!	[1] Timer at this end ("Y" or "N")
+;
+
+let boundType = string;	! for ease in reading prog output: really integer;
+
+
+boundType array inBound
+,		outBound [ min#code : max#code ]
+;
+boolean array must!encode		! strictly an outbound affair;
+,	transmittable			! again outbound;
+,	receivable [ 0 : 255 ]		! Ahhh, inbound;
+;
+boolean	inBound!header!breaks!Inchwl	! false if header passes inchwl;
+,	inBound!trailer!breaks!Inchwl	! false if trailer passes inchwl;
+;
+integer	inBound!pid!all!good		! received through data packet;
+,	inBound!pid!top!allowed		! will take through ...;
+,	outBound!pid!all!good		! he's got thru this;
+,	outBound!pid!top!allowed	! he'll take thru this;
+,	outBound!pid!sent		! we've sent thru this;
+;
+! break tables;
+integer pass!outBound!asis	! allows though all but mustencode;
+,	to!inBound!shift!in	! pass to (& drop) inBound[#shift!in];
+,	skip!inBound!header	! pass to (& drop) inBound[#header];
+,	aWord			! pass one word and upper case it;
+,	read.ast.break		! to read one line from a file;
+,	ast!pass		! breaks on any non-Ast character (#ht);
+;
+
+simple procedure setup!breaks;
+begin	string seps;
+	integer i;
+seps := #sp & #ht & crlf & "|,+&";
+setbreak( aWord := getbreak, seps, seps, "INSKT" );
+
+setbreak( read.ast.break := getbreak, #ff & #lf, #cr, "INS" );
+
+seps := '177; for i := 1 step 1 until '37 do seps := seps & i;
+setbreak( ast!pass := getbreak, seps, #nul, "IR" );
+
+! next three just insure reserved tables;
+setbreak( to!inBound!shift!in := getbreak, 0, 0, "INS" );
+setbreak( skip!inBound!header := getbreak, 0, 0, "INS" );
+setbreak( pass!outBound!asis :=  getbreak, 0, 0, "INS" );
+end;
+require setup!breaks initialization[0];
+
+! OS interfaces: ;
+boolean routine canFind( string file ); return(true);
+	! canfind(f) is true if at least one such file exists;
+
+integer routine guess!mode( string file!name );
+begin 
+outstr("I guess `"); 
+outstr( file!name );
+outstr( "' is AST." & crlf ); 
+return(m.AST); 
+end;
+
+simple integer procedure now; start!code own integer tim; aos 1,tim;end;
+	! now: the current time;
+
+boolean routine gettingLate( integer before );
+	return( now > 20 + before );
+routine pstr( string s );	! for debugging;
+begin integer ch;
+if length(s)=0 then begin outstr(""""""); return; end;
+if '40 <= (ch := lop(s)) < '177
+ then begin outchr(""""); outchr(ch); end;
+while true
+   do begin
+	if '40 <= ch < '177
+	 then begin
+		while '40 <= (ch := lop(s)) < '177
+		   do begin outchr(ch); if ch="""" then outchr(ch); end;
+		outchr("""");
+		if ch=0=length(s) then return;
+	      end;
+	while not ('40 <= ch < '177)
+	   do begin
+		outstr(" '"); outstr( cvos(ch) );
+		if length(s)=0 then return;
+		ch := lop(s);
+	      end;
+	outstr(" """); outchr(ch);
+      end;
+end;
+routine unpack!reset!table( string table );
+begin	integer	i, byte;
+
+if length(table) neq 45
+ then usererr(length(table),3,"Oops...bad reset table length =");
+other!ftp!Version := (lop(table) lsh 8) lor lop(table);
+    for i := 0 step 1 until 255
+      do transmittable[i] := 0 > (byte := 
+		if i land 7 = 0 then lop(table) rot -8 else byte lsh 1);
+max!transport!out   := (lop(table) lsh 8) + lop(table);
+other!window!size   := lop(table);
+inbound[#header]    := lop(table) & "{Head}";
+inbound[#trailer]   := lop(table) & "{Tail}" & crlf;
+inbound[#link!PTC]  := lop(table) & "{Link}";
+inbound[#shift!in]  := lop(table);	
+inbound[#shift!out] := lop(table);	
+other!checksum!type := lop(table);	
+timeout!seconds     := lop(table);	
+timer!there := table = "Y";
+
+if 0 < max!transport!out < dead!transport!minimum
+ then usererr(max!transport!out,3,"Transport max is too small:");
+if other!checksum!type neq this!checksum!version 
+ then usererr(other!checksum!type,3,"Unknown checksum type =");
+if "Y" neq table neq "N" then usererr(table,1,"Oops...bad timer");
+end;
+string routine make!reset!table( 
+	integer	Version			! of FTP spoken;
+	,	max!transport!length	! 0:64K-1;
+	,	!window!size!		! this is ignored, so why send;
+	,	timeout!seconds
+	;
+	boolean timer!here 
+	);
+begin	own integer array buf[0:32];
+	integer r!ptr;
+r!ptr := point( 8, buf[0], -1 );
+idpb( version lsh -8, r!ptr );
+idpb( version, r!ptr );					! size 2: 2;
+  begin		integer i, byte, bit!pointer;
+    for i := 0 step 1 until 255
+      do begin
+	if i land 7 = 0
+	 then begin
+		if i then idpb( byte, r!ptr );
+		byte := 0;
+		bit!pointer := point( 1, byte, 35-8 );
+	      end;
+	if receivable[i] then idpb( 1, bit!pointer ); 
+      end;
+    idpb( byte, r!ptr );
+  end;							! size 32: 34;
+idpb( max!transport!length lsh -8, r!ptr );
+idpb( max!transport!length, r!ptr );			! size 2: 36;
+idpb( !window!size!, r!ptr );	! << totally unused >>;	! size 1: 37;
+idpb( outbound[#header], r!ptr );	! header char	  size 1: 38;
+idpb( outbound[#trailer], r!ptr );	! trailer char	  size 1: 39;
+idpb( outbound[#link!PTC], r!ptr );	! link PTC;	! size 1: 40;
+idpb( outbound[#shift!in], r!ptr );	! to_encode char  size 1: 41;
+idpb( outbound[#shift!out], r!ptr );	! from_encode ch  size 1: 42;
+idpb( this!checksum!version, r!ptr );			! size 1: 43;
+idpb( timeout!seconds, r!ptr );				! size 1: 44;
+idpb( if timer!here then "Y" else "N", r!ptr );		! size 1: 45;
+return( stmake( point(8, buf[0], -1), 45, 8 ) );
+end;
+routine finalize!in!out;	! set the dependent vbls;
+begin	string s;
+	integer char;
+setbreak( to!inBound!shift!in, inBound[#shift!in], null, "INS" );
+s := null;
+for char := 0 step 1 until 127
+   do if must!encode[char] then s := s & char;
+setbreak( pass!outBound!asis, s, null, "INR" );
+inBound!header!breaks!Inchwl := #ht neq inBound[#header] < '40;
+inBound!trailer!breaks!Inchwl := #ht neq inBound[#trailer] < '40;
+! error in classification that says doesn't break when it does is OK;
+setbreak( skip!inBound!header, inBound[#header], null, "IS" );
+end;
+
+string routine table!a!specials( boundType array specials );
+begin	! note: link!PTC "doesn't exist", shift-in and shift-out may be different;
+specials[#header]   := "*";	specials[#trailer]  := #cr;
+specials[#ack!PSC]  := "+";	specials[#nak!PSC]  := "-";
+specials[#shift!in] := "%";	specials[#shift!out]:= "%";
+specials[#data!PTC] := "=";	specials[#rfr!PSC]  := "?";
+return( "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-*/=.,()%?" );
+end;
+
+string routine table!b!specials( boundType array specials );
+begin	! note: link!PTC "doesn't exist", shift-in and shift-out may be different;
+specials[#header]   := #esc;	specials[#trailer]  := #cr;
+specials[#ack!PSC]  := "x";	specials[#nak!PSC]  := "y";
+specials[#shift!in] := #si;	specials[#shift!out]:= #so;
+specials[#data!PTC] := "w";	specials[#rfr!PSC]  := "z";
+result := null;
+for i := #nul upto #xoff-1, #xoff+1 upto #xon-1, ##xon+1 upto #del
+   do result := result & i;
+return( result );
+end;
+
+routine rob!specials( boundType array specials );
+begin	! note: link!PTC "doesn't exist", shift-in and shift-out may be different;
+specials[#header]   := #esc;	specials[#trailer]  := #cr;
+specials[#link!PTC] := "|";	specials[#shift!in] := "{";
+specials[#shift!out]:= "}";	specials[#data!PTC] := "w";
+specials[#ack!PSC]  := "x";	specials[#nak!PSC]  := "y";
+specials[#rfr!PSC]  := "z";
+specials[#rrq!PSC]  := "[";	! Reset request (data: reset table);
+specials[#rrp!PSC]  := "]";	! Reset response (data: reset table);
+specials[#com!PSC]  := "?";	! COM (an undefined link subclass);
+end;
+
+routine display!specials( boundType array specials );
+begin	! note: link!PTC "doesn't exist", shift-in and shift-out may be different;
+specials[#header]   := "__";	     specials[#trailer]  := "~" & crlf;
+specials[#link!PTC] := "|=link:";    specials[#shift!in] := "{";
+specials[#shift!out]:= "}";	     specials[#data!PTC] := "w=data:";
+specials[#ack!PSC]  := "x=ack:";     specials[#nak!PSC]  := "y=nak:";
+specials[#rfr!PSC]  := "z=rfr:";
+specials[#rrq!PSC]  := "[=rrq:";! Reset request (data: reset table);
+specials[#rrp!PSC]  := "]=rrp:";! Reset response (data: reset table);
+specials[#com!PSC]  := "?=com:";! COM (an undefined link subclass);
+end;
+
+routine rob!standard;
+begin	! provide a pretty standard character set setup;
+	integer ch;
+rob!specials(outBound);
+rob!specials(inBound);
+
+arrclr(must!encode,true); ! banish all but space & printing ASCII;
+for ch := '40 step 1 until '176 do must!encode[ch]:=false;
+
+! better also get the special characters;
+must!encode[ outBound[#shift!in] ] := true;
+must!encode[ outBound[#trailer] ] := true;
+finalize!in!out;
+end;
+
+routine standard!printable;
+begin	! provide a pretty standard character set setup;
+	integer ch;
+display!specials(outBound);
+rob!specials(inBound);
+
+arrclr(must!encode,true); ! banish all but space & printing ASCII;
+for ch := '40 step 1 until '176 do must!encode[ch]:=false;
+
+! better also get the special characters;
+must!encode[ outBound[#shift!in] ] := true;
+must!encode[ outBound[#trailer] ] := true;
+finalize!in!out;
+end;
+require standard!printable initialization;
+! local variables: ;
+own integer	in!frame!characters
+,		out!frame!characters
+;
+routine transport!status;
+print( crlf, in!frame!characters, " chars seen in-frame, ", 
+	out!frame!characters, " out-of-frame (", 
+	100 * in!frame!characters / 
+	(in!frame!characters + out!frame!characters), "% Good." & crlf);
+
+string routine get!transport!record;
+begin "get transport record"
+		integer chr;
+		string result;
+if inBound!header!breaks!Inchwl
+ then do inc(out!frame!characters, length(inchwl))
+	until !skip! = inBound[#header];
+
+if inBound!trailer!breaks!Inchwl 
+ then do begin "nice trailer"
+		string line;
+	   result := null;
+	   line := inchwl;
+	   while (chr := !skip!) neq inBound[#trailer]
+	    do begin
+		result := result & line & chr;
+		line := inchwl;
+		if chr=#esc & line="v"
+		 then outstr( version!string & crlf );
+	       end;
+	   result := result & line;
+	   if inBound!header!breaks!Inchwl
+	    then DONE
+	    else inc(out!frame!characters, 
+			length(scan(result, skip!inBound!header, chr)));
+	 end "nice trailer"
+	until chr = inBound[#header]
+ else begin "ugly trailer"
+	if not inBound!header!breaks!Inchwl
+	 then while inchrw neq inBound[#header] 
+		do inc(out!frame!characters);
+	result := null;
+	while (chr := inchrw) neq inBound[#trailer]
+	   do result := result & chr;
+      end "ugly trailer";
+inc(in!frame!characters, length(result));
+return( result );
+end "get transport record";
+boolean routine isHexDigit(integer char);
+return( ("0" <= char <= "9")  or  ("A" <= char <= "Z") );
+
+string routine hexDigits(integer byte);
+begin	preset!with	"0", "1", "2", "3", "4", "5", "6", "7",
+			"8", "9", "A", "B", "C", "D", "E", "F";
+	own safe integer array hexDigit[0:15];
+return( hexDigit[byte lsh -4] & hexDigit[byte land '17] );
+end;
+
+integer routine deHex( integer v );
+return( v - (if v<="9" then 0+"0" else "A"-10) );
+
+string routine make!encoded!string( string source, source2 );
+begin	string res;
+	boolean currently!encoding;
+res := scan( source, pass!outBound!asis, !skip! ); ! copy all passables;
+if length(source)=0
+ then begin
+	res := res & scan( source2, pass!outBound!asis, !skip! );
+	if length( source2 ) = 0
+	 then return( res )
+	 else source swap source2;
+      end;
+while true
+   do begin	integer char;
+	res := res & outBound[#shift!in];
+	while must!encode[char := lop(source)] or must!encode[source]
+	   do begin
+		res := res & hexDigits(char);
+		if length(source)=0
+		 then if length( source2 )
+			 then source swap source2
+			 else return(res);
+	      end;
+	res := res & outBound[#shift!out] & char
+		& scan( source, pass!outBound!asis, !skip! );
+	if length(source)=0
+	 then begin
+		res := res & scan( source2, pass!outBound!asis, !skip!);
+		if length( source2 ) = 0
+		 then return( res )
+		 else source swap source2;
+	      end;
+      end;
+end;
+
+string routine checksum!string(string source);
+begin	integer cks;
+cks := 0;
+while length(source) 
+   do begin
+	inc(cks,cks + lop(source) + 1);
+	while cks land (-1 lsh 14)
+		do inc(cks, 1 - (1 lsh 14));
+      end;
+return( (cks lsh -7) & (cks land '177) );
+	! serendipity: ts = 7 + 7.  If blanks are sendable, use!;
+end;
+
+string routine do!encode( string source );
+return( make!encoded!string( source, checksum!string(source) ) );
+
+define minimum!PID# = 0+#sp, maximum!PID# = 0+"z";
+integer out!pending!PID	! the PID for the outgoing data packet;
+,	in!pending!PID	! the PID for the incoming data packet;
+;
+string out!pending!buf	! the text for the data packet last sent out;
+,	in!pending!buf	! the text for the data packet last received; 
+;
+
+routine pid!increment( reference integer pid!variable );
+	if inc(pid!variable) > maximum!PID#
+	   then pid!variable := minimum!PID#;
+
+boolean routine pid!in!range( integer pid, floor, ceiling );
+return( if floor < pid <= ceiling then true
+	eif floor <= ceiling then false
+	else not(ceiling < pid <= floor)
+	);
+
+routine PID!setup;
+begin
+out!pending!PID := in!pending!PID := 0;	! nothing in buffers;
+   outBound!pid!all!good			! he's got thru this;
+:= outBound!pid!top!allowed
+:= outBound!pid!sent				! we've sent thru this;
+:= inBound!pid!all!good			! we got through this packet;
+:= inBound!pid!top!allowed		! we will take through this;
+:= maximum!PID#;
+end;
+require PID!setup initialization;
+routine send!Link( integer SubClassIndex; string body );
+begin
+print(	outBound[#header] 
+,	do!encode(outbound[#link!PTC] & outbound[SubClassIndex] & body)
+,	outBound[#trailer]
+);
+end;
+
+routine reset!request;
+begin
+inBound!pid!all!good := maximum!PID#; 
+inBound!pid!top!allowed := minimum!PID#; 
+outBound!pid!all!good := maximum!PID#; 
+outBound!pid!sent := maximum!PID#; 
+outBound!pid!top!allowed := minimum!PID#;
+send!Link( #rrq!PSC, make!reset!table(0, 5000, 1, 63, false) );
+	! Version, transport!length, !window!size!, ;
+	! timeout!seconds, timer!here ;
+end;
+
+routine reset!response;
+begin
+send!Link( #rrp!PSC, make!reset!table(0, 5000, 1, 63, false) );
+	! Version, transport!length, !window!size!, ;
+	! timeout!seconds, timer!here ;
+inBound!pid!all!good := maximum!PID#; 
+inBound!pid!top!allowed := minimum!PID#; 
+outBound!pid!all!good := maximum!PID#; 
+outBound!pid!sent := maximum!PID#; 
+outBound!pid!top!allowed := minimum!PID#;
+end;
+
+routine sendACK;
+	send!Link( #ack!PSC,	inBound!pid!all!good &
+				inBound!pid!top!allowed ); 
+
+routine sendNAK( integer packet!id );
+	send!Link( #nak!PSC, packet!id );
+
+routine sendRFR;
+	send!Link( #rfr!PSC, null );
+routine gotRRQ( string reset!body );
+begin 
+reset!response; 
+unpack!reset!table( reset!body );
+end;
+
+routine gotRRP( string reset!body );
+begin 
+unpack!reset!table( reset!body );
+end;
+
+routine gotACK( integer has!got, will!take );
+begin 
+if has!got = out!pending!PID then out!pending!PID := 0;
+if out!pending!PID=0 or pid!in!range(out!pending!PID, has!got,will!take)
+ then begin
+	outBound!pid!all!good := has!got;
+	outBound!pid!top!allowed := will!take;
+      end
+ else usererr(0,1,"Other end ignoring the protocol!!!");
+	! upgrade: drop the packet;
+end;
+
+routine gotNAK( integer dead!PID );
+if out!pending!PID = dead!PID 
+ then print(crlf, "Resending: ", out!pending!buf, crlf)
+ else begin sendACK; sendRFR; end;	! maybe one of these will help;
+boolean routine did!decode( reference string result; string source );
+begin	string res;
+
+res := scan( source, to!inBound!shift!in, !skip! ); ! copy passables;
+while length( source )
+   do begin	integer ch;
+	while isHexDigit(ch := lop(source))
+	   do begin
+		res := res & ( (deHex( ch ) lsh 4)
+				lor deHex( ch := lop(source) ));
+		if not isHexDigit(ch)
+		 then return(false);	! Odd number of HEX digits;
+	      end;
+	if inBound[#shift!out] neq ch neq 0 then res := res & ch;
+		! cope with the "no shift-out character" possibility;
+	res := res & scan( source, to!inBound!shift!in, !skip! );
+      end;
+result := res[1 to inf-2];
+IFCR DEBUGSW THENC 
+	if noCheck then begin result := res; return(true); end;
+	if starOk and equ(res[inf-1 for 2],"**") then return(true); 
+ENDC
+return( equ( res[inf-1 for 2], checksum!string(result) ) );
+end;
+! page locals: ;
+own integer last!success!time
+,	checksum!successes 
+,	checksum!failures 
+,	consecutive!failures 
+;
+routine packet!status;
+begin
+print( crlf, 
+	"I have seen ", checksum!successes, " good packets, and only ",
+	checksum!failures, " bad ones." & crlf );
+if consecutive!failures 
+ then print( consecutive!failures, 
+	" consecutive packets have been bad recently (", 
+	last!success!time, "/", now, ")." & crlf );
+end;
+
+string routine GoodPacket;
+begin	string result;
+while not did!decode( result, get!transport!record )
+   do begin	! checksum is bad, try again;
+	if inc(consecutive!failures) land 3 = 0
+	 then if gettingLate( last!success!time )
+		 then sendRFR else sendACK;
+      end;
+inc(checksum!failures, consecutive!failures);
+consecutive!failures := 0;
+inc(checksum!successes);
+last!success!time := now;
+return( result );
+end;
+routine one!packet;
+begin	string vbl; 
+	integer ptc;
+vbl := GoodPacket;
+ptc := lop(vbl);
+if ptc = inBound[#data!PTC]
+ then begin "data"	integer PID;
+	PID := lop(vbl);		! get the PID;
+	if pid!in!range( pid,	inBound!pid!all!good,
+				inBound!pid!top!allowed )
+	 then begin
+		in!pending!pid := pid;
+		in!pending!buf := vbl;
+		if pid neq inBound!pid!all!good
+		 then pid!increment(inBound!pid!all!good);
+	      end
+	 else sendNAK( inBound!pid!top!allowed ); ! which is all!good+1;
+      end "data"
+else if ptc = inBound[#link!PTC]
+ then begin "link"	integer psc;
+	psc := lop(vbl);			! get the subtype;
+	if  psc = inBound[#ack!PSC]
+	 then if length(vbl)=2		then gotACK(lop(vbl), vbl)
+					else usererr(0,1,"Bad ACK sent")
+	eif psc = inBound[#nak!PSC] 
+	 then if length(vbl)=1		then gotNAK( vbl )
+					else usererr(0,1,"Bad NAK sent")
+	eif psc = inBound[#rfr!PSC] 
+	 then if length(vbl)=0		then sendACK
+					else usererr(0,1,"Bad RFR sent")
+	eif psc = inBound[#rrq!PSC] then gotRRQ(vbl)
+	eif psc = inBound[#rrp!PSC] then gotRRP(vbl)
+IFCR DEBUGSW THENC
+	eif psc = "~" then usererr(0,1,"Ok: " & vbl, vbl )	! debug;
+	eif psc = "*" then begin	! consume data xfers;
+			if in!pending!pid
+			 then pid!increment(
+				inBound!pid!top!allowed );
+			in!pending!pid := 0;
+			end
+ENDC
+	else usererr(psc,3,"Unknown LINK subclass: ");
+      end "link"
+ else usererr(ptc,3,"Unknown packet type: ");
+end;
+string routine next!data!packet;
+while true
+   do begin
+	if in!pending!pid = inBound!pid!top!allowed
+	 then begin	string res;
+		res := in!pending!buf;
+		in!pending!pid := 0;
+		pid!increment( inBound!pid!top!allowed ); 
+		sendACK;
+		return( res );
+	      end;
+	one!packet;
+      end;
+routine sendRecord( string data );
+begin
+while length(data)
+   do begin	integer ch, reps;
+		string copy;
+	copy := data;
+	ch := lop(data);
+	if ch = data then begin
+		for reps := 1 step 1 while length(data)
+		   do if ch neq lop(data)
+			then begin 
+				data := copy[reps+1 to inf];
+				done;
+			      end
+			eif reps > 31
+			 then begin
+				dec(reps,31);
+				copy := copy[32 to inf];
+				if ch=#SP then sendONE( 31
+						+ dataHeader.opx.SPACE )
+				eif ch=0 then sendONE( 31
+						+ dataHeader.opx.ZERO )
+				eif ch=#E.BL then sendONE( 31
+						+ dataHeader.opx.BLANK )
+				else sendTWO(31+dataHeader.opx.COPY,ch);
+			      end;
+		if ch=#SP 
+			then sendONE( reps + dataHeader.opx.SPACE )
+		eif ch=0 
+			then sendONE( reps + dataHeader.opx.ZERO )
+		eif ch=#E.BL
+			then sendONE( reps + dataHeader.opx.BLANK )
+		eif reps = 1 
+			then data := copy	! NOTE:32 copy(n) case;
+		else sendTWO( reps + dataHeader.opx.COPY, ch );
+	      end
+	eif ch=#sp then begin		! ASCII space: multi seen above;
+		sendONE( DataHeader.opx.SPACE + 1 );
+	      end
+	eif ch='100 then begin		! EBCDIC blank:multi seen above;
+		sendONE( DataHeader.opx.BLANK + 1 );
+	      end
+	 else begin	! good old vanilla data;
+* dataHeader.op0.EOR, dataHeader.op0.EOF, dataHeader.op0.EOD
+, dataHeader.opx.AsIs,
+		lenMax := 31 min buffer_room;
+		s := ch;
+		len := 1;
+		while len < lenMax and ((ch := lop(data)) neq data)
+		   do begin if ch=#sp or ch='100 inc(len);
+	      end
+      end;
+case op of begin
+    end;
+if op=#EOR or op=#EOF or op=#EOF
+ then begin 
+	if length(data) then usererr(op,3,"zero op with data?");
+	sendOne( op );
+      end
+ else begin
+	if 0 < length(data) < 32
+	 then begin
+	      end;
+	 else usererr(op,3,"This opcode needs Data!");
+      end;
+end;
+routine sendEOR; dataPacket( dataHeader.op0.EOR, null );
+routine sendEOF; dataPacket( dataHeader.op0.EOF, null );
+routine sendEOD; dataPacket( dataHeader.op0.EOD, null );
+
+routine sendAsIs( string dataLine );
+
+routine sendDATA( integer Data!SubClass!index; string dataLine );
+begin
+
+define	dataHeader.opcode.mask	= '340
+,	dataHeader.opx.AsIs	= '040
+,	dataHeader.opx.Zero	= '100
+,	dataHeader.opx.SPACE	= '140
+,	dataHeader.opx.COPY	= '200
+,	dataHeader.opx.BLANK	= '240
+
+,	dataHeader.count.mask	= '037
+;
+
+end;
+routine sendDATA( string Data!SubClass; string dataLine );
+begin
+while out!pending!PID
+   do begin "get last packet out"
+		integer i;
+	for i:=1 step 1 until 4
+	   do begin 
+		one!packet; 
+		if out!pending!PID=0 then done "get last packet out";
+	      end;
+	sendRFR; one!packet;
+	if out!pending!PID
+	 then print(crlf,"Resending: ", out!pending!buf, crlf );
+      end;
+out!pending!PID := outBound!pid!sent;
+pid!increment( out!pending!PID );
+out!pending!buf := outBound[#header] 
+	& do!encode( outBound[#data!PTC] & out!pending!pid 
+			& data!SubClass & dataLine )
+	& outBound[#trailer];
+while not pid!in!range( out!pending!PID,
+		outBound!pid!all!good, outBound!pid!top!allowed )
+   do begin sendRFR; one!packet; end;
+print( out!pending!buf );
+if assumeAck then out!pending!PID := 0;
+pid!increment( outBound!pid!sent ); 
+end;
+routine enter!ftp;	print("<<FTP on>>" & crlf);
+routine end!ftp;	print("<<FTP off>>" & crlf);
+
+routine sendEOR( integer n );
+	sendDATA("<<EOR * ", cvs(n) );
+
+routine send!file!description( string file );
+	sendDATA( "<<File: ", file );
+
+routine sendBIN( string filename );
+	usererr(0,1, "BINARY and a PDP-10, surely you jest!" & crlf );
+
+routine send.partial.Ast.Line( string partial.line );
+	sendDATA( "+", partial.line );
+
+routine send.final.Ast.Line( string partial.line );
+	sendDATA( "*", partial.line );
+
+routine send.Ast.Record( string full!line );
+	sendDATA( "-", full!line );
+integer routine lookup!command( string word );
+begin
+if length(word)=0
+or equ(word,"NOOP")	then return( c.noop );
+if equ(word,"BLOCKREAD") then return( c.blockRead );
+if equ(word,"QUIT")	then return( c.quit );
+if equ(word,"DOWNLOAD")
+or equ(word,"FROM10")
+or equ(word,"SEND")	then return( c.send );
+if equ(word,"SIZE")	then return( c.size );
+if equ(word,"STATUS")	then return( c.status );
+if equ(word,"ASCII")
+or equ(word,"TEXT")
+or equ(word,"AST")	then begin transfer!mode:= m.AST; return(c.noop); end;
+if equ(word,"BINARY")
+or equ(word,"BIN")	then begin transfer!mode:= m.BIN; return(c.noop); end;
+if equ(word,"GUESS")	then begin transfer!mode:= m.GUESS; return(c.noop); end;
+if equ(word,"VERSION")	then begin print( version!string & crlf );
+						return(c.noop); end;
+
+if equ(word,"BLANK")	then return( c.blank ); 
+if equ(word,"TAIL")	then return( c.tail );
+if equ(word,"ADDTABS")	then return( c.itab );
+if equ(word,"RECEIVE")
+or equ(word,"UPLOAD")
+or equ(word,"FROMPC")
+or equ(word,"GET")	then return( c.receive );
+if equ(word,"NOCHECK")	then return( c.noCheck );
+if equ(word,"ASSUMEACK") then return( c.assumeAck );
+if equ(word,"WILDCHECK")
+or equ(word,"STAROK")	then return( c.starOk );
+if equ(word,"BAIL")
+or equ(word,"DEBUG")
+or equ(word,"DDT")
+ then begin
+	usererr(0,1,"Ok: " & word, word );
+	return( c.noop );
+      end;
+if word = "?"
+ then begin
+	outstr( "HELP, AST, SEND, GET, NOOP, STATUS, or QUIT" & crlf );
+	return( c.noop );
+      end;
+if equ(word,"HELP")
+ then begin
+	outstr( "
+	NOOP		QUIT	ZAPBLANK	KEEPBLANK
+	GUESS		BINARY = BIN	ASCII = TEXT = AST
+	DOWNLOAD = FROM10 = SEND
+	RECEIVE = UPLOAD = FROMPC = GET
+	STATUS		VERSION			BLOCKREAD
+	BAIL		DEBUG=DDT
+	Integer switches:	<sw> <newValue>  or  <sw> ?
+		SIZE = max line length read from filesys
+	Boolean switches:	<sw> ON, <sw> OFF, or <sw> ?
+		BLANK = Suppress blank lines when reading from filesys
+		TAIL = Suppress blanks at the end of lines
+		ADDTABS = Use tabs `where appropriate' on incoming files
+		WILDCHECK = Allow a checksum of `**' to be sufficient
+		NOCHECK = Dont do checksum processing on incoming lines
+		ASSUMEACK = Don't wait for Ack messages
+");	return( c.noop );
+      end;
+return(c.unknown);
+end;
+IFCR TRUE THENC		! start!code version is busted (shit);
+  string routine to!last!white( string line );
+  begin string copy;
+  copy := line;
+  while length(copy) do begin	integer endSize;
+	while #sp neq lop(copy) neq #ht
+		 do if length(copy)=0 then return(line);
+	endSize := length(copy) + 1;
+	while not (#sp neq lop(copy) neq #ht) 
+	   do if length(copy)=0 then return(line[1 for inf-endSize]);
+     end;
+  return(line) ! here last char is print after white (or line=null);
+  end;
+ELSEC
+  simple string procedure to!last!white( string line );
+  begin!code	define r.len=1, r.ptr=0, r.ch=2, r.tmp=4;
+		label ploop, wloop, wexit, white;
+	hrrz	r.len,-1(sp);
+	move	r.ptr,0(sp);
+	jumpg	r.len,ploop;
+	popj	p,;		! special case: null string;
+
+ wexit:	addm	r.tmp,-1(sp);	! shorten result string by whitecount;
+	popj	p,;
+
+ white:	movni	r.tmp,(r.len);	! save -chars left in string ;
+	sojle	r.len,wexit;	! (counting this whitespace character);
+				! loop over white chars till end or prt;
+ wloop:	ildb	r.ch,r.ptr;
+	caie	r.ch,'40;	! space;
+	 cain	r.ch,'11;	! or tab;
+	  sojg	r.len,wloop;
+	jumple	r.len,wexit; 	! if stopped due to length, go clip;
+
+ ploop:	ildb	r.ch,r.ptr;	! first loop: while printing(lop) do;
+	caie	r.ch,'40;	! space;
+	 cain	r.ch,'11;	! or tab;
+	  jrst	white;		! whitespace seen, next loop;
+	sojg	r.len,ploop;
+	popj	p,;		! ended with printing, no change;
+  end;	
+ENDC
+string routine ast!encode( string line );
+begin	string s;
+	integer brk;
+s := scan( line, ast!pass, brk );
+while length(line)
+   do begin
+	if lop(line) = #ht
+	 then s := s & ((#sp&#sp &#sp&#sp &#sp&#sp &#sp&#sp)
+			[1 for 8-(7 land length(s))])
+		& scan( line, ast!pass, brk )
+	 else begin
+		usererr(brk,3,"Unexpected character in AST file:");
+		s := s & brk & scan( line, ast!pass, brk );
+	      end;
+      end;
+return( s );
+end;
+
+string routine end!ast!encode(  string tail
+;				integer compression!state );
+begin
+return( tail );
+end;
+
+string routine mid!ast!encode(  string str
+;				reference integer compression!state );
+begin
+return( str );
+end;
+integer inch;
+boolean routine oneAST( integer array filDat );
+begin "oneAST"	own string preamble, postamble, device;
+		own integer brk,eof;
+		string fn;
+		boolean flag;
+if inch < 0
+ then begin
+	open( inch := getchan, device := cv6str(filDat[-2]),0, 4,0,
+			read!length, brk, eof:=true );
+	if eof then begin release(inch); inch:=-1; return(true); end;
+		! stop since device cannot be opened.;
+	device := (if filDat[-2] = cvsix("DSK")
+		   then null else device & ":");
+	preamble := (if filDat[-4]
+		 then "("& cv6str(filDat[-4]) & cv6str(filDat[-3]) &")"
+		 else null);
+	postamble := (if filDat[-4]=0 and !lh(filDat[-1])
+			 then "[" & cvos(!lh(filDat[-1])) & ","
+				& cvos(!rh(filDat[-1])) & "]"
+			 else null);
+      end;
+fn:= preamble & cv6str(filDat[0]) & "." & cv6str(filDat[1]) & postamble;
+lookup( inch, fn, flag );
+if flag
+ then begin end ! file not found;
+ else begin
+	send!file!description( device & fn );
+	   do begin	string line;
+		line := input(inch, read.ast.break);
+		if eof and (brk=0=length(line)) then done;
+		if brk and clipping!tail	! white lines are blank;
+		 then line := to!last!white( line );
+		if drop!blank!lines and length(line)=0 and brk = #lf
+		 then begin	integer blanklines;
+			for blanklines := 0 step 1
+				while length(line)=0 and brk = #lf
+			   do begin
+				line := input(inch, read.ast.break);
+				if brk and clipping!tail
+				 then line := to!last!white( line );
+			      end;
+			if length(line) ! ie NOT at EOPage or EOFile;
+			 then sendEOR( blankLines );
+		      end; ! blank line processing;
+		if brk = 0
+		 then begin	! long line: must have terminated on count.;
+				integer compression!state;
+			compression!state := 0;
+			  do  begin
+				send.partial.Ast.Line( mid!ast!encode( 
+					line, compression!state ) );
+				line := input(inch, read.ast.break);
+			      end
+			 until brk or eof;
+			if clipping!tail
+			 then line := to!last!white( line );
+			send.final.Ast.Line( end!ast!encode( 
+					line, compression!state ) );
+		      end
+		 else if length(line) or brk neq #ff  ! pagemarks look blank;
+			 then send.Ast.record( ast!encode( line ) );
+		if brk = #ff then send.Ast.record( #ff );	! new page;
+	      end
+	 until eof;
+      end;
+close(inch);
+return(false);	! just keep on going iteration through the files;
+end "oneAST";
+routine sendAST( string fileGroup );
+begin
+inch := -1;
+redufd( oneAST, fileGroup, "#*C" );
+if inch >= 0
+ then release(inch)
+ else outstr("<<<no files like that>>>" & crlf);
+	! no files matching group found;
+end;
+
+
+routine sendfile( reference string rest!of!line; integer mode );
+begin	string file;
+file := scan( rest!of!line, aWord, !skip! );
+outstr(" I really should send you PDP-10 file `"); 
+outstr(file);
+outstr( "'." & crlf );
+if canFind(file)
+ then begin
+	if mode = m.guess then mode := guess!mode(file);
+	if mode = m.BIN
+	 then begin
+		outstr("BINARY and a PDP-10, surely you jest!" & crlf );
+		mode := m.AST;
+	      end;
+	if m.AST neq mode neq m.BIN
+	 then outstr("unknown file mode!!" & crlf)
+	 else begin
+		enter!ftp;
+		if mode = m.AST then sendAST(file) else sendBIN(file);
+		end!ftp;
+	      end;
+	outstr( file ); 
+	outstr( " is now sent!" & crlf );
+      end
+ else outstr( "... but I won't because I can't find it." & crlf );
+did!something := true;
+end;
+
+
+routine getfile( reference string rest!of!line );
+begin	string file;
+file := scan( rest!of!line, aWord, !skip! );
+outstr( " I really should get PC file `" );
+outstr( file );
+outstr( "', but I won't." & crlf );
+did!something := true;
+end;
+boolean routine numeric( string s );
+begin
+while s="-" do lop(s);
+while "0" <= lop(s) <= "9" do if length(s)=0 then return(true);
+return(false);
+end;
+
+routine int!val( reference integer variable; string val );
+begin
+if length(val)=0 or val = "?"	then print(" is ", variable, crlf)
+eif numeric(val)		then variable := cvd(val)
+else print("illegal integer value `", val, "', keeping old value = ", 
+		variable, crlf );
+end;
+
+
+routine bool!val( reference boolean variable; string val );
+begin
+if length(val)=0 or val = "?"	then print(" is ", (if variable 
+					then "ON" else "OFF"), crlf )
+eif equ(val,"ON") 
+ or equ(val,"TRUE")		then variable := true
+eif equ(val,"OFF")
+ or equ(val,"FALSE")		then variable := false
+else print("illegal boolean value `", val, "', keeping old value = ", 
+		(if variable then "ON" else "OFF"), crlf );
+end;
+! main program;
+	string command!line;
+read!length := 80;
+transfer!mode := m.AST;
+did!something := false;
+drop!blank!lines := true;
+while true
+   do begin "main loop"
+		string command;
+		integer brk;
+		routine bool!v(reference boolean switch);
+		 bool!val( switch, scan(command!line, aWord, brk) );
+	   do begin
+		outstr("Command: ");
+		command!line := inchwl;
+		while !skip! = #lf
+		   do begin
+			outstr("(cont): ");
+			command!line := command!line & #sp & inchwl;
+			if !skip! = #esc
+			 then begin
+				command!line:=null;
+				outstr(crlf);
+				done;
+			      end;
+		      end;
+	      end
+	 until length(command!line);
+	while length(command := scan( command!line, aWord, brk ))
+	do case lookup!command( command )
+	   of begin
+		[c.quit] done "main loop";
+		[c.send] sendfile( command!line, m.AST );
+		[c.receive] getfile( command!line );
+		[c.blockRead] begin	string s;
+				s := next!data!packet; 
+				print(crlf& "Data is `", s, "'.");
+			      end;
+		[c.noop] begin end;
+		[c.status] begin transport!status; packet!status; end;
+		[c.size] int!val( read!length,
+				scan(command!line, aWord, brk));
+		[c.blank] bool!v( drop!blank!lines );
+		[c.tail] bool!v( clipping!tail );
+		[c.itab] bool!v( adding!tabs );
+		[c.noCheck] bool!v(noCheck);
+		[c.assumeAck] bool!v(assumeAck);
+		[c.starOk] bool!v(starOk);
+		[else] begin
+			outstr("Unknown command `"); 
+			outstr(command); 
+			outstr( "' seen!" & crlf );
+			if did!something
+			 then done "main loop"
+			 else continue "main loop";
+		      end
+	      end;
+	if length(command!line)
+	 then begin
+		outstr( "Ignoring: `" );
+		outstr( command!line );
+		outstr( "'." & crlf );
+	      end;
+      end "main loop";
+end "ftp controller" .
+   <ORY
