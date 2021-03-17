@@ -1,0 +1,348 @@
+begin "play Summaries"
+
+require "(SAILIB)SAIL.DEF" source!file;
+
+simple integer procedure addin( reference integer vbl; integer amount );
+begin!code
+	move	1,amount;
+	addm	1,vbl;
+end;
+
+simple integer procedure add1( reference integer vbl );
+	begin!code	aos 1,vbl;	end;
+
+simple integer procedure sub1( reference integer vbl );
+	begin!code	sos 1,vbl;	end;
+
+Define Inc(v,a)={
+	IFCR length(cvps(a))=0 or equ(cvps(a),"1")
+	THENC		add1(v)
+	ELSEC IFCR equ(cvps(a),"-1")
+	      THENC	sub1(v)
+	      ELSEC	addin(v,a)
+	ENDC  ENDC
+};
+
+simple integer procedure LORin( reference integer vbl; integer bits );
+	begin!code	move 1,bits;	iorb 1,vbl;	end;
+
+simple string procedure spaces( integer howMany );
+begin	own string spaces;	! speeches adjoin, blank result;
+while length(spaces)<howMany do spaces_ spaces & #sp & spaces;
+return( spaces[1 for howMany] );
+end;
+integer inch, cnt, brk, eof;	! INCH is the channel for the play;
+! Play format:
+! Page 1: dramatis personnae
+!	abbrev= sex charNum name [ othername ] 
+!		{{ personality }}
+! Subsequent pages:
+!	[ACT number]
+!	page:	abbrev line_count REPEAT( , abbrev line_count )REPEAT
+!		(possibly continued on further lines)
+;
+
+! break tables: ;
+integer	Speech		! read one speech (abbrev + line-count);
+,	toNumber	! pass everything up to a digit;
+,	lineColon	! stop at eol or colon;
+,	toPage		! just move to next page;
+;
+simple procedure setup;
+begin
+setbreak(Speech_ getbreak, ":," & crlf & #ff, crlf & #sp & #ht, "INST");
+setbreak(toNumber_ getbreak, "0123456789", null, "IR");
+setbreak(lineColon_ getbreak, ":" & #lf & #ff, ":"& crlf & #ff,"INST");
+setbreak(toPage_ getbreak, #ff, #ff, "UINST");
+end;
+require setup initialization;
+define	minChar=0+"a"	! minimum for character code.;
+;
+record!class character( string abbrev, name, pseudonym;
+			integer code, speeches, lines, lastPage;
+			string pages;
+			r!p(character) next, prev );
+r!p(character) activeCharacters, wings; integer lastCode;
+
+
+procedure mergeCounts;
+while activeCharacters
+   do begin	r!p(character) r;
+		string abbrev;
+	abbrev_ character:abbrev[activeCharacters];
+	r_ wings;
+	while not equ(abbrev, character:abbrev[r]) 
+		do r_ character:next[r];
+	Inc(character:speeches[r],character:speeches[activeCharacters]);
+	Inc( character:lines[r], character:lines[activeCharacters] );
+	character:pages[r]_ character:pages[r]
+				& character:pages[activeCharacters];
+	activeCharacters_ character:next[activeCharacters];
+      end;
+
+
+r!p(character) procedure new!character( string abbrev, 
+				name(""), pseudonym("") );
+begin	r!p(character) r;
+r_ new!record(character);
+FORLC field=(abbrev,name,pseudonym) DOC {character:field[r]_field;} ENDC
+character:next[r]_ wings;
+if wings
+ then begin
+	character:prev[wings]_ r;
+	character:code[r]_ Inc( lastCode );
+      end
+ else lastCode_ character:code[r]_ minChar;
+return(wings_ r);
+end;
+
+
+r!p(character) procedure dup!character( r!p(character) who );
+begin	r!p(character) r;
+r_ new!record(character);
+FORLC field=(abbrev,name,pseudonym,code)
+	DOC {character:field[r]_ character:field[who];} ENDC
+character:next[r]_ activeCharacters;
+if activeCharacters then character:prev[activeCharacters]_ r;
+return(activeCharacters_ r);
+end;
+r!p(character) procedure findCharacter( string abbrev );
+begin	r!p(character) r;
+r_ activeCharacters;
+while r do if equ( character:abbrev[r], abbrev )
+	 then return(r) else r_ character:next[r];
+r_ wings;
+while r do if equ( character:abbrev[r], abbrev )
+	 then return( dup!character(r) ) else r_ character:next[r];
+r_ dup!character( new!character( abbrev ) );
+end;
+r!p(character) procedure aSpeech( string abbrev; integer lines, page );
+! registers a speech and returns the character code
+;
+begin	r!p(character) who,lead;
+who_ findCharacter( abbrev );
+if character:lastPage[who] neq page
+ then begin
+	character:pages[who]_ character:pages[who] & cvs(page) & ",";
+	character:lastPage[who]_ page;
+      end;
+Inc( character:lines[who], lines );
+Inc( character:speeches[who] );
+if lead_ character:prev[who]	! bubble up;
+ then begin
+	if character:next[lead]_ character:next[who]
+	 then character:prev[ character:next[lead] ]_ lead;
+	character:prev[who]_ character:prev[lead];
+	character:next[who]_ lead;
+	character:prev[lead]_ who;
+	if lead=activeCharacters
+	 then activeCharacters_ who
+	 else character:next[ character:prev[ who ] ]_ who;
+      end;
+return( who );
+end;
+procedure speechSummary( integer Speeches, Lines );
+print( Lines, " lines, ", Speeches, " speeches [", 
+	cvf( Lines / Speeches ), " lines each]" & crlf );
+
+integer actSpeeches, actLines;
+define maxDist=6;	! maximum adjacency distance;
+define maxChar=35+minChar;	! Ah well, a hard constant (1 bit per);
+define hisBit(character)="(1 rot character)";
+
+integer ringPos;		! index into ring;
+integer array ring[1-maxDist:maxDist-1];
+! ring[ringPos-N-1] has character who spoke N speeches ago;
+
+integer array overallAdjacent, adjacent [0:maxDist-1,minChar:maxChar];
+! adjacent[N-1,char] has bits on for each character who spoke
+  N speeches before char did.;
+! overallAdjacent accumulates these bits for the entire play;
+
+procedure aCharacter( integer char );
+! call with code of character. sets his adjacency bits from the ring.
+;
+if char leq maxChar then
+begin		integer dist;
+for dist_ maxDist-1 step -1 until 0
+   do LORin( adjacent[dist,char], ring[ringPos-dist] );
+if Inc(ringPos) geq maxDist
+ then begin ringPos_ 0; ring[0]_ hisBit(Char); end
+ else ring[ringPos]_ ring[ringPos-maxDist]_ hisBit(Char);
+end;
+
+procedure squareUp;
+! make adjacent bit mean "within N of" (commutative closure operation)
+;
+begin	integer dist, char;
+for dist_ 0 step 1 until maxDist-1
+ do for char_ minChar step 1 until maxChar
+   do begin	integer bit, accum, other;
+	bit_ hisBit(Char);
+	accum_ adjacent[dist, Char];
+	for other_ minChar step 1 until maxChar
+	   do if adjacent[dist,other] land bit
+		then accum_ accum lor hisBit(other);
+	adjacent[dist,char]_ accum;
+      end;
+end;
+string procedure readAct( boolean showDetail );
+begin "readAct"
+	string element, res;
+	integer page;
+actSpeeches_ actLines_ 0; res_ null; 
+while true
+   do begin 	! print header;
+	element_ input( inch, lineColon );
+	if brk=":" then done;
+	print( element, crlf );
+	if eof then return( res );
+      end;
+for page_ cvd(element) step 1 while brk=":"
+   do begin "one page"
+		integer pagSpeeches, pagLines;
+	if cvd(element) neq page then print("?",page, "/", element,"?");
+	if showDetail then print( element, ": " );
+	pagSpeeches_ pagLines_ 0;
+	while true
+	   do begin	string id;
+			integer lines, code;
+		element_ input(inch, Speech);
+		if #cr neq brk neq "," then done;
+		id_ scan( element, toNumber, brk );
+		lines_ intscan( element, brk );
+		code_ character:code[ aSpeech(id, lines, page) ];
+		aCharacter( code );
+		Inc( pagSpeeches );
+		Inc( pagLines, lines );
+	      end;
+	Inc(actSpeeches, pagSpeeches);
+	Inc(actLines, pagLines);
+	if showDetail then speechSummary( pagSpeeches, pagLines );
+      end;
+return(res);
+end;
+simple procedure printPageList( string pages );
+begin		integer page, nextPage, brk;
+print( #ht & "pages ", page_ intscan(pages,brk) );
+while length(pages) > 1
+   do begin
+	if (nextPage_ intscan(pages,brk)) = page+1
+	 then begin
+		while (Page_ intscan(pages,brk)) = nextPage+1
+		   do nextPage_ page;
+		print( ":", nextPage );
+	      end
+	 else page_ nextPage;
+	if page then print(",", page);
+      end;
+print(crlf);
+end;
+string procedure proximity(integer Char, Other, width);
+! returns a string to represent how close Char is to Other.
+! This is blank if they talk "to" each other, other it is the number
+! of intervening speeches.  Width is the desired result string length.
+;
+if Char=Other then return( spaces(Width-1) & "\" ) else
+begin	integer dist, bit;
+bit_ hisBit(Char);
+if adjacent[0,Other] land bit then return( spaces(width) );
+for dist_ 1 step 1 until maxDist-1
+   do if adjacent[dist,Other] land bit
+	 then begin	integer ow,od; string s;
+		getformat(ow,od); setformat(width,od);
+		s_ cvs(dist);
+		setformat(ow,od); 
+		return(s);
+	      end;
+return( spaces(Width-1) & "*" );
+end;
+
+procedure characterSummary( r!p(character) head );
+begin	integer characterCount;
+	r!p(character) r;
+if not r_ head then return;
+for characterCount_ 0 step 1 while r do r_ character:next[r];
+
+    begin	r!p(character) array srt[1:characterCount];
+		integer i, j, l;
+	for i_ 1 step 1 while head
+	   do begin 
+		l_ character:lines[r_ head];
+		for j_ 1 step 1 until i-1
+		   do if l > character:lines[srt[j]] then done;
+		for j_ j step 1 until i do srt[j] swap r;
+		head_ character:next[head]; 
+	      end;
+	for i_ i-1 step -1 until 1
+	   do begin
+		r_srt[i];
+		print( character:abbrev[r], "=", character:name[r],
+			" ", character:pseudonym[r], " ==> " );
+		speechSummary(character:Speeches[r],character:Lines[r]);
+		printPageList( character:pages[r] );
+	      end;
+	squareUp;	! make the adjacency relationship commutative;
+	print( crlf & #ht & #ht & "Conflicts" & crlf & #ht );
+	for j_ characterCount step -1 until 1
+	   do print( #sp, character:abbrev[ srt[j] ] );
+	for i_ characterCount step -1 until 1
+	   do begin	integer code;
+		r_srt[i]; code_ character:code[r];
+		print( crlf, character:abbrev[r], #ht );
+		for j_ characterCount step -1 until 1
+		   do print( proximity( code, character:code[srt[j]],
+				length(character:abbrev[srt[j]])+1 ) );
+	      end;
+	print(crlf& "-----------------------------------" & crlf& crlf);
+    end;
+end;
+integer playSpeeches, playLines;
+procedure newPlay;
+begin 
+playSpeeches_ playLines_ 0; 
+wings_ activeCharacters_ null!record;
+arrclr(overallAdjacent); ringPos_ 0; ! ringPos just runs around ring;
+end;
+
+
+procedure beginAct; 
+begin actLines_ actSpeeches_ 0; arrclr(adjacent); arrclr(ring); end;
+
+
+procedure endAct;
+begin
+Inc( playLines, actLines ); Inc( playSpeeches, actSpeeches );
+mergeCounts;
+end;
+procedure checkAct;
+begin	string summary;
+	integer i,j;
+beginAct; 
+summary_ readAct( false );
+for i_ 0 upto maxDist-1 do for j_ minChar upto maxChar
+   do LORin( overallAdjacent[i,j], Adjacent[i,j] );
+speechSummary( actSpeeches, actLines );
+characterSummary( ActiveCharacters );
+endAct;
+end;
+
+open(inch_getchan, "DSK",'10000, 4,0, cnt_200,brk,eof_false);
+  do  begin
+	print("Play file: ");
+	lookup( inch, inchwl, eof );
+      end
+ until not eof;
+do input(inch, toPage) until brk or eof;	! skip over char list;
+setformat(0,1); 
+newPlay;
+do checkAct until eof;
+release(inch);	! for good form;
+arrtran( Adjacent, overallAdjacent );	! pick up entire play adjacents;
+
+print(crlf, "Overall play summary: ");
+speechSummary( playSpeeches, playLines );
+characterSummary( wings );
+end "play Summaries" $
+
+   
