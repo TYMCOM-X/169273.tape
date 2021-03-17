@@ -1,0 +1,393 @@
+        title   pascl   Pascal Program Development System monitor
+        twoseg
+;
+;    This program encapsules the Pascal Development System command level,
+;	performing several functions:
+;
+;	(1) It sets up the linked system as the CL, so that it is auto-
+;	matically run when jobs terminate.
+;
+;	(2) The first time the program is invoked in a session, it acts like
+;	a pascal main program and initializes the environment by appropriate
+;	runtime calls.
+;
+;	(3) It provides ways to run other programs, or to exit to the ".", i.e.
+;	the TOPS-10 monitor.  When the program is exited, the low segment 
+;	storage, including the stack and routine calling the run function,
+;	is saved.
+;
+;	(4) On all subsequent entries, it restores the low segment and returns
+;	to the caller of the run function, so that execution continues as if
+;	the core image had never been wiped.
+;
+	subttl	external definitions, external symbols, and equates
+
+	search	cypsym
+	search	passym
+
+	stksz=	3000		; stack size of running system
+
+	ap.ilm=	20000		; illegal memory reference trap mask
+
+	.rbcnt=	0		; enter/lookup extended arguments
+	.rbppn=	1
+	.rbnam=	2
+	.rbext=	3
+	.rbprv=	4
+	.rbsiz=	5
+
+	opdef	adjsp	[105b8]
+
+	extern	open.		; pascal runtime entrys
+	extern	rewrt.
+	extern	close.
+	extern	exit.
+	extern	prfid.
+	extern	fblst.		; file block list
+	extern	tty		; standard files
+	extern	ttyout
+	extern	pasclp		; the PDS command level
+	subttl	low segment storage
+
+        reloc   0
+clfid:  sixbit  /dsk/
+        sixbit  /pascl/
+        sixbit  /   /
+clppn:  0,,0
+
+tflst:	exp	17		; .IODMP - dumpmode
+	sixbit	/dsk/
+	xwd	0,0		; no buffers for dump mode
+
+tflid:	exp	.rbsiz		; enter/lookup block for low seg file
+	exp	0		; ppn
+	sixbit	/###pcl/	;
+	sixbit	/tmp/
+	exp	0		; protection
+	exp	0		; to get size of file
+
+rundev:	block 1			; run uuo name block
+runnam:	block 1
+runext:	block 1
+runmbz:	block 1			; must be zero
+runppn:	block 1
+runcor:	block 1			; should be zero
+
+lowiwd:	block	1		; iowd for static storage + stack
+	exp	0		; zero word to terminate list
+hpiwd:	block	1		; iowd for heap
+	exp	0
+
+hpend:	block	1		; holds end of heap (core) at exit
+
+savhp:	block	1		; marks heap as having been accessed from file
+
+savreg:	block	20		; register save area
+	subttl	Primary initialization
+        reloc   400000
+        entry   pascl
+
+pascl:	jfcl	0,0			; don't care how it enters
+	reset				; as per conventions
+
+;
+;    There is a problem on ADP where the CL program may be restarted without
+;	its low seg being reinitialized.  The following checks for a dirty
+;	low seg and if found, reruns the CL directly.
+;
+	skipn	3,clppn			; jump if low seg virgin
+	  jrst	  begin
+	dmove	1,clfid			; copy cl name into run block
+	dmovem	1,rundev
+	movem	3,runppn
+	setzm	runext			; sixbit /   /
+	hrrzi	0,rundev
+	run	0,
+
+;
+;    Open the low seg image temp file. If already there, this is a reentry
+;	to the CL; otherwise must initialize the environment (including
+;	opening the file.
+;
+begin:	open	0,tflst			; init channel, 0 never used by runtime
+	  jrst	  nofile
+	lookup	0,tflid			; see if it is already there
+	  jrst	  initpg		; lookup fails, file not there
+	  jrst	  reent
+
+;
+;    Create the temp file, as its being open for write is expected by the 
+;	exit code.
+;
+initpg:	hllzs	tflid+.rbext		; clear date fields
+	setzm	tflid+.rbprv		; clear protection code field
+	enter	0,tflid
+	  jrst	  nofile
+
+;
+;    Set up special sys: library to be search.  This is a special for system
+;	12 on ADP.
+;
+	move	2,[xwd -1,.spths]	; set own job and set function
+	move	3,[xwd	1,301]		; set special sys: ppn 
+	move	1,[xwd	2,2]		; set arg count and addr
+	spath.	1,0			; tell monitor to set up search
+	 halt
+;
+;    Set up this program as the CL.
+;
+	move    1,[-2,,2]               ; get our ppn
+        gettab  1,
+        halt
+        movem   1,clppn                 ; use it to set up CL
+
+        movei   1,clfid                 ; set up the CL
+        calli   1,-16
+
+;
+;    Initialize the stack and the rest of the environment.  This code is 
+;	liberally adapted from INITP. in the runtime.
+;
+	hlrz	ac1,.jbsa##		; get how much core we have
+	addi	ac1,stksz		; add in stack requirements
+	core	ac1,			; ask monitor for core
+	  jrst	  nocore
+
+	hlrz	ac1,.jbsa##		; get start of stack
+	move	ac0,.jbrel##		; record end of stack + force heap to
+	hrlm	ac0,.jbsa##		;   start at an allocation boundary
+	hrrm	ac0,.jbff##		;   start as equal to the above
+	hrri	topp,(ac1)	; make -(stacksize - 40),,stack base
+	sub	ac1,ac0
+	hrli	topp,40(ac1)
+	hrrzi	basis,(topp)		; stack frame base ptr, 0 lh tags main
+
+	movei	ac1,[0]			; no prog info block for main
+	movem	ac1,0(basis)
+	adjsp	topp,4			; use minimal stack frame size
+
+;
+;    Construct IOWDs for writing low segment image file.  This is split into
+;	two parts: the static and stack whose length is fixed after initialization
+;	and the heap, which may grow.
+;
+	move	1,.jbrel##		; get end of stack and static
+	hrrzm	1,hpiwd			; -0,heap-1
+	subi	1,.jbsa##-1
+	movn	1,1
+	hrlm	1,lowiwd
+	movei	1,.jbsa-1
+	hrrm	1,lowiwd		; -(.jbrel##(r)-(.jbsa-1), .jbsa-1
+
+	setom	savhp			; cause heap to be written on exit
+;
+;    Call the command loop written in Pascal
+;
+	pushj	topp,pasclp
+	jrst	exit.			; should not return, but ...
+	subttl	Exit routines
+;
+;    DOTCL exits to the TOPS-10 command loop, i.e. the "."
+;
+
+	entry	dotcl
+dotcl:	jsp	14,savenv		; save the world
+	exit	10,			; go to TOPS-10
+
+
+
+;
+;    RUNPRG is a pascal callable function which runs a program whose name
+;	is given as a string. Usage:
+;
+;	  external procedure runprg (name: file_id)
+;
+;    RUNCLL is similar to the above, except that the program is run at
+;	offset 1, the CL entry point.  Usage is the same.
+;
+	entry	runprg
+runprg:	jsp	14,parse		; parse the file name
+	jsp	14,savenv		; remember how to reinit
+	hrlzi	0,0			; offset 0
+	hrri	0,rundev		; get name block
+	run	0,
+	halt
+
+	entry	runcll
+runcll:	jsp	14,parse
+	jsp	14,savenv
+	hrlzi	0,1			; run at offset 1
+	hrri	0,rundev	
+	run	0,
+	halt
+;
+;    utility to parse a file name for runprg, runcll
+;
+
+parse:	move	reg2,0(reg)		; get length of name string
+	movei	reg1,1(reg)		; byte ptr to 0th char
+	hrli	reg1,440700
+	movei	reg,filptr(topp)	; overlay file block on stack to get info
+	pushj	topp,prfid.		; call pascal runtime filename parser
+	  popj	  topp,			; assumed okay, return if name error
+	move	0,fildev(topp)		; copy relevant components
+	movem	0,rundev
+	move	0,filnam(topp)
+	movem	0,runnam
+	move	0,filext(topp)
+	movem	0,runext
+	setzm	runmbz
+	setzm	runcor
+	jrst	0(14)
+	subttl	Environment Saving on Exit
+
+;
+;     SAVENV saves the environment (i.e. low segment storage).  It is called
+;	from the various exit routines by a "jsp 14,".
+;
+savenv:	movem	0,savreg		; save the registers
+	move	0,[1,,savreg+1]
+	blt	0,savreg+17
+;
+;    Close all open files.
+;
+	movei	reg,fblst.-fillnk	; get start of file block list
+clslp:	hrrz	reg,fillnk(reg)		; advance to next one on list
+	jumpe	reg,sewr1		; jump on end of chain
+	push	topp,reg
+	pushj	topp,close.		; call runtime to do the close
+	pop	topp,reg
+	jrst	clslp
+
+;
+;    Write out the portion of the low seg containing the static storage
+;	and the stack.  Note that we are careful to compute hpiwd before
+;	writing the low seg, so that it goes out with the rest.
+;
+diriwd:	iowd	1,lowiwd	; iowd to write "directory" word for reading file
+	exp	0		; terminate io list
+
+sewr1:	skipn	savhp			; compute hpiwd only if writing (see below)
+	  jrst	  sewr2
+	move	1,.jbrel##		; get current end of core
+	movem	1,hpend			; save to realloc on reentry
+	hrrz	2,hpiwd			; get start of heap - 1
+	sub	2,1			; - (heap end - (heap start - 1))
+	hrlm	2,hpiwd			; save iowd (used on reentry)
+
+sewr2:	useto	0,1			; position at start of file
+	out	0,diriwd		; write iowd used to read rest of file
+	  jrst	  .+2
+	  jrst	  wrerr
+	out	0,lowiwd
+	  jrst	  .+2			; everything kosher
+	  jrst	  wrerr
+
+;
+;    Write out the heap if it is in core.  SAVHP indicates the condition.
+;	On the first invocation, this is set to nonzero, as we known that
+;	storage is allocated by the initialization in the command loop. On
+;	subsequent invocations, all heap manipulation will trap to GETHP;
+;	this will read in the heap and set SAVHP.
+;
+	skipn	savhp			; continue if heap read in
+	  jrst	  sedone		; go close file
+
+	out	0,hpiwd
+	  jrst	  sedone
+	  jrst	  wrerr
+
+sedone:	close	0,			; close the temp file
+	jrst	0(14)
+	subttl	Reentry Initialization
+
+reent:	skipn	tflid+.rbsiz		; check size of file
+	  jrst	  initpg		; start over from scratch
+
+;
+;    Put file into update mode, as exit code will expect to be able to write
+;	it.  Then read in the static and stack storage, after first making
+;	room for it in core.
+;
+	enter	0,tflid
+	  jrst	  nofile
+	hlrz	ac1,.jbsa##	; alloc core, as in primary initialization
+	addi	ac1,stksz
+	core	ac1,
+	  jrst	  nocore
+	in	0,diriwd	; get iowd to read rest of file
+	  jrst	  .+2
+	  jrst	  rderr
+	in	0,lowiwd		; read in core
+	  jrst	  .+2
+	  jrst	  rderr
+
+;
+;    Now have the static and stack.  We do not read in the heap at this time
+;	as it may not be needed by the user.  Instead, we wait for a reference
+;	to the heap (or heap control block). Since this is beyond the end of
+;	core, it will cause an illegal memory trap. At the trap, core is
+;	extended, the heap is read in, and the faulting instruction retried.
+;	If it is a valid error, the fault will reoccur, but with the handler
+;	disabled.
+;
+	setzm	savhp			; mark heap as unaccessed
+	movei	1,gethp			; set trap handler
+	movem	1,.jbapr##
+	movei	1,ap.ilm		; enable handler
+	aprenb	1,
+
+;
+;    Restore the user's registers.  Reopen the teletype files. And return
+;	to the caller of the exit routine.
+;
+	movsi	17,savreg		; restore regs
+	blt	17,17
+
+	movei	reg,tty			; open (tty);
+	setz	reg2,
+	pushj	topp,open.
+	movei	reg,ttyout		; rewrite (tty);
+	setz	reg2,
+	pushj	topp,rewrt.
+
+	popj	topp,			; return to caller
+;
+;    GETHP - this reads in the heap on an illegal memory reference.  As it
+;	does not enable another illegal memory trap, future calls will not
+;	be taken.
+;
+gethp:	push	topp,1			; extend core to make room for heap
+	move	1,hpend
+	core	1,
+	  jrst	  noheap
+	pop	topp,1
+	aos	savhp			; mark heap as accessed
+	in	0,hpiwd			; read the heap
+	  jrst	  @.jbtpc##		; read ok, retry the faulting instruction
+	  jrst	  rderr
+	subttl	Error message routines
+
+nofile:	outstr	[asciz/
+Cannot open temp file./]
+	exit	10,
+
+noheap:	outstr	[asciz/
+Cannot allocate heap./]
+	exit	10,
+
+nocore:	outstr	[asciz/
+Cannot allocate stack./]
+	exit	10,
+
+rderr:	outstr	[asciz/
+Error reading temp file./]
+	exit	10,
+
+wrerr:	outstr	[asciz/
+Error writing temp file./]
+	exit	10,
+
+	lit
+        end     pascl
+  
