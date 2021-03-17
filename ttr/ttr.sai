@@ -1,0 +1,1751 @@
+begin "TTR"
+
+require "MYSAIL.DEF" source!file;
+require "BRKINI.REQ" source!file;
+
+require "TTRDEF.DEF" source!file;
+require !Version version;
+
+require "CMDSCN.REQ" source!file;
+require "CMDSCN.DEF" source!file;
+require "TTRCMD.DEF" source!file;
+
+require "RDFILE.REQ" source!file;
+require "PRICHK.REQ" source!file;
+require "TYMRIB.DEF" source!file;
+require "TTRREC.DEF" source!file;
+require "TIMEZN.DEF" source!file;
+
+
+!   Record definitions ;
+
+record!class files( Integer Usr1, Usr2, Nam, Ext, Nmsk, Emsk;
+		    r!p ( files ) Next );
+
+record!class xlate( String  OldName, NewName;	! textual references ;
+		    Integer Usr1, Usr2;		! sixbit Oldname     ;
+		    r!p ( xlate ) Next );	! pointer to next    ;
+
+r!p (files) fhead, fthis, flast;		! file descriptions  ;
+r!p (xlate) xhead, xthis, xlast;		! translation ptrs   ;
+
+
+!   Array Storage ;
+
+Preset!with "-Jan-","-Feb-","-Mar-","-Apr-","-May-","-Jun-",
+	    "-Jul-","-Aug-","-Sep-","-Oct-","-Nov-","-Dec-";
+Own String  Array MNames[ 0:11 ];		! -names- of months  ;
+
+Preset!with 31,28,31,30,31,30,31,31,30,31,30,31;
+Own Integer Array Months[ 0:11 ];		! days in each month ;
+
+Preset!with 366,365,365,365;
+Own Integer Array Years[ 0:3 ];			! days in each year  ;
+
+Define VerboseSize = 8;
+Preset!with "ALL","DIRECTORY","FILES","NAMES",
+	    "USERNAMES","DATES","SIZES","CHECKSUMS";
+Own String  Array VerboseNames[1:VerboseSize];	! verbosity keywords ;
+
+Preset!with V$All, V$Dir, V$Fil, V$Fil lor V$Nam,
+	    V$Fil lor V$Usr, V$Fil lor V$Day,
+	    V$Fil lor V$Siz, V$Fil lor V$Chk;
+Own Integer Array VerboseValues[1:VerboseSize];	! verbosity values   ;
+
+Preset!with "TERMINAL","FILE","BOTH","HELP","?";
+Own String  Array OutputModes[ 0 : 4 ];		! legal output modes ;
+
+Define MaxRange = '44 * '2000;			! depends on Range   ;
+Own Safe Integer Array Range[ 0 : '1777 ];	! tape position data ;
+Own Safe Integer Array LastUser[ 0 : 1 ];	! keep last username ;
+Own Safe Integer Array DskName[ 0:2 ];		! asciz user name    ;
+
+Own Safe Integer Array VM[ 0:MaxBytes-1 ];	!  tape data buffer  ;
+
+
+!   Variables, flags and data ;
+
+Own Integer InChan, InJFN;			! tape channel data  ;
+Own Integer Eof, Eot, InEof;			! end of file, tape  ;
+Own Integer DskChan, DskEof, DskJFN;		! output file stuff  ;
+
+Own Integer AllRange, NewPos, DonePos;		! range variables    ;
+Own Integer FilePtr, FileWanted;		! some file stuff    ;
+Own Integer CurSSet, CurPos;			! save set positions ;
+
+Own Integer DeviceFound;			! device inited flag ;
+Own Integer InSaveSet, InDataFile;		! SS and file flags  ;
+Own Integer TotalFiles, TotalTape, TapeNumber;	! also total counts  ;
+Own Integer RecordSize, FileSize, FullSize;	! sizes of things    ;
+Own Integer NeedNextTape, SkipData;		! multi-tape support ;
+Own Integer PartialUser, PartialFile;		! multi-tape support ;
+
+Own Integer OutputMode, Verbosity;		! mode & verbosity   ;
+Own Integer TimeZone;				! current time zone  ;
+Own Integer FileDate, FileTime;			! temps for timing   ;
+Own Integer Index, Val;				! loop index "HELP"  ;
+
+Own String  Device;				! device name        ;
+Own String  DskUser, DskFile;			! names of user/file ;
+Own String  TapeUser, TapeFile;			! names of user/file ;
+Own String  Command, Line;			! scratch strings    ;
+Own String  Zone;				! name of time zone  ;
+Own String  LastTape, SSName, LastSSN;		! names of things    ;
+Own String  NewOutputMode, NewOutputFile;	! print output stuff ;
+
+
+Simple String Procedure CV( Integer Val, Wid(0), Typ(0) );
+! ----------------------------------------------------------------------;
+!									;
+!	CV		ConVert a value "Val" into a numeric string of	;
+!			width "Wid" using the conversion method "Typ".	;
+!			Solves the problem of setting and resetting	;
+!			the width and digits parameters to GETformat	;
+!			and SETformat over and over again.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "my own cvxxx"
+
+    Integer Width, Digits;
+    Own String Str;
+
+    GetFormat( Width, Digits );
+    SetFormat( Wid,0 );
+
+    Str_ Case Typ of ( Cvs( Val ), Cvos( Val) );
+
+    SetFormat( Width, Digits );
+    Return( Str );
+
+end "my own cvxxx";
+
+
+Ifcr TENEX
+ thenc
+
+Simple Integer Procedure DecDate( Integer Days, Minutes, Seconds );
+! ----------------------------------------------------------------------;
+!									;
+!	DecDate		Routine to convert a standard Tymshare file	;
+!			date into DEC universal date/time format.	;
+!			Tymshare uses days since 01-Jan-64 and time	;
+!			since midnight.  The universal date/time is	;
+!			days since November 18,1858 in the left half	;
+!			and fractions of a day in the right half.	;
+!									;
+! ----------------------------------------------------------------------;
+Return( !Xwd( ( Days + 38394 ),
+	      (((Minutes * 60) + Seconds ) lsh 18) div (60 * 60 * 24)) );
+
+ endc
+
+
+Simple String Procedure TymDay( Integer TimeOfDay );
+! ----------------------------------------------------------------------;
+!									;
+!	TymDay		Routine to convert a date-time word with time	;
+!			in minutes (bits 11-21) and the number of days	;
+!			since 1-Jan-64 in bits 22-35, into a string.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "date time converter"
+    Define OneDay = 60 * 24, ZoneOffset = 60;
+    Integer Year, Month, Date, Time, Y, M, N;
+
+    Year_ 64;  Y_ 0;
+
+    Time_ (TimeOfDay lsh -14) land '3777;
+    Date_ TimeOfDay land '37777;
+
+    If ( TimeZone neq Z$GMT )
+     then begin "Convert time zone"
+	Time_ Time + ( TimeZone * ZoneOffset );
+	If ( Time < 0 )
+	 then begin
+	    Time_ Time + OneDay;
+	    Date_ Date - 1;
+	 end
+	 else If ( Time geq OneDay )
+	       then begin
+		  Time_ Time - OneDay;
+		  Date_ Date + 1;
+	       end;
+     end "Convert time zone";
+
+    While ( Years[ Y land '3 ] < Date )
+     do begin
+	Year_ Year + 1;
+	Date_ Date - Years[ Y land '3 ];
+	Y_ Y + 1;
+     end;
+
+    Month_ 0;
+    For M_ 0 step 1 until 11
+     do begin
+	If ( M neq 1 )  or  ( Y land '3 )
+	 then N_ Months[ M ]
+	 else N_ Months[ M ] + 1;
+	If ( N < Date )
+	 then begin
+	    Month_ Month + 1;
+	    Date_  Date  - N;
+	 end
+	 else done;
+     end;
+
+    Return( Cv( Date, -2 ) & MNames[ Month ] & Cv( Year Mod 100, -2 ) &
+	    " " & Cv( Time div 60, -2 ) & ":" & Cv( Time mod 60, -2 ) );
+
+end "date time converter";
+
+
+Simple procedure ToOutput;
+! ----------------------------------------------------------------------;
+!									;
+!	ToOutput	Insure that output is pointed at the correct	;
+!			stream, whether it be the terminal, a file or	;
+!			both.						;
+!									;
+! ----------------------------------------------------------------------;
+If ( Length( NewOutputMode ) )		! if specified by the user ;
+    and ( NewOutputMode neq "T" )	! but is not "TERMINAL"    ;
+ then SetPrint( NewOutputFile, NewOutputMode[1 for 1] );
+
+
+
+Simple procedure ToTerminal;
+! ----------------------------------------------------------------------;
+!									;
+!	ToTerminal	Insure that output is pointed at the terminal	;
+!			without bothering any potential file that is	;
+!			receiving output.				;
+!									;
+! ----------------------------------------------------------------------;
+If ( Length( NewOutputMode ) )		! insure terminal gets output ;
+    and ( NewOutputMode neq "T" )	! but not if already setup    ;
+ then SetPrint( NewOutputFile, "O" );
+
+
+
+Simple string procedure TranslateUser( Integer Nam1, Nam2 );
+! ----------------------------------------------------------------------;
+!									;
+!	TranslateUser	Takes the 2-part username found in the VM data	;
+!			array (passed as arguments) and translates it	;
+!			into the appropriate username for file output.	;
+!			If no translation is found, then a NULL string	;
+!			returned, otherwise the "NEW" name is returned.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "translator"
+
+    Xthis_ Xhead;				! start at top of list ;
+
+    While ( Xthis_ Xlate:Next[ Xthis ] )	! if any matches, then ;
+     do If ( Nam1 = Xlate:Usr1[ Xthis ] ) and	! return the "newname" ;
+	   ( Nam2 = Xlate:Usr2[ Xthis ] )
+	 then Return( If ( Length( Xlate:Newname[ Xthis ] ) )
+			then Opn.B & Xlate:Newname[ Xthis ] & Cls.B
+			else Null);
+
+    Return( Null );				! if none, then null ;
+
+end "translator";
+
+
+
+Boolean Procedure SetupFiles( String CmdLine );
+! ----------------------------------------------------------------------;
+!									;
+!	SetupFiles	Routine to accept a list of files specified	;
+!			on the command line, and build the appropriate	;
+!			file list to be used for the tape reading	;
+!			functions: DIRECTORY and RESTORE.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "get file specs"
+    String  U, F, E;
+    Boolean Dot;
+
+    Fthis_ FHead_ New!Record( Files );		! reset the file list ;
+
+    Scan( CmdLine, BrkWht, Brk );		! clear whitespace ;
+
+    If ( Length( CmdLine ) )			! if we typed anything ;
+     then While ( Length( CmdLine ) )		!  then parcel it up ;
+      do begin "one piece at a time"
+
+	Line_ Scan( CmdLine, BrkCom, Brk );	! scan to first comma ;
+
+	If ( Length( Line ) )			! if we got something ;
+	 then begin "between commas"		!  then check it out ;
+
+	    If not ( RdFile( Line, U, F, E, Dot ) )
+	     then Return( False );		! error if bad filename ;
+						! else make a new record ;
+
+	    Fthis_ Files:Next[Fthis]_ New!Record( Files );
+
+	    Files:Usr1[Fthis]_ CvSix( U[1 for 6] );
+	    Files:Usr2[Fthis]_ CvSix( U[7 for 6] );
+	    Files:Nmsk[Fthis]_ MyMask( CvSix( F[1 for 6] ) );
+	    Files:Emsk[Fthis]_ MyMask( CvSix( E[1 for 3] ) );
+	    Files:Nam[Fthis]_  CvSix(F[1 for 6]) lor Files:Nmsk[Fthis];
+	    Files:Ext[Fthis]_  CvSix(E[1 for 3]) lor Files:Emsk[Fthis];
+
+	 end "between commas";
+      end "one piece at a time"
+     else					! else insure "ALL" ;
+	Fthis_ Files:Next[ Fthis ]_ New!Record( Files );
+
+    Return( Fthis neq Fhead );			! If no records, it's bad ;
+						!  else return TRUE ;
+end "get file specs";
+
+
+
+Simple boolean procedure FileMatch;
+! ----------------------------------------------------------------------;
+!									;
+!	FileMatch	Returns TRUE if the username fields and the	;
+!			file.ext fields from the current file header	;
+!			match one of the "files" records.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "is this it"
+
+    Simple boolean procedure UserMatch;
+    Return( ( 0 = Files:Usr1[Fthis] )  or
+	    ( ( Files:Usr1[Fthis] = VM[ FR.User ] )
+	      and ( Files:Usr2[Fthis] = VM[ FR.User+1 ] ) )
+	   );
+
+    Simple boolean procedure NameMatch;
+    Return( ( 0 = Files:Nam[Fthis] ) or
+	    ( ( Files:Nam[Fthis] =
+		(Files:Nmsk[Fthis] lor VM[ FR.LKB+!RBNAM ]) )
+	      and ( !lh(Files:Ext[Fthis]) =
+		!lh((Files:Emsk[Fthis] lor VM[ FR.LKB+!RBEXT ])) ) )
+	   );
+
+    Fthis_ Fhead;			! copy head of list ;
+    While ( Fthis_ Files:Next[Fthis] )	! for each file record ;
+     do If ( UserMatch and NameMatch )	!   if user & name matches ;
+	 then Return( True );		!    then TRUE ;
+
+    Return( False );			! No match ;
+
+end "is this it";
+
+
+
+Simple Integer Procedure RangeByte( Integer BitNumber );
+! ----------------------------------------------------------------------;
+!									;
+!	RangeByte	Returns a bytepointer such that the IBP part	;
+!			of I-LDB and I-DPB will point to the specified	;
+!			bit position in the array.			;
+!									;
+! ----------------------------------------------------------------------;
+start!code "little bits make a byte"
+    define T1=1, T2=T1+1;  Protect!acs T1,T2;
+
+	Move	T1,BitNumber;		! Get bit/file number ;
+	Soj	T1,;			! Subtract before operation ;
+	Idivi	T1,36;			! Separate into parts ;
+	Addi	T1,Range[0];		! Index into range array ;
+	Subi	T2,36;			! Subtract to get offset ;
+	Movn	T2,T2;			! Reverse sign to positive ;
+	Lsh	T2,30;			! Slide into position ;
+	Tlo	T2,'100;		! setup Point(1,0,offset) ;
+	Iorm	T2,T1;			! make a pointer and return ;
+
+end "little bits make a byte";
+
+
+
+Simple Procedure AddRange( Integer Here, There );
+! ----------------------------------------------------------------------;
+!									;
+!	AddRange	Routine to set the bit positions between	;
+!			here and there in the range array.  Not the	;
+!			"fastest" way, but the easiest.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "feed me more"
+    Own Integer Delta, Where;
+
+    DonePos_ DonePos Max There;		! remember highest range ;
+
+    Delta_ There - Here;		! get difference between values ;
+    Where_ RangeByte( Here );		! get pointer to first bit ;
+
+    Quick!Code "zippy"
+	Define T1=1; Label Loop;
+
+	Movei	T1,1;			! a bit to set ;
+Loop:	Idpb	T1,Where;		! in the range array ;
+	Sosl	Delta;			! for each file ;
+	  Jrst	Loop;			! repeat the operation ;
+    end "zippy";
+
+end "feed me more";
+
+
+
+Simple Integer Procedure FirstPos;
+! ----------------------------------------------------------------------;
+!									;
+!	FirstPos	Returns the first position number set in the	;
+!			range array.					;
+!									;
+! ----------------------------------------------------------------------;
+begin "start over"
+
+    quick!code "jffpos"
+	Define T1=1, T2=2, T3=3, P='17;  Label Loop;
+
+	Movei	T1,1;			! Start at position 1 ;
+	Push	P,T2;			! Save a register ;
+	Push	P,T3;			!  And another ;
+	Movei	T2,Range[0];		! Point to the range array ;
+	Hrli	T2,'440100;		! Build a byte pointer ;
+Loop:	Ildb	T3,T2;			! Get a bit ;
+	Skipn	T3;			! Skip if set ;
+	 Aoja	T1,Loop;		! Otherwise loop ;
+	Pop	P,T3;			! Restore both registers ;
+	Pop	P,T2;			! And return the counter ;
+
+    end "jffpos";
+
+end "start over";
+
+
+
+Simple Boolean Procedure LegalRange( String Place );
+! ----------------------------------------------------------------------;
+!									;
+!	LegalRange	Returns true if the specified numeric string	;
+!			is OCTAL and within the range of the bit-table	;
+!			or is a left subset of the word "END".		;
+!									;
+! ----------------------------------------------------------------------;
+begin "check it out"
+    Integer Brk;
+    String Str;
+
+    If not ( Length( Place ) )			! must not be empty ;
+     then begin
+	Print( "Tape positions must be non-blank", Crlf );
+	Return( False );
+     end;
+
+    Scan( Str_ Place, BrkOct, Brk );		! must match all octal ;
+    If ( Length( Str ) = 0 )			! if so, return value ;
+     then begin
+
+	If ( Cvo( Place ) > MaxRange )
+	 then begin
+
+	    Print( "Tape positions must not exceed ",
+		    Cvos(MaxRange), ".", Crlf );
+	    Return( False );
+
+	 end
+	 else Return( Cvo(Place) );
+
+     end;
+
+    If KEqu( Place,"END"[1 for length(Place)] )	! must match "END" ;
+     then Return( MaxRange );			!  which very positive ;
+
+    Print( "Tape positions should be entered as OCTAL numbers", Crlf,
+	   "between 1 and ",Cvos( MaxRange )," inclusive.", Crlf );
+
+    Return( False );				! else return 0 ;
+
+end "check it out";
+
+
+
+Simple Boolean Procedure GetRange;
+! ----------------------------------------------------------------------;
+!									;
+!	GetRange	Prompts the user for a range and returns	;
+!			true if a valid set of ranges is specified.	;
+!			As a "side-effect" the appropriate bits are	;
+!			turned "ON" or "OFF" in the range table.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "find a good home"
+    Own String Line, Part, Start, Stop;
+    Own Integer B, E;
+
+    AllRange_ False;				! initially none  ;
+    Print( "Tape positions: " );		! prompt the user ;
+    Line_ Inchwl;				! read the answer ;
+    Scan( Line, BrkWht, Brk );
+
+    If Length( Line )				! something typed ;
+     then begin "specified entries"
+
+	ArrClr( Range );			! clear the range ;
+	DonePos_ 0;
+
+	While Length( Line )
+	 do begin "each entry"
+
+	    Part_ Scan( Line, BrkCom, Brk );	! get an entry ;
+	    If ( Length( Part ) )		!  and break it apart ;
+	     then begin "gobble morsel"
+		Start_ Scan( Part, BrkDsh, Brk );
+		Stop_ If ( Length( Part ) )	! fill with ending ;
+		       then Part		!  or with a copy ;
+		       else Start;		!  of the same ;
+	     end "gobble morsel";
+
+	    If not ( (B_ LegalRange( Start )) and
+		     (E_ LegalRange( Stop  )) )	! both must be legal ;
+	     then Return( False );
+
+	    If ( B leq 0 ) or			! start must be positive ;
+		( E < B )			! end must not be less ;
+	     then Return( False )		!  else it's illegal ;
+	     else AddRange( B,E );		! if so, then add it ;
+
+	 end "each entry"
+     end "specified entries"
+     else begin "default entry"
+
+	ArrClr( Range, -1 );			! a blank line means  ;
+	DonePos_ MaxRange;			! position 1 to E-O-T ;
+	AllRange_ True;				! ...for every tape.  ;
+
+     end "default entry";
+
+    Return( DonePos );				! tell of success ;
+
+end "find a good home";
+
+
+Simple Procedure OpenTape;
+! ----------------------------------------------------------------------;
+!									;
+!	OpenTape	Does the appropriate thing to open the tape	;
+!			device for either of the TENEX or TYMCOM-X	;
+!			operating systems (includes TOPS-20 as TENEX).	;
+!									;
+! ----------------------------------------------------------------------;
+begin "sigh"
+
+    Ifcr TYMCOMX
+     thenc
+
+	Open( InChan, Device, Mode, 1,0, MaxBytes,0, InEof_ -1 );
+
+     elsec
+
+	If ( InChan )			! If non-zero channel value ;
+	 then CFile( InChan );		!  then insure file closed ;
+
+	InChan_ GtJFN( Device&":", 0 );	! Get a JFN for the device ;
+
+	If ( InChan = -1 )		! If we can't open device ;
+	 then InEof_ !Skip!		!  then set eof flag ;
+	 else begin
+
+	    OpenF( InChan, 4 );		!  open in dump mode for read ;
+	    InJFN_ CvJFN( InChan );	! Now, convert chan into JFN ;
+
+	 end;
+
+     endc
+
+end "sigh";
+
+
+Simple Procedure RewindTape;
+! ----------------------------------------------------------------------;
+!									;
+!	RewindTape	Rewinds the current tape device and resets	;
+!			all the necessary tape and file position	;
+!			variables.					;
+!									;
+! -----------------------------------------------------------------;
+begin "whirrrrrr"
+
+    If ( InEof )			! if an EOF was seen...  ;
+     then OpenTape;			!  then insure open tape ;
+
+    MTape( InChan, "W" );		! rewind the tape and... ;
+
+    Eof_ Eot_ False;			!   reset the tape flags ;
+    InSaveSet_ InDataFile_ False;	!   reset SS & file flag ;
+    CurSSet_ CurPos_ 0;			!   reset SS & file pos  ;
+    LastSSN_ SSName_ Null;		!   reset saved SS Names ;
+
+end "whirrrrrr";
+
+
+
+Simple String Procedure ContinuationBanner;
+! ----------------------------------------------------------------------;
+!									;
+!	ContinuationBanner  Returns a string which describes "any"	;
+!			    partial or complete continuation of a file	;
+!			    or user across tapes.  "Null" if tape is	;
+!			    NOT a continuation tape.			;
+!									;
+! ----------------------------------------------------------------------;
+Return( If ( Val_VM[ HR.DayTime ] lsh -33 )
+	 then (If ( Val land 2 ) then "User - " else "") &
+	      (If ( Val land 1 ) then "File - " else "") &
+	      (If ( Val land 3 ) then "is " else "") &
+	      ("Continued from previous tape.") & Crlf
+	 else ("")
+			);
+
+
+Simple Procedure PrintTapeHeader;
+! ----------------------------------------------------------------------;
+!									;
+!	PrintTapeHeader	will print out the current tape ID and version	;
+!			information from the current VM array.		;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Print( LastTape_ Crlf & "Tape #" & Cv( !rh( VM[HR.Sequence] ) ) &
+	    " from TITO version " & Cv(!lh( VM[HR.Version] ), 0,1) &
+	    Crlf & "Written " & TymDay(VM[HR.DayTime]) &
+	    (If ( TimeZone = Z$GMT ) then " GMT" else "") &
+	    Crlf & ContinuationBanner & Crlf);
+end;
+
+
+
+Simple Boolean Procedure SaveSetHeader;
+! ----------------------------------------------------------------------;
+!									;
+!	SaveSetHeader	Returns whether the current contents of VM	;
+!			is a save-set header for TITO format tapes.	;
+!									;
+! ----------------------------------------------------------------------;
+Return( ( !rh(VM[ HR.Count ]) = 4 ) and		! count = 4, *FAILSAFE  ;
+	( VM[ HR.Failsafe ] = CVSIX("*FAILS") ) and
+	( VM[ HR.OneTwo ] = !Xwd(1,2) )		! right PPN code ;
+				);
+
+
+
+Simple Boolean Procedure FileHeader;
+! ----------------------------------------------------------------------;
+!									;
+!	FileHeader	Returns whether the current contents of VM	;
+!			is a file header for TITO format tapes.		;
+!									;
+! ----------------------------------------------------------------------;
+Return( ( !lh(VM[ FR.Count ]) = !lh( -1 ) ) and
+	( !lh(VM[ FR.Version ]) = !lh(CVSIX("DSK")) ) );
+
+
+
+Simple Boolean Procedure TapeIn;
+! ----------------------------------------------------------------------;
+!									;
+!	TapeIn		Attempt to read a record from the tape.		;
+!			Returns "TRUE" if data is read, or "FALSE"	;
+!			if at logical end-of-tape.  "EOF"		;
+!									;
+! ----------------------------------------------------------------------;
+begin "TYMCOM-X INPUT"
+
+    While not ( Eot )
+     do begin "Get a record"
+
+	Ifcr TYMCOMX
+	 thenc
+
+	    If ( InEof )		! If eof seen ;
+	     then OpenTape;		!  then insure tape is open ;
+
+	    ArryIn( InChan, VM[ 0 ], MaxBytes );
+
+	 elsec
+
+	    Start!Code
+		Define T1=1, T2=2, P1='13, P2='14;
+		Label NoGood, Ok, NoData;
+
+		Hrlzi	P1,-MaxBytes;	! Setup for IOWD ;
+		Hrri	P1,VM[-1];	! Iowd MaxBytes,VM[0] ;
+		Setz	P2,;		! Clear next word in list ;
+		Move	T1,InJFN;	! Get JFN;
+		Movei	T2,P1;		! Setup DUMPI ;
+		Setzm	InEof;		! Clear EOF flag ;
+		DUMPI;			! Read the tape ;
+		  Jrst	NoGood;		!  Some error ;
+		 Jrst	Ok;		! Everything is fine ;
+	    NoGood:
+		Caie	T1,'600220;	! It it's an I/O error ;
+		Cain	T1,'600221;	!  (device/data/eof) ;
+		 Caia;			!   then ... ;
+		  Jrst	NoData;		!   else give error ;
+		Move	T1,InJFN;	! Read the device status ;
+		GDSTS;			!  from the monitor ;
+		Trne	T2,'300010;	! Bad bits on? ;
+		  Jrst	NoData;		! Yes -- give error ;
+		Trne	T2,'020000;	! EOF ? ;
+		 Setom	InEof;		!  Yes, Set flag ;
+	    NoData:
+		Move	T1,InJFN;	! get JFN ;
+		Trz	T2,'770010;	! Clear bits ;
+		SDSTS;			!  in device status ;
+	    Ok:
+	    end;
+
+	 endc
+
+	Eot_ ( InEof ) and ( Eof );
+
+	If not ( Eof_ ( InEof ) )
+	 then Return( True );
+
+     end "Get a record";
+
+    Return( False );
+
+end "TYMCOM-X INPUT";
+
+
+
+Simple Boolean Procedure InitializeDevice;
+! ----------------------------------------------------------------------;
+!									;
+!	InitializeDevice	Procedure to insure that we indeed	;
+!				have a TITO format tape on the drive.	;
+!				The tape is left in the "rewind" state	;
+!				positioned at load-point.		;
+!				If the tape is NOT in TITO format it is	;
+!				unloaded and a new tape is requested.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Get device"
+    If ( DeviceFound )			! If currently selected ;
+     then RewindTape;			!  then rewind it first ;
+
+    While ( True )			! Until a selection is made ;
+     do begin "prompt and negotiate"
+
+        If ( 0 = Length( Line ) )	! If the user didn't specify ;
+         then begin			!  then prompt for device name ;
+            Print( "Tape Input Device: " );
+            Line_ Inchwl;		! Accept name from terminal ;
+	 end;
+
+	Device_ CToken( Line );		! Read up to first punctuation ;
+	If ( Kequ( Device,"NO" ) )	! See if user wants to abort ;
+	 then begin "user says NO"
+	    Cfile( DskChan );		! Close any open file ;
+	    Print( Crlf&"Operation aborted."&Crlf&Crlf );
+	    Return( DeviceFound_ False );
+	 end "user says NO";
+
+	OpenTape;			! Open the magtape device ;
+
+	If ( InEof )
+	 then Print( "Device """, Device, """ not available." & Crlf &
+		    "Please enter another device name or ""NO""." & Crlf )
+
+	 else begin "We have some kind of device"
+	    RewindTape;
+	    If ( TapeIn and SaveSetHeader  )
+	     then begin "probably a TITO tape"
+		PrintTapeHeader;	! let the user know it's OK ;
+		RewindTape;		! then reset for beginning ;
+	     end "probably a TITO tape"
+	     else begin "probably NOT a TITO tape"
+		Print( "Tape NOT in TITO format." & Crlf &
+		    "Please mount another tape and try again..." & Crlf );
+
+		MTape( InChan, "U" );	! unload tape ;
+		DeviceFound_ False;	! set flag for insurance ;
+		InEof_ True;		! flag as un-done ;
+	     end "probably NOT a TITO tape";
+	 end "We have some kind of device";
+
+	If ( InEof )			! If things went awry ;
+	 then Line_ Null		!  then clear line for retry ;
+	 else Done;			!  otherwise, we are done ;
+     end "prompt and negotiate";
+
+    Return( DeviceFound_ True );
+
+end "Get device";
+
+
+Simple Boolean Procedure MountNextTape;
+! ----------------------------------------------------------------------;
+!									;
+!	MountNextTape	Determines the reel number of the next tape	;
+!			in the current sequence of tapes, and requests	;
+!			the user to mount the next tape.  The user may	;
+!			continue by mounting the "correct" next tape	;
+!			or abort the operation by entering "NO" as the	;
+!			current tape device name.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "effect continuation"
+
+    MTape( InChan, "U" );		! Unload the current tape ;
+    DeviceFound_ False;
+
+    TapeNumber_ 1 + (-1 * ( !rh(VM[HR.Sequence]) lor (-1 lsh 18) ));
+
+    Val_ VM[ HR.DayTime ] lsh -33;	! copy significant info ;
+
+    Print(If ( PartialUser_ Val land 2 )
+	   then "User: ("&TapeUser&") " else "",
+	  If ( PartialFile_ Val land 1 )
+	   then "File: "&TapeFile&" - " else "",
+	  If ( Val land 3 )
+	   then "will be "              else "",
+	  "continued on the next tape."&Crlf );
+
+    Do begin "get right tape"
+
+	Print(  Crlf&"Please mount next tape (#",TapeNumber,
+		") - or respond ""NO""."&Crlf );
+
+	Line_ Null;			! Clear line for init dev  ;
+	If not ( InitializeDevice )	! See if tape is available ;
+	 then Return( False );		! no?  well, let them know ;
+
+	If ( ( !rh( VM[HR.Sequence] ) neq TapeNumber )
+	    or ( Val neq VM[ HR.DayTime ] lsh -33 ) )
+	 then begin "not right tape"
+
+	    Print(  Crlf&"Wrong tape - This is tape #",
+		    !rh( VM[HR.Sequence] ), "."&Crlf,
+		    (If ( VM[HR.DayTime] land !bit(1) ) then "User " else ""),
+		    (If ( VM[HR.DayTime] land !bit(2) ) then "File " else ""),
+		    (If ( VM[HR.DayTime] land !bit(3,2) )
+		      then "continued from previous tape."&Crlf else ""),
+		    "Do you want to continue? " );
+
+	    Scan( Line_ Inchwl, BrkWht, Brk );
+
+	    If ( Length( Line ) and
+		 Kequ( Line,"YES"[1 for length(line)] ) )
+	     then Done
+	     else begin "wrong tape"
+
+		MTape(  InChan, "U" );
+                DeviceFound_ False;
+		Print( Crlf&"Unloading tape..." );
+
+	     end "wrong tape";
+	 end "not right tape";
+
+     end "get right tape" until !rh(VM[HR.Sequence]) = TapeNumber;
+
+    Return( True );
+
+end "effect continuation";
+
+
+
+Simple Boolean procedure EachTapeIsSetup;
+! ----------------------------------------------------------------------;
+!									;
+!     EachTapeIsSetup	Returns "TRUE" when the current tape has been	;
+!			checked and the desired positions have been	;
+!			entered by the user, (if necessary).		;
+!									;
+! ----------------------------------------------------------------------;
+begin "each tape"
+
+    If ( NeedNextTape )			! Are we on another tape yet ;
+     then begin "multi-reel"
+	Print( '14 & Crlf );		! Paginate the output ;
+
+	ToTerminal;			! insure terminal gets output ;
+	If not ( MountNextTape )	! get the next tape ;
+	 then Return( False );		!  or return on error condition ;
+
+     end "multi-reel";
+
+    ToTerminal;				! insure terminal gets output ;
+
+    If not ( AllRange )			! If "ALL" was NOT specified ;
+     then begin "need range"		!  then prompt for a range ;
+	If not ( GetRange )		! Ask for tape positions ;
+	 then Return( False );		! -- and return if not Ok! ;
+     end "need range";
+
+    If ( FirstPos < CurPos )		! If we need to ... ;
+      or ( NeedNextTape ) or ( Eot )	!   for one reason or another ;
+     then RewindTape;			! then rewind everything ;
+
+    ToOutput;				! restore output to stream ;
+    NeedNextTape_ False;		! clear next-tape flag ;
+    Return( True );			! -- Done! -- ;
+
+end "each tape";
+
+
+Simple Procedure Header.Restore;
+! ----------------------------------------------------------------------;
+!									;
+!	Header.Restore	Total the files found in this save set.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "header"
+    If ( VM[ HR.Sequence ] land '400000 )
+     then begin "trailer record"
+
+	TotalTape_ TotalTape + InSaveSet;
+	InSaveSet_ 0;
+
+	If ( VM[ HR.DayTime ] lsh -33 )
+	 then NeedNextTape_ True;
+
+     end "trailer record";
+
+end "header";
+
+
+
+Simple Procedure File.Restore;
+! ----------------------------------------------------------------------;
+!									;
+!	File.Restore	Open the appropriate disk file for this tape	;
+!			file and output the data from the remaining	;
+!			portion of the file-header record.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "File Info"
+
+    If not ( FileWanted_ FileMatch )
+     then Return;
+
+    If ( PartialFile )
+     then Print( Crlf& "File continued from previous tape." &Crlf )
+     else begin "New file"
+
+	If ( InDataFile )
+	 then begin
+	    Print( Crlf &
+	    "[File had too little data on tape, continuing with next file.]"
+	     & Crlf & Crlf );
+	    CFile( DskChan );
+	 end;
+
+	InSaveSet_ InSaveSet + 1;
+	InDataFile_ True;
+
+	If ( VM[ FR.User ] neq LastUser[0] )
+	    or ( VM[ FR.User+1 ] neq Lastuser[1] )
+	 then begin
+	    DskUser_ TranslateUser( VM[FR.User], VM[FR.User+1] );
+
+	    If ( Verbosity land V$Dir )
+	     then Print( "(", TapeUser, ")",
+			 (If Length(DskUser) then " ==> "&DskUser else ""),
+			 Crlf );
+
+	    LastUser[0]_ VM[ FR.User ];
+	    LastUser[1]_ VM[ FR.User+1 ];
+	 end;
+
+	Open( DskChan_Getchan,"DSK", '10, 0,4, 0,0, DskEof_ -1 );
+	If ( DskEof )
+	 then Usererr(0,0,"Cannot Get DSK channel","X");
+
+	DskFile_ DskUser & Cv6str( VM[FR.LKB+!RBNAM] ) &
+		 (if ( !lh(VM[FR.LKB+!RBEXT]) )
+		   then "."&Cv6str( VM[FR.LKB+!RBEXT] land (-1 lsh 18) )
+		   else "");
+
+	Ifcr TENEX
+	 thenc
+	    Enter( DskChan, DskFile, DskEof_ -1 );
+	    DskJFN_ CvJFN( DskChan );
+	    DskName[0]_ CvAsc( DskUser[ 2 to (6 min INF-1)] );
+	    DskName[1]_ If ( Length(DskUser) > 7 )
+			 then CvAsc( DskUser[ 7 to (11 min INF-1)] )
+			 else 0;
+	    DskName[2]_ If ( Length(DskUser) > 12 )
+			 then CvAsc( DskUser[12 to (13 min INF-1)] )
+			 else 0;
+	 elsec
+	    Redefine !chENT = '5;
+
+	    If ( Length( DskUser ) )
+	     then begin "SetPPN for writing"
+		VM[ FR.User   ]_ CvSix( DskUser[1 for 6] );
+		VM[ FR.User+1 ]_ CvSix( DskUser[7 for 6] );
+		VM[ FR.LKB+!RBPPN ]_ Location( VM[ FR.User ] );
+	     end "SetPPN for writing"
+	     else VM[ FR.LKB+!RBPPN ]_ 0;
+
+	    Chnior( DskChan, VM[ FR.LKB ], !chENT );
+
+	    DskEof_ If ( !Skip! )	! error if cannot ENTER ;
+		     then 0
+		     else !Xwd( -1, !rh(VM[ FR.LKB+!RBEXT ]) );
+	 endc
+
+	If ( DskEof )
+	 then begin
+	    ToTerminal;			! insure user sees message ;
+	    Print( Crlf&"Cannot ENTER file: """,DskFile,""" (",
+		    Cvos( !rh(DskEof) ), ")"&Crlf&
+		    "Skipping file...and continuing."&Crlf );
+	    ToOutput;			! insure we continue OK ;
+	    FileWanted_ False;		! skip this file ;
+	    InDataFile_ False;		! and forget we were here ;
+	    Return;
+	 end;
+
+    end "New file";
+
+    If ( Verbosity land V$Fil )
+     then begin
+	FileTime_ (VM[FR.LKB+!RBPRV] lsh -12) land '3777;
+	FileDate_ (VM[FR.LKB+!RBPRV] land '7777) lor
+		    ((VM[FR.LKB+!RBEXT] land '140000) lsh -2);
+
+	Print(
+	    Verbose( V$Fil, CvXstr(VM[ FR.LKB+!RBNAM ])& "." &
+		CvXstr(VM[ FR.LKB+!RBEXT ] land (-1 lsh 18))    ),
+	    Verbose( V$Usr, CvXstr(VM[ FR.User ]) & CvXstr(VM[ FR.User+1 ]) ),
+	    Verbose( V$Day, "  " & TymDay( (FileTime lsh 14) lor FileDate ) ),
+	    Verbose( V$Day, "  " & TymDay( VM[ FR.Daytime ] )   ),
+	    Verbose( V$Siz, " " & Cv(VM[ FR.LKB+!RBALP ], 5)    )
+	);
+     end;
+
+end "File Info";
+
+
+Simple Procedure Data.Restore;
+! ----------------------------------------------------------------------;
+!									;
+!	Data.Restore	Skip through DATA records, writing the data	;
+!			out to the current file.			;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    If ( RecordSize > FileSize )
+     then begin "last record"
+
+	If ( PartialFile )
+	 then
+	    If ( FileHeader )
+	     then ArryOut( DskChan,VM['101+SkipData],FileSize-'100-SkipData )
+	     else ArryOut( DskChan, VM['1+SkipData], FileSize-SkipData )
+	 else
+	    If ( FileHeader )
+	     then ArryOut( DskChan,VM['101],FileSize-'100 )
+	     else ArryOut( DskChan, VM['1], FileSize );
+
+	ClosF( DskChan );
+
+	Ifcr TENEX
+	 thenc
+	    Define !FBCRV = '13, !FBREF = '15;
+	    Define DTH = { ((VM[ FR.LKB+!RBEXT ] land '140000) lsh -2) };
+	    Define DTA = { (VM[ FR.LKB+!RBEXT ] land '37777) };
+	    Define DTL = { (VM[ FR.LKB+!RBPRV ] land '7777) };
+	    Define TMM = { ((VM[ FR.LKB+!RBPRV ] land '37770000) lsh -12) };
+	    Define TMS = { ((VM[ FR.LKB+!RBLIC ] land '77000000) lsh -18) };
+
+	    ChFdb( DskChan, !FBCRV, -1, DecDate( DTH + DTL, TMM, TMS ) );
+	    ChFdb( DskChan, !FBREF, -1, DecDate( DTA, 0, 0 ) );
+
+	    If ( DskName[0] )
+	     then start!code "set author"
+		Define T1 = 1, T2 = 2, !SFAUT = 0, SFUST = '104000000551;
+
+		Hrlzi	T1,!SFAUT;	! Document what function code ;
+		Hrr	T1,DskJFN;	!  using the current disk JFN ;
+		Hrli	T2,'440700;	! Setup "POINT 7" ;
+		Hrri	T2,DskName[0];	!  to the Asciz username ;
+		SFUST;			! Set the author name ;
+	    end "set author";
+	 endc
+
+	RlJFN( DskChan );
+
+	If ( Verbosity land V$Fil )
+	 then Print( " ",
+	    Verbose( V$Chk, PriChk( VM[ FileSize+1 ] )  ),
+	    Crlf );
+	InDataFile_ False;
+
+     end "last record"
+     else begin "normal record"
+
+	If ( PartialFile )
+	 then
+	    If ( FileHeader )
+	     then ArryOut(DskChan,VM['101+SkipData],RecordSize-'100-SkipData)
+	     else ArryOut( DskChan, VM['1+SkipData], RecordSize-SkipData )
+	 else
+	    If ( FileHeader )
+	     then ArryOut( DskChan, VM['101], RecordSize-'100 )
+	     else ArryOut( DskChan, VM['1], RecordSize );
+
+	FileSize_ FileSize - RecordSize;
+
+     end "normal record";
+
+    PartialFile_ PartialUser_ False;	! Clear flags if set ;
+    SkipData_ 0;			!  and also skip-size ;
+
+ end;
+
+
+
+Simple Procedure Header.Print;
+! ----------------------------------------------------------------------;
+!									;
+!	Header.Print	Prints save-set header or trailer information.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    If ( VM[ HR.Sequence ] land '400000 )
+     then begin "trailer record"
+
+	If ( InSaveSet )
+	 then Print( Crlf&"Total of ",InSaveSet," files in saveset."&
+	    Crlf&Crlf& "End of Saveset #", CurSSet,
+	    " from TITO version ",Cv(!lh( VM[HR.Version] ), 0,1),
+	    Crlf& "Written ", TymDay(VM[HR.DayTime]),
+	    (If ( TimeZone = Z$GMT ) then " GMT" else ""), Crlf );
+
+	TotalTape_ TotalTape + InSaveSet;
+	InSaveSet_ 0;
+
+	If ( VM[ HR.DayTime ] lsh -33 )
+	 then NeedNextTape_ True;
+
+     end "trailer record"
+     else begin
+
+	SSName_ "Saveset #" & CvS( CurSSet_ CurSSet + 1 ) &
+		  " from TITO version " &
+		  Cv(!lh( VM[HR.Version] ), 0,1) &
+		  Crlf & "Written " &
+		  TymDay(VM[HR.DayTime]) &
+		  (If ( TimeZone = Z$GMT ) then " GMT" else "") &
+		  Crlf & ContinuationBanner & Crlf;
+
+     end;
+
+end;
+
+
+
+Simple Procedure File.Print;
+! ----------------------------------------------------------------------;
+!									;
+!	File.Print	Print out header info for each file.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "File Info"
+
+    If not ( FileWanted_ FileMatch )
+     then Return;
+
+    If ( Length( SSName ) )
+     then begin
+	Print( Crlf, SSName );
+	LastSSN_ SSName;
+	SSName_ Null;
+     end;
+
+    If ( PartialFile )
+     then Print( Crlf& "File continued from previous tape." &Crlf )
+     else If ( InDataFile )
+	 then Print( Crlf &
+	  "[File had too little data on tape, continuing with next file.]"
+	  & Crlf & Crlf );
+
+    InSaveSet_ InSaveSet + 1;
+    InDataFile_ True;
+    FileTime_ (VM[FR.LKB+!RBPRV] lsh -12) land '3777;
+    FileDate_ (VM[FR.LKB+!RBPRV] land '7777) lor
+		((VM[FR.LKB+!RBEXT] land '140000) lsh -2);
+
+    Print( Cv(!rh(VM[FR.Sequence]), 5,1), " ",
+	    CvXstr(VM[ FR.LKB+!RBNAM ]), ".",
+	    CvXstr(VM[ FR.LKB+!RBEXT ] land (-1 lsh 18)),
+	    CvXstr(VM[ FR.User ]), CvXstr(VM[ FR.User+1 ]),
+	    "  ", TymDay( (FileTime lsh 14) lor FileDate ),
+	    "  ", TymDay( VM[ FR.Daytime ] ), " ",
+	    Cv(VM[ FR.LKB+!RBALP ], 5), " " );
+
+end "File Info";
+
+
+
+Simple Procedure Data.Print;
+! ----------------------------------------------------------------------;
+!									;
+!	Data.Print	Skip through DATA records, decrementing the	;
+!			filesize variable until it falls within the	;
+!			current record, and then pretty-print the	;
+!			checksum.					;
+!									;
+! ----------------------------------------------------------------------;
+begin
+
+    If ( RecordSize > FileSize )
+     then begin "last record"
+
+	Print( PriChk( VM[ FileSize+1 ] ), Crlf );
+	InDataFile_ False;		! finished with file ;
+
+     end "last record"
+     else FileSize_ FileSize - RecordSize;
+
+    PartialFile_ PartialUser_ False;	! Clear flags if set ;
+    SkipData_ 0;			!  and also skip-size ;
+
+end;
+
+
+
+Simple Procedure Skeleton( Simple Procedure Header, File, Data );
+! ----------------------------------------------------------------------;
+!									;
+!	Skeleton	Routine to process the data on a TITO format	;
+!			magnetic-tape spacing FORWARD from some initial	;
+!			position (possibly from BOT).  The routines	;
+!			provided are for processing the individual	;
+!			record types: Header, File, and Data.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "Skeleton Reader"
+
+    RecordSize_ !rh( VM[ HR.Count ] );	! HR.FR.DR.Count == 0 ;
+
+    If ( SaveSetHeader )		! if this is a header record ;
+     then Header			!  then perform header ;
+     else begin "Not SS Header"
+
+	If ( FileHeader )		! if this is a file record ;
+	 then begin "file header"	!  then perform accounting ;
+
+	    TapeUser_ Cv6str( VM[FR.User] ) & Cv6str( VM[FR.User+1] );
+	    TapeFile_ Cv6str( VM[FR.LKB+!RBNAM] ) & "." &
+			Cv6str( VM[FR.LKB+!RBEXT] land (-1 lsh 18) );
+
+	    If ( PartialFile )
+	     then begin "continuation"
+
+		SkipData_ (FullSize-FileSize) mod 128;	! delta block ;
+		FileSize_ FileSize + SkipData + '100;	! new size ;
+
+	     end "continuation"
+	     else begin "normal"
+
+		FileSize_ ( FullSize_ VM[ FR.LKB+!RBSIZ ] ) + '100;
+		If ( (VM[FR.LKB+!RBEXT] land (-1 lsh 18)) = CVSIX("UFD") )
+		 then FileSize_ FileSize - VM[ FR.LKB+!RBSIZ ];
+		FilePtr_ RangeByte( CurPos_ !rh(VM[ FR.Sequence ]) );
+		FileWanted_ Ildb( FilePtr );
+
+	     end "normal";
+
+	    If ( FileWanted )		! File-Wanted is by POSITION ;
+	     then File;			!  ...turned off by no match ;
+
+	 end "file header";
+
+	If ( FileWanted )		! File-Wanted is by POSITION ;
+	 then Data;			! manage the data accordingly ;
+
+     end "Not SS Header";
+
+end "Skeleton Reader";
+
+
+Simple Procedure TapeReader( Integer Function );
+! ----------------------------------------------------------------------;
+!									;
+!	TapeReader	Routine to drive the general mechanism which	;
+!			reads a single magnetic tape and performs one	;
+!			of the "known" functions with the resultant	;
+!			data from the tape.				;
+!									;
+!	Functions:	DIRECTORY, RESTORE				;
+!									;
+! ----------------------------------------------------------------------;
+begin "Reading Tape"
+
+    TotalFiles_ TotalTape_ 0;		! Start with a fresh outlook ;
+    NeedNextTape_ AllRange_ False;	! Assume just one tape ;
+    ArrClr( LastUser );			! Forget everything ;
+
+    ToOutput;				! direct output to stream ;
+    While ( EachTapeIsSetup )
+     do begin "for each tape"
+	TotalTape_ InSaveSet_ 0;	! No files YET on this tape ;
+
+	If ( CurPos = 0 ) and		! if at the beginning of tape ;
+	   ( SaveSetHeader ) and	!  and at header (not trailer) ;
+	   ( (VM[HR.Sequence] land '400000) = 0 )
+	 then PrintTapeHeader		!  then print the header ;
+	 else Print( LastTape,		!  or the last tape header ;
+	 	Crlf, LastSSN );	!   and last known pos info ;
+
+	Case Function
+	 of begin "known functions"
+	  [ F$Directory ]		! If "DIRECTORY" ;
+	    While (CurPos leq DonePos)	! While we're within range ;
+		   and ( TapeIn )	!  and there is some tape ;
+	     do Skeleton( Header.Print,	!  read and print the directory ;
+			  File.Print,
+			  Data.Print );
+	  [ F$Restore ]			! If "RESTORE" ;
+	    While (CurPos leq DonePos)	! While we're within range ;
+		   and ( TapeIn )	!  and there is some tape ;
+	     do Skeleton(Header.Restore,
+			 File.Restore,	!  read the tape and restore ;
+			 Data.Restore)	!  selected files to disk ;
+
+	 end "known functions";
+	  
+	Print(Crlf&"Total of ",TotalTape_ TotalTape+InSaveSet,
+		" files found."&Crlf );
+
+	TotalFiles_ TotalFiles + TotalTape;
+	If not ( NeedNextTape )
+	 then begin
+	    MTape( InChan, "R" );	! backspae one record ;
+	    Done;			! finish loop ;
+	 end;
+     end "for each tape";
+
+    If ( TotalFiles neq TotalTape )
+     then Print( "Grand Total of ",TotalFiles,"."&Crlf );
+
+    ToTerminal;				! make sure terminal gets this ;
+    If ( TotalFiles )
+     then Print( Crlf&"Done!"&Crlf );
+
+end "Reading Tape";
+
+
+Simple Boolean Procedure All.Legal( Reference Integer Index );
+Return( True );
+
+
+
+Procedure Cmd.Action(	Reference Integer Command.Index;
+			Reference String  Command.Line;
+			Reference Integer Break.Char );
+begin "command actions"
+
+
+    Simple procedure NotImp;
+    Print( Cmd.Name[ Command.Index ], " Not Implemented", Crlf );
+
+!   The following pages each contain one or more of the processing
+!   commands.  
+;
+
+
+Simple procedure C.Abracadabra;
+begin "Do Magic"
+    Define !JBDDT = '74;
+    Internal Own Integer !Stack, !Strst, !Frmst;
+
+    Start!code
+	MOVEM	'17,!Stack;
+	MOVEM	'16,!Strst;
+	MOVEM	'12,!Frmst;
+	SKIPE	'1,!JBDDT;
+	  JRST	('1);
+    end;
+
+    Print( Crlf & "Nothing happens." & Crlf & Crlf );
+
+end "Do Magic";
+
+
+Simple procedure C.Directory;
+begin "DIRECTORY"
+
+    If not ( SetupFiles(Command.Line) )	! First check for files ;
+     then Return;			! -- and return if not Ok! ;
+
+    TapeReader( F$Directory );		! Perform a directory ;
+
+end "DIRECTORY";
+
+
+
+Simple procedure C.Forget;
+begin "FORGET"
+
+    Print( Crlf );
+
+    If ( Length( Command.Line ) )	! one or all ? ;
+     then while Length( Command.Line )
+      do begin "forget translation"
+
+	Line_ Scan( Command.Line, BrkCom, Brk );
+
+	Xthis_ Xlast_ Xhead;
+	While ( Xthis_ Xlate:Next[ Xthis ] )
+	 do If ( Kequ( Xlate:Oldname[ Xthis ], Line ) )
+	     then done
+	     else Xlast_ Xthis;
+
+	If ( Xthis )
+	 then begin
+	    Print( "Forgetting... ", Xlate:Newname[Xthis],
+		    " <== ", Xlate:Oldname[Xthis], Crlf );
+	    Xlate:Next[ Xlast ]_ Xlate:Next[ Xthis ];
+	 end
+	 else Print( "No translation found for: "&Line&Crlf );
+
+     end "forget translation"
+     else begin "forget all translations"
+
+	If ( Xlate:Next[ Xhead ] )
+	 then begin
+	    Print( "Forgetting all translations"&Crlf );
+	    Xhead_ new!record( Xlate );
+	 end
+	 else Print( Crlf&"No translations to forget"&Crlf );
+
+     end "forget all translations";
+    Print( Crlf );
+end "FORGET";
+
+
+
+Simple procedure C.Output;
+While (TRUE )
+ do begin "OUTPUT"
+
+    If ( 0 = Length( Command.Line ) )
+     then begin
+	Print( Crlf & "Change output to (T,F,B,?): " );
+	Command.Line_ Inchwl;
+	Scan( Command.Line, BrkWht, Brk );
+	If ( 0 = Length( Command.Line ) )
+	 then Command.Line_ "T";
+     end;
+
+    NewOutputMode_ CToken( Command.Line );
+    Scan( Command.Line, BrkWht, Brk );
+    NewOutputFile_ Command.Line;
+
+    OutputMode_ FndKey( NewOutputMode, OutputModes );
+    If ( OutputMode < 0 )		! read the mode and check ;
+     then OutputMode_ 4;		! if it's illegal, use "HELP" ;
+
+    Case OutputMode of begin "file modes"
+     [0] begin
+	      SetPrint( NewOutputFile, "T" );
+	      Done;
+	   end;
+
+     [1][2] begin
+	      While ( 0 = Length( NewOutputFile ) )
+	       do begin
+		  Print( "Output file name: ");
+		  NewOutputFile_ Inchwl;
+	       end;
+
+	      SetPrint( Null, "T" );	! close any "OPEN" file ;
+
+	      SetPrint( NewOutputFile, NewOutputMode[1 for 1] );
+
+	      ToTerminal;		! terminal should get this ;
+
+	      Print( Crlf );
+	      Done;
+	   end;
+
+     [3][4] Print( Crlf & "Output modes are:" & Crlf &
+	    "  Terminal  - output to user's terminal" & Crlf &
+	    "  File      - output to file (prompts for filename)" & Crlf &
+	    "  Both      - output to both terminal and file" &
+	    Crlf & Crlf )		! no semi-colon ;
+
+    end "file modes";
+
+ end "OUTPUT";
+
+
+
+Simple procedure C.Restore;
+begin "RESTORE"
+
+    If not ( SetupFiles(Command.Line) )	! First check for files ;
+     then Return;			! -- and return if not Ok! ;
+
+    TapeReader( F$Restore );		! Perform the restore ;
+
+end "RESTORE";
+
+
+
+Procedure C.Skip;
+begin "SKIP"
+
+    NewPos_ Cvo( Command.Line );	! read a number ;
+    If ( NewPos )
+     then begin
+	If ( NewPos < CurPos )		! if current pos is past ;
+	 then RewindTape;		!  then rewind for start ;
+
+	While ( CurPos < NewPos )	! while pos is less than ;
+		and ( TapeIn )		!  desired but not yet EOT ;
+	 do If ( FileHeader )		!  if a header, inc pos ;
+	     then CurPos_ !rh( VM[ FR.Sequence ] );
+
+	If ( Eot )			! if too far? then complain ;
+	 then Print( Crlf&"Tape position is past EOT."&Crlf&Crlf )
+	 else MTape( InChan, "R" );	! else backup one record ;
+     end
+     else Print( Crlf&"A file position is required."&Crlf&Crlf );
+
+
+end "SKIP";
+
+
+Procedure C.Translate;
+begin "TRANSLATE"
+
+    If ( Length( Command.Line ) )	! translate or list? ;
+     then while Length( Command.Line )
+      do begin "perform translation"
+	String T.From, T.To;
+
+	Line_ Scan( Command.Line, BrkCom, Brk );
+	T.To_ Scan( Line, BrkEqu, Brk );
+	T.From_ Line;
+
+	If ( 0 = Length( T.From ) )
+	 then T.From Swap T.To;
+
+	Xthis_ Xlast_ Xhead;
+	While ( Xthis_ Xlate:Next[ Xthis ] )
+	 do If ( Kequ( Xlate:Oldname[ Xthis ], T.From ) )
+	     then done
+	     else Xlast_ Xthis;
+
+	If not ( Xthis )
+	 then begin
+	    Xthis_ Xlate:Next[ Xlast ]_ new!record( Xlate );
+	    Xlate:Oldname[ Xthis ]_ T.From;
+	    Xlate:Usr1[ Xthis ]_ CvSix( T.From[1 for 6] );
+	    Xlate:Usr2[ Xthis ]_ CvSix( T.From[7 for 6] );
+	 end;
+
+	Xlate:Newname[ Xthis ]_ T.To;
+
+     end "perform translation"
+     else begin "list translations"
+
+	Xthis_ Xlast_ Xhead;
+
+	If ( Xlate:Next[ Xthis ] )
+	 then begin
+
+	    Print( Crlf&"Usernames will be translated as follows:"&Crlf );
+
+	    While ( Xthis_ Xlate:Next[ Xthis ] )
+	     do Print( If Length( Xlate:Newname[ Xthis ] )
+			then Xlate:Newname[ Xthis ] else "-null-",
+			" <== ", Xlate:Oldname[ Xthis ], Crlf );
+
+	 end
+	 else Print( Crlf&"No translations will be done."&Crlf );
+
+	Print( Crlf );
+
+     end "list translations";
+end "TRANSLATE";
+
+
+
+Simple procedure C.Verbosity;
+begin "VERBOSITY"
+    Integer OldVerbosity;
+
+    If ( Length( Command.Line ) )
+     then begin "something entered"
+	OldVerbosity_ Verbosity;
+	Verbosity_ 0;
+
+	While ( Length( Command.Line ) )
+	 do begin "one at a time"
+
+	    Line_ Scan( Command.Line, BrkBrk, Brk );
+	    If ( Brk = "," )
+	     then Brk_ Lop( Command.Line );
+	    Scan( Command.Line, BrkWht, Brk );
+
+	    If ( 0 < Val_ FndKey( Line, VerboseNames ) )
+	     then Verbosity_ Verbosity lor VerboseValues[Val]
+	     else begin "bad value"
+		Print( Crlf&"Unrecognized verbosity value """,Line,
+			"""."&Crlf&"-- Please enter one of --"&Crlf );
+		For Val _ 1 step 1 until VerboseSize
+		 do Print( "    ",VerboseNames[ Val ],
+			    If 0 = Val mod 4 then Crlf else "," );
+		Print( Crlf );
+		Verbosity_ OldVerbosity;
+		Return;
+	     end "bad value";
+	 end "one at a time";
+
+	If ( Verbosity = 0 )
+	 then Verbosity_ V$Dir;
+
+      end "something entered"
+      else Verbosity_ V$Dir;
+
+end "VERBOSITY";
+
+
+
+Simple procedure C.Zone;
+begin "ZONE"
+    Integer SaveZone;
+
+    If ( Length( Command.Line ) )
+     then begin "something entered"
+
+	SaveZone_ TimeZone;
+
+	If ( 0 < Val_ FndKey( Command.Line, TimeZones ) )
+	 then TimeZone_ TimeOffsets[ Val ]
+	 else begin
+
+	    TimeZone_ SaveZone;
+	    Print( Crlf & "Unrecognized time zone: """,
+		   Command.Line, """" & Crlf );
+
+	 end
+
+     end "something entered"
+     else TimeZone_ Z$Gmt;
+
+end "ZONE";
+
+
+
+Simple Procedure C.Quit;		! procedure "QUIT" - "EXIT" ;
+begin "QUIT"
+
+    SetPrint( Null, "N" );		! close output file, if any ;
+    If ( DeviceFound )			! if something on the drive ;
+     then RewindTape;			!  then rewind it - be nice ;
+    Call( 1, "EXIT" );			! TOPS-10, TYMCOM-X EXIT    ;
+
+end "QUIT";
+
+
+Simple procedure C.Unload;
+begin "UNLOAD"
+
+    RewindTape;				! Rewind tape to setup flags ;
+    MTape( InChan, "U" );		! Unload tape ;
+    DeviceFound_ False;			! Forget about device ;
+
+end "UNLOAD";
+
+
+Ifcr not ( Declaration( C.HELP ) land Check!type( Procedure ) )
+ thenc
+
+    Simple Procedure C.Help;
+    begin "HELP"
+
+	If Command.Line = "?"		! followed by ? ;
+	 then Command.Line_ "HELP";	! make it "..HELP" ;
+
+	If Length( Command.Line )	! "HELP <token>" ;
+	 then begin "short help check"
+
+	    Index_ FndCmd( CToken(Command.Line), Cmd.Name, All.Legal );
+	    If Index geq ArrInfo( Cmd.Name, 1 )
+	     then Print( Crlf, Cmd.Text[ Index ], Crlf,
+			 Cmd.Info[ Index ], Crlf )
+	     else Print( "  Unrecognized or ambigious help command"&Crlf );
+
+	 end "short help check"
+	 else begin "long help text"
+
+	    Print(  Crlf & ProgramBanner & Crlf & "Commands:" & Crlf );
+
+	    For Index _ ArrInfo( Cmd.Name, 1 )	! for each keyword;
+			step 1 until		!  in the specified;
+			ArrInfo( Cmd.Name, 2 )	!  array -- do;
+	     do
+		Ifcr ( Declaration( CMD$Inv ) )	! non zero? ;
+		 thenc
+		    If 0 = ( Cmd.Flag[ Index ] land CMD$Inv )
+		     then
+		 endc
+			Print( "  ", Cmd.Text[ Index ], Crlf );
+
+	 end "long help text";
+
+	Print( Crlf );
+
+    end "HELP";
+
+ endc
+
+
+
+    If ( Cmd.Flag[ Command.Index ] land CMD$NeedTape )
+	and ( not DeviceFound )		! Make sure everything's OK ;
+     then begin "verify device"
+
+        Print(  Crlf & "Tape device not initialized -- command aborted." &
+                Crlf & "Use the DEVICE command to select a tape device." &
+                Crlf & Crlf );		! Rebuke user for being dense ;
+	Return;				! and return to command scanner ;
+
+     end "verify device";
+
+    Command_ Cmd.Name[ Command.Index ];	!  M-A-I-N  C-M-D  L-O-O-P  ;
+    Scan( Command.Line, BrkWht, Brk );	! trim away whitespace      ;
+    Line_ Command.Line;			! copy for command routines ;
+
+    Case Command.Index			! case of begin C:C:C:C end ;
+     of begin
+	$$C$PROCS
+     end;
+
+end "command actions";
+
+
+Print(  Crlf, "[", ProgramBanner, "]", Crlf );
+
+Ifcr TYMCOMX
+ thenc
+    InChan_ Getchan;			! grab a tape channel ;
+ endc
+
+DeviceFound_ False;			! no device initially ;
+Xhead_ new!record( Xlate );		! setup translations  ;
+Verbosity_ V$Dir;			! print directories   ;
+TimeZone_ Z$GMT;			! no zone changes     ;
+
+CmdScn( ProgramPrompt, Cmd.Name, All.Legal, Cmd.Action, True );
+
+
+end "TTR";
+ d@gä
