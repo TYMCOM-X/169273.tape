@@ -1,0 +1,925 @@
+
+require "(SAILIB)XTEND" library;
+require "(SAILIB)XTEND.DCL" source!file; 
+
+string info!tree;
+string pointer;
+string file!name;
+record!pointer(NODE) tree!name;
+record!pointer(NODE) path!name;
+integer page!no;
+integer count;
+integer command;
+string  parameter;
+
+  define
+    max!deep = 30,
+    master!file = {"INFO.DAT"},
+    root!title = {"Summary of available information"},
+    root!name = {"ROOT"},
+    root!file = {"INFO.NFO"},
+
+    big = '377777777777,
+    PubColumns = 3,
+    PubDepth = 3,
+    PubWidth = 80,
+    PubLength = 60,
+    tab = 24,
+    indent = 3;
+
+  ! define data structure;
+
+  record!class NODE (
+	record!pointer(NODE) 
+		PARENT,			! up-level node ;
+		DOWN,			! first child node ;
+		NEXT;			! next child node ;
+	string 	NAME,			! name of node ;
+		TITLE,			! longer name description ;
+		FILE;			! name of file node is in ;
+	integer CREATION,		! date/time of creation ;
+		LEVEL,			! security level ;
+		TMP );			! ??? ;
+  record!pointer(NODE) ROOT,N,CN;
+
+record!class PUB (
+	record!pointer(node) Node;  ! pointer to node;
+	record!pointer(any!class) Llink,Rlink );
+
+record!pointer (PUB) PUBroot;	    ! root of tree for index;
+
+  ! disk IO pointers and things;
+
+  integer BRK,EOF,FLG,CNT,INCHAN,OUTCHAN,LINENO,PAGENO,SOSLNO;
+  integer !FORM!,!PAGE!,!FILE!,SEC!TYPE;
+  string SEC!NAME,SEC!TITLE,NEXT!LINE,NEXT!PROMPT,PAG!ID;
+  
+  ! terminal IO stuff;
+
+  integer CMD,PAG!PAG,PAG!SAV,PAG!LN,PAG!SP;
+  integer NOPAGE,NON!STOP;
+  record!pointer(NODE) PAG!N;
+  boolean BLANK,T!DPY;
+  string ARG;
+  set ARGS;
+
+  ! miscelaneous bookeeping;
+
+  integer LEVEL,DEPTH,I;
+  label DISPATCH,NXTCMD;
+  string ME,MYNAM,LINE,master!dir,root!dir;
+
+  ! external procedures and things;
+
+  external procedure $recgc;	! record garbage collector;
+
+
+! TIO routines;
+
+simple procedure outchr(integer X);
+auxclv(-1,X,3);
+
+forward boolean procedure GET!COMMAND(string P(null));
+
+simple integer procedure PEEK; begin "PEEK"
+  ! wait for a character if necessary and return that
+    character - don't read it from buffer;
+  own integer CH;
+  auxclv(-1,0,'10); ! Skip if char;
+  if not !SKIP!
+    then calli('10000000,'72); ! HIBER until CHAR;
+  CH:=calli(0,-'14); ! REDNXT;
+  return(CH);
+  end "PEEK";
+
+simple string procedure SPACE(integer CNT); begin "SPACE"
+  own string S;
+  while length(S)<CNT do
+    S:=S&" ";
+  return(S[1 for CNT]);
+  end "SPACE";
+
+string LastP;
+simple procedure PROMPT(string P("{~}")); begin "PROMPT"
+  if not equ(P,"{~}")
+    then begin
+      LastP_P_"["&(if node:DOWN[CN] neq null!record then ":" else null)
+	&node:NAME[CN]&(if length(P) then "; " else null)&P&"]";
+      end
+    else begin
+      P_LastP;
+      end;
+  auxclv(-1,0,'50);
+  Cursor(TTYlength-1);
+  Write(P);
+  ClearLine;
+  end "PROMPT";
+
+simple procedure MSG(string M); begin "MSG"
+  Cursor(TTYlength,1);
+  Write(M);
+  ClearLine;
+  end "MSG";
+
+simple procedure SET!HEAD(string ID;
+	record!pointer(NODE)N;
+	reference integer PAG); begin "SET!HEAD"
+  PAG!ID:=ID;
+  PAG!N:=N;
+  PAG!PAG:=location(PAG);
+  PAG!SAV:=PAG;
+  PAG!SP:=0;
+  PAG!LN:=0;
+  end "SET!HEAD";
+
+procedure PAGE!BREAK; begin "PAGE!BREAK"
+  string PGNO;
+  if PAG!LN and not NON!STOP
+    then GET!COMMAND("more");
+  ClearScreen;
+  PAG!LN:=2;
+  if PAG!SAV=memory[PAG!PAG]
+    then PAG!SP:=PAG!SP +1
+    else begin
+      PAG!SP:=1;
+      PAG!SAV:=memory[PAG!PAG];
+      end;
+  PGNO:="page " & (if PAG!SAV then cvs(PAG!SAV)&"-" else null)
+    & cvs(PAG!SP);
+  write(PAG!ID & " "
+    & node:NAME[PAG!N] & "; "
+    & node:TITLE[PAG!N]
+    & space(TTYwidth-3
+	-length(node:TITLE[PAG!N])
+	-length(PGNO)
+	-length(PAG!ID)
+	-length(node:NAME[PAG!N]))
+    & PGNO
+    & crlf & crlf);
+  end "PAGE!BREAK";
+
+procedure SEND(string S); begin "SEND"
+  if BLANK or length(S) then begin
+    if (PAG!LN = 0) or (PAG!LN+3 > TTYlength)
+      then PAGE!BREAK;
+    PAG!LN:=PAG!LN+1;
+    write(S & crlf);
+    end;
+  end "SEND";
+
+
+! WHERE command;
+
+forward boolean procedure LOCATE(string S;
+	reference record!pointer(NODE) N;
+	record!pointer(NODE) R(null!record));
+
+simple procedure WHERE; begin "WHERE"
+  own record!pointer(NODE) N;
+  if props(path!name)
+    then N:=datum(path!name)
+    else N:=CN;
+  MSG(node:FILE[N]&":"&node:NAME[N]&";"&node:TITLE[N]);
+  end "WHERE";
+
+
+! the SET command !;
+
+procedure SET!(string ARG1(null)); begin "SET!"
+  string COM;
+
+  define TST (STR) = {
+    equ(STR[1 for length(COM)],COM) };
+
+  COM:=scan(datum(parameter),4,BRK);
+
+  if tst("NOBLANK")
+   then begin "NOBLANK"
+    BLANK:=false;
+    return;
+    end "NOBLANK";
+
+  if tst("BLANK") then begin "BLANK"
+    BLANK:=true;
+    return;
+    end "BLANK";
+
+  if tst("LENGTH") then begin "LENGTH"
+    TTYlength:=cvd(datum(parameter));
+    return;
+    end "LENGTH";
+
+  if tst("TERMINAL") then begin "TERMINAL"
+    BRK:=0;
+    COM:=datum(parameter);
+    datum(parameter):=null;
+    end "TERMINAL";
+
+  if tst("WIDTH") then begin "WIDTH"
+    TTYwidth:=cvd(datum(parameter));
+    return;
+    end "WIDTH";
+
+  if BRK then begin "BADCOM"
+    MSG("?Illegal option: "&COM);
+    return;
+    end "BADCOM";
+
+  CmdScr (Com);
+
+  end "SET!";
+
+
+! table of contents;
+
+procedure CONTENTS(reference record!pointer(NODE)R); begin "CONTENTS"
+  integer MAXLEVEL;
+  recursive procedure CONTENTER(record!pointer(NODE)N); begin "CON"
+    if (N neq null!record) and (LEVEL leq MAXLEVEL) then begin
+      SEND(space(LEVEL*indent)
+	& node:TITLE[N]
+	& space(TTYwidth-length(node:TITLE[N])
+		-length(node:NAME[N])-LEVEL*indent)
+	& node:NAME[N]);
+      LEVEL:=LEVEL+1;
+      N:=node:DOWN[N];
+      while N neq null!record do begin
+	CONTENTER(N);
+	N:=node:NEXT[N];
+	end;
+      LEVEL:=LEVEL-1;
+      end;
+    end "CON";
+  ClearScreen;
+  if props(tree!name) then R:=datum(tree!name);
+  SET!HEAD("Contents",R,nopage);
+  MAXLEVEL:=(if props(count)
+    then datum(count)
+    else big);
+  LEVEL:=0;
+  CONTENTER(R);
+  end "CONTENTS";
+
+
+
+procedure PUBLISH (
+	record!pointer(NODE) R );
+begin "publish"
+define simple="", safe="";
+
+!	file output routines and globals
+;
+    integer Ichan,Ochan;	    ! Ichan used in pass 2;
+    integer Brk,Eof;		    ! for channels;
+    string FN;			    ! file name;
+    string TitleStr;		    ! title line;
+    integer SubPage;		    ! page number within section;
+    integer PageNo;		    ! page number;
+    integer LineNo;		    ! line on page;
+
+    simple procedure Heading;
+    begin "heading"
+	string PageStr;
+	SubPage _ SubPage +1;
+	PageStr _ "page "&cvs(SubPage);
+	PageNo _ PageNo +1;
+	LineNo _ 4;
+	cprint(OChan, 
+	    crlf, 
+	    TitleStr, 
+	    space(PubWidth-length(TitleStr)-length(PageStr)), 
+	    PageStr,
+	    crlf, crlf);
+    end "heading";
+
+    simple procedure Footing;
+    begin "footing"
+    if LineNo = big then return;! only one footing per page;
+	for LineNo _ LineNo step 1 until PubLength 
+	    do cprint(OChan,crlf);
+	cprint(OChan, space(PubWidth%2-1), PageNo, '15&'14);
+	LineNo _ big;
+    end "footing";
+
+    simple procedure LineOut (string L);
+    begin "lineout"
+	if LineNo > PubLength-2 then begin
+	    Footing;
+	    Heading;
+	end;
+	cprint(OChan, L, crlf);
+        LineNo _ LineNo +1;
+    end "lineout";
+    
+    simple procedure Title (string T);
+    begin "title"
+	TitleStr _ T;
+	SubPage _ 0;
+    end "title";
+
+!	routines to handle binary tree building for index and fixups
+;
+    procedure Insert (record!pointer(node) N);
+    begin "insert"
+	recursive procedure Insert! (
+	    reference record!pointer(pub) P;
+	    value record!pointer(pub) X );
+	if P 
+	    then if Compare(Node:name[Pub:node[x]],Node:name[Pub:node[p]]) < 0
+		then Insert! (Pub:Llink[p],X)
+		else Insert! (Pub:Rlink[p],X)
+	    else P _ X;
+	record!pointer(pub) P;
+	P _ new!record(pub);
+	Pub:node[p] _ N;
+	Insert! (PubRoot,P);
+    end "insert";
+
+!	recursive routines to do contents etc.
+;
+    procedure Titler (record!pointer(node) R);
+    if R then begin "titler"
+	string NodeName,PathName;
+	NodeName _ PathName _ Node:name[r];
+	while R _ Node:parent[r] do 
+	    PathName _ Node:name[r] & "/" & PathName;
+	do LineOut(null) until LineNo > (PubLength%2-3);
+	LineOut ("            Published:   "&StDate(calli(0,'14),'203));
+	LineOut ("            System:      "&cvs(calli('33000011,'41)));
+	LineOut ("            Directory:   "&me);
+	LineOut ("            Data base:   "&mynam);
+	LineOut ("            Path:        "&PathName);
+	LineOut ("            Node:        "&NodeName);
+    end "titler";
+
+    integer Level;		    ! level of indentation for contents;
+
+    recursive procedure Contenter (record!pointer(node) R);
+    if R and Level leq datum(count) then begin "contenter"
+	Insert (R);		    ! stash away for index;
+	Node:tmp[r] _ 0;	    ! clear printed flag;
+	LineOut (
+	    space(Level*3) &
+	    Node:name[r] & ": " &
+	    Node:title[r] & "    " &
+	    1&cvos(memory[location(R)])&2 ); ! will get fixed pass 2;
+	Level _ Level +1;
+	R _ Node:down[r];
+	while R do begin
+	    Contenter (R);
+	    R _ Node:next[r];
+	end;
+	Level _ Level -1;
+    end "contenter";
+
+    recursive procedure Publisher (record!pointer(node) R);
+    if R then begin "publisher"
+	Footing;
+	if Node:tmp[r] then return; ! don't reprint nodes;
+	Node:tmp[r] _ PageNo+1;	    ! stash away for pass 2;
+	if Node:down[r] 
+	    then begin "menu"
+		record!pointer(node)N;
+		msg ("Pass1: (menu) "&Node:name[r]&" p"&cvs(PageNo+1));
+		Title ("Menu: " & Node:name[r] & "; " & Node:title[r]);
+		N _ Node:down[r];
+		while N do begin
+		    LineOut (1&cvos(memory[location(N)])&2 & 
+				    ! will get fixed pass 2;
+			(if Node:down[n] then ":" else " ") &
+			Node:name[n] & space(16-length(Node:name[n])) &
+			Node:title[n]);
+		    N _ Node:next[n];
+		end;
+	    end "menu"
+	    else if Open!Node(R)=0 then begin "text"
+		msg ("Pass1: (text) "&Node:name[r]&" p"&cvs(PageNo+1));
+		Title ("Text: " & Node:name[r] & "; " & Node:title[r]);
+		if !FORM! then Get!Line;! discard heading;
+		do begin "copy"
+		    LineOut (Get!Line);
+		    if !PAGE! then Footing;
+		end "copy" until !FILE!;
+		close (InChan);
+	    end "text";
+	R _ Node:down[r];
+	while R do begin
+	    Publisher (R);
+	    R _ Node:next[r];
+	end;
+    end "publisher";
+
+    safe string array Txt2Col[1:PubLength-5];
+    integer Ptr2Col;
+    integer Col2Col;
+
+    simple procedure Ini2Col;
+    begin
+	integer I;
+	Footing;
+	arrclr(Txt2Col);
+	Ptr2Col _ Col2Col _ 0;
+    end;
+	
+    simple procedure Out2Col (string T);
+    begin "Out2Col"
+	Ptr2Col _ Ptr2Col +1;
+	if Ptr2Col > PubLength-5 then begin "new column"
+	    Ptr2Col _ 1;
+	    Col2Col _ Col2Col + PubWidth%PubColumns;
+	    if Col2Col > PubWidth-5 then begin "new page"
+		integer I;
+		Col2Col _ 0;
+		Heading;
+		for I _ 1 step 1 until PubLength-5 
+			do LineOut (Txt2Col[i]);
+		arrclr(Txt2Col);
+		Footing;
+	    end "new page";
+	end "new column";
+	if length(T) then Txt2Col[Ptr2Col] _ 
+	    Txt2Col[Ptr2Col] & 
+	    space(Col2Col-length(Txt2Col[Ptr2Col])) &
+	    T;
+    end "Out2Col";
+
+    simple procedure Flush2Col;
+    if Col2Col or Ptr2Col then begin
+	integer I;
+	Heading;
+	for I _ 1 step 1 until PubLength-5 do 
+	    LineOut (Txt2Col[i]);
+	Footing;
+    end;
+
+    integer Char1;
+
+    recursive procedure Indexer (record!pointer(pub) R);
+    if R then begin "indexer"
+	own string S;
+	own record!pointer(node) N;
+	Indexer (Pub:Llink[r]);
+	N _ Pub:node[r];
+	if Char1 neq (Node:name[n] land '137) then begin
+	    Char1 _ Node:name[n] land '137;
+	    Out2Col(null);
+	    Out2Col(null);
+	end;
+	Out2Col(Node:name[n]&"  "&cvs(Node:tmp[n]));
+	N _ Node:down[n];
+	while N do begin
+	    Out2Col("  /"&Node:name[n]&"  "&cvs(Node:tmp[n]));
+	    N _ Node:next[n];
+	end;
+	Indexer (Pub:Rlink[r]);
+    end "indexer";
+
+!	pass 1:
+	output contents with R!P to node replacing page #,
+	output menu's with R!P to node replacing page #,
+	output texts (build index and fixups for contents)
+	output complete index,
+;
+    if not props(count) then datum(count) _ PubDepth;
+    if props(tree!name) then R _ datum(tree!name);
+    FN _ Node:name[r]&".LST";
+    OChan _ GetChan;
+    open(OChan,"DSK",0,0,4, 0,0,EOF);
+    if EOF then begin msg ("cant init dsk:"); return end;
+    enter(OChan,FN,EOF);
+    if EOF then begin msg ("cant enter file DSK:"&FN); return end;
+    PubRoot _ null!record;
+    Char1 _ 0;
+    Level _ 0;
+    PageNo _ 0;
+    LineNo _ big;
+    cprint(OChan,'14&null);	    ! form feed at beginning;
+    
+!	title page (pass 1)
+;
+    msg ("Pass 1: (title)");
+    Title ("Title: "&Node:name[r]&"; "&Node:title[r]);
+    Titler (R);
+    Footing;
+
+!	table of contents (pass 1)
+;
+    msg ("Pass 1: (contents)");
+    Title ("Contents: "&Node:name[r]&"; "&Node:title[r]);
+    Contenter (R);
+    Footing;
+
+!	here come the text
+;
+    Publisher (R);
+    Footing;
+
+!	here come the index
+;
+    msg ("Pass 1: (index)");
+    Title ("Index: "&Node:name[r]&"; "&Node:title[r]);
+    Ini2Col;
+    Indexer (PubRoot);
+    Flush2Col;
+    Footing;
+
+!	end of pass 1
+;
+    close (OChan);
+
+!	pass 2
+;
+    msg ("Pass 2: (fixups) DSK:"&FN);
+    IChan _ GetChan;
+    open(IChan,"DSK",0,4,0, 2560,Brk,EOF);
+    if EOF then begin msg ("can't init DSK:"); return end;
+    lookup(IChan,FN,EOF);
+    if EOF then begin msg ("DSK:"&FN&" disappeared between passes"); return end;
+    enter(OChan,FN,EOF);
+    if EOF then begin msg ("DSK:"&FN&" can't be superceded"); return end;
+
+!	copy file
+;
+    while not EOF do begin "copy"
+	string LVN;		    ! last valid node (diagnostic);
+	string TXT;
+	Txt _ input(IChan,9);
+	out(OChan,Txt);
+	while BRK=1 do begin "signal-1"
+	    integer I;
+	    record!pointer(node) N;
+	    Txt _ input(IChan,9);
+	    if Brk=2 then begin "signal-2"
+		I _ cvo(Txt);
+		if I=0 or !lh(I) then begin "fubar"
+		    print(crlf,"?FUBAR: Grabage if fixup: ",Txt,crlf,
+			"?last valid fixup for node ",LVN,crlf);
+		    cprint (OChan, 1&null, Txt&2);
+		    done "signal-1" 
+		end "fubar";
+		memory[location(N)] _ I;
+		out (OChan, (cvs(Node:tmp[n])&"      ")[1 to 6]);
+	    	LVN _ Node:name[n];
+	    end "signal-2"
+	    else out (OChan, 1&Txt);
+	end "signal-1";
+    end "copy";
+
+!	end of pass 2
+;
+    release (IChan);
+    close (OChan);
+    release (OChan);
+    PubRoot _ null!record;	    ! discard index tree;
+    msg ("Output in file DSK:"&FN);
+
+end "publish";
+
+procedure EDIT(record!pointer(NODE)N); begin "EDIT"
+  integer FLAG;
+  string F,T;
+  if props(path!name) then N:=datum(path!name);
+  outstr(node:FILE[N]&":"&node:NAME[N]&";"&node:TITLE[N]&crlf);
+  tmpout("INF",node:NAME[N],FLAG);
+  if FLAG
+    then usererr(0,1,"?Can't create TMPCOR:INF")
+    else begin
+      if node:FILE[N]="("
+        then F:=node:FILE[N]
+        else F:=node:FILE[N]&me;
+      T:="F"&#ctrl("E")&#ctrl("T")&"$menu|"&node:NAME[N]
+	&crlf&#ctrl("E")&#ctrl("T")&"$text|"&node:NAME[N]
+	&#esc&crlf;
+      EDIT10(F,T);
+      end;
+  end "EDIT";
+
+
+! Tree traversing procedures;
+
+forward procedure MENU(reference record!pointer(NODE)R);
+forward procedure TEXT(reference record!pointer(NODE)R);
+
+simple procedure UP(reference record!pointer(NODE) R);begin "UP"
+  own integer I;
+  if not props(count) then datum(count):=1;
+  for I:=datum(count)-1 step -1 until 0 do begin
+    R:=node:PARENT[R];
+    if R=null!record then begin
+      R:=ROOT;
+      done;
+      end;
+    end;
+  if node:DOWN[R]
+    then menu(R)
+    else text(R);
+  end "UP";
+
+procedure GOTO!(reference record!pointer(NODE) R); begin "GOTO!"
+  if props(path!name) then R:=datum(path!name);
+  if node:DOWN[R]
+    then menu(R)
+    else text(R);
+  end "GOTO!";
+
+procedure MENU(reference record!pointer(NODE)R); begin "MENU"
+  integer INDEX;
+  record!pointer(NODE)N;
+  if props(path!name) then R:=datum(path!name);
+  SET!HEAD("Menu: ",R,nopage);
+  N:=node:DOWN[R];
+  if N=null!record then NEXT!PROMPT:="no menu";
+  INDEX:=0;
+  while N neq null!record do begin
+    INDEX:=INDEX+1;
+    SEND(cvs(INDEX) & "."
+	& space(4-length(cvs(INDEX)))
+	& (if node:DOWN[N] neq null!record then ":" else " ")
+	& node:NAME[N]
+	& space((16-length(node:NAME[N]))max 2)
+	& node:TITLE[N]);
+    N:=node:NEXT[N];
+    end;
+  end "MENU";
+
+procedure TEXT(reference record!pointer(NODE)R); begin "TEXT"
+  record!pointer(NODE)N;
+  if props(path!name) then R:=datum(path!name);
+  if OPEN!NODE(R)=0
+    then begin "COPY-TEXT"
+      if !FORM! then GET!LINE;
+      SETPL(INCHAN,LINENO,PAGENO,SOSLNO);
+      PAGENO:=1;
+      SET!HEAD("Text: ",R,PAGENO);
+      do begin "COPY-FILE"
+	do begin "COPY-PAGE"
+	  SEND(GET!LINE);
+	  end "COPY-PAGE"
+	until !PAGE!;
+	if not !FILE! then PAGE!BREAK;
+	end "COPY-FILE"
+      until !FILE!;
+      close(INCHAN);
+      end "COPY-TEXT"
+    else begin "NO-TEXT"
+      close(INCHAN);
+      NEXT!PROMPT:="no text";
+      end "NO-TEXT";
+  end "TEXT";
+
+procedure NEXT!(reference record!pointer(NODE) R); begin "NEXT!"
+  if node:NEXT[R]=null!record
+    then if node:PARENT[R]=null!record
+      then
+      else R:=node:PARENT[R]
+    else R:=node:NEXT[R];
+  GOTO!(R);
+  end "NEXT!";
+
+
+! Tree maintenance procedures;
+
+procedure DUMP; begin "DUMP"
+  integer OUTCHAN;
+  recursive procedure DUMPER(record!pointer(NODE)N); begin "DUMPER"
+    simple procedure DUMP!NODE(record!pointer(NODE)N); begin "D!N"
+      out(OUTCHAN,cvs(LEVEL)&";"&node:FILE[N]&";"&node:NAME[N]
+	&";"&cvs(node:CREATION[N])&";"&node:TITLE[N]&"."&crlf);
+      CNT:=CNT+1;
+      DEPTH:=DEPTH max LEVEL;
+      end "D!N";
+    if N neq null!record then begin
+      DUMP!NODE(N);
+      LEVEL:=LEVEL+1;
+      N:=node:DOWN[N];
+      while N neq null!record do begin
+        DUMPER(N);
+        N:=node:NEXT[N];
+	end;
+      LEVEL:=LEVEL-1;
+      end;
+    end "DUMPER";
+  open(OUTCHAN_getchan,"DSK",1,0,5,0,0,0);
+  enter(OUTCHAN,master!file&(master!dir),FLG);
+  if FLG then usererr(0,1,"?Can't enter master file: "
+    &master!file&ME);
+  LEVEL:=1;
+  CNT:=DEPTH:=0;
+  DUMPER(ROOT);
+  if LEVEL neq 1
+    then write("?Stack got screwed durring DUMP"&crlf);
+  close(OUTCHAN); release(OUTCHAN);
+  write(cvs(CNT)&" nodes, "&cvs(DEPTH)&" deep."&crlf);
+  end "DUMP";
+
+recursive proc BUILDER(record!pointer(NODE)N); begin "BUILDER"
+  own integer CODE;
+  record!pointer(NODE)N1;
+  N1:=node:DOWN[N]:=null!record;
+  write(space(LEVEL)&node:FILE[N]);
+  CODE:=OPEN!NODE(N,"MENU");
+  node:CREATION[N]:=CRE!DATE;
+  if !FORM! then begin "FORMATED"
+    write(":"&node:NAME[N]);
+    case CODE of begin
+      [0] begin "READ-MENU"
+	if SEC!TITLE then node:TITLE[N]:=SEC!TITLE;
+	GET!LINE;
+	while not !FILE! do if NEXT!LINE="*" 
+	then begin
+	  LINE:=GET!LINE;
+	  if N1=null!record
+	    then N1:=node:DOWN[N]:=new!record(NODE)
+	    else N1:=node:NEXT[N1]:=new!record(NODE);
+	  node:PARENT[N1]:=N;
+	  MENU!SCAN(N1,LINE);
+	end
+	else GET!LINE;
+	close(INCHAN);
+	write(crlf);
+	end "READ-MENU";
+      [1] begin "NO-FILE"
+	write("    ?Not found"&crlf);
+	end "NO-FILE";
+      [2] begin "NO-MENU"
+	write(crlf);
+	end "NO-MENU";
+      else usererr(CODE,2,
+	"?Illegal return code from OPEN!NODE")
+      end
+    end "FORMATED"
+  else begin "UN-FORMATED"
+    case CODE of begin
+      [0] write(crlf);
+      [1] write("    ?Not found"&crlf);
+      else usererr(CODE,2,
+	"?Illegal return code from OPEN!NODE")
+      end
+    end "UN-FORMATED";
+  LEVEL:=LEVEL+1;
+  N1:=node:DOWN[N];
+  while N1 neq null!record do begin
+    BUILDER(N1);
+    N1:=node:NEXT[N1];
+    end;
+  LEVEL:=LEVEL-1;
+  end "BUILDER";
+
+procedure BUILD; begin "BUILD"
+  ClearScreen;
+  write("Generating internal data base..."&crlf);
+  ROOT:=CN:=new!record(NODE);
+  $recgc;	! collect the garbage;
+  if not props(pointer)
+    then datum(pointer):=root!file&":"&root!name&";"&root!title;
+  node:FILE[ROOT]:=scan(datum(pointer),2,BRK);
+  node:NAME[ROOT]:=(if BRK=":"
+	then scan(datum(pointer),2,BRK)
+	else root!name);
+  node:TITLE[ROOT]:=(if BRK=";"
+	then datum(pointer)
+	else root!title);
+  BUILDER(ROOT);
+  DUMP;
+  write(10&10&crlf);
+  end "BUILD";
+
+procedure REBUILD; begin "REBUILD"
+  recursive procedure REBUILDER(record!pointer(NODE)N); begin "REB"
+    if N neq null!record then begin
+      lookup(INCHAN,node:FILE[N]&ME,FLG);
+      if FLG or (CRE!DATE neq node:CREATION[N])
+	then BUILDER(N)
+	else begin "NEXT"
+	  LEVEL:=LEVEL+1;
+	  N:=node:DOWN[N];
+	  while N neq null!record do begin
+	    REBUILDER(N);
+	    N:=node:NEXT[N];
+	    end;
+	  LEVEL:=LEVEL-1;
+	  end "NEXT";
+      end;
+    end "REB";
+  ClearScreen;
+  write("Rebuilding internal data base..."&crlf);
+  LEVEL:=0;
+  REBUILDER(ROOT);
+  DUMP;
+  write(crlf&crlf);
+  end "REBUILD";
+
+procedure VERIFY; begin "VERIFY"
+  recursive procedure VERIFIER(record!pointer(NODE)N); begin "VER"
+    if N neq null!record then begin
+      lookup(INCHAN,node:FILE[N]&ME,FLG);
+      close(INCHAN);
+      if (if FLG then 0 else CRE!DATE)neq node:CREATION[N]
+	then write(node:FILE[N] & (if FLG
+	  then " had been deleted."
+	  else " has been altered.") & crlf);
+      N:=node:DOWN[N];
+      while N neq null!record do begin
+	VERIFIER(N);
+	N:=node:NEXT[N];
+	end;
+      end;
+    end "VER";
+  ClearScreen;
+  write("Verifying internal data base..."&crlf);
+  VERIFIER(ROOT);
+  write(crlf&crlf);
+  end "VERIFY";
+
+
+! INIT and EXIT procedures;
+
+procedure INIT; begin "INIT"
+  record!pointer(NODE) array PATH[0:max!deep];
+  integer LAST,LEVEL,DEPTH;
+  ttyup(true);
+  PATH[0]:=null!record;
+  LAST:=CNT:=DEPTH:=0;
+  BLANK:=true;   ! default is to keep blank lines;
+  NEXT!PROMPT:=null;
+  setbreak(1,'12&'14,'15,"FINS");
+  setbreak(2,";:",'40,"KINS");
+  setbreak(3,";.",'15&'12,"FINS");
+  setbreak(4,"=",'40,"KINS");
+  setbreak(5,'40&'11&"?",null,"KINR");
+  setbreak(6,'40&'11,null,"FXNR");
+  setbreak(7,";/",":","KINS");
+  setbreak(8,null,0,"I");
+  setbreak(9,1&2,null,"FINS");
+  ME _	"["&cvos(calli(-'25,'41) lsh -18)&
+	","&cvos(calli(-'25,'41) land '777777)&
+	"]";
+  MYNAM _ cv6str(calli('777777000003,'41));
+  I _ (calli(-'24,'41)lsh -24)land '17;
+  case I of begin
+    ['14] "1200 baud" SET!("TERM=");
+    ['12] "110 baud" SET!("TERM=TTY");
+    [1][2][3][4][5][6][7] "300 or 150 baud"
+      if code('051300000000,memory[1])land '1000000
+	then "hard FF" SET!("TERM=315")
+	else "soft FF" SET!("TERM=126");
+    else SET!("TERM=")
+    end;
+  ClearScreen;
+  write(MYNAM&" version "&cvos(memory['137])&crlf);
+  open(INCHAN_getchan,"DSK",1,5,0,256,BRK,EOF);
+  lookup(INCHAN,master!file&(master!dir_null),FLG);
+  if FLG
+    then lookup(INCHAN,master!file&(master!dir_ME),FLG)
+    else master!dir:=null;
+  if FLG
+    then begin "NO-DATA-BASE"
+      write("?Data base DSK:"&master!file
+	&master!dir&" not found"&crlf);
+      ROOT:=CN:=null!record;
+      end "NO-DATA-BASE"
+    else 
+      while LEVEL:=cvd(input(INCHAN,3)) do begin "LOAD-DATA-BASE"
+        CNT:=CNT+1;
+        N:=new!record(NODE);
+	if ROOT=null!record
+	  then ROOT:=CN:=N
+	  else if LAST<LEVEL
+	    then node:DOWN[PATH[LAST]]:=N
+	    else node:NEXT[PATH[LEVEL]]:=N;
+        LAST:=LEVEL;
+	PATH[LEVEL]:=N;
+	node:PARENT[N]:=PATH[LEVEL-1];
+	node:FILE[N]:=input(INCHAN,2);
+	node:NAME[N]:=input(INCHAN,2);
+	node:CREATION[N]:=cvd(input(INCHAN,2));
+	node:TITLE[N]:=input(INCHAN,3);
+        if BRK neq "." then usererr(0,1,
+	  "?Illegal format on master file at level "&cvs(LEVEL));
+	if EOF then usererr(0,1,
+	  "?Premature end of master file at level "&cvs(LEVEL));
+	DEPTH:=DEPTH max LEVEL;
+	end "LOAD-DATA-BASE";
+  close(INCHAN);
+  if ROOT=null!record then begin
+    ROOT:=CN:=new!record(NODE);
+    node:FILE[ROOT]:=root!file;
+    node:NAME[ROOT]:=root!name;
+    node:TITLE[ROOT]:=root!title;
+    end;
+  write(cvs(CNT)&" nodes, "&cvs(DEPTH)&" deep."&crlf);
+  ifc compiler!switch("B") thenc usererr(0,1,"Enter BAIL?"); endc
+  end "INIT";
+
+
+begin "INFO-MAIN"
+  INIT;
+  ARG:=read!temp("INF",FLG);
+  if not FLG then begin
+    kill!temp("INF"); kill!temp("SVC");
+    REBUILD;
+    locate(ARG,CN,ROOT);
+    end;
+  end "INFO-MAIN";
+end
+ [ ã
