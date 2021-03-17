@@ -1,0 +1,5 @@
+$PAGE PRGDIR.INC, last modified 5/11/84, zw
+EXTERNAL
+PROCEDURE prgm_ppn ( VAR INTEGER );
+EXTERNAL
+FUNCTION prgm_dir: STRING [15];
