@@ -1,0 +1,173 @@
+entry	AuxWindow;
+begin	"AUXWIN"
+
+require "(SAILIB)SAIL.DEF" source!file;
+!get!definitions(TYMINT);
+require "(MPL)UUOSYM.SAI" source!file;
+
+external procedure W!Msg( string MSG );		! PEAK message line svc;
+own integer PORT;				! aux circuit port number;
+
+!	interrupt administration
+
+notes:
+    o	interrupt is used to move keyboard data out to the circuit
+    o	for efficiency, an immediate interrupt is used - beware -
+	no SAIL data structures may be touched by this routine!
+    o	channel 10 is used because SAIL uses some of the lower ones
+;
+
+simple procedure TTYsvc;
+begin
+!	CAVEAT HACKER: this is a SAIL IMMEDIATE INTERRUPT PROCEDURE!!!
+
+    o	read as many characters as exist from TTY bufer (image mode)
+    o	send them all out to aux circuit
+    o	issue leave def int to begin reflecting yellow balls
+    o	return causes SAIL to dismis the interrupt
+;
+    begin!code
+	label LOOP,DONE;
+	define T1=1, C=2;
+	protect!acs T1,C;
+
+LOOP:	HRROI	T1,!axI8S;
+	AUXCAL	T1,C;		! get char from TTY and skip;
+	  JRST	DONE;		! no chars, cleanup and dismiss;
+	HRL	T1,Port;
+	HRRI	T1,!axO8;
+	AUXCAL	T1,C;		! output char to AUX CIR - may block;
+	JRST	LOOP;
+DONE:	HRROI	T1,!axLDE;
+	AUXCAL	T1,;		! let TTY echo yellow balls;
+    end;
+end;
+
+simple procedure Enable!TTY;
+begin
+!	define immediate interrupt for char received from TTY;
+
+    intmap ( tinass( -1, !IACHR, 10 ), TTYsvc, 0 );
+    enable ( newenb(10) );
+    auxclv ( -1, 0, !axLDE );		! echo yellow balls;
+
+end;
+
+simple procedure Disable!TTY;
+begin
+!	deassign and disable interrupt for char received from TTY;
+
+    intmap ( tinass ( -1, !IACHR, 0 ), TTYsvc, 0 );
+    disable ( newenb(10) );
+
+end;
+
+!	auxilary circuit administration
+
+notes:
+    o	build a circuit to specified user name/host
+    o	the following defaults are handled by this procedure:
+	    <null>	defaults to LIUN:CSYS
+	    nnnn	defaults to nnnn:HSYS - won't work from uNodes
+	    nnnn:	defaults to nnnn:CSYS
+	    nnnn:ssss		    nnnn:ssss
+	    :ssss	defaults to LIUN:ssss
+	where
+	    LIUN = logged in user name
+	    CSYS = current system number
+	    HSYS = home system number
+    o	error messages call external procedure W!Msg
+    o	returns port number if succesful, else -1, !SKIP! is also set
+;
+
+integer procedure CREAUX ( string LoginString );
+begin	"CREAUX"
+    integer I, Port;
+    integer array X[0:5];
+    string S,ERRMSG;
+
+!	convert to upper case;
+    S := LoginString; LoginString := null;
+    while length(S) do 
+	LoginString := LoginString &( if "a" leq (I_lop(S)) leq "z"
+	    then I-'40 else I );
+
+!	handle defaults in login string;
+    if length(LoginString) = 0 then LoginString := ":";
+    if LoginString[1 for 1] = ":" then LoginString :=
+	cv6str(calli(!xwd(-1,!GTUNM),calli!GETTAB))
+	& cv6str(calli(!xwd(-1,!GTUN1),calli!GETTAB))
+	& LoginString;
+    if LoginString[inf for 1] = ":" then LoginString :=
+	LoginString
+	& cvs(calli(!xwd(!CNSYS,!GTCNF),calli!GETTAB));
+
+!	pack string in an array and call the monitor to build the circuit;
+    for I := 0 upto 5 do X[i] := cvasc(LoginString[1+5*i to 5+5*i]);
+    Port := I := calli(location(X[0]),calli!CREAUX);
+
+!	if monitor call skipped, return port number to our caller;
+    if !SKIP! then begin
+	W!Msg( "Login: "&LoginString&" [ok]" );
+	return(Port);
+    end;
+
+!	otherwise, we got an error, print the message;
+    case !lh(I) of begin
+      	[CXSUP#] case !rh(I) of begin
+	[CXSFE#] ERRMSG_"?format error";
+	[CXSBU#] ERRMSG_"?not in MUD";
+	[CXSBM#] ERRMSG_"?bad MUD";
+	[CXSHU#] ERRMSG_"?host unavailable";
+	[CXSDF#] ERRMSG_"?download/dialout failure";
+	[CXSTO#] ERRMSG_"?timeout";
+	[CXSAB#] ERRMSG_"?access barred";
+	[CXSIS#] ERRMSG_"?error in ISIS";
+	[CXSLQ#] ERRMSG_"?long queue in supervisor";
+	else ERRMSG_"?supervisor error: '"&cvos(!rh(I)) end;
+	[CX2AX#] ERRMSG_"?too many circuits";
+	[CXLOG#] ERRMSG_"?not your username";
+	[CXDCB#] ERRMSG_"?no room in monitor";
+	[CXNRR#] ERRMSG_"?sup ignored original req";
+	[CXNRL#] ERRMSG_"?sup ignored login message";
+	[CXNCH#] ERRMSG_"?sup supplied no circuit";
+	[CXERR#] ERRMSG_"?sup error on original request";
+	else ERRMSG_"?unknown error: '"&cvos(!lh(I))
+    end;
+    W!Msg( "Login: "&LoginString&" [failed] "&ERRMSG );
+    !SKIP! := false;
+    return( -1 );
+end	"CREAUX";
+
+!	AuxWindow
+
+notes:
+    o	assumes echo is off on command port
+    o	takes over terminal for duration of circuit
+    o	no escape character (feature?)
+    o	uses SAIL immediate interrupts - beware!
+;
+
+internal procedure AuxWindow( string LoginString; procedure ChrSvc );
+begin	"AuxWindow"
+    Port := Creaux( LoginString );
+    if Port geq 0 then begin "OK"
+	integer CHR;
+	string S;
+	Enable!TTY;				! enable interrupts;
+	while true do begin "GetChr"
+	    auxclr( Port, CHR, !axI8C );	! wait for a character;
+	    if not !SKIP! then done;		! has it been zapped?;
+	    S := CHR;
+	    do begin "GetMore"
+		auxclr( Port, CHR, !axI8S );	! get more if there is any;
+		if !SKIP! then S := S& CHR;
+	    end "GetMore" until not !SKIP!;
+	    ChrSvc( S );			! call user's routine;
+	end "GetChr";
+	Disable!TTY;				! disable interrupts;
+	W!Msg( "[circuit zapped]" );
+    end "OK";
+end	"AuxWindow";
+
+end "AUXWIN" $
