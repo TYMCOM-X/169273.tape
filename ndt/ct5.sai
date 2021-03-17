@@ -1,0 +1,610 @@
+begin "ftp controller"
+
+require "SAIL.DEF" source!file;
+! was: require "(SAILIB)SAIL.DEF" source!file;
+  !get!module(EXTEND);
+! require "(sailib)xtend.dcl" source!file;
+! require "(sailib)xtend" library;
+
+
+! commands: ;
+define c.noop=0, c.quit=1, c.send=2, c.receive=3, c.size=4, c.unknown=5;
+
+! program transfer modes: ;
+define m.AST=1, m.BIN=2, m.guess=3;
+
+
+boolean did!something		! set true so illegal can pop out.;
+,	drop!blank!lines	! true to drop trailing blank lines;
+;				! on pages in AST files;
+integer transfer!mode		! general mode for file transfers;
+,	read!length		! max count of file chars per read;
+;
+define min#code = 0; define max#code = min#code-1;
+define #code(name) = {redefine max#code = max#code + 1;
+			define name = max#code};
+! transport level:;
+	#code(#header);
+	#code(#trailer);
+	#code(#shift!in);
+	#code(#shift!out);
+! PTC (in transport):	body ::= encoded( [PTC] ...text... [Checksum] );
+	#code(#link!PTC);
+	#code(#data!PTC);
+! link PSC:; 
+	#code(#ack!PSC); ! positive acknowledge (data: topOk,botNeed);
+	#code(#nak!PSC); ! negative acknowledge (data: dead PID);
+	#code(#rfr!PSC); ! request for response (null data);
+	#code(#rrq!PSC); ! Reset request (data: reset table);
+	#code(#rrp!PSC); ! Reset response (data: reset table);
+	#code(#com!PSC); ! unused;
+! data PSC:; 
+
+! PID -- Packet ID;
+! [header] ...body... [trailer]
+! ...body... ::= encoded( [PTC] ...text... [Checksum] )
+! PTC = Link:
+!	...text... ::= [PSC] data
+!	PSC = ACK:	data ::= [PID.lastgood] [PID.maxSend] 
+!	PSC = NAK:	data ::= [PID.guessed.bad]
+!	PSC = RFR:	data ::= <<nothing>>
+!	PSC = COM:	<undefined as of yet>
+!	PSC = RRQ:	data ::= Reset.Table
+!	PSC = RRP:	data ::= Reset.Table
+! PTC = Data:
+!	...text... ::= [PID] [PSC] data
+!	{{PID is the Packet identifier}}
+!	{{PSC is Data class header without the Link bit.}}
+
+procedure fill!reset!table( 
+	integer	Version			! of FTP spoken;
+	,	max!transport!length	! 0:2^16-1
+	,	max!transport!length
+	,	!window!size!
+	,	checksum!type
+	,	timeout!seconds
+	;
+	boolean timer!here 
+	);
+begin
+idpb( version lsh -8, r!ptr );
+idpb( version, r!ptr );
+  begin		integer byte, bit!pointer;
+    for i := 0 step 8 until 255
+      do begin
+	if i land 7 = 0
+	 then begin
+		if i then idpb( byte, r!ptr );
+		byte := 0;
+		bit!pointer := point( 1, byte, 35-8 );
+	      end;
+	if receivable(i) then idpb( 1, bit!pointer ); 
+      end;
+    idpb( byte, r!ptr );
+  end;
+idpb( max!transport!length lsh -8, r!ptr );
+idpb( max!transport!length, r!ptr );
+idpb( !window!size!, r!ptr );	! << totally unecessary >>;
+idpb( inbound[...], r!ptr );	! header character;
+idpb( inbound[...], r!ptr );	! trailer character;
+idpb( inbound[...], r!ptr );	! link PTC;
+idpb( inbound[...], r!ptr );	! to_encode character;
+idpb( inbound[...], r!ptr );	! from_encode character;
+idpb( checksum!type, r!ptr );
+idpb( timeout!seconds, r!ptr );
+idpb( if timer!here then "Y" else "N", r!ptr );
+end;
+! Reset.table: [2] Version
+!	[32] Bit vector of receivable character set
+!	[2] Max Transport packet length after encoding
+!	[1] Window size << implied by the protocol, so what the... >>
+!	[1] Header character
+!	[1] Trailer character
+!	[1] Link Packet type character (PTC)
+!	[1] Shift-to-Encoding character
+!	[1] Shift-from-Encoding character
+!	[1] Checksum type identifier
+!	[1] # of seconds till timeout (How about exponent:4, val:4?)
+!	[1] Timer at this end ("Y" or "N")
+;
+
+let boundType = string;	! for ease in reading prog output: really integer;
+
+
+boundType array inBound
+,		outBound [ min#code : max#code ]
+;
+boolean array must!encode[0:255]	! strictly an outbound affair;
+;
+boolean	inBound!header!breaks!Inchwl	! false if header passes inchwl;
+,	inBound!trailer!breaks!Inchwl	! false if trailer passes inchwl;
+;
+integer	inBound!largest!packet!all!good
+,	inBound!largest!packet!will!allow
+;
+string	outBound!data!record!head
+,	outBound!data!record!tail
+;
+! break tables;
+integer pass!outBound!asis	! allows though all but mustencode;
+,	to!inBound!shift!in	! pass to (& drop) inBound[#shift!in];
+,	skip!inBound!header	! pass to (& drop) inBound[#header];
+,	aWord			! pass one word and upper case it;
+,	aLine			! to read one line from a file;
+;
+
+simple procedure setup!breaks;
+begin	string seps;
+seps := #sp & #ht & crlf & "|,+&";
+setbreak( aWord := getbreak, seps, seps, "INSKT" );
+setbreak( aLine := getbreak, #ff & #lf, #cr, "INS" );
+
+! next three just insure reserved tables;
+setbreak( to!inBound!shift!in := getbreak, 0, 0, "INS" );
+setbreak( skip!inBound!header := getbreak, 0, 0, "INS" );
+setbreak( pass!outBound!asis := getbreak, 0, 0, "INS" );
+end;
+require setup!breaks initialization[0];
+
+procedure pstr( string s );	! for debugging;
+begin integer ch;
+if length(s)=0 then begin outstr(""""""); return; end;
+if '40 <= (ch := lop(s)) < '177
+ then begin outchr(""""); outchr(ch); end;
+while true
+   do begin
+	if '40 <= ch < '177
+	 then begin
+		while '40 <= (ch := lop(s)) < '177
+		   do begin outchr(ch); if ch="""" then outchr(ch); end;
+		outchr("""");
+		if ch=0=length(s) then return;
+	      end;
+	while not ('40 <= ch < '177)
+	   do begin
+		print(" '", cvos(ch) );
+		if length(s)=0 then return;
+		ch := lop(s);
+	      end;
+	outstr(" """); outchr(ch);
+      end;
+end;
+define minimum!PID# = 0+#sp, maximum!PID# = 0+"z";
+
+simple procedure pid!increment( reference integer pid!variable );
+	if (pid!variable := pid!variable + 1) > maximum!PID#
+	   then pid!variable := minimum!PID#;
+
+
+simple boolean procedure pid!in!range( integer pid, floor, ceiling );
+return( if floor < ceiling 
+		then (floor < pid < ceiling)
+		else not(ceiling < pid < floor)
+	);
+procedure finalize!in!out;	! set the dependent vbls;
+begin	string s;
+	integer char;
+setbreak( to!inBound!shift!in, inBound[#shift!in], null, "INS" );
+s := null;
+for char := 0 step 1 until 127
+   do if must!encode[char] then s := s & char;
+setbreak( pass!outBound!asis, s, null, "INR" );
+outBound!data!record!head := outBound[#header] & outBound[#data!PTC];
+outBound!data!record!tail := outBound[#trailer];
+inBound!header!breaks!Inchwl := #ht neq inBound[#header] < '40;
+inBound!trailer!breaks!Inchwl := #ht neq inBound[#trailer] < '40;
+! error in classification that says doesn't break when it does is OK;
+setbreak( skip!inBound!header, inBound[#header], null, "IS" );
+end;
+
+simple procedure rob!specials( boundType array specials );
+begin	! note: link!PTC "doesn't exist", shift-in and shift-out may be different;
+specials[#header]   := #esc;	specials[#trailer]  := #cr;
+specials[#link!PTC] := "|";	specials[#shift!in] := "{";
+specials[#shift!out]:= "}";	specials[#data!PTC] := "w";
+specials[#ack!PSC]  := "x";	specials[#nak!PSC]  := "y";
+specials[#rfr!PSC]  := "z";
+end;
+
+simple procedure display!specials( boundType array specials );
+begin	! note: link!PTC "doesn't exist", shift-in and shift-out may be different;
+specials[#header]   := "__";	     specials[#trailer]  := "~" & crlf;
+specials[#link!PTC] := "|=link:";    specials[#shift!in] := "{";
+specials[#shift!out]:= "}";	     specials[#data!PTC] := "w=data:";
+specials[#ack!PSC]  := "x=ack:";     specials[#nak!PSC]  := "y=nak:";
+specials[#rfr!PSC]  := "z=rfr:";
+end;
+
+simple procedure rob!standard;
+begin	! provide a pretty standard character set setup;
+	integer ch;
+rob!specials(outBound);
+rob!specials(inBound);
+
+arrclr(must!encode,true); ! banish all but space & printing ASCII;
+for ch := '40 step 1 until '176 do must!encode[ch]:=false;
+
+! better also get the special characters;
+must!encode[ outBound[#shift!in] ] := true;
+must!encode[ outBound[#trailer] ] := true;
+finalize!in!out;
+end;
+
+simple procedure standard!printable;
+begin	! provide a pretty standard character set setup;
+	integer ch;
+display!specials(outBound);
+rob!specials(inBound);
+
+arrclr(must!encode,true); ! banish all but space & printing ASCII;
+for ch := '40 step 1 until '176 do must!encode[ch]:=false;
+
+! better also get the special characters;
+must!encode[ outBound[#shift!in] ] := true;
+must!encode[ outBound[#trailer] ] := true;
+finalize!in!out;
+end;
+require standard!printable initialization;
+string procedure get!transport!record;
+begin "get transport record"
+		integer chr;
+		string result;
+if inBound!header!breaks!Inchwl
+ then do inchwl until !skip! = inBound[#header];
+
+if inBound!trailer!breaks!Inchwl 
+ then do begin "nice trailer"
+		string line;
+	   result := null;
+	   line := inchwl;
+	   while (chr := !skip!) neq inBound[#trailer]
+	    do begin
+		result := result & line & chr;
+		line := inchwl;
+	       end;
+	   result := result & line;
+	   if inBound!header!breaks!Inchwl
+	    then DONE
+	    else scan( result, skip!inBound!header, chr );
+	 end "nice trailer"
+	until chr = inBound[#header]
+ else begin "ugly trailer"
+	if not inBound!header!breaks!Inchwl
+	 then while inchrw neq inBound[#header] do;
+	result := null;
+	while (chr := inchrw) neq inBound[#trailer] 
+	   do result := result & chr;
+      end "ugly trailer";
+return( result );
+end "get transport record";
+simple boolean procedure isHexDigit(integer char);
+return( ("0" <= char <= "9")  or  ("A" <= char <= "Z") );
+
+simple string procedure hexDigits(integer byte);
+begin	preset!with	"0", "1", "2", "3", "4", "5", "6", "7",
+			"8", "9", "A", "B", "C", "D", "E", "F";
+	own safe integer array hexDigit[0:15];
+return( hexDigit[byte lsh -4] & hexDigit[byte land '17] );
+end;
+
+simple integer procedure deHex( integer v );
+return( v - (if v<="9" then 0+"0" else "A"-10) );
+
+string procedure make!encoded!string( string source, source2 );
+begin	string res;
+	boolean currently!encoding;
+res := scan( source, pass!outBound!asis, !skip! ); ! copy all passables;
+if length(source)=0
+ then begin
+	res := res & scan( source2, pass!outBound!asis, !skip! );
+	if length( source2 ) = 0
+	 then return( res )
+	 else source swap source2;
+      end;
+while true
+   do begin	integer char;
+	res := res & outBound[#shift!in];
+	while must!encode[char := lop(source)] or must!encode[source]
+	   do begin
+		res := res & hexDigits(char);
+		if length(source)=0
+		 then if length( source2 )
+			 then source swap source2
+			 else return(res);
+	      end;
+	res := res & outBound[#shift!out] & char
+		& scan( source, pass!outBound!asis, !skip! );
+	if length(source)=0
+	 then begin
+		res := res & scan( source2, pass!outBound!asis, !skip!);
+		if length( source2 ) = 0
+		 then return( res )
+		 else source swap source2;
+	      end;
+      end;
+end;
+
+simple string procedure checksum!string(string source);
+begin	integer cks;
+cks := 0;
+while length(source) 
+   do begin
+	cks := cks + cks + lop(source) + 1;
+	while cks land (-1 lsh 14)
+		do cks := cks + ( 1 - (1 lsh 14) );
+      end;
+return( (cks lsh -7) & (cks land '177) );
+	! serendipity: 14 bits = 7 + 7.  If blanks are sendable, use!;
+end;
+
+string procedure do!encode( string source );
+return( make!encoded!string( source, checksum!string(source) ) );
+boolean procedure did!decode( reference string result; string source );
+begin	string res;
+
+res := scan( source, to!inBound!shift!in, !skip! ); ! copy passables;
+while length( source )
+   do begin	integer ch;
+	while isHexDigit(ch := lop(source))
+	   do begin
+		res := res & ( (deHex( ch ) lsh 4)
+				lor deHex( ch := lop(source) ));
+		if not isHexDigit(ch)
+		 then return(false);	! Odd number of HEX digits;
+	      end;
+	if inBound[#shift!out] neq ch neq 0 then res := res & ch;
+		! cope with the "no shift-out character" possibility;
+	res := res & scan( source, to!inBound!shift!in, !skip! );
+      end;
+result := res[1 to inf-2];
+return( equ( res[inf-1 for 2], checksum!string(result) ) );
+end;
+simple procedure sendACK;
+begin
+send!packet( #ack!PSC,	inBound!largest!packet!all!good, 
+			inBound!largest!packet!will!allow ); 
+end;
+
+string procedure read!good!data!packet;
+begin	string result; 
+	own integer last!success!time;
+while true
+   do if did!decode( result, get!transport!record )
+	 then begin
+		last!success!time := now; 
+		if result[1 for 1] = 
+		pid!increment( inBound!largest!packet!all!good );
+		pid!increment( inBound!largest!packet!will!allow ); 
+		sendACK; 
+		return(result); 
+	      end
+	 else if getting!late( last!success!time ) then sendRFR;
+end;
+! string procedure read!good!data!packet; 
+! OS interfaces: ;
+boolean procedure canFind( string file ); return(true);
+	! canfind(f) is true if at least one such file exists;
+simple integer procedure now; start!code own integer tim; aos 1,tim;end;
+	! now: the current time;
+
+integer procedure guess!mode( string file );
+begin print("I guess `",file,"' is AST." & crlf); return(m.AST); end;
+
+procedure enter!ftp;	print("<<FTP on>>" & crlf);
+
+procedure end!ftp;	print("<<FTP off>>" & crlf);
+
+procedure sendEOR( integer n ); print("<<EOR * ", n, ">>" & crlf);
+
+procedure send!file!description( string file );
+	print( "<<File: ", file, ">>" & crlf );
+
+procedure sendBIN( string filename );
+	usererr(0,1, "BINARY and a PDP-10, surely you jest!" & crlf );
+
+procedure send.partial.Ast.Line( string partial.line );
+print( "+",
+	outBound!data!record!head,
+	do!encode( partial.line ),
+	outBound!data!record!tail,
+	"+" );
+
+procedure send.final.Ast.Line( string partial.line );
+print( "**",
+	outBound!data!record!head,
+	do!encode( partial.line ),
+	outBound!data!record!tail );
+
+procedure send.Ast.Record( string full!line );
+print(	outBound!data!record!head,
+	do!encode( full!line ),
+	outBound!data!record!tail );
+integer procedure lookup!command( string word );
+begin
+if length(word)=0
+or equ(word,"NOOP")	then return( c.noop );
+if equ(word,"QUIT")	then return( c.quit );
+if equ(word,"DOWNLOAD")
+or equ(word,"FROM10")
+or equ(word,"SEND")	then return( c.send );
+if equ(word,"SIZE")	then return( c.size );
+if equ(word,"ASCII")
+or equ(word,"TEXT")
+or equ(word,"AST")	then begin transfer!mode:= m.AST; return(c.noop); end;
+if equ(word,"BINARY")
+or equ(word,"BIN")	then begin transfer!mode:= m.BIN; return(c.noop); end;
+if equ(word,"GUESS")	then begin transfer!mode:= m.GUESS; return(c.noop); end
+;
+if equ(word,"ZAPBLANK") then begin drop!blank!lines := true; end;
+if equ(word,"KEEPBLANK")then begin drop!blank!lines := false; end;
+if equ(word,"RECEIVE")
+or equ(word,"UPLOAD")
+or equ(word,"FROMPC")
+or equ(word,"GET")	then return( c.receive );
+if equ(word,"BAIL")
+or equ(word,"DEBUG")
+or equ(word,"DDT")
+ then begin
+	usererr(0,1,"Ok: " & word, word );
+	return( c.noop );
+      end;
+if word = "?"
+ then begin
+	print( "HELP, AST, SEND, GET, NOOP, or QUIT" & crlf );
+	return( c.noop );
+      end;
+if equ(word,"HELP")
+ then begin
+	print( "
+	NOOP		QUIT	ZAPBLANK	KEEPBLANK
+	GUESS		BINARY = BIN	ASCII = TEXT = AST
+	DOWNLOAD = FROM10 = SEND
+	RECEIVE = UPLOAD = FROMPC = GET
+	SIZE chars
+	BAIL		DEBUG=DDT
+");	return( c.noop );
+      end;
+return(c.unknown);
+end;
+integer inch;
+boolean procedure oneAST( integer array filDat );
+begin "oneAST"	own string preamble, postamble, device;
+		own integer brk,eof;
+		string fn;
+		boolean flag;
+if inch < 0
+ then begin
+	open( inch := getchan, device := cv6str(filDat[-2]),0, 4,0,
+			read!length, brk, eof:=true );
+	if eof then begin release(inch); inch:=-1; return(true); end;
+		! stop since device cannot be opened.;
+	device := (if filDat[-2] = cvsix("DSK")
+		   then null else device & ":");
+	preamble := (if filDat[-4]
+		 then "("& cv6str(filDat[-4]) & cv6str(filDat[-3]) &")"
+		 else null);
+	postamble := (if filDat[-4]=0 and !lh(filDat[-1])
+			 then "[" & cvos(!lh(filDat[-1])) & ","
+				& cvos(!rh(filDat[-1])) & "]"
+			 else null);
+      end;
+fn:= preamble & cv6str(filDat[0]) & "." & cv6str(filDat[1]) & postamble;
+lookup( inch, fn, flag );
+if flag
+ then begin end ! file not found;
+ else begin
+	send!file!description( device & fn );
+	   do begin	string line;
+		line := input(inch, aLine);
+		if eof and (brk=0=length(line)) then done;
+		if drop!blank!lines and length(line)=0 and brk = #lf
+		 then begin	integer blanklines;
+			for blanklines := 0 step 1
+				while length(line)=0 and brk = #lf
+			   do line := input(inch, aLine);
+			if length(line) ! ie NOT at EOPage or EOFile;
+			 then sendEOR( blankLines );
+		      end; ! blank line processing;
+		if brk = 0
+		 then begin	! long line: must have terminated on count.;
+			  do  begin
+				send.partial.Ast.Line( line );	! partial line;
+				line := input(inch, aLine);
+			      end
+			 until brk or eof;
+			send.final.Ast.Line( line );	! final part of line;
+		      end
+		 else if length(line) or brk neq #ff  ! pagemarks look blank;
+			 then send.Ast.record( line );
+		if brk = #ff then send.Ast.record( #ff );	! new page;
+	      end
+	 until eof;
+      end;
+close(inch);
+return(false);	! just keep on going iteration through the files;
+end "oneAST";
+procedure sendAST( string fileGroup );
+begin
+inch := -1;
+redufd( oneAST, fileGroup, "#*C" );
+if inch >= 0
+ then release(inch)
+ else begin print("<<<no files like that>>>"); end; ! no files matching group found;
+end;
+procedure sendfile( reference string rest!of!line; integer mode );
+begin	string file;
+file := scan( rest!of!line, aWord, !skip! );
+print(" I really should send you PDP-10 file `", file, "'." & crlf );
+if canFind(file)
+ then begin
+	if mode = m.guess then mode := guess!mode(file);
+	if mode = m.BIN
+	 then begin
+		print("BINARY and a PDP-10, surely you jest!" & crlf );
+		mode := m.AST;
+	      end;
+	if m.AST neq mode neq m.BIN
+	 then print("unknown file mode!!")
+	 else begin
+		enter!ftp;
+		if mode = m.AST then sendAST(file) else sendBIN(file);
+		end!ftp;
+	      end;
+	print(file, " is now sent!" & crlf );
+      end
+ else print("... but I won't because I can't find it." & crlf );
+did!something := true;
+end;
+procedure getfile( reference string rest!of!line );
+begin	string file;
+file := scan( rest!of!line, aWord, !skip! );
+print(" I really should get PC file `", file, "', but I won't." & crlf );
+did!something := true;
+end;
+! main program;
+	string command!line;
+read!length := 80;
+transfer!mode := m.AST;
+did!something := false;
+drop!blank!lines := true;
+while true
+   do begin "main loop"
+		string command;
+		integer brk;
+	   do begin
+		outstr("Command: ");
+		command!line := i;
+		while !skip! = #lf
+		   do begin
+			outstr("(cont): ");
+			command!line := command!line & #sp & inchwl;
+			if !skip! = #esc
+			 then begin
+				command!line:=null;
+				print(crlf);
+				done;
+			      end;
+		      end;
+	      end
+	 until length(command!line);
+	while length(command := scan( command!line, aWord, brk ))
+	do case lookup!command( command )
+	   of begin
+		[c.quit] done "main loop";
+		[c.send] sendfile( command!line, m.AST );
+		[c.receive] getfile( command!line );
+		[c.noop] begin end;
+		[c.size] read!length :=
+				1 max intscan( command!line, !skip! );
+		[else] begin
+			print("Unknown command `", command, "' seen!" & crlf );
+			if did!something
+			 then done "main loop"
+			 else continue "main loop";
+		      end
+	      end;
+	if length(command!line)
+	 then print("Ignoring: `", command!line, "'." & crlf );
+      end "main loop";
+end "ftp controller" .
+ f
