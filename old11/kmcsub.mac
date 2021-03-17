@@ -1,0 +1,687 @@
+.PAGE
+;-----
+;CALCND - Calc node number from port
+;	Node number = two highest bits of port number
+;	Inputs:
+;		INDAT1 =>	Port number
+;	Outputs:
+;		SP10 =>		Node number (0-3)
+;
+;-----
+.=	2000				;Load in page 2
+CALCND:	BRWRTE	IBUS,	INDAT1		;Get port number
+	BRSHFT				;Shift right 6 to get node number
+	BRSHFT
+	BRSHFT
+	BRSHFT
+	BRSHFT
+	BRSHFT
+	SP	BR,	SELB,	SP10	;Load current node number
+;-----
+; Mask off node number, Leaves only port number.
+;-----
+	BRWRTE	IMM,	PMASK		;Load port mask
+	SP	IBUS,	INDAT1,	SP0	;Get node+port from header
+	OUT	BR,	AANDB,	OUTDA1	;Mask off node # leaving port #
+;-----
+; Fall into CHKSTA
+;-----
+.PAGE
+.SBTTL	CHKSTA - Check node state for 20 input
+;-----
+;CHKSTA - Check node state
+;	Node state description:
+;	  Hard down:  Used for nonexistant nodes and while downloading nodes.
+;		These bits are set/cleared by the host in the KMC device
+;		register LINENM (76xxx3). Bits in this reg are defined as:
+;
+;		0 =>	Node 0
+;		1 =>	Node 1
+;		4 =>	Node 2
+;		7 =>	Node 3
+;
+;	  State table:  These are used to dynamically bring up nodes
+;		and to keep the KMC from hanging on a node that has
+;		gone out to lunch.
+;
+;		0 => up		Proceed
+;		1 => down	Try to change state to up-pending
+;		2 => up-pending	Try to change state to up
+;
+;	GETDRC will not return if current DR does not exist.
+;	Dispatch on current node state
+;
+;	CALL SEQUENCE:	Main level routine only!
+;		CALLSB	SP13,	CHKSTA
+;
+;	INPUTS:		SP10 =>	Current node number (0-3)
+;
+;	RETURNS:	Skip return on node up
+;			No skip return if node is down
+;			SP11 =>	Memory offset for current node state
+;
+;-----
+CHKSTA:	SPBR	IBUS,	LINENM,	SP7	;Copy Line Down reg
+	BRWRTE	IBUS,	LINENM		;Copy twice as it may have changed
+					; since this is dual ported RAM
+	COMP	BR,	SP7		;Are both reads the same?
+	Z	2$			;Br if read was good
+	ALWAYS	CHKSTA			;Bad read, try again
+
+2$:	LDMA	IMM,	DRCSR		;Prepare to load DRCSR low byte
+	BRWRTE	IMM,	DR0ST		;LOAD TABLE BASE INCASE OF DOWN ND
+	SP	BR,	SELB,	SP11
+	BRWRTE	BR,	SELA,	SP10	;Get node number
+	SP	BR,	SELB,	SP0
+	BRADDR	XTAB
+;-----
+; Jump table for DR address and node selection
+;-----
+	.ALWAY	BR,	ADD,	SP0,	P2
+XTAB:	ALWAYS	DR0
+	ALWAYS	DR1
+	ALWAYS	DR2
+.PAGE
+;-----
+; Here for node 3
+;-----
+DR3:	BRWRTE	BR,	SELA,	SP7	;Load device down bits
+	BR7	NDR3			; Br if host is down
+	MEM	IMM,	DR3LOB		;Load device addr
+	BRWRTE	IMM,	DR3ST		;Save state pointer
+	ALWAYS	ALLNOD
+
+;-----
+; Here for node 2
+;-----
+DR2:	BRWRTE	BR,	SELA,	SP7
+	BR4	NDR2
+	MEM	IMM,	DR2LOB
+	BRWRTE	IMM,	DR2ST
+	ALWAYS	ALLNOD
+
+;-----
+; Here for node 1
+;-----
+DR1:	BRWRTE	BR,	SELA,	SP7
+	BR1	NDR1
+	MEM	IMM,	DR1LOB
+	BRWRTE	IMM,	DR1ST
+	ALWAYS	ALLNOD
+
+;-----
+; Here for node 0
+;-----
+DR0:	BRWRTE	BR,	SELA,	SP7
+	BR0	NDR0
+	MEM	IMM,	DR0LOB
+	BRWRTE	IMM,	DR0ST
+.PAGE
+;-----
+; Here for all nodes to store current node state pointer and
+; check node state
+;-----
+ALLNOD:	SP	BR,	SELB,	SP11, LDMAR ;Store current node state pointer
+					; & point to node state
+	COMP	MEMX,	SP16		;Test NODE_STATE
+	Z	NODDWN			;Br if node is down
+	C	HSTCHK			;Br if node is up
+	ALWAYS	NODPND			;Node is pending
+
+;-----
+; Node is down, try to change to up-pending
+;-----
+NODDWN:	CALLSB	SP12,	GETDRC		;Get DRCSR
+	BRWRTE	IBUS,	INDAT1		;Get $DVOUT
+	BR7	NODICE			;Br if still down
+	NODST	BR,	SELA,	SP11,	LDMAR ;Point to node state
+	MEM	MEMX,	ADD,	SP16	;Inc state to up-pending
+;-----
+; Node is in up-pending state, try to bring it up
+;-----
+NODPND:	CALLSB	SP12,	GETDRC		;Get DRCSR
+	BRWRTE	IBUS,	INDAT1		;Get $DVOUT
+	BR7	NODUP			;Br if node came up
+	ALWAYS	NODICE			;Still up-pending
+
+;-----
+; Bring node up
+;-----
+NODUP:	NODST	BR,	SELA,	SP11,	LDMAR ;Point to node state
+	MEM	IMM,	0		;Bring node up
+.PAGE
+;-----
+; Here to check for host output or input
+;-----
+HSTCHK:	BRWRTE	BR,	SELA,	SP1	;Get device number
+	BR0	ITISUP			;Br if host output
+;-----
+; See if the node wants to talk
+;-----
+	CALLSB	SP12,	GETDRC		;Get DRCSR
+	BRWRTE	IBUS,	INDAT1		;Get $DVOUT
+	BR7	ITISUP			;Br if node wants to talk
+NODICE:	RTNSUB	SP13,	P0		;Fail-no skip on return
+
+;-----
+; Here if interface disabled
+;-----
+NDR3:	SP	BR,	INCA,	SP11	;Calculate table offset for RSTITF
+NDR2:	SP	BR,	INCA,	SP11
+NDR1:	SP	BR,	INCA,	SP11
+NDR0:	RTNSUB	SP13,	P0		;Fail - return with no skip
+
+;-----
+; Here when node is up. Calc & store current DR11 addr
+;
+;	DRCSR=	76xxx0
+;	DROBUF=	76xxx2
+;	DRINBF=	76xxx4
+;-----
+ITISUP:	LDMA	IMM,	DRCSR
+	BRWRTE	MEMX,	ADD,	SP15	;Calc INBUF addr
+	LDMA	IMM,	DROBUF
+	MEM	BR,	SELB		;Store INBUF addr
+	LDMA	IMM,	DRINBF
+	MEM	BR,	ADD,	SP15	;Store OBUF address low byte
+;-----
+; Node is up, Do skip return.
+;-----
+	SP	BR,	INCA,	SP13	;Node up-do skip return
+	RTNSUB	SP13,	P0
+
+.PAGE
+.SBTTL	I/O Subroutines
+;-----
+;GETDRC - Get DR11's control status register => DRCSR
+;	This routine will not return to caller if the device does
+;	not exist, rather it goes directly to NXTDEV and 
+;	does not collect $200.
+;-----
+GETDRC:	LDMA	IMM,	DRCSR		;Point to DRCSR addr in my mem
+	OUT	MEMI,	SELB,	IBA1	;Load DRCSR addr in NPR registers
+	OUT	MEMI,	SELB,	IBA2
+	OUT	MEMX,	SELB,	ONPR	;Load high addr bytes and start R NPR
+	IOWAIT				;Wait till R NPR complete
+	BRWRTE	IBUS,	UBBR		;Check for NXM
+	BR0	NXM			;Br if no such device
+	RTNSUB	SP12,	P2		;Return with DRCSR in INDAT registers
+					; and the knowlege that the device
+					; really exists.
+;-----
+;GETDRH - Get DR11's data register => DRINBUF
+;-----
+GETDRH:	LDMA	IMM,	DRINBF
+	OUT	MEMI,	SELB,	IBA1
+	OUT	MEMI,	SELB,	ONPR	;Load high addr bits and start R NPR
+	IOWAIT
+	RTNSUB	SP12,	P2		;Return with data in INDAT registers
+
+.PAGE
+;-----
+;ACCEPT - Set accept bit on DR11 ($DVACP), wait for $dvout to clr,
+;	clr $DVACP and return.  A timer is used to keep
+;	a sick node from hanging the KMC11. Timeouts are handled
+;	by calling RSTITF.
+;-----
+ACCEPT:	OUT	IBUS,	INDAT1,	OPORT3	;Save msg temporarily
+	OUT	IBUS,	INDAT2,	OPORT4
+	LDMA	IMM,	DRCSR
+	OUT	MEMI,	SELB,	OBA1	;Load DRCSR output addr
+	OUT	MEMI,	SELB,	OBA2
+	INCMA
+	OUT	MEMI,	SELB,	OBR
+	OUT	MEMI,	SELB,	OUTDA1	;Load accept bit to xfer
+	OUT	MEMI,	SELB,	OUTDA2
+	OUT	MEMI,	SELB,	ONPR	;Start write-npr
+	CLR44	IOTIMR			;Clr timer
+	IOWAIT				;Make sure npr finished
+;-----
+; Wait for $DVOUT to clear
+;-----
+WAIT00:	LDMA	IMM,	DRCSR
+	OUT	MEMI,	SELB,	IBA1	;Load DRCSR addr
+	OUT	MEMI,	SELB,	IBA2
+	OUT	MEMI,	SELB,	ONPR	;Start read-npr
+	LDMA	IMM,	IOTIMR		;Point to I/O timer
+	MEM	MEMI,	ADD,	SP16	;Inc loop counter
+	MEM	MEMX,	ADDC,	SP17	;Add in carry if any
+	BRWRTE	MEMX,	SELB		;Timed out?
+	BR7	TMOTI			;Br if timed out
+	IOWAIT
+	BRWRTE	IBUS,	INDAT1		;Get $DVOUT
+	BR7	WAIT00			;Br if $DVOUT not clr yet
+	LDMA	IMM,	CST
+	OUT	MEMI,	SELB,	OUTDA1	;Clr low byte
+	OUT	MEMI,	SELB,	ONPR	;Start write-npr
+	IOWAIT
+;-----
+; Xfer data to output registers
+;-----
+	OUT	IBUS,	PORT3,	OUTDA1
+	OUT	IBUS,	PORT4,	OUTDA2
+	RTNSUB	SP12,	P2
+.PAGE
+.SBTTL	GETDR - Get word from node
+;-----
+;GETDR - Get a word from current node
+;-----
+GETDR:	CLR44	IOTIMR
+NOTRDY:	CALLSB	SP12,	GETDRC		;Get DRCSR
+	BRWRTE	IBUS,	INDAT1		;Load $DVOUT
+	BR7	RDY			;Br when data is ready
+	LDMA	IMM,	IOTIMR		;Point to I/O timer
+	MEM	MEMI,	ADD,	SP16	;Inc loop counter
+	MEM	MEMX,	ADDC,	SP17	;Add in carry if any
+	BRWRTE	MEMX,	SELB		;Timed out?
+	BR7	TMOTI			;Br if timed out
+	ALWAYS	NOTRDY
+
+RDY:	CALLSB	SP12,	GETDRH		;Get data word
+	CALLSB	SP12,	ACCEPT		;Finish handshake
+	RTNSUB	SP13,	P0		;Done with word
+
+.PAGE
+;-----
+;PUTDR - Routine to put a word in a DR11 (base)
+;-----
+; Wait for last $DVACP to clr from last xmit
+PUTDR:	CLR44	IOTIMR			;Clr timer
+NOTDN:	CALLSB	SP12,	TIMCHK		;Check for timeout
+	CALLSB	SP12,	GETDRC		;Copy DRCSR
+	BRWRTE	IBUS,	INDAT2
+	BR7	NOTDN			;Loop till $DVACP = 0 or timout
+; Load DROBUF addr and send data word
+	LDMA	IMM,	DROBUF		;Point to addr in mem
+	OUT	MEMI,	SELB,	OBA1	;Load reg
+	OUT	MEMI,	SELB,	OBA2
+	OUT	MEMI,	SELB,	OBR	;Load mem ext
+	OUT	MEMI,	SELB,	ONPR	;Load high bits and start write-npr
+	IOWAIT
+; Set $DVOUT bit on DR
+	OUT	MEMI,	SELB,	OUTDA1	;Load bits to send
+	OUT	MEMI,	SELB,	OUTDA2
+	LDMA	IMM,	DRCSR		;Load DRCSR addr
+	OUT	MEMI,	SELB,	OBA1
+	OUT	MEMI,	SELB,	OBA2
+	LDMA	IMM,	WNPRZ
+	OUT	MEMI,	SELB,	ONPR	;Start write-npr
+; Wait for $DVACP to be set
+	CLR44	IOTIMR			;Clr timer
+	IOWAIT
+NTDON:	CALLSB	SP12,	TIMCHK		;Check for timeout
+	CALLSB	SP12,	GETDRC		;Copy DRCSR
+	BRWRTE	IBUS,	INDAT2
+	BR7	2$			;Br if $DVACP is set
+	ALWAYS	NTDON			;Not ready yet
+
+; Clr $DVOUT and return
+2$:	BRWRTE	IMM,	0
+	OUT	BR,	SELB,	OUTDA1	;Clr data reg
+	LDMA	IMM,	WNPRZ
+	OUT	MEMX,	SELB,	ONPR	;Start write-npr
+	RTNSUB	SP13,	P0		;Done with this word
+
+;-----
+;TIMCHK - Increment timer and check for timeout
+;	Timeout will crash node else return
+;-----
+TIMCHK:	LDMA	IMM,	IOTIMR		;Point to word
+	MEM	MEMI,	ADD,	SP16	;Inc low byte
+	MEM	MEMX,	ADDC,	SP17	;Add carry if any
+	BRWRTE	MEMX,	SELB
+	BR7	EATOPT			;Br if timed out
+	RTNSUB	SP12,	P2		;Ok - return
+
+.PAGE
+.SBTTL	Return jump table
+;-----
+; Return jump table for subroutines called from several pages.
+;-----
+
+RX0:	ALWAYS	RT0
+RX2:	ALWAYS	RT2
+RX4:	ALWAYS	RT4
+RX6:	ALWAYS	RT6
+RX10:	ALWAYS	NXTDEV			;Return for Node Active msg (null msg)
+.PAGE
+.SBTTL	GET20 - Routine to get a word from host ring buffer
+;-----
+; GET20 - Routine to get a word from host output ring buffer
+;	Returns:
+;		BRG => 1 if successful,  0 if no output to do
+;-----
+.=	3000				;Load in page 3
+
+;-----
+; Comp internal output ring pointers ORK & ORP to see if there is output to do
+;-----
+GET20:	LDMA	IMM,	ORK
+	SP	MEMI,	SELB,	SP2
+	SP	MEMI,	SELB,	SP3
+	COMP	MEMI,	SP2		;Comp ORK to ORP
+	Z	2$
+	ALWAYS	DOOUT
+
+2$:	COMP	MEMI,	SP3
+	Z	NEWORP
+	ALWAYS	DOOUT
+
+;-----
+; Get new output ring pointer from host and update ORP
+;-----
+NEWORP:	LDMA	IMM,	ORPPD
+	OUT	MEMI,	SELB,	IBA1
+	OUT	MEMI,	SELB,	IBA2
+	OUT	MEMI,	SELB,	ONPR
+;-----
+; Store new output ring pointer ORP
+;-----
+	LDMA	IMM,	ORP
+	IOWAIT
+	MEM	IBUS,	INDAT1,	INCMAR
+	MEM	IBUS,	INDAT2,	INCMAR
+;-----
+; Compare ORK & ORP
+;-----
+CMPTR:	LDMA	IMM,	ORP
+	COMP	MEMI,	SP2
+	Z	2$
+	ALWAYS	DOOUT
+
+2$:	COMP	MEMI,	SP3
+	Z	NOOUT
+	ALWAYS	DOOUT
+
+;-----
+; Buffer is empty
+;-----
+NOOUT:	BRWRTE	IMM,	0		;Set unsuccessful flag
+	RTNSUB	SP12,	P0
+.PAGE
+;-----
+; Output to do! Get data word
+;-----
+DOOUT:	LDMA	IMM,	ORKAD
+	OUT	MEMI,	SELB,	IBA1
+	OUT	MEMI,	SELB,	IBA2
+	OUT	MEMI,	SELB,	ONPR
+;-----
+; Inc ORKAD to point to next 16 bit word
+;-----
+INCPT:	LDMA	IMM,	ORKAD
+	SP	MEMI,	SELB,	SP2
+	SP	MEMI,	SELB,	SP3
+	BRWRTE	IMM,	2
+	SP	BR,	ADD,	SP2
+	SP	BR,	APLUSC,	SP3
+;-----
+; Check for wrap around
+;-----
+	LDMA	IMM,	ORMXAD
+	COMP	MEMI,	SP2
+	Z	2$
+	ALWAYS	STORKA
+
+2$:	COMP	MEMI,	SP3
+	Z	4$
+	ALWAYS	STORKA
+
+;-----
+; Wrapped around, load base addr
+;-----
+4$:	LDMA	IMM,	ORBAD
+	SP	MEMI,	SELB,	SP2
+	SP	MEMI,	SELB,	SP3
+;-----
+; Store new ORKAD
+;-----
+STORKA:	LDMA	IMM,	ORKAD
+	MEM	BR,	SELA,	SP2,	INCMAR
+	MEM	BR,	SELA,	SP3,	INCMAR
+;-----
+; Check for odd PDP10 half-word
+;-----
+	IOWAIT
+;-----
+; Xfer data to output reg
+;-----
+	OUT	IBUS,	INDAT1,	OUTDA1
+	OUT	IBUS,	INDAT2,	OUTDA2
+	BRWRTE	BR,	SELA,	SP2
+	BR1	RTNX			;Return via successful flag
+
+.PAGE
+;-----
+; Inc ORK
+;-----
+INCORK:	LDMA	IMM,	ORK
+	SP	MEMI,	SELB,	SP2
+	SP	MEMI,	SELB,	SP3
+	SP	BR,	INCA,	SP2
+	SP	BR,	APLUSC,	SP3
+;-----
+; Check for wrap
+;-----
+	LDMA	IMM,	ORKMX
+	COMP	MEMI,	SP2
+	Z	12$
+	ALWAYS	STORK
+
+12$:	COMP	MEMI,	SP3
+	Z	14$
+	ALWAYS	STORK
+
+;-----
+; Wrapped around, zero buffer offset
+;-----
+14$:	BRWRTE	IMM,	0
+	SP	BR,	SELB,	SP2
+	SP	BR,	SELB,	SP3
+;-----
+; Store new ORK
+;-----
+STORK:	LDMA	IMM,	ORK
+	MEM	BR,	SELA,	SP2,	INCMAR
+	MEM	BR,	SELA,	SP3,	INCMAR
+;-----
+; Set successful flag and return
+;-----
+RTNX:	BRWRTE	IMM,	1		;Set successful flag
+	RTNSUB	SP12,	P0
+.PAGE
+.SBTTL	PUT20 - Routine to put a word in host ring buffer
+;-----
+; PUT20 -- routine to insert a message into host input ring buffer
+;	Inputs:
+;		IRKAD => Unibus address of next available location
+;			 in input ring buffer (this is a byte address).
+;		IRBAD => Unibus address of input ring buffer base.
+;		IRMXAD=> Unibus address of top of buffer+1
+;		IRPPD => Unibus address of PDP-10 input ring read pointer
+;		IRP   => KMC copy of the PDP-10 input ring read pointer
+;			  (this is the limit for KMC input; that is we cannot
+;			   push IRK to or above this location.  This is a
+;			   PDP-10 word offset)
+;		IRK   => internal copy of the PDP-10 input ring KMC write
+;			  pointer (this is a PDP-10 word offset)
+;		IRPKM => Unibus address of the PDP-10 input ring KMC write pointer
+;		SP6   => Remaining words in this message
+;		SP5   => Flag to indicate that this is a message that has
+;			  been split in two in order to avoid wrapping around
+;		SP4   => Port number of split message
+;-----
+
+;-----
+; Load address to send data to from KMC mem
+;-----
+PUT20:	LDMA	IMM,	IRKAD
+	OUT	MEMI,	SELB,	OBA1
+	OUT	MEMI,	SELB,	OBA2
+	OUT	MEMI,	SELB,	OBR	;Load host mem ext
+;-----
+; Write 16 bit word into input ring buffer
+;-----
+	OUT	MEMI,	SELB,	ONPR
+	SP	BR,	DECA,	SP6	;Dec word-to-go
+;-----
+; Increment IRKAD to point to next available PDP10 half-word in
+; input ring buffer.
+;-----
+INCPTR:	LDMA	IMM,	IRKAD
+	SP	MEMI,	SELB,	SP2	;Get IRKAD
+	SP	MEMI,	SELB,	SP3
+	BRWRTE	IMM,	2
+	SP	BR,	ADD,	SP2	;Add 2
+	SP	BR,	APLUSC,	SP3	; with carry if necessary
+;-----
+; Check for wrap around
+;-----
+	LDMA	IMM,	IRMXAD
+	COMP	MEMI,	SP2		;Are lo by same?
+	Z	2$			; Br if so
+	ALWAYS	6$			; not same
+
+2$:	COMP	MEMI,	SP3		;Are hi by same?
+	Z	4$			; Br if wrapped
+	ALWAYS	6$			; not same
+
+;----
+; Perform consistency on SP6, it should be zero at this point
+;----
+4$:	BRWRTE	IMM,	0
+	COMP	BR,	SP6
+	Z	5$			;Zero jump if every thing is ok
+	HANG
+
+;-----
+; Wrapped around, load IRKAD with input ring base addr (IRBAD)
+;-----
+5$:	LDMA	IMM,	IRBAD
+	SP	MEMI,	SELB,	SP2
+	SP	MEMI,	SELB,	SP3
+.PAGE
+;-----
+; Store IRKAD. It now points to next available location in PDP-10 buffer
+;-----
+6$:	LDMA	IMM,	IRKAD
+	MEM	BR,	SELA,	SP2,	INCMAR ;Store IRKAD
+	MEM	BR,	SELA,	SP3,	INCMAR
+;-----
+; Inc IRK with wrap around check if on odd PDP10 half-word
+;-----
+	BRWRTE	BR,	SELA,	SP2
+	BR1	7$			;Br if even
+	ALWAYS	10$			;Needs rounding
+
+;-----
+; Done with this msg? If so must round up to next PDP10 word boundry
+;-----
+7$:	BRWRTE	IMM,	0
+	COMP	BR,	SP6
+	Z	INCPTR			;Br if done and round up
+	RTNSUB	SP13,	P0		;Even, return
+
+;-----
+; Need to inc IRK
+;-----
+10$:	LDMA	IMM,	IRK
+	SP	MEMI,	SELB,	SP2
+	SP	MEMI,	SELB,	SP3
+	SP	BR,	INCA,	SP2	;Inc IRK
+	SP	BR,	APLUSC,	SP3
+;-----
+; Check for wrap arround
+;-----
+	COMP	MEMI,	SP2		;Check for wrap around
+	Z	12$			; Br if lo by same
+	ALWAYS	16$			; not same
+
+12$:	COMP	MEMI,	SP3
+	Z	14$			;Br if hi by same
+	ALWAYS	16$			; not same
+
+;-----
+; Wrapped around, zero buffer offset
+;-----
+14$:	BRWRTE	IMM,	0
+	SP	BR,	SELB,	SP2
+	SP	BR,	SELB,	SP3
+.PAGE
+;-----
+; Store new IRK
+;-----
+16$:	LDMA	IMM,	IRK
+	MEM	BR,	SELA,	SP2,	INCMAR
+	MEM	BR,	SELA,	SP3,	INCMAR
+
+;-----
+; Compare input ring pointers (IRP AND IRK)
+;-----
+CMPIRP:	LDMA	IMM,	IRP
+	COMP	MEMI,	SP2
+	Z	20$
+	ALWAYS	22$
+
+20$:	COMP	MEMI,	SP3
+	Z	24$
+;-----
+; Done with msg? If so br to input done routine
+;-----
+22$:	BRWRTE	IMM,	0
+	COMP	BR,	SP6
+	Z	INPDON			;Br if done with msg
+	RTNSUB	SP13,	P0
+
+.PAGE
+;-----
+; Internal pointers are same, get a new IRP from host
+;-----
+24$:	LDMA	IMM,	IRPPD
+	OUT	MEMI,	SELB,	IBA1
+	OUT	MEMI,	SELB,	IBA2
+	OUT	MEMI,	SELB,	ONPR
+	BRWRTE	IMM,	0
+26$:	BRWRTE	BR,	ADD,	SP16	;This loop keeps us from banging the memory
+	C	28$			;Check for flop from 377 to 0
+	ALWAYS	26$			;Do this 255 times
+28$:	IOWAIT				;Just to be safe
+;-----
+; Store new IRP
+;-----
+	LDMA	IMM,	IRP
+	MEM	IBUS,	INDAT1,	INCMAR
+	MEM	IBUS,	INDAT2,	INCMAR
+	ALWAYS	CMPIRP
+
+;-----
+; Input done, pointers are all fixed up and only the host pointer
+; needs updated.
+INPDON:	LDMA	IMM,	IRK		;Load data
+	OUT	MEMI,	SELB,	OUTDA1
+	OUT	MEMI,	SELB,	OUTDA2
+	LDMA	IMM,	IRPKM		;Load host pointer address
+	OUT	MEMI,	SELB,	OBA1
+	OUT	MEMI,	SELB,	OBA2
+	OUT	MEMI,	SELB,	ONPR
+;-----
+; Check to see if there is a second data msg to send.
+;-----
+	BRWRTE	IMM,	0
+	COMP	BR,	SP5		;Is there a 2nd data msg to process?
+	Z	NXTDEV			;Br if not (Normal end of msg)
+;-----
+; Here to fix up for 2nd data message
+;-----
+	IOWAIT				;Wait for NPR to finish
+	BRWRTE	BR,	SELA,	SP5	;Get header
+	OUT	BR,	SELB,	OUTDA2	;Restore it
+	BRWRTE	BR,	SELA,	SP4,	;Get port number
+	OUT	BR,	SELB,	OUTDA1	;Restore it
+	BRWRTE	IMM,	0		;Clear queue
+	SP	BR,	SELB,	SP5
+	ALWAYS	MUNG2			;All fixed up. Xmit 2nd msg.
+;-----
+; END of PUT20!
+;-----
+   
