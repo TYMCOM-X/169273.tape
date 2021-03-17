@@ -1,0 +1,629 @@
+begin "AUXIO"
+  require "  Handles AC license correctly" message;
+  require '56 version;
+comment Revision history
+  version when who what
+  56 22-Apr-87 JMS Don't send nulls when reading from a file.
+  55 16-Apr-87 JMS Add SET FILTER (default) and SET NOFILTER commands.
+  54  4-Jan-85 WRS
+;
+  require "SAIL.DEF" source!file;
+
+require "(SAILIB)TYMINT.DEF" source!file;
+simple procedure OUTSTR (string X);
+start!code
+    define SP = '16;
+    hrroi 1,'67;	comment !AXOPC;
+    auxcal 1,-1(SP);	comment takes word 1 of a sail string;
+end;
+
+  integer PORT,EOF,BRK,DSK!IN,DSK!OUT,SLOT,BAUD,ESCAPE,LF!cnt;
+  integer CEof,CBRK,Com!File,DISK!WRD,DISK!PTR,CHR!RCD;
+  integer array DialAcct[0:4];	! accounting data goes here;
+  string LOG!STR,OUT!FILE,DIAL!UNAME;
+  boolean COPY,BLANK,FILTER,NO!LF,CARRIER,ECHO,YB!,LF!,DIAL!!,DIALACCT!;
+  define CREAUX = -'44, ZAPCIR = -'45, AX!SIC = '10, AX!SIL = '50,
+    AX!STS = '61, AX!I8C = 0, AX!O8 = 3, AX!FSW = '64, AX!HNG = '60,
+    AX!IB = '15, AX!OB = '16, AX!IC = '44, AX!OCI = '51, AX!SI = '33,
+    HIBER = '72, AX!I8S = '1, AX!CBO = '7, AX!LDEM = '11;
+
+  define ac!lic = '400;
+  define BlockSize = 8;		! Chars between yellow balls;
+
+simple integer procedure GetLch;
+begin
+    integer I;
+    start!code
+	move 1,Port;
+	movem 1,I;
+	ttcall 6,I;
+	end;
+    return(I);
+    end;
+
+simple procedure YellowBall;
+begin
+    GetLch;
+    do begin
+	calli((PORT lsh (35-8))+hl('140),HIBER);
+	if not !SKIP! then usererr(0,0,"HIBER uuo failed");
+    end until (Port=0) or (GetLch land '020000000000);
+end;
+
+simple procedure CRWait;
+begin
+    integer LF!tmp;
+    LF!tmp_LF!cnt;
+    do begin
+	calli(1000,HIBER);
+	if not !SKIP! then usererr(0,0,"HIBER uuo failed");
+    end until (Port=0) or (LF!tmp < LF!cnt);
+end;
+
+  define service!routine = {forward simple procedure};
+
+  define HELP!MESSAGE = {"Valid commands are:
+?			print this message
+@<file-name>		execute commands in file named
+=<hhmm>			wait for time HHMM in 24 hour local time
+;<message>		send message to terminal
+Creaux <user>:<sys>	build circuit over Tymnet
+Dial <phone#>		dialout
+Force <string>		send string to host followed by <crlf>
+Input <file-spec>	send contents of file over circuit
+List			display current settings and connections
+Output <file-spec>	record all chars from host in file
+Resume			resume transparent connection
+Set COPY | NOCOPY	turn on and off recording
+Set BLANK | NOBLANK	turn on and off blank line suppression
+Set FILTER | NOFILTER	filter control characters out of the log file
+Set FLOW=LINEFEED | FLOW=YELLOWBAL | FLOW=NONE    set handshaking
+Set Captain=<uname>	set captain username for outdial
+Set ^<char>		set escape character (default is ^P)
+Time <seconds>		wait until no chars rec'd for n secs (5)
+Unattach		detach job
+Wait <seconds>		wait for n seconds to elapse
+Zap			disconnect auxiliary connection
+"};
+
+  simple procedure turn!on(integer LIC); begin "ON"
+    integer I;
+    I:=call(-'20,"GETTAB");
+    if (I land (LIC lsh 18))=0
+      then calli(I lor (LIC lsh 18),-'10);
+  end;
+
+  simple procedure turn!off(integer LIC); begin "OFF"
+    integer I;
+    I:=call(-'20,"GETTAB");
+    if (I land (LIC lsh 18))and((I land LIC)=0)
+      then calli(I xor (LIC lsh 18),-'10);
+  end;
+
+  simple procedure diskout(integer CH); begin "DISKOUT"
+    dpb(CH,DISK!PTR);
+    ibp(DISK!PTR);
+    if rh(DISK!PTR)neq location(DISK!WRD) then begin
+      WORDOUT(DSK!OUT,DISK!WRD);
+      DISK!PTR:=point(7,DISK!WRD,6);
+      DISK!WRD:=0;
+      end;
+  end "DISKOUT";
+
+  simple procedure CLOSE!OUT; begin "CO"
+    if OUT!FILE and (DISK!PTR neq point(7,DISK!WRD,6))
+      then wordout(DSK!OUT,DISK!WRD);
+    close(DSK!OUT);
+  end "CO";
+
+  service!routine ZAPPED;
+  service!routine CHARACTER;
+
+  simple procedure INTERRUPTS(integer PORT); begin "INTERRUPTS"
+    define
+      ZC = 5, SC = 6, CC = 7;   ! channels;
+    if PORT
+      then begin "TURN-ON"
+	calli('377777777777,-'35);	! INTACT uncause all;
+	enable(newenb(zc));
+	enable(newenb(cc));
+	intmap(tinass(PORT,cause!tty!zap,zc),ZAPPED,0);
+	intmap(tinass(PORT,cause!tty!chr,cc),CHARACTER,0);
+	end "TURN-ON"
+      else begin "TURN-OFF"
+	disable(newenb(zc));
+	disable(newenb(cc));
+	intmap(tinass(PORT,cause!tty!zap,0),ZAPPED,0);
+	intmap(tinass(PORT,cause!tty!chr,0),CHARACTER,0);
+	end "TURN-OFF";
+    end "INTERRUPTS";
+
+  simple procedure ZAPPED; begin "ZAPPED"
+    own integer SKIP;
+    SKIP:=!SKIP!;
+    if PORT and not DIAL!! then outstr(crlf&"[circuit zapped]"&crlf);
+    PORT:=0;
+    CARRIER:=false;
+    INTERRUPTS(0);
+    calli(-1,ZAPCIR);
+    !SKIP!:=SKIP;
+  end "ZAPPED";
+
+  simple integer procedure GETWRD(integer port);
+  begin	"GETWRD"
+	integer I,J;
+	I _ 0;
+	for J _ 3 step -1 until 0 do
+	  I _ I lsh 8 lor auxclv(PORT,0,AX!IC);
+	return(I);
+  end  	"GETWRD";
+
+  simple procedure CHARACTER; begin "CHAR"
+    own integer CH,SKIP;
+    SKIP:=!SKIP!;
+    do begin "eat chars"
+      auxclv(PORT,0,AX!SIC);
+      if not !SKIP! then begin
+	auxclv(PORT,0,AX!LDEM);
+	done "eat chars";
+	end;
+      CH:=auxclv(PORT,0,AX!IC);
+      CHR!RCD:=CHR!RCD+1;
+      if DIAL!! and CH=1 then begin
+	CH_auxclv(PORT,0,AX!IC);
+	if CH neq 1 then begin
+	  case CH of begin
+	  ['176] begin
+		DialAcct[0] _ auxclv(PORT,0,AX!IC) lsh 8 + auxclv(PORT,0,AX!IC);
+		DialAcct[1] _ getwrd(PORT);
+		DialAcct[2] _ getwrd(PORT);
+		DialAcct[3] _ getwrd(PORT);
+		DialAcct[4] _ getwrd(PORT);
+		DialAcct! _ true;
+	  end;
+	  ['177] outstr(crlf&"[disconnect]"&crlf);
+	  else outstr("[mysterious message type]"&crlf)
+	  end;
+	  continue "eat chars";
+	end;
+      end;
+      if CH='12 then LF!cnt_LF!cnt+1;
+      if CH>'40 then NO!LF:=false;
+      if (CH='12) and NO!LF and not BLANK then continue;
+      if CH='12 then NO!LF:=true;
+      if ECHO then auxclv(-1,CH,AX!O8);
+      if FILTER and CH='33 then CH:="$";
+      if FILTER and (CH<'07 or (CH>'15 and CH<'40) or CH='177) then continue;
+      if COPY then diskout(CH);
+      end "eat chars" until PORT=0;
+    !SKIP!:=SKIP;
+    end "CHAR";
+
+  simple procedure SLAVE; begin "SLAVE"
+    own integer CH;
+    ECHO:=true;
+    auxcli(-1,'314,AX!FSW);
+    do begin
+      CH:=auxclv(-1,0,AX!I8S);
+      if !SKIP! then begin
+        if (CH land '177)=ESCAPE then done;
+        auxclv(PORT,CH,AX!O8);
+	if DIAL!! and CH=1 then auxclv(PORT,1,AX!O8);
+      end;
+      calli(hl('10),HIBER);
+    end until PORT=0;
+    auxcli(-1,0,AX!FSW);
+    ECHO:=false;
+    if PORT then auxclv(PORT,0,AX!CBO);
+    if DialAcct! then begin
+!	outstr("[time=");
+!	outstr(cvs(DialAcct[2]-DialAcct[1]));
+!	outstr("sec chin=");
+!	outstr(cvs(DialAcct[3]));
+!	outstr(" chout=");
+!	outstr(cvs(DialAcct[4]));
+!	outstr("]");
+	DialAcct! _ false;
+    end;
+    outstr(crlf);
+    end "SLAVE";
+
+  boolean SendLf!;
+  simple procedure SEND(string FILE); begin "SEND"
+    own integer CH,Blips;
+    string FOO;
+    LF!cnt_Blips_0;
+    lookup(DSK!IN,FILE,EOF);
+    if EOF
+      then outstr("?Can't read file "&FILE)
+      else do begin
+	Foo _ input(Dsk!In, 5);	! break on LF (and skip);
+	if length(FOO)=0 then Foo _ cr;! cope with CR LF LF;
+	Blips_Blips+length(foo);
+	while length(Foo) do begin
+	  integer CH;
+	  CH _ lop(Foo);
+	  if CH=0 then Blips_Blips-1 else auxclv(Port,CH,AX!O8);
+	  if DIAL!! and CH=1 then auxclv(Port,1,AX!O8);
+	end;
+	if Brk and SendLf! then auxclv(Port,Brk,AX!O8);
+	if YB!
+	    then YellowBall
+	    else if Brk and LF! then CRWait;
+	outstr(cvs(blips)&" ");
+	end until EOF or PORT=0;
+    close(DSK!IN);
+    outstr(crlf);
+    outstr(crlf);
+    end "SEND";
+
+  boolean procedure CREATE(string LOGSTR;
+	reference integer PORT); begin "CREATE"
+    integer array FOO[0:length(LOGSTR)%5];
+    integer I;
+    for I:=1 step 5 until length(LOGSTR)
+      do FOO[I%5]:=cvasc(LOGSTR[I for 5]);
+    PORT:=calli(location(FOO[0]),CREAUX);
+    if not !SKIP! then begin
+      outstr(crlf&"?Can't build circuit to "&LOGSTR&crlf);
+      case lh(PORT) of begin
+	[0] case rh(PORT) of begin
+	  [1] outstr("?Format error"&crlf);
+	  [2] outstr("?User name not in MUD"&crlf);
+	  [3] outstr("?Bad MUD"&crlf);
+	  [4] outstr("?System unavailable"&crlf);
+	  [5] outstr("?Downline/dialout request failure"&crlf);
+	  [6] outstr("?Tymout"&crlf);
+	  [7] outstr("?Access barred"&crlf);
+	  [8] outstr("?Error in ISIS"&crlf);
+	  [9] outstr("?Supervisor queue too long"&crlf);
+	  [else] outstr("?Unknown sup error code: "&cvos(rh(port))&crlf) end;
+	[1] outstr("?Too many circuits without AC license"&crlf);
+	[2] outstr("?Not your user name without AC license"&crlf);
+	[3] outstr("?No room for DDB (out of monitor free core)"&crlf);
+	[4] outstr("?Supervisor not responding to request"&crlf);
+	[5] outstr("?Supervisor not responding to string"&crlf);
+	[6] outstr("?Supervisor not supplying a channel"&crlf);
+	[7] outstr("?Supervisor rejected original request"&crlf);
+	[else] outstr("?Unknown error code: "&cvos(port)&crlf) end;
+      return(false);
+      end;
+    return(true);
+    end "CREATE";
+
+simple procedure WILD(reference string USER); begin "WILD"
+  define si={('17&null)};
+  if USER=si
+    then USER:=cv6str(calli(-'22,'41))&cv6str(calli(-'21,'41))
+	&USER[2 to inf];
+  if equ(USER[inf-1 for 2],":"&si)
+    then USER:=USER[1 to inf-1]
+	&cvs(cvd(cvstr(calli('5000011,'41))[2 to 5]));
+  end "WILD";
+
+boolean procedure BUILD(string USERNAME); begin "BUILD"
+  WILD(USERNAME);
+  DIAL!! _ false;
+  turn!off(ac!lic);
+  if CREATE(USERNAME,PORT) then begin
+    outstr("[connected]"&crlf);
+    NO!LF:=true;
+    INTERRUPTS(PORT);
+    LOG!STR:=USERNAME;
+    return(not Com!File);
+    end;
+  LOG!STR:=null;
+  PORT:=0;
+  return(false);
+end "BUILD";
+
+string CAPT!UN;
+simple procedure CAPTini;
+CAPT!UN _ "RAILDIAL:804";
+require CAPTini initialization;
+
+boolean procedure DIAL(string PHONENO); begin "DIAL"
+  DIAL!! _ true;
+  turn!on(ac!lic);
+  PORT:=0; LOG!STR:=null; calli(-1,ZAPCIR);
+  outstr("Trying.");
+  if not CREATE(CAPT!UN&";",PORT) then return(0);
+  outstr(".");
+  auxclv(PORT,'20,3);		! msg type;
+  auxclv(PORT,'01,3);		! fill;
+  auxclv(PORT,'02,3);		! service;
+  auxclv(PORT,'01,3);		! tid;
+  auxclv(PORT,'01,3);		! modem;
+  auxclv(PORT,length(PhoneNo),3);! # length;
+  auxclv(PORT,'00,3);		! options (high);
+  auxclv(PORT,'03,3);	       	! options (low);
+  begin
+    integer I;
+    string X;
+    X _ PhoneNo;
+    for I _ 1 upto 10 do
+	auxclv(PORT,(lop(X)-"0")lsh 4 lor (lop(X)-"0"),3);
+  end;
+  LOG!STR:=PHONENO;
+  begin "bar"
+    recursive string procedure cvhs(integer X);
+    return( (if X geq 16 then cvhs(X lsh -4) else null)
+	& "0123456789ABCDE"[(X land 15 +1) for 1] );
+    integer Index,CNT,FLG,CHR;
+    integer STAT;
+    string Host;
+    string RESP;
+    RESP _ null;
+    FLG_ CNT_ 0;
+    do begin
+	RESP_ RESP & char!w ( CHR_ auxclv(PORT,0,0), 8 );
+	while length(RESP) > 1 and not equ(RESP[1 to 2],'40&1) do begin
+	    if FLG_FLG+CHR then
+		print(crlf,"%unexpected response: ",cvhs(lop(RESP)));
+	    if 20 < CNT_CNT+1 then begin
+		print(crlf,"?No response to Dial-Out Request",crlf);
+		return(0);
+	    end;
+	end;
+    end until length(RESP)=20;
+    print(crlf);
+    STAT _ RESP[3 for 1];
+    Index _ RESP[4 for 1];
+    Host _ RESP[5 for 4];
+    outstr("Dial-Out Status "); outstr(cvhs(STAT)); outstr("  ");
+    case STAT of begin
+	[0] outstr("[connection established]"&crlf);
+	[4] outstr("[remote busy]"&crlf);
+	[8] outstr("[trunk busy]"&crlf);
+	[12] outstr("[no answer]"&crlf);
+	[16] outstr("[no carrier]"&crlf);
+	[20] outstr("[one of (4,8,C,10)]"&crlf);
+	[24] outstr("[service not available at this priority]"&crlf);
+	[28] outstr("[service not available at this time]"&crlf);
+	[32] outstr("[equipment not available]"&crlf);
+	[36] outstr("[equipment out of service]"&crlf);
+	else outstr("[unexpected status]"&crlf)
+    end;
+    if STAT then return(0);
+    auxclv(PORT,'100,3);	! establish modem connection;
+    auxclv(PORT,'02,3);		! fill;
+    auxclv(PORT,Index,3);	! modem index;
+  end;
+  if auxclv(PORT,0,0) neq '40
+    or auxclv(PORT,0,0) neq '2
+    then print("[modem connection not acknowledged]",crlf);
+  auxclv(PORT,0,0);
+  interrupts(PORT);
+  return(true);
+  end "DIAL";
+
+  procedure OUTPUT(string FILE); begin "OUTPUT"
+    CLOSE!OUT;
+    enter(DSK!OUT,FILE,BRK);
+    if BRK
+      then outstr("?Can't enter file "&FILE&crlf)
+      else begin
+	OUT!FILE:=FILE;
+	COPY:=true;
+	DISK!PTR:=point(7,DISK!WRD,6);
+	DISK!WRD:=0;
+	end;
+    end "OUTPUT";
+
+  procedure LIST; begin "LIST"
+    if PORT then outstr("Remote="&LOG!STR&'40);
+    outstr((if FILTER then "FILTER " else "NOFILTER "));
+    outstr((if COPY then "COPY " else "NOCOPY "));
+    if OUT!FILE then outstr("Output=DSK:"&OUT!FILE&'40);
+    outstr((if BLANK then "BLANK " else "NOBLANK "));
+    outstr("Flow="&(if YB! then "YellowBalls "
+	else if LF! then "LineFeeds " else "None "));
+    outstr((if SendLf! then "SEND-LF " else "OMIT-LF "));
+    outstr("Captain="&CAPT!UN&'40);
+    outstr(crlf);
+    end "LIST";
+
+  procedure SET(string ARG); begin "SET"
+    string FOO;
+    while ARG do begin
+      FOO:=scan(ARG,1,BRK);
+      if FOO="?" then outstr("SET followed by one of"&crlf
+	&"    COPY | NOCOPY | BLANK | NOBLANK"&crlf
+	&"  | FLOW=YELLOWBALL | FLOW=LINEFEED | FLOW=NONE"&crlf
+	&"  | SENDLF | OMITLF | FILTER | NOFILTER"&crlf
+	&"  | CAPTAIN=<uname> | ^<escape-char>"&crlf)
+      else if FOO="^" then ESCAPE:=FOO[2 to 2] land '37
+      else if equ(FOO[1 to 6],"FLOW=Y") then begin YB!_true; LF!_false end
+      else if equ(FOO[1 to 6],"FLOW=L") then begin YB!_false; LF!_true end
+      else if equ(FOO[1 to 6],"FLOW=N") then begin YB!_false; LF!_false end
+      else if equ(FOO,"LINEFEED") then YB! _ false
+      else if equ(FOO,"LINEFEEDS") then YB! _ false
+      else if equ(FOO,"YB") then YB! _ true
+      else if equ(FOO,"YELLOWBALL") then YB! _ true
+      else if equ(FOO,"YELLOWBALLS") then YB! _ true
+      else if equ(FOO,"COPY") then COPY:=(OUT!FILE neq null)
+      else if equ(FOO,"NOCOPY") then COPY:=false
+      else if equ(FOO,"BLANK") then BLANK:=true
+      else if equ(FOO,"NOBLANK") then BLANK:=false
+      else if equ(FOO,"FILTER") then FILTER:=true
+      else if equ(FOO,"NOFILTER") then FILTER:=false
+      else if equ(FOO,"SENDLF") then SendLf!_true
+      else if equ(FOO,"OMITLF") then SendLf!_false
+      else if equ(FOO,"SEND") then SendLf!_true
+      else if equ(FOO,"OMIT") then SendLf!_false
+      else if equ(FOO[1 to 8],"CAPTAIN=") then CAPT!UN _ FOO[9 to inf]
+      else begin
+	outstr("?Unrecognized token: "&FOO&crlf);
+	done;
+	end;
+      end;
+    end "SET";
+
+  simple procedure COMMAND!FILE(string FILE); begin "COMMAND!FILE"
+    own boolean FOO;
+    own string FPN,AUN,S;
+    FPN:="["&cvos(lh(calli(-'25,'41)))
+      &","&cvos(rh(calli(-'25,'41)))&"]";
+    AUN:="["&cvos(lh(calli(-'23,'41)))
+      &","&cvos(rh(calli(-'23,'41)))&"]";
+    open(Com!File_getchan,"DSK",1,5,0,256,CBRK,CEof);
+    		 lookup(Com!File, FILE, CEof);
+    if CEof then lookup(Com!File, FILE&AUN, CEof);
+    if CEof then lookup(Com!File, FILE&FPN, CEof);
+    FOO:=CEof;
+    if CEof then lookup(Com!File, "MYAUX.COM", CEof);
+    if CEof then lookup(Com!File, "MYAUX.COM"&AUN, CEof);
+    if CEof then lookup(Com!File, "AUXIO.COM"&FPN, CEof);
+    if FOO then while not CEof do begin
+      S:=input(Com!File,4);
+      if S="@" and equ(S[2 to inf],FILE) then done;
+      end;
+    if CEof then begin
+      outstr("?Command file "&FILE&" not found"&crlf);
+      release(Com!File);
+      Com!File:=0;
+      end;
+    end "COMMAND!FILE";
+
+simple procedure TimeWait (integer TOD);
+begin
+    own integer T,TARG;
+    TARG_ (TOD % 100) * 3600000 + (TOD mod 100) * 60000;
+    T_ call(0,"MSTIME");
+    do begin
+	if TARG - T > 300000
+	    then call(60,"SLEEP")
+	    else call(1,"SLEEP");
+	T _ call(0,"MSTIME");
+    end until T > TARG and T < TARG + 60000;
+end;
+
+simple procedure WAIT(integer TIME(0)); begin "WAIT"
+  own integer TARG;
+  if PORT and (TIME=0) then begin
+    YellowBall;
+    if not !SKIP! then usererr(0,1,"?HIBER failed durring WAIT");
+    end
+  else if PORT and (TIME>0) then begin
+    TARG:=call(0,"MSTIME")+TIME*1000+500;
+    while PORT and (call(0,"MSTIME")<TARG) do call(1,"SLEEP");
+    end
+  else if PORT and (TIME<0) then begin
+    calli(hl(1)-TIME,HIBER);
+    if not !SKIP! then usererr(0,1,"?HIBER failed duriing WAIT -n");
+    end;
+  end "WAIT";
+
+simple procedure FORCE(string MSG); begin "FORCE"
+  if Msg[inf for 1]= ""
+	then Msg _ Msg[1 to inf-1]
+	else Msg _ Msg & cr;
+  if PORT then while Msg do auxclv(PORT,lop(Msg),AX!O8);
+  end "FORCE";
+
+simple procedure HANG; begin "HANG"
+  YellowBall;
+  ! wait for an orange ball;
+  auxclv(PORT,0,AX!HNG);
+  calli(10000,HIBER);
+  ! wait for acknowledge interrupt;
+  end "HANG";
+
+simple procedure SLEEP(integer TIME); begin "SLEEP"
+  own integer TARG,IT;
+  if TIME=0 then TIME:=20;
+  do begin "bigone"
+    TARG_(IT:=call(0,"MSTIME"))+TIME*1000;
+    CHR!RCD:=0;
+    do begin
+      call(10,"SLEEP");
+      if call(0,"MSTIME")<IT then begin
+	IT:=call(0,"MSTIME");
+	TARG _ TARG - 1000*60*60*24;
+      end;
+      if CHR!RCD then continue "bigone";
+    end until TARG < call(0,"MSTIME");
+  end until CHR!RCD=0;
+end "SLEEP";
+
+begin "MAIN"
+  string COM,ARG;
+  outstr("version "&cvos(memory['137])&crlf);
+  ttyup(true);
+  setbreak(1," ",null,"KINS");
+  setbreak(2,null,'12,"FXNA");
+  setbreak(3,null,"-/() ","KINS");
+  setbreak(4,'12,'15,"FINS");
+  setbreak(5,'12,null,"FINSZ");
+  setbreak(6,"",null,"FINS");
+  setbreak(7,"",null,"FINS");
+  open(DSK!IN_getchan,"DSK",0,5,0,1024,BRK,EOF);
+  open(DSK!OUT_getchan,"DSK",'14,0,5,0,0,0);
+  BLANK:=true; BAUD:=2; ESCAPE:="P" land '37; YB!:=true; LF!:=false;
+  COPY:=false; ECHO:=false; DIAL!UNAME:="LOCAL"; FILTER:=true;
+  while true do begin "COMMAND"
+    auxclv(-1,0,AX!SIL);
+    if COM!FILE then begin
+      ARG:=input(COM!FILE,4);
+      if CEOF or ARG="@" then begin
+        close(COM!FILE); release(COM!FILE);
+        COM!FILE:=0;
+        end;
+      end;
+    if not COM!FILE then begin
+      ECHO:=false;
+      outchr("*");
+      ARG:=inchwl;
+      end;
+    COM:=scan(ARG,1,BRK);
+    begin "Fixup () and <>"
+	string A;
+	integer Brk _ null;
+	do begin
+	    A _ A & Scan(Arg,6,Brk);
+	    if Brk=0 then done;
+	    if Brk="" then auxclr(-1,memory['301],'64);
+	    outstr(Scan(Arg,7,Brk));
+	    A _ A & inchwl;
+	    if Brk="" then begin
+		auxclr(-1,memory[1],'64);
+		outstr(crlf);
+		end;
+	    end until 0;
+	Arg _ A;
+	end;
+    case COM of begin
+      ["@"] COMMAND!FILE(COM[2 to inf]);
+      ["="] TimeWait(cvd(COM[2 to inf]));
+      [";"] print(COM," ",ARG,crlf);
+      ["Creaux"] if BUILD(ARG) then SLAVE;
+      ["Dial"] if DIAL(ARG) then SLAVE;
+      ["Force"] FORCE(ARG);
+      ["Wait"] WAIT(cvd(ARG));
+      ["Time"] SLEEP(cvd(ARG));
+      ["Output"] OUTPUT(ARG);
+      ["Input"] SEND(ARG);
+      ["Set"] SET(ARG);
+      ["List"] LIST;
+      ["Zap"] ZAPPED;
+      ["Hang"] if CARRIER then HANG;
+      ["Quit"] begin
+	if CARRIER then HANG;
+	close(DSK!IN);
+	CLOSE!OUT;
+	call(0,"EXIT");
+	end;
+      ["Unattach"] begin
+	calli(calli('777777000006,'41) lor (1 lsh 34),-'11);
+	outstr("frame "&cvs(call(0,"PJOB"))&" detaching...");
+	calli(0,-'6);
+	end;
+      ["Resume"] if PORT then SLAVE
+        else outstr("?No circuit"&crlf);
+      ["?"] outstr(HELP!MESSAGE);
+      [null] ;
+      else outstr("Huh? - type ""?"" for help"&crlf) end;
+    end "COMMAND";
+  end "MAIN";
+end "AUXIO"
+    n d
