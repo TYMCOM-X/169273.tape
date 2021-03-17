@@ -1,0 +1,654 @@
+	search	rtsmki
+	$module	MODFIT
+;    +--------------------------------------------------------------+
+;    |                                                              |
+;    |                         M O D F I T                          |
+;    |                         - - - - - -                          |
+;    |                                                              |
+;    +--------------------------------------------------------------+
+;    
+;    PURPOSE:  To provide dynamic storage for PASCAL programs via the
+;       routines NEW, DISPOSE, MARK, and RELEASE.  MODFIT defines the
+;       entry points NEW.,  DSPOS.,  MARK.,  and  RLEAS.,  using  the
+;       standard calling conventions for these routines.
+;    
+;    USAGE:
+;    
+;         MOVEI 2,size(ptr^)
+;         PUSHJ 17,NEW.
+;         MOVEM 2,ptr
+;    
+;         MOVE  2,ptr
+;         PUSHJ 17,DSPOS.
+;    
+;         PUSHJ 17,MARK.
+;         MOVEM 2,heapmark
+;    
+;         MOVE  2,heapmark
+;         PUSHJ 17,RLEAS.
+;    
+;    EFFECTS:   MODFIT  will  expand  the  low  segment  as needed to
+;       perform the allocation, printing a 'HEAP overflow' message if
+;       the  CORE  call to TOPS-10 fails.  Calls to DISPOSE place new
+;       entries on a free space list, while calls to  RELEASE  return
+;       low segment storage to the system.
+;    
+;    ALGORITHM:  The allocation - collapsing algorithm was taken from
+;       Knuth's 'Art of Computer Programming' (see  page  6  of  this
+;       listing).  Adjacent  free  blocks  are coalesced during a NEW
+;       operation; a contiguous set of  free  blocks  are  completely
+;       coalesced   before   an   allocation   is   made.  If,  after
+;       collapsing, there is  still  insufficient  storage,  the  low
+;       segment  is  expanded  to  provide a new block of appropriate
+;       size.  If a free block is found, and the block is larger than
+;       the  requested  size,  it  will be split, with the new record
+;       being taken from the tail of the block.
+;    
+;    NOTES:  The quantum of low-segment extension is the same as  the
+;       system allocation quantum (see page 7).
+;    
+;    EXTERNAL REFERENCES:
+;    
+;       .JBREL
+;       .JBSA
+;       TWAIT.
+;       WRTPC.
+;       DIE.
+;    
+;    ----------------------------------------------------------------
+
+;
+
+	debug=0				;0 for normal, <>0 for debug
+
+; entry points in this module
+
+	ENTRY	HPREAD,HPLOAD,HPWRIT,HPSAVE	; what's special here
+	intern	ALC0.		; cause package to be loaded
+	ALC0.=	0
+	intern	NEW.,DSPOS.
+;	intern	MARK.,RLEAS.	;currently unused
+
+; externs for error reporting
+
+	extern	TWAIT.,DIE.,WRTPC.
+
+;
+; heap header DSECT
+
+	LHEAP=0				;LH is addr of previous heap
+	TAIL=0				;RH is word past end of heap
+	FHEAD=1				;RH forward pointer in free list
+	FTAIL=1				;LH backlink in freelist chain
+
+	ROVER=2				;points to free block to search first
+
+	EXTPTR=3			;word for writing out to file
+
+	HDRSIZ=4			;number of words in heap header
+
+;
+; block data word DSECT
+
+	SIZE=0				;size of block (including header)
+					; negative if alloc'd, positive if free
+
+;	the next two are only for blocks on the free list
+
+	BLINK=1				;LH is back link on list
+	FLINK=1				;RH is fore link
+
+;
+; allocation parameters
+
+	MINBLK=2			;minimum size block to allocate
+					;  must be >= 2 to mean anything
+	SMALL=5				;don't split leaving remnants of this size
+					; (this size does not include control word)
+
+	extern	HSTRT.			; synthetic heap start address
+
+;
+; register allocations
+
+	ALLOC=2				;size to allocate on NEW
+	HEAP=3				;working pointer to current heap
+	BLK=1				;for walking free blocks
+	HMARK=2				;param for MARK and RELEASE
+	T=4				;temp (2 of them)
+	T2=5
+	NEXT=T+2			;for walking free blocks
+	NEW=T+3				;returns addr of newly alloc'd block
+	T3=T+4
+	NIL=^O377777			;the nil pointer
+
+;
+; static storage
+
+	$low
+	$STATIC	CHEAP,1			; ptr to current heap
+	$STATIC	DUMSTA,1		; status word for dump mode I/O
+	$STATIC	CHNUM,1			; channel number cell
+	$STATIC DESTREG,1		; store destination register for NEW
+	$STATIC RW.ADR,1		; read/write core address
+	$STATIC RW.CNT,1		; read/write block count
+	$STATIC RW.BLK,1		; read/write disk block
+
+	IFE DEBUG, <
+	  DEFINE COUNT(A) <>>
+	IFN DEBUG, <
+	  DEFINE COUNT(A) <
+	    AOS 0,A>
+	$STATIC	CNNEW,1
+	$STATIC	CNDISP,1
+	$STATIC	CNCOAL,1
+	$STATIC	CNEXT,1
+	$STATIC	CNSPLI,1
+	$STATIC	CNEXAM,1>
+
+	$high
+
+; initialize -- get space for heap, and initialize below
+
+INIT:	MOVEI	HEAP,HSTRT.		; get addr of low seg free start
+	PUSHJ	TOP,NEWHP		; tack on new one
+	HRRZS	0,LHEAP(HEAP)		; set back pointer to zero
+	POPJ	TOP,0			; and go home
+
+
+;
+; initialize a header -- assume HEAP points to the new heap, and that
+; CHEAP contains the last heap. Just make sure there's space enough for
+; the heap header.
+
+NEWHP:	MOVEI	T,HDRSIZ(HEAP)		; get enough room for header
+	CAMG	T,.JBREL##		; do we already have enough?
+	JRST	NEWOK			;   yes, don't do CORE call
+	CORE	T,0			; else ask TOPS-10 for loseg
+	JRST	FAIL			; no go
+
+NEWOK:	MOVE	T,CHEAP			; pick up old heap pointer
+	HRLM	T,LHEAP(HEAP)		; install as back heap pointer
+	MOVEI	T,HDRSIZ(HEAP)		; get addr of first free word
+	HRRM	T,TAIL(HEAP)		;   which is new end-of-heap ptr
+
+	MOVEI	T,<FHEAD-1>(HEAP)	; get addr one word before free ptrs
+	HRLI	T,0(T)			; duplicate in left half
+	MOVEM	T,FHEAD(HEAP)		;   and put head and tail of free list
+	HRRZM	T,ROVER(HEAP)		; that's where we'll start next time
+
+	HRRZM	HEAP,CHEAP		; record ptr, insure LH zeroes
+	POPJ	TOP,0
+
+
+; HPWRIT -- call to write out current heap. It is assumed that something
+;   is there, and that the end of the heap falls on a 128-word minus one
+;   boundary (e.g. 12777b, 20777b, etc.). 
+
+	extern	OPN$FI,CLOS$F,READ$P,WRIT$P	; externs for dump I/O
+
+HPWRIT:	MOVE	PSA,$MODFIT(PDA)	; load data pointer
+	SETZM	4(TOP)			; error if we return now
+	SKIPN	0,CHEAP			; make sure there's an active heap
+	POPJ	TOP,0			;   else go home now
+
+	PUSH	TOP,3			; save addr of skyhook cell
+
+; load parameters -- assume 2 has addr of file name
+
+	MOVEI	3,CHNUM			; addr of channel number cell
+	MOVEI	4,DUMSTA		;   and boolean status cell
+	SETZ	5,0			; clear inputonly flag
+	MOVEI	6,1			; and set deletecontents true
+	PUSHJ	TOP,OPN$FI		; open the file
+	SKIPN	0,DUMSTA		; did it go?
+	JRST	HPSERR			; no
+
+	HRRZI	HEAP,HSTRT.		; get synthetic heap address start
+	HRRZ	T,CHEAP			; must use currently active heap
+	HRRZ	T,TAIL(T)		;   to get real tail of heap
+	SUBI	T,0(HEAP)		; get length (addr(FREE)-addr(HEAD)-1)
+	IDIVI	T,^o200			; get size of heap in blocks
+	MOVE	T2,0(TOP)		; get skyhook address to store
+	HRLI	T2,0(T)			; left halfword gets size of heap
+	MOVEM	T2,EXTPTR(HEAP)		; put down in control area of heap
+	HRRZ	T2,CHEAP		; get current CHEAP value
+	HRLM	T2,LHEAP(HEAP)		;   and kludge in as backlink of first
+;
+; write the heap to the file.  do the write in chunks of no more
+; than 16 pages (64 disk blocks) to avoid op sys problems
+;
+	MOVEI	2,0(HEAP)		; starting core address
+	MOVEM	2,RW.ADR
+	MOVEI	3,0(T)			; number of blocks
+	MOVNM	3,RW.CNT
+	SETZM	RW.BLK			; starting block number
+W.LOOP:
+	MOVE	2,RW.ADR		; next core address
+	SKIPN	3,RW.CNT		; neg blocks remaining
+	JRST	W.DONE			; all done
+	MOVN	3,3
+	CAILE	3,^o100			; max count = 64
+	MOVEI	3,^o100
+	ASH	3,7			; blocks * 128 = words
+	ADDM	3,RW.ADR		; increment next core address
+	ASH	3,-7			; words / 128 = blocks again
+	ADDM	3,RW.CNT		; decrement blocks remaining
+	MOVE	4,RW.BLK		; next block to write
+	ADDM	3,RW.BLK		; increment next block
+	MOVE	5,CHNUM			; get channel number
+	MOVEI	6,DUMSTA		; address of status cell
+	PUSHJ	TOP,WRIT$P		; do it
+	SKIPN	DUMSTA			; success?
+	JRST	HPSERR			; no, failure
+	JRST	W.LOOP			; yes, do next chunk
+W.DONE:
+	MOVE	2,CHNUM			; set up pars to close fil
+	SETZ	3,0			; channel, deletefile=false
+	PUSHJ	TOP,CLOS$F		; do it
+	HRRZS	0,HSTRT.+LHEAP		; zero out phony backlink to avoid trouble
+
+	POP	TOP,T2
+	MOVEI	T,1			; return TRUE
+	MOVEM	T,4(TOP)
+	POPJ	TOP,0			; go home
+
+HPSERR:	POP	TOP,T2
+	SETZM	4(TOP)			; return FALSE
+	POPJ	TOP,0
+
+;
+; HPSAVE -- wrapper for HPWRIT.  Do HPWRIT, then blow up if error.
+;
+
+HPSAVE:	PUSHJ	TOP,HPWRIT
+	SKIPE	5(TOP)			; success?
+	POPJ	TOP,0			; yes, return
+	MOVEI	T,[asciz/
+?	Disaster in heap save call/]
+	JRST	ALCDIE
+
+
+;
+; HPREAD -- reset the world from a file.  Filename in R2, purge/nopurge flag
+;   in R3, return skyhook cell.  What could be easier?
+
+HPREAD:	MOVE	PSA,$MODFIT(PDA)	; data area pointer
+	PUSH	TOP,3			; save addr of skyhook cell
+	MOVEI	3,CHNUM			; load pars -- 2 has fname, 3 channel cell
+	MOVEI	4,DUMSTA		; status cell
+	MOVEI	5,1			; inputonly true
+	SETZ	6,0			; delete contents false
+	PUSHJ	TOP,OPN$FI		; do it
+	SKIPN	DUMSTA			; did we really do it??
+	JRST	HPLERR			; no, sorry.
+
+	MOVEI	HEAP,HSTRT.		; start address
+	MOVEI	T2,^o177(HEAP)		;   need one page to read in
+	CORE	T2,0			; so try for it
+	JRST	FAIL			; no go.
+
+	MOVEI	2,0(HEAP)		; address for read
+	MOVEI	3,1			; number of blocks
+	SETZ	4,0			; start at disk block zero
+	MOVE	5,CHNUM			; get channel number
+	MOVEI	6,DUMSTA		; addr of status word
+	PUSHJ	TOP,READ$P		; get first page of heap
+	SKIPN	0,DUMSTA		; did we get it?
+	JRST	HPLERR			; no.
+
+; now set up for rest of heap
+
+	MOVEI	HEAP,HSTRT.		; get start address
+	HLR	T,EXTPTR(HEAP)		; get size of former heap in blocks
+	IMULI	T,^o200			; now size in words
+	ADDI	T,-1(HEAP)		; end of heap one word before
+	CORE	T,0			; get space needed
+	JRST	FAIL			; sorry.
+;
+; read the heap from the file.  do it in chunks of no more
+; than 16 pages (64 blocks) to avoid op sys problems
+;
+	MOVEI	2,HSTRT.+^o200		; start read one block after heap
+	MOVEM	2,RW.ADR
+	HLRZ	3,EXTPTR+HSTRT.		; pick up heap length in blocks
+	SUBI	3,1			; less one already read
+	MOVNM	3,RW.CNT
+	MOVEI	4,1			; start at file block one
+	MOVEM	4,RW.BLK
+R.LOOP:
+	MOVE	2,RW.ADR		; next core address
+	SKIPN	3,RW.CNT		; neg remaining disk blocks
+	JRST	R.DONE			; none
+	MOVN	3,3
+	MOVE	4,RW.BLK		; next disk block
+	CAILE	3,^o100			; max chunk = 64 blocks
+	MOVEI	3,^o100
+	ADDM	3,RW.CNT		; decrement blocks remaining
+	ASH	3,7			; blocks * 128 = words
+	ADDM	3,RW.ADR		; increment next core address
+	ASH	3,-7			; words / 128 = blocks again
+	ADDM	3,RW.BLK		; increment next disk block
+	MOVE	5,CHNUM			; get channel number
+	MOVEI	6,DUMSTA		; addr of status word
+	PUSHJ	TOP,READ$P		; do it
+	SKIPN	DUMSTA			; success?
+	JRST	HPLERR			; no, failure
+	JRST	R.LOOP			; yes, get next chunk
+R.DONE:
+	MOVE	2,CHNUM			; gotta close down load file
+	POP	TOP,3			; get purge/nopurge flag
+	PUSHJ	TOP,CLOS$F
+	MOVEI	HEAP,HSTRT.		; addr of new heap
+	HLRZ	T,LHEAP(HEAP)		; get old CHEAP value from save
+	MOVEM	T,CHEAP			; and restore it
+	HRRZS	0,LHEAP(HEAP)		; zap nasty phony backlink
+	HRRZ	T,EXTPTR(HEAP)		; get stored skyhook from file
+	MOVEM	T,4(TOP)
+	POPJ	TOP,0
+
+HPLERR:	POP	TOP,T2			; get addr of skyhook cell
+	MOVEI	T,NIL			; get a nil
+	MOVEM	T,4(TOP)
+	POPJ	TOP,0
+
+
+;
+; HPLOAD -- wrapper for HPREAD.  Assumes nopurge.
+;
+
+HPLOAD:	SETZ	3,0
+	JRST	HPREAD
+
+
+;
+; NEW -- May have to initialize entire heap structure via INIT. Then
+;   get a block (either via KNUTH from free chain, or by extending the
+;   current heap), zero it out, and mark it as allocated.
+
+NEW.:	
+	jsr	ins.sm##
+	ADJSP	TOP,^o20
+	HRLI	1,2
+	HRRI	1,-^o16(TOP)
+	BLT	1,-1(TOP)
+	MOVEI	R1,1			; get one ARG word
+	ADDB	R1,-^o20(TOP)
+	MOVEI	R0,@-1(R1)		; EA is size needed
+	MOVE	PSA,$MODFIT(PDA)
+	LDB	R1,[point 4,-1(R1),12]	; AC bits give destin reg
+	MOVEM	R1,DESTREG
+	MOVE	EXP1,R0			; put in right register
+	SKIPN	HEAP,CHEAP		; get current hptr, dont skip if zero
+	PUSHJ	TOP,INIT		;   and initialize heap structure
+	COUNT	CNNEW			; count new call if debug enabled
+
+NEW2:	MOVEI	ALLOC,1(ALLOC)		; add one to size for data word
+	CAIGE	ALLOC,MINBLK		; if less then minimum then
+	MOVEI	ALLOC,MINBLK		;   then install min size 
+
+	PUSHJ	TOP,KNUTH		; try for block on free list
+	PUSHJ	TOP,XTEND		; fail, extend current heap end
+
+	SETZM	0,1(NEW)		; zero first word of new block
+	IFLE MINBLK-2,<			; assemble test for one-word record
+	  CAIG	ALLOC,2			; only if minimum block size
+	  JRST	NUDONE >		; is <= 1 (obviously)
+
+	HRLI	T,1(NEW)		; source pointer (zeroed word)
+	HRRI	T,2(NEW)		; destination (one word after)
+	MOVEI	T2,0(NEW)		; set up end of BLT pointer in T2
+	ADDI	T2,-1(ALLOC)		;   ALLOC-1 words past control word
+	BLT	T,0(T2)
+
+NUDONE:	MOVEI	ALLOC,1(NEW)		; return addr of block + 1
+	MOVE	R0,DESTREG		; where to put it
+	ADDI	R0,-^O20(TOP)	; make address of saved reg
+	MOVEM	ALLOC,@R0
+	HRLI	1,-^o16(TOP)
+	HRRI	1,2
+	BLT	1,15
+	jsr	ins.sm##
+	ADJSP	TOP,-^o20
+	POPJ	TOP,0
+
+;
+; DISPOSE -- after discovering that the address is reasonable, place the
+;   newly freed block as the first block on the free list.
+
+DSPOS.:	
+	jsr	ins.sm##
+	ADJSP	TOP,^o20
+	HRLI	1,2
+	HRRI	1,-^o16(TOP)
+	BLT	1,-1(TOP)
+	MOVEI	R1,1			; get ARG word
+	ADDB	R1,-^o20(TOP)		; fix return addr too
+	MOVEI	EXP1,@-1(R1)		; get addr of DISPOSEable record
+	MOVE	PSA,$MODFIT(PDA)
+	MOVE	HEAP,CHEAP		; pick up current heap pointer
+	SUBI	ALLOC,1			; dec record addr. to get data word
+	MOVEI	T,0(HEAP)		; get current heap addr in T
+	COUNT	CNDISP			; count dispose calls
+
+DSPS2:	CAIG	T,0(ALLOC)		; if record addr. more than heap top
+	JRST	DSPS3			;   then we've got the right heap
+	HLRZ	T,LHEAP(T)		; else pick up this heap's back link
+	JUMPE	T,DSERR			; error if last heap
+	JRST	DSPS2			;   else check the 'new' one
+
+DSPS3:	CAIGE	ALLOC,HDRSIZ(T)		; if record addr less than end of header
+	JRST	DSERR			;   then that's an error too
+
+	HRRZ	T2,TAIL(T)		; pick up addr of end of heap
+	CAILE	ALLOC,-MINBLK(T2)	; if record more than end of heap minus
+	JRST	DSERR			;   min rec. size, error
+
+	SKIPL	T2,SIZE(ALLOC)		; get size field of block
+	JRST	DSPREV			;   positive, already free: error
+
+;
+; at this point, ALLOC is the addr of the new free block, and T is the
+;   addr of the heap containing the block. Tack it onto the start of
+;   that heap's free list.
+
+	MOVE	T2,FHEAD(T)		; get current first free one
+	HRL	T2,T			;   and addr of heap for back link
+	MOVEM	T2,FLINK(ALLOC)		; install as ptr word for new block
+	HRLM	ALLOC,BLINK(T2)		; addr of new as blink for old 1st one
+	HRRM	ALLOC,FHEAD(T)		; and as flink of heap header
+
+	MOVMS	0,SIZE(ALLOC)		; set size field positive for free
+	HRLI	1,-^o16(TOP)
+	HRRI	1,2
+	BLT	1,15
+	jsr	ins.sm##
+	ADJSP	TOP,-^o20
+	POPJ	TOP,0
+
+;
+;  KNUTH -- allocation-compaction algorithm taken from "Art of Computer
+;    Programming" Vol. 1, sec. 2.5, problem 19.  It looks for a free block
+;    large enough for the allocation, coalescing free blocks as it looks.
+;
+;  ALLOC contains the word size of the block needed, HEAP points to the
+;    current heap. NEW will contain the address of the control word of the
+;    allocated block if successful (skip 1 return), else the routine
+;    will return without a skip.
+
+
+KNUTH:	MOVE	BLK,ROVER(HEAP)		;get addr of first block to check
+	SETZ	T2,T2			; clear flag for being done
+	HRRZ	NEW,TAIL(HEAP)		; remember tail of current heap
+
+KNCHEK:	CAIE	BLK,<FHEAD-1>(HEAP)	; are we at free list header block?
+	JRST	KNSIZE			;   no, check this block out.
+	JUMPN	T2,KNFAIL		; if second time at header, K. fails
+	MOVEI	T2,1			; else set flag for next time around
+	JRST	KNNEXT			;   and get next block to check.
+
+KNSIZE:	MOVE	NEXT,SIZE(BLK)		; pick up block size to get addr
+	ADDI	NEXT,0(BLK)		;   of next physical block
+	CAIN	NEXT,0(NEW)		; don't try to coalesce block at
+	JRST	KNFIT			;   end of heap -- try to use it
+
+	SKIPG	T,SIZE(NEXT)		; pick up block's size word
+	JRST	KNFIT			;   negative, alloc'd, try to use current
+;
+; Now BLK points to a free block to which the free block at NEXT may be
+;   coalesced.  Do it, and try for a second coalesce.
+;
+	COUNT	CNCOAL			; count as a coalesce
+	HLRZ	T3,BLINK(NEXT)		; get deleted block's backlink
+	HRRZ	T,FLINK(NEXT)		;   and forelink
+	HRLM	T3,BLINK(T)		; put old backlink in next's backlink
+	HRRM	T,FLINK(T3)		;   and old forelink in prev's fore
+	HRRZ	NEXT,SIZE(NEXT)		; get additional size
+	ADDM	NEXT,SIZE(BLK)		;   to add to original size
+	JRST	KNSIZE			; go try for second coalesce
+;
+; Here, BLK points to a candidate for allocation. Check its size; it may
+;   need to be split.
+;
+KNFIT:	MOVE	T,SIZE(BLK)		; get size of block to try
+	COUNT	CNEXAM			; count examination of blocks for size
+	CAIGE	T,0(ALLOC)		; will it go?
+	JRST	KNNEXT			;   too small, get next block
+
+	HRRZ	T2,FLINK(BLK)		; we got one, get its forelink
+	MOVEM	T2,ROVER(HEAP)		;   and place as ROVER for next time
+	SUBI	T,0(ALLOC)		; get size of remaining block
+	CAIG	T,SMALL			; is it too small to fool with?
+	JRST	KALLOC			;   yes, just allocate whole thing
+	COUNT	CNSPLI			; count number of splits
+	MOVEM	T,SIZE(BLK)		; else install new split size
+	ADDI	BLK,0(T)		;   and get start of new block
+	MOVNM	ALLOC,SIZE(BLK)		; put down control word for block
+	JRST	KNDONE			;   and take successful return
+;
+; Here, the whole BLK must be allocated. We must unchain it from the
+;   free list.
+;
+KALLOC:	HLRZ	T,BLINK(BLK)		; get backlink address
+	HRRZ	T2,FLINK(BLK)		;   and forelink address
+	HRRM	T2,FLINK(T)		; put as forelink of preceding block
+	HRLM	T,BLINK(T2)		;   and BL as backlink of next
+	MOVNS	0,SIZE(BLK)		; negate size to mark as alloc'd
+
+KNDONE:	MOVEI	NEW,0(BLK)		; set up return parameter
+	AOS	0,0(TOP)		; tick return address for SKIP1 ret.
+	POPJ	TOP,0			; go home
+
+KNNEXT:	HRRZ	BLK,FLINK(BLK)		; get next block in list
+	JRST	KNCHEK			;   and check it out
+
+KNFAIL:	MOVEM	BLK,ROVER(HEAP)		; change ROVER in case previous ROVER
+					;   was coalesced (thanks, RNF!! )
+	POPJ	TOP,0
+
+;
+; XTEND -- to get more space for allocation. XTEND first checks .JBREL in
+;   the job data area to see if the program already has enough core to
+;   make the allocation. If not, a CORE monitor call is executed. In this
+;   manner, the system allocation quantum is also the program low-segment
+;   extension quantum. 
+
+XTEND:	MOVE	NEW,TAIL(HEAP);		; old tail will be start of ...
+	MOVEI	T,0(NEW)		;   new block(s)
+	COUNT	CNEXT		unt heap extensions
+	ADDI	T,0(ALLOC)		; add needed size to new max addr
+	CORE	T,0			;   and try for it
+	JRST	FAIL			; no go
+
+	HRRZ	T,.JBREL##		; get new loseg limit
+	ADDI	T,1			; tick by one word
+	HRRM	T,TAIL(HEAP)		;   to get new heap tail
+
+	SUBI	T,0(NEW)		; difference of addrs is size of new
+	MOVEI	T3,0(T)			;   chunk just created
+	SUBI	T,0(ALLOC)		; get size beyond size needed
+	CAIG	T,SMALL			; is it worth worrying about?
+	JRST	XTEND2			;   no
+;
+; NEW has old heap tail, which will be the address of the newly created free
+;   block.  T has the free block size, and T3 has the size of the piece
+;   which was just obtained from TOPS-10.
+;
+	COUNT	CNSPLI			; count as a split
+	MOVEM	T,0(NEW)		;  control word for new free block
+	SUBI	T3,0(T)			; change size of allocated block
+	HRLI	T2,<FHEAD-1>(HEAP)	; free links -- backlink to heap header
+	HRR	T2,FHEAD(HEAP)		;   and forelink to current first
+	HRRM	NEW,FHEAD(HEAP)		; make heap header point to us
+	HRLM	NEW,BLINK(T2)		;   and former first point to us
+	MOVEM	T2,FLINK(NEW)		;   and put down new control word
+	ADDI	NEW,0(T)		; NEW now has addr of block to allocate
+;
+; NEW has address of new block to allocate. T3 has its size.
+;
+XTEND2:	MOVNM	T3,0(NEW)		; put negative size for control word
+	POPJ	TOP,0			; go home
+
+;
+; MARK. -- saves the current heap, and creates a new one.
+;
+;
+;MARK.:	SKIPN	HEAP,CHEAP		; if current heap pointer is zero
+;	PUSHJ	TOP,INIT		;   then create a heap to mark
+;	HRRZ	HEAP,TAIL(HEAP)		; get heap's tail, which will be
+;	PUSHJ	TOP,NEWHP		;   start of the new heap
+;	MOVE	HMARK,CHEAP		; return current heap as heapmark
+;	POPJ	TOP,0
+;
+;
+; RLEAS. -- restores the heap previous to the heapmark parameter. First
+;   we must check to see if there IS a previous!
+;
+;
+;RLEAS.:	MOVE	T,CHEAP			; pick up current heap pointer
+;
+;RLLOOP:	JUMPE	T,RLSERR		; if zero, end of backchain
+;	CAIN	T,0(HMARK)		; is this one the one?
+;	JRST	RLSOK			;   yes, we found it
+;	HLRZ	T,LHEAP(T)		;   no, get previous
+;	JRST	RLLOOP			;     and go back
+;
+;RLSOK:	HLRZ	HEAP,LHEAP(HMARK)	; get heap previous to pointed to.
+;	JUMPE	HEAP,RLSERR		;   first heap -- can't release
+;	MOVEM	HEAP,CHEAP		; make this one new current heap
+;
+;	HRRZ	T,TAIL(HEAP)		; to reset loseg, get end of heap
+;	CORE	T,0			;   and set as new max loseg addr
+;	JRST	RLSERR
+;	POPJ	TOP,0
+;
+;
+; ERROR ROUTINES
+;
+
+RLSERR:	MOVEI	T,[asciz/
+?	Invalid HEAP pointer in RELEASE call/]
+	JRST	ALCDIE
+
+FAIL:	MOVEI	T,[asciz/
+?	HEAP overflow. Try again with more core/]
+	POP	TOP,0			; we know this one called from internals
+	JRST	ALCDIE
+
+DSERR:	MOVEI	T,[asciz/
+?	Bad pointer in DISPOSE/]
+	JRST	ALCDIE
+
+DSPREV:	MOVEI	T,[asciz/
+?	Attempt to free freed block/]
+
+ALCDIE:	PUSHJ	TOP,TWAIT.
+	OUTSTR	0(T)
+	MOVE	R0,0(TOP)
+	PUSHJ	TOP,WRTPC.
+	JRST	DIE.
+
+	LIT
+	$END	MODFIT
+	end
+  i Eb
