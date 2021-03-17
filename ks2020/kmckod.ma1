@@ -1,0 +1,638 @@
+.SBTTL	KMCKOD - Main program
+	ALWAYS	STARTX			;Jump to initialization code
+.SBTTL	NXTDEV - Main loop - Device scheduling
+;-----
+;NXTDEV - Main loop and device scheduler.
+;	There are 8 device states, all odd states dispatch to PDP20
+;	service routine, even states dispatch to DR11 service routine.
+;	All scheduling variables & data are stored in page 0.
+;
+;	States:	0,2,4,6 => DR0,DR1,DR2,DR3	(base)
+;		1       => PDP20		(host)
+
+
+
+; Select next device and store in SP1
+
+NXTDEV:	SP	BR,	INCA,	SP1	;Select next device
+	BRWRTE	IMM,	7		; Insure that there is no wrap around
+	SPBR	BR,	AANDB,	SP1	; SP1,BR <= SP1 AND 07
+	BR0	DO20			; Do 20 service on odd counts
+
+; Host input routine
+;	SP1 => Current node*2
+
+	BRSHFT				;Calc unit number (divide by 2)
+	SP	BR,	SELB,	SP10	; and save in SP10
+	CALLSB	SP13,	CHKSTA		;See if node is up and has data
+	  ALWAYS	NXTDEV		;Dead node or no data
+					;Skip return if node is up and has data
+
+.PAGE
+.SBTTL	GETHDR - Get header from node
+
+;GETHDR - Node wishes to speak, get header, check for valid msg type and fields.
+;	Then dispatch to proper processing routine. The DR11's
+;	$DVACP bit is not set till the msg at least appears valid
+
+GETHDR:	CALLSR	SP12,	GETDRH,	RX0	;Get header word
+;	INDAT1 - Opcode for operation
+;	INDAT2 - Port # for all normal operations,
+;		 0 for block mode word count and node up message.
+
+RT0:	; Dispatch on message type
+	SPBR	IBUS,	INDAT2,	SP2	;Get MSG_TYP from header
+	BR7	DATAIN			;Br if data msg ( > 200)
+	COMP	BR,	SP17		;Test MSG_TYP for valdity
+	Z	RSTITF			;Br if invalid msg type (zero)
+	LDMA	IMM,	CONST		;Point to table of message types
+	COMP	MEMI,	SP2		;Compare with 177
+	Z	BLKMOD			;Br if block mode
+	COMP	MEMI,	SP2		;Test for Node Active msg (176)
+	Z	NODACT			;Br if node active msg
+	COMP	MEMI,	SP2		;Test for MSG_TYP > MSGMAX (63)
+	C	RSTITF			;Br if invalid msg type
+					;Fall into normal msg code
+
+.SBTTL	Normal input => 20
+
+;Normal Input => 20's ring buffer
+;	Accept header, lookup msg length and xfer msg
+	CALLSB	SP13,	CALPRT		;Check port field and insert node number
+	CALLSR	SP12,	ACCEPT,	RX2	;Accept msg (set DR11C flag)
+RT2:	NODST	BR,	SELA,	SP2, LDMAR ;Load msgtype as table offset
+	SP	MEMX,	SELB,	SP6	;Get wrd_to_go by indexing into table
+XFER00:	CALLSB	SP13,	PUT20		;Output word to 20
+	CALLSB	SP13,	GETDR		;Get data word from base
+	ALWAYS	XFER00			;More to xfer (PUT20 goes to NXTDEV when done)
+
+; CALPRT - Subroutine for translating port numbers
+; Calculate host port number from node number and port number
+; supplied by node and restore to header.
+;	host port # = node port # + node # * 100
+
+CALPRT:	BRWRTE	IMM,	300		;Form mask of illegel bits
+	SP	IBUS,	INDAT1,	SP0	;Load port number from header
+	BRWRTE	BR,	AANDB,	SP0	;Just leave 2 highest bits
+	COMP	BR,	SP17		;Check for zero
+	Z	CALPR1			;Continue if field is zero
+	ALWAYS	RSTITF			;Non-zero is fatal node error
+CALPR1:	BRWRTE	BR,	SELA,	SP10	;Load node number (0-3)
+	BROTAT				;Rotate to 2 highest bit positions
+	BROTAT
+	OUT	BR,	AORB,	OIDAT1	;Calc host port number & restore
+	RTNSUB	SP13,	P0
+.PAGE
+.SBTTL	DATAIN - Data input => 20
+
+;DATAIN-Xfer data blk 11 => 20
+;	Note: May eventually want to breakup data msg that wrap around
+
+DATAIN:	CALLSB	SP13,	CALPRT		;Check port field and insert node number
+	CALLSR	SP12,	ACCEPT,	RX4	;Accept header
+RT4:
+
+; Entry point for 2nd data message (jumped to by PUT20 if SP5 is non-zero)
+
+MUNG2:	BRWRTE	IBUS,	IODAT2		;Get header from NPR input register
+	BRWRTE	BR,	AANDB,	SP14	;Mask with 0177 to get byte count
+	SP	BR,	SELB,	SP2	;Save byte count in SP2
+	COMP	BR,	SP17		;Check for 0 length data msg
+	Z	RSTITF			;Br to node down routine on invalid message length
+	BRWRTE	IMM,	2		;Check for short (1 word) data msg
+	COMP	BR,	SP2		;
+	C	MUNGCK			;Br if must check for data msg wrap arnd
+
+; Convert header byte count to word count
+; by masking off sign bit, rounding up one byte and shifting
+; bytes => words.
+
+MUNGRT:	BRWRTE	BR,	ADD,	SP16	;Round up to next word by adding one
+	BRSHFT				;Mask and shift
+	BRWRTE	BR,	ADD,	SP16	;Add one for the header
+	SP	BR,	SELB,	SP6	;Store wrd_to_go
+
+; Xfer data
+XFER01:	CALLSB	SP13,	PUT20		;Put word in 20's ring buffer
+	CALLSB	SP13,	GETDR		;Get data word
+	ALWAYS	XFER01			;More to do! (PUT20 returns directly to NXTDEV)
+
+
+; NULL Message - Used to sequence the node from a down state
+; to an up state. This msg is discarded.
+
+NODACT:	BRWRTE	IBUS,	INDAT1		;Get second byte of message
+	COMP	BR,	SP17		;Check for zero
+	Z	NODAC1			;Continue if field is zero
+	ALWAYS	RSTITF			;Non-zero is fatal node error
+NODAC1:	CALLSR	SP12,	ACCEPT,	RX10	;Accept this msg
+;	ALWAYS	NXTDEV			;RETURN VIA INTERPAGE RETURN
+.PAGE
+.SBTTL	BLKMOD - Block_mode input and output
+
+;BLKMOD -- Start block mode. This can only be initiated by the
+;	base.  Accept msg, get rest of msg (KMC swallows this msg).
+;	START_BLOCKMOD msg =>	177,	wrdcnt,	address
+;				1 byte	2 bytes	3 bytes
+
+
+BLKMOD:	BRWRTE	IBUS,	INDAT1		;Get second byte of message
+	Z	BLKMO1			;Goto BLKMO1 if 377(fix this sometime)
+	COMP	BR,	SP17		;Check for zero
+	Z	BLKMO1			;Continue if field is zero
+	ALWAYS	RSTITF			;Non-zero is fatal node error
+BLKMO1:	CALLSR	SP12,	ACCEPT,	RX6	;Accept msg header
+RT6:	SP	IBUS,	IODAT1,	SP7	;Save xfer direction bit (bit 7) in SP7
+	CALLSB	SP13,	GETDR		;Get more of msg
+	SP	IBUS,	IODAT2,	SP6	;Save word count in SP6
+	CALLSB	SP13,	GETDR		;Get last of msg
+
+; Convert address from PDP10 to Unibus. That is shift left 2
+
+	CALLSB	SP13,	SHFL16		;Shift INDAT left
+	CALLSB	SP13,	SHFL16		; "
+	SP	IBUS,	IODAT1,	SP2	;Save addr
+	SP	IBUS,	IODAT2,	SP3
+
+; We now have word count in SP6 and the unibus addr in SP2 & SP3
+; Test for transfer direction: pos => OUTPUT, neg => INPUT
+	BRWRTE	BR,	SELA,	SP7	;Get direction bit (sign)
+	BR7	XBTO20			;Br if => 20
+
+; Blockmode output  20 => 11
+XBTO11:	BRWRTE	IMM,	201.		;Set up max count from 2020
+	COMP	BR,	SP6		;Check for count in range
+	C	RSTITF			;Node is probably sick
+	BRWRTE	BR,	SELA,	SP2	;Get address low byte
+	OUT	BR,	SELB,	IBA1	;Store in NPR address register
+	BRWRTE	BR,	SELA,	SP3	;Get address high byte
+	OUT	BR,	SELB,	IBA2	;Store in NPR address register(high)
+	LDMA	IMM,	RHNPRZ		;Point to bits to start NPR
+	OUT	MEMI,	SELB,	ONPR	;Load high bits & start NPR
+	IOWAIT
+;	SP	IBUS,	IIBA1,	SP2	;Save xfer addr
+;	SP	IBUS,	IIBA2,	SP3
+	OUT	IBUS,	INDAT1,	OUTDA1	;Xfer data from NPR input reg
+	OUT	IBUS,	INDAT2,	OUTDA2	; to NPR output reg
+	CALLSB	SP13,	PUTDR		;Send data to 11 (PUTDR returns with an I/O active)
+	SPBR	BR,	DECA,	SP6	;Dec wrd to go
+	COMP	BR,	SP17		;See if upper byte = 0
+	Z	NXTDEV			;Br if done
+	BRWRTE	IMM	2		;Inc input addr by two
+	SP	BR,	ADD,	SP2
+	SP	BR,	APLUSC,	SP3
+	ALWAYS	XBTO11			;More to do
+.PAGE
+.SBTTL	BLKIPT - Block mode host input
+
+;XFER => 20 - No header is sent, no pointers to keep!
+
+XBTO20:	BRWRTE	BR,	SELA,	SP6	;GET COUNT
+	BRWRTE	BR,	SUB,	SP17	;Count is neg so compliment it
+	SP	BR,	SELB,	SP6	;Restore pos count to SP6
+	BRWRTE	IMM,	32.		;Set up max count from 11
+	COMP	BR,	SP6		;Check for count in range
+	C	RSTITF			;Node is probably sick
+TO20:	CALLSB	SP13,	GETDR		;Get data word from 11
+	BRWRTE	BR,	SELA,	SP2	;Get low byte of 20 address
+	OUT	BR,	SELB,	OBA1	;Store in low byte of NPR output reg
+	BRWRTE	BR,	SELA,	SP3	;Restore high byte of addr
+	OUT	BR,	SELB,	OBA2	;Store in NPR high byte
+	LDMA	IMM,	HSMEXT		;Load host mem ext
+	OUT	MEMI,	SELB,	OBR
+	OUT	MEMX,	SELB,	ONPR	;Start out-npr
+	IOWAIT
+	SPBR	BR,	DECA,	SP6	;Dec wrd to go
+	COMP	BR,	SP17		;Done with xfer?
+	Z	NXTDEV			;Br if done
+	BRWRTE	IBUS,	IOBA1		;Load low byte of addr
+	BRWRTE	BR,	ADD,	SP15	;Inc output address by two
+	SP	BR,	SELB,	SP2	;Save low byte of output addr
+	BRWRTE	IBUS,	IOBA2		;Load high byte of addr into BR
+	BRWRTE	BR,	ADDC,	SP17	;Add in carry
+	SP	BR,	SELB,	SP3	;Save output addr in SP3
+	ALWAYS	TO20			;More to do
+.PAGE
+.SBTTL	DO20 - Output service routine
+
+;DO20 - Output service routine 20 => 11
+
+
+; Return with msg header if success flag set  else buffer empty
+
+DO20:	COMP	BR,	SP16		;Check for a count of 1	
+	Z	2$			;If DEVICE is 1 do 20 service
+	ALWAYS	NXTDEV			;otherwise lighten the load on the 20
+2$:	CALLSB	SP12,	GET20
+	BR0	CHKHDR			;Br if successful
+	ALWAYS	NXTDEV			;Output buffer is empty
+
+
+;CHKHDR - Check for valid msg type and dispatch to proper code
+
+CHKHDR:	SPBR	IBUS,	INDAT2,	SP2	;Save header for future use
+	SP	IBUS,	INDAT1,	SP3
+	BR7	DATOUT			;BR IF DATA MESSAGE
+	COMP	BR,	SP17
+	Z	KILHST			;Br if invalid msg type (zero)
+	LDMA	IMM,	MXMSG		;Check for MSGTYP < 63
+	COMP	MEMX,	SP2
+	C	KILHST			;Br if invalid msg type
+					;Fall into normal msg code
+
+
+;Output normal msg
+
+; Get msg length
+	NODST	BR,	SELA,	SP2, LDMAR ;Load msgtype as table offset into MAR
+	SP	MEMX,	SELB,	SP6	;Get wrd-to-go
+
+; Calc node number from port number and check node state
+XFER02:	CALLSB	SP13,	CALCND		;Return node number in SP10
+					; and fall into CHKSTA
+	  ALWAYS	EATOPT		;Node is down,chuck msg
+					;Skip return if node is up
+
+; Xfer rest of msg
+XFER03:	CALLSB	SP13,	PUTDR		;Output word (PUTDR returns with an I/O active)
+	SPBR	BR,	DECA,	SP6	;Dec wrd-to-go
+	COMP	BR,	SP17
+	Z	UPDOPT			;Br if wrd-to-go = 0
+	CALLSB	SP12,	GET20		;Get next word from host
+	BR0	XFER03			;Br if no err
+
+; Error! data message is 0 length or header
+; requested more data than ring provided. That is KMC and host
+; are out of sync.
+
+	ALWAYS	KILHST			;Out of sync, kill host
+.PAGE
+
+;DATOUT - Xfer data msg from host to base
+
+DATOUT:
+; Get wrd-to-go
+	BRWRTE	BR,	SELA,	SP2	;Get header from SP2
+	BRWRTE	BR,	AANDB,	SP14	;Mask with 0177
+	BRWRTE	BR,	ADD,	SP16	;Round up one byte
+	BRSHFT				;Bytes => words
+	COMP	BR,	SP17		;Check for 0 length data message
+	Z	KILHST			;Br on invalid msg length
+	BRWRTE	BR,	ADD,	SP16	;Add one for header
+	SP	BR,	SELB,	SP6	;Store wrd-to-go in SP6
+	ALWAYS	XFER02			;Go handle common stuff
+;	CALLSB	SP13,	CALCND		;Return node number in SP10
+					; and fall into CHKSTA
+;	  ALWAYS	EATOPT		;Node is down, chuck rest of msg
+					;Skip return if node is up
+
+;XFER04:	CALLSB	SP13,	PUTDR		;Write word to node (PUTDR returns with an I/O active)
+;	SPBR	BR,	DECA,	SP6	;Dec wrd-to-go
+;	COMP	BR,	SP17
+;	Z	UPDOPT			;Br if done with xfer
+;	CALLSB	SP12,	GET20		;Get data word
+;	BR0	XFER04			;Br if successful
+
+; Error! data message is 0 length or header
+; requested more data than ring provided. That is KMC and host
+; are out of sync.
+
+;	ALWAYS	KILHST			;Out of sync, kill host!
+.PAGE
+
+; Here on nxm
+NXM:	CALLSB	SP13,	NXMTRP		;Set nxm bit
+	BRWRTE	BR,	SELA,	SP1	;Doing input or output?
+	BR0	EATOPT			;Br if output
+	ALWAYS	RSTITF			;Input
+
+EATOPT:	CALLSB	SP13,	EATMSG		;Eat rest of output msg
+	ALWAYS	RSTITF			;Send Reset Interface msg & mark
+					;node as down
+
+UPDOPT:	CALLSR	SP13,	UPDOPZ,	NXTDEV	;Update output ring pointer
+;	ALWAYS	NXTDEV			;Returns directly to scheduler
+
+RX12:	ALWAYS	RT12			;Inter page return for EATMSG
+RX14:	ALWAYS	RT14			;Inter page return for TMOTI
+RX16:	ALWAYS	RT16			;Inter page return for TMOTI
+RX22:	ALWAYS	RT22			;Inter page return
+.PAGE
+.SBTTL	INIT - Initialize KMC, once only code
+
+.=	1000
+
+; INIT - Here on startup.
+; Initialize KMC, execute this code only once.
+; Init scratch pad constants.
+
+STARTX:	LDMAP	IMM,	0		;Set to page 0 in data RAM
+	LDMA	IMM,	INIT		;Initially points to 0
+	OUT	MEMX,	SELB,	OOCON	;INIT REGESTER MODIFY DISABLE REG
+	OUT	MEMX,	SELB,	OPORT1	;INIT NXM REG
+	OUT	MEMX,	SELB,	OBR	;INIT NXM BIT
+	SP	MEMX,	SELB,	SP1	;INIT DEV SELECT #
+	SP	MEMX,	SELB,	SP5	;Init 2nd data msg queue
+	SP	MEMI,	SELB,	SP17	;0
+	SP	MEMI,	SELB,	SP16	;1
+	SP	MEMI,	SELB,	SP15	;2
+	SP	MEMI,	SELB,	SP14	;177
+
+; Fetch input ring base (IRBASE) and input ring size (IRSIZE)
+
+	OUT	MEMI,	SELB,	IBA1	;Load 20 address of input ring base(IRBASE)
+	OUT	MEMI,	SELB,	IBA2
+	OUT	MEMI,	SELB,	ONPR	;Get IRBASE from host
+	LDMA	IMM,	IRBAD		;Prepare to store IRBAD
+	IOWAIT
+	MEM	IBUS,	INDAT1,	INCMAR	;Move IRBAD from input data register
+	MEM	IBUS,	INDAT2,	INCMAR
+	LDMA	IMM,	IRKAD		;Init IRKAD with IRBAD
+	MEM	IBUS,	INDAT1,	INCMAR
+	MEM	IBUS,	INDAT2,	INCMAR
+	LDMA	IMM,	INIT0		;Point to address of IRING size in 20
+	OUT	MEMI,	SELB,	IBA1
+	OUT	MEMI,	SELB,	IBA2
+	OUT	MEMI,	SELB,	ONPR	;Get IRSIZE from host
+	LDMA	IMM,	IRBAD		;Get IRBAD again
+	SP	MEMI,	SELB,	SP2
+	SP	MEMI,	SELB,	SP3
+	IOWAIT
+	BRWRTE	IBUS,	INDAT1		;Add IRBASE & IRSIZE
+	LDMA	IMM,	IRMXAD		;Store max ring addr
+	MEM	BR,	ADD,	SP2, INCMAR
+	BRWRTE	IBUS,	INDAT2
+	MEM	BR,	ADDC,	SP3, INCMAR
+
+;Convert bytes => PDP10 words
+	CALLSB	SP13,	SHFR16		;Do 16 bit shift right on INDAT
+	CALLSB	SP13,	SHFR16
+	LDMA	IMM,	IRKMX		;Point to IRING max address
+	MEM	IBUS,	INDAT1,	INCMAR	;Store IRING max address
+	MEM	IBUS,	INDAT2,	INCMAR
+.PAGE
+
+; Fetch output ring base (ORBASE) and output ring size (ORSIZE)
+
+	LDMA	IMM,	INIT1
+	OUT	MEMI,	SELB,	IBA1	;Get address of output ring in 20
+	OUT	MEMI,	SELB,	IBA2
+	OUT	MEMI,	SELB,	ONPR	;Get ORBASE from host
+	LDMA	IMM,	ORBAD		;Point to output ring address 
+	IOWAIT
+	MEM	IBUS,	INDAT1,	INCMAR	;Store ORBAD
+	MEM	IBUS,	INDAT2,	INCMAR
+	LDMA	IMM,	ORKAD		;Init ORKAD with output ring address
+	MEM	IBUS,	INDAT1,	INCMAR
+	MEM	IBUS,	INDAT2,	INCMAR
+	LDMA	IMM,	INIT2
+	OUT	MEMI,	SELB,	IBA1	;Get address of ORING size in 20
+	OUT	MEMI,	SELB,	IBA2
+	OUT	MEMI,	SELB,	ONPR	;Get ORSIZE from host
+	LDMA	IMM,	ORBAD		;Get ORBAD again
+	SP	MEMI,	SELB,	SP2
+	SP	MEMI,	SELB,	SP3
+	IOWAIT
+	BRWRTE	IBUS,	INDAT1		;Add ORBASE & ORSIZE
+	LDMA	IMM,	ORMXAD
+	MEM	BR,	ADD,	SP2, INCMAR
+	BRWRTE	IBUS,	INDAT2
+	MEM	BR,	ADDC,	SP3, INCMAR
+	CALLSB	SP13,	SHFR16		;Do 16 bit shift right on INDAT
+	CALLSB	SP13,	SHFR16		; once more with feeling!
+	LDMA	IMM,	ORKMX		;Init ORKMX
+	MEM	IBUS,	INDAT1,	INCMAR
+	MEM	IBUS,	INDAT2,	INCMAR
+	ALWAYS	NXTDEV			;Jump to main program
+
+.PAGE
+
+; SHFR16 - 16 BIT right shift of INDAT1 & INDAT2
+;	uses SP0, BRG
+
+SHFR16:	SPBR	IBUS,	INDAT2,	SP0	;GET HIGH BYTE SAVING BIT 0 IN SP0
+	BRSHFT				;SHIFT RIGHT
+	OUT	BR,	SELB,	OIDAT2	;RESTORE
+	BRWRTE	IBUS,	INDAT1		;GET LOW BYTE
+	BRSHFT	BR,	SELA,	SP0	;SHIFT RIGHT, BIT 7 = SP0 BIT 0
+	OUT	BR,	SELB,	OIDAT1	;RESTORE
+	RTNSUB	SP13,	P1
+
+
+; SHFL16 - 16 bit left shift of OUTDA1 & OUTDA2
+;	uses SP0, BRG
+
+SHFL16:	SP	IBUS,	IODAT1,	SP0	;Load low byte
+	SP	BR,	TWOA,	SP0	;Shift left one, bit 7 => carry
+	OUT	BR,	SELA,	OUTDA1	;Restore
+	SP	IBUS,	IODAT2,	SP0	;Load high byte
+	SP	BR,	TWOAC,	SP0	;Shift left 1, bit 0 = carry
+	OUT	BR,	SELA,	OUTDA2	;Restore result
+	RTNSUB	SP13,	P0
+.PAGE
+.SBTTL	DATA message wrap around check for input
+
+; Here when doing host input and the data msg may wrap arround the end
+; of the input ring buffer. If message will wrap arround the message
+; must be broken into two data messages because the host can't handle
+; the wrap around.
+
+MUNGCK:	LDMA	IMM,	IRKMX		;See how much room is left in buffer
+	SP	MEMI,	SELB,	SP3	;Get max offset for buffer
+	SP	MEMI,	SELB,	SP4
+	LDMA	IMM,	IRK		;Get current buffer pointer
+	SP	MEMI,	SUB,	SP3	;Sub low bytes (A-B)
+	SP	MEMI,	SUBC,	SP4	; " High bytes (A-B-Carry)
+	SP	BR,	TWOA,	SP3	;Convert PDP10 words to bytes
+	SP	BR,	TWOAC,	SP4
+	SP	BR,	TWOA,	SP3
+	SP	BR,	TWOAC,	SP4
+	BRWRTE	IMM,	2
+	SP	BR,	SUB,	SP3	;Adjust for 2 in header word
+	BRWRTE	IMM,	0
+	SP	BR,	SUBC,	SP4
+
+; SP3 & SP4 = Free bytes in input buffer.
+; Subtract msg size and free bytes
+
+	BRWRTE	BR,	SELA,	SP3	;Load buffer size
+	BRWRTE	BR,	SUB,	SP2	;Sub msg size (A-B)
+	SP	BR,	SELB,	SP3	;Save difference
+	BRWRTE	BR,	SELA,	SP4	;Load high byte of buffer size
+	BRWRTE	BR,	SUBC,	SP17	; (A-B-Carry)
+	C	MUNGDT			;Br if msg will not fit
+
+;Here if data msg will fit
+FIT:	BRWRTE	BR,	SELA,	SP2	;Restore byte count
+	ALWAYS	MUNGRT			;Return and process data normally
+.PAGE
+
+; Here if data message needsmunged. That is the message will wrap
+; around the end of the buffer and must be broken into two messages
+
+MUNGDT:	COMP	BR,	SP17		;COMP TO SET Z & C BIT
+	Z	2$			;BR IF MSG FITS EXACTLY
+	ALWAYS	4$			;Will not fit
+
+2$:	COMP	BR,	SP3		;Test low byte for exact fit
+	Z	FIT			;Br if msg fits exactly
+4$:	BRWRTE	IMM,	200		;Compose 2nd message header
+	BRWRTE	BR,	AORB,	SP3	;OR in data message bit
+	SP	BR,	SELB,	SP5	;SP5 = 2nd msg header
+	SP	IBUS,	IODAT1,	SP4	;SP4 = 2nd msg port number
+
+; Fix up header for this message
+
+	BRWRTE	BR,	SELA,	SP3	;Get byte count for 2nd msg
+	SP	BR,	SUB,	SP2	;SP2 = 1st msg byte count
+	BRWRTE	IMM,	200		;Compose new header
+	BRWRTE	BR,	AORB,	SP2	;Got new header
+	OUT	BR,	SELB,	OUTDA2	;Restore header
+	BRWRTE	BR,	SELA,	SP2	;Restore byte count
+	ALWAYS	MUNGRT			;All fixed up, return & process 1st msg
+.PAGE
+.SBTTL	NXMTRP - NONEXISTANT MEMORY TRAP
+
+; Nxmtrp - Here on attempt to write to a nonexistant DR11
+; This is responded to by setting a bit in the
+; non existant device regester (CSR 3).
+
+NXMTRP:	BRWRTE	IMM,	0		;Clr nxm bit as it may have been set
+	OUT	BR,	SELB,	OBR	; while checking DR states.
+
+; Set NXM bit for this device
+	BRWRTE	IMM,	NXMBTB		;Load base of NXM bit table in mem
+	NODST	BR,	ADD,	SP10, LDMAR ;Calc & load table offset in MAR
+	BRWRTE	MEMX,	SELB		;Pick up bit value from table in BRG
+	SP	IBUS,	PORT1,	SP0	;Copy current NXM reg
+	OUT	BR,	AORB,	OPORT1	;Restore all NXM bits to CSR
+	RTNSUB	SP13,	P0		;The bits are set, return
+.PAGE
+.SBTTL	EATMSG - Eat rest of output message
+
+; EATMSG - Eat rest of msg in output ring buffer
+; Here when node has timed out. The output ring in the host must
+; be cleaned up and a reset node msg sent to host.
+
+EATMSG:	SPBR	BR,	DECA,	SP6	;Dec word count
+	COMP	BR,	SP17		;Done eating msg?
+	Z	UPDOPZ			;Br if so
+	CALLSR	SP12,	GET20,	RX12	;Eat next word in output buffer
+RT12:	BR0	EATMSG			;Br if successful read
+
+; Here on attempt to read past end of output ring buffer
+; In this case it is OK, at least KMC and host should still be in sync.
+
+.SBTTL	UPDOPZ - Update output ring pointer
+
+; UPDOPZ - Update output ring pointer ORPKMC
+; First round up pointers to next PDP10 addr
+
+UPDOPZ:	LDMA	IMM,	ORKAD
+	BRWRTE	MEMX,	SELB
+	BR1	2$
+	IOWAIT				;Wait for any PUTDR I/O to finish
+	ALWAYS	RT22
+
+2$:	CALLSR	SP12,	INCPT,	RX22	;Round pointers
+
+; Update pointers in host
+
+RT22:	LDMA	IMM,	ORK		;Point to address of output ring index
+	OUT	MEMI,	SELB,	OUTDA1	;Move output ring index to data reg
+	OUT	MEMI,	SELB,	OUTDA2
+	LDMA	IMM,	ORPKM
+MEMI,	SELB,	OBA1	;Load address of output ring index in 20
+	OUT	MEMI,	SELB,	OBA2
+	OUT	MEMI,	SELB,	OBR	;Load host mem ext
+	OUT	MEMI,	SELB,	ONPR
+	IOWAIT
+	RTNSUB	SP13,	P0		;Done
+
+.PAGE
+.SBTTL	TMOTI - Timeout for host input
+
+; Here for timeout on DR handshake durring host input.
+
+TMOTI:	LDMA	IMM,	IRPKM		;Point to address of IRPK in 10's memory
+	OUT	MEMI,	SELB,	IBA1	;Load IRPKMC address
+	OUT	MEMI,	SELB,	IBA2
+	LDMA	IMM,	RHNPRZ
+	OUT	MEMI,	SELB,	ONPR	;Read from 20
+
+; Restore old IRK
+
+	LDMA	IMM,	IRK		;Point to our copy of IRK
+	IOWAIT				;Wait for NPR to finish
+	MEM	IBUS,	INDAT1,	INCMAR	;Restore IRK to value before this message
+	MEM	IBUS,	INDAT2,	INCMAR
+	OUT	IBUS,	INDAT1,	OUTDA1	;Copy to shift registers
+	OUT	IBUS,	INDAT2,	OUTDA2
+	CALLSR	SP13,	SHFL16,	RX14	;Convert 10 word addr => Unibus byte addr
+RT14:	CALLSR	SP13,	SHFL16,	RX16
+RT16:	SP	IBUS,	IODAT1,	SP2	;Copy byte offset to SP2 and SP3
+	SP	IBUS,	IODAT2,	SP3
+	LDMA	IMM,	IRBAD		;Point to IRING base addr (Unibus)
+	BRWRTE	MEMI,	SELB		;Get IRBASE low byte
+	LDMA	IMM,	IRKAD		;Point to IRKAD
+	MEM	BR,	ADD,	SP2	;Calculate low byte of current IRING address
+	LDMA	IMM,	IRBAD+1		;Do high byte
+	BRWRTE	MEMI,	SELB		;Get IRBASE high byte
+	LDMA	IMM,	IRKAD+1		;Point to IRKAD
+	MEM	BR,	ADDC,	SP3	;Calculate high byte
+
+; Fall into Reset Interface routine
+.PAGE
+.SBTTL	RSTITF - Crash node
+
+;RSTITF - The current node is sick so we tell the host
+;	by sending a Reset Interface message and setting node
+;	state to down. Now it's the host's problem.
+
+RSTITF:	BRWRTE	IMM,	NXMBTB		;Load base of nxm bit table in mem
+	NODST	BR,	ADD,	SP10, LDMAR ;Calc offset & get load MAR
+2$:	BRWRTE	IBUS,	OCON		;Has disable reg been locked out?
+	BR0	2$			;Br if so
+	BRWRTE	MEMX,	SELB		;Get bit value from table
+	SP	IBUS,	LINENM,	SP0	;Copy current reg value
+	OUT	BR,	AORB,	OLINEN	;Restore reg with current disable bits
+; CLR DRCSR TO PREVENT DEADLOCK
+	LDMA	IMM,	DRCSR
+	OUT	MEMI,	SELB,	OBA1	;LOAD DRCSR ADDRESS
+	OUT	MEMI,	SELB,	OBA2
+	LDMA	IMM,	CSZ
+	OUT	MEMX,	SELB,	OBR	;LOAD HOST MEM EXTENSION
+	LDMA	IMM,	CST
+	OUT	MEMI,	SELB,	OUTDA1	;LOAD OUTPUT DATA
+	OUT	MEMI,	SELB,	ONPR	;SEND ZERO BYTE
+	BRWRTE	BR,	SELA,	SP10	;Calc port number for node
+	BROTAT
+	BROTAT
+	OUT	BR,	SELB,	OUTDA1	;Compose host reset by base msg
+	BRWRTE	IMM,	0		;Clear SP5 just in case
+	SP	BR,	SELB,	SP5
+	BRWRTE	IMM,	3
+	OUT	BR,	SELB,	OUTDA2
+	NODST	BR,	SELA,	SP11, LDMAR ;Set node state to down
+	MEM	IMM,	1
+	BRWRTE	IMM,	1		;Load word length
+	SP	BR,	SELB,	SP6
+	CALLSB	SP13,	PUT20		;Send msg to host
+;	ALWAYS	NXTDEV			;PUT20 returns directly to scheduler
+.PAGE
+.SBTTL	KILHST - Kill host, Fatal error routine.
+
+; KILHST - Here on invalid msg type or 0 length data msg.
+; Probably KMC and host are out of sync. This is not recoverable
+; so the host is killed to preserve the remains for posterity.
+
+KILHST:	LDMA	IMM,	KILDAT		;Load data to send host
+	OUT	MEMI,	SELB,	OUTDA1	;Load output reg
+	OUT	MEMI,	SELB,	OUTDA2
+	OUT	MEMI,	SELB,	OBA1	;Load output addr
+	OUT	MEMI,	SELB,	OBA2
+	OUT	MEMI,	SELB,	OBR	;Load host memory extension
+	OUT	MEMI,	SELB,	ONPR	;Write npr
+	HANG		;The time has come for all good things to end.
+			;Daisy,  Daisy...
+    np^Kù
