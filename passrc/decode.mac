@@ -1,0 +1,285 @@
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	This assembly contains the subroutines DECOD. and STRTD.,	;
+;	which provide file name decoding for TENIO.  Although you	;
+;	might think that these are true external subroutines, appear-	;
+;	ance in this case is not reality, for these are assembled	;
+;	separately only so that they may be used by programs other	;
+;	than TENIO.  Accordingly, these routines violate standard	;
+;	register saving protocol; it is presumed that if register	;
+;	preservation is required, a (separate) covering interface	;
+;	will provide it.						;
+;									;
+;	On entry, R0 contains the maximum number of characters in the	;
+;	string, R1 points to an internal name block, and R7 points to	;
+;	the string to convert (it may (but need not) be an ILDB type	;
+;	byte pointer).  The real string length is optional; if it is	;
+;	unknown, R0 will be large.  These routines exit+0 if they get	;
+;	in trouble; otherwise, they exit+1 in which case the internal	;
+;	file block items will be filled in or updated by the converted	;
+;	string items.  See macro definitions below for the internal	;
+;	format; the basic external format is as follows:		;
+;									;
+;	device:filnam.ext[proj #,prog #,sfd1,...,sfdn]<prot code>	;
+;									;
+;	However, in order to facilitate use by PASCAL programs, items	;
+;	may appear in any order, and blanks may (or may not) be used	;
+;	to delimit items.  Furthermore, almost any item may be omitted.	;
+;	As you can by now see, this whole thing gets rather hairy;	;
+;	detailed descriptions of each item and subitem will appear in	;
+;	the comments for the code that processes it.			;
+;									;
+;	The only difference between DECOD. and STRTD. is that DECOD.	;
+;	sets up defaults for the block (device DSK:, the rest zero)	;
+;	while STRTD. just overrides whatever was already in the block	;
+;	at call time.  Both routines preserve Rs 1, 2, 3, 12, 13, and	;
+;	15; they link by R14.  ALL OTHER REGISTERS ARE FAIR GAME AND	;
+;	MAY GET SMASHED (not to mention a bit potted).			;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+	SUBTTL	Main Line File Name Decoding
+	TITLE	DECOD. - File Name String Decoding for TENIO
+	ENTRY	DECOD.,STRTD.	; TENIO hooks
+;
+	SEARCH	OPDEFS		; The usual stuff
+;
+;	Macros to define an internal file name block.
+;
+	DEFINE	DEVICE<0(1)>	; Device (possibly ersatz) for file
+	DEFINE	FILNAM<1(1)>	; File name, in SIXBIT
+	DEFINE	EXTPRO<2(1)>	; Extension,,prot code and SFD count
+	DEFINE	PPN<3(1)>	; Proj #,,prog # of file owner
+	DEFINE	DIR<4(1)>	; two-word username
+	DEFINE	BUF<6(1)>	; buffer in read of names
+	SALL			; Suppress the expansions of these
+;
+MAXSFD==	5		; Maximum SFD nesting level supported
+;
+	TWOSEG			; Keep us reentrant
+;
+	RELOC	400000
+;
+;	We're off!
+;
+DECOD.:	MOVSI	6,'DSK'		; Set up default device as DSK:
+	MOVEM	6,DEVICE
+	CLEARM	FILNAM		; No default file name
+	CLEARM	EXTPRO		; Null default extension
+	CLEARM	PPN		; Current user or library PPN default
+	CLEARM	DIR
+;
+;	Now start the actual decoding process.
+;
+STRTD.:	TLNN	7,-1		; Have we a byte pointer?
+	HRLI	7,(POINT 7)	; No. Make one
+BGOBBL:	JSP	17,GRAB		; Fetch next character
+BLOOK:	CAIN	4," "		; A blank?
+	JMP	BGOBBL		; Yes. Hop over it and start over
+	MOVEI	5,6		; No. Try to analyze next stuff
+	JSP	11,ITEMGO	; as a six character item
+	JUMPZ	6,TRYDIR	; Null item. Look for special characters
+	CAIE	4,":"		; Success. Did we end with a colon?
+	JMP	DONAME		; No. Must be file name
+	MOVEM	6,DEVICE	; Yes. Store explicit device
+	JMP	BGOBBL		; and restart at top
+;
+DONAME:	MOVEM	6,FILNAM	; Store file name
+	CAIN	4," "		; End with blank?
+	JMP	BGOBBL		; Yes. Restart
+TRYDIR:	CAIE	4,"("
+	JRST	TRYEXT
+	MOVEI	5,^D12		; 12 CHARS ALLOWED
+	JSP	11,ITEM
+	CAIE	4,")"		; Must be matched
+	JMP	0(14)
+	MOVE	6,BUF
+	MOVEM	6,DIR
+	MOVE	6,1+BUF
+	MOVEM	6,1+DIR
+	SETZM	PPN
+	JRST	BGOBBL
+TRYEXT:	CAIE	4,"."		; No. Start of extension
+	JMP	TRYPPN		; No
+	MOVEI	5,3		; Yes. No more than three sixbit
+	JSP	11,ITEM		; characters in item
+	HLLM	6,EXTPRO	; Store extension
+	JMP	BLOOK		; and start over
+;
+TRYPPN:	CAIE	4,"["		; Start of PPN (or full path)?
+	JMP	TRYPRO		; No. Something else
+	MOVEI	5,6		; Yes. Read octal project number
+	JSP	11,RDOCT	; (six digits maximum)
+	JUMPNZ	10,PRJPUT	; Got one. Store it
+	CAIE	4,","		; Null. Was there even a comma?
+	JMP	DEFPAT		; No. Use 0 (default path)
+	JSP	16,PPGRB.##	; Yes. Use user project number
+	HLRZ	10,10		; Move to right half of register
+PRJPUT:	MOVSI	6,0(10)		; Align it properly
+	CAIE	4,","		; Programmer number specified?
+	JMP	SUBPRG		; No. Use default
+	MOVEI	5,6		; Maybe. Try to read one
+	JSP	11,RDOCT
+	JUMPNZ	10,PRGPUT	; Yes
+SUBPRG:	JSP	16,PPGRB.##	; No. Use user programmer number
+PRGPUT:	HRRI	6,0(10)		; Build combined PPN
+	MOVEM	6,PPN		; and save it
+	SETZM	DIR
+PPNDUN:
+	CAIN	4,"]"		; Normal path terminator?
+	JMP	BGOBBL		; Yes. Restart from top
+	JMP	BLOOK		; No. Closing "]" is optional
+;
+DEFPAT:	CLEARM	PPN		; Set up default path,
+	JMP	PPNDUN		; with no SFDs
+;
+TRYPRO:	CAIE	4,"<"		; Start of protection code?
+	JMP	TRYFIN		; No
+	MOVEI	5,3		; Yes. Read octal code
+	JSP	11,RDOCT
+	JUMPNZ	5,0(14)		; Must be exactly three digits
+	CAIE	4,">"		; and properly terminated
+	JMP	0(14)
+	DPB	10,[POINT 9,EXTPRO,26]; Looks good. Store it
+	JMP	BGOBBL
+;
+TRYFIN:	CAILE	4,37		; A legal string terminator?
+	JMP	0(14)		; No. Give up
+	HLRZ	6,EXTPRO	; Yes. Is extension "UFD"?
+	CAIE	6,'UFD'
+	JMP	CHKDIR		; No. All is well
+	MOVSI	6,1		; Yes. Set PPN to [1,1]
+	ORI	6,1
+	EXCH	6,PPN
+	MOVEM	6,FILNAM	; and set file name to PPN
+	JMP	1(14)
+CHKDIR:	SKIPN	DIR
+	JMP	CHKPPN
+	MOVEI	6,DIR
+	MOVEM	6,PPN
+	JMP	1(14)
+CHKPPN:
+	MOVE	6,PPN
+	SVC	7,GETPPN
+	NOP
+	TLNN	6,777777
+	HLL	6,7
+	TRNN	6,777777
+	HRR	6,7
+	MOVEM	6,PPN
+	JMP	1(14)
+
+	SUBTTL	Decoding Utility Subroutines - ITEMGO, ITEM
+;
+;	ITEMGO and ITEM--Subroutines to decode and convert an alpha-
+;	numeric item to sixbit.  On entry, R4 contains the first item
+;	character (ITEMGO only) and R5 contains the maximum number of
+;	characters allowed in the item.  Rs 4, 5, 16, and 17 will be
+;	clobbered.  On exit, R4 will contain the character which
+;	terminated the item and R6 will contain the item converted to
+;	SIXBIT and halfword left aligned.  Link by R11; sideways exit+0
+;	if an error is encountered.
+;
+;	In order to make life easy for PASCAL users, the characters #
+;	and _ are treated as legal sixbit characters (along with all
+;	standard alphanumerics).  In order to facilitate specification
+;	of any arbitrary file name, a " is treated as the start of a
+;	string of octal digits, with two octal digits being converted
+;	to one sixbit character.  There must be an even number of such
+;	digits.  A second " terminates octal decoding.
+;
+ITEM:	JSP	17,GRAB		; Fetch first decoding character
+ITEMGO:
+	CLEARM	BUF		; Null initial item
+	CLEARM	1+BUF
+	MOVE	6,[POINT 6,BUF]
+ITEMCH:	CAIL	4,"A"		; Is character alphabetic (upper
+	CAILE	4,"Z"		; case)?
+	JMP	NOTLET		; No
+DOSIX:	SUBI	4,40		; Yes. Convert to SIXBIT
+PUTSIX:	IDPB	4,6
+	JSP	17,GRAB		; Fetch next character
+	SOJNM	5,ITEMCH	; and loop for next analysis
+	JMP	0(14)		; Too many characters. Bomb out
+;
+NOTLET:	CAIGE	4,"0"		; Is character numeric?
+	JMP	SPECHR		; No. Try special character list
+	CAIG	4,"9"		; Maybe
+	JMP	DOSIX		; Yes. Convert in standard manner
+	CAIL	4,"a"		; Perhaps lower case alphabetic?
+	CAILE	4,"z"
+	JMP	SPECHR		; Not that either. Might be special
+	ANDI	4,77		; Yes. Special six bit conversion
+	JMP	PUTSIX
+;
+;	Item end reached.  Adjust it to halfword boundary.
+;
+ENDITM:	MOVE	6,BUF
+	JMP	0(11)		; Now return
+;
+;	Not a normal alphanumeric.  Let # and _ get by; if character
+;	is ", convert octal pairs to a sixbit character.
+;
+SPECHR:	CAIE	4,"#"		; A special sixbit character?
+	CAIN	4,"_"
+	JMP	DOSIX		; Yes
+	CAIE	4,""""		; No. Start of octal string?
+	JMP	ENDITM		; No. Terminate item
+OCTNAM:	JSP	16,OCTCHK	; Yes. Have we a first octal digit?
+	JMP	ENDOCT		; 0 No. Make sure we ended right
+	LSH	6,3		; 1 Yes. Accumulate it into item
+	ORI	6,0(4)
+	JSP	16,OCTCHK	; Is it paired?
+	JMP	0(14)		; 0 No. That's completely invalid
+	LSH	6,3		; 1 Yes. Include it in the word
+	ORI	6,0(4)
+	SOJNM	5,OCTNAM	; Loop for another pair
+	JMP	0(14)		; But don't allow word overflow
+;
+ENDOCT:	CAIN	4,""""		; Did string terminate properly?
+	JMP	0(14)		; No. Death to invalid strings
+	JSP	17,GRAB		; Yes. Don't count " as part of item
+	JMP	ITEMCH
+
+	SUBTTL	Decoding Utility Subroutines - RDOCT, OCTCHK, and GRAB
+;
+;	RDOCT--Subroutine to read and convert an octal number.  On
+;	entry, R5 contains the maximum number of octal digits that
+;	will be allowed for this number.  Rs 4 and 17 are used.  On
+;	exit, R10 will contain the octal number and R4 the first
+;	character encountered that is not a valid octal digit.  Link
+;	by R11; sideways exit+0 if the count is exceeded.
+;
+RDOCT:	CLEAR	10,0		; Null initial number
+OCTLUP:	JSP	16,OCTCHK	; Is next character valid?
+	JMP	0(11)		; No. Return
+	LSH	10,3		; Yes. Accumulate it
+	ORI	10,0(4)
+	SOJNM	5,OCTLUP	; and loop for more
+	JMP	0(14)		; Too many digits. Give up
+;
+;	OCTCHK--Subroutine to validate and convert an octal digit.
+;	Link by R16 if invalid (R4 will contain the character), by
+;	1(16) if valid (R4 will contain the value).
+;
+OCTCHK:	JSP	17,GRAB		; Fetch next character
+	CAIL	4,"0"		; Is it an octal digit?
+	CAILE	4,"7"
+	JMP	0(16)		; No. Return+0
+	ANDI	4,7		; Yes. Convert it
+	JMP	1(16)		; and return+1
+;
+;	GRAB--Subroutine to read the next character if there is one.
+;	On entry, R0 contains the remaining character count and R7
+;	contains an ILDB byte pointer.  On exit, R4 contains the
+;	character (or zero if none left) and Rs 0 and 7 are updated.
+;	Link by R17.
+;
+GRAB:	SOJNM	0,FETCH		; Any more left?
+	TDZSKP	4,4		; No. Return a null (will end string)
+FETCH:	ILDB	4,7		; Yes. Fetch next character
+	JMP	0(17)
+;
+	LIT			; The usual literal pool
+	END			; The end. (What else?)
+  
