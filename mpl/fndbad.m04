@@ -1,0 +1,402 @@
+TITLE	FNDBAD - finds all "bad" files /WRS 4-Nov-79
+
+
+T1=1
+T2=2
+T3=3
+T4=4
+P1=5
+P2=6
+CH=7
+CH1=10
+BUF=11
+P=17
+
+;EXTENDED LOOKUP/ENTER/RENAME PARAMETERS
+.rbPPN==1
+.rbNAM==2
+.rbEXT==3
+.rbPRV==4
+.rbSIZ==5
+.rbVER==6
+.rbFUT==7
+.rbEST==10
+.rbALC==11
+.rbPOS==12
+.rbFT1==13
+.rbLIC==14
+.rbMTA==15
+.rbDEV==16
+.rbSTS==17
+.rbELB==20
+.rbEUN==21
+.rbQTF==22
+.rbQTO==23
+.rbMXA==24
+.rbUSD==25
+.rbAUT==26
+.rbUNM==27
+.rbUN1==30
+.rbPCA==31
+.rbUFD==32
+.rbALP==33
+.rbSNM==34
+.rbPJC==35
+.rbPID==36
+
+; parameters
+
+ERRMSK==1B27+1B28+1B29+1B32+1B35; SCE,HWE,HRE,BFS,BDA
+UFDSIZ==^D512/^D5		; # entries in a UFD page
+
+; chanio definitions
+
+CIOLKP==4
+CIOCLO==1
+CIOUFD==33
+CIOMAP==35
+CIOENT==5
+
+; i/o channels
+
+MFD==0
+UFD==1
+FIL==2
+OCH==3
+
+OPDEF VCREAT [CALLI -67]
+OPDEF VREMOV [CALLI -65]
+
+.JBVER==137
+LOC .JBVER
+4
+RELOC
+
+; macros
+
+DEFINE MSG(TEXT)	<OUTSTR [ASCIZ/'TEXT/]>
+DEFINE MSGCR(TEXT)	<OUTSTR [ASCIZ/'TEXT
+/]>
+DEFINE WARN(TEXT,JUMP)	<JRST [ MSGCR('TEXT)
+				JRST 'JUMP]>
+
+SUBTTL	Storrage allocation for buffers, etc.
+
+MFDREC==2			; # words in MFD record
+MFDBLK:		; MFD directory control block
+	XWD -<MFDREC*UFDSIZ>,MFDBUF ; pointer to buffer
+	SIXBIT "*"		; all directories
+	SIXBIT "UFD"		; (extension)
+	EXP 0			; return only the file name
+MFDZ:	BLOCK 3			; used by CHANIO (init to 0)
+MFDCNT:	BLOCK 1			; count of entries in buffer
+MFDBUF:	BLOCK MFDREC*UFDSIZ	; buffer
+
+UFDREC==3			; # words in UFD record
+UFDBLK:		; UFD directory control block
+	XWD -<UFDREC*UFDSIZ>,UFDBUF ; pointer to buffer
+	SIXBIT "*"		; all files
+	SIXBIT "*"		; (extension)
+	EXP 1B4			; return name and status bits
+UFDZ:	BLOCK 3			; used by CHANIO (init to 0)
+UFDCNT:	BLOCK 1			; count of entries in buffer
+UFDBUF:	BLOCK UFDREC*UFDSIZ	; buffer
+
+UFDLKB:		; UFD extended lookup block
+	40			; lookup block size
+	BLOCK 40
+
+FILLKB:		; FIL extended lookup block
+	40			; lookup block size
+	BLOCK 40
+
+OPNBLK:	0		
+OUTDEV:	BLOCK 1		
+	XWD OBUF,0	
+OBUF:	BLOCK 3
+
+OUTENT:	3
+OUTPPN:	BLOCK 1
+OUTNAM:	BLOCK 1
+OUTEXT:	BLOCK 1
+
+PS==	40
+ARRAY	PDL[PS]
+
+SUBTTL 	Initialization
+
+START:	RESET
+	MOVE	P,[IOWD PS,PDL] ; stack
+	SETZM	ERRSUM#	       	; no errors yet
+	PUSHJ	P,GETFIL	; get output file name
+	OPEN	OCH,OPNBLK	; open output file channel
+	  WARN	<?can't open output device>,START
+	ENTER	OCH,OUTENT	; enter output file
+	  WARN	<?can't enter output file>,START
+	OPEN	MFD,[EXP 17,SIXBIT/DSK/,0]
+	  WARN	<?can't open DSK: (MFD)>,[HALT]
+	OPEN	UFD,[EXP 0,SIXBIT/DSK/,0]
+	  WARN	<?can't open DSK: (UFD)>,[HALT]
+	OPEN	FIL,[EXP 0,SIXBIT/DSK/,0]
+	  WARN	<?can't open DSK: (FIL)>,[HALT]
+	LOOKUP	MFD,[EXP <1,,1>,<'UFD',,0>,0,<1,,1>]
+	  WARN	<?can't lookup MFD>,[HALT]
+
+SUBTTL 	Main Loop
+
+	PUSHJ	P,INITU		; init MFD scanner
+NUSER:	PUSHJ	P,NEXTU		; get another user
+	  JRST 	DONE		;   no more UFD's - done
+;; These bits are never actually set - so they are useless!
+;; When everybody gets fixed to set them then take out the ";;".
+;; <everybody> ::= DSKCLN | <monitor> | TITO | SNARL
+;;	TLNE	T4,(1B9+1B10+1B11+1B14+1B15); any errors in this dir?
+	 PUSHJ	P,LOOKU		; look it up 
+	  JRST	NUSER		; flop
+
+	PUSHJ	P,INITF		; init UFD scanner
+NFILE:	PUSHJ	P,NEXTF		; get another file
+	  JRST	NUSER		;   no more files this UFD
+	TRNE	T4,1B20		; test if file bad
+	  PUSHJ	P,CKERR		;   yes - report error bits
+	JRST	NFILE
+
+DONE:	PUSHJ	P,LEGEND	; do legend (if necessary)
+	RELEAS	OCH,		; release all channels
+	RELEAS	MFD,
+	RELEAS	UFD,
+	RELEAS	FIL,
+	EXIT	
+
+SUBTTL 	UFD/MFD scanning stuff
+
+INITU:	SETZM	MFDZ		; zero out DCB
+	MOVE	T1,[MFDZ,,MFDZ+1]
+	BLT	T1,MFDCNT
+	POPJ	P,
+
+INITF:	SETZM	UFDZ		; zero out DCB
+	MOVE	T1,[UFDZ,,UFDZ+1]
+	BLT	T1,UFDCNT
+	POPJ	P,
+
+NEXTU:	SOSGE	T4,MFDCNT	; buffer empty?
+	  JRST [MOVE T1,[CIOUFD,,MFD]
+		CHANIO T1,MFDBLK
+		  POPJ	P,	; no more entries
+		JRST NEXTU]
+	IMULI	T4,MFDREC
+	ADDI	T4,MFDBUF	; build pointer to record
+	MOVE	T1,[1,,1]	; get MFD PPN
+	MOVEM	T1,UFDLKB+.rbPPN
+	MOVE	T1,0(T4)	; get PPN for this UFD
+	MOVEM	T1,UFDLKB+.rbNAM
+	MOVE	T1,1(T4)	; get extension (redundant)
+	MOVEM	T1,UFDLKB+.rbEXT
+	JRST	CPOPJ1
+
+NEXTF:	SOSGE	T4,UFDCNT	; buffer empty?
+	  JRST [MOVE T1,[CIOUFD,,UFD]
+		CHANIO T1,UFDBLK
+		  POPJ	P,	; no more entries
+		JRST NEXTF]
+	IMULI	T4,UFDREC
+	ADDI	T4,UFDBUF	; build pointer to record
+	MOVE	T1,UFDLKB+.rbNAM; get PPN for file
+	MOVEM	T1,FILLKB+.rbPPN
+	MOVE	T1,0(T4)	; get name 
+	MOVEM	T1,FILLKB+.rbNAM
+	MOVE	T1,1(T4)	; get extension 
+	MOVEM	T1,FILLKB+.rbEXT
+	MOVE	T4,2(T4)	; get status bits
+CPOPJ1:	AOS	(P)
+CPOPJ:	POPJ	P,
+
+LOOKU:	MOVE	T1,[CIOLKP,,UFD]
+	CHANIO	T1,UFDLKB
+	  POPJ	P,		; error return
+	JRST	CPOPJ1		; it worked!
+
+LOOKF:	MOVE	T1,[CIOLKP,,FIL]
+	CHANIO	T1,FILLKB
+	  POPJ	P,		; error return
+	JRST	CPOPJ1		; it worked!
+
+SUBTTL	Routine to report bad files
+
+CKERR:	PUSHJ 	P,LOOKF		; lookup file to get .rbSTS
+	 SETZM	FILLKB+.rbSTS	;  if can't look up - fake it
+	HRRZ	BUF,FILLKB+.rbSTS
+	IORM	BUF,ERRSUM	; keep track for legend
+	MOVEI	CH,"("
+	PUSHJ	P,CHROUT	; "("
+	MOVE	T1,UFDLKB+.rbUNM
+	PUSHJ	P,SIXOUT	; print user name
+	MOVE	T1,UFDLKB+.rbUN1
+	PUSHJ	P,SIXOUT
+	MOVEI	CH,")"
+	PUSHJ	P,CHROUT	; ")"
+	MOVE	T1,FILLKB+.rbNAM
+	PUSHJ	P,SIXOUT	; print file name
+	MOVEI	CH,"."
+	PUSHJ	P,CHROUT	; "."
+	HLLZ	T1,FILLKB+.rbEXT
+	PUSHJ	P,SIXOUT	; print extension
+	MOVEI	T1,^D25
+	PUSHJ	P,DOPOS		; tab to 25
+	HRRZ	BUF,FILLKB+.rbSTS
+ERRPRN:	MOVSI	T4,-ERRLEN		
+ERRPR1:	TDNN	BUF,ERRTAB(T4)	; is this bit on?
+	  JRST	ERRPR2			
+	HLRZ	T1,ERRTAB(T4)	; print its name
+	PUSHJ	P,MSGOUT		
+ERRPR2:	AOBJN	T4,ERRPR1	; try next bit
+	PUSHJ	P,CRLF		; <CRLF> at end
+	OUT	OCH,		; force it out
+	  POPJ	P,
+	WARN	<?output error on output device>,[HALT]
+
+LEGEND:	MOVE	BUF,ERRSUM	; get summary of bits ref'd
+	JUMPE	BUF,CPOPJ	; no bits - no legend
+	PUSHJ	P,CRLF
+	MOVEI	T1,[ASCIZ "Legend:"]
+	PUSHJ	P,MSGOUT
+	PUSHJ	P,CRLF
+	MOVSI	T4,-ERRLEN	; get length of table
+MSGPR1:	TDNN	BUF,MSGTAB(T4)	; is this bit on?
+	  JRST	MSGPR2		;   no, next
+	HLRZ	T1,MSGTAB(T4)	; yes, get string address
+	PUSHJ	P,MSGOUT	; print legend
+	PUSHJ	P,CRLF		; end with <CRLF>
+MSGPR2:	AOBJN	T4,MSGPR1	; next legend
+	OUT	OCH,		; force the text out
+	  POPJ	P,
+	WARN	<?output error on output device>,[HALT]
+
+DEFINE ERRS <
+ERR	NDL,19,No DeLete (critical file)
+ERR	NFS,21,No Fail-Safe (never restore this file)
+ERR	SCE,27,Soft Ckecksum Error (found bad by monitor)
+ERR	HWE,28,Hard Write Error (3 times)
+ERR	HRE,29,Hard Read Error (3 times)
+ERR	BFS,32,found Bad by Fail-Safe (or TITO or SNARL)
+ERR	BDA,35,found Bad by Damage Assessment cusp (DSKCLN)
+>
+
+DEFINE	ERR(ERR,BIT,MSG)< XWD [ASCIZ/'ERR /],1B<BIT> >
+ERRTAB: ERRS
+ERRLEN==.-ERRTAB
+
+DEFINE	ERR(ERR,BIT,MSG)< XWD [ASCIZ/  ERR': MSG/],1B<BIT> >
+MSGTAB: ERRS
+
+SUBTTL	Get an output filename from terminal
+
+ARRAY 	USRNAM[2]
+
+GETFIL:	OUTSTR 	[ASCIZ "Output file: "]
+	SETZM 	OUTDEV
+	SETZM 	USRNAM
+	SETZM 	USRNAM+1
+	SETZM 	OUTNAM
+ 	SETZM 	OUTEXT
+S1:	MOVE 	T1,[POINT 6,OUTNAM]
+	MOVEI 	T2,6
+	SETZM 	OUTNAM
+S2:	INCHWL 	T3
+	CAIN 	T3,15		; IF <CR> EAT LF
+	  INCHWL T3
+	CAIL 	T3,140		; convert case
+	  SUBI 	T3,40
+	CAIN 	T3,"("		; handle user name
+	  JRST [MOVE 	T1,[POINT 6,USRNAM]
+		MOVEI 	T2,14
+		SETZM 	USRNAM
+		SETZM 	USRNAM+1
+		JRST 	S2]
+	CAIN 	T3,")"		; expect file name again
+	  JRST 	S1
+	CAIN 	T3,"."		; now expect extension
+	  JRST [MOVE 	T1,[POINT 6,OUTEXT]
+		MOVEI 	T2,3
+		SETZM 	OUTEXT
+		JRST 	S2]
+	CAIN	T3,":"		; what I thought was FNAME is really DEV
+	  JRST [MOVE	T1,OUTNAM
+		MOVEM	T1,OUTDEV
+		JRST	S1]
+	SUBI 	T3,40
+	JUMPL 	T3,GOTFIL	; is it a ^ char?
+	JUMPE 	T3,S2
+	SOJL 	T2,S2
+	IDPB 	T3,T1
+	JRST 	S2
+
+GOTFIL:	SKIPN	T1,OUTDEV
+	  MOVSI	T1,'DSK'
+	MOVEM	T1,OUTDEV
+	SKIPN	T1,OUTNAM
+	  MOVE	T1,[SIXBIT 'FNDBAD']
+	MOVEM	T1,OUTNAM
+	SKIPN	T1,OUTEXT
+	  MOVSI	T1,'RPT'
+	MOVEM	T1,OUTEXT
+	POPJ	P,
+
+SUBTTL UTILITY ROUTINES
+
+SIXOUT:	MOVE	CH1,T1		; get word
+SIXOU1:	SETZ	CH,
+	LSHC	CH,6		; next byte into CH
+	JUMPE	CH,CPOPJ	; return if null
+	ADDI	CH," "-' '	; convert to ascii
+	PUSHJ	P,CHROUT	; output it
+	JRST	SIXOU1
+
+OCTOUT:	SKIPA	T3,[^D8]	; octal
+DECOUT:	MOVEI	T3,^D10
+RADOUT:	IDIVI	T1,(T3)
+	HRLM	T2,(P)
+	SKIPE	T1
+	PUSHJ	P,RADOUT
+	HLRZ	CH,(P)
+	ADDI	CH,"0"		;CONVERT TO ASCII
+	PUSHJ	P,CHROUT	;OUTPUT IT
+	POPJ	P,
+
+MSGOUT:	HRLI	T1,440700	;MAKE INTO BYTE POINTER
+MSGLUP:	ILDB	CH,T1		;GET A BYTE
+	JUMPE	CH,CPOPJ	;FINISHED COUNTING
+	PUSHJ	P,CHROUT
+	JRST	MSGLUP		;CONTINUE
+
+CHROUT:	JUMPE	CH,CPOPJ	;IGNORE NULLS
+	AOS	HPOS#		;INCREMENT HOR POS
+	SOSGE	OBUF+2		;MORE IN BUFFER?
+	 JRST	CHROU1		;NO, DO INPUT
+	IDPB	CH,OBUF+1
+	POPJ	P,
+CHROU1:	OUT	OCH,		;OUTPUT A BUFFER
+	 JRST	CHROU2		;GO PUT CHAR IN NOW
+	WARN	<OUTPUT ERROR>,<CHROUT>
+CHROU2:	SOS	HPOS		;WILL BE INNCREMENTED AGAIN
+	JRST	CHROUT
+
+CRLF:	MOVEI	T1,[BYTE (7)15,12,0,0,0]
+	PUSHJ	P,MSGOUT
+	SETZM	HPOS		;BACK TO POS 0
+	POPJ	P,		;RETURN
+
+DOPOS:	CAMN	T1,HPOS		;ALREADY THERE?
+	 POPJ	P,		;YES, JUST RETURN
+	CAMG	T1,HPOS		;PAST WHERE WE WANT?
+	 PUSHJ	P,[PUSH P,T1
+		PUSHJ P,CRLF
+		POP P,T1
+		POPJ P,]
+	MOVEI	CH," "		;PRINT BLANK
+	PUSHJ	P,CHROUT
+	JRST	DOPOS
+
+	END	START
+   
