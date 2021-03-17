@@ -1,0 +1,623 @@
+begin "FINDIT"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)PRTSUB.REQ" source!file;
+require "(SAILIB)CVPPN.REQ" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "(SAILIB)FILDAT.REQ" source!file;
+require "(SAILIB)FNDKEY.REQ" source!file;
+require "(SAILIB)ARGS.REQ"   source!file;
+
+require '12 lsh 24 lor '0 version;
+require crlf&"License: RF" message;
+
+Define AllBits = '360200000000;	! Size+lic+time+status+DEC.date ;
+Define !PPN(x) = {"[", Cvos(!lh(x)), ",", Cvos(!rh(x)), "]"};
+Define Gettab(x,y) = { calli( !xwd( (x), (y) ), calli!GETTAB ) };
+
+record!class File(  Integer Name, NMask, XName, Ext, EMask, XExt;
+		    Integer Find;
+		    r!p (file) Next );
+
+record!class Link(  String Txt;
+		    Integer Ppn, Msk, Knt, Fil, Ext;
+		    r!p (file) Nam; r!p (link) Nxt );
+
+r!p (link) Head, This;
+r!p (file) That;
+r!p (any!class) Last;
+
+Own Integer Name, Ext, ExpPpn, ExpMask, UserPPN, UserMask;
+Own Integer LastAun, Quest, Spec, Brk, CIndex;
+Own Boolean Interactive;
+Own String  Line, FileSpec, UfdName;
+Own String  Host;
+Integer lic;
+
+Preset!with "FINDIT";
+Safe String Array LegalCommands[ 1:1 ];
+
+
+string item OutputFile;			! output file ;
+string item InputFiles;			! list of input files ;
+
+item Checksum;				! do checksums of files ;
+item Quiet;				! output ONLY to file ;
+item Sticky;				! controls "sticky" username ;
+
+Simple Simple String Procedure CvDate ( integer Date.In );
+begin "CvDate"
+    preset!with
+    "January", "February", "March",     "April",   "May",      "June",
+    "July",    "August",   "September", "October", "November", "December";
+    own safe string array Months [0:11];  !  Note: "Months[i][1 for 3]" ;
+    own string Day, Month, Year;
+    integer Digits, Width;
+
+    getformat(Width, Digits);
+    setformat(-2, 0);
+
+    Day _ cvs( (Date.In mod 31) + 1 );
+    Month _ Months[ (Date.In div 31) mod 12 ][1 for 3];
+    Year _ cvs( (Date.In div (31 * 12)) + 64 );
+
+    setformat(Width, Digits);
+
+    return(  Day & "-" & Month & "-" & Year );
+
+end "CvDate";
+
+
+Simple String procedure CvTime( Integer Time );
+begin "CVTIME"
+    Own integer Width, Digits;
+    Own string  HH, MM;
+
+    GetFormat( Width, Digits );
+    SetFormat( -2, 0 );
+
+    HH_ Cvs( Time div (60 * 60) );
+    MM_ Cvs( ( Time mod (60 * 60) ) div 60 );
+
+    SetFormat( Width, Digits );
+
+    Return( HH & ":" & MM );
+
+end "CVTIME";
+
+
+Simple Integer Procedure Wild( Integer Card );
+begin
+    Preset!with '77 lsh 30, '77 lsh 24, '77 lsh 18,
+		'77 lsh 12, '77 lsh  6, '77;
+    Own Integer Safe Array Wmask[ 1:6 ];
+    Preset!with '03 lsh 30, '03 lsh 24, '03 lsh 18,
+		'03 lsh 12, '03 lsh  6, '03;
+    Own Integer Safe Array Wvalue[ 1:6 ];
+    Preset!with '12 lsh 30, '12 lsh 24, '12 lsh 18,
+		'12 lsh 12, '12 lsh  6, '12;
+    Own Integer Safe Array Wstar[ 1:6 ];
+    Preset!with         -1, -1 lsh  -6, -1 lsh -12,
+		-1 lsh -18, -1 lsh -24, -1 lsh -30;
+    Own Integer Safe Array Wmall[ 1:6 ];
+    Own Integer Index, Mask;
+
+    Mask_ 0;
+    For Index_ 1 step 1 until 6
+     do begin
+	If ( (Card land Wmask[Index]) = Wstar[Index] )
+	 then Return( Mask_ Mask lor Wmall[Index] );
+	If ( (Card land Wmask[Index]) = Wvalue[Index] )
+	 then Mask_ Mask lor Wmask[Index];
+     end;
+    Return( Mask );
+end;
+
+Simple String Procedure WildSpec( Reference String S; Reference Integer B );
+begin
+    Own Integer Brk;
+    Own Boolean InUser;
+    Own String Break, Copy;
+
+    Brk_ 0;
+    InUser_ False;
+    Break_ Copy_ Null;
+
+    While Length( S ) or (Brk neq 0)
+     do begin
+	Copy_ Copy & (If Brk="?"
+			then "#"
+			else If Brk="*"
+			    then If InUser
+				then "*"
+				else "######"
+			    else Break)
+		   & Scan( FileSpec, Quest, Brk );
+
+	Break_ If Brk neq 0 then Brk else Null;
+
+	If ( Brk = "(" )
+	 then InUser_ True;
+	If ( Brk = ")" )
+	 then InUser_ False;
+     end;
+
+    B_ Brk;
+    Return( Copy );
+
+end;
+
+
+Simple Integer Procedure EatOct( String S; Reference Integer Mask );
+begin
+    Own Integer Val,Chr;
+
+    Val_ Mask_ 0;
+
+    While ( Length( S ) )
+     do begin "grabbing characters"
+
+	Chr_ Lop( S );
+
+	If ( "0" leq Chr ) and ( Chr leq "7" )
+	 then begin
+	    Val_ ( Val lsh 3 ) + ( Chr - "0" );
+	    Mask_ Mask lsh 3;
+	 end
+	 else If ( Chr = "*" )
+	     then begin
+		While not ( Val land ('7 lsh 33) )
+		 do begin
+		    Val_ ( Val lsh 3 ) lor '7;
+		    Mask_ ( Mask lsh 3 ) lor '7;
+		 end;
+		Done;
+	     end
+	     else If ( Chr = "?" )
+		 then begin
+		    Val_ ( Val lsh 3 ) lor '7;
+		    Mask_ ( Mask lsh 3 ) lor '7;
+		 end
+		 else Done;
+
+     end "grabbing characters";
+
+    Return( Val );
+
+end;
+
+
+Simple Integer Procedure ScanPPN( Reference String S; Reference Integer M );
+begin
+    Own Integer MyPPN, Proj, Prog, ProjMask, ProgMask;
+    Own String  Str;
+
+    MyPPN_ Calli( 0, calli!GETPPN );
+
+    While ( Length( S ) )
+     do begin
+
+	Str_ Scan( S, Spec, Brk );
+
+	If ( Brk = "[" )
+	 then Proj_ Prog_ ProjMask_ ProgMask_ 0;
+
+	If ( Brk = "," )
+	 then Proj_ EatOct( Str, ProjMask );
+
+	If ( Brk = "]" )
+	 then begin
+	    Prog_ EatOct( Str, ProgMask );
+	    Done;
+	 end;
+
+     end;
+
+    If ( Proj = 0 )
+     then Proj_ !lh( MyPPN );
+
+    If ( Prog = 0 )
+     then Prog_ !rh( MyPPN );
+
+    M_ !Xwd( ProjMask, ProgMask );
+    Return( !Xwd( Proj, Prog ) );
+
+end;
+
+
+String Procedure GetSpec( Reference String S; Reference Integer P, M, B );
+begin
+    Own Integer Brk, Mask, Ppn;
+    Own String  FSpec;
+
+    Brk_ Mask_ Ppn_ 0;
+    FSpec_ Null;
+
+    While Length( S )
+     do begin
+
+	FSpec_ FSpec & Scan( S, Spec, Brk );
+
+	If ( Brk = 0 ) or ( Brk = "," )
+	 then Done;
+
+	If ( Brk = "[" )
+	 then Ppn_ ScanPPN( S_ ("[" & S), Mask );
+
+     end;
+
+    B_ Brk;    M_ Mask;    P_ Ppn;
+    Return( FSpec );
+
+end;
+
+
+Simple Integer Procedure SubsetSpec( Integer F1, E1, F2, E2 );
+begin
+    Own Integer F, E;
+
+    F_ F1 lor F2;			! combine masks ;
+    E_ E1 lor E2;
+
+    If (F = F1) and (E = E1)		! if first spec = combined ;
+     then Return( 1 );			!  then second is subset ;
+
+    If (F = F2) and (E = E2)		! if second spec = combined ;
+     then Return( -1 );			!  then first is subset ;
+
+    Return( 0 );			! no match ;
+end;
+
+
+Procedure CopyRecord( r!p (file) That; Integer Name, Ext );
+begin
+
+    File:Name[ That ]_ Name;
+    File:Ext[ That ]_ Ext_ Ext land (-1 lsh 18);
+    File:NMask[ That ]_ Wild( Name );
+    File:EMask[ That ]_ Wild( Ext );
+    File:XName[ That ]_ File:NMask[ That ] lor Name;
+    File:XExt[ That ]_ File:EMask[ That ] lor Ext;
+
+end;
+
+
+Procedure CreateLinkRecord;
+begin
+    Own Integer Which;
+
+    !  Find last record which matches current data ;
+
+    Last_ This_ Head;
+    While ( This_ Link:Nxt[ This ] )
+     do begin
+	If ( Link:Ppn[ This ] = UserPpn )
+	 and ( Link:Msk[ This ] = UserMask )
+	  then Done;
+	Last_ This;
+     end;
+
+    !  If none found, then create a new record ;
+
+    If not ( This )
+     then begin
+	This_ Link:Nxt[ Last ]_ new!record( link );
+	Link:Knt[ Head ]_ Link:Knt[ Head ] + 1;
+	Link:Msk[ Head ]_ Link:Msk[ Head ] lor UserMask;
+	Link:Ppn[ This ]_ UserPpn;
+	Link:Msk[ This ]_ UserMask;
+	Link:Txt[ This ]_ UfdName;
+	Link:Nam[ This ]_ new!record( file );
+     end;
+
+    !  Find last file record ;
+
+    Last_ That_ Link:Nam[ This ];
+    While ( That_ File:Next[ That ] )
+     do If ( Which_ SubsetSpec( Name lor Wild(Name),
+				( Ext lor Wild(Ext) ) land (-1 lsh 18),
+				File:Name[That] lor File:NMask[That],
+				File:Ext[That] lor File:EMask[That] ) )
+	 then
+	    If ( Which > 0 )
+	     then begin
+		CopyRecord( That, Name, Ext );
+		Link:Fil[ This ]_ Link:Fil[ This ] lor File:Nmask[ That ];
+		Link:Ext[ This ]_ Link:Ext[ This ] lor File:Emask[ That ];
+		Return;
+	     end
+	     else Return
+	 else Last_ That;
+
+    !  Create new file record and add new specification ;
+
+    That_ File:Next[ Last ]_ new!record( file );
+    CopyRecord( That, Name, Ext );
+
+    !  Update global fields in link record ;
+
+    Link:Fil[ This ]_ Link:Fil[ This ] lor File:Nmask[ That ];
+    Link:Ext[ This ]_ Link:Ext[ This ] lor File:Emask[ That ];
+    Link:Knt[ This ]_ Link:Knt[ This ] + 1;
+
+end;
+
+boolean procedure WantUfd( Reference Integer Aun );
+begin
+    LastAun_ Aun;
+    This_ Head;
+    While ( This_ Link:Nxt[ This ] )
+     do If ( (Aun lor Link:Msk[This]) = Link:Ppn[This] )
+	 then Return( True );
+    Return( False );
+end;
+
+procedure UfdProc( Reference Integer Chan; Integer Array Lkb );
+begin
+    UfdName_(Cv6str(LKB[!RBUNM])&Cv6str(LKB[!RBUNM+1])&"           ")[1 for 12];
+    LastAun_LKB[!RBNAM];
+end;
+
+
+boolean procedure WantFile( Reference Integer Filename, Extension );
+begin
+    Own R!P (link) Hold;
+
+    That_ Link:Nam[ This ];
+    While ( That_ File:Next[ That ] )
+     do If ( (Filename lor File:NMask[That]) = File:XName[That] )
+	 and ( (Extension lor File:EMask[That]) = File:XExt[That] )
+	 then Return( File:Find[That]_ True );
+
+    Hold_ This;
+    While ( Hold_ Link:Nxt[ Hold ] )
+     do If ( (LastAun lor Link:Msk[Hold]) = Link:Ppn[Hold] )
+	 then begin
+	    That_ Link:Nam[ Hold ];
+	    While ( That_ File:Next[ That ] )
+	     do If ( (Filename lor File:NMask[That]) = File:XName[That] )
+		 and ( (Extension lor File:EMask[That]) = File:XExt[That] )
+		 then Return( File:Find[That]_ True );
+	     end;
+    Return( False );
+end;
+
+boolean procedure ThisFile( Reference Integer Filename, Extension );
+begin
+    That_ Link:Nam[ This ];
+    While ( That_ File:Next[ That ] )
+     do If ( (Filename lor File:NMask[That]) = File:XName[That] )
+	 and ( (Extension lor File:EMask[That]) = File:XExt[That] )
+	 then Return( File:Find[That]_ True );
+    Return( False );
+end;
+
+
+procedure FileProc(Reference Integer Chan,Count,Brk,FileEof; Integer Array LKB);
+comment Format of output:
+0000000001111111111222222222233333333334444444444555555555566666666667777777777
+1234567890123456789012345678901234567890123456789012345678901234567890123456789
+ name LJ,  host RJ, file LJ, size RJ, date, time, checksum,* protection, license
+(LONGUSERNAME:1051) FILNAM.EXT 00003 24-Jun-87 19:33 LOGHEH  ALL ALL ALL
+(SYS         :  22) X.SAV        123  1-Jan-64  0:01 VAVVAV$ ALL NO  NO  777157
+ * is one of !"#$%&' based on file bits, $ means Katakana (.RBLIC bit 9)
+;
+begin
+   Integer bits;
+   bits_ ((LKB[5] lsh -9 ) land '17);	! '10 = TMP, '4=Katakana, '3=unused ;
+   if (bits < '10) and (!lh(LKB[1]) neq !lh(cvsix("TMP"))) then
+   Print( "(" & UfdName & ":" & Host & ") ",
+	(  Cv6str( LKB[0] ) &
+	   (If !lh(LKB[1])
+	    then "." & Cv6str( LKB[1] land (-1 lsh 18) )
+	    else "") & "          " )[ 1 for 10 ],
+	(if LKB[2] < 0
+	  then " *Big*"
+	  else If LKB[2] < 400000
+	        then ("     "&Cvs(LKB[2] div 4))[inf-5 to inf]
+		else Cvs(LKB[2] div 4)  ),
+	" ", CvDate( !lh( LKB[4] ) ),
+	" ", CvTime( !rh( LKB[4] ) ),
+	" ",
+	(if ( props( Checksum ) )
+	  then FBData(Chan,LastAun,LKB[0],LKB[1])[1 for 6]
+	  else "      "),
+	cvstr((bits+32) lsh 29), PrProt( LKB[5] land '777 ),
+	(if LKB[3] then ("      "&Cvos(LKB[3]))[inf-6 to inf] else ""),
+	Crlf);
+end;
+Procedure ReadFileList;
+begin
+
+    !  Setup initial link pointer ;
+    This_ Head;
+
+    while ( Interactive )		! non command line data ;
+     do begin "real session"
+
+	SetPrint( null, "T" );		! return print to terminal. ;
+	Print( "Find file: " );		! prompt for an input line, ;
+	Line_ inchwl;			! and read it from terminal ;
+	if length( Line ) = 0		! on a blank line from user ;
+	 then return;			!  simply terminate session ;
+
+	if ( ArgParse( OutputFile, InputFiles,
+	  {Checksum,Quiet},		! Add ,Sticky sometime ;
+	  Line ) )
+	 then done;			! success, break loop ;
+
+     end "real session";
+
+    if ( props( Checksum ) = NTVAL )	! if /NOCHECKSUM typed ;
+     then props( Checksum )_ 0		!  set to false ;
+     else props( Checksum )_ 1;		!  otherwise set to true ;
+
+    if ( props( Quiet ) = NOVAL )	! if /QUIET typed ;
+     then props( Quiet )_ 1		!  set to true ;
+     else props( Quiet )_ 0;		!  otherwise set to false ;
+
+    Line_ datum( InputFiles );		! simulate input line ;
+    datum( InputFiles )_ null;		! clear input line ;
+
+    if ( props( OutputFile ) )		! if user specified listing ;
+     then SetPrint( datum( OutputFile ),
+		    (if props( Quiet ) then "F" else "B") );
+
+    !  While the user types non-blank lines - parse them ;
+
+    While Length( Line )
+     do begin
+
+	! First get a single spec, possibly separated by a comma ;
+
+	FileSpec_ GetSpec( Line, ExpPpn, ExpMask, Brk );
+	If not ( Length( FileSpec ) or ExpPpn or ExpMask or Brk )
+	 then Continue;
+
+	! Then, handle wildcards -- ? translates to # ;
+
+	FileSpec_ WildSpec( FileSpec, Brk );
+
+	! Convert to a useable format, handling (username) ;
+
+	Name_ cvfil( FileSpec, Ext, UserPpn );
+	If ( UserPpn = 0 ) or ( !lh( UserPpn ) neq 0 )
+	 then UfdName_ Null
+	 else UserPpn_ CvPPN( UfdName_ Cv6str( memory[ UserPpn   ] )
+				     & Cv6str( memory[ UserPpn+1 ] )  );
+
+	! Apply PPN and MASK from above, if no username specified ;
+
+	If ( UserPpn = 0 )
+	 then begin
+	    UserPpn_ ExpPpn;
+	    UserMask_ ExpMask;
+	 end
+	 else UserMask_ 0;
+
+	! If nothing specified, skip this rot, else make a link ;
+
+	If ( 0 = (Name lor Ext lor UserPpn lor UserMask) )
+	 then Continue
+	 else begin
+
+	    If ( UserPpn = 0 )
+	     then UserPpn_ UserMask_ -1;
+	    If ( 0 = (Name lor Ext) )
+	     then Name_ Ext_ CvSix("*");
+
+	    CreateLinkRecord;
+	 end;
+
+     end;
+end;
+
+Procedure PrintMissingFiles;
+begin
+    Own string User;
+    Own Boolean FirstTime;
+
+    ! start at the beginning - and do each link ;
+
+    This_ Head;
+    FirstTime_ True;
+    While ( This_ Link:Nxt[ This ] )
+     do begin "list user links"
+
+	! print pertinent information about the user ;
+
+	User_ If ( Length( Link:Txt[ This ] ) )
+	       then "(" & Link:Txt[ This ] & ")"
+	       else if ( Link:Msk[ This ] = -1 )
+		     then Null
+		     else "[" &
+			  Cvos( !lh(Link:Ppn[This] lor Link:Msk[This])) &
+			  "," &
+			  Cvos( !rh(Link:Ppn[This] lor Link:Msk[This])) &
+			  "]";
+
+	! setup file list - and print names and extensions ;
+
+	That_ Link:Nam[ This ];
+	While ( That_ File:Next[ That ] )
+	 do begin "list file names"
+
+	    If not ( File:Find[ That ] )
+	     then begin
+
+		If ( FirstTime )		! first time, print header ;
+		 then begin "the first"	
+		    FirstTime_ False;		! been here now ;
+		    if ( props( OutputFile ) )	! if file, terminal too ;
+		     then setPrint( datum( OutputFile ), "B" );
+		    Print( Crlf, "No files found to match:", Crlf );
+		 end "the first";
+
+		Print( "  ", User, Cv6str( File:Name[ That ] ) );
+		If ( !lh( File:Ext[ That ] ) )
+		 then Print( ".", Cv6str( File:Ext[ That ] ) );
+		Print( Crlf );
+
+	     end;
+	 end "list file names";
+     end "list user links";
+
+    If not ( FirstTime )
+     then Print( Crlf );
+
+end;
+label test;
+setbreak( Quest_ getbreak, "?*()", Null, "INS" );
+setbreak( Spec_ getbreak, "[,]", Null, "INS" );
+lic_ Gettab(-1,!gtLIC);
+
+if not( ArgParse( OutputFile, InputFiles, {Checksum,Quiet}, ARGS ) )
+ then start!code uuo!EXIT 1,; uuo!EXIT; end;
+
+if not( 0 < CIndex_ FndKey( ArgV[0], LegalCommands ) )
+ then Usererr( 0,0, "Illegal command: "&ArgV[0], "X" );
+
+Interactive_ not( props(InputFiles) );	! if nothing specified, interactive ;
+
+MFDset( '17, 0,0, 0 );
+Host_ ("    " & Cvs(Gettab(!CNSYS,!GTCNF)))[inf-3 for inf];
+
+test:
+if (!LH(Gettab(-1,!gtAUN)) neq 3 and	! If not in GAN 3;
+     not (lic land ((LC!WPS lor LC!RPS) lsh -18)) )	! And no RF on frame;
+	then Calli(lic land lnot(LC!RPS),calli!SETLIC);
+
+do begin "main drag"
+
+    Head_ new!record( link );
+    ReadFileList;
+    If not ( Link:Nxt[ Head ] )
+     then Done;
+
+    If ( Link:Msk[ Head ] )
+     then MfdScn( Cvsix("*"), Cvsix("*"), Cvsix("*"), AllBits,
+		    WantUfd, UfdProc, WantFile, FileProc )
+     else begin "one at a time"
+	This_ Head;
+	While ( This_ Link:Nxt[ This ] )
+	 do begin
+	    UfdName_(Link:Txt[ This ] & "           ")[1 for 12];
+	    LastAun_ Link:Ppn[ This ];
+	    That_ File:Next[ Link:Nam[ This ] ];
+	    If ( Link:Knt[ This ] > 1 )
+	     then UfdScn( LastAun, Cvsix("*"), Cvsix("*"),
+			  AllBits, ThisFile, FileProc )
+	     else UfdScn( LastAun, File:Name[That], File:Ext[That],
+			  AllBits, ThisFile, FileProc );
+	 end;
+     end "one at a time";
+
+    PrintMissingFiles;
+
+ end "main drag" until not ( Link:Nxt[ Head ] );
+
+start!code uuo!EXIT 1,; uuo!EXIT end;
+
+end "FINDIT";
+  
