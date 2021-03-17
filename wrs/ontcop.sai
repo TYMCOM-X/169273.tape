@@ -1,0 +1,358 @@
+begin	"ONTCOP"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(WRS)AUXLIB.REQ" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+require 1 version;
+
+string Ont1Name,Ont2Name,Ont1Key,Ont2Key,Ont1Host,Ont2Host;
+
+item ZapProcedure;
+procedure ZapHandler;
+begin
+    usererr(0,0,"??circuit zapped (oh dear)","X");
+end;
+simple procedure ZapHandlerIni;
+assign(AuxDead_ZapProcedure,ZapHandler);
+require ZapHandlerIni initialization;
+
+integer Ontyme1,Ontyme2;	! port numbers;
+
+simple string procedure GetLine(integer T(0));
+begin	"GetLine"
+    integer CH;
+    string L;
+    if T < 60 
+	then T _ T * 1000
+	else T _ T lor !bit(17);
+    L _ null;
+    do begin 
+    	calli(AuxPort*!bit(8)+!hl('110)+T,calli!HIBER);
+    	auxclv(AuxPort,0,!AXSIC);
+    	if !SKIP! 
+	    then case CH _ AuxIn land '177 of begin
+		[#lf] done;
+		['177] ;
+		else L _ L & CH end
+	    else begin !SKIP! _ false; return(L) end;
+    end until !lh(AuxPort);
+    !SKIP! _ true;
+    if equ(L,"tc> host not responding"&#cr)
+	then usererr(0,0,"?host not responding","X");
+    return (L);
+end	"GetLine";
+
+procedure SendLine(string S);
+begin
+    integer C;
+    if S[inf for 1] neq #cr then S _ S & #cr;
+    while length(S) do AuxOut(lop(S));
+    do C _ AuxIn land '177 until C = #lf;
+end;
+
+simple boolean procedure Index (string A,B);
+begin
+    integer I,X,LB;
+    X _ length(A)-(LB_length(B))+1;
+    for I _ 1 upto X do if equ(A[i for LB],B) then return(I);
+    return(0);
+end;
+
+procedure Connect(string Ont1Host,Ont1Name,Ont1Key,Ont2Host,Ont2Name,Ont2Key);
+begin
+    integer P; string S;
+
+    do begin
+        P _ creaux("BPUTNEY:"&Ont1Host);
+        Ontyme1 _ AuxPort;
+	if not !SKIP! then begin
+	    print("%retrying CREAUX",crlf);
+	    call(30,"SLEEP");
+	    continue end;
+    end until !SKIP!;
+
+    do begin
+        P _ creaux("BPUTNEY:"&Ont2Host);
+        Ontyme2 _ AuxPort;
+	if not !SKIP! then begin
+	    print("%retrying CREAUX",crlf);
+	    continue end;
+    end until !SKIP!;
+    print("[connected]",crlf);
+
+    AuxPort _ Ontyme1;
+    AuxSync("ID?");
+    SendLine(Ont1Name);
+    SendLine(Ont1Key);
+    do begin
+	S _ GetLine(20);
+	if not !SKIP! then usererr(0,0,"?can't sign on ONTYME1","X");
+    end until index(S,"ACCEPTED");
+
+    AuxPort _ Ontyme2;
+    AuxSync("ID?");
+    SendLine(Ont2Name);
+    SendLine(Ont2Key);
+    do begin
+	S _ GetLine;
+    	if not !SKIP! then usererr(0,0,"?can't sign on ONTYME2","X");
+    end until index(S,"ACCEPTED");
+    print("[signed on]",crlf);
+end;
+
+procedure Disconnect;
+begin
+    AuxPort _ Ontyme1; AuxZap;
+    AuxPort _ Ontyme2; AuxZap;
+end;
+
+procedure Sync;
+begin
+    integer GIGO;
+    string S;
+    SendLine(":ALLFUCKEDUP");
+    GIGO _ 0;
+    do begin
+	S _ GetLine(10);
+	if 20 < (GIGO_GIGO+1) then begin
+	    print("%out of sync",crlf);
+	    disconnect;
+            connect(Ont1Host,Ont1Name,Ont1Key,Ont2Host,Ont2Name,Ont2Key);
+	    SendLine(":ALLFUCKEDUP"); 
+	    GIGO _ 0;
+	end;
+    end until equ(S,"?ALLFUCKEDUP?"&#cr)+equ(S,"INVALID COMMAND"&#cr);
+end;
+
+record!class FILE (
+	string NAME;
+	integer SIZE;
+	r!p(a!c) LINK
+);
+record!class USER (
+	string	NAME;
+	r!p(FILE) FILES;
+	r!p(a!c) LINK 
+);
+r!p(USER) USERS;
+
+procedure GetUsers;
+begin
+    integer CNT,I;
+    string S;
+    label Sickness;
+    AuxPort _ Ontyme1;
+	Sickness:
+    USERS _ null!record;
+    SendLine(":DIS NAMES.ALL");
+    do begin
+	S _ GetLine;
+	if I_index(S,"IDS:") then CNT _ cvd(S[I+4 to inf]);
+    end until index(S,"KEY TIME AUTH");
+    for I _ 1 upto CNT do begin
+	r!p(USER) U;
+	S _ GetLine(20);
+	if not !SKIP! then begin
+	    print("%user directory timeout...retrying",crlf);
+	    goto SICKNESS end;
+	U _ new!record(USER);
+	USER:link[u] _ USERS;
+	IF index(S," ") LEQ 12 then
+	USER:name[u] _ S[1 for index(S," ")-1] else
+	USER:name[u] _ S[1 for 12];
+	USERS _ U;
+    end;
+    print("[",CNT," users listed]",crlf);
+end;
+
+procedure GetFiles(r!p(USER) U);
+begin
+    integer CNT,LX,I;
+    string S;
+    AuxPort _ Ontyme1;
+    SendLine(#ctrl("N"));
+    SendLine(":IMI "&USER:name[U]);
+    SendLine(":LIST");
+    do begin
+	S _ GetLine;
+	if index(S,"NONE") then begin
+	    print("[",USER:name[u],"; no files]",crlf);
+	    return end;
+	if index(S,"NO ") then begin
+	    print("?error for user ",USER:name[u],": ",S,crlf);
+	    return end;
+    end until index(S,"--CREATED--");
+    LX _ index(S,"LNGTH");
+    CNT _ 0;
+    do begin
+	r!p(FILE) F;
+	S _ GetLine(10);
+	if not !SKIP! then done;
+	if S neq "*" then begin
+	    print("?asterik expected for user ",USER:name[u],": ",S,crlf);
+	    continue end;
+	F _ new!record(FILE);
+	FILE:link[f] _ USER:files[u];
+  	FILE:name[f] _ S[1 for index(S," ")-1];
+  	FILE:size[f] _ cvd(S[LX for 5]);
+	USER:files[u] _ F;
+	CNT _ CNT + 1;
+    end until false;
+    print("[",USER:name[u]," listed; ",CNT," files]",crlf);
+end;
+
+procedure copyfile (r!p(USER)U;r!p(FILE)F);
+begin
+    integer CNT;
+    string S;
+    AuxPort _ Ontyme2;
+    SendLine(":IMI OFF");
+    do GetLine(5) until not !SKIP!;
+    SendLine(":IMI "&USER:name[u]);
+    do begin
+	S _ GetLine;
+	if index(S,"INVALID ") then begin
+	    print("?file ",USER:name[u]," ",FILE:name[f]," not sent: ",S,crlf);
+	    return end;
+    end until index(S,"ACCEPTED");
+!   CNT _ 0; S _ FILE:name[f];
+!   while lop(S)="*" do CNT _ CNT +1;
+!   begin
+!	SendLine(":CLEAR "&FILE:name[f][1 To CNT]&" "&FILE:name[f][CNT+1 To INF])
+!   end;
+!   do begin
+!	S _ GetLine;
+!	if index(S,"NOT AVAILABLE") then begin
+!	    print("?file ",USER:name[u]," ",FILE:name[f]," not sent: filename in use",crlf);
+!	    return end;
+!	if index(S,"FILE(S) DELETED") then begin
+!	    print("%file ",USER:name[u]," ",FILE:name[f]," superceded",crlf);
+!	    done end;
+!   end until index(S,"FILE(S) MISSING");
+    SendLine(":ERASE");
+    do S _ GetLine until index(S,"ACCEPTED");
+
+    AuxPort _ Ontyme1;
+    SendLine(#ctrl("N"));
+    do GetLine(5) until not !SKIP!;
+    SendLine(":IMI "&USER:name[u]);
+    do begin
+	S _ GetLine;
+	if index(S,"NO ") then begin
+	    print("?file ",USER:name[u]," ",FILE:name[f]," not sent: ",S,crlf);
+	    return end;
+    end until index(S,"ACCEPTED");
+    SendLine(":ERASE");
+    do S _ GetLine until index(S,"ACCEPTED");
+    SendLine("@@@@@@BEGINOFFILE");
+    SendLine(":GET "&FILE:name[f]);
+    do begin
+	S _ GetLine;
+	if index(S,"NO ") then begin
+	    print("?file ",USER:name[u]," ",FILE:name[f]," not sent: ",S,crlf);
+	    return end;
+    end until index(S,"ACCEPTED");
+    SendLine("@@@@@@ENDOFFILE");
+    SendLine(":TYPE");
+    do S _ GetLine until equ(S,"@@@@@@BEGINOFFILE"&#cr);
+
+    CNT _ FILE:size[f];
+    while CNT + 1000 > 0 do begin
+	AuxPort _ Ontyme1;
+	S _ GetLine(10);
+	if not !SKIP! then begin
+	    print("%file ",USER:name[u]," ",FILE:name[f]," timeout",crlf);
+	    done end;
+	if equ(S,"@@@@@@ENDOFFILE"&#cr) then done;
+	AuxPort _ Ontyme2;
+	SendLine(S);
+	CNT _ CNT - length(S) -1;
+    end;
+    if CNT then print("%file ",USER:name[u]," ",FILE:name[f]," ",
+	(if CNT > 0 then cvs(CNT)&" undercount" else cvs(-CNT)&" overcount"),crlf);
+
+    AuxPort _ Ontyme2;
+    CNT _ 0; S _ FILE:name[f];
+    while lop(S)="*" do CNT _ CNT +1;
+    case CNT of begin
+ 	[1] SendLine(":FILE "&FILE:name[f][1 To CNT]&" "&FILE:name[f][CNT+1 To INF]);
+ 	[2] SendLine(":FILE "&FILE:name[f][1 To CNT]&" "&FILE:name[f][CNT+1 To INF]);
+ 	[3] begin
+               print (FILE:name[f]," filed as shared file, public file not allowed!",crlf);
+               SendLine(":FILE "&FILE:name[f][1 To 2]&" "&FILE:name[f][CNT+1 To INF]) 
+	    end;
+ 	else print("%file ",USER:name[u]," ",FILE:name[f]," file format error",crlf)
+    end;
+    do begin
+	S _ GetLine;
+	if index(S,"EXISTING FILE") then begin
+	    print("?file ",USER:name[u]," ",FILE:name[f]," ",S,crlf);
+	    done end;
+	if index(S,"NOT HAVE PROPER") then begin
+	    print("?file ",USER:name[u]," ",FILE:name[f]," ",S,crlf);
+	    done end;
+	if index(S,"WORKSPACE EMPTY") then begin
+	    print("?file ",USER:name[u]," ",FILE:name[f]," ",S,crlf);
+	    done end;
+	if index(S,"INVALID") then begin
+	    print("?file ",USER:name[u]," ",FILE:name[f]," ",S,crlf);
+	    done end;
+    end until index(S,"FILED AWAY AS");
+    print("[",USER:name[u]," ",FILE:name[f],"]",crlf);
+
+    AuxPort _ Ontyme1; Sync;
+    AuxPort _ Ontyme2; Sync;
+end;
+
+begin	"MAIN"
+    r!p(USER) U;
+    r!p(FILE) F;
+
+    ifcr compiler!switch("B") thenc AuxTrace _ true; endc
+    SetPrint("ONTCOP.LOG","B");
+    ttyup(true);
+        print ("Ontyme 1 Host Number?: ");
+        Ont1Host _ inchwl;
+        print ("Ontyme 1 supervisor name (I.E. TYM.SUP)?: ");
+        Ont1Name _ inchwl;
+        print ("Ontyme 1 Key?: ");
+        Ont1Key _ inchwl;
+        print ("Ontyme 2 Host Number?: ");
+        Ont2Host _ inchwl;
+        print ("Ontyme 2 supervisor name (I.E. TYM.SUP)?: ");
+        Ont2Name _ inchwl;
+        print ("Ontyme 2 Key?: ");
+        Ont2Key _ inchwl;
+        connect(Ont1Host,Ont1Name,Ont1Key,Ont2Host,Ont2Name,Ont2Key);
+    ifcr compiler!switch("B") thenc usererr(0,0,0,"B"); endc
+    getusers;
+    do begin
+	string UN1;
+	print("First user to transfer (or <CR>): ");
+	UN1 _ inchwl;
+	if length(UN1)=0 then done;
+	U _ USERS;
+	while U do begin
+	    if equ(USER:name[u],UN1) then done;
+	    U _ USER:link[u];
+	end;
+	if not equ(USER:name[u],UN1) then begin
+	    print("?not in list, try again",crlf);
+	    continue end;
+	USERS _ U;
+    end until true;
+    U _ USERS;
+    while U do begin
+	getfiles(U);
+	F _ USER:files[u];
+	while F do begin
+	    copyfile(U,F);
+	    F _ FILE:link[f];
+	end;
+	U _ USER:link[u];
+    end;
+    disconnect;
+
+end	"MAIN"
+end
+ 
