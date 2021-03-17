@@ -1,0 +1,935 @@
+entry howmany,block,scanline,wildop,normop,defflag,defvalue,secop;
+begin
+require "[]<>" delimiters;
+define !=[comment];
+require "sys:gogtab.def" source!file;
+  ! attop(user) - set to make corget use top of core;
+external integer rpgsw;
+  ! rpgsw - set by sail entry code if run with offset=1;
+integer firsti,lasti,firsto,lasto,savetop,off,wptr,idone;
+  ! firsti - pointer to first scan block for input spec, 0 if none;
+  ! lasti - pointer to last scan block for input spec, valid only
+		if firsti non-zero;
+  ! firsto,lasto - as above for output spec;
+  ! savetop - place to save previous setting of attop(user);
+  ! off - place to put run offset, derived from gogtab;
+  ! wptr - pointer to scan block currently in use by wildop, set to
+		zero to ask wild to reinitialize self;
+  ! idone - set to 1 at first call to .iscan so we don't repeat it;
+integer lastsw;
+  ! lastsw - number of switches defined, 0 if none;
+protect!acs 1,2,3,4; ! protect our temps from access construct;
+
+define p='17,rf='12,sp='16,user='15,scsiz='32,lksiz='17;
+
+
+IFCR false THENC
+! define #name=0, #type=1, #maximum=2, #flags=3, #defaults=4;
+safe integer array switches[ #name:#defaults, 1:swchNum ];
+! swchnum=20;
+! safe integer array ntab,ptab,mtab,ftab,dtab[1:swchnum];
+  ! ntab - table of sixbit switch names;
+  ! ptab - table of switch types, i.e. processor used to decode;
+  ! mtab - table of switch maximum values;
+  ! ftab - table of flags for switches;
+  ! dtab - table of default switch values (not used by DEC scan);
+ENDC
+
+external integer corget,corinc,gogtab,correl,!iscan,!tscan,!oscan,
+   !jbff,!helpr,!jbrel,!clrbf,!fmsgx;
+
+safe integer array iblk[0:1],tblk[0:'10];
+  ! iblk,tblk - temp arrays used as argument blocks to scan and
+		wild. Used freely as temps.  No assumptions about
+		initialization;
+record!class tables (integer upperLimit;
+			safe integer array 
+				name, var, type, flags, defaults );
+record!pointer (tables) current!table;
+define switchBlock(block)=[tables:] & [block] & [[current!table]];
+
+procedure exPandTables(integer expandTo);
+if current!table=null!record 
+or tables:upperLimit[current!table] < expandTo
+ then begin
+	integer array name, var, type, flags, defaults[1:expandTo];
+	boolean new;
+	if new_ (current!table=null!record)
+	 then current!table_ new!record(tables);
+	tables:upperLimit[current!table]_ expandTo;
+	forlc array_(name, var, type, flags, defaults) 
+	  doc [	memory[location(array)]  swap
+			memory[location(tables:array[current!table])];
+	  ] endc
+	if not new
+	 then begin
+		forlc array_(name, var, type, flags, defaults) 
+		  doc [ arrtran( tables:array[current!table], array );
+		  ] endc
+	      end;
+      end;
+
+simple procedure init; ! to restore initial state in case of ^c-start;
+ begin firsti_firsto_idone_lastsw_wptr_0; expandTables(1);
+ end;
+require init initialization[0];
+
+
+procedure addEntry( integer name; reference integer variable;
+			integer type, flags, defaults );
+begin
+expandTables( lastSw_ lastSw + 1 );
+! tables:name [current!table][lastSw]_ name; 
+! tables:var  [current!table][lastSw]_ location(variable);
+! tables:type [current!table][lastSw]_ type;
+! tables:flags[current!table][lastSw]_ flags;
+! tables:defaults[current!table][lastSw]_ defaults;
+switchBlock(name )[lastSw]_ name; 
+switchBlock(var  )[lastSw]_ location(variable);
+switchBlock(type )[lastSw]_ type;
+switchBlock(flags)[lastSw]_ flags;
+switchBlock(defaults)[lastSw]_ defaults;
+end;
+! SCANLINE;
+
+comment
+>>>SCANLINE<<<
+procedure for initializing scan and reading user's command line
+(using .tscan).
+>>>ARGS<<<
+shortname - passed to .iscan as name of TMPCOR/CCL file
+longname - passed to .iscan as name of monitor command. If null,
+  pass 0.  Passed to .helpr as name of program for /HELP.  Passed
+  to .oscan as line to look for in SWITCH.INI.  If null, .oscan
+  not called
+mulout - flag passed to .tscan to allow more than one output spec.
+  As additional sideeffect setting this prevents putting more
+  than one command on a line separated by commas.
+>>>SIDEEFFECTS<<<
+Sets idone so .iscan won't be called next time.
+Sets up firsti,lasti,firsto,lasto.;
+
+internal procedure scanline(string shortname(null),longname(null);
+				Boolean mulout(0));
+ begin
+ label allocin,allocout,done,initi,inito,clrans,clrdon,defnxt,
+   defdon,deflop,clrlop,help;
+ integer sixname;
+   ! sixname - sixbit version of longname, .iscan gets ptr to this;
+ if longname  ! [0] IOWD for list of monitor commands;
+  then iblk[0]_(-1 lsh 18) lor (location(sixname)-1)
+  else iblk[0]_0;
+ iblk[1]_cvsix(shortname) lsh -18;  ! [1] ptr to runoffset,,CCL name;
+ sixname_cvsix(longname);
+ wptr_0;  ! wptr must be zero so next call to .lkwld restarts it;
+ off_if rpgsw then 1 else 0; ! .iscan needs 0/1,rpgsw is 0/-1;
+ start!code
+ movei 1,off;
+ hrlm 1,access(iblk[1]);
+ hrri 1,access(iblk[0]);  ! ac1= length,,iblk;
+ hrli 1,2;
+ push p,rf;
+ push p,sp;
+ skipn idone;  ! don't need .iscan more than once;
+  pushj p,!iscan;
+ setom idone;  ! so we don't do this again;
+			! [0] IOWD ptr to switch name table;
+ movn 1,lastsw;
+ hrl 1,1;
+! hrri 1,access(ntab[1]);  
+ HRRI 1,ACCESS( switchBlock(name)[1] ); 
+ subi 1,1;
+ movem 1,access(tblk[0]);
+			! [1] ptr to switch flag table,,max table;
+! hrli 1,access(ftab[1]);
+! hrri 1,access(mtab[1]);
+ HRLI 1,ACCESS( switchBlock(flags)[1] ); 
+ HRLI 1,ACCESS( switchBlock(type)[1] ); 
+ movem 1,access(tblk[1]);
+			! [2] 0,,ptr to switch processor table;
+! hrrzi 1,access(ptab[1]);
+ HRRZI 1,ACCESS( switchBlock(var)[1] );
+ movem 1,access(tblk[2]);
+ hrli 1,2;  ! 2 is code for supply own routine;
+ hrri 1,help;  ! [3] 2,,address of my routine for /HELP;
+	! still SCANLINE - setting up arg for .TSCAN;
+
+ movem 1,access(tblk[3]);
+ hrlzi 1,clrans;  ! [4] routine to clear switches to -1,,0;
+ movem 1,access(tblk[4]);
+ hrri 1,allocout;  ! [5] ptr to routine to get place to put scan blk for input,,output;
+ hrli 1,allocin;
+ movem 1,access(tblk[5]);
+ setzm access(tblk[6]);  ! [6] 0;
+ movei 1,0;  ! [7] flags - 1b18 = mulout;
+ skipe mulout;
+ hrrzi 1,'400000;
+ movem 1,access(tblk[7]);
+ setzm access(tblk['10]); ! [10] 0;
+ move user,gogtab; ! address of beginning of user table;
+ move 1,attop(user);  ! save old value of this flag;
+ movem 1,savetop;
+ setom attop(user);  ! now set flag so CORGET comes from top -
+   Need this because WILD wants all SCAN blocks contiguous, and we don't
+   know how many there will be.  So ALLOCIN gets a block at end of core
+   and keeps expanding it to put new SCAN blocks in.  Can only
+   guarantee that expansion is possible if they are at the top;
+ skipe 2,firsti;  ! any old SCAN blocks?;
+ pushj p,correl;  ! no longer need them, so free their space;
+ setzm firsti;  ! firsti=0 is sign that no input scan blocks seen;
+ skipe 2,firsto;
+ pushj p,correl;
+ setzm firsto;  ! ditto firsto;
+ hrri 1,access(tblk[0]);  ! AC1= length,,block;
+ hrli 1,'10;
+ pushj p,!tscan;
+ move 1,sixname;  ! set up block for .OSCAN.  Mostly same as .TSCAN;
+ movem 1,access(tblk[4]);  ! [4] name of SWITCH.INI line;
+ hrli 1,5;  ! AC1 = length,,block  - locations beyond [4] not used;
+ hrri 1,access(tblk[0]);
+ skipe sixname;  ! If no name specified, no point looking;
+ pushj p,!oscan;
+ move user,gogtab;  ! Now we restore the ATTOP flag to orig;
+ move 1,savetop;
+ movem 1,attop(user);
+ movn 1,lastsw;
+	! still SCANLINE - default  switch values;
+
+Comment here we start a section of code to set default values
+for switches not set by user or SWITCH.INI.  Note that -1 means
+a switch has not been seen yet.  The -1 is set of by CLRANS,
+and is used by SCAN, too;
+
+ hrl 1,1;  ! ac1 = aobjn ptr to processor table (whose rh is loc
+		into which value of switch goes);
+		! ac4 = ptr to table of defaults;
+! hrri 1,ptab[1];
+! hrri 4,dtab[1];  
+ HRRI 1,ACCESS( switchBlock(var)[1] );
+ HRRI 4,ACCESS( switchBlock(defaults)[1] );
+ jumpge 1,defdon;  ! allow zero trip loop;
+deflop:
+ move 2,(1);  ! ac3 _ ..ac1 (value of switch);
+ move 3,(2);
+		! we want to compare to -1, so aos and compare to 0;
+ aoje 3,defnxt;  ! if value of switch not -1, has real value;
+ move 3,(4);  ! .ac1 _ ..ac4 (switch _ default value);
+ movem 3,(2);
+defnxt:  ! here after giving switch the right value;
+ aos 4;  ! now do our loop, incr t1&t4;
+ aobjn 1,deflop;
+defdon:
+ pop p,sp;
+ pop p,rf;
+ jrst done;  ! kludge! kludge! skip around subroutines;
+	! still SCANLINE - routines called by .TSCAN for switches;
+
+Comment  The following routines may be called by .tscan
+during its processing of the user command.  They have
+been cleverly designed so as not to interfere with the
+sail runtimes.
+
+HELP - routine to process /HELP.  Calls .HELPR just like
+the one built into .tscan.  Problem is that .HELPR reads
+the help file into buffers at .jbff.  Sail has .jbff=-1.
+So we set .jbff _ ..jbrel+1  Then .HELPR
+will get its own core and not interfere with sail's.
+(We trust sail doesn't monkey with .jbrel).  Note that
+.helpr releases any extra core it gets.  Of course we
+restore .jbff at the end;
+
+help:
+ push p,!jbff;  ! save sail's .jbff;
+ hrrz 1,!jbrel;  ! .jbff _ ..jbrel+1;
+ addi 1,1;
+ movem 1,!jbff;
+ move 1,sixname;  ! .helpr want's program name in ac1;
+ pushj p,!helpr;
+ pop p,!jbff;
+ pushj p,!clrbf;  ! here we mimick what .tscan's help routine
+	does.  they clear the rest of the command line and
+	restart.  .clrbf is in scan;
+ jrst !fmsgx;  ! get a new line;
+
+Comment The following routine, clrans, sets -1 into all
+switch value locations.  This is used as a sign by both
+scan and my defaulting routine that the switch is not set
+yet.  This routine is called by .tscan whenever it is
+about to scan a new command line.  If we wanted permanent
+switches, we would not reset those to -1.;
+
+clrans:
+ movn 1,lastsw;  ! ac1 is aobjn ptr to processor table, whose
+		   rh is place switch values go;
+ jumpge 1,clrdon;  ! allow zero trip loop;
+ hrl 1,1;
+! hrri 1,access(ptab[1]);
+ HRRI 1,ACCESS( switchBlock(var)[1] );
+clrlop:
+ move 2,(1);  ! .ac1 _ -1 (set value of switch to -1);
+ setom (2);
+ aobjn 1,clrlop;
+clrdon:  ! here after all switches have been reset to -1;
+ popj p,;
+	! still SCANLINE - routines called by .TSCAN for core alloc;
+
+Comment The stuff following here is routines called by
+SCAN when it needs somewhere to put a SCAN block.  The first
+time somebody wants a block, I call CORGET to make one.
+ATTOP is set to force the block to come at the top of core.
+From then on, CORINC is called to extend the existing block.
+This is because WILD expects the blocks to be continguous.
+The only way to guarantee that is to put them all in one
+SAIL corget block.  The reason for forcing it to the top
+of core is to guarantee that it can be expanded indefinitely.;
+
+allocin:
+ movei 3,scsiz;  ! SAIL core routines want AC2=loc of block, AC3=size;
+ skipn 2,firsti;  ! See if we have already generated the first block;
+ jrst initi;  ! No - go do so;
+ pushj p,corinc;  ! Yes - just add more room for another one;
+  jrst 4,.;  ! impossible, we think;
+ move 1,lasti;  ! lasti _ .lasti + scsiz   - say we have another block;
+ movei 2,scsiz;
+ add 1,2;  ! Note the SCAN wants AC1=address, AC2=length of new block;
+ movem 1,lasti;
+ popj p,;
+
+initi:  ! Here when the first SCAN block is about to be made;
+ pushj p,corget;  ! Get new block of core for it;
+ jrst 4,.;  ! impossible ?;
+ movem 2,firsti;  ! And save ptr to it as first and last;
+ movem 2,lasti;
+ move 1,2;  ! Put addr in AC1 for SCAN;
+ movei 2,scsiz;  ! Return length in AC2;
+ popj p,;
+
+allocout:  ! Same as allocin, more or less;
+ movei 3,scsiz;
+ skipn 2,firsto;
+ jrst inito;
+ pushj p,corinc;
+  jrst 4,.;
+ move 1,lasto;
+ movei 2,scsiz;
+ add 1,2;
+ movem 1,lasto;
+ popj p,;
+
+inito:
+ pushj p,corget;
+  jrst 4,.;
+ movem 2,firsto;
+ movem 2,lasto;
+ move 1,2;
+ movei 2,scsiz;
+ popj p,;
+
+done:  ! Now we are back in main code after .OSCAN was done;
+ end;
+ end;
+! CVPPN, HOWMANY;
+
+external integer !lkwld,e!dfo,e!dfl,!skip!,!chktm;
+  ! These are all entries to WILD that will be useful in WILDOP;
+  ! !SKIP! is the usual SAIL external for error information;
+
+Comment
+>>>CVPPN<<<
+Procedure that returns external representation of a PPN, suitable
+for printing or using in SAIL LOOKUP/ENTER.
+>>>ARGS<<<
+ppn - either a real PPN or pointer to a path block;
+
+string procedure cvppn(integer ppn);
+ begin string out; integer v;
+ if not ppn then return(null);
+ if ppn land (-1 lsh 18)
+   then return("["&cvos(ppn lsh -18)&","&cvos(ppn land '777777)&"]");
+  begin
+  ppn_('2222 rot -12) + 2 + ppn;
+  out_"["&cvos( ldb(ppn) ) & "," & cvos( ildb(ppn) );
+  while v_memory[ppn_ppn+1,integer] do out_out & "," & cv6str( v );
+  return (out&"]")
+  end
+ end;
+
+internal safe integer array lookbl[0:lksiz-1];
+  ! lookbl - This is LOOKUP/ENTER block for primary files;
+integer safe array openb1[0:2],pathb1[0:8];
+  ! openbl,pathbl - OPEN and PATH blocks for primary files;
+
+Comment
+>>>HOWMANY<<<
+This procedure returns the number of input or output file
+specs that were typed by the user the last time SCANLINE was
+called.  Note that things like A+B and A'OR'B are counted as
+one file spec, so we are effectively counting commas.
+>>>ARGS<<<
+in - If .GE. 0, the routine counts input specs. If < 0 output;
+
+internal integer procedure howmany(integer in);
+ begin integer cur,last,count;
+  ! cur - pointer to SCAN block being counted;
+  ! last - pointer to last SCAN block on this side of =;
+  ! count - place to accum count;
+ if in geq 0 then begin cur_firsti; last_lasti end
+	     else begin cur_firsto; last_lasto end;
+ count_0;
+ if cur=0 then return(0);
+ for cur_cur step scsiz until last do
+   if not memory[cur+4,integer] land '007000000000  ! don't count if 'OR' or 'AND' spec;
+     then count_count+1;
+ return(count);
+ end;
+! NULBLK, BLOCK;
+
+preload!with
+[4]0,
+'600000000000,
+'607000000000,
+[12]0,
+[8]-1;
+safe integer array nulblk[0:scsiz-1];
+  ! nulblk - a null file spec, returned by block when user didnt type anything;
+
+comment
+>>>BLOCK<<<
+This routine returns the address of a SCAN block, as specified by fileno.
+The SCAN block represents one file spec that the user typed.  If a spec
+is requested and the user did not type that many, a pointer to NULBLK
+will be returned if OKNONE is set.
+>>>ARGS<<<
+fileno - N indicates the N'th spec on input side, -N on output side,
+	0 the entire input side taken together.  (If wildcard
+	interpretation has begun, the spec currently being scanned is
+	returned for 0.)
+negok - true if negative fileno's are OK
+zerok - true if zero fileno is OK
+posok - true if positive fileno's are OK
+oknone - true if it is OK to specify a filespec that the user didn't
+	type.  If this is false an error is given in that case;
+
+internal integer procedure block(integer fileno,negok(1),zerok(1),posok(1),oknone(0));
+ begin integer cur,last,count;
+  ! cur - pointer to SCAN block being scanned;
+  ! last - pointer to last SCAN block on this side of =;
+  ! count - not used?;
+ if (fileno < 0) and not negok or   ! check validity of FILENO;
+    (fileno = 0) and not zerok or
+    (fileno > 0) and not posok
+   then usererr(0,0,"BLOCK - Illegal fileno.");
+ if fileno geq 0 then begin cur_firsti; last_lasti end  ! get limits for search;
+   		 else begin cur_firsto; last_lasto end;
+ if fileno < 0 then fileno_-fileno;  ! and make fileno non-neg;
+ if fileno = 0 then if wptr then return(wptr) else fileno_1;  ! for 0 use block currently being scanned;
+ if cur then for cur _ cur step scsiz until last do
+   if fileno=1  ! we decrement fileno until it becomes 1;
+     then return(cur)
+     else if not memory[cur+4,integer] land '007000000000  ! but don't count 'AND' or 'OR' spec;
+       then fileno_fileno-1;
+ if oknone then return(location(nulblk[0]));  ! here if search fails;
+ outstr("
+?SCANEF Not enough file specs
+");
+ return(0);
+ end;
+! WILDOP;
+
+comment
+>>>WILDOP<<<
+Open file specified by fileno.  Assumes spec contains wildcards.
+Each call to WILDOP gets the next file.  If no more, return null.
+Errors all get error messages printed, return null, set EOF and
+!SKIP!.  If it works, this returns a complete file spec for the
+file found as a string.
+>>>ARGS<<<
+Following parameters are passed to a SAIL OPEN:
+  channel, mode, inbuf, outbuf, count, brchar, eof
+fileno - which filespec to use: >0 for input side, <0 for output
+   side, 0 for whole input side
+function - bits: do LOOKUP
+		 2 - do ENTER
+   OPEN always done, 1 is mandatory;
+
+internal string procedure wildop(integer channel,mode,inbuf,outbuf;
+			  reference integer count,brchar,eof;
+			  integer fileno(0),function(1));
+ begin
+ integer done,type,badtime;
+  ! done is set when WILD is finished, also error flag;
+  ! type is device type code returned by WILD;
+  ! badtime is set if file not allowed by /SINCE, etc.;
+ integer first,last;
+  ! first - pointer to first SCAN block in spec;
+  ! last - pointer to last SCAN block in spec;
+ label x,again,fin;
+ first _ block(fileno, false, true, true);
+ if not first then begin eof_true; !skip!_1; return(null) end;  ! error if no spec;
+ if fileno=0 then last_lasti
+	     else last_0;  ! last=0 tells WILD only one spec;
+ if not (function=1 or function=3) then usererr(0,0,"WILDOP - Illegal function");
+again:
+ done_0;
+ start!code	protect!acs 1;
+ hrli 1,first;
+ hrri 1,last;
+ movem 1,access(tblk[0]);  ! [0] - ptr to first,,last SCAN block;
+ hrli 1,access(openb1[0]);
+ hrri 1,access(lookbl[0]);
+ movem 1,access(tblk[1]);  ! [1] - OPEN,,LOOKUP block;
+ hrli 1,scsiz;
+ hrri 1,lksiz;
+ movem 1,access(tblk[2]);  ! [2] - size of SCAN,,LOOKUP block;
+ hrli 1,'440000;  ! all devices, NEW/SYS logic enabled;
+ hrri 1,wptr;
+ movem 1,access(tblk[3]);  ! [3] - flags,,ptr to current SCAN block;
+ setzm access(tblk[4]);  ! [4] - routine called at end of directory;
+ hrli 1,5;  ! length of block;
+ hrri 1,access(tblk[0]);
+	! still WILDOP - about to do .LKWLD;
+
+ push p,rf; ! AC's needed by SAIL;
+ push p,sp;
+ pushj p,!lkwld;
+ setom done;  ! set if no more flags;
+ movem 2,type;  ! WILD tells us what kind of device it is;
+ pop p,sp;
+ pop p,rf;
+ end;
+ if done then begin eof_true; !skip!_0; return(null) end;  ! no more flags - not an err eof_true;
+ open(channel, cvxstr(openb1[1]), openb1[0] lor mode,inbuf,outbuf,
+		count,brchar,eof);
+ if eof then begin start!code push p,rf;push p,sp;  ! eof set on error, let WILD print message;
+             pushj p,e!dfo;setom !skip!; pop p,sp;pop p,rf; end;
+	     return(null) end;  ! and give error return;
+ if type>0 then return(cv6str(openb1[1])&":");  ! > 0 means non-directory;
+ start!code  ! here we will do LOOKUP, possible ENTER;
+ push p,rf;
+ push p,sp;
+ hrlz 1,channel;  ! make up LOOKUP CHANNEL,LOOKBL;
+ lsh 1,5;
+ tlo 1,'76000;
+ hrri 1,access(LOOKBL[0]);
+ skipe type;  ! =0 if want short LOOKUP block;
+ jrst x;
+ hrri 1,access(LOOKBL[2]);  ! use address of short block;
+x: setom !skip!;
+ xct 1;  ! here do the LOOKUP;
+ setzm !skip!;  ! flag it failed;
+ skipn !skip!;
+ jrst fin;  ! if so, done;
+ setzm badtime;  ! flag for doesn't meet time constraints;
+ push p,1;
+ pushj p,!chktm;  ! check /SINCE, etc;
+ setom badtime;  ! doesn't meet constraints;
+ pop p,1;
+ move 2,function;  ! if user asked for ENTER;
+ trne 2,2;
+ skipe badtime;  ! and time is OK;
+ jrst fin;
+ tlo 1,'77000;  ! make the LOOKUP into an ENTER;
+ xct 1;  ! do an ENTER;
+ setzm !skip!;
+fin:
+ pop p,sp;
+ pop p,rf;
+ end;
+ if badtime then go to again;  ! if file doesn't meet time spec, try again;
+ if not !skip! then  ! see if an error someplace - let WILD print it;
+  begin start!code push p,rf; push p,sp; pushj p,e!dfl; pop p,sp; pop p,rf;
+  end; !skip!_-1; eof_true; return(null) end;  ! and take bad return;
+ !skip!_0;
+ eof_0;
+ return(cv6str(openb1[1])&":"&cv6str(LOOKBL[2])&"."&
+	cv6str(LOOKBL[3] land '777777000000)&
+	cvppn(LOOKBL[1]))  ! OK - return file spec;
+ end;
+! NORMOP;
+
+external integer !stopb,e!lken,!tfilb;
+  ! routines in SCAN/WILD useful for non-wildcard operations;
+
+comment
+>>>NORMOP<<<
+This routine opens a single file.  No wildcards are allowed.  If
+a default extension is supplied for a LOOKUP, and the LOOKUP fails,
+it is tried again with a null extension.  Of course if FILE. is
+typed the default extension is not tried.
+>>>ARGS<<<
+Passed directly to the SAIL OPEN:
+   channel, mode, inbuf, outbuf, count, brchar, eof
+FILENO - which file spec to use >0 for input side, <0 for output.
+   Must be single file spec.
+function - bits: 1 - LOOKUP
+		 2 - ENTER
+		 4 - RENAME
+  If any are specified, OPEN also done. 0 to 4 are valid.
+defext - extension used if user didn't type one.;
+
+internal string procedure normop(integer channel,mode,inbuf,outbuf;
+			  reference integer count,brchar,eof;
+			  integer fileno(1),function(1);
+			  string defext(null));
+ begin
+ integer first,wildc;
+  ! first - pointer to SCAN block specifying file;
+  ! wildc - flag set if spec had wildcard in it;
+ label ok,bad,nolook,noent,lkfail,lkagn;
+ arrclr(lookbl);  ! initialize the LOOKUP block - .STOPB isn't good about doing this;
+ lookbl[0]_lksiz-1;  ! number of arg's following;
+ first_block(fileno,true,false,true);  ! pointer to SCAN block;
+ if not first then begin eof_true; !skip!_1; return(null) end;  ! if no spec, error;
+ if function<0 or function>4 then usererr(0,0,"NORMOP - Illegal function");
+ if function=4 and not memory[first+4,integer] land '400000000000 then  ! check flag that device specified;
+   begin
+   outstr("
+?SCADIR Device illegal for rename
+");
+ !skip!_1;
+ eof_true;
+ return(null)
+ end;
+ if defext and memory[first+4,integer] land '200000000000  ! flag that no ext specified;
+   then memory[first+3,integer]_cvsix(defext) lor '777777;
+ start!code
+ hrli 1,scsiz;
+ hrr 1,first;  ! [AC1] - size SCAN block,,addr. of SCAN block;
+ movei 2,access(openb1[0]);  ! [AC2] - addr of OPEN block;
+ movei 3,access(LOOKBL[0]);
+ hrli 3,lksiz;  ! [AC3] - size,,addr of LOOKUP block;
+ movei 4,access(pathb1[0]);  ! [AC4] - place to put path;
+	! still NORMOP;
+
+ push p,rf;
+ push p,sp;
+ setzm wildc;
+ pushj p,!stopb;  ! sets up LOOKUP, OPEN blocks from SCAN block;
+ setom wildc;  ! error return if any wildcards in spec;
+ pop p,sp;
+ pop p,rf;
+ end;
+ if wildc then
+  begin
+  outstr("
+?SAIWCI Wildcard illegal");
+  start!code
+  push p,rf;
+  push p,sp;
+  move 1,first;
+  pushj p,!tfilb;  ! here we print the file spec;
+  pop p,sp;
+  pop p,rf;
+  end;
+  !skip!_1;  ! and take the error return;
+  eof_true;
+  return(null)
+  end;
+ eof_true;
+ if function land 3 then begin  ! if 1 or 3, need OPEN;
+ open(channel,cvxstr(openb1[1]),openb1[0] lor mode,inbuf,outbuf,count,brchar,eof);
+ if eof then  ! here if OPEN failed;
+  begin
+  outstr("
+?SCAOPN Open failure for "&cv6str(openb1[1])&'15&'12);
+  !skip!_-1;
+  return(null)
+  end;
+ end;
+ !skip!_0;
+ eof_0;
+	! still NORMOP - do the function;
+
+ if function then  ! now do LOOKUP, ENTER, RENAME if asked for;
+ start!code
+ push p,rf;
+ push p,sp;
+ hrlz 1,channel;  ! make up LOOKUP CHANNEL,LOOKBL;
+ lsh 1,5;
+ tlo 1,'76000;
+ hrri 1,access(LOOKBL[0]);
+ move 2,function;
+ trnn 2,1;
+ jrst nolook;
+lkagn:  ! here if code has 1 bit on - LOOKUP;
+ xct 1;
+ jrst lkfail;  ! error return from LOOKUP - may be wrong ext;
+nolook:
+ tlo 1,'77000;  ! make into ENTER instruction;
+ trnn 2,2;
+ jrst noent;
+ xct 1;  ! do ENTER if code has 2 bit on;
+ jrst bad;  ! always an error;
+noent:
+ tlz 1,'22000;  ! make into RENAME instruction;
+ trnn 2,4;
+ jrst ok;
+ xct 1;  ! do RENAME if code has 4 bit on;
+ jrst bad;
+ jrst ok;  ! good return;
+lkfail:  ! if LOOKUP failed;
+ hlrz 3,access(LOOKBL[3]);
+ jumpe 3,bad;  ! and non-null extension;
+ move 3,first;
+ move 3,4(3);
+ tlnn 3,'200000;  ! and user didn't type extension;
+ jrst bad;
+ setzm access(LOOKBL[3]);  ! then try again with null extension;
+ jrst lkagn;
+bad:  ! here if real error;
+ setom !skip!;
+ setom access(eof);
+ movei 1,access(LOOKBL[0]);
+ movei 2,lksiz;
+ move 3,first;
+ pushj p,e!lken;  ! this is error printer - uses code from lookup block;
+ok:
+ pop p,sp;
+ pop p,rf;
+ end;
+ return(if not !skip! then cv6str(openb1[1])&":"&cv6str(LOOKBL[2])&"."&
+		       cv6str(LOOKBL[3] land '777777000000)&
+		       cvppn(LOOKBL[1])
+		  else null)  ! if OK, return file spec used;
+ end;
+! DEFCLEAR, DEFFLAG;
+
+comment
+>>>DEFCLEAR<<<
+Call to clear out switch settings.  Currently doesn't do much, but
+may become more complicated as we improve implementation.
+>>>ARGS<<<
+none
+>>>SIDEEFFECTS<<<
+resets LASTSW, which is a pointer to the last switch defined;
+
+internal procedure defclear; lastsw_0;
+
+comment
+>>>DEFFLAG<<<
+Defines a switch that can occur as /FLAG or /NOFLAG.
+>>>ARGS<<<
+name - name of the switch to be defined
+loc - place to put the value:  1 if /FLAG, 0 if /NOFLAG
+def - value to put in loc if neither /FLAG or /NOFLAG seen, probably
+   should be 0 or 1, though anything except -1 is OK
+>>>SIDEEFFECTS<<<
+puts entries into the various switch tables.  For explanations of
+what goes in them, see the comments on page 1 of this program;
+
+internal procedure defflag(string name; reference integer loc; 
+				integer def(0));
+ begin
+addEntry( cvsix(name), loc, 0, 1 rot -6, def );
+IFCR false THENC
+ lastsw_lastsw+1;  ! now have one more switch;
+ if lastsw>swchnum
+   then usererr(0,0,"Too many switches defined");
+ ntab[lastsw]_cvsix(name);
+ ptab[lastsw]_location(loc);
+ mtab[lastsw]_0;
+ ftab[lastsw]_'10000000000;  ! flag that this is simple /X /NOX type;
+ dtab[lastsw]_def; ! this table is used by me after SCAN is done to set defaults;
+ENDC
+ end;
+! DEFVALUE;
+
+external integer !swdec,!swoct,!swsix;
+  ! These are routines in SCAN to process switch arguments that
+  ! are respectively: decimal numbers, octal numbers, sixbit;
+
+comment
+>>>DEFVALUE<<<
+This procedure defines switches of the form /NAME:<value>.
+Note that <value> must be typed.
+>>>ARGS<<<
+name - name of switch
+loc - place to put value
+type -   0 - decimal number
+	 1 - octal number
+	 2 - sixbit word
+>>>SIDEEFFECTS<<<
+puts entries for this switch in the switch tables;
+
+internal procedure defvalue(string name; reference integer loc;
+    integer type(0),def(0));
+ begin
+addEntry( cvsix(name), loc,  
+    case type of (location(!swdec),location(!swoct),location(!swsix)),
+    2 rot -3, 
+    def );
+IFCR false THENC
+ lastsw_lastsw+1;
+ ntab[lastsw]_cvsix(name);
+ ptab[lastsw]_location(loc);
+ mtab[lastsw]_case type of (location(!swdec),location(!swoct),location(!swsix));
+ ftab[lastsw]_'200000000000;  ! flag that value can take a whole word;
+ dtab[lastsw]_def;
+ENDC
+ end;
+! SECOP;
+
+external integer !scwld,e!sco,e!scl;
+  ! routines in WILD for use by SECOP;
+
+internal safe integer array lookb2[0:lksiz-1];
+  ! LOOKUP block for use only by secondary file opener;
+safe integer array openb2[0:2],pathb2[0:8],tmpblk[0:scsiz-1];
+  ! openb2 - open block for secop;
+  ! pathb2 - path block for secop;
+  ! tmpblk - place to copy scanblock for secop (since we change it);
+
+comment
+>>>SECOP<<<
+Routine for openning file when the file name is a function of
+the file openned by another file spec, e.g. foo.*=bar.*.  Also
+simpler cases where default file name taken from another file.
+Behavior may be a bit obscure unless you read the WILD documentation
+to see how wildcards are treated in secondary files.  Similar
+to NORMOP except for how the filename is gotten
+>>>ARGS<<<
+passed directly to SAIL OPEN:
+    channel, mode, inbuf, outbuf, count, brchar, eof
+fileno - file spec for file to be openned. >0 from input side, <0
+    from output side
+function - bits: 1 - LOOKUP
+		 2 - ENTER
+		 4 - RENAME
+OPEN is always done. Values from 0 to are legal;
+
+internal string procedure secop(integer channel,mode,inbuf,outbuf;
+			  reference integer count,brchar,eof;
+			  integer fileno(0),function(1);
+			  string defext(null),defdev("DSK");integer prifile(0));
+ begin
+ integer done,type,badtime,devchr;
+  ! done - error indicator;
+  ! type - device type returned by WILD;
+  ! badtime - not used?;
+  ! devchr - on if device is directory type;
+ integer first,last,extword;
+   ! first is ptr to main scan block;
+   ! last is ptr to scan block for defaults;
+   ! extword gets default ext,,777777;
+ label x,nolook,noent,bad,ok,ret;
+ EXTWORD _ '777777; ! ONLY USED IF NULL EXT WITH EXPLICIT DOT;
+ first _ block(fileno, true, false, true, true); ! ptr to scan blk;
+ if not first then begin eof_true; !skip!_1; return(null) end;
+ arrblt(tmpblk[0],memory[first],scsiz); ! copy scan blk since we will change it;
+ last _ block(prifile, true, true, true); ! ptr to scan blk for defaults;
+ if function < 0 or function > 4 then usererr(0,0,"SECOP - Illegal function");
+ if not tmpblk[0]  ! if user didn't type device;
+    then tmpblk[0] _ cvsix(defdev);  ! then use default;
+ start!code  ! see if device is directory;
+	! still SECOP - about to do DEVCHR;
+
+ movei 2,'200000; ! construct devchr uuo - phys-only bit;
+ move 1,access(tmpblk[4]); ! switch word;
+ tlnn 1,'40000; ! use specify /physical-only?;
+ setz 2,; ! no - use normal uuo;
+ ior 2,['047040000004]; ! make a devchr uuo;
+ move 1,access(tmpblk[0]); ! get device to check;
+ xct 2; ! devchr;
+ hlrz 1,1; ! put bits in rh where we can test;
+ andi 1,'24; ! get bits for is magtape and is directory device;
+ movem 1,devchr; ! put it somewhere;
+ end;
+ ! if device isn't directory, file name isn't crucial, so if
+ ! user didn't specify one, we copy whole source spec.  this
+ ! prevents wild-card errors, since match is guaranteed.;
+ ! OTHERWISE, WE USE NAME AND EXT FROM ORIG AS DEFAULT;
+ IF NOT TMPBLK[1]  ! NO NAME SPECIFIED;
+   THEN IF NOT (DEVCHR = 4) ! NON-DIRECTORY DEVICE;
+          THEN ARRBLT(TMPBLK[1],MEMORY[LAST+1],SCSIZ-1) ! COPY WHOLE INPUT SPEC;
+          ELSE BEGIN TMPBLK[1]_MEMORY[LAST+1];TMPBLK[2]_MEMORY[LAST+2] END;
+ IF (NOT TMPBLK[3]) AND (TMPBLK[4] LAND '200000000000) ! NO EXT SPECIFIED;
+   THEN IF DEFEXT
+          THEN TMPBLK[3] _ CVSIX(DEFEXT) LOR '777777
+        ELSE IF MEMORY[LAST+3]  ! IF INPUT IS PERMISSIBLE;
+          THEN TMPBLK[3] _ MEMORY[LAST+3]  ! THEN USE IT;
+        ELSE TMPBLK[3] _ CVSIX("*"); ! ELSE MAKE IT EXPLICIT;
+ first _ location(tmpblk[0]);  ! need ptr below;
+ done_0;
+ start!code
+ hrli 1,last;
+ hrri 1,first;
+ movem 1,access(tblk[0]);  ! [0] - SCAN block for source,,main spec;
+ hrli 1,access(openb1[0]);
+ hrri 1,access(openb2[0]);
+ movem 1,access(tblk[1]);  ! [1] - OPEN block for source,,main spec;
+ hrli 1,access(lookbl[0]);
+ hrri 1,access(lookb2[0]);
+ movem 1,access(tblk[2]);  ! [2] - LOOKUP block for source,,main spec;
+ hrli 1,extword;
+ hrri 1,lksiz;
+ movem 1,access(tblk[3]);  ! [3] - addr of def ext,,size LOOKUP blocks;
+ hrli 1,4;  ! length of arg block;
+ hrri 1,access(tblk[0]);
+ push p,rf;
+ push p,sp;
+ pushj p,!scwld;
+ setom done;  ! some sort of trouble;
+ movem 2,type;  ! type of device - save for later;
+ pop p,sp;
+ pop p,rf;
+ end;
+ if done then begin eof_true; !skip!_0; return(null); end;  ! error from WILD;
+ if not lookb2[6] then lookb2[6]_lookbl[6];  ! default version no.;
+ eof_true;
+	! still SECOP - about to do OPEN;
+
+ if function land '3 then begin   ! only 1 or 2 get OPEN;
+ open(channel,cvxstr(openb2[1]),openb2[0] lor mode,inbuf,outbuf,count,brchar,eof);
+ if eof then begin start!code push p,rf; push p,sp;  ! open error;
+             pushj p,e!sco;setom !skip!; pop p,sp;pop p,rf; end;
+	     return(null) end;  ! let WILD print the message;
+ end;
+ if type>0 then return(cv6str(openb2[1])&":");  ! this is device doesn't want LOOKUP, etc.;
+ start!code
+ push p,rf;
+ push p,sp;
+ hrlz 1,channel;
+ lsh 1,5;
+ tlo 1,'76000;  ! make up LOOKUP CHANNEL,LOOKB2;
+ hrri 1,access(lookb2[0]);
+ skipe type;
+ jrst x;
+ hrri 1,access(lookb2[2]);  ! here if want short LOOKUP block;
+x:
+ move 2,function;
+ setzm !skip!;
+ trnn 2,1;
+ jrst nolook;
+ xct 1;  ! here if user wants LOOKUP - do it;
+ jrst bad;
+nolook:
+ tlo 1,'77000;  ! turn it into ENTER;
+ trnn 2,2;
+ jrst noent;
+ xct 1;  ! here for ENTER;
+ jrst bad;
+noent:
+ tlz 1,'22000;  ! turn it into RENAME;
+ trnn 2,4;
+ jrst ok;
+ xct 1;  ! here for RENAME;
+ jrst bad;
+ jrst ok;
+bad:
+ setom !skip!;
+ok:
+ pop p,sp;
+ pop p,rf;
+ end;
+ if !skip! then  ! if error, let WILD print message;
+  begin start!code push p,rf; push p,sp; pushj p,e!scl; pop p,sp; pop p,rf;
+  end; !skip!_-1; eof_true; return(null) end;  ! and error return;
+ !skip!_0;
+ eof_0;
+ return(cv6str(openb2[1])&":"&cv6str(lookb2[2])&"."&
+	cv6str(lookb2[3] land '777777000000)&
+	cvppn(lookb2[1]));  ! otherwise return file spec;
+ end;
+end
+
+  pè
