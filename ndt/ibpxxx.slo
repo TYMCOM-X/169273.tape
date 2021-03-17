@@ -1,0 +1,259 @@
+
+modify-field COND
+        q-odd   = 12    ;same as Q0-35, but more readable
+        -q-odd  = 13    ;same as -Q0-35, but more readable
+$
+
+repeat Extended.address [
+modify-field COND
+        sect.0  = 75    ;in section zero (false for now)
+        -sect.0 = 74    ;not in section zero (true for now)
+$
+]
+
+.define do.eoi [] [SEOI]
+.define do.neoi [] [SNEOI + 1]
+
+calcDev = 11    ;or whatever.  this is the calculation AMEM block (ADJBP)
+old.ac = D%amem1
+sav.ptr2 = D%amem2
+r.align = D%amem3
+bytes.forward = old.ac  ;changes from old.ac to bytes.forward at name change
+
+  .opcode[133]                                                          ;IBP
+        DFRQ D[CONST calcDev] DEST[DEV-ADR] COND[AC=0] LBJUMP[IBPM1] $
+        ALU[MEMAC] DEST[Q HOLD] COND[AC=0] LBJUMP[IBPA1] $
+
+  .reloc
+  .pair
+IBPM1:  RE-XCT D[MEM] ROT[12.] DEST[AR] 
+repeat 1 - Extended.address [ JUMP[ADJBP.] $ ]
+repeat Extended.address [ COND[OBUS<0] LBJUMP[ADJBP.] $ ]
+                ; non-zero AC is an ADJBP, branch is "global byp or not"
+        RE-XCT R-M-W D[MEM] ROT[12.] MASK[6] DEST[AR]
+                                        COND[OBUS=0] JUMP[do.neoi] $
+                ;Get S field (a zero means we are all done)
+        D[AR] ROT[30.] DEST[Q] $
+                ;put into pos field position
+        D[HOLD] ALU[D-Q] DEST[MEMSTO] COND[CRY0] JUMP[do.neoi] $
+                ;Subtract from P (in place) and store, checking for overflow
+        ;here: Q=size * 1B5, HOLD+Q = old AC, must increment word address
+repeat 1 - Extended.address [
+        D[CONST[44]] ROT[30.] ALU[D-Q] DEST[Q] $
+                ;get proper P-field (36 - size)
+]
+repeat Extended.address [
+        D[CONST[44]] ROT[30.] ALU[D-Q] DEST[Q] 
+                                COND[-sect.0] PUSHJ[..ibp.global] $
+                ;get proper P-field, check for possible global byte pointer
+]
+        D[MEM] MASK[30.] ALU[D+Q+1] DEST[Q MEMSTO] $
+                ;here it is definitely not a global byte pointer.
+        IFRQ D[MASK[18.]] ALU[D&Q] COND[-OBUS=0] JUMP[do.EOI] $
+                ;did it carry out of the displacement field? if not, all done
+        D[CONST[1]] ROT[18.] ALU[Q-D] DEST[MEMSTO] EOI $
+                ;otherwise, subtract back the carry and finish up.
+
+repeat Extended.address [
+..ibp.global:   ;we must move to the next word, and this may be a global bytptr
+        D[HOLD] ROT[12.] DEST[AR] COND[-OBUS<0] POPJ $
+                ;Well, is the "its global" bit on? if not, this is simple
+                ;otherwise keep enough info in AR to undo if cannot write W2
+        D[HOLD] MASK[30.] ALU[DorQ] DEST[Q MEMSTO] PUSHJ[..IBP.W2] $
+        ALU[Q] DEST[MEMSTO] PUSHJ[..IBP.W2] $   ;Hmmm ECC error, try once more?
+                ;ECC 2nd error or Page fault, give up. [Note: cannot ECC,Fault]
+        D[MA] ALU[D-1] DEST[MA] $
+                ;recover the old value of the MA (what about section wraps?)
+        D[AR] ROT[24.] DEST[Q] $
+                ;rebuild the original byte ptr so no inconsistent data left
+        D[AR] MASK[6] DEST[AR] COND[-MA<20] JUMP[. + 2] $
+                ;by adding the size back to the old over-advanced pointer
+        D[AR] ROT[30.] ALU[D+Q] DEST[MEMAC] MA_MA+1 JUMP[OK,Re-Execute] $
+        D[AR] ROT[30.] ALU[D+Q] DEST[MEMSTO] $
+        MA_MA+1 JUMP[OK,Re-Execute] $
+
+..IBP.W2: MA_MA+1 COND[MA<20] JUMP[..IBP.FIN.AC] $
+        DF/WT D[MEM] R-M-W TRAP-CTL RE_XCT ALU[D+1] DEST[Q MEMSTO] $
+        D[MASK[30.]] ALU[D&Q] COND[-OBUS=0] JUMP[do.neoi] $
+        IFRQ D[CONST[1]] ROT[30.] ALU[Q-D] DEST[MEMSTO] JUMP[do.eoi] $
+..IBP.FIN.AC:
+        ACSEL[AC,MA] ALU[B+1] ALU-DST[B] DEST[AR] $
+        IFRQ D[AR] MASK[30.] COND[-OBUS=0] JUMP[do.eoi] $
+        D[LIT[010000 _ 18.]] DEST[Q] SHORT $
+        D[AR] ALU[D-Q] DEST[MEMAC] EOI $
+]
+;; ... ALU[MEMAC] DEST[Q HOLD] COND[AC=0] LBJUMP[IBPA1] $
+.pair
+IBPA1:  D[CONST calcDev] DEST[DEV-ADR] JUMP[IBPM1] $
+                ; non-zero AC is an ADJBP, finish setup ADJBP memory
+        D[MEM] ROT[12.] MASK[6] DEST[AR] COND[OBUS=0] JUMP[do.neoi] $
+                ;Get S field (0 size is a No-op)
+repeat 1 - Extended.address [
+        IFRQ D[AR] ROT[30.] ALU[Q-D] DEST[MEMAC] COND[CRY0] JUMP[do.eoi] $
+                ;Subtract from P (in place) and store, checking for overflow
+                ;either just end, or do the "next word" fixup
+        D[MASK 30.] ALU[D&Q] DEST[Q] SHORT $
+                ;clear out the Pos field
+]
+repeat Extended.address [
+        IFRQ ACSEL[AC,MA] D[AR] ROT[30.] ALU[Q-D] DEST[O-AC HOLD] 
+						COND[CRY0] JUMP[do.eoi] $
+                ;Subtract from P (in place) and store, checking for overflow
+                ;either just end, or do the "next word" fixup
+        D[MASK 30.] ALU[D&Q] DEST[Q] COND[-sect.0] PUSHJ[IBP3] $
+                ;ptr will overflow, must advance to next word (may be Global)
+]
+        D[CONST 44] ROT[30.] ALU[D+Q+1] DEST[Q HOLD] $
+                ;New P of 44, add 1 to adr
+        D[MEM] MASK[18.] COND[-OBUS=0] JUMP[IBP31] $
+                ;JUMP IF ADR NOT 0 (DID NOT OVERFLOW)
+        D[CONST 1] ROT[18.] ALU[Q-D] DEST[Q] $
+                ;BACKUP LEFT HALF undoing previous carry
+IBP31:  D[AR] ROT[30.] ALU[Q-D] DEST[MEMAC] NEOI $
+                ;Store it
+
+repeat Extended.address [
+IBP3:   D[MEM] ROT[12.] COND[-OBUS<0] POPJ $
+                ;If it is not a global byte pointer, just get out of here
+        D[CONST 44] ROT[30.] ALU[D+Q] DEST[Q] $
+	D[AR] ROT[30.] ALU[D-Q] DEST[MEMAC] 
+			MA_MA+1 COND[-MA<20] JUMP[IBP.17] $
+	ACSEL[AC,MA] ALU[B+1] DEST[AC AR] $
+	D[AR] MASK[30.] COND[-OBUS=0] JUMP[do.neoi] $
+	
+.pair
+ADJBP.: ;here MEM has word 1 of byte pointer, AR has it ROT 12., at .+1 if b12
+        D[AR] MASK[6] DEST[AR] COND[-OBUS=0] LBJUMP[ADJBP3] $
+                ;extract the size field, separate special case size = 0
+                ;save away as divisor in AR [divide expects it there]
+repeat Extended.address [ 
+        ACSEL[AC+1] ALU[AC] DEST[sav.ptr2] MA_MA+1 COND[sect.0] JUMP[ADJBP.] $
+                ;put a nice thing to restore in sav.ptr2 in case 0 sect, size
+                ;cope with an unreadable global byte pointer before it gets bad
+                ;if in section zero, this cannot be a global byte pointer
+        DFRQ ALU[MEMAC] DEST[sav.ptr2] COND[MA<20] JUMP[ADJBP.] $
+                ;presuming we have an AC for part two of the pointer, grab it
+                ;then proceed with the ADJBP
+        D[MEM] RE-XCT DEST[sav.ptr2] $
+                ;Oh my, was global byte pointer in memory, get the second word
+        D[AR] ROT[24.] DEST[HOLD] JUMP[ADJBP.] $
+                ;restore old MEM value, since the read mangled it.
+]
+
+..nogo: ;0 bytes per word. set Overflow(b0), Trap1(b10), and NoDivide(b12)
+        ;proceed without changing ACs (ie restore the old ones)
+        D[PC-FLAGS] DEST[Q] $
+        D[nlit[240 _ 18.]] ALU[DorQ] DEST[PC-FLAGS] $
+        D[old.ac] DEST[AC] NEOI $
+                ;restore the AC, since we will otherwise be in trouble
+
+repeat Extended.address [ 
+.pair
+..noadj: D[sav.ptr2] ACSEL[AC+1] DEST[AC] $     ;byte size 0, global bit on
+        D[MEM] DEST[AC] EOI $                   ;byte size 0, just get ptr
+.pair
+ADJBP3: IFRQ D[MEM] ROT[12.] COND[-OBUS<0] LBJUMP[..NOADJ] $
+                ;Above is for Size 0, it is either MOVE or DMOVE (if global)
+]
+repeat 1 - Extended.address [ 
+.pair
+ADJBP3: D[MEM] DEST[AC] NEOI $
+]
+        ;now: MEM= byte ptr word 0, AR=Size << 6,
+        ;if B12 (global byte pointer bit) is on sav.ptr2 has proper AC+1
+        ;for no word-adjust (second byte ptr word or true AC+1 for section 0)
+        ALU[0] DEST[Q] SHORT $  ;"low order" part of divide
+        D[MEM] ROT[6] MASK[6] DEST[O-AC old.ac] 
+                        COND[-OBUS=0] PUSHJ[..SixDiv] $ ;skip a 0/x divide
+                ;First division is Pos / Size to get offset,bytesLeft
+        
+        D[CONST[36.]] ALU[D-AC] DEST[O-AC r.align] $
+                ;save count of wasted tail bits, get number of left-side bits
+                ;in preparation for a second divide to get bytes/word
+        D[AR] ROT[30.] ALU[AC-D] COND[OBUS<0] JUMP[..nogo] $
+                ;not even one byte/word (note that AR is size rot 6)
+        D[old.ac] ALU[D-Q] DEST[bytes.forward] $
+                ;save the total number of bytes past tail of the word
+        ALU[0] DEST[Q] PUSHJ[..SixDiv] $
+                ;divide. (again by AR) quo: bytes/word; rem: DEC's "Alignment"
+        ALU[Q] DEST[AR] $       ;where bigDiv takes its divisor (?)
+        ALU[0] DEST[AC] $ ;know the number of bytes/word, set for full divide
+        D[bytes.forward] DEST[Q] COND[-OBUS=0] PUSHJ[..BigDiv] $
+        ;Now, quotient (in Q) is word-adjust, remainder (in AC) is byte-adjust
+repeat Extended.address [
+        D[MEM] ROT[12.] COND[OBUS<0] PUSHJ[..add.two] $
+                ;check for possible "global byte pointer" comes back if local
+]
+        D[MEM] MASK[30.] ALU[Q+D] DEST[O-AC AR] $
+                ;calculate new byte pointer for everything but the offset
+        D[MEM] MASK[18.] ALU[Q+D] DEST[HOLD] $
+                ;get carry,,proper right half of local byte pointer
+        D[MEM] MASK[LEFT] ALU[AC-D] DEST[AC] $
+                ;remove the carry that we mistakenly performed (if any)
+        ;;here AC is correct except for the P field (b0:b5), which is 0
+        ;;AR has the remainder of the division (bytes to adjust by)             
+..word.done:    ;Note: known that -1 < AR * byte-size + r.align < 36
+        D[r.align] DEST[O-AC r.align] $
+                ;keeping byte pointer in r.align, Pos field built to Q-high
+        D[r.align] ROT[12.] MASK[6] DEST[Q] COND[q-odd] LBJUMP[..mul6] $
+.pair
+..mul6: ;extremely restricted multiply. AR * Q + AC to Q-high (bits 0:5)
+.repeat 5 [
+        ALU[AC+0] DEST[D4] ENDCONN[LSH] COND[q-odd] LBJUMP[. + 2] $
+        D[AR] ALU[AC+D] DEST[D4] ENDCONN[LSH] COND[q-odd] JUMP[. + 2] $
+]
+        IFRQ ALU[AC+0] DEST[D4] ENDCONN[LSH] JUMP[. + 2] $
+        IFRQ D[AR] ALU[AC+D] DEST[D4] ENDCONN[LSH] $
+
+        ;now mix in the rest of the byte pointer, and we are all done
+        D[r.align] ALU[DorQ] DEST[AC] EOI $
+
+
+repeat Extended.address [
+..add.two: D[sav.ptr2] ALU[Q+D] ACSEL[AC+1] DEST[O-AC AR]
+                        COND[sect.0] JUMP[..oops] $
+                ;get new word pointer presuming no wrap, put in dest for w2
+                ;if it turns out to be a global flag but section 0, undo this
+        D[MEM] MASK[30.] DEST[O-AC AR] $
+                ;set up AC to be appropriate result w/o Pos field, and hide
+                ;the number of bytes off in AR. (just like in local calc)
+        D[sav.ptr2] MASK[30.] ALU[Q+D] DEST[Q] $
+                ;Now we check to see if a wrap-around occurred
+        D[MASK[30.]] ALU[-D&Q] DEST[Q] COND[OBUS=0] JUMP[..word.done] $
+                ;If no carry, we are all set (didn't wrap)
+        ACSEL[AC+1] ALU[AC-Q] JUMP[..word.done] $
+                ;Subtract out the amount we carried to do wrap, then done
+
+..oops: ;global byte pointer flag, put in section 0, undo the mangled AC+1
+        D[AR] ACSEL[AC+1] DEST[AC] POPJ $
+]
+.pair
+..BigDiv:
+  .define div_step [] [ DEST[D6] ENDCONN[M/D] C500 ] $
+        ;;endconn[m/d] == mask[73]  <is> AC0 := Overflow # Sign // Q35 := -Sign
+  .define get_divisor [] [ D[AR] ] $
+
+.repeat 30. [
+        get_divisor ALU[AC-D] div_step COND[OBUS<0] LBJUMP[. + 2] $
+        get_divisor ALU[AC+D] div_step COND[OBUS<0] JUMP[. + 2] $
+]
+..SixDiv: ;Divide AC by "AR" (six-step). Quotient to Q, remainder to AC
+        ;On entry, AC = 00<numerator>, Q = 0, divisor (rotated 6) in AR
+        ;Note that the first of this chain should always jump (?!)
+.repeat 6 [
+        get_divisor ALU[AC-D] div_step COND[OBUS<0] LBJUMP[. + 2] $
+        get_divisor ALU[AC+D] div_step COND[OBUS<0] JUMP[. + 2] $
+]
+        get_divisor ALU[AC-D] div_step JUMP[. + 2] $
+        get_divisor ALU[AC+D] div_step $
+
+        ALU[SH-AC] DEST[D5] MASK[0] $
+                ;Lots of mumbly magic. MASK[0]? Really JUST ALU[AC] DEST[D5]
+                ;;*** ALU[SH-AC] = ALU[ SOURCE 0,A 3 ]; 3 is no-alu (passthru)
+                ;Note that D5 is: ac := alu-res << 1 (I think)
+        D[CONST 1] ROT[43] ALU[D#AC] DEST[AC] COND[-OBUS<0] POPJ C550 $
+                ;adjust sign of remainder and check it (Is this necessary?)
+        get_divisor ALU[D+AC] DEST[AC] POPJ NORM $
+                ;over-shot, adjust remainder
+
+  
