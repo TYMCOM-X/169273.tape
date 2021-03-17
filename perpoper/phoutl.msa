@@ -1,0 +1,470 @@
+-- file PhoenixUtil.mesa
+-- last modified by Randy, 18-Sep-81 16:05:48
+
+DIRECTORY
+  CmFile USING [Lop],
+  HeapString USING [AppendChar],
+  Inline USING [DIVMOD],
+  PhoenixDefs,
+  PhoenixOps USING [secsPerMin, secsPerHr, secsPerDay, secsPerWeek,
+    secsPerMoon, today],
+  String USING [SubString, SubStringDescriptor],
+  Time USING [Pack, Packed, Unpack, Unpacked];
+
+PhoenixUtil: PROGRAM
+  IMPORTS CmFile, HeapString, Inline, PhoenixOps, Time
+  EXPORTS PhoenixOps =
+BEGIN OPEN PhoenixDefs, PhoenixOps;
+
+Phase: TYPE = LONG INTEGER;
+
+Packed: TYPE = LONG INTEGER;
+Unpacked: TYPE = RECORD [day, month, year, weekday: INTEGER];
+
+DatePieces: TYPE = MACHINE DEPENDENT RECORD [
+  vp(0): SELECT OVERLAID * FROM
+    packed => [d(0:0..31): Packed],
+    pieces => [chars(0:0..31): PACKED ARRAY [0..4) OF CHARACTER],
+    ENDCASE];
+
+EvalState: TYPE = RECORD [
+  start, until, base: Time.Packed _ System.gmtEpoch,
+  targetStart, targetEnd: Time.Packed _ System.gmtEpoch,
+  ss: String.SubString,
+  op: CHARACTER];
+
+UnitType: TYPE = {days, weeks, months, years, dows, moons};
+
+Interval: TYPE = RECORD [
+  vp: SELECT type: UnitType FROM
+    days, weeks, months, years => [n: INTEGER],
+    dows => [n: INTEGER, dow: DayOfWeek],
+    moons => [n: INTEGER, phase: {new, full}],
+    ENDCASE];
+
+months: ARRAY [0..11] OF INTEGER _
+  [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+monthToDay: ARRAY [0..11] OF INTEGER =
+  [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
+
+DateFromTime: PUBLIC PROCEDURE [t: Time.Packed] RETURNS [Packed] = INLINE
+  {RETURN[System.SecondsSinceEpoch[t] / secsPerDay]};
+
+TimeFromDate: PUBLIC PROCEDURE [d: Packed] RETURNS [Time.Packed] = INLINE
+  {RETURN[[d * secsPerDay - System.gmtEpoch]]};
+
+Pack: PUBLIC PROCEDURE [u: Unpacked] RETURNS [p: Packed] =
+  BEGIN
+  END;
+
+Unpack: PUBLIC PROCEDURE [p: Packed] RETURNS [u: Unpacked] =
+  BEGIN
+  END;
+
+Mod: PROCEDURE [dividend: LONG INTEGER, divisor: INTEGER] RETURNS [rem: INTEGER] =
+  {RETURN[
+    IF dividend > 0 THEN Inline.LongDivMod[dividend, divisor].remainder
+    ELSE -(divisor - Inline.LongDivMod[ABS[dividend], divisor].remainder)]};
+
+AppendDate: PUBLIC PROCEDURE [s: POINTER TO STRING, d: Packed] =
+  BEGIN
+  dp: DatePieces;
+  dp.d _ d;
+  FOR i: CARDINAL IN [0..4) DO HeapString.AppendChar[s, dp.chars[i]] ENDLOOP;
+  END;
+    
+DOMToDate: PUBLIC PROCEDURE [dom: STRING, year: INTEGER] RETURNS [packed: Packed] =
+  BEGIN
+  domType: CHARACTER = dom[0];
+  unpacked: Unpacked _ [year: year, month:, day: 1, weekday:];
+  SELECT domType FROM
+    domSimple =>
+      BEGIN
+      uToday: Unpacked _ Unpack[today];
+      month: INTEGER _ Num[dom[1]];
+      day: INTEGER _ Num[dom[2]];
+      unpacked.month _ month;
+      unpacked.day _ IF day # 0 THEN day ELSE
+        (IF (Num[dom[1]] = 2 AND
+             year MOD 4 = 0 AND
+             year MOD 100 # 0 OR
+             year MOD 400 = 0) THEN 29
+        ELSE months[Num[dom[1]]]);
+      packed _ Pack[unpacked];
+      END;
+    domUnits =>
+      BEGIN
+      SELECT dom[1] FROM
+        dow =>
+          BEGIN
+          n: INTEGER = Num[dom[2]];
+          dayOfWeek: INTEGER _ Num[dom[3]];
+          unpacked.month _ Num[dom[4]];
+          unpacked _ Unpack[packed _ Pack[unpacked]]; -- get dow of first day of month
+          IF dayOfWeek = 7 THEN
+            BEGIN
+            rem, weeks: INTEGER;
+            [weeks, rem] _ Inline.DIVMOD[n, 5];
+            packed _ packed + weeks * 7;
+            IF rem + unpacked.weekday >= 5 THEN rem _ rem + MIN[6 - unpacked.weekday, 2];
+            packed _ packed + rem;
+            END
+          ELSE
+            BEGIN
+            unpacked.day _
+              IF dayOfWeek <= unpacked.weekday THEN dayOfWeek + 7 - unpacked.weekday
+              ELSE dayOfWeek - unpacked.weekday;
+            unpacked.day _ unpacked.day + (n - 1) * 7;
+            packed _ Pack[unpacked];
+            END;
+          END;
+        day, week =>
+          BEGIN
+          unpacked.month _ Num[dom[3]];
+          packed _ Pack[unpacked];
+          packed _ packed + (Num[dom[2]] - 1) * (IF dom[1] = week THEN 7 ELSE 1);
+          END;
+        newMoon, fullMoon =>
+          BEGIN
+          pTime: Time.Packed;
+          uTime: Time.Unpacked _ [
+            year: year, month: Num[dom[3]], day: 1,
+            hour: 0, minute: 0, second: 0,
+            weekday:, zone: localZone, dst: DSTAtDOM[Num[dom[3]], 1]];
+          targetPhase: Phase _ IF dom[1] = newMoon THEN 0 ELSE secsPerMoon / 2;
+          n: INTEGER = Num[dom[2]];
+          phaseAtStart: Phase = POMAtDate[uTime.month, 1, year];
+          pTime _ Time.Pack[uTime];
+          IF phaseAtStart > targetPhase THEN targetPhase _ targetPhase + secsPerMoon;
+          pTime _ [pTime + (targetPhase - phaseAtStart) + secsPerMoon * (n - 1)];
+          packed _ DateFromTime[pTime];
+          END;
+        ENDCASE => ERROR;
+      END;
+    ENDCASE;
+  END;
+
+POMAtDate: PROCEDURE [month, day, year: INTEGER] RETURNS [phase: Phase] =
+  BEGIN
+  golden: INTEGER _ (year MOD 19) + 1;
+  century: INTEGER _ year / 100 + 1;
+  gregCorrection: INTEGER _ (3 * century) / 4 - 12;
+  clavCorrection: INTEGER _ (century - 16 - (century - 18) / 25) / 3;
+  extraDays: INTEGER _ (5 * year) / 4 - gregCorrection - 10;
+  epact: INTEGER _ ((11 * golden + 19 + clavCorrection - gregCorrection) MOD 30) + 1;
+  dayInYear: INTEGER _ monthToDay[month] + day;
+  secondsThisMoon: LONG INTEGER;
+  IF (epact = 25 AND golden > 11) OR epact = 24 THEN epact _ epact + 1;
+  IF month > 1 THEN
+    IF year MOD 4 = 0 THEN
+      IF year MOD 100 # 0 THEN
+        {IF year MOD 400 = 0 THEN dayInYear _ dayInYear + 1}
+      ELSE dayInYear _ dayInYear + 1;
+  RETURN[(dayInYear * secsPerDay + epact * secsPerDay) MOD secsPerMoon];
+  END;
+
+EvalCycles: PROCEDURE [eval: EvalState] RETURNS [success: BOOLEAN] =
+  BEGIN OPEN eval;
+  int: Interval;
+  dayOfMonth: INTEGER _ 0;
+  SELECT op FROM
+    domSimple, domUnits =>
+      BEGIN
+      date: Packed;
+      uStart: Unpacked _ Unpack[targetStart];
+      uEnd: Unpacked _ Unpack[targetEnd];
+      s: STRING _ [ss.length];
+      String.AppendSubString[s, ss];
+      date _ DOMToDate[s, uStart.year];
+      IF targetStart > date THEN RETURN[FALSE];
+      date _ DOMToDate[s, uEnd.year];
+      RETURN[date <= targetEnd];
+      END;
+    monthly => {dayOfMonth _ LopNum[ss]; int _ [months[LopNum[ss]]]};
+    ENDCASE--units-- =>
+      BEGIN
+      int _ EvalUnits[eval];
+      op _ Lop[ss];
+      IF op = cyclic THEN IF ~EvalCycles[eval] THEN RETURN[FALSE];
+      END;
+  WITH int SELECT FROM
+    days =>
+      BEGIN
+      targetStart _ targetStart + ((targetStart - base) MOD n);
+      targetEnd _ targetEnd - ((targetEnd - base) MOD n);
+      RETURN[targetStart <= targetEnd];
+      END;
+    dows => {};
+    weeks =>
+      BEGIN
+      targetStart _ targetStart + ((targetStart - base) MOD (n * 7));
+      targetEnd _ targetEnd - ((targetEnd - base) MOD (n * 7));
+      RETURN[targetStart <= targetEnd];
+      END;
+    moons => {};
+    months => {};
+    years => {};
+    ENDCASE => ERROR;
+  END;
+
+EvalUnits: PROCEDURE [eval: EvalState] RETURNS [int: Interval] =
+  BEGIN OPEN eval;
+  SELECT op FROM
+   day => int _ [days[LopNum[ss]]];
+   dow => {int _ [dows[n: LopNum[ss]]]; int.dow _ LopDOW[ss]};
+   week => int _ [weeks[LopNum[ss]]];
+   newMoon => int _ [moons[LopNum[ss], new]];
+   fullMoon => int _ [moons[LopNum[ss], full]];
+   month => int _ [months[LopNum[ss]]];
+   year => int _ [years[LopNum[ss]]];
+   ENDCASE => ERROR;
+  END;
+
+Lop: PUBLIC PROCEDURE [ss: String.SubString] RETURNS [c: CHARACTER] =
+  {RETURN[CmFile.Lop[ss]]};
+
+LopNum: PUBLIC PROCEDURE [ss: String.SubString] RETURNS [INTEGER] =
+  {RETURN[Num[Lop[ss]]]};
+
+LopTime: PUBLIC PROCEDURE [ss: String.SubString] RETURNS [t: Time.Packed] =
+  BEGIN
+  TimePieces: TYPE = MACHINE DEPENDENT RECORD [
+    vp(0): SELECT OVERLAID * FROM
+      packed => [t(0:0..31): Time.Packed],
+      pieces => [chars(0:0..31): PACKED ARRAY [0..4) OF CHARACTER],
+      ENDCASE];
+  tp: TimePieces;
+  FOR i: CARDINAL IN [0..4) DO tp.chars[i] _ Lop[ss] ENDLOOP;
+  RETURN[tp.t];
+  END;
+
+MatchDate: PUBLIC PROCEDURE
+  [expr: String.SubString,
+  targetDate: Time.Packed,
+  startDate, untilDate, baseDate: Time.Packed _ System.gmtEpoch]
+  RETURNS [BOOLEAN] =
+  BEGIN
+  success: BOOLEAN _ TRUE;
+  eval: EvalState;
+  eval.ss _ expr;
+  eval.start _ startDate;
+  eval.until _ untilDate;
+  eval.base _ baseDate;
+  eval.targetStart _ eval.targetEnd _ targetDate;
+    BEGIN OPEN eval;
+    op _ Lop[ss];
+    IF op = starting THEN {start _ LopTime[ss]; op _ Lop[ss]};
+    IF op = until THEN {until _ LopTime[ss]; op _ Lop[ss]};
+    IF op = base THEN {base _ LopTime[ss]; op _ Lop[ss]};
+    IF op = nonCyclic THEN RETURN[LopTime[ss] = targetDate];
+    IF op IN [before..onOrAfter] THEN IF ~EvalDispl[eval] THEN RETURN[FALSE];
+    IF Later[start, targetStart] THEN targetStart _ start;
+    IF Later[targetEnd, end] THEN targetEnd _ end;
+    IF Later[targetStart, targetEnd] THEN RETURN[FALSE];
+    IF op = cyclic THEN IF ~EvalCycles[eval] THEN RETURN[FALSE];
+      BEGIN
+      originalSS: String.SubStringDescriptor _ ss^;
+      WHILE op = except DO
+        ss^ _ originalSS;
+        IF MatchDate[ss, targetDate, start, until, base] THEN RETURN[FALSE];
+        ENDLOOP;
+      END;
+    END;
+  RETURN[TRUE];
+  END;
+
+Num: PUBLIC PROCEDURE [c: CHARACTER] RETURNS [INTEGER] = {RETURN[LOOPHOLE[c]]};
+
+Reduce: PUBLIC PROCEDURE
+  [ss: String.SubString, base: Packed] RETURNS [date: Packed] =
+  BEGIN
+  unpacked: Unpacked;
+  operation: CHARACTER _ Lop[ss];
+  unitType: CHARACTER _ Lop[ss];
+  n: INTEGER _ LopNum[ss];
+  dowVal: INTEGER;
+  IF unitType = dow THEN dowVal _ LopNum[ss];
+  IF ss.length # 0 THEN date _ Reduce[ss, base] ELSE date _ base;
+  IF operation = before OR operation = onOrBefore THEN n _ -n;
+  unpacked _ Unpack[date];
+  SELECT unitType FROM
+    day => date _ date + n;
+    week => date _ date + n * 7;
+    dow =>
+      BEGIN
+        IF operation = onOrbefore OR operation = onOrAfter THEN
+          IF unpacked.weekday = dowVal
+            OR (dowVal = 7 AND unpacked.weekday ~IN[5..6]) THEN RETURN;
+        IF dowVal = 7 THEN -- n weekdays before or after
+          BEGIN
+          weeks: INTEGER _ n / 5;
+          days: INTEGER _ Mod[n, 5];
+          date _ date + weeks * 7 + days;
+          unpacked _ Unpack[date];
+          IF unpacked.weekday IN [5..6] THEN
+            IF n < 0 THEN {unpacked.weekday _ 4; date _ Pack[unpacked]}
+            ELSE date _ date + 7 - unpacked.weekday;
+          END
+        ELSE
+          BEGIN
+          IF n > 0 THEN date _ date + ABS[Mod[(dowVal - unpacked.weekday), 7]]
+          ELSE date _ date - ABS[Mod[unpacked.weekday - dowVal, 7]];
+          date _ date + (n - 1) * 7;
+          END;
+        END;
+    newMoon, fullMoon =>
+      BEGIN
+      time: Time.Packed _ DateToTime[date];
+      targetPhase: Phase _ IF unitType = newMoon THEN 0 ELSE secsPerMoon / 2;
+      unpackedPhase: Phase _ POMAtDate[unpacked.month, unpacked.day, unpacked.year];
+      IF (operation = onOrBefore OR operation = onOrAfter) AND targetPhase = unpackedPhase
+        THEN RETURN[base];
+      IF n > 0 THEN
+        BEGIN
+        IF unpackedPhase >= targetPhase THEN targetPhase _ targetPhase + secsPerMoon;
+        time _ [time + (targetPhase - phaseAtStart) + secsPerMoon * (ABS[n] - 1)];
+        END
+      ELSE
+        BEGIN
+        IF targetPhase >= unpackedPhase THEN unpackedPhase _ unpackedPhase + secsPerMoon / 2;
+        time _ [time - unpackedPhase - secsPerMoon * (ABS[n] - 1)];
+        END;
+      date _ TimeToDate[time];
+      END;
+    month =>
+      BEGIN
+      years: INTEGER _ (unpacked.month + n) / 12;
+      months: INTEGER _ Mod[unpacked.month + n, 12];
+      unpacked.year _ unpacked.year + years;
+      unpacked.month _ unpacked.month + months;
+      date _ Pack[unpacked];
+      END;
+    yearUnits => {unpacked.year _ unpacked.year + n; date _ Pack[unpacked]};
+    ENDCASE => ERROR;
+  END;
+
+ReduceStrings: PUBLIC PROCEDURE [offset, base: STRING] RETURNS [date: Time.Packed] =
+  BEGIN
+  baseDesc: String.SubStringDescriptor _ [base, 0, base.length];
+  desc: String.SubStringDescriptor _ [offset, 0, offset.length];
+  RETURN[Reduce[@desc, LopTime[@baseDesc]]];
+  END;
+
+EvalDispl: PROCEDURE [eval: EvalState] RETURNS [BOOLEAN] =
+  BEGIN OPEN eval;
+  unitType: CHARACTER;
+  FOR op _ op, Lop[ss] UNTIL op ~IN [before..onOrAfter] DO
+    unitType: CHARACTER _ Lop[ss];
+    n: INTEGER _ LopNum[ss];
+    dowVal: INTEGER _ IF unitType = dow THEN LopNum[ss] ELSE 0;
+    IF op = before OR op = onOrBefore THEN n _ -n;
+    SELECT unitType FROM
+      day => {targetStart _ targetStart + n; targetEnd _ targetEnd + n};
+      dow =>
+        BEGIN
+        unpacked: Unpacked _ Unpack[targetStart];
+        days, weeks: INTEGER;
+        IF dowVal = 7 THEN -- the nth weekday before or after
+          BEGIN
+          IF unpacked.weekday IN [5..6] THEN -- move to before weekend
+            targetStart _ targetStart + 4 - unpacked.weekday;
+          unpacked _ Unpack[targetEnd];
+          IF unpacked.weekday IN [5..6] THEN -- move to after weekend
+            targetEnd _ targetEnd  + 7 - unpacked.weekday;
+          IF targetStart > targetEnd THEN RETURN[FALSE];
+          IF operation = onOrBefore OR operation = onOrAfter THEN n _ n + -n / ABS[n];
+          weeks _ n / 5;
+          days _ Mod[n, 5];
+          targetStart _ targetStart + weeks * 7 + days;
+          unpacked _ Unpack[targetStart];
+          IF unpacked.weekday IN [5..6] THEN targetStart _ targetStart +
+            (IF n < 0 THEN 4 - unpacked.weekday ELSE 7 - unpacked.weekday);
+          targetEnd _ targetEnd + weeks * 7 + days;
+          unpacked _ Unpack[targetEnd];
+          IF unpacked.weekday IN [5..6] THEN targetEnd _ targetEnd +
+            (IF n < 0 THEN 4 - unpacked.weekday ELSE 7 - unpacked.weekday);
+          END
+        ELSE
+          BEGIN
+          IF unpacked.weekday # dowVal THEN -- clip forward to correct day of week
+            targetStart _ targetStart + ABS[Mod[dowVal - unpacked.weekday, 7]];
+          unpacked _ Unpack[targetEnd];
+          IF unpacked.weekday # dowVal THEN -- clip backward to correct day of week
+            targetEnd _ targetEnd - ABS[Mod[unpacked.weekday - dowVal, 7]];
+          IF operation = before OR operation = after THEN
+            targetStart _ targetStart - n / ABS[n];
+          targetStart _ targetStart + n * 7;
+          IF targetStart > targetEnd THEN RETURN[FALSE];
+          END;
+        END;
+      week => {targetStart _ targetStart + n * 7; targetEnd _ targetEnd + n * 7};
+      newMoon, fullMoon =>
+        BEGIN
+        uStart: Time.Unpacked _ Time.Unpack[targetStart];
+        uEnd: Time.Unpacked _ Time.Unpack[targetEnd];
+        phase: Phase _ POMAtDate[uStart.month, uStart.day, uStart.year];
+        targetPhase: Phase _ IF op = newMoon THEN 0 ELSE secsPerMoon / 2;
+        IF phase # targetPhase THEN
+          BEGIN
+          IF phase >= targetPhase THEN targetPhase _ targetPhase + secsPerMoon;
+          targetStart _ [targetStart + targetPhase];
+          uStart _ Time.Unpack[targetStart];
+          END;
+        targetPhase _ IF op = newMoon THEN 0 ELSE secsPerMoon / 2;
+        IF (phase _ POMAtDate[uEnd]) # targetPhase THEN
+          BEGIN
+          IF targetPhase >= phase THEN phase _ phase + secsPerMoon;
+          targetEnd _ [targetEnd - (phase - targetPhase)];
+          END;
+        Offset[(n - 1) * secsPerMoon];
+        IF sign = neg THEN
+            {targetEnd _ [targetEnd + secsPerMoon];
+            IF op = before THEN
+              {targetStart _ targetStart + 1; targetEnd _ targetEnd + 1}}
+          ELSE
+            {targetStart _ [targetStart - secsPerMoon];
+            IF op = after THEN
+              {targetStart _ targetStart - 1; targetEnd _ targetEnd - 1}};
+        IF targetStart > targetEnd THEN RETURN[FALSE];
+        END;
+      month =>
+        BEGIN
+        months, years: INTEGER;
+        uStart: Unpacked _ Unpack[targetStart];
+        uEnd: Unpacked _ Unpack[targetEnd];
+        IF sign = neg THEN
+          BEGIN
+          [years, months] _ Inline.DIVMOD[n, 12];
+          uStart.year _ uStart.year - years; uEnd.year _ uEnd.year - years;
+          IF months > uStart.month THEN
+            {uStart.year _ uStart.year - 1; uStart.month _ uStart.month + 12 - months}
+          ELSE uStart.month _ uStart.month - months;
+          IF months > uEnd.month THEN
+            {uEnd.year _ uEnd.year - 1; uEnd.month _ uEnd.month + 12 - months}
+          ELSE uEnd.month _ uEnd.month - months;
+          END
+        ELSE
+          BEGIN
+          [years, months] _ Inline.DIVMOD[uStart.month + n, 12];
+          uStart.year _ uStart.year + years; uStart.month _ months;
+          [years, months] _ Inline.DIVMOD[uEnd.month + n, 12];
+          uEnd.year _ uEnd.year + years; uEnd.month _ months;
+          END;
+        targetStart _ Pack[uStart]; targetEnd _ Pack[uEnd];
+        IF targetStart > targetEnd THEN RETURN[FALSE];
+        END;
+      years =>
+        BEGIN
+        unpacked: Unpacked _ Unpack[targetStart];
+        unpacked.year _ unpacked.year + n;
+        targetStart _ Pack[unpacked];
+        unpacked _ Unpack[targetEnd];
+        targetEnd _ Pack[unpacked];
+        END;
+      ENDCASE;
+    ENDLOOP;
+  RETURN[TRUE];
+  END;
+
+END.
+    
