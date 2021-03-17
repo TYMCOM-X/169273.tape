@@ -1,0 +1,1433 @@
+	SUBTTL	Some Initial Trumpet Soundings
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	At long last!							;
+;									;
+;	This is TENIO.  TENIO is a collection of subroutines designed	;
+;	to provide an intelligent interface to file I/O on TOPS-10.	;
+;	Although its initial use was as an assembly code interface, it	;
+;	is set up so that any reasonable language could be made to	;
+;	talk to it.							;
+;									;
+;	Some basic philosophy:  the interface provides a rather gene-	;
+;	ralized capability to read or write one or more words to any	;
+;	location in any file.  Since TOPS-10 allows file I/O only	;
+;	in even multiples of 200 (octal) words at a time, TENIO uses	;
+;	its own set of intermediate buffers to allow I/O to proceed	;
+;	at any word.  (This buffering may be suppressed if it's not	;
+;	required.)  The user may specify the position in the file at	;
+;	which I/O will occur, or may allow TENIO to do it via a se-	;
+;	quential file pointer mechanism.  (That pointer may also be	;
+;	explicitly reset by the user.)  TENIO uses TOPS-10 dump mode	;
+;	I/O for all its I/O activities, as it appears to be not only	;
+;	more convenient but also faster than other TOPS-10 I/O modes.	;
+;									;
+;	Where possible and sensible, TENIO has made use of the most	;
+;	recent facilities provided by the environment.  This includes	;
+;	using SVC FILOP. to do file openings and using several machine	;
+;	capabilities not available on either the KA10 or the KI10	;
+;	(excluding the string instructions).  Should it ever become	;
+;	necessary to retrofit TENIO to a KI10, special attention	;
+;	should be paid to the coding assumption that BLT will always	;
+;	completely update its accumulator pointers upon completion.	;
+;	Also, no provision has been made in this code for multiple	;
+;	section PDP-10s or for file block numbers which exceed a	;
+;	halfword in size.						;
+;									;
+;	In order to avoid naming conflicts, all entry points end with	;
+;	a ".".  If the "." would cause the name to exceed six charac-	;
+;	ters, the second character of the name is omitted.		;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+	SUBTTL	PASCRAP and Other Commentary
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	This package has been extensively overhauled in order to allow	;
+;	the PASCAL I/O system to use it.  One of the PASCAL system	;
+;	goals is to enable large programs to segment themselves with	;
+;	GETSEGs.  This requires that all references to scratch storage	;
+;	be register relative, and that base registers be defined at	;
+;	initialization.  As a result, TENIO now follows some rather	;
+;	nominally bizarre interface conventions:			;
+;									;
+;	1.  Shortly after entry, each routine must call TNAB. (TENIO	;
+;	    NAB) to grab pointers to its scratch storage (in R2) and	;
+;	    AC block (in R3).						;
+;									;
+;	2.  Absolutely no absolute reference to variable storage	;
+;	    (except for the job data area) is allowed.			;
+;									;
+;	3.  If TENIO needs to call an external routine which (A)	;
+;	    could be required for a PASCAL program, and (B) needs	;
+;	    some scratch storage of its own, R15 must be set equal	;
+;	    to its value on entry.					;
+;									;
+;	4.  On exit, R2 must still point to TENIO's scratch storage	;
+;	    (the dispatcher may use it to find the register block	;
+;	    if PASCAL is active).					;
+;									;
+;	5.  TENIO may not increment the UUO return pointer itself;	;
+;	    separate exit points (SKIP1. and SKIP2.) in the UUO		;
+;	    dispatcher are provided to do the job.			;
+;									;
+;	For PASCAL runtime purposes, it is assumed that this code will	;
+;	run with interrupts masked; accordingly, Rs 16 and 17 may get	;
+;	clobbered.  The dispatcher will restore them on exit.  Also,	;
+;	in order to make our life easier, register numbers are not	;
+;	allowed to wrap around (i.e., if AC is 17, AC+1 may not be	;
+;	used in the call).						;
+;	4-28-80:  Quick and dirty modified to run under Tymshare (SVC	;
+;	FILOP.s removed and a few CHANIOs tossed in).  WARNING:  this	;
+;	should NOT be taken as a production quality I/O system.  --QQSV	;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+	SUBTTL	Scratch Area for This Beast (And Other Random Definitions)
+;
+;	First, the usual random scratch.
+;
+	TITLE	TENIO - Low Level File I/O Interface Package for TOPS-10
+	SEARCH	opdfki
+	EXTERN	APOIN.,LUOAD.	; Hooks to calling interface
+	extern	box.rg,blt.sm
+	ENTRY	IOUUO.,TENIO.,RET14.,RET16.; Yutzy Kortezojan entry grab
+	INTERN	OPENF.,COSEF.,TUNCF.,RDBLK.,RBLKR.,RDWRD.,RWRDR.; Real
+	INTERN	WBLK.,WBLKR.,WRWRD.,WWRDR.,NOTEF.,NAMEF.,PINTF.; TENIO
+	INTERN	FOSVC.,FUSHF.	; starting handles
+	TWOSEG			; For sure, reentrant
+;
+;	All dirty core appears in other assemblies (see comments above).
+;	This defines macros to facilitate its reference.  (Oh, for a
+;	DSECT pseudo op!)  R2 points to it after TNAB. has been called.
+;
+;	First, the data areas needed for parameters to the TOPS-10 I/O
+;	calls.
+;
+;	A FILOP. block.
+;
+	DEFINE	FUNCOD<0(2)>	; Channel # to use,,FILOP. function code
+	DEFINE	IOMODE<1(2)>	; I/O mode (always 57--synchronous dump)
+	DEFINE	FILDEV<2(2)>	; SIXBIT device (possibly ersatz)
+;
+	DEFINE	IOLST<3(2)>	; Overlap dump mode I/O list here
+;
+	DEFINE	FILBUF<3(2)>	; Buffer pointers (not used by dump mode)
+	DEFINE	BLKPTR<5(2)>	; LOOKUP type block pointer
+;
+;	A LOOKUP/ENTER/RENAME block.  This is used by file closing as
+;	well as opening.
+;
+	DEFINE	LUKENT<6(2)>	; Length of remaining stuff (usually 5)
+	DEFINE	ENTPPN<7(2)>	; Proj #,,Prog # for file
+	DEFINE	ENTNAM<10(2)>	; SIXBIT file name
+	DEFINE	ENTEXT<11(2)>	; SIXBIT extension,,returned error code
+	DEFINE	ENTPRO<12(2)>	; Nine bits of protection, 27 bits of junk
+	DEFINE	ENTLEN<13(2)>	; Returned word length of file
+;
+;	Additional length used to truncate files.
+;
+	DEFINE	RNJUNK<14(2)>	; Version, spool name, and estimated crap
+	DEFINE	RNALOC<17(2)>	; Actual block length allocated for file
+;
+;	Internal name block (for file name decoding) and a PATH block
+;	(overlapped with LOOKUP block above).
+;
+	DEFINE	INTBLK<15(2)>	; Decoded file name scratch area
+MAXSFD==	5		; Maximum depth SFD supported
+;
+;
+;	The blocks.  (See below.)
+;
+	DEFINE	BS.<4+MAXSFD+INTBLK>; File Block Start
+	DEFINE	BLOCKS<BS.>	; Channel 1
+;
+;	Other blocks are not directly referenced (see real scratch
+;	storage for listing).
+;
+	DEFINE	LSTBLK<16*BLKSIZ+BS.>; Channel 17 (the last)
+;
+;	File block layout.  These are pointed to by R1 or R3 (the latter
+;	primarily in OPENF and CLOSEF).  FBGR must be defined in line.
+;
+	DEFINE	FILNAM<0(FBGR)>	; File name, in SIXBIT
+	DEFINE	EXTPRO<1(FBGR)>	; Extension,,nine bits of protection stuff
+	DEFINE	CURSOR<2(FBGR)>	; Sequential file pointer (word address)
+	DEFINE	SWCHBF<3(FBGR)>	; Switches,,internal buffer pointer
+	DEFINE	BLKNUM<4(FBGR)>	; Current block,,next expected block
+	DEFINE	EOF<5(FBGR)>	; End of file pointer (word address)
+BLKSIZ==	6		; Length of the above
+FBGR==		-1		; (Safety first)
+;
+;	Switches in SWCHBF left half as follows:
+;
+INOK==		400000		; Input allowed (must match WILLRD)
+OUTOK==		200000		; Output allowed (must match WILLWR)
+OPENED==	INOK+OUTOK	; Something is allowed
+BUFOK==		100000		; Internal buffering allowed
+TRUNC==		40000		; Current buffer has < 200 words
+DIRTY==		20000		; Current buffer must be rewritten
+TENBUF==	10000		; Internal buffer supplied by TENIO
+MULTAC==	4000		; File is multiple writable
+;
+;	Switches in left half of OPENF register
+;
+WILLRD==	400000		; File may be read
+WILLWR==	200000		; File may be written
+NOEMPT==	100000		; Initial file empty should be suppressed
+INTERN==	40000		; Name data is in internal block form
+NOCREA==	20000		; Output file will not be created
+WILMUL==	10000		; Output file should be multi accessible
+WONTBF==	4000		; No buffer should be supplied
+EXLENG==	2000		; User supplied string length and pointer
+;
+;	N.B.:  EXLENG also appears in FORTRAN interface.
+;
+;
+;	Switch in right half of TRUNCF switch register
+;
+TRNCLZ==	1		; Leave file closed after truncation
+;
+;	Finally, the layout of an internal name block.  R1 always
+;	points to these.  (We use either INTBLK or a block provided
+;	by the caller.)
+;
+	DEFINE	DEVICE<0(1)>	; Device (possibly ersatz) of file
+	DEFINE	INTNAM<1(1)>	; (Internal) file name, in sixbit
+	DEFINE	PATH<1(1)>	; Argument block for PATH. (overlapped)
+	DEFINE	INTEXT<2(1)>	; Extension,,prot code and SFD count
+	DEFINE	PPN<3(1)>	; Proj #,,prog # for file
+;
+	DEFINE	ACS<0(3)>	; Register block, after TNAB. call
+;
+;	A few Tymshare goodies.
+;
+	opdef	chanio[43b8]	; The Tymshare answer to SVC FILOP.
+.chrel==	0		; Equivalent to RELEAS
+.chlk==		4		; Equivalent to LOOKUP
+.chent==	5		; Equivalent to ENTER
+.chopn==	13		; Equivalent to OPEN
+.chmen==	41		; Equivalent to multiaccess update FILOP.
+.chvrb==	42		; Equivalent to update RIB FILOP.
+.chftr==	45		; Truncate a file--a new Tymshare joy!
+;
+	SALL			; Suppress macro expansion
+	RELOC	400000		; The rest is clean
+
+	SUBTTL	OPENF - Open or Test a File
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	OPENF (op code 5)--This subroutine is used to open a file for	;
+;	input or output, or to test its existence.  Parameters:		;
+;									;
+;	A:	Left half is option switches (see above).  If neither	;
+;		input nor output is specified, the file's existence	;
+;		will be tested.  Right half is file name string		;
+;		pointer, internal name block pointer (see above),	;
+;		or string length, as specified by option switches.	;
+;	A+1:	If internal buffering is used, this points to a user	;
+;		specified internal buffer or contains zero, in which	;
+;		case TENIO will supply the buffer.  If no buffering	;
+;		is specified, A+1 is ignored.				;
+;	A+2:	If an explicit string length is specified in A, this	;
+;		contains an ILDB byte pointer to read the string.	;
+;		A+2 is ignored in all other cases.			;
+;	E:	Channel number to use, or zero (in which case TENIO	;
+;		will allocate a channel number).			;
+;									;
+;	Return codes:							;
+;									;
+;	+0:	Error; A contains error code from system or -1 if	;
+;		TENIO detected the error.  The file was not opened.	;
+;	+1:	Success (or file exists).  Registers unchanged; E will	;
+;		contain the channel number if TENIO supplied it.	;
+;									;
+;	OPENF must be invoked before I/O can be done on a file.		;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+TENIO.:	BLOCK	0		; A handle to grab
+IOUUO.:	BLOCK	0		; Obsolete handle
+OPENF.:	JSP	16,TNAB.##	; Find our registers and scratch
+	LDB	4,APOIN.	; Fetch AC number
+	MOVEI	12,ACS		; and point to AC
+	ADDI	12,0(4)
+	MOVE	5,0(12)		; Fetch switches and pointer (or count)
+	HLL	2,5		; Save switches
+	CAIGE	4,16		; Large register specified?
+	JMP	OREGOK		; No. No tests needed
+	TLNZ	2,EXLENG	; Yes. String length specified?
+	JMP	BADOPE		; Yes. Would wrap around
+	CAIGE	4,17		; No. Was it R17?
+	JMP	OREGOK		; No. Looks good
+	TLNN	2,WONTBF	; Yes. Is buffer needed?
+	JMP	BADOPE		; Yes. Can't get it
+OREGOK:	HRRZ	13,LUOAD.	; Find effective word
+	CAIG	13,17		; (may be in registers)
+	ADDI	13,ACS
+	HRRZ	6,0(13)		; Fetch channel
+	JUMPNZ	6,GAVECH	; Did he give us one?
+	JSP	17,CHNGET	; No. Get our own
+	JMP	BADOPE		; 0 All busy. Give up
+	JMP	GOTCH		; 1 Got one
+;
+;	User supplied channel number. Validate it.
+;
+GAVECH:	CAILE	6,17		; In legal range?
+	JMP	BADOPE		; No
+	HRREI	3,-1(6)		; Perhaps
+	JUMPM	3,BADOPE	; Zero is reserved for terminal I/O
+	IMULI	3,BLKSIZ	; Seems valid. Find file block
+	ADDI	3,BLOCKS
+FBGR==		3		; (Poor man's USING)
+	SKIPZ	SWCHBF		; Is file already open?
+	JMP	BADOPE		; Yes. Can't do it twice
+GOTCH:	HRLZM	6,FUNCOD	; Valid channel. Save for FILOP.
+	TLNZ	2,INTERN	; Is this an internal name call?
+	JMP	GOTBLK		; Yes. Take short cut
+	TLNZ	2,EXLENG	; No. Explicit length supplied?
+	JMP	GRBLEN		; Yes. Fetch it
+	MOVEI	0,777777	; No. Allow very long string
+	MOVEI	7,0(5)		; (assume will terminate)
+DECGO:	TLNN	7,17		; Index in byte pointer or
+	TRNN	7,777760	; string in registers?
+	JMP	BADOPE		; Yes. That's a no no
+;
+;	The external routine called below is, in fact, really an internal
+;	routine (separated so others can use it); accordingly, it does
+;	not take a standard PUSHJ 17,etc. call with register saving.
+;	DECOD. and STRTD. (see CLOSEF below) assume R0 contains the
+;	maximum allowable string size, R1 points to an internal block
+;	to build into, and R7 points to the input string.  Rs 2,
+;	3, 12, 13, and 15 are preserved; R14 is the link register.
+;	ALL OTHER REGISTERS MAY GET SMASHED!  You have been warned.
+;
+	MOVEI	1,INTBLK	; Point to internal name block and
+	JSP	14,DECOD.##	; decode the file string
+	JMP	BADOPE		; 0 Bad data. Give up
+BUFCHK:	TLNZ	2,WILLRD+WILLWR	; 1 Name OK. Is this just a test?
+	TLNZ	2,WONTBF	; (or perhaps no buffer is wanted?)
+	JMP	BLDOPE		; One or the other. Try the file
+	SKIPZ	11,1(12)	; Did user give me a buffer?
+	JMP	BLDOPE		; Apparently she did
+;
+;	ANYBF., BFGET., and BFDMP. may hit Rs 5, 6, and 17.
+;
+	JSP	16,ANYBF.##	; Will one be available?
+	JMP	BADOPE		; 0 No buffer. Give up
+BLDOPE:	MOVEI	6,57		; 1 Looks OK. Build OPEN block
+	MOVE	7,DEVICE
+	DMOVEM	6,IOMODE	; Always use synchronous dump mode
+	CLEARM	FILBUF		; Buffers are none of TOPS-10's business
+;
+;	For Tymshare, we can't use SVC FILOP. to do the work, so we're
+;	stuck with a bunch of CHANIOs for OPEN, LOOKUP, and ENTER functions.
+;
+	hlrz	5,funcod	; Hang on to channel
+	hrli	5,.chopn	; First, open the device
+	chanio	5,iomode	; (equivalent to OPEN)
+	jmp	badope		; 0 Can't get started. Bizarre!
+	JSP	17,BLDENT	; 1 Now build LOOKUP block
+	hrli	5,.chlk		; and open input side of things
+	chanio	5,lukent	; (equivalent to LOOKUP)
+	JMP	NOXIST		; 0 Doesn't exist, or something
+	TLNN	2,WILLRD+WILLWR	; 1 File exists. Do we need it?
+	JMP	TESTOK		; No. Clear it and cheer
+	TLNN	2,WILLWR	; Yes. Input only?
+	JMP	OPENDN		; Yes. Proceed to copy attributes
+	TLNZ	2,NOEMPT	; Output file. Empty first?
+	JMP	OPENUP		; No
+	clearb	6,7		; Yes. Build extra long ENTER block
+	dmovem	6,rnjunk
+	dmovem	6,-1+rnaloc
+	movei	7,200011	; and set bit so Tymshare will automatically
+	movem	7,lukent	; chop file on ENTER
+openup:	hrli	5,.chent	; Assume single access update
+	tlnz	2,wilmul	; Is multi access desired?
+	hrli	5,.chmen	; Yes. Set it up
+	chanio	5,lukent	; Now open output side (equivalent to ENTER)
+	JMP	FAILOP		; 0 No can do. Bitch a bit
+	cain	7,200011	; Was file emptied?
+	clearm	entlen		; Yes. Better remind Tymshare
+OPENDN:	HLRZ	5,FUNCOD	; 1 Success. Get channel number
+	HRRZ	6,0(13)		; Did the user supply this channel number?
+	CAIE	6,0(5)
+	HRRM	5,0(13)		; No. Return our number
+	MOVE	7,ENTNAM	; Save actual file name
+	HLR	10,ENTPRO	; Save actual protection code
+	ANDCMI	10,777		; (no junk bits)
+	DMOVEM	7,FILNAM
+	MOVE	6,ENTLEN	; Save EOF pointer
+	MOVEM	6,EOF
+	CLEARM	CURSOR		; Start cursor at beginning
+	MOVEI	6,1		; No current block; first block
+	MOVEM	6,BLKNUM	; will come next
+	HLRZ	6,2		; Now build switches
+	ANDI	6,OPENED	; Take INOK, OUTOK from WILLRD, WILLWR
+	TLNZ	2,WILMUL	; Multiple simultaneous access OK?
+	ORI	6,MULTAC	; Yes. Reflect it
+	TLNZ	2,WONTBF	; Internal buffering OK?
+	JMP	SETSWT		; No. Set switches and leave
+	ORI	6,BUFOK		; Yes. Remember that
+	HRLI	6,0(11)		; Fetch possible buffer address
+	JUMPNZ	11,SETSWT	; If user supplied one, we're done
+	ORI	6,TENBUF	; No such luck. It's mine
+	MOVSM	6,SWCHBF	; Save switches and
+	MOVEI	4,SWCHBF	; set to allocate a buffer
+;
+;	See ANYBF. note above.  This is a nonstandard external call and
+;	may smash registers.  Since ANYBF. returned OK, this call should
+;	never fail.
+;
+	JSP	16,BFGET.##	; GMABP (getmeabufferplease)
+	HALT	.		; 0 HWIMB? (helpwhereismybuffer)
+	JMP	SKIP1.##	; 1 Thank you. Bye bye
+;
+SETSWT:	MOVSM	6,SWCHBF	; No buffer allocation needed. Just
+	JMP	SKIP1.##	; store switches (and possible buffer)
+;
+;	Either we don't need to leave the file open, or something
+;	went seriously awry.  Purge the channel and leave appropriately.
+;
+failop:	hrrz	6,entext	; A failure. Snarf return code
+setrc:	movem	6,0(12)
+	MOVEI	7,LEAVE.##	; and set marker
+	JMP	BLAST
+;
+TESTOK:	MOVEI	7,SKIP1.##	; Just a test. Leave OK
+blast:	hrli	5,.chrel	; Pitch the channel
+	chanio	5,0		; (equivalent to RELEAS)
+	JMP	0(7)		; and leave
+;
+;	The file doesn't exist.  That might or might not be bad.
+;	(Maybe we can make one.)
+;
+noxist:	hrrz	6,entext	; Can't input. Why not?
+	jumpnz	6,setrc		; If not nonexistant file, abandon ship
+	TLNZ	2,WILLWR	; That was it. Will we write to the file?
+	TLNZ	2,NOCREA	; Yes. May we create it?
+	JMP	FAILOP		; No (or not output). Forget it
+	HLLZM	10,ENTEXT	; Yes. Reset error flag
+	clearm	entlen		; On Tymshare, watch out for leftover length
+	JMP	OPENUP		; Now open for output
+;
+;	File name comes from internal format block.  Take short cut.
+;
+GOTBLK:	MOVEI	1,0(5)		; User specified internal block
+	CAILE	1,17		; Is it in the registers?
+	JMP	BUFCHK		; No
+	JMP	BADOPE		; Yes. Stop it cold
+;
+;	User specified string length.  Byte pointer is in AC+2.
+;
+GRBLEN:	MOVEI	0,0(5)		; Fetch length
+	MOVE	7,2(12)		; and byte pointer
+	JMP	DECGO
+
+	SUBTTL	OPENF - A Few Sundry Subroutines
+;
+;	CHNGET--Subroutine to scan the file blocks and find an unused one.
+;	On exit, R3 points to the first unused file block and R6 contains
+;	its channel number.  Link by 1(17) if one is found, by R17 if one
+;	isn't.
+;
+CHNGET:	MOVEI	3,LSTBLK	; Last block first
+	MOVEI	6,17
+TCH:	SKIPNZ	SWCHBF		; Test CHannel. Already open?
+	JMP	1(17)		; No. Grab it
+	SUBI	3,BLKSIZ	; Yes. Back up to next one
+	SOJP	6,TCH
+	JMP	0(17)		; Glug! All channels busy
+;
+;	BLDENT--Subroutine to build a LOOKUP/ENTER/RENAME block.  This
+;	routine copies information from the internal name block pointed
+;	to by R1 to the LOOKUP block.  Rs 6 and 7 are used as scratch.  On
+;	exit, R10 contains the extension in its left half.  Link by R17.
+;
+BLDENT:	DMOVE	6,INTNAM	; Grab name, ext, protection+SFD flag
+	MOVE	10,7		; Save extension and ction
+	HRRI	7,0
+	DMOVEM	6,ENTNAM	; Store name and extension
+	MOVEI	6,5		; Five words in a LOOKUP block
+	TRZN	10,777		; Any specified SFDs?
+	SKP	7,PPN		; No. Use direct PPN
+	MOVEI	7,PATH		; Yes. Point to explicit path
+	DMOVEM	6,LUKENT
+	HRLZM	10,ENTPRO	; Store protection
+	JMP	0(17)
+
+	SUBTTL	CLOSEF - Close and Deallocate a File
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	CLOSEF (op code 6)--This subroutine is used to close and	;
+;	deallocate a file after the user has finished doing I/O.	;
+;	Parameters:							;
+;									;
+;	A:	Right half is an option code, as follows:		;
+;		0 ==> Close one file	4 ==> Close and rename file	;
+;		1 ==> Destroy one file	as per internal name block	;
+;		2 ==> Close all files	5 ==> Close and rename file	;
+;		3 ==> Close and rename	as per string length in left	;
+;		file as per file name	half and byte pointer in AC+1	;
+;		string							;
+;		For codes 3 and 4, the left half is a pointer to the	;
+;		appropriate string or block.				;
+;	E:	Ignored for code 2; contains the file number to close	;
+;		otherwise						;
+;									;
+;	Returns:							;
+;									;
+;	+0:	Error; A contains error code from system, or -1 if	;
+;		TENIO detected the error.				;
+;	+1:	Success; registers unchanged.				;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+COSEF.:	JSP	16,TNAB.##	; Grab TENIO scratch and register block
+	LDB	5,APOIN.	; Find specified AC
+	MOVEI	12,0(5)
+	ADDI	12,ACS
+	HRRZ	4,0(12)		; Fetch function code
+	CAIG	5,16		; Is AC number small enough?
+	JMP	CREGOK		; Yes
+	CAIN	4,5		; Maybe not. RENAME string length given?
+	JMP	BADOPE		; Yes. No register wrap around allowed
+CREGOK:	CAIN	4,2		; Close all files?
+	JMP	CLOZAL		; Yes. Set up a loop
+	CAIG	4,5		; No. Is function valid?
+	JSP	14,GETBLK	; Yes. Find file block
+	JMP	BADOPE		; 0 Invalid (or bad function). Error out
+	ADDI	12,ACS		; 1 Restore AC pointer
+	JUMPZ	5,BADOPE	; If file not open, don't reclose
+	JSP	14,SHUTF	; Shut the file down
+	JMP	BADOPE		; 0 and leave, unsuccessfully
+	JMP	SKIP1.##	; 1 or successfully
+;
+;	Close all requested.  Set up a loop.
+;
+CLOZAL:	CLEARB	4,0		; Set close code and no errors yet
+	MOVEI	1,LSTBLK	; Start with the last block
+FBGR==		1		; R1 now points to file blocks
+	HRLI	2,740		; Set up channel 17 (aligned as AC)
+CLZLUP:	SKIPNZ	5,SWCHBF	; Is this file open?
+	JMP	CLZNXT		; No
+	JSP	14,SHUTF	; Yes. Close it down
+	SETO	0,0		; 0 Trouble. Remember it
+CLZNXT:	SUB	2,[40,,0]	; 1 Step channel backwards
+	SUBI	1,BLKSIZ
+	CAIL	1,BLOCKS	; Have we reached the beginning yet?
+	JMP	CLZLUP		; No. Try next file
+	JUMPZ	0,SKIP1.##	; Yes. Leave happily if no error;
+BADOPE:	SETOM	0(12)		; otherwise, bitch
+	JMP	LEAVE.##
+;
+;	SHUTF is only slightly a subroutine, as the RENAME and DESTROY
+;	options break out into separate stuff.  On entry, R1 points to
+;	a file block, R2 (left half) contains the AC style channel number 
+;	(to be ORed into an instruction word), R4 contains the close
+;	code, and R5 contains the switches and buffer address.  If the
+;	code is 0 (for close), this routine will link by R14 on failure,
+;	by 1(14) on success.  Renames just amble their separate way.
+;
+SHUTF:	CAIE	4,1		; Destroying the file?
+	JSP	16,FLUSH	; No. Purge buffer if necessary
+;
+;	Current kludge:  if FLUSH generates a disk error, no signal
+;	will be returned.  So it goes.
+;
+;	FILFIN is a dive into SHUTF without purging the buffer.
+;
+FILFIN:	TLNN	5,TENBUF	; Did we allocate an internal buffer?
+	JMP	CLFINI		; No
+	HRRZI	6,0(5)		; Yes. Purge it
+	JSP	16,BFDMP.##	; HIABYMH (hereisabufferyoumayhave)
+RET14.:	JMP	0(14)		; 0 Release snark. Give up
+CLFINI:	CLEARM	SWCHBF		; 1 Deallocate the file block
+	JUMPNZ	4,RENAM		; A non close function?
+	JSP	17,IOOP		; No. Close the file and pitch the channel
+	RELEAS	0
+	JMP	1(14)		; Ta ta
+;
+;	Destroy or rename the file.  Generate a RENAME block.
+;
+RENAM:	SOJZ	4,DSTROY	; If destroy, just kill file name
+	CAIN	4,4-1		; Did we get an internal block?
+	JMP	INTREN		; Yes. Use it directly
+	JSP	17,GETPTH	; No. Build internal name block
+FBGR==		3		; (switched by GETPTH)
+	CAIN	4,5-1		; Explicit string length given?
+	JMP	RENLEN		; Yes
+	HLRZ	7,0(12)		; No. Fetch string pointer
+	MOVEI	0,777777	; Assume very long length
+RENDEC:	JSP	14,STRTD.##	; Update internal name block
+	JMP	CLFAIL		; 0 Decode failed. Just release channel
+RENBLD:	JSP	17,BLDENT	; 1 Build a RENAME block
+RENGO:	JSP	17,IOOP		; Now rename and close the file
+	RENAME	LUKENT
+	JMP	RENERR		; 0 Save error code
+	JSP	17,IOOP		; 1 Success. Release the channel
+	RELEAS	0
+	JMP	SKIP1.##	; and leave
+;
+CLFAIL:	SETOM	0(12)		; Failure. Report same
+RENKIL:	JSP	17,IOOP		; Now let go of the channel
+	RELEAS	0
+	JMP	LEAVE.##	; and get out of here
+;
+RENERR:	HRRZ	6,ENTEXT	; Rename error. Pluck error code
+	MOVEM	6,0(12)		; and return it
+	JMP	RENKIL
+;
+DSTROY:	CLEARM	LUKENT		; Destroy file. Use short form block
+	JMP	RENGO
+;
+INTREN:	HLRZ	1,0(12)		; Grab user supplied internal block
+	JMP	RENBLD		; and build RENAME block from it
+;
+RENLEN:	HLRZ	0,0(12)		; Fetch user supplied string length
+	MOVE	7,1(12)		; AC+1 has byte pointer
+	JMP	RENDEC
+;
+;
+;	GETPTH, USEPTH--Subroutines to build an internal name block
+;	for an open channel.  On entry, R1 points to the file block
+;	(GETPTH) or R3 points to the file block and R1 points to a
+;	supplied internal name block (USEPTH), and R2 contains the
+;	AC aligned channel number.  Rs 6 and 7 are used as scratch.
+;	On exit, R10 contains the device (in case we need it).  Link
+;	by R17.
+;
+GETPTH:	MOVEI	3,0(1)		; Save file block pointer
+	MOVEI	1,INTBLK	; Use our own internal block
+;
+;	If there's a Tymshare equivalent for SVC PATH., I havent found it
+;	yet.  Accordingly, the device is assumed to be DSK: (probably OK)
+;	and the PPN is set to 0 (may not be OK at all).  Sorry about that.
+;
+usepth:	DMOVE	6,FILNAM	; Grab name, extension, prot code
+	ANDCMI	7,777		; Assume no SFDs
+	DMOVEM	6,INTNAM	; Finish building internal block
+	clearm	ppn		; No way to retrieve the PPN
+	movsi	10,'DSK'	; Assume is DSK: for device
+	JMP	0(17)
+FBGR==		1		; Set up for stuff below
+
+	SUBTTL	TRUNCF - Truncate and (Optionally) Close a File
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	TRUNCF (op code 14)--This subroutine is used to truncate a	;
+;	file that is already open for output.  Optionally, the file	;
+;	may be left closed.  Parameters:				;
+;									;
+;	A:	File address to set the EOF and sequential pointer to.	;
+;	A+1:	Word of switches.  Currently, only bit 35 is relevant;	;
+;		if set, the file will be left closed on exit.		;
+;	E:	File number to close					;
+;									;
+;	Returns:							;
+;									;
+;	+0:	Error; A contains the error code from the system, or	;
+;		-1 if TENIO detected the error.				;
+;	+1:	Success; registers unchanged.				;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+TUNCF.:	JSP	13,OUTCHK	; Make sure we're properly open
+	CAILE	12,16		; AC number too large?
+	JMP	FRET		; Yes. Do not try
+	ADDI	12,ACS		; No. Find A
+	MOVE	0,0(12)		; Fetch new EOF
+	CAMLE	0,EOF		; Bigger than current EOF?
+	JMP	BADOPE		; Yes. Disallow it
+	HLRZ	6,BLKNUM	; No. Look at current buffered block
+	SUBI	6,1		; (DEC counts from 1)
+	LSH	6,7
+	CAMGE	0,6		; Is it past new EOF?
+	HRRZS	BLKNUM		; Yes. Wipe it out
+	TRNN	0,177		; Is truncation to even block boundary?
+	JMP	CLEAN		; Yes. Just flush buffer
+	JSP	15,BFSWAP	; No. Fetch new last block
+	TLOSKP	5,DIRTY+TRUNC	; Mark end and force rewrite later
+;
+CLEAN:	JSP	16,FLUSH	; Purge intermediate buffer
+;
+;
+;	In this instance, Tymshare actually made our life easier.  By
+;	providing a real truncate function, they did away with the need
+;	for the nasty close and reopen sequence (and its attendent risk)
+;	necessary when running vanilla TOPS-10.
+;
+trungo:	hlrz	6,2		; Isolate the channel number
+	lsh	6,-5
+	hrli	6,.chftr	; Now truncate the file
+	chanio	6,0(12)		; (no native equivalent)
+	jmp	fretrc		; 0 No go. Return with reason
+NEWEOF:	MOVEM	0,EOF		; 1 Set up new EOF
+	MOVEM	0,CURSOR	; and sequential file pointer
+	MOVE	7,1(12)		; Fetch switch argument
+	TRNN	7,TRNCLZ	; Should file be closed at end?
+	JMP	SKPOUT		; No. Return happily
+	CLEAR	4,0		; Yes. Set close code
+	JSP	14,SHUTF	; Do whatever's needed to shut down
+	JMP	BADOPE		; 0 Trouble in a funny place
+	JMP	SKIP1.##	; 1 Looks good
+fretrc:	HRRZM	6,0(12)		; Return return code
+	JMP	FRET		; and exit
+
+	SUBTTL	I/O Routines - Calling Sequences and Register Usage Protocol
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	Data transfers are handled by RDBLK, RDBLKR, RDWRD, RDWRDR,	;
+;	WRBLK, WRBLKR, WRWRD, and WRWRDR.  For the block oriented rou-	;
+;	tines, the block address is in A, the block length is in A+1;	;
+;	for the word oriented routines, the word to be read or written	;
+;	is in A.  The random routines have the file address from which	;
+;	to read or write in the next sequential register after the	;
+;	above; the sequential routines use the saved sequential file	;
+;	pointer (CURSOR) from the file block.  Both random and sequen-	;
+;	tial routines will update the file address at exit; the block	;
+;	oriented routines will update the memory address and length as	;
+;	well.  All routines exit+0 on error; the input routines exit+1	;
+;	if an EOF is hit (in which case only partial I/O may be done),	;
+;	+2 if all went well.  The output routines exit+1 if no error	;
+;	was found.  For all routines the file number will be in E.	;
+;									;
+;	This collection of routines is much more interrelated than	;
+;	OPENF and CLOSEF; accordingly, there is a more formalized re-	;
+;	gister usage protocol.  In general, R0 will contain the current	;
+;	file address cursor (word address); R1 points to the relevant	;
+;	file block; R2 (left) contains channel number AC aligned; R2	;
+;	(right) points to our scratch storage (for PASCAL).  R3 keeps	;
+;	track of the current user memory address; it is used as a BLT	;
+;	pointer, so the right half register is used for input routines,	;
+;	the left half for output routines.  R4 contains the negative	;
+;	of the remaining length to read or write; R5 contains SWCHBF	;
+;	(switches in left half, intermediate buffer pointer in right	;
+;	half).  Rs 6, 7, and 10 are scratch registers of varying de-	;
+;	grees of locality (see comments in the code).  R11, incredibly	;
+;	enough, is not used for anything, R12 points to A, and R13	;
+;	points to the file pointer (i.e., either A+2 or CURSOR).  Rs 14	;
+;	through 17 are hierarchical subroutine links; the protocol is	;
+;	that lowest level routines link by R17,second level routines by	;
+;	R16, etc.  No routine may touch a link register above its level	;
+;	(e.g., if it links by R16, Rs 14 and 15 are off limits); it may	;
+;	use a lower level register (in the example above, R17) for lo-	;
+;	cal scratch if it desires.  Since there is absolutely nothing	;
+;	recursive about this code, there is no stack pointer.		;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+	SUBTTL	RDBLK - Read a Sequential Block from File
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	RDBLK (op code 1)--Read a sequential block from a file into	;
+;	memory (see general I/O routines comments for calling se-	;
+;	quence).  This will exit+1 if a read of any length (including	;
+;	zero) is attempted beyond the end of the file.			;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+RDBLK.:	JSP	13,INCHEK	; Find file block and scratch storage
+	CAILE	12,16		; Is AC # > 16?
+	JMP	FRET		; Yes. No wrap around allowed
+	ADDI	12,ACS		; No. Point to AC
+	MOVEI	13,CURSOR	; Use sequential file pointer
+BLFTCH:	MOVE	0,0(13)		; Fetch file pointer
+	JUMPM	0,FRET		; Negative pointer. No go
+	HRRZ	3,0(12)		; Point to input buffer
+	CAIG	3,17		; Is buffer in registers?
+FRET:	JMP	LEAVE.##	; Yes. Centralized Fail RETurn (exit+0)
+	MOVN	4,1(12)		; No. Fetch negative length
+	JUMPP	4,FRET		; User gave negative length. Ungood
+	JSP	14,READ		; Do it!
+;
+;	Read succeeded.  Figure amount actually read; use requested
+;	length for EOF calculation.  (We can't use the length in R4
+;	because it got adjusted so it wouldn't actually try to read
+;	past the end of file.)
+;
+	MOVE	7,0(12)		; Find buffer beginning
+	HRRM	3,0(12)		; Return updated buffer pointer
+	SUBI	3,0(7)		; Compute actual length read
+	HRLI	3,0		; Make sure left half is clear
+	MOVE	7,1(12)		; Fetch original desired length
+	SUBM	7,3		; Difference is length to return
+	MOVEM	3,1(12)
+	ADD	7,0(13)		; Find desired final file pointer
+	CAMLE	7,EOF		; Was it past file end?
+	JMP	SVCRSR		; Yes. Save cursor and exit+1
+DUBSKP:	MOVEM	0,0(13)		; No. Save final file pointer
+	MOVEM	5,SWCHBF	; and switches
+	JMP	SKIP2.##	; Exit+2
+
+	SUBTTL	RDBLKR, RDWRD, and RDWRDR - Single Word and Random Block Input
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	RDBLKR (op code 2)--Read a random block.  The file pointer	;
+;	is in A+2; otherwise, this just feeds into RDBLK.		;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+RBLKR.:	JSP	13,INCHEK	; Find file block and test for input
+	CAILE	12,15		; Would AC number force wrap around?
+	JMP	FRET		; Yes. Forbid it
+	ADDI	12,ACS		; No. Point to A
+	MOVEI	13,2(12)	; Find file pointer
+	JMP	BLFTCH		; The rest is the same as sequential
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	RDWRD (op code 7) and RDWRDR (op code 10)--Sequential and ran-	;
+;	dom word input.  This code sets R3 to point to A (in saved	;
+;	AC block) and sets up a length of 1.  That effectively fakes	;
+;	RDBLK and RDBLKR into dealing with a one word block.		;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+RDWRD.:	JSP	13,INCHEK	; Check input and find file block
+	ADDI	12,ACS		; Set up AC pointer
+	MOVEI	13,CURSOR	; Use saved file pointer
+WDFTCH:	MOVE	0,0(13)		; Fetch file pointer
+	JUMPM	0,FRET		; If negative, give up
+	MOVEI	3,0(12)		; Point to saved AC
+	SETO	4,0		; Negative length = -1
+	JSP	14,READ		; Read the word
+	CAMN	0,0(13)		; Did cursor advance?
+	JMP	SKPOUT		; No; Must be EOF. Exit+1
+	JMP	DUBSKP		; Yes. Exit+2
+
+RWRDR.:	JSP	13,INCHEK	; Check input and get file block
+	MOVEI	17,WDFTCH	; Set up input take off spot
+WRDRAN:	CAILE	12,16		; Might AC+1 wrap around to 0?
+	JMP	FRET		; Yes. That's a no no
+	ADDI	12,ACS		; No. Point to AC
+	MOVEI	13,1(12)	; Find file pointer
+	JMP	0(17)		; and do random word input or output
+
+	SUBTTL	Input Data Transfer Subroutines--INCHEK, GETBLK
+;
+;	INCHEK--Subroutine to find a file block and insure that input
+;	is acceptable on it.  This routine calls GETBLK to do most of
+;	its dirty work.  Link by R13 (a very brief deep subroutine call).
+;
+INCHEK:	JSP	14,BTNAB	; Find the file block and other scratch
+	JMP	FRET		; 0 Invalid channel number. Duck out
+	TLNZ	5,INOK		; 1 Is input valid?
+	JMP	0(13)		; Yes. Return
+	JMP	FRET		; No. Don't try
+;
+;	BTNAB--Subroutine to find a file block and scratch storage.
+;	On entry, R15 must be unchanged from its value at entry (it
+;	may be some sort of weird PASCAL scratch storage pointer).
+;	GETBLK--Subroutine to just find a file block.  On entry, LUOAD.
+;	(looks like location 40) points to the channel number.  On exit,
+;	R1 points to the file block, R2 (left) contains the channel
+;	number aligned for ORing into an I/O instruction, R2 (right)
+;	points to the TENIO. scratch area, R5 contains the switches
+;	and buffer address, and R12 contains the AC number.  Link
+;	by 1(14) on success, by R14 on invalid channel number.
+;
+BTNAB:	JSP	16,TNAB.##	; Find scratch area and registers
+GETBLK:	HRRZ	1,LUOAD.	; Fetch channel number
+	CAIG	1,17		; (may be in registers)
+	ADDI	1,ACS
+	HRRZ	1,0(1)
+	MOVEI	5,0(1)		; Align channel number
+	LSH	5,5		; into AC slot
+	HRLI	2,0(5)
+	CAILE	1,17		; Is channel in valid range?
+	JMP	0(14)		; No. Exit+0
+	SOJM	1,0(14)		; Channel zero is reserved, too
+	IMULI	1,BLKSIZ	; Valid. Find file block
+	ADDI	1,BLOCKS
+	MOVE	5,SWCHBF	; Fetch switches, buffer pointer,
+	LDB	12,APOIN.	; and AC number
+	JMP	1(14)		; Exit+1
+
+	SUBTTL	Input Data Transfer Subroutines--READ
+;
+;	READ--Subroutine to manage input operations for all input data
+;	transfer functions.  On entry, R0 contains the file address from
+;	which to read, R1 points to the file block, R2 contains the
+;	AC aligned channel number and scratch area pointer, R3 is
+;	the user's input buffer pointer, R4 is the negative of the length
+;	to be read, and R5 contains the internal buffer pointer and the
+;	usual collection of switches.  On exit, Rs 0 and 3 have been
+;	updated as required and as much input as could be done was.  Link
+;	by R14.  This routine sideways exits to FRET if an error of some
+;	sort is encountered.
+;
+READ:	MOVE	7,0		; Compute negative length of maximum
+	SUB	7,EOF		; that could be read
+	CAMGE	4,7		; Did the user request more?
+	MOVE	4,7		; Yes. Trim request down to size
+	JUMPNM	4,0(14)		; If nothing will be read, leave now
+	CLEARM	1+IOLST		; Something will. Set I/O list terminator
+	TRNN	0,177		; Are we on a disk block boundary?
+	JMP	EVENBI		; Yes. May do direct input
+	JSP	15,BFSWAP	; No. Get block into intermediate buffer
+	MOVE	7,0		; Find address in buffer from which to
+	ANDI	7,177		; begin copying (buffer address+offset)
+	MOVEI	10,0(5)
+	ADDI	10,0(7)
+	HRL	3,10		; Generate BLT pointer
+	SUBI	7,200		; Compute remaining buffer length
+	CAMGE	7,4		; Is that more than we need?
+	MOVE	7,4		; Yes. Don't get carried away!
+	SUB	4,7		; Update remaining input length
+	SUB	0,7		; Update file input pointer
+	SUBM	3,7		; Compute first address not hit
+	dmovem	10,box.rg
+	movei	10,-1(7)
+	movei	11,3
+	jsr	blt.sm		; Copy just up to it
+	dmove	10,box.rg
+;
+;	BLKCHK leaves information in Rs 6 and 15.  The latter is a
+;	violation of our link register protocol.  Sigh.
+;
+EVENBI:	JSP	16,BLKCHK	; Is there a full block left?
+	JMP	RDTAIL		; 0 No. Copy the tail
+	NOP	0		; 1 Yes. Buffer is tail block
+	JSP	16,FLUSH	; 2 Yes; buffer in middle. Purge it
+RDIRCT:	MOVEI	7,0(15)		; 3 Yes, and buffer no problem
+	JSP	17,FIND		; Tell I/O system where to read
+	USETI	0(7)		; (feed to IOOP)
+	HRLZI	7,0(4)		; Fetch remaining negative length
+	HRRI	7,-1(3)		; and starting address - 1
+	MOVEM	7,IOLST		; The result is an I/O word
+	JSP	17,IOOP		; Now read a whole bunch
+	IN	IOLST		; (executed with channel number)
+	JMP	INUP		; 0 All went well. How nice
+;
+;	Send all disk errors through this point.
+;
+DSKERR:	JMP	FRET		; 1 Trouble. Shouldn't happen
+;
+INUP:	SUB	0,4		; Now update file pointer
+	SUBI	3,0(4)		; and buffer pointer
+	TRNZ	4,177		; Was this an even block length?
+	ADDI	6,1		; No. Adjust to next block
+	HRRM	6,BLKNUM	; Keep track of next I/O block
+	JMP	0(14)		; And that's it
+;
+;	No full blocks to be read.  Use the intermediate buffer if we
+;	can.
+;
+RDTAIL:	JUMPNM	4,0(14)		; Quit if no more at all
+	TLNN	5,BUFOK		; Some left. Is there a buffer?
+	JMP	NOBUFR		; No. Must read in directly
+	JSP	15,BFSWAP	; Yes. Fetch current disk block
+	HRLI	3,0(5)		; Copy from front of buffer
+	SETCM	7,4		; Compute length remaining - 1
+	ADDI	0,1(7)		; Update final file pointer
+	ADDI	7,0(3)		; Compute last location in buffer
+	dmovem	10,box.rg
+	movei	10,(7)
+	movei	11,3
+	jsr	blt.sm		; and move in the tail
+	dmove	10,box.rg
+	JMP	0(14)
+;
+NOBUFR:	MOVEI	6,0(15)		; No buffer. Get final block number
+	JMP	RDIRCT		; and use direct input
+
+	SUBTTL	Input Data Transfer Subroutines--BFSWAP
+;
+;	BFSWAP--Subroutine to insure that the intermediate buffer con-
+;	tains the desired disk block.  If the current block is not the one
+;	desired this routine will flush it to disk (if necessary) and read
+;	in the new one.  On entry, R0 contains the current file pointer.
+;	All scratch registers get clobbered.  On exit, the block number
+;	has been updated.  Link by R15.  This will sideways exit to FRET
+;	if it gets in trouble.
+;
+BFSWAP:	TLNN	5,BUFOK		; Is there a buffer?
+	JMP	FRET		; No. Get out now
+	MOVE	6,0		; Yes. Compute desired block number
+	LSH	6,-7
+	ADDI	6,1		; (DEC counts from 1)
+	HLRZ	16,BLKNUM	; Is it the current block?
+	CAIN	6,0(16)
+	JMP	0(15)		; Yes. All set
+	JSP	16,FLUSH	; No. Purge to disk if needed
+	MOVE	16,EOF		; Compute last block in file
+	ADDI	16,177		; (don't add 1 if on block boundary)
+	LSH	16,-7
+	CAIGE	16,0(6)		; Is it beyond the end?
+	JMP	VIRGIN		; Yes. Zero the buffer
+	MOVEI	7,0(6)		; No. Tell input where to read
+	JSP	17,FIND
+	USETI	0(7)		; Set pointer; channel ORed in
+	MOVEI	7,-1(5)		; Find starting buffer address - 1
+	HRLI	7,-200		; Disk block is 200 (octal) words
+	MOVEM	7,IOLST
+	JSP	17,IOOP		; Read in the disk block
+	IN	IOLST
+	AOSKP	BLKNUM		; Success. Increment next block
+	JMP	DSKERR		; Failure. Exit sideways
+	TLZ	5,TRUNC		; Assume full buffer read
+	CAIN	16,0(6)		; Is this the final block?
+TRUNCO:	TLO	5,TRUNC		; Yes. Assume it's truncated
+	HRLM	6,BLKNUM	; This is now our buffer
+	JMP	0(15)
+;
+VIRGIN:	CLEARM	0(5)		; Beyond file end. Zero the whole
+	MOVEI	7,1(5)		; buffer
+	HRLI	7,0(5)		; Build BLT pointer
+	dmovem	10,box.rg
+	movei	10,177(5)
+	movei	11,7
+	jsr	blt.sm		; Zzzzzzzzzap!
+	dmove	10,box.rg
+	JMP	TRUNCO		; (This is now the last block)
+
+	SUBTTL	Input Data Transfer Subroutines--BLKCHK
+;
+;	BLKCHK--Subroutine to determine whether there are any full sized
+;	blocks to be read or written and, if there are, whether the
+;	intermediate buffer contains one of them.  On exit, R15 will
+;	contain the block number of the current file pointer and R6 will
+;	contain the block number following the last full block to be
+;	transfered (part of it may or may not also be transfered).
+;	Links:  by R16 ==> no full blocks to transfer (in which case
+;	R6 will contain 0), 1(16) ==> buffer contains block following
+;	full block, and part of it will be transfered, 2(16) ==> buffer
+;	contains a full block which will be transfered, 3(16) ==> buffer
+;	contains no block which will be transfered.  For the last three
+;	returns, there will be one or more full blocks to transfer.  Note
+;	that although this routine links by R16, it returns values in
+;	R15.  This is a (nearly) unavoidable violation of protocol.
+;
+BLKCHK:	MOVN	6,4		; Get length remaining
+	LSH	6,-7		; Convert to full blocks left
+	MOVE	15,0		; Compute current block number
+	LSH	15,-7
+	ADDI	15,1
+	JUMPZ	6,0(16)		; No full blocks left. Exit+0
+	ADDI	6,0(15)		; Some left. Find trailing block number
+	HLRZ	17,BLKNUM	; Fetch current block number
+	CAIG	15,0(17)	; Is buffer outside transfer range?
+	CAIGE	6,0(17)
+	JMP	3(16)		; Yes (or it doesn't exist). Exit+3
+	CAIE	6,0(17)		; Maybe. Is it trailing block?
+	JMP	2(16)		; No; must be interior. Exit+2
+	TRNN	4,177		; Yes. Will some be transfered?
+	JMP	3(16)		; No. Exit+3
+	JMP	1(16)		; Yes. Exit+1
+
+	SUBTTL	Input Data Transfer Subroutines--FLUSH
+;
+;	FLUSH--Subroutine to update the disk from the intermediate
+;	buffer if the buffer has been modified.  No parameters; Rs 7 and
+;	10 are used as scratch.  Link by R16.
+;
+FLUSH:	TLNN	5,DIRTY		; Is buffer dirty?
+RET16.:	JMP	0(16)		; No. No need to write it then
+	HLRZ	7,BLKNUM	; Yes. Fetch its disk block number
+	JUMPZ	7,0(16)		; Null. How odd. Just leave
+	JSP	17,FIND		; Valid. Tell TOPS-10 where to go
+	USETO	0(7)
+	MOVEI	7,-1(5)		; Build I/O list
+	TLNZ	5,TRUNC		; Is this possibly < 200 words?
+	JMP	SMALBF		; Yes. Figure out how many
+	HRLI	7,-200		; No. Use full amount
+PUTOUT:	MOVEM	7,IOLST
+	JSP	17,IOOP		; Now write the block
+	OUT	IOLST
+	AOSKP	BLKNUM		; Success. Increment block counter
+	JMP	DSKERR		; Failure. Get out fast
+	TLZ	5,DIRTY		; Block is now clean
+	JMP	0(16)
+;
+SMALBF:	MOVN	17,EOF		; Remaining length is low order seven
+	ORI	17,-200		; bits of negative EOF pointer
+	HRLI	7,0(17)		; (Try it if you don't believe me!)
+	JMP	PUTOUT		; Now write it normally
+
+	SUBTTL	Input Data Transfer Subroutines--FIND and IOOP
+;
+;	FIND--Subroutine to locate a particular disk block.  On entry,
+;	R7 contains the relevant number and 0(17) is a USETI or USETO
+;	(for input and output, respectively) instruction (without a
+;	channel number).  R10 is used as scratch.  On exit, TOPS-10
+;	has been informed.  Link by 1(17).
+;
+FIND:	HRRZ	10,BLKNUM	; Fetch next block number
+	CAIN	7,0(10)		; Is it the requested one?
+	JMP	1(17)		; Yes. No system call needed
+	HRRM	7,BLKNUM	; No. It will be soon...
+;
+;	IOOP--Subroutine to execute an I/O instruction that contains
+;	a channel number as its AC field.  On entry, 0(17) contains
+;	the relevant I/O instruction (with no channel number specified).
+;	R10 is used as scratch.  Link by 1(17) if the instruction does
+;	not skip, by 2(17) if it does.
+;
+IOOP:	HLLZ	10,2		; Grab channel number
+	OR	10,0(17)	; OR in the rest of the instruction
+	XCT	10		; Do it!
+	JMP	1(17)		; Instruction did not skip. Exit+1
+	JMP	2(17)		; Instruction skipped. Exit+2
+
+	SUBTTL	WRBLK, WRBLKR - Write Blocks of Memory to a File
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	WRBLK (op code 3)--Write a sequential memory block to file	;
+;	WRBLKR (op code 4)--Write a random memory block to file		;
+;	See general I/O routines comments for calling sequences.	;
+;	(In order to avoid conflicts with the PASCAL I/O system,	;
+;	WRBLK has dropped the "R".  Yuch.)				;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+WBLK.:	JSP	13,OUTCHK	; Find file block for file
+	CAILE	12,16		; Do registers wrap around?
+	JMP	FRET		; Yes. Ungood
+	ADDI	12,ACS		; No. Point to A
+	MOVEI	13,CURSOR	; Use sequential file pointer
+BLSHUV:	MOVE	0,0(13)		; Fetch actual file pointer
+	JUMPM	0,FRET		; (object if negative)
+	HRLZ	3,0(12)		; Get output buffer location
+	TLNN	3,-20		; Is it in the registers?
+	JMP	FRET		; Yes. That's illegal
+	MOVN	4,1(12)		; No. Fetch negative block length
+	JSP	14,WRITE	; and write the block
+	HLRM	3,0(12)		; Update buffer pointer
+	CLEARM	1(12)		; No more to be written
+SVCRSR:	MOVEM	0,0(13)		; Update file cursor
+SKPOUT:	MOVEM	5,SWCHBF	; Restore switches
+	JMP	SKIP1.##	; and leave successfully
+
+
+WBLKR.:	JSP	13,OUTCHK	; Find file block and check output
+	CAILE	12,15		; The usual wrap around check
+	JMP	FRET		; No go
+	ADDI	12,ACS		; OK. Point to A
+	MOVEI	13,2(12)	; File pointer is in AC+2
+	JMP	BLSHUV		; Now just write a block
+
+	SUBTTL	WRWRD, WRWRDR - Write a Single Word to a File
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	WRWRD (op code 11)--Write a sequential word to file		;
+;	WRWRDR (op code 12)--Write a random word to a file		;
+;	Again, see the general I/O routine comments for calling se-	;
+;	quences.							;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+WRWRD.:	JSP	13,OUTCHK	; Again, check output
+	ADDI	12,ACS		; Point to A
+	MOVEI	13,CURSOR	; Do it sequentially
+WDSHUV:	MOVE	0,0(13)		; Fetch cursor
+	JUMPM	0,FRET		; (barf if negative)
+	MOVSI	3,0(12)		; Set output buffer in saved ACs
+	SETO	4,0		; Length is one
+	JSP	14,WRITE	; Write the word
+	JMP	SVCRSR		; Save the cursor and exit
+
+
+WWRDR.:	JSP	13,OUTCHK	; The usual output check
+	MOVEI	17,WDSHUV	; Write out the AC,
+	JMP	WRDRAN		; after random I/O setup
+
+	SUBTTL	Output Data Transfer Subroutines--OUTCHK, WRITE, EOFUP
+;
+;	OUTCHK--Subroutine to find a file block and insure that
+;	output is OK (analogously with INCHEK).  Link by R13 (a
+;	short but very deep subroutine).
+;
+OUTCHK:	JSP	14,BTNAB	; Find the file block
+	JMP	FRET		; 0 No can do. Leave fast
+	TLNZ	5,OUTOK		; 1 Is output OK?
+	JMP	0(13)		; Yes. Return
+	JMP	FRET		; No. Take a dive
+;
+;	WRITE--Subroutine to manage output operations for all four
+;	output functions.  On entry, the left half of R3 points to
+;	the user's output buffer; other registers are similar to
+;	those used for READ.  On exit, Rs 0 and 3 have been updated.
+;	Link by R14; sideways exit to FRET if anything proves amiss.
+;
+WRITE:	JUMPZ	4,0(14)		; If nothing to write, leave now
+	CLEARM	1+IOLST		; Something. Set up I/O list terminator
+	TRNN	0,177		; Are we at an even disk block boundary?
+	JMP	EVENBO		; Yes
+	JSP	15,BFSWAP	; No. Get required disk block into buffer
+	MOVE	7,0		; Compute starting buffer offset
+	ANDI	7,177
+	HRRI	3,0(5)		; Set up copy to starting address
+	ADDI	3,0(7)
+	SUBI	7,200		; Compute negative buffer tail length
+	CAMGE	7,4		; Is it more than total copy length?
+	MOVE	7,4		; Yes. Copy only what we should
+	SUB	4,7		; Compute negative length left
+	SUB	0,7		; Update file cursor
+	SUBM	3,7		; Compute first location not hit
+	dmovem	10,box.rg
+	movei	10,-1(7)
+	movei	11,3
+	jsr	blt.sm		; and copy required block
+	dmove	10,box.rg
+	TLO	5,DIRTY		; Buffer is now dirty
+	JSP	17,EOFUP	; Update end of file if needed
+	JUMPNM	4,0(14)		; If done, quit here
+	JSP	16,FLUSH	; Else, purge buffer (possibly avoid seek)
+EVENBO:	JSP	16,BLKCHK	; Any full blocks to write?
+	JMP	WRTAIL		; 0 No. Write partial one
+	JMP	BIGOUT		; 1 Yes; tail block needs no purge
+	TLZSKP	5,TRUNC+DIRTY	; 2 Yes; ditch internal block
+	JMP	BIGOUT		; 3 Yes. Buffer not affected
+	HRRZS	BLKNUM		; Clear out buffer number
+BIGOUT:	MOVEI	7,0(15)		; Fetch requested block number
+	JSP	17,FIND		; and point I/O system to it
+	USETO	0(7)		; 0 (to be executed)
+	MOVSI	7,177(4)	; 1 Compute negative word count of
+	TLZ	7,177		; blocks to write
+	HLR	7,3		; Compute starting address - 1
+	SUBI	7,1
+	MOVEM	7,IOLST		; and build I/O list
+	JSP	17,IOOP		; Now write the block
+	OUT	IOLST
+	JMP	OUTUP		; 0 Success
+	JMP	DSKERR		; 1 Failure. Give up early
+;
+OUTUP:	HLRO	17,7		; Now get negative length written and
+	SUB	0,17		; update file cursor
+	SUB	4,17		; and remaining length
+	HRRI	7,0		; Clear out right half junk to
+	SUB	3,7		; update output pointer
+	HRRM	6,BLKNUM	; Save next I/O system block
+	JSP	17,EOFUP	; Update end of file if needed
+WRTAIL:	JUMPNM	4,0(14)		; Again, duck if finished
+	JSP	15,BFSWAP	; Not done. Fetch current buffer
+	HRRI	3,0(5)		; Grab buffer address for BLT output
+	SETCM	7,4		; Compute last word hit
+	ADD	7,3		; (buffer+length-1)
+	dmovem	10,box.rg
+	movei	10,(7)
+	movei	11,3
+	jsr	blt.sm		; and smash the buffer
+	dmove	10,box.rg
+	TLO	5,DIRTY		; which is now dirty
+	SUB	0,4		; Update file cursor
+	MOVEI	17,0(14)	; and set up return address for...
+;
+;	EOFUP--Subroutine to update the end of file marker and flag
+;	the buffer as truncated, if necessary.  Link by R17.
+;
+EOFUP:	CAMG	0,EOF		; Have we exceeded the old EOF?
+	JMP	0(17)		; No. Return
+	MOVEM	0,EOF		; Yes. This is now it
+	TLZ	5,TRUNC		; Assume full block
+	TRNZ	0,177		; Are we at a block boundary?
+	TLO	5,TRUNC		; No. Must be a short buffer
+	JMP	0(17)
+
+	SUBTTL	NOTEF - Return Current File Status
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	NOTEF (op code 17)--This subroutine returns the current status	;
+;	and pointers for a file.  Parameters:				;
+;									;
+;	E:	Channel number of the file to be noted			;
+;									;
+;	Return codes:							;
+;									;
+;	+0:	Error; registers are unchanged				;
+;	+1:	Success.  Registers will be as follows:			;
+;									;
+;	A:	Current sequential file pointer				;
+;	A+1:	Current end of file pointer				;
+;	A+2:	Status switches.  Bit 35 = 1 ==> input is OK; bit	;
+;		34 = 1 ==> output is OK.				;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+NOTEF.:	JSP	14,BTNAB	; Find the file block
+	JMP	FRET		; 0 Invalid channel number
+	JUMPZ	5,FRET		; 1 If not open, give up
+	CAILE	12,15		; File open. Will A+2 wrap around?
+	JMP	FRET		; Yes. Stop it now
+	ADDI	12,ACS		; No. Point to A
+	MOVE	6,CURSOR	; Return sequential pointer
+	MOVE	7,EOF		; Return EOF pointer
+	DMOVEM	6,0(12)
+	CLEAR	4,0
+	TLNZ	5,INOK		; Is input legal?
+	ORI	4,1		; Yes. Return switch
+	TLNZ	5,OUTOK		; Output legal?
+	ORI	4,2		; Yes. Return that switch
+	MOVEM	4,2(12)		; Return status switches
+	JMP	SKIP1.##	; Happily home
+
+	SUBTTL	NAMEF - Return Full Internal Name of Current File
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	NAMEF (op code 15)--This subroutine returns an internal name	;
+;	block for an open file.  Parameters:				;
+;									;
+;	A:	Pointer to a nine word block for the full name.  This	;
+;		may be as small as five words if no SFDs will be used.	;
+;	E:	Channel number of the relevant file.			;
+;									;
+;	Return codes:							;
+;									;
+;	+0:	Error (file not open, bad channel number, etc.)		;
+;	+1:	Name returned in block.					;
+;									;
+;	Registers are unchanged in either case.				;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+NAMEF.:	JSP	14,BTNAB	; Find the file block
+	JMP	FRET		; 0 Couldn't do. Give up
+	TLNN	5,OPENED	; 1 Open for something?
+	JMP	FRET		; No
+	ADDI	12,ACS		; Yes. Find A
+	MOVEI	3,0(1)		; Set up other file block pointer
+	MOVE	1,0(12)		; Point to user's internal block
+	JSP	17,USEPTH	; Generate the block
+	MOVEM	10,DEVICE	; Save the real disk
+	JMP	SKIP1.##	; That's it
+
+	SUBTTL	POINTF - Set Sequential File Pointer
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	POINTF (op code 20)--This subroutine is used to set the se-	;
+;	quential file pointer for a file.  Parameters:			;
+;									;
+;	A:	The new sequential file pointer for the file.		;
+;	E:	Channel number of the file whose pointer is to be set.	;
+;									;
+;	Returns:							;
+;									;
+;	+0:	Error.							;
+;	+1:	Success.						;
+;									;
+;	Registers are unchanged in either case.				;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+PINTF.:	JSP	14,BTNAB	; Find file block
+	JMP	FRET		; 0 Invalid channel number. Barf
+	ADDI	12,ACS		; 1 Find A
+	TLNZ	5,OPENED	; Is file open for something?
+	SKIPNM	2,0(12)		; Yes. Is new pointer negative?
+	JMP	FRET		; Yes (or file not open). Give up
+	MOVEM	2,CURSOR	; No. Store new pointer
+	JMP	SKIP1.##	; and cheer off
+
+	SUBTTL	FIOSVC - Just Return Next Available Channel (for Now)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	FIOSVC (op code 16)--This op is used to subdispatch in order	;
+;	to extend TENIO's capabilities.  The effective address is an	;
+;	index which dispatches to a collection of sub operators.	;
+;									;
+;	Currently there is only one suboperator:			;
+;	CHANNL (sub op 0)--This returns the next available (according	;
+;	to TENIO) channel number.  It is the channel that will be used	;
+;	if the user OPENFs a file and lets TENIO generate a channel.	;
+;	Parameter:							;
+;									;
+;	A:	On successful exit, this will contain the channel	;
+;		number for the next OPENF.				;
+;									;
+;	Return codes:							;
+;									;
+;	+0:	No more channels available.  Registers are unchanged.	;
+;	+1:	OK.  A contains the channel number.			;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+FOSVC.:	JSP	16,TNAB.##	; Find AC block and scratch
+	HRRZ	1,LUOAD.	; Fetch effective address
+	JUMPNZ	1,FRET		; Currently, only 0 is legal
+	LDB	12,APOIN.	; Fetch AC number
+	ADDI	12,ACS
+	JSP	17,CHNGET	; Find next channel number
+	JMP	FRET		; 0 No more channels. Quit
+	MOVEM	6,0(12)		; 1 Return channel number
+	JMP	SKIP1.##
+
+	SUBTTL	FLUSHF - Update External File Copy
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;									;
+;	FLUSHF (op code 13)--This subroutine updates the disk by	;
+;	writing the internal buffer to the disk (if it is dirty) and	;
+;	(optionally) updating the file RIB pointers.  Parameters:	;
+;									;
+;	A:	Option code, as follows:				;
+;		Bit 35 = 1 ==> file RIB should be updated		;
+;		Bit 34 = 1 ==> all open files should be updated		;
+;		Other bits are ignored.					;
+;	E:	Ignored if bit 34 = 1; contains the file number to be	;
+;		updated otherwise.					;
+;									;
+;	Returns:							;
+;									;
+;	+0:	Error (invalid file number, file not open, or file	;
+;		not open for output).					;
+;	+1:	Success.						;
+;									;
+;	Registers are not changed by this subroutine.			;
+;									;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+FUSHF.:	JSP	16,TNAB.##	; Find ACs and scratch
+	LDB	12,APOIN.	; Fetch AC
+	ADDI	12,ACS
+	MOVE	4,0(12)
+	TRNZ	4,2		; Is this flush all?
+	JMP	FLSHAL		; Yes
+	JSP	13,OUTCHK	; No. Make sure open for output
+	JSP	15,PURGE	; Update the disk
+	JMP	FRET		; 0 Trouble. Bitch lightly
+	JMP	SKIP1.##	; 1 Hunky dory. That was easy
+;
+;	Flush all files.  Step through the file blocks; flush all
+;	blocks that are currently open for output.
+;
+FLSHAL:	MOVEI	1,BLOCKS	; Find first block
+	HRLI	2,40		; (Channel 1, properly aligned)
+FSHLUP:	SKIPZ	5,SWCHBF	; Is this file open?
+	TLNN	5,OUTOK		; Yes. Is it for output?
+	JMP	FLNEXT		; No. Step to next one
+	JSP	15,PURGE	; Yes. File it as needed
+	JMP	FRET		; 0 Can't do. Quit early
+FLNEXT:	ADD	2,[40,,0]	; 1 Step to next channel
+	ADDI	1,BLKSIZ
+	CAIG	1,LSTBLK	; Over the end?
+	JMP	FSHLUP		; No. Do next file
+	JMP	SKIP1.##	; Yes. Skip return home
+;
+;	PURGE--Subroutine to update the disk for one file.  On entry,
+;	R1 points to the relevant file block, R2 contains the properly
+;	aligned channel number, R5 contains the file switches and buffer
+;	pointer, and R13 contains the update RIB switch.  On exit, SWCHBF
+;	has been updated.  Rs 7, 10, 16, and 17 get hit.  Link by 1(15)
+;	on success, by R15 if some kind of failure occurred.
+;
+PURGE:	JSP	16,FLUSH	; Clear out the TENIO buffer
+	MOVEM	5,SWCHBF	; and say so
+	TRNN	4,1		; Is RIB update required?
+	JMP	1(15)		; No. Leave
+	HLLZS	BLKNUM		; Yes. Don't count on next block
+;
+;	Again, Tymshare doesn't support SVC FILOP., but the CHANIO
+;	equivalent is virtually identical.
+;
+	hlrz	0,2		; Find the channel number
+	lsh	0,-5
+	hrli	0,.chvrb	; Now update the RIB
+	chanio	0,0		; (equivalent to update RIB FILOP.)
+	jmp	0(15)		; 0 Can't do. Abort flush call
+	JMP	1(15)		; 1 Success. Leave normally
+;
+;	And the end of it all.
+;
+	LIT			; Pool them
+	END
+    !
