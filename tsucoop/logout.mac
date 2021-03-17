@@ -1,0 +1,1440 @@
+TITLE	LOGOUT - program to log off the TYMCOM-X system
+tymver==47	; tymshare version
+tymfix==2	; tymshare bugfix
+
+if2 <printx License needed: WC OP SY ST HF JL>
+;Ver 47.2: 5/7/86 - Don't loop forever if UFD interlock is busy.
+;		Output correct program name on "KJOB n,n".  /JMS
+;ver 47.1: 12/1/82 - Don't die if running a pre-inactivity logout monitor. /TLC
+;ver 47:   7/15/82 - Remove call to RLSLDB.  Print message when logout
+;	is due to inactivity timeout.
+;ver 46:   8/17/81 - doesn't screw users with files larger than 400000
+;ver 45.1: 11/28/80 - now sends yellow ball after output messages
+;ver 45:   9/25/80 - added call to RLSLDB to release spare LDB,
+;		also added update to UFD cell for last logout
+;ver 44.1: 7/10/80 - removed potentially offensive messages ("kill...")
+;ver 44:         - allows multiple job#s in argument /WRS
+;ver 43.4: 3/04/80 - changed to make unabbreviated commands work /WRS
+;ver 43.3: 2/12/80 - changed to know about HANG knowing about FD's /WRS
+;ver 43.2: 2/7/80 - changed to kill children /WRS
+;ver 42.3: 10/15/79 - changed to never INIT TTY: /WRS
+;ver 41: 2/24/79 - added ALP facility (see logoff uuo) /WRS
+;ver   : 5/?/78 to HACK everything into lower case for APL users! /WRS
+;edit sep 76 aaa convert to pure stream acct'g. ";-" identifies
+;edited 7/16/73. second entry point added to suppress printouts
+;w.weiher,n.latham,nov 71
+
+;copyright (c) 1969, 1970 by digital equipment corporation, maynard mass
+
+	TWOSEG
+jobver=137
+loc jobver
+xwd tymver,tymfix		; version number
+	RELOC	400000
+
+;parameters from commod.mac
+
+ribppn==1
+ribnam==2
+ribext==3
+ribatt==4
+  owsprv==3		;size of owners access code field
+  ownprv==2		;rightmost bit of owners access code field
+ribsiz==5
+ribver==6
+ribalc==11
+ribft1==13
+riblog==ribft1
+ribmta==15
+ribufd==16
+ribqtf==22
+ribqto==23
+ribqtr==24
+ribusd==25
+ribsts==17
+  riplog==400000
+
+mntcnt==10000		;bit in return from dskchr uuo if mount count=0
+usrtal==1		;index in dskchr return for blocks left on str for user
+.upsaf==20000		;bit in dskchr ac return for single access str
+
+;end of parameters from commod.mac
+
+phonly==200000		; force physical only
+
+; accumulator definitions
+
+	f=0			;flag register
+	a=1			; a thru d are general purpose...in particular,
+	t1=a
+	b=2			; lookup's and enter's are done here.
+	t2=b
+	c=3
+	t3=c		;-
+	d=4
+	e=5
+	calc=6			;-
+	job=calc
+	t=7
+	s=10			;contains index in strtab of current str
+	wd=11
+	m=12			;for messages
+	n=13			;for number typeouts
+	n1=14			;ditto
+	r=15			;radix for radix printer
+	ch=16			;for characters
+	p=17			;pushdown list pointer
+
+;device channel definitions
+
+	ufd=1			;to read the user's ufd
+	dsk=3			;to delete files, etc.
+
+deb==0
+
+;lud information (logout with tru control and gfd)
+
+ludhsh==^d887	;hash for lud
+
+laun==0	;offset for aun
+llink==2	;link
+lbits==2	;bits
+ ltrub==(1b4)	;tru control
+ lcspb==400	;cusp to run
+lhun==4	;hashed user name
+lscn==5		;cusp to run (if present)
+
+lfsnam==5	;file structure name
+
+array com,name[2],buf[200]
+
+integer hshblk,hshnam,osppg,strptr,strnum
+
+		;the gettab uuo is new in monitor 3.19 and works as follows:
+		;calling sequence:	calli ac,gettab
+		;			error return
+		;			normal return
+		;entry conditions:
+		;	rh of ac = encoded monitor table designator (see list below)
+		;	lh of ac =job number (lt 0 indicates current job)
+		;exit conditions:
+		;	on normal return ac contains value of requested table entry
+		;	on error return (ac)=-1 indicates you are not privileged to
+		;	execute this uuo but if contents of ac are unchanged it
+		;	indicates the specified table or job number did not exist.
+
+	;gettab table codes
+
+		jbtsts=0	;job status bits
+		jbtadr=1	;protection and relocation settings
+		prjprg=2	;project,programmer number
+		jbtprg=3	;last program name used in run or get command
+		ttime=4		;total run time for this job
+		jbtkct=5	;kilo-core-tics used by this job
+		jbtprv=6	;privilege table (not yet implemented in monitor 3.27)
+		jbtswp=7	;swapped out address and size, in-core protect time
+		opqptb==16	;value for gettab to get ppn of command area
+		opqpin==4	;index in table
+		opqstb==16	;value for file structure for commands
+		opqsin==15	;index in table
+		jbtrct==17	;table of disk blocks read by job number
+		jbtwct==20	;table of disk blocks written
+		jbtdct==777700	;mask for incremental blocks
+	segptr==15	;to find out number of jobs
+	cnftbl==11	;also
+	auntab==-23		;aun
+ldblog==-24		;supervisor info
+unm1==-22		;first half of user name
+unm2==-21		;second half of user name
+jlog==4		;bit which says we are logged in
+jacct==1	;jacct bit
+kjp==100	;kjob pending bit in jbtsts
+rstcmd==1000	;restricted command mode bit in jbtprv word
+prvtru==2000	;user has tru restriction
+;see 'acct' routine & 'gtab' table defining logout
+;	record written to the stream for the use of these
+;	gettab items:
+
+truget==-44	;return double precision tru's
+kctget==-45	;return double precision kilo-coore-ticks
+mcyget==-46	;gets d.p. micro cycles
+
+trutab==4	;singl prec. used by fndmod (stat & usage)
+auntab==-23	;aun
+bcstab==-13	;break chrs*size
+cintab==-7	;chrs in
+cnktab==-12	;connect time
+cottab==-10	;chrs out
+dlktab==-2	;lookups
+elptab==-11	;elapsed time*size
+enttab==-33	;enters
+joblin==-27	;job to line conversion
+logtab==-24	;login info from supervisor
+rcttab==17	;blocks read
+rmctab==-35	;remote characters
+rmstab==-34	;remote time
+sertab==-4	;enters*size
+sintab==-5	;blocks in*size
+slktab==-3	;lookups*size
+sottab==-6	;blocks out*size
+wcttab==20	;blocks written
+soktab==-37	;from soakem uuo
+jbtbet==-40	;bio elapsed time
+jbtbio==-41	;bio chrs
+
+datitm==11	;item number for date
+dattab==11	;table for date
+timitm==10	;item number for time
+timtab==11	;table for time
+staitm==17	;item number for states
+statab==11	;table for states
+jfyitm==26
+jfytab==11	;item and table for jiffies/sec
+jbtmpc==-47	;mapped pg count
+jbtpws==-50	;pgs to working set
+jbtpwh==-51	;double-precision: pws*size
+
+;flag bits - left half of accumulator f
+
+	truflg==2	;this user under tru control and aun#ppn
+	trudir==4	;user under tru control and aun=ppn
+	nttyf=10	;no tty available?!
+	diruse==20	;directory in use by another user
+	inalog==400	;this is an inactivity logout
+	bpaf=10000	;set if stop at null in sixbp routine
+	filf=40000	;set to inhibit nsblks in acct'g record see "acct"
+
+;flag bits - right half of accumulator f - from tyil subroutine
+
+	lstf=1		;list file directory
+	savf=2		;save this file
+	prtf=4		;protect this file
+	kilf=10		;k typed - kjob - delete all unprotected files
+	itmf=20		;itemized discussion of files
+	dleet=40	;delete all files
+	save=100	;save all files
+
+
+;define special character codes
+
+	space=40	;space
+	cr=15		;carriage return
+	lf=12		;line feed
+	esc=33		;escape
+	altmd=175	;alt-mode
+	langlb=74	;left angle racket
+	ranglb=76	;right angle bracket
+
+extern jobsa,jobrel
+
+
+;misc parameters
+
+	ttysiz=26
+	dsksiz=203	;for core management
+	asscon=20000	;for opr test
+	dvavl=40	;ditto
+	eof=20000	;end-of-file status bit (for statz's and stato's)
+;OPDEFs and such
+opdef	pjrst  [jumpa 17,]
+opdef	auxcal [042b8]
+opdef	chanio [043b8]
+opdef	setlic [calli -10]
+opdef	setprv [calli -11]
+opdef	setjal [calli -21]
+opdef	dismis [calli -23]
+opdef	hang   [calli -32]
+opdef	intadr [calli -33]
+opdef	intenb [calli -34]
+opdef	intass [calli -36]
+opdef	settim [calli -37]
+opdef	tinass [calli -42]
+opdef	putsar [calli -62]
+opdef	logoff [calli -130]
+opdef	evict  [calli -134]
+opdef	daytim [calli -143]
+
+;define intadr stuff for setting up output wait & timer interrupts
+;/aaa
+
+.iaclr==4
+.iaree==2
+.iaiow==3
+.iatim==4
+.iarom==4
+gobbl==7
+ch1==1
+ch2==2
+ch3==3
+ch1msk==1b1
+ch2msk==1b2
+ch3msk==1b3
+integer sav1,sav2,sav3
+array intvec[6]
+intrvl==^d30		;gobbler output only after this much time
+			;spent in i/o wait.
+
+ufdgil==^d360	;number of times to try for interlock
+ulkstr==6	;struuo code to lock a str
+uclstr==7	;code to unlock
+
+gobnam==2
+gobppn==1
+gobjob==0	;positions for args in gobstr uuo
+
+maxfs==^d14
+
+exllen==32
+
+exlppn==ribppn
+exlnam==ribnam
+exlext==ribext
+exlsiz==ribsiz
+exlatt==ribatt
+exlalc==ribalc
+exlqtr==ribqtr
+exlqtf==ribqtf
+exlqto==ribqto
+exlusd==ribusd
+exlsts==ribsts
+exltru==31	;accumulated tru count for tru limit
+
+gtlecs==100000		; bit in GETLCH: cmd avail for rescan
+auxils==47		; input char line mode (skip)
+auxcib==6		; clear input buffer
+auxilw==46		; input char line mode (wait)
+.gtaun==-23		; gettab tables
+.gtsts==0
+.gtprv==6
+.gtnam==3
+.gtunm==-22
+.gtun1==-21
+.gtlic==-20
+.gtina==-55		; inactivity timeout
+inahit==(1b0)		; running logout because of inactivity timeout
+pvacts==1b22		; me big account supervisor (grunt)
+pvtymp==1b21		; tymshare propietary user (inhouse)
+LIC.WC==400000
+.fsdsl==1		;function to define new search list
+SUBTTL	Start of program
+
+stpt:	tdza f,f	;clear f on normal entry
+	movsi f,nttyf	;here from exit call, no tty output
+	reset		;reset i/o
+	hrroi	a,.gtina	;get inactivity logout word
+	gettab	a,
+	 jrst	inano		;pre-inactivity logout monitor
+	tlnn	a,inahit	;logout being run as a result of inactivity?
+	jrst	inano
+	tlo	f,inalog	;yes, indicate why logout being run
+	tlz	f,nttyf		;ok to do tty output if TTY attached
+inano:	getlin a,
+	tlnn a,-1	;TTY attached?
+	 tlo f,nttyf
+	move p,pdp		;set up push down list
+
+	tlne f,nttyf		; was he run at start+1
+	  jrst killme		;   don't bother rescanning
+	seto a,
+	getlch a		; find out if cmd avail for rescan
+	tlnn a,gtlecs
+	  jrst killme		; must have been run by uuo
+	rescan
+	setz e,			; clear command
+	seto d,			; initialize mask
+	hrroi a,auxils		; auxcal to get char line mode (skip)
+	movei b,6		; allow six chars of command
+	move c,[point 6,e]	; obtain byte pointer
+cmd0:	auxcal a,ch		; eat the command used to run us
+	  jrst killme
+	caig ch,100		; break on most non-alpha
+	  jrst cmdcmp
+	cail ch,140
+	  subi ch,40
+	subi ch,40
+	idpb ch,c		; save it in sixbit
+	lsh d,-6
+	sojg b,cmd0
+
+cmdcmp:	setca 	d,		; complement mask
+	move 	b,[-cmdcnt,,cmdtab]; get pointer to command table
+cmdchk:	move 	c,(b)
+	and 	c,d
+	camn 	c,e		; see if any matched the table
+	  jrst 	cmdii		; found a match in the table
+	aobjn 	b,cmdchk
+	pushj	p,cmdeat	; eat line - no matches
+	jrst	killme
+
+	; eat rest of line
+cmdeat:	auxcal 	a,ch		; get char
+	  jrst 	killme
+	cail 	ch,40		; break on ctrl
+	  jrst 	cmdeat
+	cain 	ch,15		; eat matching LF
+	  auxcal a,ch
+	  jfcl
+	popj	p,
+
+cmdii:	push	p,[-1]		; flag to killer that we're done
+	setzm	argflg#		; show that we haven't seen an argument
+
+cmdi:	setz	job,
+cmd1:	auxcal 	a,ch		; get char
+	  jrst 	killme		; wierd - ran out of chars
+	caie 	ch,","		; break on ,
+	 caige 	ch,40		; break on ctrl
+	  jrst 	cmdx
+	cain	ch," "		; ignore blanks (really)
+	  jrst	cmd1
+	cail 	ch,"0"		; could it be a number?
+	 caile 	ch,"9"
+	  jrst 	cmderr		; not a number!!
+	setom	argflg		; now we've seen an argument
+	imuli 	job,12		; decimal shift
+	addi 	job,-"0"(ch)
+	jrst 	cmd1
+cmdx:	cain 	ch,15		; cr?
+	  auxcal a,ch		; eat the lf
+	  jfcl
+	push	p,job		; save so we can do it later
+	cain 	ch,","		; if terminator was a "," - do it again
+	  jrst 	cmdi
+	; all done stacking - whole line has been read
+	; stack has job numbers followed by -1
+	; pop them off and kill them as we go
+	skipn	argflg		; if no arguments, just logout ourself
+	  jrst	killme
+popkil:	pop	p,job		; get next job number
+	jumpl	job,popkld	; all done
+	pushj	p,kaj		; kill it
+	jrst	popkil		; go back for more
+popkld: exit	1,		; all done
+	jrst	.-1
+
+cmdtab:	sixbit "LOGOUT"
+	sixbit "KJOB"
+	sixbit "BYE"
+cmdcnt=.-cmdtab
+
+cmderr: push	p,ch		; save the character
+	pushj	p,cmdeat	; eat the command line
+	pop	p,ch
+	cain	ch,"?"		; don't say error if a ?
+	  jrst	cmder1
+	push	p,ch
+	movei	m,[asciz '?illegal character "']
+	pushj	p,msg
+	pop	p,ch
+	pushj	p,ouch
+	movei	m,[asciz '" in command, ']
+	pushj	p,msg
+cmder1:	movei	m,[asciz 'use one of
+    LOGOUT
+    LOGOUT job#,job#,...job#
+']
+	pushj	p,msg
+	exit	1,
+	jrst	.-1
+
+; user has given command containing a job number...
+; the job number is in a - check it out...
+
+kaj:	pjob a,
+	camn job,a		; don't allow kill self
+	  jrst	[outstr [asciz "?this is job "]
+		move n,job
+		pushj p,decprt
+		popj p,]
+	jumple job,badjob	; neg or zero is no-no
+	hrlz	a,job		; gettab [<job>,,0] - JBTSTS
+	ifn .gtsts,<hrri a,.gtsts>
+	gettab	a,
+	  jrst	badjob
+	tlnn	a,jlog		; does job exist?
+	  jrst  badjob
+
+; now we've established that the job exists, see if user is allowed
+; to hang it...
+
+	trne	a,kjp		; if kjob pending - don't allow nesting
+	  jrst	[movei	m,[asciz "?frame "]
+		pushj 	p,msg
+		ldb 	n,[point 12,job,35]
+		pushj	p,decprt
+		movei	m,[asciz " not logged in"]
+		pushj	p,msg
+		pushj	p,crlf
+		popj 	p,]
+
+	hrroi	c,.gtprv	; privs (acct sup)
+	gettab	c,
+	  halt .
+	hrroi	b,.gtaun	; my user's aun
+	gettab	b,
+	  halt	.
+	hrl	a,job		; other user's aun
+	hrri	a,.gtaun
+	gettab	a,
+	  jrst	badjob		; job went away?
+	xor	a,b
+	trne	c,pvtymp!pvacts
+	  jumpe	a,killer	; if aun's are equall - okay for
+				; tymshare user or acct sup'd user...
+	trne	c,pvacts	; if gan's are equall - okay for
+	 tlne	a,-1		; acct sup'd user
+	  skipa
+	   jrst killer
+	hrroi	b,.gtlic	; gettab for license
+	gettab	b,
+	  halt .		; sick!
+	trne	b,lic.wc	; wc user can do anything!
+	  jrst	killer
+
+; blew it - can't kill job requested
+
+badjob:	movei	m,[asciz "?bad frame number: "]
+	pushj	p,msg
+	ldb	n,[point 12,job,35]
+	pushj	p,decprt
+	pushj	p,crlf
+kilxit:	popj	p,
+
+jbtext:	movei	m,[asciz "frame "]
+	pushj	p,msg
+	ldb	n,[point 12,job,35]
+	pushj	p,decprt
+	movei	m,[asciz ", user "]
+	pushj	p,msg
+	hrl	n,job
+	hrri	n,.gtunm
+	gettab	n,
+	  popj	p,
+	pushj	p,sixprt
+	hrl	n,job
+	hrri	n,.gtun1
+	gettab	n,
+	  popj	p,
+	pushj	p,sixprt
+	movei	m,[asciz ", running "]
+	pushj	p,msg
+	SKIPE	N,PROGNM	;[47.2] If called from KILLJB,
+	 JRST	JBTXT1		; report what it was running, not "LOGOUT"
+	hrl	n,job
+	hrrI	n,.gtnam
+	gettab	n,
+	  popj	p,
+JBTXT1:	SETZM	PROGNM		;[47.2]
+	pushj	p,sixprt
+	aos	(p)
+	popj	p,
+
+; okay - now get confirmation (if required)
+
+killer:
+	jumpe	a,killok	; if aun's are equall - no confirm
+	movei	m,[asciz "Logout "]
+	pushj	p,msg
+	pushj	p,jbtext	; type job data
+	  jfcl			; eh!
+	movei	m,[asciz ", okay? "]
+	pushj	p,msg
+	hrroi	b,auxcib	; clear input buffer
+	auxcal	b,
+	hrroi	b,auxilw	; wait for line
+	auxcal	b,ch
+	  setz ch,
+	caile	ch,140
+	  subi	ch,40
+	move	c,ch
+eatlin:	caie	c,cr
+	 cail	c,40
+	  skipa
+	   jrst	eaten
+	auxcal	b,c
+	  setz c,
+	jrst	eatlin
+eaten:	caie	ch,"Y"
+	  jrst	kildie
+
+; now it has been confirmed, etc...
+; kill the sucker!!!
+
+killok:	pushj	p,killjb	; kill the job (or ask it to leave)
+	  jrst  kildie
+	popj	p,
+
+; something wrong, print error message
+
+kildie:	movei	m,[asciz "?error logging out frame "]
+	pushj	p,msg
+	ldb	n,[point 12,job,35]
+	pushj	p,decprt
+	pushj	p,crlf
+	popj	p,
+
+; this routine kills a job.  It will first ask it to leave (if it is so
+; enabled (evict, NTQ, etc.)).
+; call with JOB/ frame number
+
+	INTEGER PROGNM
+killjb:	HRL	N,JOB		;[47.2] Get name of program
+	HRRI	N,.GTNAM	;[47.2]  before the EVICT
+	GETTAB	N,		;[47.2]  or HANG uuos change
+	  SETZ	N,		;[47.2]  it to "LOGOUT"
+	MOVEM	N,PROGNM	;[47.2]
+	movsi	a,1
+	hrr	a,job
+	evict	a,		; give job "please go away" interrupt
+	  setz	a,		; not implimented - fake it
+	jumpe	a,kiljhg	; job not enabled for NTQ interrupt
+	movei	m,[asciz "[evicted "]
+	pushj	p,msg
+	jrst	killex
+kiljhg:	movsi	a,3		; force logout, hang by jobnumber
+	hrr	a,job
+	hang	a,		; el-fatal-o
+	  popj	p,		;  error return
+	movei	m,[asciz "[removed "]
+	pushj	p,msg
+killex:	pushj	p,jbtext	; FRAME job USER user RUNNING program
+	  jfcl			; eh!
+	movei	m,[asciz "]"]
+	pushj	p,msg
+	pushj	p,crlf
+	aos	(p)
+	popj	p,		; normal return
+
+; routine to print warning message if children exist
+
+.GTFTR==	-54		; frame tree info
+
+childk:	hrroi	a,.GTFTR
+	gettab	a,		; get child
+	  setz	a,
+	ldb	job,[point 12,a,35] ; get child frame #
+	jumpe	job,cpopj	; no more children
+	movei	m,[asciz "[inferiors will be disowned]"]
+	pushj	p,msg
+	jrst	crlf		; CRLF does popj p,
+
+killme:
+
+	movsi a,400000
+	movsi b,'TTY'
+	move c,[xwd tyob,tyib]
+
+	hrroi c,-20
+	gettab c,
+	  setz c,
+
+	hrroi a,jbtsts	; get jbtsts
+	gettab a,
+	  jrst dienow
+	tron a,kjp	; check (and set) kjob pending - if
+			; this is our second time through here
+			; it will still be set so logout immediately.
+	setjal a,
+	  jrst dienow	; if can't set KJP then must not support
+			; logoff uuo in this monitor!!!!
+	hrrz a,c	; throw away process license
+	hrl a,c		; keep whatever user originally had
+	setlic a,
+
+	hrroi b,52	; outstr auxcal (in case error)
+	setz a,		; run alp (if any) at addr+0
+	tlne f,nttyf	; unless no tty
+	  movsi a,1	; then run at start+1
+	logoff a,
+	  auxcal b,[asciz "?cant run alternate logout program
+"]
+	setlic c,	; restore license to process
+
+dienow: pushj p,childk		;kill all subordinate frames
+
+	movei b,^d20000	;try lots of times
+tryjal:	hrroi a,jbtsts	;get the job status bits
+	gettab a,
+	 jsp t,  [sojge b,tryjal	;try again
+		jrst errxit]	;complain & quit
+	tlz a,jlog	;reset logged in bit
+	tlo a,jacct	;and turn on jacct
+ife deb,<setjal a,	;do it
+	 jsp t,  [sojge b,tryjal	;try again
+		jrst errxit]	;complain,quit>
+
+
+	movsi	n,(sixbit .sys.)
+	devppn	n,200000	;get ppn for sys
+	  move	n,sysppx
+	movem	n,sysppn
+	move	n,[xwd opqpin,opqptb]
+	gettab	n,	;get ppn for queueing area
+	  move	n,pntppn
+	movem	n,cmdpp
+	pjob a,
+	movem a,thsjob	;set job number
+
+
+;set up software interrupts to prevent long output waits
+;in case cmd port backpressured or lots of junk in output circuit. /aa
+setint:	tlne f,nttyf		;if we have a tty, do these things
+	jrst log1		;cant if none
+	move a,[.iaclr+.iaree,,intvec]
+	intadr a,		;reset software int
+	jsp t,	errxit
+	hrloi a,(<.iaiow>b8+<ch2>b17)	;rh:=-1 for cmd port
+	tinass a,			;ch2 traps i/o wait
+	 jrst [hrroi a,gobbl	;send gobbler. job probably being hung,
+		auxcal a,	;so tinass fails. relieve any
+		jrst log1]	;existing backpressure
+	hrloi a,(<.iarom>b8+<ch3>b17)	;ch3 traps output room
+	tinass a,
+	 jrst [hrroi a,gobbl	;send gobblr on cmd port
+		auxcal a,	;tieve possible backpressure.
+		jrst log1]	;tinass fails..job probably being hung
+	move a,[<.iatim>b17+ch1]	;and timer timeout on ch1
+	intass a,
+	jsp t, errxit
+	setz a,
+	settim a,	;make sure no timer running
+	jfcl
+	move a,[ch1msk+ch2msk+ch3msk+1b0]	;enable all channels
+	intenb a,
+	jsp t, errxit
+
+
+	movei a,intch1
+	movem a,intvec+1	;set up trap vector in writeable
+	movei a,intch2		;memory at runtime
+	movem a,intvec+3
+	movei a,intch3
+	movem a,intvec+5
+
+
+log1:	getppn a,		;who called logout ?
+	jfcl
+				; with this [p,p] is present.
+	movem a,svpjpg		;save user's project,programmer number.
+	setzm nsblks	;no blocks so far
+	tlz f,filf	;just to make sure
+	setom strbuf	;start gettin his str's
+	hrroi a,jbtprv	;get rid of restricted command bit
+	gettab a,
+	 jrst nxtstr	;sommthing wrong
+	trz a,rstcmd
+	setprv a,
+
+	hrroi a,jbtprv
+	gettab a,
+	 jrst nxtstr	;must be something badly wrong, no prv info
+	trnn a,prvtru	;does this user have a tru budget?
+	jrst nxtstr	;no
+	move a,[staitm,,statab]
+	gettab a,
+	 jrst nxtstr
+	trnn a,100000
+	jrst nxtstr	;not in tru control period
+	hrroi a,trutab
+	gettab a,
+	 jrst nxtstr
+	movem a,intru#	;get tru's
+	hrroi a,auntab
+	gettab a,
+	 jrst nxtstr
+	came a,svpjpg
+	tloa f,truflg	;tru control, different directory
+	tloa f,trudir	;tru control, this directory
+	movem a,inaun#	;if not same directory save aun
+NXTSTR:	move a,[sixbit /DSKB/]
+	EXCH a,strbuf		;[47.2] STRBUF is -1 first time thru
+	CAMN A,[SIXBIT /DSKB/]	;[47.2] Tried DSKB already?
+	 JRST NOUFD2		;[47.2] Yes, don't loop forever
+	pushj p,lokstr		;get the interlock
+	 jrst NOSTR1		;can not set it, flag error, get next STR
+	movei a,17
+	hrli a,400000
+	movei c,00
+	move b,strbuf
+	open ufd,a
+	 jrst err2
+	open dsk,a
+	 jrst err2
+	tlz f,diruse	;reset in use flag
+	pushj p,chkus	;is it in use by another job?
+	 tlo f,diruse!filf	;set directory in use, some dir in use
+	pushj p,lkufst	;set to read ufd
+	tlne f,diruse	;if directory not in use by another
+	tlne f,trudir	;or tru control and aun=ppn, do lookup
+	lookup ufd,lookbf
+	 jrst noufd1	;not there
+	move a,lookbf+exlqto
+	movem a,qto	;save logged out quota
+	push p,nsblks	;save blocks
+	setzm nsblks	;accumulate for this str
+	tlne f,diruse	;if directory in use
+	jrst	[setom lookbf+exlusd	;must be tru control
+		jrst ufdtru]	;just update tru count
+	movsi a,(sixbit /*/)
+	movem a,lkarg+1
+	movem a,lkarg+2
+	move a,[-1000,,lkbuf]
+	movem a,lkarg
+	move a,[1b1+1b4]
+	movem a,lkarg+3
+	setzm lkarg+4
+nxtq1:	pushj p,lkset	;next file
+	 jrst finths		;done
+	pushj p,delchk		;delete if tmp
+	jrst nxtq1
+
+finths:	pushj p,delchk
+	pushj p,qlst		;give over quota msg if needed
+	pushj 	p,lkufst
+	lookup 	ufd,lookbf	;now get ufd again
+	 jrst 	noufd
+	movsi 	a,riplog	;some files, reset logged in bit
+	andcam 	a,lookbf+exlsts
+	move 	a,nsblks
+	lsh	a,-2
+	movem 	a,lookbf+exlusd	;set real used count
+ufdtru:	move 	a,intru
+	tlne 	f,trudir
+	addm 	a,lookbf+exltru
+	movei	a,20		;get gmt date/time
+	daytim	a,
+	movem	a,lookbf+riblog	;save date/time of last logout
+ufrn:	rename 	ufd,lookbf
+	 jfcl			;ignore if cant
+noufd:	pop p,a
+	addm a,nsblks		;increase total blocks seen
+noufd1:	pushj p,nlkstr		;unlock
+NOUFD2:				;[47.2] Done all STRs that LOGOUT knows about
+	jrst truchk		;go do accounting after checkin tru and gfd
+
+nostr:	pushj p,nlkstr		;so info not used on logout
+NOSTR1:	tlo f,filf		;our count is not really right, -1 in acounting
+	jrst nxtstr		;but try next anyway
+lkset:	skiple lkcnt
+	jrst lkset1	;have stuff in buffer
+	move t1,[33,,ufd]
+	chanio t1,lkarg		;refill buffer
+	popj p,		;cant
+	skipn lkcnt	;nothing to refill it with
+	popj p,		;yes.
+	movei t1,lkbuf
+	movem t1,lkbufp	;pointer to start of buffer
+lkset1:	move t1,lkbufp
+	move t2,(t1)
+	movem t2,uflnam	;name
+	movem t2,lookbf+exlnam
+	move t2,1(t1)
+	movem t2,uflext
+	movem t2,lookbf+exlext	;extension
+	move t2,2(t1)
+	camn t2,[-1,,400000]	;see if file too big to list by .chufd
+	  pushj p,lkrlsz	;yes--so find real size (return it in t2)
+	movem t2,uflnbl		;size
+	addm t2,nsblks
+	move t2,3(t1)
+	movem t2,uflsts		;status bits
+	addi t1,4		;point to next entry
+	movem t1,lkbufp
+	sos lkcnt		;finished with entry
+cpopj1:	aos (p)
+	popj p,
+
+;lookup files' sizes for files larger than 400000 blks, too big for .chufd
+lkrlsz:	movei t2,exllen		; length of block
+	movem t2,lkrlbk
+	move t2,(t1)		; name
+	movem t2,lkrlbk+exlnam
+	move t2,1(t1)		; extension
+	movem t2,lkrlbk+exlext
+	move t2,svpjpg		; ppn
+	movem t2,lkrlbk+exlppn
+	movei t2,400000		; in case of error -- set size to 400000
+	lookup dsk,lkrlbk
+	  popj p,		; error -- return 400000
+	move t2,lkrlbk+exlsiz	; file size in words
+	lsh t2,-7		; convert to DEC blocks
+	popj p,			; return
+
+array lkrlbk[exllen]		; extended lookup block files .gt. 400000 blks
+integer uflnam,uflext,uflnbl,uflsts,lkbufp
+array lkarg[10],lkbuf[1000]
+integer delnbl
+array delnam[4]
+
+errxit:	;let user know things are fouled up, and quit.
+	movei m,	[asciz /
+error in logout. please inform your tymshare representative/]
+	tlnn f,nttyf
+	pushj	p,msg
+	exit
+
+delchk:	skipn delnam		;anything to delete?
+	jrst delch1		;no
+	lookup dsk,delnam
+	jrst delch1
+	setzm delnam
+	rename dsk,delnam
+	jrst delch1
+	movn t1,delnbl
+	addm t1,nsblks
+delch1:	hlrz t1,uflext
+	move t2,uflsts
+	caie t1,'TMP'	;.tmp file?
+	trne t2,1b23	;or delte file?
+	skipa		;yes.
+	popj p,
+	hrlzm t1,delext
+	move t1,uflnam
+	movem t1,delnam	;to be deleted next time
+	setzm delppn
+	move t1,uflnbl
+	movem t1,delnbl
+	popj p,
+;Routines to get and release the UFD interlock
+;[47.2] Rewrote LOKSTR routine to give message on timeout
+
+LOKSTR:	movei s,ufdgil	;Try 360 times (6 minutes)
+LOKST1:	movei b,ulkstr	;code to lock it
+	move c,strbuf
+	move d,svpjpg
+	move a,[xwd 3,b]
+	struuo a,	;Set interlock
+	 SKIPA
+	jrst cpopj1	;set now
+	movei a,1
+	sleep a,	;Sleep for 1 second
+	SOJG S,LOKST1	;Try again
+	MOVE N,STRBUF
+	PUSHJ P,SIXPRT	;Name of structure = "DSKB"
+	MOVEI M,[ASCIZ /: UFD interlock busy too long, proceeding anyway
+/]
+	PUSHJ P,MSG
+	POPJ P,		;Error return from LOKSTR
+
+nlkstr:	movei b,uclstr	;clear code
+	move d,svpjpg
+	move c,strbuf	;str name
+	move a,[xwd 3,b]
+	struuo a,
+	 jfcl
+	popj p,
+
+chkus:	move b,[xwd segptr,cnftbl]	;number of jobs
+	gettab b,
+	 movei b,^d96	;failed, assume 96
+	movni b,-1(b)
+	hrlzs b
+chkus1:	move c,strbuf
+	movem c,gobuf+gobnam
+	move c,svpjpg
+	movem c,gobuf+gobppn
+	movei c,1(b)
+	camn c,thsjob	;is it this one?
+	jrst chkus2	;yes, don't check
+	movem c,gobuf+gobjob
+	movei c,gobuf
+	gobstr c,
+	 skipa		;ppn and job don't match or not in src lst
+	popj p,		;is in use by another job
+chkus2:	aobjn b,chkus1	;try more
+	jrst cpopj1	;no one using it
+
+;subroutine to type message if str whose index is in s is over its logged out quota
+
+qlst:	move a,nsblks
+	lsh a,-2	;convert to pages
+	camg a,qto	;si it over quota?
+	popj	p,		;no, exit
+	move	a,strbuf	;get name of str
+	pushj	p,sixbp		;type it
+	movei	m,[asciz . logged out quota .]
+	pushj	p,msg
+	move	n,qto	;quota out
+	pushj	p,decprt
+	movei	m,[asciz . exceeded by .]
+	pushj	p,msg
+	move	n,nsblks	;amount over
+	lsh n,-2	;convert to pages
+	sub n,qto	;amount over
+	pushj	p,decprt
+	movei	m,[asciz . pages.]
+	pushj	p,msg
+	pjrst	crlf
+
+lkufst:	movei	a,exllen-1	;set up for extended lookup of user's ufd
+	movem	a,lookbf	;length of argument list
+	move	a,mfdpp
+	movem	a,lookbf+exlppn	;ppn of ufd's
+	move	a,svpjpg
+	movem	a,lookbf+exlnam	;user's ppn is file name
+	movsi	a,(sixbit .ufd.)
+	movem	a,lookbf+exlext	;.ufd is ext
+	popj	p,
+
+
+truchk:	tlnn f,truflg	;is user tru control and aun#ppn
+	jrst acct	;no, go do accounting
+	movei a,16
+	movsi b,'SYS'
+	movei c,0
+	open dsk,a
+	 jrst acct	;can not get sys to look at lud
+	movsi a,'LUD'
+	movsi b,'SYS'
+	setzb c,d
+	lookup dsk,a
+	 jrst acct1	;remember to release
+	hrroi a,unm1
+	gettab a,
+	 jrst acct1
+	movem a,name
+	hrroi a,unm2
+	gettab a,
+	 jrst acct1
+	movem a,name+1
+	move a,[iowd 200,buf]
+	movem a,com
+	setzm com+1
+
+	move a,[555555555555]
+	move b,[361275431652]
+	move c,[612754316523]
+	move n,name
+	move n1,name+1
+	movei wd,0
+	pushj p,rnd
+	pushj p,rnd
+	pushj p,rnd
+	pushj p,rnd
+	xor c,b
+	move n,c
+	tlz n,400000
+	idivi n,ludhsh
+	movem n1,hshblk
+	xor a,c
+	jumpe a,acct1
+	movem a,hshnam
+	pushj p,fndusr	;find the user
+	 jrst acct1	;not valid
+	move a,buf+laun(wd)
+	exch a,svpjpg
+	movem a,osppg
+	move b,buf+llink(wd)
+	andi b,177	;b/words this lud entry
+	move a,buf+lbits(wd)
+	addi b,(wd)	;b/addr next lud entry
+	tlne a,ltrub	;tru budget present?
+	addi wd,1	;1 further for tru control
+	trne a,lcspb	;init file present?
+	addi wd,3	;filename,2 wds username
+	movem wd,strptr	;base for picking up structure quotas,names
+	subi b,lscn(wd)	;now calculate how many structures, at
+	idivi b,3	;3 words (name,quota in,qu out) per str
+	movem b,strnum
+trulp:	sosge strnum
+	jrst acct2	;finished
+	move wd,strptr
+	move b,buf+lfsnam(wd)
+	trz b,7777	;only 4 chrs
+	movem b,strbuf
+	movei a,16
+	movei c,0
+	open ufd,a
+	 jrst nxttuf	;get next str
+	pushj p,lokstr
+	 jrst nxttuf
+	pushj p,lkufst
+	lookup ufd,lookbf
+	 jrst nxttu1
+	setom lookbf+exlusd
+	move a,intru
+	addm a,lookbf+exltru
+	rename ufd,lookbf
+	 jfcl
+nxttu1:	pushj p,nlkstr
+nxttuf: movei a,3
+	addm a,strptr
+	jrst trulp
+acct2:	move a,osppg
+	movem a,svpjpg
+acct1:	release dsk,0
+	jrst acct
+
+;randomizer for has
+
+rnd:	add b,n
+	rotc n,-22
+	movei calc,5
+rnd1:	move d,b(wd)
+	mul d,[5*5*5*5*5*5*5*5*5*5*5*5*5*5*5]	;5^15
+	addm e,c(wd)
+	aoje wd,rnd2
+	movni wd,1
+	trne b,1
+	skipl c
+	movei wd,0
+	exch a,c
+rnd2:	sojg calc,rnd1
+	popj p,
+
+fndusr:	move a,hshnam
+	move b,hshblk
+	addi b,1
+srus1:	hrrzm b,usrblk#	;save for changing broadcast bits
+	useti dsk,(b)
+	input dsk,com
+srus0:	movei wd,0
+srusr:	camn a,buf+lhun(wd)
+	jrst cpopj1		;found
+nuser:	skipg b,buf+laun(wd)
+	jrst blklnk
+	move b,buf+llink(wd)
+	andi b,177
+	add wd,b
+	caile wd,177
+	popj p,		;lud is bad
+	jrst srusr
+
+blklnk:	jumpe b,cpopj		;invalid user
+	camg b,usrblk	;must always go forward
+	popj p,
+	jrst srus1	;set block numbeer and read
+
+;-edit sep 76 aa remove "getfct","append" ref's,replace with
+;-	call to new uuo "putsar" put stream acctng record type 23
+
+
+acct:	setzb	n,n+1		;first get rid of in-core temps
+	move	m,[xwd 5,n]	;pointer to zero data
+ife deb,<tmpcor	m,	;delete>
+	jfcl			;ignore error return
+	release ufd,0		;release ufd and dsk channels
+	release dsk,0
+	move a,[staitm,,statab]
+	gettab a,
+	 movei a,0
+	tlne a,1
+	jrst logfin	;no accouting if still auto-restart
+	move a,[datitm,,dattab]
+	gettab a,
+	 movei a,0
+	jumpl a,logfin	;or date still negative
+;-here was call to append pkg to get fact file,set date in entry.
+;-gettab logout record info & put into stmdat array:
+	movsi a,-gtblen
+gtblp:	hrro b,gtab(a)	;read accounting data
+	gettab b,
+	 setzb b,b+1	;default to zero (b+1 in case d.p.)
+	hlrz t,gtab(a)
+	trze t,(1b0)	;test & reset double prec flag
+	movem b+1,stmdat+1(t)
+	movem b,stmdat(t)
+	aobjn a,gtblp
+	move a,stmhed
+	movem a,stmdat
+	pjob a,
+	dpb a,[point 9,stmdat,17]
+	ldb a,[point 4,stmdat+stmlog,11]
+	dpb a,[point 12,stmdat,29]	;terminal type
+	move a,stmdat+stmaun
+	came a,svpjpg	;is aun same as ppn?
+	tlo f,filf	;no set flag to give -1 for blocks used
+	move a,nsblks
+	tlne f,filf
+	movni a,1	;someone else logged in
+	movem a,stmdat+stmflg
+
+	movsi a,777700
+	andcam a,stmdat+stmrct	;remove extra bits in
+	andcam a,stmdat+stmwct	;blocks read,written
+acctwr:	movei calc,stmdat
+	putsar calc,	;-put logout rec into stream
+	pushj p,acctf	;-fail,keep trying
+
+;-fall thru to logfin
+
+
+
+pruntm:	tlne	f,nttyf
+logfin: logout			;if no tty, then all done, logout
+	movei	m,inamsg
+	tlne	f,inalog	;is this an inactivity logout
+	pushj	p,msg		;yes, so inform user
+	dmove a,stmdat+stmtru	;a,b:=dp tru's
+	divi a,^d100		;convert to tru's * 10^2
+	idivi a,^d100		;now get whole and fract
+	move n,a
+	pushj p,decprt
+	pushj p,pdot
+	move n,b
+	pushj p,decpr2
+	movei m,trums
+	pushj p,msg
+	move a,stmdat+stmcnk	;get connect time
+	idivi a,^d3600		;hours in a
+	idivi b,^d60		;min in b, sec in c
+	move n,a
+	pushj p,decprt
+	pushj p,pcol
+	move n,b
+	pushj p,decpr2
+	pushj p,pcol
+	move n,c
+	pushj p,decpr2
+	pushj p,crlf
+
+	skipn stmdat+stmrms	;any remote periph charges??
+	jrst logfn1
+	movei m,[asciz /dispatch connect /]
+	pushj p,msg
+	move a,stmdat+stmrms
+	addi a,^d30	;round
+	idivi a,^d60	;to min
+	idivi a,^d60	;get hr and min
+	move n,a
+	pushj p,decprt
+	pushj p,pcol
+	move n,b
+	pushj p,decpr2
+	pushj p,crlf
+logfn1:	move a,[40,,^D5000]	;5 secs or orange ball
+	hiber a,
+	 jfcl
+	logout
+	halt
+
+;-acctf	 here if putsar fails. if err code returned
+;	is non-zero, msg to oper tty, msg to user tty, & return.
+;	zero error code means no system acctg, up for free.
+;	return immediately.
+
+
+acctf:	jumpe calc,cpopj ;calc=putsar err code. 0 means no acctg
+	movei m,[asciz/system error logout program/]
+	pushj p,msg
+	movei m,[asciz/
+logout bad putsar arguments. system problem. leave system up,
+notify pdp10 os group./]
+	setuuo m,
+	jfcl
+	popj p,	;return & finish, no logout record
+
+decpr2:	movei ch,"0"		;print at least 2 decimal digits
+	caig n,11		; (if less that 9, output a zero).
+	pushj p,ouch		;fall into decprt
+
+decprt:	skipa r,[12]		;decimal radix
+octprt:	movei r,10		;octal radix
+rdxprt:	idivi n,(r)		;the usual radix print routine.....
+	hrlm n1,0(p)
+	skipe n
+	pushj p,rdxprt
+	hlrz ch,0(p)
+	addi ch,"0"		;fall into ouch
+ouch:
+tyo:	tlne f,nttyf		;tty output impossible if no tty present.
+	popj p,
+	push p,s	;save for good measure
+	axochi=51	;auxcal outchi fn no.
+	hrroi s,axochi	;-1,,axochi (-1 for cmd port)
+	auxcal s,(ch)	;type the chr, do not block if no line present
+	pop p,s
+cpopj:	popj p,0
+
+;three little trap routines to keep us from waiting forever in tty output
+;in case circuit backpressured or slow..
+;interrupts are not enabled until after all tty input is finished.
+;therefore only output wait can fire ch2.
+;ch3 fires when backpressure relieved.
+
+intch2:	movem a,sav2	;here if logout goes into tty i/o wait
+	move a,secnds
+	settim a,	;set up ch1 to fire in awhile. already enabled
+	jfcl
+	move a,[ch2msk+0b0]	;now disable further tiow interrupts
+	intenb a,
+	jsp t, errxit
+	move a,sav2
+	dismis		;re-execute the tty instr (auxcal in tyo)
+
+intch1:	movem a,sav1
+	hrroi a,gobbl	;-1,,send gobbler function code
+	auxcal a,	;gbbble up the stuff which is blocking us
+	move a,sav1
+	dismis		;re-execute the tty instr. shouldnt block now.
+secnds:	xwd 1,intrvl
+
+intch3:	movem a,sav3
+	setz a,
+	settim a,	;kill timer so it doesnt cause gobbler
+	jfcl		;if backpressure releived before timeout.
+	move a,sav3
+	dismis
+
+msg:	hrli m,440700		;message printing routine.....
+msg1:	ildb ch,m		;m points to string of ascii characters
+	jumpe ch,cpopj		;null character ends string--**exit**.
+	pushj p,ouch		;output next character...
+	jrst msg1
+
+prspc:	movei ch,space		;print a space...
+	jrst ouch
+
+pcol:	movei ch,":"
+	jrst ouch
+
+pdot:	movei ch,"."		;print dot
+	jrst ouch
+
+crlf:	jsp m,msg		;print carriage return, line feed.
+	asciz /
+/
+sixbpa:	tloa	f,bpaf		;stop at first null
+sixbp:	tlz	f,bpaf		;output all 6 chars
+	move b,[xwd 440600,a]	;sixbit print routine....
+sixbp1:	ildb ch,b
+	tlne	f,bpaf
+	jumpe	ch,cpopj
+	addi ch,40		;convert sixbit to ascii
+	pushj p,ouch
+	tlne b,770000
+	jrst sixbp1		;print 6 characters from accumulator a
+	popj p,0
+
+sixprt:	push	p,a		; sixbit print - preserves a
+	move	a,n
+	pushj	p,sixbpa
+	pop	p,a
+	popj	p,
+
+;special message printing routines, messages, and stuff
+
+inamsg:	asciz	/
+autologout
+/
+trums:	asciz / tru
+terminal time: /
+
+err2:	pushj	p,nopnfs
+	jrst nostr
+
+
+err4:	movei	m,[asciz .?struuo failure
+.]
+	pushj	p,msg
+	jrst	acct
+
+
+nopnfs:	movei	m,[asciz .?cant open file structure .]
+	pushj	p,msg
+	move	a,b
+	pushj	p,sixbpa
+	pjrst	crlf
+
+ufdrer:	getsts	ufd,n		;get error status in n
+	trne	n,20000		;skip if not eof
+	popj	p,		;merely return if eof
+	movei	m,[asciz .
+?.]
+	pushj	p,msg
+	move	a,strbuf	;get name of str
+	pushj	p,sixbpa
+	movei	m,[asciz . ufd read error, status = .]
+	pushj	p,msg
+	pushj	p,octprt
+	pjrst	crlf
+
+
+
+;left half is index for placement into stmdat. rh is gettab item
+;	sign bit flags item as word 1 of double precision value
+
+gtab:	stmaun,,auntab
+	400000+stmtru,,truget	;hi order tru
+	;4 is low order tru
+	;5 is -1 flag if somebody else still logged in this ufd
+	400006,,kctget
+	;7 is low order kilo core ticks
+	10,,dlktab	;lookups
+	11,,slktab	;lookups*size
+	12,,sertab	;enter+renames*size
+	13,,sintab	;blocks read * size
+	14,,sottab	; blocks wr  * size
+	15,,cintab	;chars in
+	16,,cottab	;chars out
+	17,,elptab	;seconds elapsed * size
+	stmcnk,,cnktab	;seconds connect no detach
+	21,,bcstab	;br chars*size
+	stmrct,,rcttab	;blocks read
+	stmwct,,wcttab	;	written
+	stmlog,,logtab	;superv login info
+	25,,enttab	;useti useto's
+	stmrms,,rmstab	;rem periph time
+	27,,rmctab	;rem periph chars
+	30,,soktab	;prem charg cell
+	31,,jbtbet	;seconds elapsed block port io
+	32,,jbtbio	;block port chars
+	400033,,mcyget	;micro cycles
+	;34 is low micro cycles
+	35,,jbtmpc	;mapped page count
+	36,,jbtpws	;pages put in working set
+	400037,,jbtpwh	;pws*size hi order
+	;40 is jbtpwl low order pws*size
+
+
+
+gtblen==.-gtab
+
+;storage and stuff
+
+
+pdlsiz==	60		; big because of stacking killed jobs
+pdp:	xwd pdlsiz,pdl	;pushdown pointer is initialized to this.
+
+mfdppn:	xwd	1,1		;mfd ppn
+sysppx:	xwd	1,4		;system files ppn
+pntppn:	xwd	3,3		;spooling ppn
+
+	integer svpjpg,blkin,nsblks,ndfils,ndblks
+
+
+;-****************************stream record definitions*****
+
+stmtyp==42	;-only logout uses record type 42
+stmlen==gtblen+^d7	;logout record length=
+; gtblen + header +date-time + flagword + low order tru,kct,microcycles,jbtpwl
+
+array stmdat[stmlen]	;-record composed into here
+stmaun==2	;position of aun in rec
+stmflg==5
+stmrct==22
+stmwct==23
+stmlog==24	;supervisor login info
+stmrms==26
+stmcnk==20
+stmtru==3
+stmhed:	byte(9)stmtyp,0(18)stmlen
+	array tyob,tyib,ufdb,ufdhed[3],rdhed[2],ufdbuf[200],pdl[pdlsiz]
+;******************************************************
+
+integer thsjob,strbuf,qto,sysppn,cmdpp,tsav
+array gobuf[5],ovq,quotar,quotaf,quotao,exist,noacc[maxfs]
+array strtab,strtb1[maxfs+1],lookbf[exllen]
+
+mfdpp==mfdppn
+stkpp==pntppn
+
+	RELOC		;Go to lowseg
+	VAR		;INTEGER and ARRAY defs here
+delext=delnam+1
+delppn=delext+1
+lkcnt=lkarg+7
+	RELOC		;Back to hiseg
+LITS:	LIT
+lgoend:	end stpt
+     /@]x
