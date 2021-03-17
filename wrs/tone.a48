@@ -1,0 +1,249 @@
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;	      2 CHANNEL, 4 TONE, PRECISION TONE GENERATOR
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+;			      _____  _____
+;			      |    \/    |
+;	  3.667 MHz CLK OUT [01]	[40] Vcc +5V
+;            11 MHx XTAL #1 [02]	[39] WR*
+;	     11 MHz XTAL #2 [03]	[38] SAH1*
+;		     RESET* [04]	[37] SAH2*
+;	       (unused) +5V [05]	[36] A5
+;			CS* [06]	[35] A4
+;	       (unused) GND [07]	[34] DAC7
+;		    WDTACK* [08]	[33] DAC6
+;		   (unused) [09]	[32] DAC5
+;		    RDTACK* [10]	[31] DAC4
+;	  733.3 KHz CLK OUT [11]	[30] DAC3
+;			 D0 [12]	[29] DAC2
+;			 D1 [13]	[28] DAC1
+;			 D2 [14]	[27] DAC0
+;			 D3 [15]	[26] Vdd +5V
+;			 D4 [16]	[25] (unused)
+;			 D5 [17]	[24] A3
+;			 D6 [18]	[23] A2
+;			 D7 [19]	[22] A1
+;		    GND Vss [20]	[21] A0
+;			      |__________|
+;
+;
+;	Note 1: A5-A0 require 1K ohm series resistor to protect drivers
+;	from side effects of the "quasi-bidirectional" implementation.
+;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;	specifications
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;
+;	parameter		typical	units	remarks
+;	---------------------	-------	-----	------------------------
+;	Output sample rate:	 8.943	KHz	11.000 MHz XTAL
+;	Frequency resolution:	 0.136	Hz	0 to 4.471 KHz
+;	Output amplitude:	   255	P-P	at 0 dB
+;				   170	P-P	at -3.5 dB
+;				    85	P-P	at -9.5 dB
+;	SAH strobe width:	31.182	uS
+;	DAC setup time:		15.000	uS	DAC valid before SAH*
+;	DAC hold time:		 2.727	uS	DAC valid after SAH*
+;?	Write cycle time:	12.273	uS	CS* to trailing WDTACK*
+;?	Read cycle time:	13.637	uS	CS* to trailing RDTACK*
+;?	WR setup time:		 6.818	uS	CS* to WR* required
+;?	Address setup time:	 2.727	uS	CS* to adr required
+;?	Address hold time:	     0	nS	adr hold after DTACK* low
+;?	Read setup time:	   390	nS	data valid before RDTACK* high
+;?	Read hold time:		    40	nS	data valid after RDTACK* high
+;?	Write setup time:	   350	nS	WDTACK* low to data required
+;?	Write hold time:	     0	nS	data hold after WDTACK* high
+;	DTACK* pulse width:	   480	nS
+;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; register assignment
+; for external access, add 0 to register number for chan 1, 24 for chan 2
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; R0 = index
+; R1 = index (interrupt routine)
+; R2 = tone 1 pointer low byte
+; R3 = tone 1 pointer high byte
+; R4 = tone 2 pointer low byte
+; R5 = tone 2 pointer high byte
+; R6 = scratch
+; R7 = scratch (interrupt routine)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; RAM assignment
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; 32 = chan 1 tone 1 rate low byte
+; 33 = chan 1 tone 1 rate high byte
+; 34 = chan 1 tone 2 rate low byte
+; 35 = chan 1 tone 2 rate high byte
+; 36 = 1st mask
+; 37 = 2nd mask
+; 40 = chan 2 tone 1 rate low byte
+; 41 = chan 2 tone 1 rate high byte
+; 42 = chan 2 tone 2 rate low byte
+; 43 = chan 2 tone 2 rate high byte
+; 44 = 1st mask
+; 45 = 2nd mask
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; formula
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;	Ptr1 += Rate1;
+;	Ptr2 += Rate2;
+;	Sum = 42 * sin( Ptr1 * PI/32768 ) + 42 * sin( Ptr2 * PI/32768 )
+;	Out = ( Sum & Mask1 ) + ( Sum >> 1 & Mask2 )
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;      Mask1   Mask2	 dB
+;	00h	00h	----
+;	80h	7Fh	-9.5
+;	FFh	00h	-3.5
+;	7Fh	7Fh	 0
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; vectors
+;
+	org	000h
+	JMP	INIT	; reset vector
+
+	org	003h
+	JMP	INTSVC	; external interrupt vector
+
+	org	007h
+	RETR		; timer interrupt vector - not used
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; initialization routine
+;
+INIT:	CLR	A	; zero acumulator
+	MOV	R0,#63
+ZERO:	MOV	A,@R0	; zero all memory and registers
+	DJNZ	R0,ZERO
+	OUTL	P1,A	; zero to DAC
+	EN	I	; enable interrupts
+	ENT0	CLK	; output clock on T0
+	JMP	CHN1	; run background
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; interrupt service routine
+; total: 9 inst, 11 bytes, 14 cycles, 19.091 uS
+;
+INTSVC:	MOV	R7,A	; save register			; T=1,1
+	IN	A,P2	; get address			; T=1,2
+	ANL	A,#63	; mask register value		; T=2,2
+	MOV	R1,A	; save in index register	; T=1,1
+	JNT1	BUSWR	; check for write		; T=2,2
+
+BUSRD:	MOV	A,@R1	; fetch data			; T=1,1
+	MOVX	@R1,A	; write to bus (WR)		; T=1,2
+	MOV	A,R7	; restore register		; T=1,1
+	RETR						; T=1,2
+
+BUSWR:	INS	A,BUS	; get data, create RD (DTACK)	; T=1,2
+	MOV	@R1,A	; store in memory		; T=1,1
+	MOV	A,R7	; restore register		; T=1,1
+	RETR						; T=1,2
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; service channel 1
+; total: 34 inst, 37 bytes, 41 cycles, 55.91 uS
+;
+CHN1:	SEL	RB0	; select bank for channel 1	; T=1,1
+	MOV	R0,#32	; ptr to tone 1 rate low byte	; T=2,2
+	MOV	A,R2	; R2 := R2 + (32)		; T=1,1
+	ADD	A,@R0					; T=1,1
+	MOV	R2,A					; T=1,1
+	INC	R0	; ptr to tone 1 rate high byte	; T=1,1
+	ANL	P2,#191	; enable SAH for previous chan	; T=2,2
+	MOV	A,R3	; R3 := R3 + (33) + (C)		; T=1,1
+	ADDC	A,@R0					; T=1,1
+	MOV	R3,A					; T=1,1
+	INC	R0	; ptr to tone 2 rate low byte	; T=1,1
+	MOV	A,R4	; R4 := R4 + (34)		; T=1,1
+	ADD	A,@R0					; T=1,1
+	MOV	R4,A					; T=1,1
+	INC	R0	; ptr to tone 2 rate high byte	; T=1,1
+	MOV	A,R5	; R5 := R5 + (35) + (C)		; T=1,1
+	ADDC	A,@R0					; T=1,1
+	MOV	R5,A					; T=1,1
+	MOVP3	A,@A	; sin R5			; T=1,2
+	MOV	R6,A					; T=1,1
+	MOV	A,R3					; T=1,1
+	MOVP3	A,@A	; sin R3			; T=1,2
+	ADD	A,R6	; R6 := sin R3 + sin R5		; T=1,1
+	MOV	R6,A					; T=1,1
+	INC	R0	; ptr to 1st mask		; T=1,1
+	ANL	A,@R0					; T=1,1
+	XCH	A,R6					; T=1,1
+	RR	A					; T=1,1
+	INC	R0	; ptr to 2nd mask		; T=1,1
+	ANL	A,@R0					; T=1,1
+	ADD	A,R6					; T=1,1
+	ORL	P2,#255	; end SAH strobe		; T=1,2
+	OUTL	P1,A	; start DAC			; T=1,2
+	JMP	CHN2					; T=2,2
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; service channel 2
+; total: 34 inst, 37 bytes, 41 cycles, 55.91 uS
+;
+CHN2:	SEL	RB1	; select bank for channel 2	; T=1,1
+	MOV	R0,#40	; ptr to tone 1 rate low byte	; T=2,2
+	MOV	A,R2	; R2 := R2 + (40)		; T=1,1
+	ADD	A,@R0					; T=1,1
+	MOV	R2,A					; T=1,1
+	INC	R0	; ptr to tone 1 rate high byte	; T=1,1
+	ANL	P2,#127	; enable SAH for previous chan	; T=2,2
+	MOV	A,R3	; R3 := R3 + (41) + (C)		; T=1,1
+	ADDC	A,@R0					; T=1,1
+	MOV	R3,A					; T=1,1
+	INC	R0	; ptr to tone 2 rate low byte	; T=1,1
+	MOV	A,R4	; R4 := R4 + (42)		; T=1,1
+	ADD	A,@R0					; T=1,1
+	MOV	R4,A					; T=1,1
+	INC	R0	; ptr to tone 2 rate high byte	; T=1,1
+	MOV	A,R5	; R5 := R5 + (43) + (C)		; T=1,1
+	ADDC	A,@R0					; T=1,1
+	MOV	R5,A					; T=1,1
+	MOVP3	A,@A	; sin R5			; T=1,2
+	MOV	R6,A					; T=1,1
+	MOV	A,R3					; T=1,1
+	MOVP3	A,@A	; sin R3			; T=1,2
+	ADD	A,R6	; R6 := sin R3 + sin R5		; T=1,1
+	MOV	R6,A					; T=1,1
+	INC	R0	; ptr to 1st mask		; T=1,1
+	ANL	A,@R0					; T=1,1
+	XCH	A,R6					; T=1,1
+	RR	A					; T=1,1
+	INC	R0	; ptr to 2nd mask		; T=1,1
+	ANL	A,@R0					; T=1,1
+	ADD	A,R6					; T=1,1
+	ORL	P2,#255	; end SAH strobe		; T=1,2
+	OUTL	P1,A	; start DAC			; T=1,2
+	JMP	CHN1					; T=2,2
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; sine lookup table
+;
+; F(I) = SIN(T)
+; length of table: 256
+; multiplier: 42
+;
+	org	300h	; page 3
+
+ db 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,22,23,24,25
+ db 26,27,27,28,29,30,30,31,32,32,33,34,34,35,35,36,37,37,38,38,38,39,39
+ db 40,40,40,40,41,41,41,41,42,42,42,42,42,42,42,42,42,42,42,42,42,41,41
+ db 41,41,40,40,40,40,39,39,38,38,38,37,37,36,35,35,34,34,33,32,32,31,30
+ db 30,29,28,27,27,26,25,24,23,22,22,21,20,19,18,17,16,15,14,13,12,11,10
+ db 9,8,7,6,5,4,3,2,1,0,-1,-2,-3,-4,-5,-6,-7,-8,-9,-10,-11,-12,-13,-14
+ db -15,-16,-17,-18,-19,-20,-21,-22,-22,-23,-24,-25,-26,-27,-27,-28,-29
+ db -30,-30,-31,-32,-32,-33,-34,-34,-35,-35,-36,-37,-37,-38,-38,-38,-39
+ db -39,-40,-40,-40,-40,-41,-41,-41,-41,-42,-42,-42,-42,-42,-42,-42,-42
+ db -42,-42,-42,-42,-42,-41,-41,-41,-41,-40,-40,-40,-40,-39,-39,-38,-38
+ db -38,-37,-37,-36,-35,-35,-34,-34,-33,-32,-32,-31,-30,-30,-29,-28,-27
+ db -27,-26,-25,-24,-23,-22,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12
+ db -11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,0
+
+	END
