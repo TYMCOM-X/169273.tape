@@ -1,0 +1,656 @@
+begin	"CIOSIM"
+
+require "(sailib)sail.def" source!file;
+require "(sys)process.def" source!file;
+require processes;
+require pnames;
+require 512 new!items;
+
+define	Forever = {while true};
+
+define	Event (name) = {
+    item name;
+    simple procedure name}&{ini;
+	mkevtt( name );
+    require name}&{ini initialization };
+define	Process (name) = {
+    item name;
+    forward recursive procedure name}&{proc;
+    simple procedure name}&{sprout;
+	sprout( name, name}&{proc, STRINGSTACK(8)+PSTACK(16) );
+    require name}&{sprout initialization;
+    recursive procedure name}&{proc };
+
+define	FrLength = 0;
+define	P!! = 1;
+define	FrLabel = null;
+define	Field (nam,len) = {
+    redefine N!! = cvps(nam) & {Position};
+    evaldefine N!! = P!!;
+    redefine N!! = cvps(nam) & {Length};
+    evaldefine N!! = len;
+    redefine N!! = cvps(nam) & {Field};
+    evaldefine N!! = cvms(P!!) & " for " & cvps(len);
+    redefine P!! = P!! + len;
+    redefine FrLength = FrLength + len;
+    redefine L!! = null & ( cvps(nam)[1 to 1] lor '140 );
+    forc X!! _ 1 stepc 1 untilc len doc {
+	redefine FrLabel = cvms(FrLabel) & cvms(L!!); } endc
+};
+define	Group (nam) = {
+    redefine N!! = cvps(nam) & {Position};
+    evaldefine N!! = P!!;
+};
+define	Puorg (nam) = {
+    redefine N!! = cvps(nam) & {Field};
+    evaldefine N!! = {nam} & {Position to } & cvms(P!!) & {-1};
+    redefine N!! = cvps(nam) & {Length};
+    evaldefine N!! = {(} & cvms(P!!) & {-} & cvps(nam) & {Position)};
+};
+
+define	sigini = { redefine tracers = null };
+define  sigvar (nam) = {
+    boolean nam;
+    redefine tracers = cvms(tracers) & {
+	if nam then print("nam"); };
+};
+
+integer procedure Shift(
+    reference string Register;
+    integer RegisterLength;
+    integer DataIn );
+begin	"Shift"
+    while length( Register ) > RegisterLength
+	do lop( Register );
+    while length( Register ) < RegisterLength
+	do Register := "0" & Register;
+    Register := Register & DataIn;
+    return( lop( Register ));
+end	"Shift";
+
+string procedure Left(
+    string Register;
+    integer Count );
+begin	"Left"
+    return( Register[1 to Count] );
+end	"Left";
+
+string procedure Right(
+    string Register;
+    integer Count );
+begin	"Right"
+    return( Register[inf+1-Count to inf] );
+end	"Right";
+
+integer procedure Parity( string Data );
+begin	"Parity"
+    integer Sum;
+    Sum := 0;
+    while length( Data ) do Sum := Sum + lop( Data );
+    return( 1 land Sum );
+end	"Parity";
+
+integer procedure CvBin( string X );
+begin	"CvBin"
+    integer XB;
+    XB := 0;
+    while length( X ) do 
+	XB := ( XB lsh 1 ) lor cvd( lop( X ) );
+    return( XB );
+end	"CvBin";
+
+string procedure CvBStr( integer XB, Digits );
+begin	"CvBStr"
+    string X;
+    integer I;
+    X := null;
+    I := 1 lsh (Digits-1);
+    while I do begin
+	X := X & (if XB land I then "1" else "0");
+	I := I lsh (-1);
+    end;
+    return( X );
+end	"CvBStr";
+
+procedure Increment( reference string X; integer Digits );
+begin	"Increment"
+    X := CvBStr( CvBin( X ) + 1, Digits );
+end	"Increment";
+
+boolean	Trace;
+Event(MasterClock);
+Event(SlaveClock);
+
+forward recursive procedure Transceiver ( itemvar XmtClock, MyClock );
+
+Process(Master);
+Transceiver( SlaveClock, MasterClock );
+
+Process(Slave);
+Transceiver( MasterClock, SlaveClock );
+
+! ----------------------------------------------------------------------------
+	messages to transceivers
+-----------------------------------------------------------------------------;
+
+item	BAIL;			! enter bail;
+item	RESET;			! request reset;
+item	XMTCYCLE;		! cause transmitter to cycle;
+
+external procedure cause( itemvar Who, What; integer How (RESCHEDULE) );
+
+procedure CauseData( itemvar Who; integer Data );
+begin "CauseData"
+    own safe itemvar array Items[" ":"z"];
+    if not( arrinfo(Items,1) leq Data leq arrinfo(Items,2) ) then
+	Data := if Data then "1" else "0";
+    if Items[Data] = any then
+	new!pname( Items[Data] := new( Data ), """"&Data&"""" );
+    cause( Who, Items[Data] );
+end	"CauseData";
+
+! ----------------------------------------------------------------------------
+	frame field definitions
+-----------------------------------------------------------------------------;
+
+! define sync patterns
+;
+define	SyncLength = 6;		! size of sync string;
+define	NSync = {"110011"};	! normal sync string;
+define	GSync = {"101101"};	! gap sync string;
+define	ResetType = 0;		! message type 0 is link reset;
+define	DataType = 1;		! data message type;
+
+! define fields within frame
+	xxxPosition	bit position of field xxx within frame
+	xxxLength	length of field xxx in bits
+	xxxField	use with substring operator, eg.  FRAME[xxxField]
+	FrLength	length of frame
+;
+Field(	BSync,	SyncLength );
+Group(Msg);
+Field(	Fr#,	2  );
+Field(	Type,	5  );
+Field(	Data,	1  );
+Field(	Ack#,	2  );
+Field(	Parity,	1  );
+Puorg(Msg);
+Field(	ESync,	SyncLength );
+
+integer procedure Next ( integer Fr# );
+begin	"Next"
+    return( ( Fr# + 1 ) land ( 1 lsh Fr#Length - 1 ) );
+end	"Next";
+
+! ----------------------------------------------------------------------------
+	receive and transmit data routines
+-----------------------------------------------------------------------------;
+
+boolean procedure XmtDataAvail;
+begin	"XmtDataAvail"
+    return( true );
+end	"XmtDataAvail";
+
+string procedure XmtData;
+begin	"XmtData"
+    own integer Data;
+    Data := Data + 1;
+    return( CvBStr( Data, DataLength ) );
+end	"XmtData";
+
+procedure RcvDataAccept( string Data );
+begin	"RcvDataAccept"
+    print( crlf&"*RcvDataAccepted: ",Data,crlf );
+end	"RcvDataAccept";
+
+! ----------------------------------------------------------------------------
+	transceiver logic
+-----------------------------------------------------------------------------;
+
+recursive procedure Transceiver ( itemvar XmtClock, MyClock );
+begin "Transceiver"
+
+
+!	receiver variables;
+
+    sigini;
+    sigvar( AckVal );			! ack field contains valid fr #;
+    string  Fr#Expected;		! number of frame expected;
+    integer FrInProg;			! # bits before looking for sync;
+    sigvar( FrPres );		! Fr properly bracketed with sync;
+    sigvar( FrVal );			! all frame validation checks okay;
+    sigvar( GapDet );			! a gap has been detected (0's);
+    string  LastValFr#;			! number of last Val frame received;
+    sigvar( NeedGap );			! need gap before recognizing sync;
+    sigvar( GSyncDet );			! the start of gap sync code was seen;
+    sigvar( NSyncDet );			! the normal frame sync was seen;
+    sigvar( OutOfSync );		! looking for a sync following a gap;
+    sigvar( ParityVal );		! current frame has Val parity;
+    integer PhaseCnt;			! =0 1/2 frame following SyncDet;
+    string  RcvRegister;		! receiver shift register;
+    sigvar( ResDet );			! a reset frame has been detected;
+    sigvar( SyncDet );			! one of the 2 sync codes was seen;
+    sigvar( SyncFault );		! expected sync but didn't get it;
+
+    procedure RcvTrace;
+    if Trace then begin "RcvTrace"
+	print( crlf,RcvRegister," F#Exp=",Fr#Expected," " );
+	print( "LVF#=",LastValFr#," " );
+	if FrInProg then
+	    print( "FIP=",FrInProg," " );
+	print( " [",myproc,",Rcv]"&crlf,cvms(FrLabel)," " );
+	tracers;
+	print( crlf );
+    end     "RcvTrace";
+
+!	transmitter variables;
+
+    sigini;
+    integer AckPtr;			! buffer to get ack'd next;
+    integer FillPtr;			! buffer to fill next;
+    sigvar( LastFrWasGap );		! last frame sent was a gap;
+    sigvar( RAckReq );			! need to ack receipt of reset;
+    sigvar( Reseting );			! in process of reset handshake;
+    sigvar( ResetReq );			! Request reset;
+    sigvar( SendGap );			! Send a Gap;
+    sigvar( SendLast );			! Send Last buffer (again);
+    sigvar( SendNext );			! Send Next buffer;
+    integer SendPtr;			! buffer to send next;
+    sigvar( SendReset );		! Send Reset on next oppertunity;
+    sigvar( TBE );			! Transmitter Buffer Empty;
+    sigvar( TRE );			! Transmitter Register Empty;
+    define  NBuf = 1 lsh (Fr#Length-1);	! number of buffers;
+    string array XmtBuf[0:NBuf-1];	! buffers (even and odd);
+    integer XmtParity;			! accumulate transmit parity;
+    string  XmtRegister;		! transmit data holding register;
+
+    procedure XmtTrace;
+    if Trace then begin "XmtTrace"
+	print( crlf,"--------------------------------------------------"
+	    [length(XmtRegister)+1 to SyncLength+MsgLength],
+	    XmtRegister,
+	    " A=",AckPtr," S=",AckPtr," F=",FillPtr,
+	    " [",myproc,",Xmt]"&crlf,cvms(FrLabel)," " );
+	tracers;
+	print( crlf );
+    end     "XmtTrace";
+
+! ----------------------------------------------------------------------------
+	transceiver reset logic
+-----------------------------------------------------------------------------;
+
+    procedure XcvReset;
+    begin   "Reset"
+	Fr#Expected := CvBStr( 0,Fr#Length );
+	AckPtr := FillPtr := SendPtr := 0;
+    end     "Reset";
+
+! ----------------------------------------------------------------------------
+	receiver sync detection logic
+-----------------------------------------------------------------------------;
+
+    procedure CheckSync;
+    begin
+
+	GSyncDet :=
+	    not FrInProg
+	    and not NeedGap
+	    and equ( RcvRegister[ESyncField], GSync );
+
+	NSyncDet :=
+	    not FrInProg
+	    and not NeedGap
+	    and equ( RcvRegister[ESyncField], NSync );
+
+	SyncDet :=
+	    NSyncDet 
+		or
+	    GSyncDet;
+
+	GapDet :=
+	    CvBin( RcvRegister[MsgField] ) = 0
+	    and CvBin( RcvRegister[ESyncField] ) = 0;
+
+	SyncFault :=
+	    not FrInProg
+	    and not OutOfSync
+	    and not SyncDet;
+
+	if SyncDet then
+	    PhaseCnt := ( SyncLength + MsgLength ) / 2;
+	if not SyncDet then
+	    PhaseCnt := PhaseCnt - 1;
+
+	if SyncFault or GSyncDet then
+	    NeedGap := true;
+	if GapDet then
+	    NeedGap := false;
+
+	if SyncFault or GSyncDet then
+	    OutOfSync := true;
+	if NSyncDet then
+	    OutOfSync := false;
+
+	if FrInProg then
+	    FrInProg := FrInProg - 1 max 0;
+	if NSyncDet then
+	    FrInProg := SyncLength + MsgLength - 1;
+
+    end;
+
+! ----------------------------------------------------------------------------
+	receive frame validation logic
+-----------------------------------------------------------------------------;
+
+    procedure CheckFrame;
+    begin
+
+	FrPres :=
+	    SyncDet
+	    and equ( RcvRegister[BSyncField], NSync );
+
+	AckVal :=
+	    Next( CvBin( RcvRegister[Ack#Field] )) neq AckPtr;
+
+	ParityVal :=
+	    Parity( RcvRegister[MsgField] ) = 1;
+
+	ResDet :=
+	    FrPres
+	    and ParityVal
+	    and CvBin( RcvRegister[TypeField] ) = ResetType;
+
+	FrVal :=
+	    ResDet
+		or
+	    FrPres
+	    and AckVal
+	    and ParityVal
+	    and equ( RcvRegister[Fr#Field], Fr#Expected );
+
+	if ResDet then begin
+	    if CvBin( RcvRegister[DataField] ) = 0
+		then RAckReq := true
+		else ResetReq := false;
+	    XcvReset;
+	end;
+
+	if FrVal then begin
+	    LastValFr# := RcvRegister[Fr#Field];
+	    Increment( Fr#Expected, Fr#Length );
+	end;
+
+    end;
+
+! ----------------------------------------------------------------------------
+	receiver logic
+-----------------------------------------------------------------------------;
+
+    procedure Receiver ( integer RcvData );
+    begin "Receiver"
+
+	Shift( RcvRegister, FrLength, RcvData );
+				! collect received data in shift register;
+	CheckSync;		! check frame for sync;
+	CheckFrame;		! check criteria for valid frame;
+	RcvTrace;		! if required, trace receiver activity;
+	if myproc=Slave then	! in case of slave, repeat receive clock;
+	    Cause( MyClock, XmtCycle );
+
+    end "Receiver";
+
+! ----------------------------------------------------------------------------
+	transmit buffer fill logic
+-----------------------------------------------------------------------------;
+
+    procedure FillBuffers;
+    begin "FillBuffers"
+
+	TBE :=
+	    FillPtr = AckPtr
+	    or FillPtr = Next( AckPtr );
+
+	if XmtDataAvail and TBE then begin
+	    FillPtr := Next( FillPtr );
+	    XmtBuf[ FillPtr mod NBuf ] := 
+		CvBStr( FillPtr, Fr#Length ) &
+		DataType &
+		XmtData &
+		"$$" &		! $ = flag to substitute Ack#;	    
+		"?";		! ? = flag to substitute Parity;
+
+	end;
+
+    end "FillBuffers";
+
+! ----------------------------------------------------------------------------
+	transmit send data
+-----------------------------------------------------------------------------;
+
+    procedure SendBuffer;
+    begin "SendBuffer"
+
+	TRE :=
+	    ( if myproc=Master then true else PhaseCnt=0 )
+	    and length( XmtRegister ) = 0;
+
+	Reseting :=
+	    ResetReq
+		or
+	    RAckReq;
+
+	SendReset :=
+	    TRE
+	    and Reseting
+	    and LastFrWasGap;
+	
+	SendNext :=
+	    TRE
+	    and not Reseting
+	    and SendPtr neq FillPtr;
+
+	SendLast :=
+	    TRE
+	    and not Reseting
+	    and not SendNext
+	    and AckPtr neq FillPtr;
+
+	SendGap :=
+	    TRE
+	    and not SendReset
+	    and not SendNext
+	    and not SendLast;
+
+	if SendNext then begin
+	    SendPtr := Next( SendPtr );
+	    XmtRegister := NSync & XmtBuf[ SendPtr mod NBuf ];
+	    XmtParity := 1 - Parity( XmtRegister[BSyncField] );
+	    LastFrWasGap := false;
+	end;
+
+	if SendLast then begin
+	    SendPtr := Next( AckPtr );
+	    XmtRegister := NSync & XmtBuf[ SendPtr mod NBuf ];
+	    XmtParity := 1 - Parity( XmtRegister[BSyncField] );
+	    LastFrWasGap := false;
+	end;
+
+	if SendReset then begin
+	    XmtRegister := NSync & CvBStr( 0, Fr#Length ) &
+		CvBStr( ResetType, TypeLength ) &
+		CvBStr( if RAckReq then 1 else 0, DataLength ) &
+		CvBStr( 0, Ack#Length ) &
+		"?";
+	    XmtParity := 1 - Parity( XmtRegister[BSyncField] );
+	    LastFrWasGap := false;
+	    RAckReq := false;
+	end;
+
+	if SendGap then begin
+	    XmtRegister := GSync & CvBStr( 0, SyncLength + MsgLength );
+	    XmtParity := 1 - Parity( XmtRegister[BSyncField] );
+	    LastFrWasGap := true;
+	end;
+
+	case XmtRegister of begin
+	    ["$"] XmtRegister := 	! substitute Ack at appropriate time;
+		CvBStr( LastValFr#, Ack#Length ) &
+		XmtRegister[3 to inf];
+	    ["?"] XmtRegister := 	! substitute Parity at appropo time;
+		CvBStr( XmtParity, ParityLength ) &
+		XmtRegister[2 to inf]
+	end;
+	XmtParity := 
+	    XmtParity xor XmtRegister;
+
+    end "SendBuffer";
+
+! ----------------------------------------------------------------------------
+	transmit logic
+-----------------------------------------------------------------------------;
+
+    procedure Transmitter;
+    begin "Transmitter"
+
+	FillBuffers;		! fill buffers if room available;
+	SendBuffer;		! transmit appropriate data;
+	XmtTrace;		! if required, trace transmitter activity;
+	CauseData( XmtClock, lop( XmtRegister ) );
+
+    end "Transmitter";
+    
+! ----------------------------------------------------------------------------
+	transceiver body
+-----------------------------------------------------------------------------;
+
+    ResetReq := true;
+    Forever do begin
+	integer itemvar Msg;
+	Msg := interrogate( MyClock, WAIT );
+				! get message from link or simulator;
+	case cvn( Msg ) of begin
+	    [cvn(BAIL)] usererr(0,0,0,"B");
+	    [cvn(RESET)] ResetReq := true;
+	    [cvn(XMTCYCLE)] Transmitter;
+	    [else] Receiver( datum( Msg ))
+	end;
+    end;
+
+end	"Transceiver";
+
+procedure ProcessCommands;
+begin	"Commands"
+    define TraceFile = {"CIOSIM.LOG"};
+    itemvar PClock;		! current process acted on by commands;
+    ttyup(true);		! convert input to upper case;
+    setprint( TraceFile,"O" );	! open trace output file;
+    priset( myproc, 15 );	! assure we won't run until nobody else can;
+    Trace := true;		! initially do traces;
+    PClock := MasterClock;	! initially pointed at master;
+    Forever do begin "CommandLoop"
+	integer I,Cnt,Cmd;
+	Cnt := Cmd := 0;
+	outchr( "*" );		! command prompt;
+	do begin
+	    Cmd := inchrw;	! get command or digit;
+	    if "0" leq Cmd leq "9" then begin
+		Cnt := Cnt * 10 + Cmd - "0";
+		Cmd := 0;
+	    end;		! accumulate digits in Cnt;
+	    if Cmd = #esc then	! --- <esc>X becomes x --- ;
+		Cmd := '40 + inchrw;
+	end until Cmd;
+	Cnt := Cnt max 1;	! if no count, use default of 1;
+	case Cmd of begin "case"
+	    ["?"] outstr( "
+syntax:    [n]cmd
+	n - optional repeat counter, default is 1
+	cmd - single character command
+commands:
+	C	step master clock 
+	Sd	(silent) step clock sending data d (0,1,G=GSync,N=NSync)
+	$Ss$	(silent) step clock sending data string s
+	Xd	(execute) step clock sending data d (0,1,G=GSync,N=NSync)
+	$Xs$	(execute) step clock sending data string s
+	[	begin trace output to terminal
+	]	end trace output to terminal
+	{	begin trace output to file CIOSIM.LOG
+	}	end trace output to file
+	$B	enter BAIL from current process
+	$Pp	select process p for subsequent commands (M=Master,S=Slave)
+	$Q	terminate simulation
+" );
+	    ["C"] begin "C"
+		Trace := false;
+		for I := 2 upto Cnt do
+		    cause( MasterClock, XMTCYCLE );
+		Trace := true;
+		cause( MasterClock, XMTCYCLE );
+	    end "C";
+	    ["s"]["x"]["S"]["X"] begin "X"
+		own integer Tracing;
+		own string X;
+		Tracing := Cmd="x" or Cmd="X";
+		if Cmd="S" or Cmd="X"
+		    then X := inchrw
+		    else X := inchwl;
+		for I := 1 upto Cnt do begin
+		    own integer X1;
+		    string X2;
+		    X2 := X;
+		    while length( X2 ) do begin
+			X1 := lop( X2 );
+			Trace := 
+			    Tracing or length(X2)=0 and I=Cnt;
+			case X1 of begin
+			    ["0"]["1"] CauseData( PClock, X1 );
+			    ["G"] X2 := GSync & X2;
+			    ["N"] X2 := NSync & X2;
+			    [else] outstr(crlf&"? 0,1,G,N expected: "&X1&crlf)
+			end;
+		    end;
+		end;
+	    end "X";
+	    ["b"] cause( PClock, BAIL );
+	    ["p"] begin "p"
+		integer ProcName;
+		ProcName := inchrw;
+		case ProcName of begin
+		    ["M"] PClock := MasterClock;
+		    ["S"] PClock := SlaveClock;
+		    [else] outstr( crlf&"? M,S expected: "&ProcName&crlf )
+		end;
+	    end "p";
+	    ["["] case getprint of begin
+		["F"] setprint( TraceFile, "B" );
+		["S"] setprint( TraceFile, "O" );
+		[else] end;
+	    ["]"] case getprint of begin
+		["B"] setprint( TraceFile, "F" );
+		["O"] setprint( TraceFile, "S" );
+		[else] end;
+	    ["{"] case getprint of begin
+		["O"] setprint( TraceFile, "B" );
+		["S"] setprint( TraceFile, "F" );
+		[else] end;
+	    ["}"] case getprint of 
+		["B"] setprint( TraceFile, "O" );
+		["F"] setprint( TraceFile, "S" );
+		[else] end;
+	    ["q"] begin "q"
+		setprint( null,"T" );
+		call( 0,"EXIT" );
+	    end "q";
+	    [#cr] inchrw;
+	    [else] print( "
+?unrecognized command: ",Cmd&null,"
+" )	end "case";
+    end "CommandLoop";
+end	"Commands";
+
+begin	"MAIN"
+    ProcessCommands;
+end	"MAIN";
+
+end	"CIOSIM" $
+    p@!
