@@ -1,0 +1,971 @@
+module vue(stack=own(stack,2000),ccl) = begin
+
+macro iudent=(owns)$;
+macro spacect=(owns+1)$;
+macro tabwidth=(owns+2)$;
+macro indend=(owns+3)$;
+macro commentpos=(owns+4)$;
+
+external fef,cclstuff,writestring,Asktty,indent,nowait;
+external mark,physline,physpos,updatecursor,filblk,time,date,ttyzap;
+external scrmod,muline,ocline,flubfr,csnum,qreg,newcount,allmod,curbuf;
+external moveforward,moveback,quit,metar,metaq,clearline,defdsk,bufini;
+external metalb,metarb,metaz,metaquest,ToPrompt,ToStatus,FromStatus,physlin;
+external getppn,bfblk2,getstr,winit,therep,relcore,readch,readcc;
+external whitespace,wbreak,eolbreak,eolchxr,eoltype;
+external owns,hatuvl,modpos,silent,freestk,freezone;
+external ppn,writeloss,comchar,repcount,maxss,flush,curline,base;
+external reset,coresize,p,lowend,hend,hbot,lowptr,hptr,clearscreen;
+external physpos,goxy,scrsze,filescan,dorescan,setlab,discat;
+external buffers,open,enter,munchi,muncho,close,Getaun,lookup;
+external distbl,initdispatch,combuf,autoinc,autotime,autowrit,autoloss;
+external redisp,ttyidle,ctrll,getchxr,sosmod;
+
+bind kilsiz=5000;
+bind extra = 100;
+
+structure based[i] = (@.based+.i)<0,36>;
+structure odas[i] = .odas + .i; !based at zero array
+structure tdas[i,j]=.tdas+(.j-1)+(.i-1)*132;
+
+local qbp;
+own kilbuf[kilsiz],killen,killer,laskil,lasmov,kilptr;
+own pcolumn,dskbuf[132],dskbfh[4];
+
+global rptr,vecadr,cclflag;
+global XPrefix="?X";
+global MetaPrefix=#033;
+global EscValue=#033;
+global DelValue=#177;
+global bind maxcalls=100;
+global rstk[MaxCalls*2+2],callchar;
+global cstk[MaxCalls+1];
+
+map odas cstk;
+map odas rstk;
+
+global routine clrkbf = begin
+    killen_0;				! Size of KILL'd Text
+    kilptr_(kilbuf-1)<1,7>		! Pointer to same.
+    end;
+
+global routine appkbf = killer_1;	! Fake a kill command.
+
+global routine killforward(flag)  = begin local cc;
+    cc_getchxr(.lowend);
+    if .flag and (.killen lss 5*kilsiz) then begin
+	replacei(kilptr,.cc);
+	killen_.killen+1
+    end;
+    if eolBreak(.cc) then muline_1;
+    if .mark neq 0 and .lowend lss .mark
+     then mark_ .mark-1;
+    hbot_.hbot+1;
+    allmod[.curbuf]_1;
+    scrmod_1
+end;
+
+global routine delforward = killforward(0);
+global routine delbackward  = begin
+    moveback(1);
+    killforward(0)
+end;
+
+global routine setchar (i,q) = begin
+    local iabs,irel,tp;
+
+    if .i lss .lowend then iabs_.i
+	    else iabs_.i+.hbot-.lowend;
+
+    irel_(.iabs-5*((.iabs-1)/5))*7;
+    irel_36-.irel;
+    tp_.p+(.iabs-1)/5;
+    (.tp<0,36>)<.irel,7>_.q		! set the byte.
+end;
+
+global routine getc (p,i) = begin
+    local irel,tp;
+
+    irel_(.i-5*((.i-1)/5))*7;
+    irel_36-.irel;
+    tp_.p+(.i-1)/5;
+    return .(.tp<0,36>)<.irel,7> !return the byte
+end;
+
+global routine setc(p,i,c) = begin
+    local tp,irel;
+    irel_(.i-5*((.i-1)/5))*7;
+    irel_36-.irel;
+    tp_.p+(.i-1)/5;
+    (.tp<0,36>)<.irel,7>_.c
+end;
+
+global routine insertchar(i) =  begin
+    if (.hbot-.lowend) lss 25 then begin
+	register bufr; map based bufr;
+	coresize(512);				! get more core
+	bufr_.p;
+	if .hend gtr .hbot then decr i from (.hend/5)+1 to (.hbot/5)-1
+	    do bufr[.i+512] _ .bufr[.i];	!shift down
+	hend_.hend+2560;
+	hbot_.hbot+2560
+    end;
+    allmod[.curbuf]_1;
+    scrmod_1;
+    if .mark neq 0 and .lowend lss .mark then mark_ .mark+1;
+    lowend_.lowend+1;
+    setchar(.lowend-1,.i);
+    if .i eql #015 or (.i eql "?L" and .sosmod) then
+	(curline_.curline+1;muline_1)
+end;
+
+global routine SelfI = InsertChar(.comchar);
+
+global routine echord = begin local tp;
+    tp_readch();		! read a character
+    if .tp eql #177 or .tp eql #10 or
+       .tp eql .DelValue or .tp eql #7 then begin
+	flush_1;		!mark it as a loss.
+	writestring(plit asciz 'Aborted')
+    end;
+    writeloss(.tp);		! print it out.
+    return .tp
+end;
+
+global routine metalt = begin
+    moveback (.lowend-1);
+    muline_1;
+    scrmod_1;
+    if .curline lss 1 then curline_1
+end;
+
+
+global routine metagt = begin
+    muline_1;
+    scrmod_1;			!force a redisplay.
+    moveforward (.hend-.hbot);
+    curline_.scrsze-1
+end;
+
+global routine errstr (foo) = begin
+    ToPrompt(.foo);
+    repcount_1;
+    rptr_0;
+    csnum_0;
+    return 0
+end;
+
+global routine ctrlg = begin
+    silent_0;
+    return errstr(plit asciz'??Ooops??');
+end;
+
+routine fileread(tp,fileppn) = begin Local filblk[6];
+    (filblk+4)_.fileppn;
+    filblk_.defdsk;
+    if not (filescan(tp,filblk)) then
+	return errstr(plit asciz'Bad file name');
+    if not open(4,0,.filblk,dskbfh<0,0>) then
+	return errstr(plit asciz'No such device');
+    buffers(4,1,1,dskbuf);
+    if not lookup(4,filblk+1) then
+	return errstr(plit asciz'No such file.');
+
+    csnum_.csnum+1;
+    rstk[.rptr+1]_1;		       !repcount value.
+    rptr_.rptr+2;		       !push on stack.
+    cstk[.csnum]_-2;
+    freestk[.csnum]_.freezone;	       !bletch.
+    return 1
+end;
+
+global routine ctrlxt = begin local glbuffer[20],tp;
+    if .csnum geq MaxCalls then begin
+	errstr(plit asciz'Infinite Macro Recursion');
+	return ctrlg()
+    end;
+    flush_0;
+    ToPrompt(plit asciz'Take commands from file: ');
+    tp_(glbuffer-1)<1,7>;
+    getstr(.tp);
+    if .flush then return errstr(plit asciz'Flushed');
+    fileread(.tp,0)
+end;
+
+global routine exini =
+    fileread((plit asciz'DSK:VUE.INI'-1)<1,7>, Getaun());
+global routine metac = begin
+    if .csnum geq MaxCalls then begin
+	errstr(plit asciz'Macro Depth Overflow');
+	return ctrlg()
+    end;
+    if .newcount then callchar_readch();
+    if .callchar geq "A" and .callchar leq "Z"
+	then  callchar_.callchar+("a"-"A");
+    if .callchar lss "a" or .callchar gtr "z" then return
+	errstr(plit asciz'Illegal Macro Slot.');
+    newcount_0;
+    csnum_.csnum+1;
+    rstk[.rptr]_.callchar;
+    rstk[.rptr+1]_.repcount;
+    rptr_.rptr+2;
+    repcount_1;
+    cstk[.csnum]_qreg(.callchar); !start at the right q-register.
+    freestk[.csnum]_.freezone
+end;
+
+global routine metap = begin
+    if .csnum eql 0 then return;   !already popped to top.
+    freezone_.freestk[.csnum];     !restore this value
+    csnum_.csnum-1; !return from qregister.
+    rptr_.rptr-2;
+    repcount_.rstk[.rptr+1];
+    callchar_.rstk[.rptr];
+    base_#400;			! ^X	(.XPrefix)
+    comchar_"E";		!  E
+    newcount_0
+end;
+
+global routine zapmac = begin
+    if .csnum eql 0 then return; !already popped to top.
+    csnum_.csnum-1; !return from qregister.
+    rptr_.rptr-2;
+    repcount_1;
+    callchar_.rstk[.rptr];
+    base_#400;			! ^X	(.XPrefix)
+    comchar_"E";		!  E
+    newcount_0
+end;
+global routine ctrlu = begin local tp,count,flag;
+    flag_0;
+    count_.hatuvl;
+    while 1 do begin
+	tp_readch();			!read a character.
+	if .tp eql "?U" then count_.count*.hatuvl
+	    else if .tp lss "0" or .tp gtr "9" then begin
+		repcount_.count+1;	!readers rep ct.
+		comchar_.tp;		!readers command.
+		if .comchar eql .MetaPrefix then base_#200
+		    else if .comchar eql .XPrefix then base_#400
+			else base_0;
+		if .base neq 0 then comchar_readch();
+		newcount_1;
+		return			!back to the shadows again!
+	    end			!hack to blast reader away from ^u.
+	    else begin
+		if .flag eql 0 then (flag_1;count_0);
+		count_.count*10+.tp-48
+	    end
+    end
+end;
+
+global routine munchnnl (line,prompt,terminator) = begin local tc,i;
+    writestring(.prompt);
+    i_1;
+    while .i lss 132 do begin
+	tc_readch();			! read a character.
+	if .tc eql #177 or .tc eql #10 or .tc eql .DelValue then begin
+	    if .i leq 1 then exitcompound[2];
+	    i_.i-1;
+	    if .(.line+.i) gtr "?Z"
+		then goxy(.physpos-1,.physlin)
+		else goxy(.physpos-1,.physlin);
+	    clearline();
+	    .line_.i-1;
+	    exitcompound[2]
+	end;
+	if .tc eql .terminator then begin
+	    flubfr();
+	    return 1
+	end;				! if we are done.
+	if .tc eql 7 then return 0;	!lossage
+	if .tc eql "?Q" then tc _ readch();
+	writeloss(.tc);
+	(.line+.i)_.tc;			! set the char.
+	.line_.i;
+	i_.i+1
+    end					! the inner loop.
+end;					! the routine.
+
+
+global routine munchline(line,prompt,terminator) = begin local retval;
+    ToPrompt(plit asciz'');
+    retval_munchnnl(.line,.prompt,.terminator);
+    WriteLoss("$");
+    flubfr();
+    return .retval
+end;
+
+global routine ctrlxx = begin local tmark;
+    if .mark eql 0 then mark_1;		!if undefined it is 1.
+    tmark_.lowend;
+    if .mark gtr .lowend+.hend-.hbot then return metagt(); !bad mark
+    if .mark lss .lowend then moveback (.lowend-.mark);
+    if .mark gtr .lowend then moveforward (.mark-.lowend);
+    return (mark_.tmark)
+end;
+
+routine killtext(killflag) = begin local n,tp;
+    if .mark eql 0 then return errstr(plit asciz'Mark not set.');
+    if .lowend gtr .mark then ctrlxx();		! mark must be after lowend
+    killer _ 1;
+    if not(.laskil) then clrkbf();
+    n_.mark-.lowend;				!how much to kill.
+    if (.n+.killen) gtr 5*kilsiz then begin %kill buffer overflow%
+	if .killflag then begin %do we want to kill it anyway?%
+	    while 1 do begin    %ask the question until "Y" or "N"%
+		ToPrompt(plit
+		    asciz 'Text too large to save, Delete it?? (Y or N): ');
+		tp_readch();
+		Writeloss(.tp);
+		if .tp eql "Y" or .tp eql "y" or .tp eql "N" or .tp eql "n"
+		    then (Writestring(plit asciz' ..Deleting...');
+			  FromStatus();		! extra clear won't hurt.
+			  exitloop)
+		    else begin
+			ToStatus();
+			Writestring(plit asciz 'Please type "Y" or "N"');
+		    end
+	    end; %while 1%
+	    if .tp eql "Y" or .tp eql "y" then exitcompound else return
+	end
+	else begin %if not .killflag -- we are copying%
+	    ToPrompt(plit asciz 'Text too large to copy!');
+	    Return
+	end  %if .killflag%
+    end; %kill buffer overflow%
+
+    while 1 do begin
+	if .n eql 0 then exitloop;		%nothing to delete/copy%
+	if .hbot eql .hend then exitloop;	% bad mark %
+	if .killen lss 5*kilsiz then		% make sure within limits %
+	    replacei(kilptr,getchxr(.lowend));	% copy the character %
+	if .killflag then killforward(0)	% kill it? %
+		     else moveforward(1);	% no -- just skip it %
+	n_.n-1;					% decrement "to do" %
+	killen_.killen+1			% increment "done"  %
+    end;
+
+    if .killflag then ToPrompt(plit asciz 'Text Killed')
+		 else ToPrompt(plit asciz 'Text Copied');
+
+    if .killen gtr 5*kilsiz then (killen_5*kilsiz); % shrink if too big %
+    mark _ 0
+end;
+
+global routine ctrlw = killtext(1);
+
+global routine metcw = killtext(0);
+
+
+global routine ctrls = begin
+    local i,char;
+    external sst;
+
+    if not munchline (sst,plit asciz'Search: ',.EscValue) then return
+	    (errstr(plit asciz'Search aborted.');-1);
+
+    incr i from 0 to (.sst)-1 do begin
+	char_.(sst+.i+1);
+	if .char geq "a" and .char leq "z" then (sst+.i+1)_.char and #737
+    end;
+
+    incr i from .lowend to .lowend+.hend-.hbot-.sst+1 do
+	if therep (sst,.i) then begin
+	    moveforward(.i+.sst[0]-.lowend);
+	    if .repcount eql 1 then return 0;
+	    repcount_.repcount-1
+	end;
+    return (errstr(plit asciz'Search failed');-1)
+end;
+
+global routine  ctrlat = begin
+    if .repcount eql 1 then begin		! default = 1
+	mark_.lowend;				!   means set mark
+	ToPrompt(plit asciz 'Mark set')
+    end
+    else begin					! else any arg
+	mark_0;					!   means to clear it
+	ToPrompt(plit asciz 'Mark cleared')
+    end;
+    repcount_1
+end;
+
+global routine ctrlr = begin
+    local i,char;
+    external sst;
+
+    if not munchline (sst,plit asciz'Reverse Search: ',.EscValue) then
+	    return (errstr(plit asciz'Reverse Search aborted.');-1);
+
+    incr i from 0 to (.sst)-1 do begin
+	char_.(sst+.i+1);
+	if .char geq "a" and .char leq "z" then (sst+.i+1)_.char and #737
+    end;
+
+    decr i from .lowend-.sst[0] to 1 do
+	if therep(sst,.i) then begin
+	    moveback(.lowend-.i);
+	    if .repcount eql 1 then return 0;
+	    repcount_.repcount-1
+	end;
+    return (errstr(plit asciz'Reverse Search Failed');-1)
+end;
+
+global routine dispatch = begin local tp,ip;
+    bind zone1=#2000;
+    while .repcount gtr 0 do begin		! Check > 0, else -big loop!
+	killer _ 0;				! kill pointer flag
+	vecadr_.comchar+.base;			! vecadr _ command-key
+	tp_.(@distbl)[.vecadr];			! tp _ command-dispatch
+	ip_.tp;					! ip _ copy of tp
+	do begin
+	    if (.ip lss 0) and (.ip gtr -zone1)
+	    then begin				! if command-rebound then
+		tp_.discat[-.ip];		! command _ rebinding
+		ip_.discat[-.ip+1]		! pointer _ next?
+	    end
+	    else ip_0;				! else pointer _ nil
+
+	    if .tp eql 1 then insertchar(.comchar)  % 1=self inserting %
+	    else if .tp eql 0 then 0		    % 0=ignore it      %
+	    else if .tp leq -zone1 then begin	    % bound to a macro %
+		if .csnum geq MaxCalls then begin
+		    errstr(plit asciz'Macro Depth Overflow');
+		    repcount_1;
+		    return
+		end;
+		callchar_(-.tp-zone1+"a")<0,0>;		! which macro char?
+		csnum_.csnum+1;				! increment level
+		rstk[.rptr]_(.callchar)<0,0>;
+		rstk[.rptr+1]_.repcount;
+		rptr_.rptr+2;				! bump pointer
+		cstk[.csnum]_qreg(.callchar);		! set macro address
+		freestk[.csnum]_.freezone;
+		repcount_1				! once per call
+	    end
+	    else (.tp)()				! else do command
+	end
+	until .ip eql 0;				! throughout rebinds
+	if .vecadr neq "?U" then laskil _ .killer;	! copy kill flag 
+	if .vecadr eql "?N" or .vecadr eql "?P"		! if move up/down
+	then lasmov_1					!  then mark move
+	else lasmov_0;					!  else clear move
+
+	repcount_.repcount-1				! repeat for count
+    end
+end;
+
+global routine reader = begin local igct;
+    setlab();				! Setup re-entry addresses
+    igct_0;
+    repcount_1;
+    while 1 do begin
+
+	if .cstk[.csnum] eql 0		!if not reading a pointer
+	 then if ttyidle()		!then if nothing to do
+	     then begin
+		autoloss();		!call autosave code.
+		if redisp(.igct geq 10)	!0 vs 1 work out perfect T/F
+		 then begin		!newscreen if idle user
+		    igct_0;		!no ignored commands.
+		    scrmod_0;		!screen not modified.
+		    muline_0		!only one line hacked.
+		 end;
+		ocline_.curline		!remember line we are on.
+	     end;
+
+	comchar_readch();		!read a command
+	if .comchar eql -1		!check for no-wait flag
+	 then return;			!if done... then exit.
+	igct_.igct+1;			!count of undisplayed commands.
+	if .comchar eql .MetaPrefix	!check for <meta>
+	 then base_#200
+	 else if .comchar eql .XPrefix	!  or ^X being typed.
+	       then base_#400
+	       else base_0;
+	if .base neq 0			!if non-zero, (meta or ^X)
+	 then comchar_readch();		!then get real command
+	newcount_1;
+	dispatch();			!execute the command
+	repcount_1
+    end
+end;					!routine begin
+
+global routine ctrlxm = begin local tp,lasttp,qbp;
+    ToPrompt(plit asciz'Macro Slot: ');
+    tp_readch();			!get the macro character slot.
+    writeloss(.tp);
+    if .tp geq "A" and .tp leq "Z" then tp_.tp+("a"-"A");	! *Capitals*
+    if .tp lss "a" or .tp gtr "z" then return
+	    errstr(plit asciz'Illegal Slot Name.');
+    writestring(plit asciz' def: ');
+    qbp_qreg(.tp);
+    lasttp_0;
+    while 1 do begin
+	tp_readch();			! get a char.
+	replacei (qbp,.tp);
+	writeloss(.tp);
+	if .tp eql (")"+#44) then return;
+	if .lasttp eql .XPrefix and .tp eql ")" then return;
+	lasttp_.tp
+    end
+end;
+
+global routine metaw = begin
+    local tp,oct;
+    external sst;
+
+    oct_.repcount;
+    repcount_1;
+    ctrlat();
+    if .oct eql 4 then tp_ctrlr()			% in front of string %
+      else begin
+	tp_ctrls();
+	if .tp neq -1 then moveback(.sst[0])		% in front of string %
+      end;
+    if .tp eql -1 then return errstr(plit asciz'String not found.');
+    ctrlw()
+end;
+
+global routine ctrla  =
+    while .lowend gtr 1
+     do if eolChxr(.lowend-1)
+	 then return
+	 else moveback(1);
+
+global routine ctrlb =
+    if .lowend gtr 1
+     then moveback(1)
+     else return zapmac();
+
+global routine metab = begin
+    while .lowend gtr 1
+     do if whitespace(getchxr(.lowend-1))
+	 then moveback(1)
+	 else exitloop;
+    while .lowend gtr 1
+     do begin
+	moveback(1);
+	if wbreak(getchxr(.lowend-1))
+	 then return
+     end;
+    return zapmac()
+end;
+
+global routine ctrlc = begin
+    ttyzap();
+    quit()
+end;
+
+global routine ctrld =
+    if .hbot neq .hend
+     then killforward(0)
+     else return zapmac();
+
+
+global routine metad =  begin
+    while .hend neq .hbot
+     do if whitespace(getchxr(.lowend))
+	 then killforward(0)
+	 else exitloop;
+    while .hend neq .hbot
+     do begin
+	killforward(0);
+	if wbreak(getchxr(.lowend))
+	 then return
+     end;
+    return zapmac()
+end;
+
+
+global routine ctrle =
+    while .hend neq .hbot
+     do if eolChxr(.lowend)
+	 then return
+	 else moveforward(1);
+
+
+global routine ctrlf =
+    if .hend neq .hbot
+     then moveforward(1)
+     else return zapmac();
+
+
+global routine metaf = begin
+    while .hend neq .hbot
+     do if whitespace(getchxr(.lowend))
+	 then moveforward(1)
+	 else exitloop;
+    while .hend neq .hbot
+     do begin
+	moveforward(1);
+	if wbreak(getchxr(.lowend))
+	 then return
+     end;
+    return zapmac()
+end;
+
+global routine ctrlk  = begin local rep,cc;
+    killer _ 1;
+    if not(.laskil) then clrkbf();
+    incr rep from 1 to .repcount do begin
+	if .hend eql .hbot then return zapmac();	% prevent overflows %
+	cc_getchxr(.lowend);				%  prime the loop   %
+	if .cc eql #15 then killforward(1)		% a blank line case %
+	else until .cc eql #15 do begin			% until end of line %
+	    if .cc eql #14 and .sosmod then exitloop;	% ? end of page ?   %
+	    killforward(1);
+	    if .hend eql .hbot then return zapmac();	% ? end of text ?   %
+	    cc _ getchxr(.lowend)			% - get character - %
+	end	% until eol %
+    end;	% incr rep ... loop %
+    repcount _ 1;					% say we are done   %
+    if .killen eql 5*kilsiz then
+	ToPrompt(plit asciz 'Too much text deleted -- not all was saved!')
+end;	% ctrl k %
+
+global routine killmultiline  = begin local rep,cc;
+    killer _ 1;
+    if not(.laskil) then clrkbf();
+    incr rep from 1 to .repcount do begin
+	if .hend eql .hbot then return zapmac();
+	cc_getchxr(.lowend);	% seed to prime the loop %
+	if .cc eql #15 and .repcount eql 1 then		% single C-K case %
+	    Return (killforward(1));
+	until .cc eql #15 do begin			% until end of line %
+	    if .cc eql #14 and .sosmod then exitloop;	% ? end of ?   %
+	    killforward(1);
+	    if .hend eql .hbot then return zapmac();	% ? end of text ?   %
+	    cc _ getchxr(.lowend)			% - get character - %
+	end;  % until eol %
+	if .repcount eql 1 then exitloop;		% single C-K case   %
+	if .cc eql #15 then killforward(1)		% finish the line   %
+    end;	% incr rep ... loop %
+    repcount _ 1;					% say we are done   %
+    if .killen eql 5*kilsiz then
+	ToPrompt(plit asciz 'Too much text deleted -- not all was saved!')
+end;	% ctrl k %
+
+routine GetPos (npcol) = begin  local place,temp;
+!This routine tells you what column you will be in, when the
+! redisplay will finally calm down.
+
+    place_.lowend;
+    while 1 do begin		       !decrement from lowend-1 down.
+	if .place eql 1 then exitloop; !we have found start of line.
+	temp_getchxr(.place-1);
+	if .temp eql "?M" or (.temp eql "?L" and .sosmod) then exitloop;
+	place_.place-1
+    end;
+
+! Now move forward.
+    .npcol_1;
+    incr i from .place to .lowend-1 do begin !all the stuff to where we are
+	temp_getchxr(.i);	       !get the data.
+	.npcol_updatecursor(.temp,..npcol)
+    end
+end;
+global routine ctrln2  = begin
+    while .hend neq .hbot
+     do begin
+	moveforward(1);
+	if eolChxr(.lowend-1)
+	 then return eolType(.lowend-1)
+     end;
+    return zapmac()
+end;
+
+global routine ctrln = begin local pos;
+    if not .lasmov then GetPos(pcolumn);
+    incr i from 1 to .repcount do ctrln2();
+    pos_1;
+    incr i from 1 to .pcolumn-1
+     do if .pos geq .pcolumn or eolChxr(.lowend)
+	 then exitloop
+	 else begin
+	    pos _ updatecursor(getchxr(.lowend),.pos);
+	    ctrlf()
+	 end;
+    repcount _ 1
+end;
+
+global routine ctrlo  = begin
+    insertchar(#015);
+    moveback(1)
+end;
+
+global routine ctrlp2  = begin
+    while .lowend gtr 1
+     do begin
+	moveback(1);
+	if eolChxr(.lowend)
+	 then return (ctrla();eolType(.lowend))
+     end;
+    return zapmac()
+end;
+
+global routine ctrlp = begin local pos;
+    if not .lasmov then GetPos(pcolumn);
+    incr i from 1 to .repcount do ctrlp2();
+    pos_1;
+    incr i from 1 to .pcolumn-1 do
+	if .pos geq .pcolumn or eolChxr(.lowend)
+	 then exitloop
+	 else begin
+	    pos _ updatecursor(getchxr(.lowend),.pos);
+	    ctrlf()
+	 end;
+    repcount _ 1
+end;
+
+global routine ctrlq  = insertchar(readch());
+
+global routine ctrlt = begin local tc;
+    if .lowend lss 3 then return (ctrlg());
+    tc_getchxr(.lowend-1);
+    allmod[.curbuf]_1;		       !mark it as munged.
+    setchar(.lowend-1,getchxr(.lowend-2));
+    setchar(.lowend-2,.tc);
+    if getchxr(.lowend-1) eql"?M" or getchxr(.lowend-2) eql "?M" then begin
+	muline_1;			!in case of moving a cr.
+	scrmod_1			!for sure!
+    end
+end;
+
+
+global routine ctrlv = begin
+    muline_1;
+    scrmod_1;
+    incr i from 1 to
+	(if .curline leq .scrsze and .curline geq 1
+		    then .scrsze-.curline
+		    else .scrsze)
+	    do if ctrln2() then exitloop;
+    if .hend neq .hbot then curline_1		!if not at the end of the file.
+end;
+
+global routine metav = begin
+    muline_1;
+    scrmod_1;
+    incr i from 1 to
+	    (if .curline leq .scrsze and .curline geq 1
+			    then .scrsze+.curline-2
+			    else .scrsze)
+	    do if ctrlp2() then
+		if .curline leq 0 then begin   !properly past top of screen.
+		    ctrln2();		       !show predecessor.
+		    exitloop
+		end;
+    curline_1
+end;
+
+global routine metacn = begin
+    incr i from 1 to .scrsze-.curline
+     do if ctrln2()
+	 then begin
+	    ctrlp2();		       !back over the page mark.
+	    exitloop
+	 end;
+    ctrle()
+end;
+
+
+global routine metacp =
+    incr i from 1 to .curline-1
+     do ctrlp2();
+
+global routine rubout =
+    if .lowend gtr 1
+     then delbackward()
+     else zapmac();
+
+global routine metadel = begin
+    while .lowend gtr 1
+     do if whitespace(getchxr(.lowend-1))
+	 then delbackward()
+	 else exitloop;
+    while .lowend gtr 1
+     do begin
+	delbackward();
+	if wbreak(getchxr(.lowend-1))
+	 then return
+     end;
+    return zapmac()
+end;
+
+global routine ctrly = begin local tp;
+    tp_(kilbuf-1)<1,7>;
+    incr i from 1 to .killen do insertchar(scani(tp))
+end;
+
+global routine metarp = begin local count, moves, leftparen, rightparen;
+    ! go to matching right parenthesis.
+    rightparen_ SELECT leftparen_getchxr(.lowend)
+	of NSET
+	    "(": ")";
+	    "[": "]";
+	    "{": "}";
+	    "<": ">";
+	    "`": "'";
+	    """": """";
+	    OTHERWISE: (return ctrlg())
+	TESN;
+    count_1;
+    moves_0;
+    do begin
+	moves_.moves+1; ctrlf();
+	if getchxr(.lowend) eql .rightparen then count_.count-1
+	else if getchxr(.lowend) eql .leftparen then count_.count+1;
+	if .count neq 0 and .hend eql .hbot then 
+	    begin
+	    while .moves gtr 0 do begin ctrlb(); moves_.moves-1 end;
+	    return ctrlg()
+	    end
+	end
+    until .count eql 0
+end;
+global routine metalp = begin local count, moves, leftparen, rightparen;
+    ! go to matching left paren.
+    leftparen_ SELECT rightparen_getchxr(.lowend)
+	of NSET
+	    ")": "(";
+	    "]": "[";
+	    "}": "{";
+	    ">": "<";
+	    "'": "`";
+	    """": """";
+	    OTHERWISE: (return ctrlg())
+	TESN;
+    count_1;
+    moves_0;
+    do begin
+	moves_.moves+1; ctrlb();
+	if getchxr(.lowend) eql .leftparen then count_.count-1
+	else if getchxr(.lowend) eql .rightparen then count_.count+1;
+	if .count neq 0 and .lowend eql 1 then 
+	    begin
+	    while .moves gtr 0 do begin ctrlf(); moves_.moves-1 end;
+	    return ctrlg()
+	    end
+	end
+    until .count eql 0
+end;
+
+Global routine metalc = begin
+!This routine searches backwards for a ctrl-l and skips it.
+    while .lowend gtr 1 do begin
+	if getchxr(.lowend-1) eql "?L" then exitloop;
+	moveback(1)
+    end;
+    curline_1;
+    scrmod_1;
+    muline_1
+end;
+
+Global routine Lastpage = begin local c;
+    c_.lowend;
+    While .c gtr 1 do begin
+	c_.c-1;
+	If getchxr(.c) eql "?L" then exitloop		! Backup past ^L
+    end;
+    If getchxr(.c) neq "?L" then return ctrlg();	! If none "Error"
+    While .c gtr 1 do begin
+	if getchxr(.c-1) eql "?L" then exitloop;	! Backup to next ^L
+	c_.c-1						!  or beginning.
+    end;
+    If .c neq .lowend then begin			! See if we moved.
+	moveback(.lowend-.c);				!  and do the work!
+	curline_1;
+	scrmod_1;
+	muline_1
+    end
+end;
+Global routine metarc = begin
+!This routine searches forwards for a ctrll and stops before it
+    while .hend neq .hbot
+      do if getchxr(.lowend) eql "?L"
+	  then exitloop
+	  else moveforward(1);
+    scrmod_1;
+    muline_1;
+    if .curline gtr .scrsze then curline_.scrsze-1
+end;
+
+Global routine Nextpage = begin local c;
+    c_.lowend;
+    While .hend neq .hbot
+     do begin
+	moveforward(1);
+	if getchxr(.lowend-1) eql "?L"
+	 then exitloop				! Move past ^L
+    end;
+    If getchxr(.lowend-1) eql "?L"
+     then begin
+	scrmod_1;
+	muline_1;
+	curline_1
+    end
+    else begin
+	moveback(.lowend-.c);
+	return ctrlg()
+    end
+end;
+
+!	***    MAIN PROGRAM STARTS HERE    ***
+
+    Cclflag_.Vreg;			! Save CCL info.
+    Reset();				! Check Visibility.
+					!  and turn off ECHO.
+
+    repcount_1;				! Repeat count.
+    clrkbf();				! Clear the kill buffer.
+
+    p_coresize(512);			! Get some memory space.
+    lowend_1;				! Begin at the beginning.
+    hbot_2500-extra;			! Set the bottom/end of
+    hend_2500-extra;			!   data after the gap.
+    lowptr_(.p-1)<1,7>;			! Setup ildb pointers for
+    hptr_(.p+((2500-extra)/5)-1)<1,7>;	!   low/high data blocks.
+    rptr_0;				! Setup pseudo-stack ptr
+    bufini();				! Initialize a buffer
+    (bfblk2+4)_getppn();		! Default to user ppn.
+
+    autotime_0;
+    autowrit_0;
+    autoinc_100;			!   Autosave frequency
+    indent_0;				!   Left Justification Margin
+    iudent_72;				!   Right Justification Margin
+    commentpos_41;			!   Comment position
+    tabwidth_4;				!   Indentation width
+
+    initdispatch();			! Initialize dispatch table.
+    incr i from "a" to "z" do begin	! Setup MACRO terminations.
+	qbp_qreg(.i);			!   Executed only once!
+	replacei(qbp,.XPrefix);		!      C-X
+	replacei(qbp,")")		!      ")"
+    end;
+
+    If .cclflag
+     then cclstuff()			! Either read TMP file
+     else dorescan();			!   or   possible command line.
+
+    If exini()				! If user has an INIT file
+     then begin
+	nowait_ 1;			! No wait for user during INIT
+	fef();				! Make sure Terminal mode setup
+	reader();			! Read Init file and type-ahead
+     end;
+
+    If Asktty()				! If we get a legal terminal
+     then begin				!  then we have work to do
+	if .nowait			!    If nowait, then
+	 then nowait_ 0			!      then clear flag
+	 else fef();			!      else Initialize Terminal
+	clearscreen();			!    Clear screen
+	winit();			!    Initialize window
+	reader()			!    On your way!
+     end;
+
+end eludom
+  `b0mO
