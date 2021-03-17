@@ -1,0 +1,1754 @@
+Entry;
+begin "DED - buffer manager"
+  require "DED.DEF" source!file;
+!! title Tymcom-X Buffer/Gap Manager ;
+
+ifcr Tops20 thenc
+  require "!!!! You're compiling the wrong buffer module !!!!" message;
+  require "!!!! This one is for Tymcom-X only.           !!!!" message;
+  TryAgainWithTheCorrectModule
+endc
+
+
+! *************************************************************************
+*									  *
+*		The buffer/gap manager.  Tymcom-X version.		  *
+*		       Dave W. Smith,  September '81			  *
+*									  *
+**************************************************************************;
+
+
+! <<  Open does not allow '.' in usernames.  This is a SAIL bug.  We must
+!     work around by doing chanios or callis ourselves.
+! <<  Reformat this page!!!
+;
+
+!                         From the Command Module
+;
+
+  external boolean
+    G!TextMode;                                 ! True if we are in Text
+                                                ! Mode.
+                                                ;
+  external safe integer array
+    C!Tab ['0:'177];
+
+  external         integer	!skip!;		! skip-return flag for
+						!  startcode;
+  external         integer	C!Debug;	! True if we are debugging;
+
+
+  external simple integer procedure
+    DecrBP (integer BP);
+
+  external boolean procedure	F!Writ( string FileName );
+
+
+  external         procedure	W!SetB( integer BufNum );
+  external         procedure	W!Msg( string Msg );  ! display a message ;
+  external         procedure	W!FixS;		! to cause update of
+						!  status line ;
+  external         procedure	W!NewS;		! set to build new status line;
+  external         procedure	W!BClr;
+  external         procedure	W!BAdd( string Msg );
+
+
+  external         procedure	T!Bell;
+  external         integer	T!Lines;	! size of physical window ;
+!! title Internal Storage ;
+! Internal storage and such ;
+
+  own integer B!Addr;		! address of buffer space ;
+  own integer B!Pages;		! number of pages mapped ;
+  own boolean B!NullFlag;	! true if Nulls in buffer ;
+
+
+! Storage for buffer descriptors ;
+
+  own integer B!!Head;		! head of active buffer list ;
+  own integer B!!List;		! pointer into list ;
+  own integer B!!Free;		! head of free list ;
+
+  own trusted integer array B!!Next   [1:BUFMAX];
+  own trusted integer array B!!Last   [1:BUFMAX];
+  own trusted string  array B!!Mode   [1:BUFMAX];
+  own trusted string  array B!!File   [1:BUFMAX];
+  own trusted string  array B!!Alias  [1:BUFMAX];
+  own trusted boolean array B!!ModP   [1:BUFMAX];
+  own trusted integer array B!!Lock   [1:BUFMAX];
+  own trusted integer array B!!Size   [1:BUFMAX];
+  own trusted integer array B!!Point  [1:BUFMAX];
+  own trusted integer array B!!GStart [1:BUFMAX];
+  own trusted integer array B!!GSize  [1:BUFMAX];
+  own trusted integer array B!!WS0    [1:BUFMAX];
+  own trusted integer array B!!WS1    [1:BUFMAX];
+
+! ------------------------------------------------------------------------;
+
+!                    Regarding User and Internal Marks
+!
+!
+!       We define two areas in the array which contains all marks
+!       maintained by Peak, the User Marks area (in the range [0,
+!       #UserMarks - 1]) and the Real Marks area ([FirstMark,
+!       MaxMarks-1]).
+!
+!
+!                          --------------------
+!                          |                  | User Marks
+!                          |                  |
+!                          --------------------
+!                          |                  | Real Marks
+!                          |                  |
+!                          |                  |
+!                          |                  |
+!                          |                  |
+!                          --------------------
+!
+!
+!       User Marks are distinguished in the sense that they are finite in
+!       number (determined at compile time), and that they are
+!       pre-allocated to the index range [0, #UserMarks - 1].
+!
+!       When the user sets a mark, a slot in the Real Marks area is
+!       allocated, and its index placed in the appropriate User Mark
+!       slot.
+!
+!       When an internal routine allocates a mark, the index in the Real
+!       Marks range of the allocated mark is returned.
+!
+!       Mark-updating procedures in the insert and delete operations deal
+!       only with marks allocated in the Real Marks area, thus keeping the
+!       amount of maintenance work done to a minimum.
+!
+!
+;
+
+  define
+    #UserMarks     = {10},
+    FirstMark      = {#UserMarks},
+    #InternalMarks = {30},
+    MaxMarks       = {((2 * #UserMarks) + #InternalMarks)};
+
+  own integer
+    MarkCnt;
+
+      ! The number of Real Marks allocated at the current time.
+      ;
+
+  own trusted integer array
+    Marks[0 : MaxMarks - 1];
+
+      ! The array containing the entire Mark structure.
+      ;
+
+
+! ------------------------------------------------------------------------;
+
+
+! Static per-buffer storage ;
+
+  internal integer B!Chan;	! channel used for swapping, i/o ;
+  internal string  B!Mode;	! mode(s) that apply to this buffer ;
+  internal string  B!File;	! filename the buffer came from ;
+  internal integer B!Prot;	! buffer's protection code ;
+  internal string  B!Alias;	! "alias" for filename ;
+
+  own integer B!Size;		! size of buffer in characters ;
+  own integer B!Point;		! pointer into the buffer ;
+  own integer B!LastP;          ! Mark Index of the Last Position pointer
+                                ;
+
+  internal boolean B!BegP;	! true iff point is at 0 ;
+  internal boolean B!EndP;	! true iff point is at B!Size ;
+  internal boolean B!ModP;	! true iff buffer has been modified ;
+  internal integer B!Lock;
+
+  internal integer B!WS0;	! Mark Index of the starting point of the
+                                ! first window.
+                                ;
+  internal integer B!WS1;	! Mark Index of the starting point of the
+                                ! second window.
+                                ;
+
+  internal integer B!CkPtSer;	! serial number of the checkpoint file ;
+  internal integer B!DedVer;	! version number of the editor that
+				!  created the checkpoint file;
+
+
+  own integer B!GapStart;	! beginning of gap ;
+  own integer B!GapSize;	! size of gap ;
+
+
+! ************************************************************************;
+
+
+! Storage for things other than buffers ;
+
+  ! static storage for byte pointers ;
+
+  own integer
+    B!GapPriorBP,	! byte pointer to character before gap ;
+    B!GapStartBP,	! byte pointer to first byte of gap ;
+    B!GapEndBP,		! byte pointer to end of gap ;
+    B!GapNextBP,	! byte pointer to character after gap ;
+    B!PntBP;		! byte pointer to character at point ;
+
+
+! the following magic is used to build byte pointers.  The five numbers
+!  point to the 0th, 1st, ... 4th 7 bit characters in a 36 bit word. ;
+
+  preset!with
+      hl('350700),
+      hl('260700),
+      hl('170700),
+      hl('100700),
+      hl('010700);
+
+  own safe integer array B!BPLeft [0:4];
+
+
+! ************************************************************************;
+!! title Rtn VCreate ;
+! =========================================================================
+=====================================+=====================================
+=                                                                         =
+=                                                                         =
+=				Rtn VCreate				  =
+=                                                                         =
+=                                                                         =
+=====================================+=====================================
+
+
+				yamm (4-3)
+
+	Create a range of pages in a process's Virtual Memory Map.
+
+
+==========================================================================;
+
+
+  simple integer procedure VCreate (integer VMPage, Count(1), Prot(3); boolean OtherFrame(false));
+  begin "VCreate"
+    integer
+      Tmp;
+
+    Tmp _
+	calli(
+	  ((if (OtherFrame) then bit(1) else 0) lor
+	      bit((Prot land !mask(2)), 7) lor
+	      xwd((Count land !mask(10)), VMPage)),
+	  -'67
+	);
+
+    return(if (!skip!) then 0 else Tmp);
+  end "VCreate";
+
+
+! ===================================+=====================================
+==========================================================================;
+!! title Rtn VClear ;
+! =========================================================================
+=====================================+=====================================
+=                                                                         =
+=                                                                         =
+=				Rtn VClear				  =
+=                                                                         =
+=                                                                         =
+=====================================+=====================================
+
+
+				yamm (4-4)
+
+	Remove a range of pages from a process's Virtual Memory Map.
+	Ignores "page does not exist" errors.
+
+
+==========================================================================;
+
+
+  simple integer procedure VClear (integer VMPage, Count(1); boolean RefBit(true), OtherFrame(false));
+  begin "VClear"
+    integer
+      Tmp;
+
+    Tmp _
+	calli(
+	  ((if (OtherFrame) then bit(1) else 0) lor
+	      (if (RefBit) then bit(7) else 0) lor
+	      xwd((Count land !mask(10)), VMPage)),
+	  -'66
+	);
+
+    return(if (!skip!) then 0 else Tmp);
+  end "VClear";
+
+
+! ===================================+=====================================
+==========================================================================;
+!! title Rtn B!GtChan ;
+! Open the next availible disk channel for dump mode I/O and return that
+  channel's identity.  (Note that this channel number will be in the range
+  [1, '17] and will not collide with other channel allocations.) ;
+
+simple integer procedure B!GtChan;
+begin "B!GtChan"
+  integer
+    Channel,
+    Flag;
+
+  if ((Channel _ getchan) = -1) then
+    usererr(0, 0, "Out of channels in B!GtChan!", "x");
+
+  open(Channel, "DSK", bit(23)+'17, 0, 0, 0, 0, Flag _ true);
+
+  if (Flag) then
+    usererr(0, 0, "Open Error in B!GtChan!", "x");
+
+  return(Channel);
+end "B!GtChan";
+!! title Rtn B!RlChan ;
+! Release the specified channel ;
+
+simple procedure B!RlChan (integer Channel);
+begin "B!RlChan"
+  release(Channel);
+end "B!RlChan";
+!! title Rtn B!Init ;
+! Initialize the buffer system by grounding the active list pointer and
+!  linking all buffers into the free list. ;
+
+internal simple procedure B!Init;
+begin "init"
+  own integer
+    I;
+
+  B!DedVer   _ DED!Version!Word;	! The current version of PEAK ;
+  B!Addr     _ BasePage * 512;		! ** hack ** start with page 100 ;
+  B!Pages    _ 0;			! ** hack ** and nothing mapped ;
+  B!!Head    _ 0;			! no list, yet ;
+  B!!List    _ 0;			! no buffers on active list ;
+  B!!Free    _ 1;			! link all buffers to free list ;
+
+  for I _ 1 upto BUFMAX - 1 do
+    B!!Next[I] _ I + 1;
+
+  B!!Next[BUFMAX] _ 0;
+
+  B!Chan _ B!GtChan;		! Establish the buffer I/O channel ;
+end "init";
+require B!Init initialization;
+!! title Rtn DeleteBuffer ;
+! Delete the buffer file open on the specified channel ;
+
+simple procedure DeleteBuffer (integer Channel);
+begin "DeleteBuffer"
+  start!code
+    move	1, Channel;
+    hrli	1, '11;		! .CHREN == 11 ;
+    setzb	2, 3;
+    setzb	4, 5;
+    chanio	1, 2;		! delete the file ;
+      jfcl;
+  end;
+end "DeleteBuffer";
+!! title Rtn B!FreeP ;
+! Routine to tell us if we have any free buffers left. ;
+
+internal simple boolean procedure B!FreeP;
+  return( B!!Free neq NULL );
+!! title Rtn NameCheckpointFile ;
+! Return the components of the checkpoint file name in sixbit. ;
+
+simple procedure NameCheckpointFile (reference integer FName, Ext);
+begin
+  FName := cvsix(cvs(1000 + call(0, "Pjob"))[2 for 3] &
+      DED!Alias[1 for 3]);
+  Ext := cvsix(cvs(1000 + B!!List)[2 for 3]);
+end;
+!! title Rtn CloseCheckpointFile ;
+! Close a checkpoint file ;
+
+simple procedure CloseCheckpointFile;
+begin
+  start!code
+    move	1, B!Chan;
+    hrli	1, 1;			! .CHCLS == 1 ;
+    chanio	1, 0;			! close the file ;
+  end;
+end;
+!! title Rtn EnterCheckpointFile ;
+! Enter a checkpoint file ;
+
+simple boolean procedure EnterCheckpointFile( integer Name, Ext );
+begin
+  integer
+    Error;
+
+  start!code
+    setzm	Error;
+    move	1, B!Chan;
+    hrli	1, 5;			! .CHENT == 5 ;
+    move	2, Name;
+    move	3, Ext;
+    setzb	4, 5;
+    chanio	1, 2;
+      movem	3, Error;		! error code is in rh( 3 ) ;
+  end;
+
+  return( not Error );
+    ! <<  You lose the identity of the error condition this way ;
+end;
+!! title Rtn LookupCheckpointFile ;
+! Lookup a checkpoint file ;
+
+simple boolean procedure LookupCheckpointFile( integer Name, Ext );
+begin
+  integer
+    Error;
+
+  start!code
+    move	1, B!Chan;		! channel ;
+    hrli	1, 4;			! .CHLK == 4  (lookup) ;
+    move	2, Name;
+    hllz	3, Ext;
+    setzb	4, 5;
+    setzm	Error;
+    chanio	1, 2;
+      setom	Error;
+  end;
+
+  return( not Error );
+    ! <<  You lose the identity of the error condition this way ;
+end;
+!! title Rtn CreateCheckpointFile ;
+! Create a checkpoint file ;
+
+simple procedure CreateCheckpointFile;
+begin
+  integer
+    Name, Ext;
+
+  NameCheckpointFile(Name,Ext);
+
+  if ( LookupCheckpointFile( Name, Ext ) ) then
+    print( crlf & "Checkpoint file already exists!" &
+	"  Continue at your own peril." );
+
+  CloseCheckpointFile;
+end;
+!! title Rtn B!Checkpoint ;
+! Flush information that we keep in static locations back
+!  into the buffer descriptor block.  Also flush the in-core image
+!  to a "checkpoint file" on disk. ;
+
+internal simple procedure B!Checkpoint;
+begin
+  integer
+    I,
+    Size, Name, Ext;
+  own safe integer array
+    IOWDlist[0:2],
+    CheckRec[0:127];
+
+  arrclr(CheckRec);
+
+  B!!File[B!!List]    _ B!File;
+  B!!Alias[B!!List]   _ B!Alias;
+
+			CheckRec[0] _ cvsix("*PEAK*");
+  B!!Point[B!!List]   _ CheckRec[1] _ B!Point;
+  B!!Size[B!!List]    _ CheckRec[2] _ B!Size;
+  B!!ModP[B!!List]    _ CheckRec[3] _ B!ModP;
+  B!!Lock[B!!List]    _ CheckRec[4] _ B!Lock;
+  B!!GStart[B!!List]  _ CheckRec[5] _ B!GapStart;
+  B!!GSize[B!!List]   _ CheckRec[6] _ B!GapSize;
+  B!!WS0[B!!List]     _ CheckRec[7] _ B!WS0;
+  B!!WS1[B!!List]     _ CheckRec[8] _ B!WS1;
+
+  ! now expand the name & alias into the record ;
+
+  CheckRec[9]  _ cvasc(B!File[1 for 5]);
+  CheckRec[10] _ cvasc(B!File[6 for 5]);
+  CheckRec[11] _ cvasc(B!File[11 for 5]);
+  CheckRec[12] _ cvasc(B!File[16 for 5]);
+  CheckRec[13] _ cvasc(B!File[21 for 5]);
+
+  CheckRec[14] _ cvasc(B!Alias[1 for 5]);
+  CheckRec[15] _ cvasc(B!Alias[6 for 5]);
+  CheckRec[16] _ cvasc(B!Alias[11 for 5]);
+  CheckRec[17] _ cvasc(B!Alias[16 for 5]);
+  CheckRec[18] _ cvasc(B!Alias[21 for 5]);
+  CheckRec[19] _ cvasc(B!Alias[26 for 5]);
+  CheckRec[20] _ cvasc(B!Alias[31 for 5]);
+
+  CheckRec[21] _ incr(B!CkPtSer);
+  CheckRec[22] _ B!DedVer;
+  CheckRec[23] _ B!Prot ;
+
+  B!!Mode[B!!List] _ B!Mode;
+  CheckRec[24] _ cvasc(B!Mode[1 for 5]);
+  CheckRec[25] _ cvasc(B!Mode[6 for 5]);
+
+  CheckRec[26] _ MarkCnt;
+
+  for I _ 0 step 1 until MaxMarks - 1 do
+    CheckRec[27 + I] _ Marks[I];
+
+    ! Stash the Marks away too.
+    ;
+
+  CheckRec[127] _ cvasc(">>>>>");
+
+
+  ! now flush the image to disk ;
+
+  NameCheckpointFile(Name, Ext);
+  EnterCheckpointFile(Name, Ext);
+
+  start!code
+    protect!acs	1, 2;
+    move		1, B!Chan;
+    hrli		1, '32;			! .CHPSO == 32 ;
+    movei		2, 1;
+    chanio		1, 2;			! set to output at page 1 ;
+      jfcl;
+    move		1, B!Chan;
+    hrli		1, 2;			! .CHOPT == 2 ;
+    movei		2, access(CheckRec[0]);
+    subi		2, 1;
+    hrli		2, -128;		! -128,,addr-1 ;
+    setz		3, ;
+    chanio		1, 2;			! do the output ;
+  end;
+
+
+  ! now build the IOWD list for output ;
+
+  Size _ (B!Size + B!GapSize + 4) div 5;
+  IOWDList[1] _ IOWDList[2] _ 0;
+
+  if (Size < '400000) then
+    IOWDList[0] _ xwd(-Size, B!Addr-1)
+  else
+  begin
+    IOWDList[0] _ xwd(-'377000, B!Addr-1);
+    IOWDList[1] _ xwd(-(Size - '377000),(B!Addr + '377000 - 1));
+  end;
+
+  start!code
+    protect!acs	1, 2, 3, 4;
+    move		1, B!Chan;
+    hrli		1, '2;		  ! .CHOPT == 2 ;
+    move		2, access(IOWDList[0]);
+    move		3, access(IOWDList[1]);
+    move		4, access(IOWDList[2]);
+    chanio		1, 2;		  ! do the output ;
+  end;
+
+  CloseCheckpointFile;
+end;
+!! title Rtn RestoreCheckpoint ;
+! Restore from a Checkpoint File ;
+
+internal simple procedure RestoreCheckpoint (integer Name, Ext);
+begin "restore"
+  own safe integer array
+    IOWDList [0:2],
+    CheckRec [0:127];
+  integer
+    I,
+    WrdSize;
+
+
+  LookupCheckpointFile(Name, Ext);
+
+
+  ! read the checkpoint header ;
+
+  start!code
+    protect!acs	1, 2;
+    move	1, B!Chan;
+    hrli	1, '31;			! .CHPSI == 31 ;
+    movei	2, 1;
+    chanio	1, 2;			! set to input at page 1 ;
+      jfcl;
+    move	1, B!Chan;
+    hrli	1, 3;			! .CHIPT == 3 ;
+    movei	2, access(CheckRec[0]);
+    subi	2, 1;
+    hrli	2, -128;		! -128,,add-1 ;
+    setz	3, ;
+    chanio	1, 2;			! read the checkpoint header ;
+  end;
+
+
+  ! now restore various facts of interest about this buffer ;
+
+  B!Point    _ B!!Point[B!!List]  _ CheckRec[1];
+  B!Size     _ B!!Size[B!!List]   _ CheckRec[2];
+  B!ModP     _ B!!ModP[B!!List]   _ CheckRec[3];
+  B!Lock     _ B!!Lock[B!!List]   _ CheckRec[4];
+  B!GapStart _ B!!GStart[B!!List] _ CheckRec[5];
+  B!GapSize  _ B!!GSize[B!!List]  _ CheckRec[6];
+  B!WS0      _ B!!WS0[B!!List]    _ CheckRec[7];
+  B!WS1      _ B!!WS1[B!!List]    _ CheckRec[8];
+
+  B!BegP     _ (B!Point = 0);
+  B!EndP     _ (B!Point = B!Size);
+  B!CkPtSer  _ CheckRec[21];
+  B!DedVer   _ CheckRec[22];
+  B!Prot     _ CheckRec[23];
+
+  B!Mode _ B!!Mode[B!!List] _
+      cvastr(CheckRec[24]) &
+      cvastr(CheckRec[25]);
+
+  set (G!TextMode, kequ(B!Mode[1 for 4], "Text"));
+
+  B!File _ B!!File[B!!List] _
+      cvastr(CheckRec[9]) &
+      cvastr(CheckRec[10]) &
+      cvastr(CheckRec[11]) &
+      cvastr(CheckRec[12]) &
+      cvastr(CheckRec[13])  B!Alias _ B!!Alias[B!!List] _
+      cvastr(CheckRec[14]) &
+      cvastr(CheckRec[15]) &
+      cvastr(CheckRec[16]) &
+      cvastr(CheckRec[17]) &
+      cvastr(CheckRec[18]) &
+      cvastr(CheckRec[19]) &
+      cvastr(CheckRec[20]);
+
+  MarkCnt _ CheckRec[26];
+
+  for I _ 0 step 1 until MaxMarks - 1 do
+    Marks[I] _ CheckRec[27 + I];
+
+    ! Restore the Mark System.
+    ;
+
+
+  ! Do some memory management first.  Kill the pages used by the last
+  ! buffer, and create some for this one to be read back into. ;
+
+  WrdSize  _ ceiling(B!Size + B!GapSize, 5);
+
+  if (VClear(BasePage, 512 - BasePage)) then
+    usererr(0, 0, "VClear Error in RestoreCheckpoint", "x");
+
+  B!Pages _ ceiling(WrdSize, 512);
+
+  if (VCreate(BasePage, B!Pages)) then
+    usererr(0, 0, "VCreate Error in RestoreCheckpoint", "x");
+
+
+  ! now restore the in-memory image for this buffer ;
+  ! build the IOWD list for input ;
+
+  IOWDList[1] _ IOWDList[2] _ 0;
+
+  if (WrdSize < '400000) then
+    IOWDList[0] _ xwd(-WrdSize, (B!Addr - 1))
+  else
+  begin
+    IOWDList[0] _ xwd(-'377000,(B!Addr - 1));
+    IOWDList[1] _ xwd(-(WrdSize - '377000), (B!Addr + '377000 - 1));
+  end;
+
+  start!code
+    protect!acs	1, 2, 3, 4;
+    move	1, B!Chan;
+    hrli	1, '3;		  ! .CHIPT == 3 ;
+    move	2, access(IOWDList[0]);
+    move	3, access(IOWDList[1]);
+    move	4, access(IOWDList[2]);
+    chanio	1, 2;		  ! do the input ;
+  end;
+
+  CloseCheckpointFile;
+end "restore";
+!! title Rtn B!Restore ;
+! Routine to reset the static definitions from a descriptor ;
+
+internal simple procedure B!Restore;
+begin
+  integer Name, Ext;
+
+  NameCheckpointFile( Name, Ext );
+  RestoreCheckpoint( Name, Ext );
+end;
+!! title Rtn B!Setup ;
+! Routine to set up a fresh buffer descriptor by unlinking one from the
+!  free list and adding it to the buffer chain.  It becomes the current
+!  buffer in the doubly linked list. ;
+
+simple procedure B!Setup;
+begin "setup"
+  integer
+    Error, Next, Flag;
+
+  if ( B!!Free = 0 ) then
+    usererr( 0,0, "Out of buffers in B!Setup" );
+
+    ! <<  Should this be a death condition? ;
+
+  Next := B!!Free;			! get a free buffer ;
+  B!!Free := B!!Next[ B!!Free ];
+
+  if ( B!!List = 0 ) then		! link into chain ;
+    begin
+      B!!Head := Next;
+      B!!Next[ Next ] := B!!Last[ Next ] := NULL;
+      B!!List := Next;
+    end
+  else
+    begin
+      B!!Next[ Next ] := B!!Next[ B!!List ];
+      B!!Last[ Next ] := B!!List;
+      if ( B!!Next[ B!!List ] neq 0 ) then
+	B!!Last[ B!!Next[ B!!List ] ] := Next;
+      B!!Next[ B!!List ] := Next;
+      B!!List := Next;
+    end;
+
+
+  ! Now allocate a channel and file for swapping ;
+
+  CreateCheckpointFile;
+
+  W!SetB( B!!List );			! tell the window manager the ;
+					!  identity of the current buffer ;
+end "setup";
+!! title Rtn B!CKFile ;
+! Routine to load the specified checkpoint file back into a buffer.
+;
+
+internal simple boolean procedure B!CKFile( integer Name, Ext );
+begin "recover checkpoint"
+  integer Error;
+
+  DeleteBuffer(B!Chan);
+
+  if ( LookupCheckpointFile( Name, Ext ) ) then
+  begin
+    RestoreCheckpoint( Name, Ext );
+    W!Msg( "Restore Complete" );
+  end
+  else
+  begin
+    W!Msg( "Lookup Failed!  Further editing may be fatal!" );
+    T!Bell;
+  end;
+
+  return( not Error );
+end "recover checkpoint";
+!! title Rtn B!Kill ;
+! Routine to "B!Kill" the current buffer by adding it to the free list
+! and resetting the current buffer to the next buffer if possible (or the
+! last buffer if not).
+;
+! <<  Buffer chain s/b a pushdown list, so that the buffer returned to is
+!     the last buffer exitted.
+;
+
+internal simple procedure B!Kill;
+begin "B!Kill"
+  own integer
+    Next;
+
+
+  DeleteBuffer(B!Chan);
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  if (B!!Head = B!!List) then B!!Head _ B!!Next[B!!List];
+
+  if (B!!Next[B!!List]) then
+  begin
+    Next _ B!!Next[B!!List];
+    B!!Last[Next] _ B!!Last[B!!List];
+
+    if (B!!Last[B!!List] neq 0) then
+      B!!Next[B!!Last[B!!List]] _ Next;
+  end
+  else if (B!!Last[B!!List]) then
+  begin
+    Next _ B!!Last[B!!List];
+    B!!Next[Next] _ B!!Next[B!!List];
+  end
+  else
+    Next _ 0;	! into the void ... ;
+
+  B!!Next[B!!List] _ B!!Free;
+  B!!Free _ B!!List;
+  B!!List _ Next;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  if (B!!List) then
+    B!Restore;
+
+  W!SetB(B!!List);
+end "B!Kill";
+!! title Rtn B!SetB ;
+! Routine to position to a specified buffer ;
+
+internal simple procedure B!SetB( integer BufNum );
+  begin
+    if ( BufNum = B!!List ) then return;
+    B!CheckPoint;
+    B!!List := BufNum;
+    W!SetB( BufNum );
+    B!Restore;
+    W!NewS;
+  end;
+!! title Rtn B!Step ;
+! Routine to step forwards or backwards along the buffer chain ;
+
+internal simple procedure B!Step( integer Dir );
+  begin
+    if ( Dir = FORWARDS ) then
+      begin
+	if ( B!!Next[ B!!List ] neq NULL ) then
+	  begin
+	    B!CheckPoint;
+	    B!!List := B!!Next[ B!!List ];
+	    W!SetB( B!!List );
+	    B!Restore;
+	    W!NewS;
+	  end
+	else
+	  W!Msg( "No buffers left >" );
+      end
+    else if ( Dir = BACKWARDS ) then
+      begin
+	if ( B!!Last[ B!!List ] neq NULL ) then
+	  begin
+	    B!CheckPoint;
+	    B!!List := B!!Last[ B!!List ];
+	    W!SetB( B!!List );
+	    B!Restore;
+	    W!NewS;
+	  end
+	else
+	  W!Msg( "No buffers left <" );
+      end;
+
+  end;
+!! title Rtn B!Cnt ;
+! Routine to tell us how many buffers to the left and right of the
+!  current buffer are active. Returns [ #left,,#right ] ;
+
+internal simple integer procedure B!Cnt;
+  begin
+    own integer Left, Right, Chain;
+
+    Chain := B!!List;
+    Left := 0;
+    while ( B!!Last[ Chain ] neq NULL ) do
+      begin
+	Left := Left + 1;
+	Chain := B!!Last[ Chain ];
+      end;
+    Chain := B!!List;
+    Right := 0;
+    while ( B!!Next[ Chain ] neq 0 ) do
+      begin
+	Right := Right + 1;
+	Chain := B!!Next[ Chain ];
+      end;
+    return( XWD( Left, Right ) );
+  end;
+!! title Rtn B!Make ;
+! Build a new buffer descriptor by setting one up and filling it in.
+;
+
+forward internal simple procedure B!SetM (integer M, P);
+forward internal simple integer procedure B!AllocateMark;
+
+internal simple procedure B!Make(string FileNam, Alias);
+begin
+  integer
+    I;
+
+  if (B!!List neq 0) then
+    B!CheckPoint;
+
+  B!Setup;
+
+  if (not length(B!Mode)) then
+    B!Mode _ "Normal";
+
+  B!!Mode[B!!List]   _ B!Mode;
+  B!!File[B!!List]   _ B!File     _ FileNam;
+  B!!Alias[B!!List]  _ B!Alias    _ Alias;
+  B!!Point[B!!List]  _ B!Point    _ 0;
+  B!!Size[B!!List]   _ B!Size     _ 0;
+  B!!ModP[B!!List]   _ B!ModP     _ false;
+  B!!Lock[B!!List]   _ B!Lock     _ 0;
+  B!!GStart[B!!List] _ B!GapStart _ 0;
+  B!!GSize[B!!List]  _ B!GapSize  _ (GAPMAX - GAPMIN) div 2;
+
+  for I _ 0 step 1 until MaxMarks - 1 do
+    Marks[I] _ -1;
+
+    ! Initialize our Mark Structure.
+    ;
+
+  B!SetM((B!LastP _ B!AllocateMark), 0);
+  B!SetM((B!WS0   _ B!AllocateMark), 0);
+  B!SetM((B!WS1   _ B!AllocateMark), -1);
+  
+  B!!WS0[B!!List] _ B!WS0;
+  B!!WS1[B!!List] _ B!WS1;
+
+    ! Initialize some important Marks.
+    ;
+
+  B!CkPtSer _ 0;
+  B!BegP _ B!EndP _ true;
+
+
+  ! now build an empty gap for the buffer ;
+
+  B!Pages _ 2;
+
+  if (VClear(BasePage, B!Pages)) then
+    usererr(0, 0, "VClear Error in B!Make", "x");
+
+  if (VCreate(BasePage, B!Pages)) then
+    usererr(0, 0, "VCreate Error in B!Make", "x");
+
+  B!!GSize[B!!List] _ B!GapSize _ 2 * 512;
+end;
+!! title Rtn ExpandGap ;
+! Routine to expand the gap.  ;
+
+simple procedure ExpandGap;
+begin
+  own integer
+    WordsUsed, WordsToMove, MoveFrom, MoveTo;
+
+  WordsUsed _ ceiling(B!Size + B!GapSize, 5);
+
+  if (VClear(BasePage + B!Pages, 1)) then
+    usererr(0, 0, "VClear Error in ExpandGap", "x");
+
+  if (VCreate(BasePage + B!Pages, 1)) then
+    usererr(0, 0, "VCreate Error in ExpandGap", "x");
+
+  B!Pages _ B!Pages + 1;
+
+
+  ! shuffle memory if the gap isn't at the end of the buffer ;
+
+  if (B!GapStart < B!Size) then
+  begin
+    MoveFrom _ WordsUsed - 1;
+    MoveTo _ WordsUsed - 1 + 512;
+    WordsToMove _ WordsUsed - (B!GapStart + B!GapSize) div 5;
+
+    while (WordsToMove > 0) do
+    begin
+      memory[B!Addr + MoveTo] _ memory[B!Addr + MoveFrom];
+      MoveTo _ MoveTo - 1;
+      MoveFrom _ MoveFrom - 1;
+      WordsToMove _ WordsToMove - 1;
+    end;
+  end;
+
+  B!GapSize _ B!GapSize + (5 * 512);
+end;
+!! title Rtn ShrinkGap ;
+! Routine to shrink the gap when it gets above GAPMAX bytes long. ;
+
+simple procedure ShrinkGap;
+  begin
+    own integer WordsUsed, MoveFrom, MoveTo, WordsToMove;
+
+    if ( B!GapStart < B!Size ) then
+      begin
+	WordsUsed := ( B!Size + B!GapSize + 4 ) div 5;
+	MoveFrom := ( B!GapStart + B!GapSize ) div 5;
+	MoveTo := MoveFrom - GAPSHRINK;
+	WordsToMove := WordsUsed - MoveFrom;
+
+	while ( WordsToMove > 0 ) do
+	  begin
+	    memory[ B!Addr + MoveTo ] := memory[ B!Addr + MoveFrom ];
+	    MoveTo := MoveTo + 1;
+	    MoveFrom := MoveFrom + 1;
+	    WordsToMove := WordsToMove - 1;
+	  end;
+      end;
+    B!GapSize := B!GapSize - 5 * GAPSHRINK;
+! W!Msg( "ShrinkGap, B!GapSize = " & cvs( B!GapSize ) );
+  end;
+
+!! title Rtn MakeGapPriorBP ;
+! Routines to make byte pointers.  These guys ar good targets for eventual
+!  recoding into assembly language. ;
+
+! Make a byte pointer to the character before the gap ;
+
+simple integer procedure MakeGapPriorBP;
+  begin
+    own integer Temp1, Temp2;
+    Temp1 := B!GapStart - 1;
+    Temp2 := B!Addr + ( Temp1 div 5 );
+    return( Temp2 lor B!BPLeft[ Temp1 mod 5 ] );
+  end;
+!! title Rtn MakeGapStartBP ;
+! Make a byte pointer to the first gap character ;
+
+simple integer procedure MakeGapStartBP;
+  begin
+    own integer Temp1;
+    Temp1 := B!Addr + ( B!GapStart div 5 );
+    return( Temp1 lor B!BPLeft[ B!GapStart mod 5 ] );
+  end;
+!! title Rtn MakeGapEndBP ;
+! Make a byte pointer to the last character in the gap ;
+
+simple integer procedure MakeGapEndBP;
+  begin
+    own integer Temp1, Temp2;
+    Temp1 := B!GapStart + B!GapSize - 1;
+    Temp2 := B!Addr + ( Temp1 div 5 );
+    return( Temp2 lor B!BPLeft[ Temp1 mod 5 ] );
+  end;
+!! title Rtn MakeGapNextBP ;
+! Make a byte pointer to the first character after the gap ;
+
+simple integer procedure MakeGapNextBP;
+  begin
+    own integer Temp1, Temp2;
+    Temp1 := B!GapStart + B!GapSize;
+    Temp2 := B!Addr + ( Temp1 div 5 );
+    return( Temp2 lor B!BPLeft[ Temp1 mod 5 ] );
+  end;
+!! title Rtn MakePointBP ;
+! More routines to make byte pointers ;
+
+! Make a byte pointer to the character to the right of the point ;
+
+simple integer procedure MakePointBP;
+  begin
+    own integer Temp1, Temp2;
+    Temp1 := B!Point + ( if ( B!Point >= B!GapStart ) then
+				B!GapSize else 0 );
+    Temp2 := B!Addr + ( Temp1 div 5 );
+    return( Temp2 lor B!BPLeft[ Temp1 mod 5 ] );
+  end;
+!! title Rtn MakeBufEndBP ;
+! Make a byte pointer to the slot past the end of the buffer ;
+
+simple integer procedure MakeBufEndBP;
+  begin
+    own integer Temp1, Temp2;
+    Temp1 := B!Size + B!GapSize;
+    Temp2 := B!Addr + ( Temp1 div 5 );
+    return( Temp2 lor B!BPLeft[ Temp1 mod 5 ] );
+  end;
+
+!! title Rtn B!ForceGap ;
+! Force the gap to the right of the point. ;
+
+simple procedure B!ForceGap;
+  begin
+    own integer Count, ToMove;
+    if ( B!Point = B!GapStart ) then
+      return
+    else if ( B!Point > B!GapStart ) then
+      begin
+	B!GapNextBP := MakeGapNextBP;
+	B!GapStartBP := MakeGapStartBP;
+	ToMove := ( B!Point - B!GapStart );
+	for Count := 1 upto ToMove do
+	  begin
+	    dpb( ldb( B!GapNextBP ), B!GapStartBP );
+	    ibp( B!GapNextBP );
+	    ibp( B!GapStartBP );
+	  end;
+	B!GapStart := B!Point;
+      end
+    else ! if ( B!Point < B!GapStart ) then ;
+      begin
+	B!GapEndBP := MakeGapEndBP;
+	B!GapPriorBP := MakeGapPriorBP;
+	ToMove := ( B!GapStart - B!Point );
+	for Count := 1 upto ToMove do
+	  begin
+	    dpb( ldb( B!GapPriorBP ), B!GapEndBP );
+	    B!GapPriorBP := DecrBP( B!GapPriorBP );
+	    B!GapEndBP := DecrBP( B!GapEndBP );
+	  end;
+	B!GapStart := B!Point;
+      end;
+  end;
+
+!! title Rtn B!Pcnt ;
+! Return the percentage that the point is into the buffer ;
+
+internal simple integer procedure B!Pcnt;
+  begin
+    return( ( B!Point * 100 ) div B!Size );
+  end;
+!! title Rtn B!GetP ;
+! Return the current value of the point. ;
+
+internal simple integer procedure B!GetP;
+  return( B!Point );
+!! title Rtn B!SetP ;
+! Set the point to an absolute position in the buffer.  If set to beginning
+!  and/or end, set the appropriate flags. ;
+
+internal simple procedure B!SetP( integer Position );
+  begin
+    B!BegP := B!EndP := false;
+    B!Point := Position;
+    if ( B!Point <= 0 ) then
+      begin
+	B!Point := 0;
+	B!BegP := true;
+      end;
+    if ( B!Point >= B!Size ) then
+      begin
+	B!Point := B!Size;
+	B!EndP := true;
+      end;
+  end;
+!! title Rtn B!GetL ;
+! Return the "last" point. ;
+
+forward internal simple integer procedure B!GetM (integer M);
+
+internal simple integer procedure B!GetL;
+begin
+  return(B!GetM(B!LastP));
+end;
+!! title Rtn B!SetL ;
+! Set the "Last" point.  (Used by the split window code). ;
+
+internal simple procedure B!SetL( integer Position );
+begin
+  B!SetM(B!LastP, Position);
+end;
+!! title Rtn B!AllocateMark ;
+! Allocate the first availible Real Mark to the caller and return its
+! index.  A return of -1 indicates that there are no more Marks
+! availible.
+;
+
+internal simple integer procedure B!AllocateMark;
+begin "B!AllocateMark"
+  integer
+    I;
+
+  for I _ FirstMark step 1 until MaxMarks - 1 do
+    if (Marks[I] = -1) then
+    begin
+      Marks[I] _ -2;
+
+      if (I - FirstMark = MarkCnt) then
+        incr(MarkCnt);
+
+      return(I);
+    end;
+
+  return(-1);
+end "B!AllocateMark";
+!! title Rtn B!DeAllocateMark ;
+! Remove a given Mark from circulation, and if possible decrease MarkCnt.
+;
+
+internal simple procedure B!DeAllocateMark (integer M);
+begin "B!DeAllocateMark"
+  integer
+    I;
+
+  if (M < 0 or M >= FirstMark + MarkCnt) then
+    usererr(0, 0, "Error in B!DeAllocateMark", "x")
+  else if (M < #UserMarks) then
+  begin
+    if (Marks[M] neq -1) then
+    begin
+      Marks[Marks[M]] _ -1;
+      Marks[M]        _ -1;
+    end;
+  end
+  else
+    Marks[M] _ -1;
+
+  for I _ FirstMark + MarkCnt - 1 step -1 until FirstMark do
+    if (Marks[I] = -1) then
+      decr(MarkCnt)
+    else
+      done;
+end "B!DeAllocateMark";
+!! title Rtn B!GetM ;
+! Return the current position of the mark ;
+
+internal simple integer procedure B!GetM (integer M);
+begin
+  if (M < 0 or M >= FirstMark + MarkCnt) then
+    usererr(0, 0, "Bad call to B!GetM, M = " & cvs(M), "x" )
+  else
+    return
+    (
+      if (M < #UserMarks) then
+        if (Marks[M] = -1) then
+          -1
+        else
+          Marks[Marks[M]]
+      else
+        Marks[M]
+    );
+end;
+!! title Rtn B!SetM ;
+! Set the mark to some position within the buffer ;
+
+internal simple procedure B!SetM (integer M, P);
+begin
+  if (P < 0) then
+    P _ 0
+  else if (P > B!Size) then
+    P _  B!Size;
+
+  if (M < 0 or M >= FirstMark + MarkCnt) then
+    usererr(0, 0, "Bad call to B!SetM, M = " & cvs(M), "x" )
+  else
+    if (M < #UserMarks) then
+    begin
+      if (Marks[M] = -1) then
+        Marks[M] _ B!AllocateMark;
+
+      Marks[Marks[M]] _ P;
+    end
+    else
+      Marks[M] _ P;
+end;
+!! title Rtn B!Move ;
+! Move forward or backward through the buffer.  If we reach the beginning
+! and/or reach the end, set appropriate flags.  Note that with an empty
+! buffer the point will be both at the beginning and the end. (This code
+! has been optimized since it is central to almost all buffer-related
+! work.)
+;
+
+internal simple procedure B!Move (integer Dir);
+begin "B!Move"
+  start!code
+    define
+      Ac13 = {'13};
+    label
+      Labl1,
+      Labl2;
+
+      setzm     B!BegP;
+      setzm     B!EndP;
+
+      move      Ac13, Dir;
+      addb      Ac13, B!Point;
+
+      jumpg     Ac13, Labl1;
+      setzb     Ac13, B!Point;
+      setom     B!BegP;
+
+    Labl1:
+      camge     Ac13, B!Size;
+        jrst    Labl2;
+
+      setom     B!EndP;
+      move      Ac13, B!Size;
+      movem     Ac13, B!Point;
+
+    Labl2:
+  end;
+end "B!Move";
+!! title Rtn B!Delete ;
+! Delete a character from the buffer.  The side of the point from
+!  which the character is deleted depends on the flag Side. ;
+
+internal simple procedure B!Delete( integer Side );
+  begin
+
+    if ( B!Lock ) then return;
+
+    B!ForceGap;
+!   if ( B!GapSize >= GAPMAX ) then ShrinkGap; 
+
+    if ( Side > 0 ) then	! delete from right of the gap ;
+      begin
+	if ( B!Point < B!Size ) then
+	  begin
+	    start!code
+              define
+                AC1 = 1,
+                AC2 = 2,
+                AC3 = 3;
+              protect!acs
+                AC1,
+                AC2,
+                AC3;
+              label
+                Loop,
+                GoOn;
+
+                move      AC1, B!Point;
+                movei     AC2, access(Marks[FirstMark]);
+                move      AC3, MarkCnt;
+
+              Loop:
+                sojl      AC3, GoOn;
+                camge     AC1, (AC2);
+                sos       (AC2);
+                aoja      AC2, Loop;
+
+              GoOn:
+            end;
+
+	    B!GapSize := B!GapSize + 1;
+	    B!Size := B!Size - 1;
+
+	    if ( B!Point = B!Size ) then
+	      B!EndP := true;
+	  end;
+      end
+    else			! delete from left of the gap ;
+      begin
+	if ( B!Point > 0 ) then
+	  begin
+	    start!code
+              define
+                AC1 = 1,
+                AC2 = 2,
+                AC3 = 3;
+              protect!acs
+                AC1,
+                AC2,
+                AC3;
+              label
+                Loop,
+                GoOn;
+
+                move      AC1, B!Point;
+                movei     AC2, access(Marks[FirstMark]);
+                move      AC3, MarkCnt;
+
+              Loop:
+                sojl      AC3, GoOn;
+                camge     AC1, (AC2);
+                sos       (AC2);
+                aoja      AC2, Loop;
+
+              GoOn:
+	    end;
+
+	    B!Point := B!Point - 1;
+	    B!GapStart := B!GapStart - 1;
+	    B!GapSize := B!GapSize + 1;
+	    B!Size := B!Size - 1;
+	  end;
+      end;
+
+    if ( not B!ModP ) then
+      begin
+	B!ModP := true;		! buffer is now modified ;
+	W!FixS;
+      end;
+
+  end;
+!! title Rtn B!Insert ;
+! Insert a character into the buffer.  The character is inserted at the
+!  right of the point, and at the left size of the gap. ;
+
+! <<  Is this actually true? ;
+
+internal simple procedure B!Insert( integer C );
+  begin "insert"
+
+    own integer InsertBP;
+
+    if ( B!Lock ) then return;
+
+    start!code
+      define
+        AC1 = 1,
+        AC2 = 2,
+        AC3 = 3;
+      protect!acs
+        AC1,
+        AC2,
+        AC3;
+      label
+        Loop,
+        GoOn;
+
+        move      AC1, B!Point;
+        movei     AC2, access(Marks[FirstMark]);
+        move      AC3, MarkCnt;
+
+      Loop:
+        sojl      AC3, GoOn;
+        camge     AC1, (AC2);
+        aos       (AC2);
+        aoja      AC2, Loop;
+
+      GoOn:
+    end;
+
+    B!ForceGap;
+    if ( B!GapSize <= GAPMIN ) then ExpandGap;
+    InsertBP := MakeGapStartBP;
+    B!GapStart := B!GapStart + 1;
+    B!GapSize := B!GapSize - 1;
+
+    dpb( C, InsertBP );
+    B!Size := B!Size + 1;
+    B!Point := B!Point + 1;
+    B!BegP := false;
+
+    if ( Not B!ModP ) then
+      begin
+	B!ModP := true;	! buffer is now modified ;
+	W!FixS;
+      end;
+
+  end "insert";
+!! title Rtn B!GetC ;
+! Return the character to the right of the point.
+;
+
+internal simple integer procedure B!GetC;
+begin "B!GetC"
+  if (B!Point >= B!Size) then
+    return(0);
+
+  start!code
+    define
+      Ac1  = {'01},
+      Ac13 = {'13},
+      Ac14 = {'14},
+      Ac15 = {'15};
+
+      move      Ac14, B!Point;          ! compute absolute char offset ;
+      caml      Ac14, B!GapStart;
+        add     Ac14, B!GapSize;
+      idivi     Ac14, 5;                ! word pointer in Ac14, offset in Ac15;
+      add       Ac14, B!Addr;           ! add base ;
+      move      Ac14, (Ac14);           ! pick up the word ;
+      imuli     Ac15, 7;                ! build a shift count ;
+      addi      Ac15, 7;                ! ... ;
+      lshc      Ac13, (Ac15);
+      andi      Ac13, '177;              ! mask to 7 bits ;
+      move      Ac1, Ac13;
+  end;
+end "B!GetC";
+!! title Rtn B!Read ;
+! Routine to slurp a file into memory from disk ;
+
+internal simple procedure B!Read(integer Chan, Words);
+begin
+  integer
+    Offset, Inc, Bits, TWords;
+  boolean
+    EmptyFile;
+
+  EmptyFile _ (Words = 0);
+  B!Pages   _ ceiling(Words, 512) + 2;
+  B!GapSize _ 2 * 512 * 5;
+
+  if (VClear(BasePage, 512 - BasePage)) then
+    usererr(0, 0, "VClear Error in B!Read", "x");
+
+  if (VCreate(BasePage, B!Pages)) then
+    usererr(0, 0, "VCreate Error in B!Read", "x");
+
+  B!Size _ Words * 5;
+  Offset _ 2 * 512;		! start with 2 gap pages ;
+  B!NullFlag _ false;
+  TWords _ Words;
+
+  while (Words) do
+  begin
+    Inc _ 512 min Words;
+    Arryin(Chan, memory[B!Addr + Offset], Inc);
+
+    start!code
+      label		loop1, loop2;
+      skipe		B!NullFlag;
+	jrst		loop2;
+      move		1, B!Addr;
+      add		1, Offset;
+      move		2, Inc;
+      caie		2, 512;
+	soje		2, loop2;
+
+    loop1:
+      sosg		TWords;		! examine all but the last word ;
+	jrst		loop2;
+      move		3, (1);
+      trnn		3, '376;		! '177 lsh 1 ;
+	setom		B!NullFlag;
+      addi		1, 1;
+      sojg		2, loop1;
+
+    loop2:
+    end;
+
+    Words  _ Words - Inc;
+    Offset _ Offset + Inc;
+  end;
+
+
+  ! now strip 1 to 4 trailing nulls from the end of the file ;
+
+  if (not EmptyFile) then
+  begin
+    Offset _ OffSet - 1;	! point to last word of file ;
+    Bits _ '177 lsh 1;		! character mask ;
+
+    for Inc _ 1 upto 4 do
+    begin
+      if (memory[B!Addr + OffSet] land Bits) then
+	done
+      else
+      begin
+	Bits _ Bits lsh 7;
+	B!Size _ B!Size - 1;
+      end;
+    end;
+  end;
+
+  B!BegP _ true;
+  B!EndP _ (not B!Size);
+end;
+!! title Rtn B!Write ;
+! Routine to spit a file out to disk ;
+
+internal simple procedure B!Write( integer Chan );
+  begin
+    own integer SavePoint, Words, Inc, Offset;
+
+    ! Push that gap the the end of the file, and insure that the last
+    ! 4 characters are NULL ;
+
+    SavePoint := B!Point;
+    B!Point := B!Size;
+    B!ForceGap;
+    Inc := MakeGapStartBP;
+    dpb( NULL, Inc );
+    idpb( NULL, Inc );
+    idpb( NULL, Inc );
+    idpb( NULL, Inc );
+
+    ! spit out the buffer ;
+
+    OffSet := 0;
+    Words := ( B!Size + 4 ) div 5;
+    while ( Words ) do
+      begin
+	Inc := Words min 512;
+	arryout( Chan, memory[ B!Addr + Offset ], Inc );
+	Words := Words - Inc;
+	OffSet := OffSet + Inc;
+      end;
+
+    B!Point := SavePoint;
+    B!ModP := false;		! buffer is again virgin ;
+
+  end;
+!! title Rtn B!AnyM ;
+! See if any buffers in the ring are modified ;
+
+internal simple boolean procedure B!AnyM;
+begin "B!AnyM"
+  integer
+    Ptr;
+
+  Ptr _ B!!Head;
+
+  while (Ptr) do
+  begin
+    if ((Ptr = B!!List and B!ModP and length(B!File)) or
+	(Ptr neq B!!List and B!!ModP[Ptr] and length(B!!File[Ptr]))) then
+      return(true);
+
+    Ptr _ B!!Next[Ptr];
+  end;
+
+  return(false);
+end "B!AnyM";
+!! title Rtn B!ModCnt ;
+! routine to return the number of buffers in the ring that are modified
+;
+
+internal simple integer procedure B!ModCnt;
+begin "B!ModCnt"
+  integer
+    Cnt,
+    Ptr;
+
+  Ptr _ B!!Head;
+  Cnt _ 0;
+
+  while (Ptr) do
+  begin
+    if ((Ptr = B!!List and B!ModP and length(B!File)) or
+	(Ptr neq B!!List and B!!ModP[Ptr] and length(B!!File[Ptr]))) then
+      incr(Cnt);
+
+    Ptr _ B!!Next[Ptr];
+  end;
+
+  return(Cnt);
+end "B!ModCnt";
+!! title Rtn B!Fini ;
+! B!Fini - walk the ring, optionally writting out modified files
+!  and deleting the checkpoint files.
+! Note that B!Kill does a B!Restore for the next buffer.
+;
+
+internal simple boolean procedure B!Fini( boolean WriteFiles );
+  begin "fini"
+
+    B!!ModP[ B!!List ] := B!ModP;
+
+    while ( B!!List ) do
+      begin "each buffer"
+
+	if ( WriteFiles and
+	     B!!ModP[ B!!List ] and
+	     length( B!!File[ B!!List ] )) then
+	  begin
+	    if ( not F!Writ( B!!File[ B!!List ] )) then return( false );
+	    B!Kill;
+	  end
+	else
+	  B!Kill;
+
+      end "each buffer";
+
+    B!RlChan(B!Chan);
+    return( true );
+
+  end "fini";
+!! title Rtn B!SeqP ;
+! Routine to tell if there are sequence number bits on.
+;
+
+internal simple boolean procedure B!SeqP;
+  begin "seq?"
+    integer I, W, C;
+
+    if ( B!Size = 0 ) then return( false );
+    W := memory[ B!Addr + ( B!GapSize div 5 ) ];
+
+    if ( not ( W land 1 )) then return( false );
+
+    W := W lsh -1;
+    for I := 1 upto 5 do
+      begin
+	C := W land '177;
+	if (( C < "0" ) or ( C > "9" )) then return( false );
+	W := W lsh -7;
+      end;
+
+    return( true );
+
+  end "seq?";
+!! title Rtn B!NulP ;
+! Routine to tell if there are NULLs in this buffer ;
+
+internal simple boolean procedure B!NulP;
+  begin
+    return( B!NullFlag );
+  end;
+!! title Rtn B!DelN ;
+! Routine to delete nulls from the buffer. Since it does not adjust Marks
+! while doing its deletion, this routine should only be invoked before
+! the buffer is turned over to the user.  Currently, it is only called
+! by F!Load and B!DelS ;
+
+internal simple procedure B!DelN;
+begin
+  B!SetP(0);
+
+  while (not B!EndP) do
+  begin
+    if (B!GetC = null) then
+    begin
+      B!ForceGap;
+      incr(B!GapSize);
+      decr(B!Size);
+
+      if (B!Point = B!Size) then
+	set(B!EndP);
+    end
+    else
+      B!Move(FORWARDS);
+  end;
+
+  B!SetP(0);
+end;
+!! title Rtn B!DelS ;
+! Routine to delete sequence numbers from the buffer.
+! *Must* be called after B!Read before any other mods are made
+! to the buffer.  Hideous things happen elsewise. ;
+
+internal simple procedure B!DelS;
+  begin
+    integer idx, count;
+
+    idx := B!Addr + ( B!GapSize div 5 );
+    count := B!Size div 5;
+
+    while ( count ) do
+      begin
+	if ( memory[ idx ] land '1 ) then
+	  begin
+	    memory[ idx ] := 0;
+	    memory[ idx + 1 ] := memory[ idx + 1 ] land '003777777777;
+	  end;
+        idx := idx + 1;
+	count := count - 1;
+      end;
+
+    B!DelN;
+  end;
+!! title Rtn B!BufStat ;
+! Routine to throw the list of buffers into the Box ;
+
+internal simple procedure B!BufStat;
+begin "buffer status"
+  integer L;
+  string S;
+
+  ! List starting with B!!Head;
+
+  L := B!!Head;
+  while ( L ) do
+  begin "list buffers"
+    if ( L = B!!List ) then
+      S := " > " else S := "   ";
+
+    if ( B!!Alias[ L ] ) then
+      S := S & B!!Alias[ L ]
+    else
+      S := S & B!!File[ L ];
+
+    if ( L = B!!List and B!ModP or
+	L neq B!!List and B!!ModP[ L ] ) then
+      S := S & " *";
+
+    W!BAdd( S );
+    L := B!!Next[ L ];
+  end "list buffers";
+end "buffer status";
+end "DED - buffer manager"
+
+
+! ***************************  End Xbuff.Sai  ****************************;
+o 	r
