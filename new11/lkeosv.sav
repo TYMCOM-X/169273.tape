@@ -1,0 +1,518 @@
+.IFF	;IF NOT USING ATC+X.25
+
+	.SBTTL	LKEOSV	- Output interrupt handler
+;-----
+; LKEOSV - Processes output interrupts from the DUV-11/DUP-11 interface
+;
+; The following code has been executed to get here:
+;	<output done interrupt>
+;	PUSH	R4
+;	MOV	<address of DDB>,R4
+;	JMP	LKEOSV
+;-----
+LKEOSV::PUSH	R0			; Save R0
+	BIS	#$IRMA,DDLEF2#(R4)	; Set IRMA timer flag
+	MOV	DDLEOS#(R4),R0		; Get output state - output active?
+	BEQ	ONEXTF			; No - check for new frame to send
+	JMP	(R0)			; Yes - dispatch to output state
+;-----
+; Here to find next frame to send (if there is one)
+;-----
+ONEXTF:	TBBN	$D1DWN,DDSTS1#(R4),ONEXT1 ; Bypass if not info xfr phase
+	BIC	#$ABORT,DDLEFG#(R4)	; Clear abort flag (not sending yet)
+	TBBN	$TIMER,DDLEFG#(R4),1$	; If timer recovery, don't send info
+	CMP	DDLELN#(R4),DDLELT#(R4)	; Info frames pending?
+	BNE	OFINFO			; Yes - send info frame
+	BR	2$			; Go check for pending RR frame
+
+1$:	TBBN	$REXMT,DDLEFG#(R4),OFRXMT ; If retransmit flag set, retransmit
+					;   1st frame on transmit ring
+2$:	TBBN	$RR,DDLEFG#(R4),OFRR	; If pending RR response for info frame
+					;   go send RR (or RNR if input busy)
+	TBBE	$RRCMD,DDLEFG#(R4),ONEXT1 ;BRANCH IF NO NEED TO SEND RR CMD YET
+	JMP	ORRCMD
+
+ONEXT1:	MOVB	DDLECM#(R4),DDLEOX#(R4)	; Get pending command - anything there?
+	BEQ	10$			; NO, GO ON
+	JMP	OFCMND			; Yes - send command frame
+10$:	MOVB	DDLEAK#(R4),DDLEOX#(R4)	; Get pending ACK - anything there?
+	BNE	OFRESP			; Yes - send response frame
+;-----
+; Here to go idle when there is no frame to output
+;-----
+OFIDLE:
+.IF	EQ	<..DPV-1>	;IF USING DPV
+	BIC	#TXITEN,@DDLEXS#(R4)	;DISABLE XMIT INTERRUPT
+	MOV	DDLEXB#(R4),R0		;GET ADDRESS OF THE XMITTER BUFFER REG
+	INC	R0			;POINTS TO UPPER BYTE
+	MOVB	#TXSTRM/400,(R0)	;TSOM=1, TGA=TABORT=TEOM=0
+					;SINCE DDLEPR(IDLE)=0, FLAGS WILL BE 
+					;  SENT AND XMIT DATA LATE ERROR WILL
+					;  SUPPRESSED.
+.IFF				;IF NOT USING DPV
+	TST	DDLEPX#(R4)		; DUP-11 or DU-11/DUV-11
+	BMI	1$			; Skip if DUP-11
+
+	BIC	#$XSEND,@DDLEXS#(R4)	; DU-11 or DUV-11 - Clear tranmitter
+					;   send (idle w/marks)
+.IFTF
+1$:	CLR	DDLEOS#(R4)		; Clear output state (go inactive)
+RTI001:	RTI04				; Return from interrupt
+.ENDC
+
+	.SBTTL	Set up for response frame (RR, RNR, REJ, UA, CMDR)
+;-----
+; Here to begin sending response frame
+;-----
+OFRESP:	CLRB	DDLEAK#(R4)		; Clear pending response function
+	CMPB	DDLEOX#(R4),#.UA	; Unnumbered Acknowledge response?
+	BEQ	OFRESX			; Yes
+	CMPB	DDLEOX#(R4),#.DM	; Disconnected Mode response?
+	BEQ	OFRESX			; Yes
+;-----
+; Make sure all is well before sending a supervisory response frame
+;-----
+	BIC	#$RR,DDLEFG#(R4)	; Clear RR pending flag
+	TBBN	$D1DWN,DDSTS1#(R4),OFIDLE ; Go idle if not info xfr phase
+	TBBE	$FRMR,DDLEFG#(R4),OFSUPV; If not FRMR state, send supervisory
+;-----
+; Begin sending FRMR frame
+;-----
+OFCMDR:	MOVB	#.FRMR,DDLEOX#(R4)	; Frame control byte <-- FRMR
+	MOV	#OINFCR,DDLEOI#(R4)	; Info fld dispatch <-- FRMR info fld
+	BR	OFRAME			; Start sending frame
+
+;-----
+; Here when received frames to be ACK'd and no info frame to piggyback ACK
+;-----
+OFRR:	BIC	#$RR,DDLEFG#(R4)	; Clear RR pending flag
+	MOVB	#.RR,DDLEOX#(R4)	; Frame control byte <-- RR
+;	TBBE	$IBUSY,DDLEFG#(R4),OFSUPV ; Input busy?
+;	MOVB	#.RNR,DDLEOX#(R4)	; Yes - frame control byte <-- RNR
+
+;-----
+; Here to get N(R) for supervisory frame and finish setup
+;-----
+OFSUPV:	MOVB	DDLEVR#(R4),R0		; Get V(R) for supervisory frame
+	ASHI	.SHFNR,R0		; Shift into N(R) position
+	BISB	R0,DDLEOX#(R4)		; Put N(R) into control byte
+
+;-----
+; Here to set frame address and information field dispatch then start sending
+;-----
+OFRESX:	MOV	#OENDTR,DDLEOI#(R4)	; Info fld dispatch <-- no info fld
+	MOVB	DDLEXR#(R4),DDLEOA#(R4)	; Frame address <-- outgoing response
+	TBBE	$ICPF,DDLEFG#(R4),OFRAME; Should Final bit be set?
+	BIC	#$ICPF,DDLEFG#(R4)	; Yes - clear input cmd Poll bit flag
+	BISB	#$PFBIT,DDLEOX#(R4)	; Set Final bit in response frame
+	BR	OFRAME			; Start sending frame
+
+
+	.SBTTL	Set up for command frame (SARM, DISC, information)
+;-----
+; Here to prepare to retransmit 1st info frame on transmit ring
+;-----
+OFRXMT:	BIC	#$REXMT,DDLEFG#(R4)	; Clear retransmit flag
+	BIS	#$FRXMT,DDLEFG#(R4)	; Flag this frame is retransmission
+	MOVB	DDLEK1#(R4),DDLET1#(R4)	; Reset timer T1
+	MOV	@DDLELH#(R4),DDLEOF#(R4); Get ptr to 1st frame on transmit ring
+	BNE	1$			; Ok if something is there
+	FSTOP	ZPR			; [Zero Packet list in Retransmission]
+
+1$:	MOVB	DDLENR#(R4),DDLEOX#(R4)	; Control byte N(S) <-- stored N(R)
+	BR	OFINF1			; Merge with info frame setup code
+
+;-----
+; Here for setup to send an information frame
+;-----
+OFINFO:	TBBE	$ICPF,DDLEFG#(R4),1$	; Was cmd frame read with Poll bit set?
+	TBBN	$RR,DDLEFG#(R4),OFRR	; Yes - if it was info, send RR w/F bit
+
+1$:	BIC	#$FRXMT,DDLEFG#(R4)	; Flag this frame not a retransmission
+	MOV	@DDLELN#(R4),DDLEOF#(R4); Get ptr to next frame to send
+	MOVB	DDLEVS#(R4),DDLEOX#(R4)	; Put V(S) into N(S) of control byte
+
+OFINF1:	ASLB	DDLEOX#(R4)		; Position N(S) in control byte
+	MOV	#OINF0,DDLEOI#(R4)	; Info fld dispatch <-- info frame kind
+	MOVB	DDLEVR#(R4),R0		; Get V(R)
+	ASHI	.SHFNR,R0		; Position N(R) for control byte
+	BISB	R0,DDLEOX#(R4)		; Put N(R) into control byte
+	BR	OFCMN1			; Merge with end of command frame setup
+
+;-----
+; HERE TO SEND AN RR COMMAND WITH P BIT
+;-----
+ORRCMD:
+	BIC	#$RRCMD,DDLEFG#(R4)	;
+	MOVB	#.RR,DDLEOX#(R4)	;SETTING UP CNTL BYTE
+;	TBBE	$IBUSY,DDLEFG#(R4),10$	;BRANCH IF NOT BUSY
+;	MOVB	#.RNR,DDLEOX#(R4)	;SEND RNR IF THIS END BUSY
+10$:
+	MOVB	DDLEVR#(R4),R0		;GET RECEIVE VARIABLE
+	ASHI	.SHFNR,R0
+	BISB	R0,DDLEOX#(R4)		;COMPLETE CNTL BYTE
+;-----
+; Here to begin sending command frame
+;-----
+OFCMND:	CLRB	DDLECM#(R4)		; Clear pending command function
+	MOV	#OENDTR,DDLEOI#(R4)	; Info fld dispatch <-- no info fld
+
+OFCMN1:	MOVB	DDLEXC#(R4),DDLEOA#(R4)	; Frame address <-- outgoing command
+	TBBE	$OCPF,DDLEFG#(R4),OFRAME; Send frame if P/F bit should be clear
+	BIC	#$OCPF,DDLEFG#(R4)	; Clear output cmd frame Poll bit flag
+	BISB	#$PFBIT,DDLEOX#(R4)	; Set Poll bit in frame control byte
+;-----
+; Drop through into beginning of frame output code...
+;-----
+	.SBTTL	Protocol output states - start sending frame
+OFRAME:
+.IF	EQ	<..DPV-1>	;IF USING DPV
+;-----
+; HERE TO START A NEW OUTPUT FRAME - SEND FRAME ADDRESS BYTE WITH TSOM OFF
+;-----
+	MOV	DDLEXB#(R4),R0	;GET ADDRESS OF XMIT BUFFER
+	BIS	#TXITEN!TXREN,@DDLEXS#(R4) ; XMITTER ENABLE AND INTERRUPT ENABLE
+	TBBE	TXLATE,(R0),OFRAM2	;BRANCH IF NOT UNDERRUN
+;-----
+; WE MAY GET HERE BECAUSE THE 1ST BYTE OF A FRAME TO ABUT IS SUPPLIED TOO
+;  LATE TO THE XMITTER
+;-----
+OFRAM1:
+	INC	R0			;POINTS TO UPPER BYTE OF XMIT BUF REG
+	MOVB	#TXSTRM/400,(R0)	;TSOM=1, CLEAR THE DATA LATE ERROR
+	CLR	DDLEOS#(R4)		;CLEAR OUPUT STATE
+	RTI04				;ABORT HAS BEEN SENT BY DPV;
+					; HERE WE SEND A FLAG AND TRY TO 
+					; RESTART THE XMISSION
+OFRAM2:	
+	MOV	#OCNTL,DDLEOS#(R4)	;NEXT STATE = OUTPUT CNTRL BYTE
+	CLR	R0
+	BISB	DDLEOA#(R4),R0		;GET FRAME ADDRESS FOR OUTPUT
+OFRAM3:
+	MOV	R0,@DDLEXB#(R4)		;OUTPUT A BYTE 
+					;  WITH TSOM=TEOM=TGA=TABORT=0
+	RTI04
+.IFF		;NOT USING DPV
+;-----
+; Here to start a new output frame - send frame synch, start of transparency,
+; address, and control bytes - <frame synch><DLE><STX><address><control>
+;-----
+	MOV	#OFRSYN,DDLEOS#(R4)	; Output state <-- send frame synch
+	CLR	DDLECO#(R4)		; Initialize CRC-16 for this frame
+
+	MOVB	#.SHSYN,DDLEOC#(R4)	; Output byte count <-- short synch
+	TBBE	$SYNCH,DDLEFG#(R4),1$	; Should extra synch bytes be sent?
+	BIC	#$SYNCH,DDLEFG#(R4)	; Yes - clear long synch flag
+	MOVB	#.LNSYN,DDLEOC#(R4)	; Byte count <-- long synch string
+
+1$:	TST	DDLEPX#(R4)		; DUP-11 or DU-11/DUV-11?
+	BMI	OFRSYN			; Skip if DUP-11
+
+	BIS	#$XSEND,@DDLEXS#(R4)	; DU-11 or DUV-11 - set send bit
+
+;-----
+; Here to send a frame synch byte
+;-----
+OFRSYN:	DECB	DDLEOC#(R4)		; Bump byte count
+	BMI	OFRDLE			; When done, send <DLE><STX>
+	MOV	#<$XSMSG!SYN>,@DDLEXB#(R4) ; Send <SYN> byte w/o CRC calc
+					;   and set start of message bit
+	RTI04				; Return from interrupt
+
+;-----
+; Here to send <DLE> byte before <STX> (start of transparency)
+;-----
+OFRDLE:	MOV	#OFRSTX,DDLEOS#(R4)	; Output state <-- send <STX> byte
+	MOVB	#DLE,@DDLEXB#(R4)	; Send <DLE> byte w/o CRC calc
+	RTI04				; Return from interrupt
+
+;-----
+; Here to send <STX> byte to start frame transparency
+;-----
+OFRSTX:	MOV	#OADDR,DDLEOS#(R4)	; Output state <-- frame address byte
+	MOVB	#STX,@DDLEXB#(R4)	; Send <STX> byte w/o CRC calc
+	RTI04				; Return from interrupt
+
+;-----
+; Here to output frame address byte
+;-----
+OADDR:	MOV	#OCNTL,DDLEOS#(R4)	; Output state <-- frame control byte
+	CLR	R0			; Clear residue
+	BISB	DDLEOA#(R4),R0		; Get frame address byte
+	JMP	OTRANS			; Output byte with transparency
+.IFTF
+;-----
+; Here to output frame control byte
+;-----
+OCNTL:
+.IFT
+	CHKLAT				;CHECK XMITER DATA LATE
+.IFTF
+	MOV	DDLEOI#(R4),DDLEOS#(R4)	; Output state <-- info field (if any)
+	CLR	R0			; Clear residue
+	BISB	DDLEOX#(R4),R0		; Get frame control byte
+.IFT
+	JMP	OFRAM3
+.IFF
+	JMP	OTRANS			; Output byte with transparency
+.ENDC	;OFRAME
+;-----
+; **** NOTE ****
+;
+; Next output state is the beginning of the information field...  Only 2 frame
+; formats have information fields: information command frame and FRMR response
+; frame...  The other frame formats (SABM, DISC, UA, DM, RR, RNR, REJ) are not
+; allowed information fields...  When frame output is initialized at ONEXTF,
+; the frame information field dispatch location is placed in the DDB (DDLEOI)
+; depending on frame format...  This is one of: OINF0 (1st byte of information
+; command frame information field), OINFCR (1st byte of FRMR response frame
+; information field), or OENDTR (end transparency - i.e. no information field)
+;-----
+	.SBTTL	Protocol output states - information frame info field
+;-----
+; Here to begin output of information frame info field
+;-----
+OINF0:	MOV	#OINFO,DDLEOS#(R4)	; Output state <-- rest of info field
+	MOV	DDLEOF#(R4),R0		; Get 1st packet pointer
+	BNE	1$			; Ok if something is there
+	FSTOP	ZPL			; [Zero Packet List]
+
+1$:	MOV	R0,DDLEOP#(R4)		; Save current packet pointer
+	MOV	R0,DDLEOB#(R4)		; Init packet byte pointer
+	ADD	#PKTYPE,DDLEOB#(R4)	; Start taking bytes from packet type
+	MOVB	PKCNT(R0),R0		; Get packet byte count
+	ADD	#<PKDATA-PKTYPE>,R0	; 1st packet has more bytes
+	MOVB	R0,DDLEOC#(R4)		; Store length of 1st packet
+	BR	OINFO			; Go send 1st information field byte
+
+;-----
+; Here to get a new packet for additional information field bytes
+;-----
+ONEWPK:	MOV	@DDLEOP#(R4),R0		; Get link to new current packet
+	BEQ	OINFET			; Quit if end of packet list
+
+	MOV	R0,DDLEOP#(R4)		; Save current packet pointer
+	MOV	R0,DDLEOB#(R4)		; Init packet byte pointer
+	ADD	#PKDATA,DDLEOB#(R4)	; Start taking bytes from pkt data
+	MOVB	PKCNT(R0),DDLEOC#(R4)	; Get packet byte count
+
+;-----
+; Here to send an information field byte
+;-----
+OINFO:	TBBN	$ABORT,DDLEFG#(R4),OABORT ; If time to abort, go do it
+	TSTB	DDLEOC#(R4)		; Any bytes left in packet?
+	BEQ	ONEWPK			; No - get next packet
+
+.IF	EQ	<..DPV-1>	;IF USING DPV
+	CHKLAT			;CHECK XMITER DATA LATE
+.IFTF
+	CLR	R0			; Clear residue
+	BISB	@DDLEOB#(R4),R0		; Get byte from packet
+	INC	DDLEOB#(R4)		; Bump byte pointer
+	DECB	DDLEOC#(R4)		; Bump packet byte count
+.IFT	;DPV
+	JMP	OFRAM3
+.IFF
+	JMP	OTRANS			; Output byte with transparency
+.ENDC
+
+;-----
+; Here to end info frame info field and update V(S)
+;-----
+OINFET:
+.IF	EQ	<..DPV-1>	;USING DPV
+	CHKLAT			;CHECK XMITER DATA LATE
+
+	INC	R0			;POINTS TO UPPER BYTE OF XMIT BUF REG
+	MOVB	#TXENDM/400,(R0)	;SET TEOM TO SEND CRC1, CRC2, FLAG
+					; OUTPUT DONE INTERRUPT SHOULD THEN
+					;  OCCUR
+	MOV	#ONEXTF,DDLEOS#(R4)	;NEXT STATE=SENDING A NEW FRAME IF 
+					;  THERE IS ONE
+.IFTF
+	BIC	#$RR,DDLEFG#(R4)	; Clear RR pending flag
+	TSTB	DDLET1#(R4)		; Timer T1 set?
+	BNE	1$			; Yes - don't reset it
+	MOVB	DDLEK1#(R4),DDLET1#(R4)	; No - set it
+	MOV	#XXINFO,DDLETX#(R4)	; Timer expire state <-- sending info
+1$:	TBBE	$FRXMT,DDLEFG#(R4),2$	; If not retransmission, bump V(S)
+	BIC	#$FRXMT,DDLEFG#(R4)	; Retransmission - clear flag
+	BR	20$
+
+2$:	INCB	DDLEVS#(R4)		; Bump V(S)
+	BICB	#$MASKN,DDLEVS#(R4)	; Perform modulus addition
+	ADD	#2,DDLELN#(R4)		; Bump next-frame-to-send pointer
+	CMP	DDLELN#(R4),DDLELE#(R4)	; End of ring?
+	BLO	20$
+	MOV	DDLELB#(R4),DDLELN#(R4)	; Yes - reset next frame pointer
+20$:
+.IFT
+	RTI04			;TEOM WAS SET, ALL DONE IF DPV
+.IFF
+	BR	OENDTR		;GO END TRANSPARENCY IF NOT DPV
+.ENDC
+
+;-----
+; Here to abort output frame
+;-----
+OABORT:
+.IF	EQ	<..DPV-1>	;IF USING DPV
+	MOV	DDLEXB#(R4),R0
+	INC	R0
+	BISB	#TXABRT/400,(R0)	;SET TXABORT,
+	MOV	#ONEXTF,DDLEOS#(R4)	;
+
+.IFF	;NOT USING DPV
+	MOV	#OABOR1,DDLEOS#(R4)	; Output state <-- send <EOT>
+	MOVB	#DLE,@DDLEXB#(R4)	; Send <DLE> byte w/o CRC calc
+	RTI04				; Return from interrupt
+
+;-----
+; Here to complete frame abort
+;-----
+OABOR1:	MOV	#OPAD1,DDLEOS#(R4)	; Output state <-- send pad byte
+	MOVB	#EOT,@DDLEXB#(R4)	; Send <EOT> byte w/o CRC calc
+
+.IFTF
+	BIC	#<$ABORT!$FRXMT>,DDLEFG(R4) ; Clear abort and retransmitted
+					;   frame flags
+	RTI04				; Return from interrupt
+.ENDC
+	.SBTTL	Protocol output states - FRMR frame information field
+;-----
+; Here to begin information field of FRMR frame
+;-----
+OINFCR:
+.IF	EQ	<..DPV-1>	;USING DPV
+	CHKLAT
+.IFTF
+	MOV	#OCVRVS,DDLEOS#(R4)	; Output state <-- send V(R) and V(S)
+	CLR	R0			; Clear residue
+	BISB	DDLECX#(R4),R0		; Get bad control byte
+
+.IFT
+	JMP	OFRAM3
+.IFF
+	BR	OTRANS			; Output byte with transparency
+.ENDC
+
+;-----
+; Here to send V(R) and V(S) in CMDR info field
+;-----
+OCVRVS:
+.IF	EQ	<..DPV-1>	;IF USING DPV
+	CHKLAT
+.IFTF
+	MOV	#OCRSN,DDLEOS#(R4)	; Output state <-- send CMDR reason
+	CLR	R0			; Clear residue
+	BISB	DDLEVR#(R4),R0		; Get V(R)
+	ASHI	<.SHFNR-1>,R0		; Partially align V(R)
+	BISB	DDLEVS#(R4),R0		; Get V(S)
+	ASL	R0			; Align V(R) and V(S)
+	TBBE	$RSREJ,DDLEFG#(R4),10$	;BRANCH IF NOT REJECTING A RESPONSE
+	BIS	#20,R0			;INDICATE FRAME BEING REJECTED IS A 
+					; RESPONSE.
+10$:
+.IFT
+	JMP	OFRAM3
+.IFF
+	BR	OTRANS			; Output byte with transparency
+.ENDC
+;-----
+; Here to send CMDR reason in CMDR frame info field
+;-----
+OCRSN:
+.IF	EQ	<..DPV-1>
+	CHKLAT
+.IFTF
+	MOV	#OENDTR,DDLEOS#(R4)	; Output state <-- end transparency
+	CLR	R0			; Clear residue
+	BISB	DDLECR#(R4),R0		; Get CMDR reason
+.IFT
+	JMP	OFRAM3
+.IFF
+	BR	OTRANS			; Output byte with transparency
+.ENDC
+	.SBTTL	Protocol output states - <DLE><ETX>, CRC, pad byte
+;-----
+; Here to end transparency
+;-----
+OENDTR:
+.IF 	EQ	<..DPV-1>	;IF USING DPV
+	MOVB	#.T3,DDLET3#(R4)	;Start the idle output RR timer
+	CHKLAT
+	INC	R0			;POINTS TO UPPER BYTE OF TDSR
+	MOVB	#TXENDM/400,(R0) 	;SET EOM TO SEND CRC1, CRC2, FLAG
+	MOV	#ONEXTF,DDLEOS(R4) 	; NEXT STATE WHEN ABOVE SEQUENCE IS DONE
+	RTI04
+.IFF				;NOT USING DPV
+	MOV	#ONEXTF,DDLEOS#(R4) ;
+	MOV	#OENDT1,DDLEOS#(R4)	; Output state <-- send <ETX>
+	MOVB	#DLE,@DDLEXB#(R4)	; Send <DLE> byte w/o CRC calc
+	RTI04				; Return from interrupt
+;-----
+; Here to send <ETX>
+;-----
+OENDT1:	MOV	#OCRC1,DDLEOS#(R4)	; Output state <-- send CRC byte 1
+	MOV	#ETX,R0			; Send <ETX>
+	BR	OCCRC			; Go calc CRC and send byte
+
+;-----
+; Here to send CRC byte 1
+;-----
+OCRC1:	MOV	#OCRC2,DDLEOS#(R4)	; Output state <-- send CRC byte 2
+	MOVB	DDLECO#(R4),@DDLEXB#(R4); Send CRC byte 1
+	RTI04				; Return from interrupt
+
+;-----
+; Here to send CRC byte 2
+;-----
+OCRC2:	MOV	#OPAD,DDLEOS#(R4)	; Output state <-- send pad byte
+	MOVB	DDLECO#+1(R4),@DDLEXB#(R4) ; Send CRC byte 2
+	RTI04				; Return from interrupt
+
+;-----
+; Here to send pad byte following frame
+;-----
+OPAD:	MOVB	#.T3,DDLET3#(R4)	; Reset idle link RR frame timer
+OPAD1:	MOV	#ONEXTF,DDLEOS#(R4)	; Output state <-- next frame to send
+	MOV	#377,@DDLEXB#(R4)	; Send pad byte & clear start msg bit
+	RTI04				; Return from interrupt
+	.SBTTL	Protocol output states - CRC & send byte to device
+;-----
+; Here to perform transparent byte output - double each <DLE> byte
+;-----
+OTRANS:	CMPB	R0,#DLE			; Byte == <DLE>?
+	BNE	OCCRC			; No - calculate CRC and send byte
+	MOV	DDLEOS#(R4),DDLETS#(R4)	; Save output state
+	MOV	#OTRAN1,DDLEOS#(R4)	; Output state <-- duplicate <DLE> byte
+	MOVB	R0,@DDLEXB#(R4)		; Send 1st <DLE> w/o CRC calc
+	RTI04				; Return from interrupt
+;-----
+; Here to send 2nd <DLE> byte for transparency
+;-----
+OTRAN1:	MOV	DDLETS#(R4),DDLEOS#(R4)	; Restore output state to normal
+	MOV	#DLE,R0			; Get 2nd <DLE> byte
+
+;-----
+; Here to calculate partial CRC-16 for output byte
+;-----
+OCCRC:	MOVB	R0,@DDLEXB#(R4)		; Send byte accross interface
+
+	PUSH	R1			; Save register
+
+	MOV	DDLECO#(R4),R1		; Get old partial CRC
+	XOR	R1,R0			; XOR old CRC and new byte
+	BIC	#177400,R0		; Clear high byte
+	ASL	R0			; Convert to word index
+	MOV	CRCTAB#(R0),R0		; Get modifier word
+	CLRB	R1			; Clear low byte of old CRC
+	SWAB	R1			; Move high byte of old CRC to low
+	XOR	R0,R1			; XOR modifier and old CRC
+	MOV	R1,DDLECO#(R4)		; Save new partial CRC
+
+	POP	R1			; Restore register
+
+	RTI04				; Return from interrupt
+.ENDC	;OENDTR
+  
