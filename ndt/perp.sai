@@ -1,0 +1,370 @@
+begin "perp"
+define fakeIO=true;
+require "(SAILIB)SAIL.DEF" source!file;
+!get!definitions(gogtab);
+!get!module(search);
+
+external integer array gogtab[0:endren];
+
+
+record!class buffer( integer room, bytePointer; r!p(buffer) next );
+		define #room=1, #bytptr=2, #next=3;
+r!p(buffer) forInterrupt;	! buffer(s) currently for output;
+integer auxArg;			! for ease/speed: holds port,,!axI8S;
+string	forceOutput;		! call forceStore to write into this;
+				! and forceRead to look at it;
+simple string procedure forceStore( string newContents );
+! returns old contents;
+begin!code 
+	movei	1,forceOutput;	! need the address of that bugger;
+	movei	2,0;		! first set length 0 (hide bytepointer);
+				! this insures that the byte pointer;
+				! is not touched by byteShovel;
+	exch	2,-1(1); 	! zero the length word and grab old one;
+	move	3,(1);		! get the (now stable) byte ptr word;
+	exch	2,-1(sp);	! swap it into the arg/result part;
+	exch	3,(sp);		! swap it into the arg/result part;
+	movem	3,(1);		! store the byte pointer part FIRST;
+	movem	2,-1(1);	! then the length (now it can be eaten);
+	popj p,;		! OK, its cool again;
+end;
+
+simple string procedure forceRead;
+begin!code 	label tryOnce;
+	movei	1,forceOutput;	! need the address of that bugger;
+	movei	2,0;		! first set length 0 (hide bytepointer);
+				! this insures that the byte pointer;
+				! is not touched by byteShovel;
+	exch	2,-1(1);	! get the value that was there;
+	push	sp,2;		! push the length word;
+	push	sp,(1);		! then the (currently stable) byteptr;
+	movem	2,-1(1);	! now restore length (let string run);
+	popj	p,;		! its cool, lets go.;
+end;
+
+integer	forcePending;	! used by causeInputInterrupt / byteShovel;
+! byteShovel sometimes needs an interrupt at a Nice, clean time ;
+! (eg: no STRING GC active). it does this by making a deferred ;
+! interrupt procedure (cause...) cause the interrupt that normally only;
+! happens on character arrival and such to go off (ie a good time);
+! this variable is to keep too many from being done (-1 if no pending);
+
+IFCR fakeIO THENC	! we will just call byteShovel directly;
+forward procedure causeInputInterrupt;
+ELSEC
+procedure causeInputInterrupt;
+begin	! run as a deferred interrupt.  Cleans up then causes real int;
+! clean up inconvenient data structures or whatever;
+forcePending_ -1;	! indicate one has been done, others OK now;
+! actually cause the interrupt;
+end;
+ENDC
+safe integer array matchB[0:8]; ! block for DFR1IN of match d-interrupt;
+
+r!p(fsm) WatchThis	! machine for the search;
+;
+integer tableAddress	! either 0 (no FSM) or "@trantab.(3);
+,	FSMstate	! from state entry for the FSM if there is one;
+,	matchPoints	! incremented once per recognition (serial #);
+,	deferRoom	!-1 per entry in "match" queue, +1 when gotten;
+			! Set to total interrupts allowed in pipe - 1;
+;
+simple procedure matchGOT;	! call when deferred "match" obtained;
+begin!code
+	aosg	deferRoom;
+	 pushj	p,causeInputInterrupt;	! tweek it: it was stopped;
+end;
+
+r!p(buffer) onMatch;	! so linked list doesn't disappear on a match;
+			! !!! tricky to set/clear, look out;
+simple procedure atFirst;
+begin 
+tableAddress_ matchPoints_ matchB[0]_ deferRoom_ 0; 
+onMatch_ null!record;
+end;
+	require atFirst initialization;
+simple procedure byteShovel;
+begin!code	define a=1, b=2,ch=3,fsm=4, c=5, r=6, ret=7;
+			! Note: 0,B,CH,FSM Fixed! (MAKFSM determined);
+			! 0 used in case tableAddress=0;
+		label rPort, rString, tryStr, nextBuffer, defer;
+		label redo, stringMatch, clrDun, allDun; 
+IFCR FakeIO THENC 
+		string fakeIOString;	! filled up in BAIL;
+		label simulate,cpopj;
+	jrst	redo;
+	simulate:	! simulates AUXCAL (including the SKIP part);
+	movei	ch,fakeIOstring;
+	hrrz	ch,-1(ch);	! null string: noSkip return;
+	jumpe	ch,cpopj;
+	movei	ch,fakeIOstring;
+	sos	-1(ch);		! else lop a char;
+	ildb	ch,(ch);
+	aos	(p);		! and skip return;
+	cpopj:
+	popj	p,;
+		define readChSkip="pushj p,simulate";
+ELSEC		define readChSkip="auxcal a,ch";
+ENDC
+redo:	MOVE	0,tableAddress;
+	SKIPE	FSM,WatchThis;	! 0,B,CH,FSM Fixed! (in FSM tables);
+	 MOVE	B,FSMstate;	! 0,B,CH,FSM Fixed! (in FSM tables); 
+	skipn	r,forInterrupt;
+	 jrst	defer;
+	skipg	c,#room(r);
+	 jsp	ret,nextBuffer;
+	skipe	a,auxArg;	! AUXCAL to read a char, if none or ;
+	 skipge	deferRoom;	! if blocked waiting for deferred room;
+	  jrst	tryStr;		! don't try to read;
+rPort:	readChSkip;
+	 jrst	trystr;		! no PTY chars, force any string;
+	idpb	ch,#bytptr(r);
+	SKIPGE	B,@0;		! Note: uses CH,FSM (,B?): FSM code;
+	 soja	c,stringMatch;
+	sojg	c,rPort;
+	MOVEM	B,FSMstate;	! Save the FSM  state away again;
+	movei	ret,rPort;
+nextBuffer:
+	movem	c,#room(r);
+	hrrz	r,#next(r);
+	movem	r,forInterrupt;
+	jumpe	r,defer;
+	skipg	c,#room(r);
+	 jrst	nextBuffer;
+	jrst	(ret);
+
+stringMatch:
+	movem	c,#room(r);	! save the values from the ACs;
+	MOVEM	B,FSMstate;	! Note: 0,B,CH Fixed!;
+
+	tlnn	b,'377777;	! was it supposed to be a special?;
+	 setzm	tableAddress;	! Ah my, can't do em, stop now;
+	skipn	onMatch;	! if hook already there, forget it;
+	 movem	r,onMatch;
+	movei	a,matchb[1];	! so we can PUSH arguments for "found";
+				! but save room for arg1 (constant);
+	push	a,b;		! the state transition which found it;
+	push	a,ch;		! the cause of the transition (char);
+	push	a,r;		! the buffer pointer where it happened;
+	push	a,#room(r);	! the "chars left" when found;
+	push	a,#bytptr(r);	! the actual pointer when found;
+	aos	b,matchPoints;	! bump the serial number;
+	push	a,b;		! and make it an argument too;
+	movei	a,matchb[0];	! get ready to call DFR1IN;
+	sos	deferRoom;	! cut back room in deferral queue;
+	push	p,a;
+	pushj	p,dfr1in;	! call it;
+	jrst	redo;		! and continue as if new interrupt;
+
+defer:	! cannot finish now, wait for user level, but force return;
+	aosle	forcePending;	! if this is already pending, all done;
+	 jrst	allDun;
+	push	p,[2];		! number of words in deferral;
+	hrroi	a,causeInputInterrupt;	! procedure to call;
+	push	p,a;
+	movei	a,-1(p);	! AOBJN pointer for processor (zero OK);
+	push	p,a;
+	pushj	p,dfr1in;	! schedule the deferred interrupt;
+	sub	p,[!xwd(2,2)];	! remove the two temps from the stack;
+	jrst	allDun;		! and leave.  cause will occur later;
+
+tryStr:
+	MOVEM	B,FSMstate;	! Save away the FSM state;
+	movem	c,#room(r);
+	movei	a,forceOutput;	! get the address of the string to go;
+	skipn	-1(a);		! null constant strings even in STRNGC;
+	 jrst	alldun;
+	move	b,gogtab;	! is the string GC active?;
+	skipge	SGCNUM(b);
+	 jrst	defer;		! yup, better look later;
+	hrrz	b,-1(a);	! get the length;
+	jumpe	b,clrDun;	! it is NULL! go make it a simple null;
+	movei	ret,rString; ! make "nextBuffer" return to loop top;
+rString:
+	sojle	c,nextBuffer;	! make sure there is room to write.;
+	sos	-1(a);		! lop that string;
+	ildb	ch,(a);
+	idpb	ch,#bytptr(r);	! and shove it out to the buffer;
+	sojg	b,rString;	! keep going if more to do;
+	movem	c,#room(r);
+clrDun:	setzm	-1(a);		! make that null easy for next time;
+allDun:
+end;
+IFCR fakeIO THENC	! we will just call byteShovel directly;
+	procedure causeInputInterrupt;
+	begin	! a deferred interrupt.  Cleans up then causes real int;
+		! clean up inconvenient data structures or whatever;
+	forcePending_ -1; ! indicate one has been done, others OK now;
+	byteShovel;	! fake an interrupt-cause;
+	end;
+ENDC
+procedure setMatch( r!p(any!class) fsm; integer procedure!address );
+begin	external record!class fsmFields( integer zero, state, 
+				char, tranLoc, ptrBase, opcode );
+tableAddress_ 0;	! so the poor guy doesn't get inconsistent data;
+WatchThis_ fsm;
+if fsm=null!record then return;		! no search is no search;
+FSMstate_ fsmFields:zero[fsm];
+matchB[8]_ procedure!address lor
+	(if procedure!address land !xwd(-1,0) then 0 else !xwd(-1,0));
+				! insure no environments of 0!;
+matchB[1]_ fsmFields:ptrBase[fsm];
+matchB[0]_ 9; 				! Set size of block;
+tableAddress_	!xwd(3,0)	! indexing (CH);
+		+ !bit(13)	! indirect;
+		+ !rh( fsmFields:tranLoc[fsm] ); ! enable search;
+end;
+record!class target( string name; r!p(target) next, link );
+
+procedure doMatch( integer ptrBase, matchTransition, lastCharacter;
+			r!p(buffer) theBuffer;
+		integer room, bytptr, matchSerial );
+begin	integer targetId;
+matchGOT;
+targetId_ MatchTransition ash -18;
+print(crlf, "Match #", matchSerial, " on '", cvos(lastCharacter),
+	", targetId= ", targetId );
+if targetId land (-1 lsh -19)
+ then begin	r!p(target) found; 
+	memory[ location( found ) ]_ memory[ targetId + ptrBase ];
+	if found then do print(" """, target:name[found], """" )
+			until null!record = (found_ target:link[found]);
+      end;
+if matchSerial = matchPoints	! if no more matches coming down pipe;
+ then begin 	! very tricky code here;
+	onMatch_ null!record;	! clear hook;
+	start!code end;	! forget all ACs;
+	! if update happened after serial Check before clearing,;
+	if matchSerial neq matchPoints and onMatch=null!record
+	 then onMatch_ theBuffer;   ! then better keep buffer around;
+      end
+ else onMatch_ theBuffer;	! can move up this far always;
+if tableAddress=0 then usererr(0,1,"Oh my, Match stopped!");
+end;
+r!p(target) head, tail;
+procedure newTarg; 
+begin r!p(target) nt;
+if tail and not head then head swap tail;
+if head and not tail
+ then begin 
+	tail_head; 
+	while target:next[tail]do tail_target:next[tail];
+      end;
+nt_ new!record(target);
+if tail
+ then begin target:next[tail]_ nt; target:link[tail]_ nt; end
+ else head_ nt;
+tail_ nt; 
+print("Target: ");
+target:name[nt]_ inchwl;
+end;
+
+own integer array eqvTab[-1:'377];
+
+simple procedure distinct;
+begin integer i; for i_ -1 step 1 until '377 do eqvTab[i]_ i; end;
+
+simple procedure hiBit;
+begin integer j; 
+for j_ 0 step 1 until '177 do eqvTab[j] swap eqvTab[j lor '200];
+end;
+
+simple procedure cCase;
+begin integer k; 
+for k_ "a" step 1 until "z" do eqvTab[k] swap eqvTab[k xor '40];
+end;
+
+simple procedure eqvIt( string s );
+if length(s) > 1
+ then begin integer base;
+	base_ lop(s);
+	while length(s) do eqvTab[base] swap eqvTab[lop(s)];
+      end;
+preset!with
+forlc #=(#nul,#soh,#stx,#etx,	#eot,#enq,#ack,#bel,
+	 #bs,#ht,#lf,#vt,	#ff,#cr,#so,#si,
+	 #dle,#dc1,#dc2,#dc3,	#dc4,#nak,#syn,#etb,
+	 #can,#em,#sub,#esc,	#fs,#gs,#rs,#us)
+ doc{ cvps(#)[2 to inf],}endc
+#sp; own string array CharName[0:'40];
+
+simple string procedure nm(integer chr);
+return( if 0 leq chr < '41 then CharName[chr]
+	else if '40 < chr < '176 then """" & chr & """"
+	else if '177 = chr then "DEL"
+	else "'" & cvos(chr) );
+
+simple procedure pn(integer ch(-2));
+begin
+if ch=-2 then begin print("n: "); ch_ cvd(inchwl); end;
+print(nm(ch)); 
+end;
+
+simple integer procedure ch(string name(null));
+begin integer i;
+if length(name)=0 then begin print(" :"); name_ inchwl; end;
+if length(name)<2 then return(name);
+if name="#" then lop(name);
+if kequ(name,"DEL") then return('177);
+for i_ 0 step 1 until '40 do if kequ(name,CharName[i]) then return(i);
+if name="'" then return(cvo(name[2 to inf]));
+return(cvd(name));
+end;
+
+simple procedure silly;
+begin	define chrs="(#nul,#soh,#stx,#etx,	#eot,#enq,#ack,#bel,
+			#bs,#ht,#lf,#vt,	#ff,#cr,#so,#si,
+	 		#dle,#dc1,#dc2,#dc3,	#dc4,#nak,#syn,#etb,
+			#can,#em,#sub,#esc,	#fs,#gs,#rs,#us,
+			#del, #sp, crlf)";
+	own string forlc #=chrs doc {NOMAC #,}ENDC tab;
+forlc #=chrs doc {#_ ch(cvps(#)); }ENDC tab_ '11; crlf_ '15&'12;
+end;
+require silly initialization;
+r!p(fsm) machine,  mc;
+own integer array smlTab[-1:'177]; 
+
+procedure newFsm( boolean useSmall(true) );
+begin
+if mc and not machine then mc swap machine;
+mc_ (if useSmall then makFsm(smlTab, head) else makFsm(eqvTab, head) );
+! maybe mask immediate interrupt here;
+setmatch( mc, location(doMatch) );
+! maybe unmask immediate interrupt here;
+end;
+
+r!p(target) procedure sts( reference string s );
+	return( usefst( (if machine then machine else mc), s ) );
+integer array rings[0:2,0:10];
+procedure aSetup;
+begin	own r!p(buffer) rp0,rp1,rp2;
+auxarg_ 0;	! make sure no I/O for a bit;
+rp0_ new!record(buffer); buffer:room[rp0]_ 11*5-1;
+buffer:bytepointer[rp0]_ point(7,rings[0,0],-1);
+rp1_ new!record(buffer); buffer:room[rp1]_ 11*5-1;
+buffer:bytepointer[rp1]_ point(7,rings[1,0],-1);
+rp2_ new!record(buffer); buffer:room[rp2]_ 11*5-1;
+buffer:bytepointer[rp2]_ point(7,rings[2,0],-1);
+buffer:next[rp1]_ rp2; buffer:next[rp0]_ rp1; forInterrupt_ rp0;
+distinct; ccase; arrtran(smltab,eqvtab);
+head_ tail_ null!record; newtarg; newtarg; newtarg; newfsm;
+auxarg_ -1;
+end;
+
+simple procedure ok; poll;
+simple procedure raid; begin!code external integer $i; jsr $i; end;
+require processes;
+item intpro;
+r!p(any!class) p1,p2,p3,p4,p5;
+string q,r,u,v;
+integer l,m,n;
+
+distinct; arrtran(smlTab, eqvTab);
+q_r_u_v;l_m_n; machine swap mc;
+p1_p2_p3_p4_p5; 
+intset(intpro);
+
+usererr(0,1,"start it","B");
+
+end;
+ 
