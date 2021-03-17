@@ -1,0 +1,716 @@
+begin "block"
+require '10 version;
+COMMENT 10 in progress
+10: default extension now null, don't search binaries
+;
+
+define ! = "comment", crlf="('15&'12)", eif="else if";
+let r!p = record!pointer;
+external integer !skip!;
+
+simple string procedure constr( integer bytptr, count );
+! this provides MEMORY[...,STRING] capability.
+    string for count chars starting with the character at ILDB(byptr)
+;
+start!code push '16,count; push '16,bytptr;
+	sub '17,['3000003]; jrst @3('17); end;
+
+require "(sailib)search.req" source!file;
+require "(sailib)extend.req" source!file;
+
+
+INTEGER  channel, eof;	! the channel of the file being searched;
+record!class tgt( string name; r!p (tgt) backp, link;
+			integer count, ident );
+r!p (tgt) pageMark;	! used for reporting (free target);
+integer leading,trailing;
+		! number of lines before(after) match to show;
+
+! begin!module  now get the actual searching routine. (TXTFND).;
+
+require "(sailib)maplib.req" source!file;
+require "(sailib)assert.sai" source!file;
+
+require "[][]" delimiters;
+
+boolean AbortSearch;	! set true to make searcher stop;
+
+safe integer array rotbuf[0:1,0:100];	! ring buffer for backtrack;
+
+integer lastWritePage, lastWriteCount, lastWritePointer;
+r!p(map1) searchPage,backupPage;
+
+integer	currentPage,currentCount,currentPointer, fileChannel;
+define startBP(pageHolder)=
+		[('440700 lsh 18 lor location(map1:a[pageHolder][0]))];
+
+integer breakLfINA;
+simple procedure setit;
+  setbreak(breakLfINA_ getbreak, '12, null, "INA");
+ require setit initialization;
+
+COMMENT
+Strategy for searching:
+
+while obtainNextBlock
+   do [ while match_ searchForward
+	   do if match = pageMark
+		then textPageProcess
+		else [	if pending >= 0 then Printup(pending,here)
+			if leading >= 0 then Printup(backup,here)
+			indicateMatches
+			markPosition
+			pending_ trailing
+			]
+	if pending >= 0 then Printup(pending,here)
+	]
+;
+
+
+string simple procedure eatfeeds( string s;
+				reference integer leadNeed );
+! Goes to beginning of line (just past line feed) which is a tail
+  of "s", and proceedes forward including leadNeed lines in the
+  resulting string.  If successful, returns leadNeed=-1, If cannot
+  complete request, sets leadNeed to proper value to obtain the
+  rest from a later call (returns all of "s", and decrements leadNeed
+  by the number of lines in the string).
+Restrictions: -1 < leadNeed < arrinfo(rotBuf,4)+1
+;
+start!code	define P='17,sp='16, ch=0,cnt=1,pnt=2,lfc=3,flag=4;
+		label eatcnt,alldun,pasall,eatlup,goLF;
+	setz	flag,;		! turns true when enough LF's seen;
+	hrrz	cnt,-1(sp);	! length( string yet to be examined );
+	move	pnt,0(sp);	! byte pointer within string;
+	skipl	lfc,leadNeed;	! LF's needed modulo (leadNeed+1);
+eatcnt:	 sojge	cnt,eatlup;	! count first character, and start;
+alldun:
+	jumpe	flag,pasall;	! if not full count, Just return;
+	move	cnt,rotBuf[0,0](lfc);	! next ring store is farthest;
+	move	pnt,rotBuf[1,0](lfc);	! back in ring (desired val);
+	hrrm	cnt,-1(sp);
+	movem	pnt,0(sp);
+	seto	lfc,;		! count ok, say we need no more;
+pasall:
+	movem	lfc,leadNeed;	! inform of new need count;
+	sub	p,['2000002];		! fix up stack;
+	jrst	@2(p);		! and return to caller;
+
+eatlup:	ildb	ch,pnt;		! pick up next character;
+	cain	ch,'12;		! is it a line feed?;
+	 jrst	goLf;		! yes, go account for it;
+	sojge	cnt,eatlup;
+	jrst	alldun;		! finished, now we can leave;
+goLF:
+	movem	cnt,rotBuf[0,0](lfc);
+	movem	pnt,rotBuf[1,0](lfc);
+	sojge	lfc,eatcnt;
+	move	lfc,leadNeed;
+	soja	flag,eatcnt;
+end;
+
+procedure backPrint;
+Comment leading=0 means from closest preceding LF forward
+	leading=1 means this line and the line previous to it, ...
+	Will never print before lastWrite
+;
+begin "backPrint"	string thisBody; integer leadLeft;
+if 0 > leadLeft_ leading
+ then return;
+thisBody_ if lastWritePage=currentPage
+	 then constr( lastWritePointer, lastWriteCount-currentCount )
+	 else constr( startBP(searchPage), 512 * 5 - currentCount );
+thisBody_ eatFeeds( thisBody, leadLeft );
+if leadLeft < 0
+ then print("..."&'15&'12)	! found all line feeds, hence skipped;
+ else if lastWritePage < currentPage
+ then begin "mapping backup"	integer backPage; string backBody;
+	for backPage_ currentPage-1 step -1 until lastWritePage
+	   do begin
+		getmap( backupPage, "R", Channel, backPage );
+		backBody_ constr( startBP(backupPage), 512 * 5 );
+		if backPage=lastWritePage
+		 then backBody_ backBody
+			[512 * 5 + 1 - lastWriteCount  to  inf];
+		backBody_ eatFeeds( backBody, leadLeft );
+		if leadLeft < 0	! found all the line feeds we needed;
+		 then begin print("..."&'15&'12); DONE; end;
+	      end;
+	print( backBody ); backBody_ null;
+	for backPage_ (backPage max lastWritePage)+1 step 1
+	 until currentPage-1
+	   do begin
+		getmap( backupPage, "R", Channel, backPage );
+		print( constr( startBP(backupPage), 512 * 5 ) );
+	      end;
+	getmap( backupPage, "U", 0,0 );
+      end "mapping backup";
+print( thisBody ); thisBody_ null;
+end "backPrint";
+
+define markHere= [
+	begin lastWritePage_ currentPage; lastWriteCount_ currentCount;
+		lastWritePointer_ currentPointer; end];
+
+simple procedure catchUp( reference integer pending );
+begin	integer brk; string text;
+assert( lastWritePage=currentPage );
+assert(currentCount geq 0);
+text_ constr( lastWritePointer, lastWriteCount-currentCount );
+do print( scan(text,breakLfINA,brk) )
+ until brk = 0 or 0 > (pending_ pending-1);
+lastWriteCount_ currentCount+length(text);
+lastWritePointer_ if length(text) 
+		then memory[location(text)] else currentPointer;
+text_ null;	! better not garbage collector near this;
+end;
+
+define !unknown!=0,!binary!=1,!ascii!=2;
+boolean allowBinary;	! normally false;
+
+internal integer procedure classify( integer words; reference integer base );
+if allowBinary or words leq 0 then return(!unknown!) else
+begin "classify"
+own safe integer array bytes[0:127], blocks[0:3];
+integer normalControls, controls, lineNumbers;
+define cr='15,lf='12,tab='11,ff='14,del='177;
+ 
+arrclr(bytes); arrclr(blocks); lineNumbers_0;
+
+start!code	define charp=cvasc("11111")-cvasc("00000");
+		define ch=3,wrd=ch+1, abj=1;
+		label letchk,nword,nogood,done,pagemk,word1;
+	hrlo	abj,words;
+	eqvi	abj,base;	! build AOBJN pointer;
+	jrst	word1;
+letchk:	setz	ch,;
+	lshc	ch,2;
+	aos	blocks[0](ch);	! count controls, punct, UPPER, lower;
+	lshc	ch,5;
+	aos	bytes[0](ch);	! count actual letters;
+	jumpn	wrd,letchk;
+nword:	aobjp	abj,done;
+word1:	skipn	wrd,(abj);
+	 jrst	nword;
+	trzn	wrd,1;		! line number candidate?;
+	 jrst	letchk;
+! check line number;
+	camn	wrd,[cvasc("     ")];	! standard !$#%%!!! page mark?;
+	 jrst	pagemk;			! sure is;
+	xor	wrd,[cvasc("00000")];	! get raw digits in each chpos;
+	tdne	wrd,[-1 xor (charp*'17)]; ! digits (or 10:15) there?;
+	 jrst	nogood;				! nope, not ASCII;
+	lsh	wrd,-1;	! dont overflow below;
+	imuli	wrd,7;	! note: [0:9]*7=[0:63], [10:15]*7=[70:105];
+			! thus this leaves the 64 bit on for [10:15];
+	tdne	wrd,[charp lsh 5];	! = (charp lsh -1) * 64;
+	 jrst	nogood;	! aha... 64-bit on, was really punct;
+pagemk:			! might as well treat page marks like linenos;
+	aos	lineNumbers;
+	jrst	nword;
+nogood:	setom	lineNumbers;
+done:
+end;
+if lineNumbers<0 then return(!binary!);	! certain (not lineno, lsb on);
+
+if words-bytes[0]<50		! since nulls are ignored;
+ then return(!unknown!);	! sample too small to know for sure;
+
+normalControls_ bytes[cr] + bytes[lf] + bytes[ff] + bytes[tab];
+
+if 1 < lineNumbers+1 < bytes[lf]+bytes[ff]	! more lines than #s;
+or lineNumbers > (normalControls ash -1)+2	! more #s than lines;
+ then return(!binary!);	! those are probably not line numbers;
+
+controls_ blocks[0] - bytes[0] - normalControls + bytes[del];
+return( if controls < 
+	(normalControls+blocks[1]+blocks[2]+blocks[3]-bytes[del]) 
+	ash -4
+	 then !ascii!	! ascii: 1/16th the normal characters are wierd;
+	 else !binary!);
+end "classify";
+
+string procedure TXTFND( r!p(fsm) machine );
+begin "TXTFND"
+	string matchList; integer textPages, matchesPerPage;
+	integer pending;	! Lines still needed to print;
+
+define textPageProcess=[
+	if matchesPerPage > 0
+	 then begin	! page number was bumped at first match;
+		matchList_ matchList & "," & cvs(textPages)
+			& " (" & cvs(matchesPerPage) & ")";
+		matchesPerPage_0;
+	      end
+	 else textPages_textPages+1	! nothing else bumped it;
+	];
+define indicateMatch(target)= [begin matchesPerPage_matchesPerPage+1;
+	tgt:count[target]_ tgt:count[target] + 1; print("~"); end];
+
+! beginning of TXTFND body;
+if searchPage=null!record then searchPage_ map1cr(0,511);
+if backupPage=null!record then backupPage_ map1cr(0,511);
+textPages_0; matchesPerPage_ 0; matchList_ null;
+lastWriteCount_ 0; lastWritePage_ 0;
+pending_ -1;
+if leading > arrinfo(rotBuf,4)
+ then usererr(0,1,"Warning: can only go back at most " 
+	& cvs(leading_arrinfo(rotBuf,4)) & " lines." );
+
+if 0 >= getmap(searchPage, "R", Channel, currentPage_1)
+	then return( "*Null" )
+else if classify(511,map1:a[searchPage][0])=!binary!
+	then begin getmap(searchPage, "U" ,0,0 ); return("*Binary") end
+else
+  do  begin "one page"	r!p(tgt) match;
+	currentCount_ 512 * 5;
+	currentPointer_ startBP(searchPage);
+	if lastWriteCount <= 0
+	 then begin assert(lastWritePage=currentPage-1); markHere; end;
+	while not abortSearch
+	  and match_ useFsm(machine,currentCount,currentPointer)
+	   do begin
+		if pending >= 0 then catchUp( Pending );
+		if match = pageMark
+		 then begin
+			textPageProcess;
+			pending_ -1;	! no report through pages;
+		      end
+		 else begin "a match"
+			if matchesPerPage=0	! no page ID yet;
+			 then print(crlf,"{Page ",
+					textPages_ textPages+1, "}");
+			if leading >= 0 then BackPrint;
+			do indicateMatch(match)
+			 until null!record=match_tgt:backp[match];
+			pending_ trailing;
+		      end "a match";
+		markHere;
+	      end;
+	if abortSearch then done;
+	currentCount_ 0;	! since it can become -1;
+	if pending >= 0 then catchUp( Pending );
+      end "one page"
+ until 0 >= getmap(searchPage, "R", Channel, currentPage_currentPage+1);
+if abortSearch
+ then matchList_ matchList & " [aborted]"
+ else textPageProcess;
+getmap( searchPage, "U", 0,0 );
+return(matchList[2 to inf]);
+end "TXTFND";
+
+require unstack!delimiters;
+! end!module;
+
+boolean restart;
+own safe integer array literally, caseless, sailStyle [-1:127];
+
+simple procedure setarrs;	! sets up standard equiv tables;
+begin	integer i;
+for i_ -1 step 1 until 127 do literally[i]_i;
+arrtran( caseless,literally );
+for i_ "a" step 1 until "z" do caseless[i] swap caseless[i xor '40];
+arrtran( sailStyle, caseless );
+sailStyle[-1] swap sailStyle[0];	! ignore nulls;
+sailStyle["!"] swap sailStyle["X" land '37];	! ! = ^X;
+restart_ true;
+end;
+require setarrs initialization;
+
+procedure setmains;	! sets the Page Mark variable (for reporting);
+if restart then
+begin	r!p (tgt) NewLine;
+restart_false;
+PageMark_ new!record(tgt);	tgt:ident [PageMark]_ -1;
+tgt:name[PageMark]_'14;
+end;
+
+r!p (tgt) procedure input!list;	! builds a linked list of input lines.;
+begin "input!list"
+	integer serial;
+	r!p (tgt) head, more;
+	string inpt;
+outstr("
+Target 1: " ); serial_1; 
+head_null!record;
+while length(inpt_ inchwl)
+   do begin more_ new!record(tgt);
+	tgt:ident [more]_ serial;
+	tgt:count [more]_ 0;
+	tgt:link [more]_ head;
+	tgt:name [more]_ inpt;
+	head_more;
+	outstr("
+Target "& cvs( serial_serial+1 ) & ": " );
+      end;
+return(head);
+end "input!list";
+
+procedure report( r!p (tgt) chain );
+! lists all targets and their current match count;
+while chain do
+begin "report"
+print( crlf, tgt:ident [chain], ") """, tgt:name [chain],
+		"""" & '11, tgt:count [chain] );
+chain_ tgt:link [chain];
+end "report";
+
+
+procedure reportBackp( r!p (tgt) chain );
+! lists all targets and their current match count;
+while chain do
+begin "reportBackp"
+print( crlf, tgt:ident [chain], ") """, tgt:name [chain],
+		"""" & '11, tgt:count [chain] );
+chain_ tgt:backp [chain];
+end "reportBackp";
+
+r!p (tgt) target!list;
+
+r!p (fsm) procedure read!targets;
+! asks for (and obtains) the list of targets to search for;
+while true do 
+begin "read!targets"	r!p (fsm) searcher; r!p (tgt)rTemp1,rTemp2;
+			boolean oldUp;
+setmains;
+oldUp_ ttyup(false);
+target!list_ input!list;
+ttyup(oldUp);
+tgt:link [PageMark]_ target!list;
+rTemp1_ PageMark;
+if searcher_ MakFsm( SailStyle, rTemp1 )
+ then begin
+	if rTemp1 
+	 then begin print(crlf, "Nulls: "); reportBackp( rTemp1 ); end;
+	if rTemp1 neq PageMark or tgt:backp[rTemp1] neq null!record
+	! not OK if PageMark is only;
+	 then begin	! straighten out target order;
+		rTemp2_ null!record;
+		while target!list
+		   do begin
+			rTemp1_ tgt:link[target!list];
+			tgt:link[target!list]_ rTemp2;
+			rTemp2_ target!list;
+			target!list_ rTemp1;
+		      end;
+		target!list_ tgt:link[PageMark]_ rTemp2;
+		return( searcher );
+	      end;
+      end;
+print( crlf, "Sorry, That's no targets at all" )
+end "read!targets";
+
+integer paren, brkdot;
+
+boolean procedure ext.lookup(string extfile,defext;
+                           integer extchan; reference integer exteof);
+! looks up extfile on the specified channel.  Returns true if the
+  lookup failed (after trying with uname and the default extension).
+;
+begin
+string file, uname;
+integer brchr;
+if length(extfile)=0 then return(true);
+lookup(extchan, extfile, exteof);
+
+if exteof then 
+ begin
+     if extfile = "(" then uname_scan(extfile, paren, brchr);
+     file_scan( extfile, brkdot, brchr);
+     if length(file)=0 then return(true);
+     lookup(extchan, uname&file, exteof);
+     if exteof then 
+     lookup(extchan, uname&file&defext, exteof);
+     if exteof then print(crlf, "lookup failure on ",
+uname&file, " and ", uname&file&defext);
+     end;
+return (exteof);
+end;
+
+
+integer filebrk, extbrk, brchr, wld!crd;
+string defext;
+
+r!p(fsm) starters;	! the search machine to use;
+boolean quiet!flag;
+integer MatchListChannel;
+
+procedure afile( string filename );
+! searches the specified file (subject to defaulting).
+    Does nothing if the file cannot be found.
+;
+begin	integer cnt,brk;
+	string result;
+
+result_null;
+
+open( channel_getchan, "DSK", 8, 8,0, cnt,brk,eof_false);
+if eof then usererr(0,0,"No DSK today");
+
+
+print( crlf, filename, "	" );
+
+if ext.lookup( filename, defext, channel, eof) then print( crlf)
+  else if "*"=result _ txtfnd(starters) then print(result);
+
+release( channel );
+if length(result)
+ then begin
+	if MatchListChannel > -2
+	 then cprint(MatchlistChannel,crlf,filename,": ", result );
+	if quiet!flag and result neq "*"
+	 then outstr(crlf & filename & ": " & result );
+      end;
+end;
+
+integer brchar;
+forward recursive procedure cmdname( string dir1, cmd!file );
+! for command files;
+
+procedure starspec( string dir!nam,starnam;boolean cmdflag );
+begin	string name, ext, dirname;
+	own integer array eluk[0:5];
+	integer ufdchan, theppn, flag;
+	r!p (any!class) ufdat;
+
+open( ufdchan_getchan,"dsk", '17,0,0, 0,0,0 );
+
+lookup(ufdchan, starnam, flag);
+
+close(ufdchan);
+fileinfo(eluk); theppn_ eluk[3];
+eluk[0]_4;
+eluk[1]_ 1 lsh 18 + 1;
+eluk[2]_ theppn;
+eluk[3]_ cvsix("UFD");
+eluk[4]_ 0;
+chnior( ufdchan, eluk[0], 4 );
+if not !skip! then usererr(0,1,"Can't read UFD for " & cvos(eluk[2]));
+
+dirname_scan(starnam,paren,brchar);
+if starnam=null then begin
+  starnam_dirname;
+  dirname_null;
+  end;
+
+name_ scan( starnam, brkdot, !skip! );
+ufdat_ iniufr( name, starnam, ufdchan, 15, 1 );
+while nxtufr( eluk, ufdat )
+  do begin
+     if not cmdflag then 
+           afile(dirname & cv6str( eluk[0]) & "." & cv6str(eluk[1]) )
+     else cmdname(dir!nam,dirname&cv6str(eluk[0])& "." &cv6str(eluk[1]));
+     end;
+release(ufdchan);
+end;
+
+
+integer ind!brk;
+
+procedure takaluk( string infile);
+begin   string directory, ind!result, star!result;
+        own boolean cmd!flag;
+cmd!flag_false;
+
+ind!result _ scan(infile, ind!brk, brchr);
+
+if infile = null then    ! not a list of files;
+  begin
+    star!result _ scan(ind!result, wld!crd, brchr);
+    if ind!result = null then   ! no wild cards;
+       afile(star!result)
+    else starspec(directory,star!result&ind!result,cmd!flag)
+  end
+else  ! it's a list of files;
+  begin
+    if ind!result = "(" then    
+       directory _ ind!result;
+    star!result _ scan(infile, wld!crd, brchr);
+    if infile = null then    ! no wild cards;
+         cmdname(directory, star!result)
+     else begin
+       cmd!flag _ true;
+       starspec(directory,star!result&infile,cmd!flag);
+       end;
+   end;
+cmd!flag_false;
+return;
+end;
+
+
+
+recursive procedure cmdname( string dir1, cmd!file);
+! reads a command file and uses it to drive TAKALUK.
+  dir1 is the directory to assume if none is given.
+;
+begin  string dir, ext!result, nxtfile; 
+       integer cmdchan, cmdeof;
+
+
+open (cmdchan_getchan, "dsk", 0,2,0,200,brchr,cmdeof_false);
+lookup(cmdchan, cmd!file, cmdeof);
+
+if ext.lookup( cmd!file, ".CMD", cmdchan, cmdeof) then print (crlf)
+else print(crlf,"file list being read from ",cmd!file,crlf);
+
+while not cmdeof do
+  begin
+    nxtfile_input(cmdchan, filebrk);
+    if length(nxtfile) then
+    begin
+      if nxtfile = "(" then dir_scan(nxtfile,paren,brchr)
+       else dir_dir1;
+      ext!result_scan(nxtfile, extbrk, brchr);
+      if brchr = "." then
+        takaluk(dir&ext!result&nxtfile)
+      else
+        takaluk(dir&ext!result&defext);
+    end;
+  end;
+release(cmdchan);
+end;
+
+procedure setRange( string rangeSpec );
+while true do
+begin	integer numint,brk, int1,int2,int3;
+! read numbers from the string, and count how many were there;
+numint_      if 0=(int1_ intscan( rangeSpec, brk )) and brk=-1	then 0
+	else if 0=(int2_ intscan( rangeSpec, brk )) and brk=-1	then 1
+	else if 0=(int3_ intscan( rangeSpec, brk )) and brk=-1	then 2
+	else 3;
+case numint of
+ begin
+  [1] leading_ trailing_ (if int1>=0 then int1%2 else -int1);
+  [2] if -1 <= int2	! normal: -L:T [L or T =-1 => recog point];
+	 then begin
+		trailing_ int2;
+		leading_ (if int1 <= 1 then -int1 else int1);
+	      end
+	eif int1 < -1	! -2-3 [probably meant -2:3];
+	 then begin
+		trailing_ -int2;
+		leading_ -
+	      end
+	 else begin	! figure they are backwards;
+		trailing_ int1;
+		leading_ (if int2 <= 1 then -int2 else int2);
+	      end;
+ ELSE begin
+	outstr(" Viewing range (-1:2 is four lines long): ");
+	rangeSpec_inchwl;
+	continue;
+      end
+ end;
+return;
+end;
+
+string recording!file, file, matchFile;
+
+leading_trailing_0;
+setbreak( brkdot_getbreak, ".", null, "INS" );
+setbreak( paren_getbreak, ")", null, "ina");
+setbreak(filebrk_getbreak, ",+"&crlf, '11&" ", "ins");
+setbreak(extbrk_getbreak,".",null,"inr");
+setbreak(ind!brk_getbreak,"@", '11&" " ,"ins");
+setbreak(wld!crd_getbreak,"*#", '11&" ", "inr");
+
+allowBinary_false;
+defext_".";
+quiet!flag_ false;
+  matchListChannel_ -2; matchFile_ null;
+  ttyup(true);
+
+
+  starters_ read!targets;
+  while true do begin "asearch"	integer brk;
+	outstr( crlf & "search in: " );
+	file_ inchwl; brk_!skip!;
+	if  equ(file[1 for 2], ".N") then starters_ read!targets
+	else if equ(file[1 for 3], ".HE") or file="?"
+		then outstr("<file-spec>, .New Targets, " &
+				".Clear Counts, .Record, .Quiet, .Loud,"
+				 & crlf & " .Viewing Range," &
+				" .Halt, .MatchList," &
+                                " .Binary Toggle or .Default Extension")
+	else if equ(file[1 for 2], ".H") then done "asearch"
+	else if equ(file[1 for 2], ".B") 
+		 then print( if allowBinary_ not allowBinary
+			then "Search" else "Ignore"," binary files.")
+	else if equ(file[1 for 2], ".R")
+		 then begin
+			setprint(null,"T");
+			if length( recording!file )
+			 then print(" [closing ", recording!file, "]");
+			print(" Recording file: ");
+			if length( recording!file_ inchwl )
+			 then begin
+				setprint(recording!file, "F");
+				quiet!flag_true;
+			      end
+			 else outstr(" [recording off]");
+		      end
+	else if equ(file[1 for 2], ".M")
+		 then begin
+			if matchListChannel > -1
+			 then release( matchListChannel );
+			matchListChannel_ -2;
+			print(" Show files with matches on: ");
+			matchFile_ inchwl;
+			if length(matchFile)=0
+			 then print(" OK, no match list file.  ")
+			eif equ(matchFile,"TTY:") 
+			or equ(matchFile,"TTY")
+			 then matchListChannel_-1
+			 else begin
+				open(matchListChannel_getchan,"DSK",0,
+					0,1, 0,0,!skip!_0 );
+				if !skip!
+				 then usererr(0,0,"Can't get disk");
+				enter(matchListChannel,matchFile,
+					!skip!_0);
+				if !skip!
+				 then begin
+					release(matchListChannel);
+					matchListChannel_-2;
+					print(crlf,"Can't make file ",
+						matchFile );
+					matchFile_ null;
+				      end;
+			      end
+		      end
+	else if equ(file[1 for 2], ".Q")
+		 then begin quiet!flag_ true; setprint(null,"I"); end
+	else if equ(file[1 for 2], ".L")
+		 then begin quiet!flag_ false; setprint(null,"C"); end
+	else if equ(file[1 for 2], ".C")
+		 then begin	r!p (tgt) r!temp;
+			r!temp_target!list;
+			do tgt:count [r!temp]_0
+			  until null!record =  r!temp_tgt:link[r!temp];
+		      end
+	else if equ(file[1 for 2], ".E") then usererr(0,1,"error?")
+        else if equ(file[ 1 for 2], ".D")
+                 then begin  
+                        outstr("DEFAULT EXTENSION: ");
+                        defext_inchwl;
+                        if defext neq "." then
+                               defext_ "." & defext;
+                      end
+
+	else if equ(file[1 for 2], ".V")
+		 then setrange(file[3 to inf])
+	 else begin "actual search"
+		takaluk( file );
+		report( target!list );
+		end "actual search";
+    end "asearch";
+setprint(null,"T");
+if length(recording!file)
+ then print( crlf, "Recording on: ", recording!file );
+if MatchListChannel > -1
+ then begin
+	print(crlf, "Match List on file: ", matchFile );
+	release(MatchListChannel); MatchListChannel_ -2;
+      end;
+end "block";
+ ^@t¸
