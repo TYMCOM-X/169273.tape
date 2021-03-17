@@ -1,0 +1,1661 @@
+
+
+
+
+BEGIN "SplFix"
+
+external integer !skip!;
+let r!p=record!pointer, a!c=any!class;
+
+external boolean rpgsw;
+
+REQUIRE "(SAILIB)EXTEND.REQ" SOURCE!FILE;
+REQUIRE "CMDPRO.HDR" SOURCE!FILE;
+REQUIRE "CMDPRO" LOAD!MODULE;
+
+REQUIRE "CHNREC.HDR" SOURCE!FILE;
+REQUIRE "CHNREC" LOAD!MODULE;
+
+
+REQUIRE 4001 NEW!ITEMS;
+REQUIRE 4001 PNAMES;
+
+COMMENT SPOOL file maintenance tool.
+	Needs work, commenting & documentation.
+;
+
+REQUIRE '002600 VERSION;
+
+REQUIRE "<><>" DELIMITERS;
+
+DEFINE Debug = <FALSE>,
+       !bit(x) = <(1 lsh (35-(x)))>;
+
+ifc Debug
+   thenc DEFINE SplDir = <"(SPPOPER)">,
+		BatDir = <"(SPPOPER)">;
+   elsec DEFINE SplDir = <"(SPOOL)">,
+		BatDir = <"(*1BATCH)">;
+endc
+
+COMMENT File names for the main data base files and their backups--
+	excludes those names that depend on month and/or system;
+
+DEFINE	GdfFile		= <SplDir & "SPOOL.GDF">,
+	GdfBak		= <SplDir & "SPOOL.GBK">,
+	NewGdfFile	= <SplDir & "SPOOL.GNW">,
+	TmpGdfFile	= <SplDir & "GDF.TMP">,
+	LostGdfFile	= <SplDir & "LOST.GDF">,
+	BadGdfFile	= <SplDir & "BAD.GDF">,
+	FdfFile		= <SplDir & "SPOOL.FDF">,
+	FdfBak		= <SplDir & "SPOOL.FBK">,
+	NewFdfFile	= <SplDir & "SPOOL.FNW">,
+	TmpFdfFile	= <SplDir & "FDF.TMP">,
+	OldFdfFile	= <SplDir & "OLD.FDF">,
+	LostFdfFile	= <SplDir & "LOST.FDF">,
+	BadFdfFile	= <SplDir & "BAD.FDF">,
+	MapFile		= <SplDir & "SPOOL.MAP">,
+	MapBak		= <SplDir & "SPOOL.MBK">,
+	NewMapFile	= <SplDir & "SPOOL.MNW">,
+	CenFile		= <SplDir & "SPLCNT">,
+	RemFile		= <SplDir & "REMCNT">,
+	TapFile		= <SplDir & "SPOOL.TAP">,
+	ParFile		= <BatDir & "PARCHG.DAT">,
+	ParNew		= <BatDir & "PARCHG.NEW">,
+	SplFile		= <BatDir & "SPLCHG.DAT">,
+	SplNew		= <BatDir & "SPLCHG.NEW">,
+	NewLogFile	= <SplDir & "SPOOL.LOG">,
+	TmpLogFile	= <SplDir & "SPLLOG.TMP">,
+        CompFile        = <SplDir & "SPLCOM.FIL">,
+        Spooltap        = <SplDir & "SPOOL.TAP">;
+
+DEFINE	Crlf   = <('15&'12)>,	Crlf2	= <('15&'12&'15&'12)>,
+	Spaces = <"                                        ">,
+	Easy   = <SIMPLE>,	Eif	= <ELSE IF>,
+	Inc(x) = <x_1+x>,	AllRdNo	= <'047>,
+	!      = <COMMENT>,	DSCR = <COMMENT>,
+	KLUDGE = <COMMENT>,	Calli!Gettab = <'41>,
+	!XWD(A,B) = <((A lsh 18) lor (B land '777777))>;
+
+
+LET	r!c = RECORD!CLASS,	r!p = RECORD!POINTER,
+	n!r = NULL!RECORD;
+
+KLUDGE  Expansions, fixups, other stuff this needs:
+	Some of the "hardwired" things here could be parameterized.
+	Needs some more cleaning up.
+	Additions needed:
+	1) Add print routines to allow user to examine records.
+	2) Add routines to search for & examine particular requests.
+	3) NEEDS EXTERNAL DOCUMENTATION!!!!
+;
+r!p(Chan) OldLogPtr,NewLogPtr,TmpLogPtr;	! For log files;
+string LogFilNam;
+
+
+simple procedure LicenseCheck;
+DSCR Checks to be sure SPFIX or the user of SPFIX has WF license set.
+;
+BEGIN  integer UserLic;
+DEFINE  !GTLIC = <-'20>,
+	LC!WF = <'2000000>;
+	
+    UserLic _ calli(!xwd(-1,!GTLIC),calli!Gettab);
+    if (UserLic land LC!WF = 0) then
+      BEGIN
+      print( "Need WF license to continue.",crlf);
+      calli(0,'12);		! Exit;
+      END;
+END;
+
+! ****  Utility Procedures ****;
+
+Easy boolean procedure Affirm(string Prompt);
+DSCR prints Prompt on the terminal and then asks for a yes or
+     no response (a yes response is anything beginning with y
+     and a no is anything beginning with n).
+     Note that only the first character of the user's input is
+     checked.  This allows responses like 'yep' or 'no way' or
+     'yas'.
+     It is assumed that a TTYUP(true) has been done.
+;
+BEGIN "Affirm" string Reply;
+while true do
+  BEGIN
+    print(Crlf, prompt, " [Yes or No] *");
+    if (Reply_inchwl) = "Y"
+      then return(true)
+      eif Reply = "N"
+        then return(false);
+  END;
+END "Affirm";
+
+
+Easy boolean procedure Confirm( String Prompt);
+DSCR prints Prompt on the terminal and asks for confirmation.  Returns
+     TRUE if user inputs a null string or anything beginning with "Y"
+     and otherwise returns FALSE.
+;
+BEGIN "Confirm" String CReply;
+CReply_null;
+print(Crlf, prompt, " [CONFIRM] ");
+if not length(CReply_inchwl) or (CReply="Y")
+  then return(true)
+  else return(false);
+END "Confirm";
+
+
+integer array DateBuf[0:2];  ! For use with DATE UUO;
+
+preload!with
+"JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+"JUL", "AUG", "SEP", "OCT", "NOV", "DEC";
+string array Month[1:12];
+
+
+simple string procedure PrintDate(integer DecDat);
+DSCR Presumes that the argument is a date in DEC format and returns a
+     string in the form dd-mon-yy.
+;
+BEGIN "PrintDate"
+if DecDat<0 then return(null);		! An obviously bad argument;
+return(cvs((DecDat mod 31) + 1) & "-" &
+       Month[((DecDat div 31) mod 12) + 1] & "-" &
+       cvs(((DecDat div 31) div 12) + 64) );
+END "PrintDate";
+
+
+simple string procedure PrintTime;
+DSCR Prints the date and time in DateBuf in the format
+     dd-mmm-yy hh:mm.
+;
+BEGIN integer TmpHr, TmpMin;
+TmpHr_DateBuf[1] div (3600*60);
+TmpMin_(DateBuf[1] div 3600) mod 60;
+return( cvs((DateBuf[0] mod 31) + 1) & "-" &
+	Month[((DateBuf[0] div 31) mod 12) + 1] & "-" &
+	cvs(((DateBuf[0] div 31) div 12) + 64) & " " &
+	(if TmpHr > 9 then null else "0") &
+	cvs(TmpHr) & ":" &
+	(if TmpMin > 9 then null else "0") &
+	cvs(TmpMin) );
+END;
+
+
+simple string procedure SetTime;
+DSCR Sets DateBuf to contain the current date and time.  If less than
+     5 sec. past midnight, get date again to make sure we got it right.
+;
+BEGIN
+DateBuf[0]_calli(1,'14);
+If (DateBuf[1]_calli(1,'22)) leq 300
+  then DateBuf[0]_calli(1,'14);
+END;
+
+
+integer PurgeDate;  ! Set to DEC date for 1st day of preceeding month;
+integer CurDate;    ! Set to current DEC date;
+integer CurMon;     ! Set to current month number (0-12);
+integer CurYear;    ! Set to current year number (2 digits);
+integer TimeZone;   ! Set to user's time zone (monitor format);
+integer PrivWd;     ! Set to user's privelige word (see the YAMM);
+integer Six!Sysno;  ! Set to system number as RIGHT-justified sixbit;
+string SysNo;       ! Set to system number;
+string SysCity;     ! Set to name of city in which system is located;
+string VerNum;	    ! Set to be the program version number;
+
+
+simple procedure Set!Params;
+DSCR This procedure initializes the above globals at run-time.
+     A phase 2 initialization procedure.
+;
+BEGIN integer PartDate, PurgeYear, PurgeMonth;
+      string SysWhere;
+SetTime;			! Set current date and time in DateBuf;
+! Now get user's time zone.  This is stored in bits 2-7 of the user's
+  privelige word;
+PrivWd_Calli('777777000006,'41);
+TimeZone_(PrivWd land '176000000000) lsh -28;
+
+CurDate_DateBuf[0];		! Save current DEC date;
+PartDate_CurDate div 31;
+PurgeMonth_PartDate mod 12;	! This is current month-1;
+CurMon_PurgeMonth+1;		! The current month;
+CurYear_(PartDate div 12) + 64;	! Set the current year;
+if PurgeMonth=0			! Now set the purge year;
+  then BEGIN PurgeYear_(PartDate div 12)-1; PurgeMonth_12; END
+  else PurgeYear_PartDate div 12;
+PurgeDate_((PurgeYear*12)+(PurgeMonth-1))*31;
+SysNo_cvastr(calli('11,'41))[1 to 4];	! Sys loc and number;
+SysWhere_lop(SysNo);			! Sets both SysWhere and SysNo;
+if SysNo[inf to inf]="-"
+  then SysNo_SysNo[1 to inf-1]
+  else SysNo_SysNo[2 to 3];		! Kludge for 3-digit system nos;
+Six!SysNo_cvsix(SysNo) lsh -24; 	! Note:  right-justified sixbit;
+if SysWhere="C"
+  then SysCity_"Cupertino"
+  else if SysWhere="H" then SysCity_"Houston"
+  else if SysWhere="V" then SysCity_"Valley Forge"
+  else if SysWhere="P" then SysCity_"Paris"
+  else if SysWhere="F" then SysCity_"Fremont"
+  else if SysWhere="D" then SysCity_"Dallas"
+  else if SysWhere="L" then SysCity_"Lockheed"
+  else if SysWhere="S" then SysCity_"Experimental Machine Room"
+  else SysCity_"LIMBO";			! Letter code not known;
+
+
+! Set program version number:  Major version number is the first 3
+  octal digits of low order half of .JBVER and minor ver. num is the
+  next 3 octal digits.;
+VerNum _ cvos((memory['137] land '777000) lsh -9) & "." &
+	 cvos(memory['137] land '777);
+END;
+
+require set!Params initialization[2];
+
+integer procedure Yesterday;
+DSCR Gets the current date (DEC-format), converts it to days since begin
+     of 1964, subtracts a day, converts it back to DEC format, and
+     returns it.  All of this hair to permit properly backing up on the
+     1st day of the month.
+;
+BEGIN "Yesterday"	integer array TmpDat[0:2];
+TmpDat[0]_calli(1,'14);			! Get Current date DEC-style;
+TmpDat[1]_1;				! Just after midnight;
+TmpDat[2]_((TimeZone) lsh 18) lor
+	  TimeZone lor '400000;		! To convert to standard-style;
+calli(location(TmpDat[0]),-'55);	! Do the conversion;
+TmpDat[0]_TmpDat[0]-1;			! Subtract a day;
+TmpDat[2]_((Timezone lor '400000) lsh 18) lor
+          Timezone;			! To convert to DEC;
+calli(location(TmpDat[0]),-'55);	! Do the conversion;
+RETURN(TmpDat[0]);
+END "Yesterday";
+
+procedure AlternateSys;
+DSCR In the rare case that Spool is installed using a different system
+number than that on the system, this procedure allows the use of spfix;
+
+  BEGIN
+  print(crlf2,"Read system number as: ");
+  Sysno_Clean(inchwl);
+  END;
+
+procedure Bye!Bye;
+begin
+! Finish up with new log file and either append it to the old one
+  or make it the old one;
+
+setprint(NewLogFile,"F");
+print(CrLf2);					! Just to the log file;
+setprint(NewLogFile,"T");			! Close the log file;
+LogFilNam_SplDir & "SPLLOG." & Month[CurMon];
+NewLogPtr_Opn!Read(NewLogFile,m.binary,false);
+if NewLogPtr neq n!r
+then begin
+OldLogPtr_Opn!Read(LogFilNam,m.binary,false);
+if OldLogPtr = n!r
+  then BEGIN
+	 rename(File[NewLogPtr],LogFilNam,AllRdNo,Flag[NewLogPtr]);
+	 All!Release;
+       END
+  else BEGIN
+	 TmpLogPtr_Opn!Write(TmpLogFile,m.binary,false);
+         if TmpLogPtr neq n!r
+         then begin
+	 inout(File[OldLogPtr],File[TmpLogPtr],-1);
+	 inout(File[NewLogPtr],File[TmpLogPtr],-1);
+	 rename(File[OldLogPtr],null,AllRdNo,Flag[OldLogPtr]);
+	 rename(File[TmpLogPtr],LogFilNam,AllRdNo,Flag[TmpLogPtr]);
+	 rename(File[NewLogPtr],null,AllRdNo,Flag[NewLogPtr]);
+	 All!Release;
+         end;
+       END;
+end;
+calli(0, '12);		! Exit without further adieu;
+end;
+procedure ErrorExit (string Why, Clean.Or.Repair);
+DSCR this procedure is called whenever there is a fatal error while executing
+     clean or repair command. The fatal error message is only output to the
+     log file so not to alarm the operator running it.
+;
+
+begin
+  All!Release;
+  SetPrint (NewLogFile, "F");	! just to the log file;
+  print ("Fatal: ", Why, crlf);
+  SetPrint (NewLogFile, "B");	! go back to TTY too;
+  print (" Can not continue ", Clean.Or.Repair, "!", crlf,
+	 "Please call the TYMCOM-X Support Line : (408) 446-6709", crlf);
+  Bye!Bye;			! of course we want to close up the log file;
+end;
+DSCR Constr and DynStr are "magical" string procedures coded (by Scott
+     Daniels) for efficiency.  Unless you are a SAIL Wizard, leave them
+     alone!  Constr is very efficient, but dangerous.  Use it only for
+     VERY temporary strings.
+;
+
+simple string procedure blowup( integer count, bytepointer );
+begin usererr(count,1,"Constr got a bad length!!"); return(null); end;
+
+simple string procedure constr( integer count, byte!pointer );
+start!code	define a=1, sp='16,p='17;
+		external integer x33;
+	skipl	a,count;
+	cail	a,'400000;
+	 jrst	blowup;
+	push	sp,a;
+	push	sp,byte!pointer;
+	sub	p,x33;
+	jrst	@3(p);
+end;
+
+
+string internal simple procedure dynstr( integer count, byte!pointer );
+return( ("@"&constr(count,byte!pointer))[2 to inf] );
+! **** Macros and procedures that define the structure of the spool
+       and accounting records  ****;
+
+DEFINE GdfFormat = <
+start!gd
+  $binary(  0,  5,  6,status) ##
+   $binary( 0, 35, 30,Req!Num) ##
+    $binary(0, 17, 12,system!six) ##
+    $binary(0, 35, 18,batch!number!six) ##
+  $binary(  1,  9, 10,nofiles) ##
+   $binary( 1, 17,  8,indent) ##
+   $bintim( 1, 35, 18,request!time) ##
+  $ganuun(  2, 35, 36,request!aun) ##
+  $bindat(  3, 17, 18,request!date) ##
+   $binary( 3, 19,  2,fullcase) ##
+   $binary( 3, 20,  1,heading) ##
+   $binary( 3, 26,  6,print!count) ##
+   $binary( 3, 27,  1,transfer!request) ##
+   $binary( 3, 28,  1,quest) ##
+   $binary( 3, 29,  1,fortran!conversion) ##
+   $binary( 3, 30,  1,double!space) ##
+   $binary( 3, 32,  2,where!completed) ##
+   $binary( 3, 35,  3,destination) ##
+  $binary(  4, 17, 18,pages) ##
+   $binary( 4, 26,  9,max!char!line!out) ##
+   $binary( 4, 35,  9,print!location) ##
+  $binary(  5,  2,  3,paper!size) ##
+   $binary( 5,  5,  3,parts) ##
+   $binary( 5,  8,  3,decollate) ##
+   $binary( 5, 11,  3,delivery) ##
+   $binary( 5, 12,  1,customer) ##
+   $binary( 5, 14,  2,charge!other) ##
+   $binary( 5, 15,  1,katakana) ##
+   $binary( 5, 17,  2,spare) ##
+   $bindat( 5, 35, 18,lines!per!page) ##
+  $sixbit(  6,  0,  4,rname) ##
+  $sixbit( 10,  0,  1,project) ##
+  $sixbit( 11,  0,  1,project2) ##
+  $sixbit( 12,  0,  4,telephone) ##
+  $ganuun( 16, 35, 36,charge!aun) ##
+  $binary( 17,  8,  9,max!copies!per!file) ##
+   $binary(17, 17,  9,charged!district) ##
+   $bindat(17, 35, 18,completion!date) ##
+  $asciiw( 18,  0,  5,transfer!location) ##
+  $sixbit( 23,  0,  1,request!user) ##
+  $sixbit( 24,  0,  1,request!user2) ##
+  $sixbit( 25,  0,  1,charge!user) ##
+  $sixbit( 26,  0,  1,charge!user2) ##
+  $binary( 27, 35, 36,word!octal!33) ##
+  $binary( 28, 35, 36,free!word!1) ##
+  $binary( 29, 35, 36,free!word!2) ##
+  $binary( 30, 35, 36,free!word!3) ##
+  $binary( 31,  0,  1,top!of!form) ##
+  $binary( 31,  1,  1,half!page) ##
+  $binary( 31,  2,  1,third!page) ##
+  $binary( 31,  3,  1,sixth!page) ##
+  $binary( 31,  4,  1,overprint) ##
+  $binary( 31,  5,  1,next!line) ##
+  $binary( 31,  6,  1,second!line) ##
+  $binary( 31,  7,  1,third!line) ##
+  $binary( 31,  8,  1,skip!line) ##
+  $binary( 31,  9,  1,skip!2lines) ##
+  $sixbit( 32,  0, 40,delivery!address) ##
+  $asciiw( 72,  0, 28,additional!delivery) ##
+  $asciiw(100,  0, 28,special!forms)
+end!gd>;
+
+DEFINE FdfFormat = <
+start!fd
+  $binary(  0,  5,  6,copies) ##
+   $binary( 0, 35, 30,Req!Num) ##
+    $binary(0, 17, 12,system!six) ##
+    $binary(0, 35, 18,batch!number!six) ##
+  $sixbit(  1,  0,  1,fname) ##
+  $binary(  2, 17, 18,dext) ##
+   $binary( 2, 35, 18,fext) ##
+  $ganuun(  3, 35, 36,request!aun) ##
+  $sixbit(  4,  0,  1,owner1) ##
+  $binary(  5,  2,  3,paper!size) ##
+   $binary( 5,  5,  3,parts) ##
+   $binary( 5,  8,  3,decollate) ##
+   $binary( 5, 11,  3,delivery) ##
+   $binary( 5, 12,  1,customer) ##
+   $binary( 5, 14,  2,charge!other) ##
+   $binary( 5, 15,  1,katakana) ##
+   $binary( 5, 17,  2,spare) ##
+   $bindat( 5, 35, 18,request!date) ##
+  $binary(  6, 14, 15,pages) ##
+   $binary( 6, 35, 21,char!xmit) ##
+  $sixbit(  7,  0,  1,owner2)
+end!fd >;
+
+DEFINE MapFormat = <
+start!md
+  $binary(  0, 11, 12,pages) ##
+   $binary( 0, 14,  3,paper!size) ##
+   $binary( 0, 17,  3,parts) ##
+   $binary( 0, 23,  6,status) ##
+   $binary( 0, 25,  2,destination) ##
+   $binary( 0, 35, 10,batch!number)
+end!md >;
+
+DEFINE AccountFormat = <
+start!acc
+  $asciic(     0,     0,     5,  Req!Num)  ##
+    $asciic(   0,     0,     2,  Status)  ##
+    $asciic(   0,     2,     3,  Num)     ##
+  $asciic(     1,     0,     4,  Date!in)  ##
+    $asciic(   1,     4,     4,  Time!in)  ##
+    $asciic(   2,     3,    12,  name)  ##
+  $asciic(     5,     0,     6,  gan)  ##
+    $asciic(   6,     1,     6,  aun) ##
+    $asciic(   7,     2,     3,  district) ##
+  $asciic(     8,     0,    12,  proj!code) ##
+    $asciic(  10,     2,     1,  customer)  ##
+      $asciic(10,     3,     2,  Type) ##
+  $asciic(    11,     0,     6,  vol) ##
+    $asciic(  12,     1,     4,  Tap!Cvt) ##
+    $asciic(  12,     1,     2,  Parts) ##
+    $asciic(  12,     3,     1,  Burst) ##
+    $asciic(  12,     4,     1,  not!used) ##
+    $asciic(  12,     1,     9,  xmitted) ##
+  $asciic(    13,     0,     5,  Delivery) ##
+    $asciic(  14,     0,     7,  Tap!Buy) ##
+    $asciic(  15,     2,     6,  date!done) ##
+    $asciic(  16,     3,     2,  end!mark)
+end!acc >;
+! Arrays used as buffers to hold records from the data bases;
+
+DEFINE GdSiz = <128>, FdSiz = <8>, MapSiz = <1>;
+
+own safe integer array MapBuf[0:(MapSiz-1)];
+own safe integer array FdfBuf[0:(FdSiz-1)];
+own safe integer array GdfBuf[0:(GdSiz-1)];
+
+DEFINE AccSiz = <17>;
+
+own safe integer array AccBuf, CopyAcc[0:(AccSiz-1)];
+
+DEFINE	$binary=<mak$nam>,	$bintim=<mak$nam>,
+	$bindat=<mak$nam>,	$ganuun=<mak$nam>,
+	$asciiw=<mak$nam$c>,	$asciic=<mak$nam$c>,
+	$sixbit=<mak$nam$c>;
+
+DEFINE	##=<,>, end!gd=<;>, end!fd=<;>, end!md=<;>, end!acc=<;>;
+
+DEFINE	start!gd=< REDEFINE mak$nam(i,b,s,name)=<pg.>&<name>;
+		   REDEFINE mak$nam$c(i,b,s,name)=
+			     <pg.>&<name>&<, pg.>&<name>&<.cnt>;
+		   integer >,
+	start!fd=< REDEFINE mak$nam(i,b,s,name)=<pf.>&<name>;
+		   REDEFINE mak$nam$c(i,b,s,name)=
+			     <pf.>&<name>&<, pf.>&<name>&<.cnt>;
+		   integer >,
+	start!md=< REDEFINE mak$nam(i,b,s,name)=<pm.>&<name>;
+		   REDEFINE mak$nam$c(i,b,s,name)=
+			     <pm.>&<name>&<, pm.>&<name>&<.cnt>;
+		   integer >,
+	start!acc=< REDEFINE mak$nam(i,b,s,name)=<acc.>&<name>;
+		    REDEFINE mak$nam$c(i,b,s,name)=
+			     <acc.>&<name>&<, acc.>&<name>&<.cnt>;
+		   integer >;
+
+GdfFormat;
+FdfFormat;
+MapFormat;
+AccountFormat;			! now global pointer variables are made;
+simple procedure Setup!Pointers;
+DSCR This creates byte pointers into the various arrays used as buffers
+     to hold the spool and accounting records.  Where appropriate, it
+     also sets integers containing counts of the number of bytes in the
+     fields.
+     It is a phase 0 initialization procedure.
+;
+BEGIN "SetupPointers" integer Base;
+
+DEFINE	##=<;>,
+	$binary(index, bit, size,name)=<$pv(name)_Base+
+		(index + ((((35-bit) lsh 6)+size) lsh 24))>,
+	$bintim(index, bit, d.18,name)=<$pv(name)_Base+
+		(index + ((((35-bit) lsh 6)+  18) lsh 24))>,
+	$bindat(index, bit, d.18,name)=<$pv(name)_Base+
+		(index + ((((35-bit) lsh 6)+  18) lsh 24))>,
+	$ganuun(index,d.35, d.36,name)=<$pv(name)_Base+
+		(index + (36 lsh 24))>,
+	$asciiw(index, d.0,words,name)=<$pv(name)_Base+
+		(index + (36 lsh 24));
+		$pvc(name)_words>,
+	$asciic(index, byte,chars,name)=<$pv(name)_Base+ndex + ((((36-(7*byte)) lsh 6) + 7) lsh 24));
+		$pvc(name)_chars>,
+	$sixbit(index, d.0,words,name)=<$pv(name)_Base+
+		(index + (36 lsh 24));
+		$pvc(name)_words>,
+	$sixbitc(index, byte,chars,name)=<$pv(name)_Base+
+		(index + ((((36-(6*byte)) lsh 6) + 6) lsh 24));
+		$pvc(name)_chars>;
+
+DEFINE	start!fd=< REDEFINE $pv(name)=<pf.>&<name>;
+		   REDEFINE $pvc(name)=<pf.>&<name>&<.cnt>;
+		   Base_location(FdfBuf[0]);
+		 >,
+	start!gd=< REDEFINE $pv(name)=<pg.>&<name>;
+		   REDEFINE $pvc(name)=<pg.>&<name>&<.cnt>;
+		   Base_location(GdfBuf[0]);
+		 >,
+	start!md=< REDEFINE $pv(name)=<pm.>&<name>;
+		   REDEFINE $pvc(name)=<pm.>&<name>&<.cnt>;
+		   Base_location(MapBuf[0]);
+		 >,
+	start!acc=< REDEFINE $pv(name)=<acc.>&<name>;
+		    REDEFINE $pvc(name)=<acc.>&<name>&<.cnt>;
+		    Base_location(AccBuf[0]);
+		  >;
+
+GdfFormat;
+FdfFormat;
+MapFormat;
+AccountFormat;				! that sets up the pointers;
+END "SetupPointers";
+
+REQUIRE Setup!Pointers initialization[0];
+r!p(Chan) GdfPtr, FdfPtr, MapPtr, BatPtr, CenPtr, RemPtr;
+integer GdfCnt, FdfCnt;
+
+boolean procedure SeizeFiles;
+DSCR This procedure opens the files that need to be made busy when
+     fixing up SPLCNT and REMCNT.  If it fails to get some file, the
+     user is asked if he wants to try again.  If no, return False.
+     Otherwise try again.  If all needed files are opened, return TRUE.
+;
+while true do
+  BEGIN "Seize"
+    GdfPtr_FdfPtr_CenPtr_RemPtr_MapPtr_n!r;	! In case we try twice;
+    if ((GdfPtr_Opn!Update(GdfFile,m.binary,false)) neq n!r) and
+       ((FdfPtr_Opn!Update(FdfFile,m.binary,false)) neq n!r) and
+       ((CenPtr_Opn!Update(CenFile,m.binary,false)) neq n!r) and
+       ((RemPtr_Opn!Update(RemFile,m.binary,false)) neq n!r) and
+       ((MapPtr_Opn!Update(MapFile,m.binary,false)) neq n!r) 
+      then return(True)
+      else All!Release;
+    if not affirm("do you want to try again?") then return(false);
+  END "Seize";
+
+
+Easy boolean procedure Read!Gdf;
+DSCR Reads a record from the GDF file to GdfBuf.
+     Returns TRUE if there are more records in the file.
+;
+BEGIN
+arryin(File[GdfPtr], GdfBuf[0], GdSiz);
+Inc(GdfCnt);
+return(not Eof[GdfPtr]);
+END;
+
+
+Easy boolean procedure Read!Fdf;
+DSCR Reads a record from the FDF file, depositing it in FdfBuf.
+     Returns TRUE if there are more records in the file.
+;
+BEGIN
+arryin(File[FdfPtr], FdfBuf[0], FdSiz);
+Inc(FdfCnt);
+return(not Eof[FdfPtr]);
+END;
+! The array QuickGdf contains pointers to some key info we need
+  about the Gdf records.  We have to assume that the file could
+  be quite large and so we cannot hope (in general) to be able to
+  read it into core.  The scheme used here allows us to dynamically
+  allocate the necessary storage as we go along.
+
+  QuickGdf files the info by request number, with a chain of
+  GdfLink records to handle cases where there are Gdf records
+  with the same request number.
+;
+
+r!c FdfNames ( integer TheName, TheExt; r!p(FdfNames) NextNam);
+r!c GdfLink ( integer i$date, i$files;
+	      r!p(gdfLink) NxtL; r!p(FdfNames) TopName);
+
+r!p(GdfLink) array QuickGdf[0:999];
+
+
+boolean procedure Set!Info(integer Data, Request, Date);
+DSCR Look for a GdfLink record that matches the request number and
+     date.  If found, store Data in its i$files field and return
+     True.  But if there is no match, create a new record with the
+     given request number, date, and data.  File it and return false.
+;
+BEGIN r!p(GdfLink) TmpLink;
+TmpLink_QuickGdf[Request];
+while TmpLink neq n!r do
+  if date = GdfLink:i$date[TmpLink]		! found a match;
+    then BEGIN GdfLink:i$files[TmpLink]_Data; return(true); END
+    else TmpLink_GdfLink:NxtL[TmpLink];		! look at next rec;
+
+! if we get here we didn't find a match;
+TmpLink_New!Record(GdfLink);
+GdfLink:NxtL[TmpLink]_QuickGdf[Request];	! Add the chain to it;
+QuickGdf[Request]_TmpLink;			! And make it the top;
+GdfLink:i$date[TmpLink]_Date;			! Save the date;
+GdfLink:i$files[TmpLink]_Data;			! And data;
+return(false);				  ! Tell caller we created one;
+END;
+
+
+boolean procedure Set!GdfInf(integer data);
+DSCR Reads the current GDF record in GdfBuf and calls set!info using
+     its request number and date.
+;
+return( set!info( data, 
+	cvd( cv6str( ldb(pg.batch!number!six) lsh 18 ) ),
+	ldb(pg.request!date)));
+
+
+boolean procedure Set!FdfInf(integer data);
+DSCR Reads the current FDF record in FdfBuf and calls set!info using
+     its request number and date.
+;
+return( set!info( data, 
+	cvd( cv6str( ldb(pf.batch!number!six) lsh 18 ) ),
+	ldb(pf.request!date)));
+integer procedure Read!Info( integer Request, Date );
+DSCR Returns information stored by get!info.
+     Assumes that something is very wrong if we don't find it.
+;
+BEGIN r!p(GdfLink) TmpLink;
+TmpLink_QuickGdf[Request];
+while TmpLink neq n!r do
+  if date = GdfLink:i$date[TmpLink]
+    then return(GdfLink:i$files[TmpLink])
+    else TmpLink_GdfLink:NxtL[TmpLink];
+ErrorExit( "attempt to read non-existant information" , "REPAIR" );
+END;
+
+
+easy integer procedure Read!GdfInf;
+return( Read!Info( 
+		cvd(cv6str(ldb(pg.batch!number!six) lsh 18)),
+		ldb(pg.request!date) ) );
+
+
+easy integer procedure Read!FdfInf;
+return( Read!Info( 
+		cvd(cv6str(ldb(pf.batch!number!six) lsh 18)),
+		ldb(pf.request!date) ) );
+boolean procedure Inc!FilCnt;
+DSCR Use the current FDF record.  Search for a matching GDF
+     record.  If found, increment its i$files count and return
+     false.  If not found, return true.  Also keep track of some
+     counters along the way.
+;
+BEGIN r!p(GdfLink) TmpLink; integer Date, Request;
+Date_ldb( pf.request!date );	! date of request for file print;
+request_cvd( cv6str( ldb(pf.batch!number!six) lsh 18 ) );
+
+TmpLink_QuickGdf[Request];
+
+while TmpLink neq n!r do
+  BEGIN r!p(FdfNames) TmpNamPtr,NewNamPtr;
+    if date = GdfLink:i$date[TmpLink]
+      then BEGIN integer CName,CExt;		! We found a match;
+	     CName_ldb(pf.fname);		! The file name;
+	     CExt_ldb(pf.dext);			! Extension (on SPOOL);
+	     TmpNamPtr_GdfLink:TopName[TmpLink];
+	     while TmpNamPtr neq n!r do
+	       BEGIN
+	         if (CName = FdfNames:TheName[TmpNamPtr]) and
+		    (CExt = FdfNames:TheExt[TmpNamPtr])
+		   then return(true)		! Duplicate FDF rec;
+		   else TmpNamPtr_FdfNames:NextNam[TmpNamPtr];
+	       END;
+	   ! If we get here, we have found a genuinely new record;
+	     NewNamPtr_new!record(FdfNames);
+	     FdfNames:TheName[NewNamPtr]_CName;
+	     FdfNames:TheExt[NewNamPtr]_CExt;
+	     FdfNames:NextNam[NewNamPtr]_GdfLink:TopName[TmpLink];
+	     GdfLink:TopName[TmpLink]_NewNamPtr;
+	     Inc(GdfLink:i$files[TmpLink]);
+	     return(false);
+           END;
+    TmpLink_GdfLink:NxtL[TmpLink];
+  END;
+
+return(true);			! Tell caller we did not find it;
+END;
+
+Integer Pgs;    ! In order to have this value available for Compare!pages;
+
+integer procedure count!chars;
+DSCR Searches the FDF file for the records that match the one
+     currently in GdfBuf and returns the number of characters
+     in that request.
+     Complains if it cannot find all of the FDF records and/or
+     if the number of pages shown in the FDF records does not
+     match the total in the GDF record.
+;
+BEGIN "Count!Chars" integer Chars, FilCnt, TheDate, TheNum;
+if FdfPtr=n!r then FdfPtr_Opn!Read(FdfFile,m.binary,false);
+if FdfPtr=n!r then ErrorExit("Cannot Opn!Read FdfFile","REPAIR");
+Chars_Pgs_0;
+FilCnt_ldb(pg.nofiles);
+TheDate_ldb(pg.request!date);
+TheNum_ldb(pg.Req!Num);
+useti(File[FdfPtr],ldb(pg.free!word!1));  ! First block with a rec;
+
+while Read!Fdf do
+  BEGIN "GetCount"
+    if (TheDate=ldb(pf.request!date)) and (TheNum=ldb(pf.Req!Num))
+      then BEGIN
+	     Chars_Chars+ldb(pf.Char!Xmit);
+	     Pgs_Pgs+ldb(pf.pages);
+	     FilCnt_FilCnt-1;
+	   END;
+    if FilCnt=0 then done "GetCount";
+  END "GetCount";
+
+! Now see if things look right;
+KLUDGE This works right as currently used in the accounting stuff,
+       BUT it won't in general--need to figure out something better
+       at some point.
+;
+if FilCnt neq 0
+  then print(Crlf2,"Bad file count for the following entry:  ",
+	     FilCnt, " missing FDF records.");
+if Pgs neq ldb(pg.pages)
+  then print(Crlf2, "The following entry shows ", Pgs, " in the FDF");
+
+return(Chars);
+END "Count!Chars";
+! Macros for the various spool request statuses;
+
+DEFINE Pending   = <0>,		Hold              = <1>,
+       Transfer  = <2>,		InProcess 	  = <3>,
+       Tape      = <4>,		Tape.done 	  = <5>,
+       Completed = <6>,		Completed.Deleted = <7>,
+       Canceled  = <8>;
+
+
+Easy BOOLEAN PROCEDURE Status.is(integer What.Stat);
+DSCR This procedure returns TRUE if the status field of the
+     request currently in GdfBuf is the same as that of the
+     status passed as the argument to the procedure and returns
+     FALSE otherwise.
+;
+return( ldb(pg.status) = What.Stat );
+
+
+Easy integer procedure map!file!word;
+DSCR Construct a new entry for SPOOL.MAP using the record in
+     GdfBuf.  Deposit it in MapBuf and return it.
+;
+BEGIN
+dpb( ldb(pg.pages),				     pm.pages );
+dpb( ldb(pg.paper!size),			     pm.paper!size );
+dpb( ldb(pg.parts),				     pm.parts );
+dpb( ldb(pg.status),				     pm.status );
+dpb( ldb(pg.destination),			     pm.destination );
+dpb( cvd(cv6str( ldb(pg.batch!number!six) lsh 18 )), pm.batch!number );
+return(MapBuf[0]);
+END;
+r!c MapMatches (integer BlkNum; r!p(MapMatches) NxtMatch);
+
+r!p(MapMatches) procedure Search!Map(integer TheReq);
+DSCR Searches the SPOOL.MAP file for entries that match the
+     given request number.  Each time a match is found
+     create a new MapMatches record, set BlkNum to be the
+     block number of that request in the GDF file and make the
+     new record the top of the list that we are returning.
+     Returns the null!record if no matches found.
+     Note that the list returned will have the most recent request
+     first.
+     This procedure opens and closes the map file using the
+     global MapPtr--so it had better not be open outside
+     this procedure.  To help detect such a snafu, MapPtr
+     is set to be the null!record before returning.
+;
+BEGIN "SearchMap" integer HowMany,WrdCnt,TheWord;
+		  r!p(MapMatches) TopMatch, OldMatch;
+if 0 geq TheReq geq 1000
+  then BEGIN
+	 print(Crlf,"Bad argument (", TheReq, ") passed to ",
+	       "Search!Map (a program bug).");
+	 return(n!r);
+       END;
+TopMatch_OldMatch_n!r;
+MapPtr_Opn!Read(MapFile,m.binary,false);
+if MapPtr = n!r then ErrorExit("Cannot Opn!Read MapFile","REPAIR");
+HowMany_wordin(File[MapPtr]);
+for WrdCnt_1 step 1 until '20 do TheWord_wordin(File[MapPtr]);
+for WrdCnt_1 step 1 until HowMany do
+  BEGIN
+    MapBuf[0]_wordin(File[MapPtr]);
+    if ldb(pm.batch!number) = TheReq
+      then BEGIN
+	     TopMatch_new!record(MapMatches);
+	     MapMatches:NxtMatch[TopMatch]_OldMatch;
+	     OldMatch_TopMatch;
+	     MapMatches:BlkNum[TopMatch]_WrdCnt;
+	   END;
+  END;
+One!Release(MapPtr);
+return(TopMatch);
+END "SearchMap";
+DEFINE MaxPrinter = <99>;		! Largest printer no. in use;
+
+procedure FixCounts;
+DSCR This is the procedure that rebuilds the files SPLCNT and REMCNT
+     from the information contained in SPOOL.GDF.  For each GDF
+     record, if it has a status between 0 and 4 (inclusive) it
+     is considered to be a pending request of some kind and the
+     appropriate counter is incremented.  Then the new count files
+     are written.
+;
+BEGIN "FixCounts" integer CenCnt, Cnt3;
+		  integer array RemCnt[0:MaxPrinter];
+if not SeizeFiles then return;
+while not eof[GdfPtr] do
+  BEGIN "Readon" integer Stat;
+    arrclr(gdfbuf);  ! To see if we can avoid that last empty buffer;
+    arryin(File[GdfPtr], GdfBuf[0], GdSiz);
+    if ((stat_ldb(pg.status)) geq 0) and (stat leq 4)
+      then BEGIN integer where,site;
+	     if (where_ldb(pg.destination)) = 1
+	       then inc(cencnt)
+	       eif where = 2
+		 then BEGIN
+		        if (site_ldb(pg.print!location)) < 0 or
+			   (site > MaxPrinter)
+			  then print(Crlf, "Bad printer number=",site,
+				     ".  Request NOT counted.")
+			  else inc(remcnt[site]);
+		      END;
+	    END;
+  END "Readon";
+
+wordout(File[CenPtr], CenCnt);
+
+! Turn on the sign bit for each printer to force PJ to move the data;
+for cnt3_0 step 1 until MaxPrinter do
+  RemCnt[Cnt3]_'400000000000 lor RemCnt[cnt3];
+
+arryout(File[RemPtr], RemCnt[0], MaxPrinter+1);
+
+All!Release;
+END "FixCounts";
+
+procedure SpoolClean;
+DSCR this routine will automatically remove all listing files on the SPOOL
+     directory that no longer belong there.
+;
+BEGIN "SpoolClean" 	string DelFilNam, Name, Ext, DirNam;
+			own integer array LukBlk[0:5];
+			own string array DelFilTab[0:300];
+			integer UfdChan, SpChan, ThePPN, UfdFlag, TotCnt;
+			integer ZapDat,CompDat,StuckFil,StuckReq;
+			integer BlkCnt;
+			boolean FirstTime;
+			r!p (any!class) UfDat;
+			itemvar FilNam;
+
+
+procedure DeleteFiles;
+begin
+	integer i, SpChan, SpFlag;
+
+  open(SpChan_getchan,"dsk",0,0,0,0,0,0);
+  for i_ 0 step 1 until TotCnt - 1 do
+    begin
+      if i= 0 then print(crlf2, "the following files are deleted:",crlf)
+              else print(",     ");
+      if (i mod 4)=0 then print(crlf);
+      lookup(SpChan, SplDir&DelFilTab[i], SpFlag);
+      if SpFlag 
+        then print("?can't find file: ")
+        else rename(SpChan,NULL,0,0);
+      print(DelFilTab[i]);
+    end;
+  release(SpChan);
+end;
+
+if not SeizeFiles then RETURN;	! Freeze the data base;
+print(CrLf,"Scanning the SPOOL data base...");
+TotCnt_CompDat_StuckFil_StuckReq_0;
+GdfCnt_0;			! Init the count of no. of GDF recs;
+ZapDat_Yesterday;
+
+print(CrLf,"Will not keep files for requests completed before ",
+      PrintDate(ZapDat));
+
+while Read!Gdf do
+  BEGIN "MakeNames" 		! Find the files to keep;
+        integer NumFil,TheReq,TheDat,ItmFlg;  itemvar OldNam;
+    if (GdfBuf[0]=0) or (ldb(pg.status) geq Completed.Deleted) or
+       ((NumFil_ldb(pg.nofiles)) = 0)
+      then continue "MakeNames";
+    if GdfBuf['34] leq 0 then GdfBuf['34]_1;	! Check FDF pointer;
+    TheReq_ldb(pg.req!num);
+    TheDat_ldb(pg.request!date);
+    useti(File[FdfPtr],ldb(pg.free!word!1));
+if (CompDat_ldb(pg.completion!date)<ZapDat) and
+   (ldb(pg.status) geq Tape.Done)
+  then BEGIN
+         StuckFil_StuckFil+NumFil;
+	 Inc(StuckReq);
+	 continue "MakeNames";
+       END;
+    FdfCnt_0;
+    while Read!Fdf do
+      BEGIN "GetNames" string SavNam;
+        if (TheDat=ldb(pf.request!date)) and (TheReq=ldb(pf.Req!Num))
+          then BEGIN
+                 SavNam_cvxstr(ldb(pf.fname)) &
+			cv6str(ldb(pf.dext) lsh 18);
+		 OldNam_cvsi(SavNam,ItmFlg);
+		 if ItmFlg
+		   then BEGIN
+		          OldNam_NEW;
+			  new!pname(OldNam,SavNam);
+			  NumFil_NumFil-1;
+			  inc(TotCnt);
+			END;
+		 if NumFil leq 0 then done "GetNames";
+	       END;
+      END "GetNames";
+    if NumFil neq 0
+      then print(Crlf,"Damage at '",cvos((GdfCnt-1)*'200),":  request",
+		 cvxstr(TheReq)," is missing ",NumFil," files!");
+  END "MakeNames";
+
+print(CrLf,"Found ",TotCnt, " files to keep.");
+! print(CrLf,"Found ",StuckReq," stuck requests totalling ", StuckFil,
+      " files."); ! Commented out since it really doesn't refer to anything;
+TotCnt_0;					! We use it again;
+
+DEFINE PhoneyNam = <"\.\">;
+
+open( UfdChan_getchan,"dsk", '17,0,0, 0,0,0 );
+lookup(UfdChan, SplDir & PhoneyNam, UfdFlag);	! Expected to fail;
+close(UfdChan);
+fileinfo(LukBlk);				! but we do get a PPN;
+ThePPN_ LukBlk[3];
+LukBlk[0]_4;					! Now set up for UFD;
+LukBlk[1]_ 1 lsh 18 + 1;
+LukBlk[2]_ ThePPN;
+LukBlk[3]_ cvsix("UFD");
+LukBlk[4]_ 0;
+chnior( UfdChan, LukBlk[0], 4 );
+if not !skip! then ErrorExit("Can't read UFD for " & SplDir, "CLEAN");
+
+UfDat_ iniufr( "*", "*", UfdChan, 15, 1 );	! Look at all files;
+
+FirstTime_true;
+while nxtufr( LukBlk, UfDat )			! One by one;
+  do BEGIN integer IntTst1,IntTst2,IntTst3,NoNameExists;
+	   string OurName,DelFilNam;
+       LukBlk[1]_LukBlk[1] land '777777000000;
+       OurName_cvxstr(LukBlk[0])&cv6str(LukBlk[1]);
+       FilNam_cvsi(OurName,NoNameExists);
+       if NoNameExists
+         then BEGIN
+	        IntTst1_LukBlk[1] lsh -18;
+		IntTst2_IntTst1 land '7777;
+		IntTst3_IntTst1 land   '77;
+		if ('202020 leq IntTst1 leq '313131) and
+		   (  '2020 leq IntTst2 leq   '3131) and
+	      	   (    '20 leq IntTst3 leq     '31)
+ 	  	  then BEGIN
+			 DelFilNam _ OurName[1 to 6]&"."&OurName[7 to 9];
+			 DelFilTab[totcnt] _ DelFilNam;
+		         Inc(totcnt);
+		       END;
+	      END;
+     END;
+release(UfdChan);
+All!Release;
+DeleteFiles;
+print(CrLf2,TotCnt," files were deleted.");
+END "SpoolClean";
+DSCR The following 6 procedures are to do the monthly repair work to get
+     rid of all bad records in the SPOOL.GDF and SPOOL.FDF files.
+;
+
+
+simple boolean procedure Need.Lic;
+DSCR Checks to be sure that either SPFIX or the user has GD and SY license
+     set so repairs can be made.
+;
+BEGIN  integer UserLic;
+  DEFINE  !GTLIC = <-'20>,
+	  LC!SY = <'40000000000>,
+	  LC!GD = <'20000000000>;
+
+  UserLic _ calli(!XWD(-1,!GTLIC),calli!Gettab);
+  if ((UserLic land LC!SY = 0) or (UserLic land LC!GD = 0)) then
+    BEGIN
+    print ("Need SY and GD license to do repairs.", crlf);
+    return(TRUE);
+    END
+  else return(FALSE);
+END;
+
+
+DEFINE  SppDir = <"(SPPOPER)">, AllRunRun = <'055>;
+ifc Debug
+  thenc DEFINE SpoolDir = <"(SPOOL)">;
+  elsec DEFINE SpoolDir = <"(SYS)">;
+endc
+string NewSpool;
+DEFINE
+  OldSpool = <SpoolDir & "SPOOL.SAV">,
+  OldFake = <SppDir & "FAKSPO.SAV">;
+
+
+simple boolean procedure RunningSpool;
+!
+!	Return true if someone is running SPOOL.
+!
+;
+begin
+  integer
+    Loop,
+    Status;
+
+  define
+    !GTFPN     = <-'25>		! File PPN;,
+    !GTNSW     = <'12>		! Table '12 for Gettab;,
+    !NSHJB     = <'20>		! Item '20  for Gettab;,
+    FromSpool  = <calli(!xwd(Loop, !GTFPN), calli!gettab) = SpoolPPN>,
+    GetStatus  = <calli(!xwd(Loop, 0), calli!gettab)>,
+    HighestJob = <calli(!xwd(!NSHJB, !GTNSW), calli!gettab)>,
+    IsAssigned = <Status land !bit(3)>,
+    IsRunning  = <Status land !bit(0)>,	
+    IsWaiting  = <Status land !bit(22)>,
+    IsSpool    = <cvsix("SPOOL") = calli(!xwd(Loop, 3), calli!gettab)>,
+    SpoolPPN   = <!xwd(1, '133677)>;
+
+  for Loop _ HighestJob step -1 until 1 do
+  begin
+    Status _ GetStatus;
+
+    ifcr DEBUG thenc
+      if (IsAssigned and IsSpool and FromSpool)
+      then begin 	
+	     if ( IsRunning and (not IsWaiting) )   ! this is to trap the 
+						      runnable jobs which
+						      are not waiting for
+						      oper action;
+	       or ( (not IsRunning) and IsWaiting ) ! this is to trap the
+						      famous OW state in
+						      which the job is NOT
+						      runnable and is waiting
+						      for oper action;
+		then return(true);
+	   end; 
+    elsec
+      if (IsAssigned and IsSpool)
+      then begin
+	     if ( IsRunning and (not IsWaiting) )
+	       or ( (not IsRunning) and IsWaiting ) then return(true);
+	   end;
+    endc
+  end;
+
+  return(false);
+end;
+
+
+procedure Disable.Spool;
+DSCR This procedure is to rename (SYS)SPOOL.SAV so repairs can be done.
+;
+BEGIN r!p(Chan) TmpPtr;
+  NewSpool _ SppDir & "SPOOL.SAV";
+  TmpPtr_Opn!Read(OldSpool, m.binary,false);
+if TmpPtr = n!r then ErrorExit("Cannot Opn!Read (SYS)SPOOL.SAV","REPAIR");
+  rename(File[TmpPtr], NewSpool, AllRunRun, Flag[TmpPtr]_0);
+  if Flag[TmpPtr] neq 0
+    then
+      begin
+	SetPrint(NewLogFile,"F");	! just to the log file;
+        NewSpool _ SppDir & "CSPOOL.SAV";
+        rename(File[TmpPtr], NewSpool, AllRunRun, Flag[TmpPtr]_0);
+        if Flag[TmpPtr] neq 0 
+ 	  then ErrorExit ("Was not able to rename SPOOL.SAV","REPAIR")
+	  else print (CRLF,"(SPPOPER)SPOOL.SAV exists",crlf,
+		    "(SYS)SPOOL.SAV has been renamed to (SPPOPER)CSPOOL.SAV",
+		     crlf);
+	SetPrint(NewLogFile,"B");	! go back to TTY too;
+      end;
+  One!Release(TmpPtr);
+
+  TmpPtr_Opn!Read(OldFake, m.binary,false);
+if TmpPtr = n!r then ErrorExit("Cannot Opn!Read OldFake","REPAIR");
+  rename(File[TmpPtr], OldSpool, AllRunRun, Flag[TmpPtr]_0);
+  if Flag[TmpPtr] neq 0 then BEGIN
+    TmpPtr_Opn!Read(OldSpool, m.binary,false);
+if TmpPtr=n!r then ErrorExit("Cannot Opn!Read OldSpool","REPAIR");
+    rename(File[TmpPtr], OldFake, AllRunRun, Flag[TmpPtr]_0);
+    ErrorExit ("Was not able to rename FAKSPO.SAV","REPAIR");
+    END;
+  One!Release(TmpPtr);
+END;
+
+procedure Enable.Spool;
+DSCR This procedure renames SPOOL back to (SYS) when spool maintenance
+     is done.
+;
+BEGIN r!p(Chan) TmpPtr;
+  print (CRLF, "Enabling SPOOL . . . ");
+  TmpPtr_Opn!Read(OldSpool, m.binary,false);
+if TmpPtr=n!r then ErrorExit("Cannot Opn!Read OldSpool","REPAIR");
+  rename(File[TmpPtr], OldFake, AllRunRun, Flag[TmpPtr]_0);
+  if Flag[TmpPtr] neq 0
+    then ErrorExit("Was not able to rename SPOOL.SAV back to (SYS)","REPAIR");
+  One!Release(TmpPtr);
+
+  TmpPtr_Opn!Read(NewSpool, m.binary,false);
+if TmpPtr=n!r then ErrorExit("Cannot Opn!Read NewSpool","REPAIR");
+  rename(File[TmpPtr], OldSpool, AllRunRun, Flag[TmpPtr]_0);
+  if Flag[TmpPtr] neq 0
+   then ErrorExit("Was not able to rename FAKSPO.SAV back to (SYS)","REPAIR");
+  One!Release(TmpPtr);
+  print ("Enabled.", CRLF);
+END;
+
+simple boolean procedure Aux!Circuit;
+DSCR Checks to see if SPFIX is being run by an aux circuit.
+;
+BEGIN
+  DEFINE !GTLOG = <-'24>;
+  return(0 = calli(!XWD(-1,!GTLOG),Calli!Gettab) land ('17 lsh 24));
+END;
+
+  
+
+procedure FixRequests;
+DSCR This is the largest and most complex procedure in the program.
+     It reads the SPOOL.GDF and SPOOL.FDF files, removing old and
+     bad records and making new files with only current good requests.
+     It also makes a new SPOOL.MAP file.
+;
+BEGIN "FixReq" integer GoodGdfCnt,GoodFdfCnt,
+		       lose!min,win!min,lose!max,win!max;
+
+DEFINE Calli!Sleep = <'31>;
+
+if Need.Lic then return;
+
+print ("Checking the status of SPOOL . . . ");
+if RunningSpool then
+while RunningSpool do		
+  BEGIN
+  if (not Aux!Circuit) and
+	 confirm ("Someone is running SPOOL. Wait 15 seconds?") then
+    BEGIN
+    print ("Sleeping . . . ");
+    calli(15, Calli!Sleep);
+    print ("Awake!")
+    END
+  else 
+    begin
+    if aux!circuit then print("Someone is running SPOOL. Try again later.")
+	else print(crlf, "SPOOL repair was not done");
+    return;
+    end;
+  END;
+
+print (". . . No one running SPOOL",crlf);
+
+print ("Disabling SPOOL . . . ");
+Disable.Spool;
+print ("SPOOL disabled.", CRLF);
+
+
+SetTime;
+lose!min_win!min_'377777777777;
+lose!max_win!max_-1;
+arrclr(QuickGdf);
+print(Crlf,"Beginning SPOOL data base repair at ",PrintTime,".");
+
+DSCR First scan the GDF file, Discarding any old or obviously bad
+     records as we go.  For each entry that looks OK, make a GdfLink
+     record for it (filed by request number in QuickGdf).  As the
+     records are created they are given the NEGATIVE of the number of
+     files in the request.  This permits easy detection of missing or
+     excess FDF records for each request.
+     Then scan the FDF file, removing any records for which we do not
+     have a corresponding GdfLink record (request no. and date must
+     match), so we remove old and obviously bad records as we go.
+     Finally, examine the GdfLink records, marking those that don't have
+     the proper number of Fdf records so that we can remove them on the
+     second pass.
+;
+BEGIN "Pass1" r!p(Chan) TmpGdfPtr,BadGdfPtr,TmpFdfPtr,BadFdfPtr;
+	      r!p(GdfLink) GdfRec;
+	      integer Req;
+GdfCnt_GoodGdfCnt_0;
+GdfPtr_   Opn!Read( GdfFile,   m.binary,false);
+if GdfPtr = n!r then ErrorExit("Cannot Opn!Read GdfFile","REPAIR");
+TmpGdfPtr_Opn!Write(TmpGdfFile,m.binary,false);
+if TmpGdfPtr = n!r then ErrorExit("Cannot Opn!Write TmpGdfFile","REPAIR");
+BadGdfPtr_Opn!Write(BadGdfFile,m.binary,false);
+if BadGdfFile = n!r then ErrorExit("Cannot Opn!Write BadGdfFile","REPAIR");
+print(Crlf,"Beginning pass 1:",CrLf,"  Scanning the GDF file... ");
+
+if EOF[GdfPtr] then
+  BEGIN
+  Enable.Spool;
+  All!Release;
+  END
+else while Read!Gdf do
+  BEGIN integer FilNum,ReqDat;
+    FilNum_ldb(pg.Nofiles);
+    Req_cvd(cv6str(ldb(pg.batch!number!six) lsh 18));
+    ReqDat_ldb(pg.request!date);
+    if ReqDat<PurgeDate
+      then arryout(File[BadGdfPtr],GdfBuf[0],GdSiz)
+    eif (FilNum=0) or (ldb(pg.status)>Canceled) or
+        (ldb(pg.system!six) neq Six!SysNo) or
+        (Req leq 0) or (Req > 999)
+      then BEGIN
+ 	     print(CrLf,"    DAMAGE:  Bad 1st word = ",
+		   cvxstr(GdfBuf[0])," (block ",GdfCnt,")");
+	     arryout(File[BadGdfPtr],GdfBuf[0],GdSiz);
+	   END
+    eif Set!Info(-FilNum,Req,ldb(pg.request!date))
+      then BEGIN
+	     print(Crlf,"    DAMAGE:  Duplicate GDF record for #",
+		   cvxstr(ldb(pg.req!num))," (block ",GdfCnt,")" );
+	     arryout(File[BadGdfPtr],GdfBuf[0],GdSiz);
+	   END
+      else BEGIN
+	     win!min_win!min min ldb(pg.request!date);
+	     win!max_win!max max ldb(pg.request!date);
+	     arryout(File[TmpGdfPtr],GdfBuf[0],GdSiz);
+	     if ldb(pg.print!location) > MaxPrinter
+	       then print(Crlf,"    WARNING:  Bad printer loc=",
+			  ldb(pg.print!location)," for #",
+		   	  cvxstr(ldb(pg.req!num))," (block ",GdfCnt,
+			  ")" );
+	   END;
+  END;
+All!Release;
+print(Crlf,"  Scanning the FDF file... ");
+
+FdfCnt_GoodFdfCnt_0;
+FdfPtr_   Opn!Read( FdfFile,   m.binary,false);
+if FdfPtr = n!r then ErrorExit("Cannot Opn!Read FdfFile","REPAIR");
+TmpFdfPtr_Opn!Write(TmpFdfFile,m.binary,false);
+if TmpFdfPtr =n!r then ErrorExit("Cannot Opn!Write TmpFdfFile","REPAIR");
+BadFdfPtr_Opn!Write(BadFdfFile,m.binary,false);
+if BadFdfPtr = n!r then ErrorExit("Cannot Opn!Write BadFdfFile","REPAIR");
+
+while Read!Fdf do
+  if FdfBuf[0] and not Inc!FilCnt
+    then BEGIN
+	   Inc(GoodFdfCnt);
+	   arryout(File[TmpFdfPtr],FdfBuf[0],FdSiz);
+	 END
+    else BEGIN
+	   arryout(File[BadFdfPtr],FdfBuf[0],FdSiz);
+	   if ldb(pf.request!date) geq PurgeDate
+	     then BEGIN		      ! Complain about bad current recs;
+		    lose!min_lose!min min ldb(pf.request!date);
+		    lose!max_lose!max max ldb(pf.request!date);
+!		    print(Crlf, "    DAMAGE:  Bad or duplicate record ",
+			  "for ",cvxstr(ldb(pf.req!num))," (rec #",
+			  FdfCnt," in FDF file)" );
+		  END;
+	  END;
+All!Release;
+
+! Stop the processing right here if we do not have any good records;
+if win!max < 0 then BEGIN
+  Enable.Spool;
+  ErrorExit ("ALL RECORDS BAD!!","REPAIR");
+  END;
+
+print(Crlf,"  Scanning the internal records...");
+
+for Req_0 step 1 until 999 do
+  BEGIN
+    GdfRec_QuickGdf[req];
+    while GdfRec neq n!r do
+      BEGIN
+        if GdfLink:i$files[GdfRec] neq 0
+	  then BEGIN
+		 lose!min_lose!min min ldb(pg.request!date);
+		 lose!max_lose!max max ldb(pg.request!date);
+		 GdfLink:i$files[GdfRec]_-1;		! Mark as bad;
+	         print(Crlf,"    DAMAGE:  request #", Req, ", dated ",
+		       PrintDate(GdfLink:i$date[GdfRec]),
+		       " is missing ", -GdfLink:i$files[GdfRec],
+		       " FDF records.");
+	       END
+	  else Inc(GoodGdfCnt);
+	GdfLink:TopName[GdfRec]_n!r;			! Not needed;
+        GdfRec_GdfLink:NxtL[GdfRec];
+      END;
+  END;
+
+! Another check to make sure that we have some good records;
+if (GoodGdfCnt leq 0) or (GoodFdfCnt leq 0) then BEGIN
+  Enable.Spool;
+  ErrorExit ("No good records found!!","REPAIR");
+  END;
+
+print(Crlf,"  Pass 1 statistics:",
+      Crlf,"    Scanned ", GdfCnt-1, " GDF records and found ",
+      GoodGdfCnt," good ones.",
+      Crlf,"    Scanned ", FdfCnt-1, " FDF records, and saved ",
+      GoodFdfCnt, " for Pass 2.",
+      Crlf,"    Dates on the good records ranged from ",
+      PrintDate(Win!Min), " to ", PrintDate(Win!Max), ".");
+if lose!max > 0
+  then BEGIN
+	 print(Crlf, "    Dates on the bad records ranged from ",
+	       PrintDate(Lose!Min), " to ", 
+	       PrintDate(Lose!Max), ".");
+       END
+  else print(Crlf, "    No bad records detected.");
+
+END "Pass1";
+
+
+DSCR On the 2nd pass we scan the FDF file first, discarding any records
+     associated with GDF records that had a bad file count.  We set
+     the i$files entry for a good GDF record to be the block number of
+     the first FDF record for that request in the new file.
+     Then we scan the GDF file, making sure that each request is
+     actually a good one.  We make the MAP file as we go.
+;
+BEGIN "Pass2" integer Status,DelDat,Temp;
+	      r!p(Chan) LostGdfPtr,NewGdfPtr,LostFdfPtr,NewFdfPtr,
+			NewMapPtr;
+
+FdfCnt_GoodFdfCnt_0;
+FdfPtr_Opn!Read(TmpFdfFile,m.binary,false);
+if TmpFdfFile = n!r then ErrorExit("Cannot Opn!Read TmpFdfFile","REPAIR");
+LostFdfPtr_Opn!Write(LostFdfFile,m.binary,false);
+if LostFdfPtr = n!r then ErrorExit("Cannot Opn!Write LostFdfFile","REPAIR");
+NewFdfPtr_Opn!Write(NewFdfFile,m.binary,false);
+if NewFdfPtr = n!r then ErrorExit("Cannot Opn!Write NewFdfFile","REPAIR");
+print(CrLf2,"Beginning pass 2...",CrLf,"  Scanning FDF file...");
+
+while Read!Fdf do
+  if (Status_Read!FdfInf) < 0
+    then arryout(File[LostFdfPtr],FdfBuf[0],FdSiz)
+    else BEGIN
+	   if Status=0 and not Set!FdfInf((GoodFdfCnt div 16)+1) then BEGIN
+	     Enable.Spool;
+	     ErrorExit ("Set!FdfInf can't find a rec that Read!FdfInf "
+			& "just found!!", "REPAIR");
+	     END;
+	   Inc(GoodFdfCnt);	      ! Do the Inc AFTER the Set!FdfInf;
+	   arryout(File[NewFdfPtr],FdfBuf[0],FdSiz)
+	 END;
+All!Release;
+
+print(CrLf,"  Scanning GDF file...");
+GdfPtr_Opn!Read(TmpGdfFile,m.binary,false);
+if GdfPtr = n!r then ErrorExit("Cannot Opn!Read TmpGdfFile","REPAIR");
+LostGdfPtr_Opn!Write(LostGdfFile,m.binary,false);
+if LostGdfPtr = n!r then ErrorExit("Cannot Opn!Write LostGdfFile","REPAIR");
+NewGdfPtr_Opn!Write(NewGdfFile,m.binary,false);
+if NewGdfPtr = n!r then ErrorExit("Cannot Opn!Write NewGdfFile","REPAIR");
+NewMapPtr_Opn!Write(NewMapFile,m.binary,false);
+if NewMapPtr = n!r then ErrorExit("Cannot Opn!Write NewMapFile","REPAIR");
+! Now write out the 1st 20 words of the new MAP file;
+wordout(File[NewMapPtr], GoodGdfCnt);	! Number of GDF recs we have;
+SetTime;
+wordout(File[NewMapPtr], DateBuf[0]);	! Date of last monthly update;
+wordout(File[NewMapPtr], DateBuf[0]);	! Date of last daily update;
+for temp_3 step 1 until '20 do wordout(File[NewMapPtr],0);
+
+GdfCnt_GoodGdfCnt_0;			! Reinit counts--AFTER writing
+					! first words of Map file;
+DelDat_Yesterday;			! Set date for file delete;
+
+while Read!Gdf do
+  if (Status_Read!GdfInf) > 0
+    then BEGIN integer PntStat,DatDone;
+	   GdfBuf['34]_Status;
+	   if ( ((PntStat_ldb(pg.status))=tape.Done) or
+	                              (PntStat=Completed) )     and
+	      ((DatDone_ldb(pg.Completion!Date))<DelDat) and
+	      (DatDone > 0)
+	     then dpb(Completed.Deleted,pg.status);
+	   arryout(File[NewGdfPtr],GdfBuf[0],GdSiz);
+	   wordout(File[NewMapPtr],map!file!word);
+	   Inc(GoodGdfCnt);
+         END
+    else BEGIN
+           if Status neq -1 then BEGIN
+	     Enable.Spool;
+	     ErrorExit("Very bad status for a GDF record (a bug)","REPAIR");
+	     END;
+	   arryout(File[LostGdfPtr],GdfBuf[0],GdSiz);
+	 END;
+All!Release; 
+
+arrclr(QuickGdf);	! No longer needed, so make recs garbage-
+			  collectable;
+GdfCnt_-1+GdfCnt;
+if GdfCnt=GoodGdfCnt
+  then print(CrLf,"    All ",GdfCnt," GDF records were used.")
+  else print(CrLf,"    Discarded ",GdfCnt-GoodGdfCnt," of the ",GdfCnt,
+	     " GDF records.");
+FdfCnt_-1+FdfCnt;
+if FdfCnt=GoodFdfCnt
+  then print(CrLf,"    All ",FdfCnt," FDF records were used.")
+  else print(CrLf,"    Discarded ",FdfCnt-GoodFdfCnt," of the ",FdfCnt,
+	     " FDF records.");
+END "Pass2";
+
+! The 3rd and final check to make sure that we have good files;
+if (GoodGdfCnt leq 0) or (GoodFdfCnt leq 0) then BEGIN
+  Enable.Spool;
+  ErrorExit("NO USABLE RECORDS LEFT AFTER END OF PASS 2!!","REPAIR");
+  END;
+
+BEGIN "SplRename" r!p(Chan) TmpPtr, OldPtr;
+! The final step is to rename the old data base files to be the backups
+  and the newly-created files to be the current data base files.  ;
+print(CrLf2,"Renaming files, wait... ");
+OldPtr_Opn!Read(GdfBak,m.binary,False);     ! OK if it fails;
+if OldPtr neq n!r			    ! It exists, so delete it;
+  then rename(File[OldPtr],"",AllRdNo,Flag[OldPtr]);
+TmpPtr_Opn!Read(GdfFile,m.binary,false);
+if TmpPtr=n!r then ErrorExit("Cannot Opn!Read GdfFile","REPAIR");
+rename(File[TmpPtr],GdfBak,AllRdNo,Flag[TmpPtr]_0);
+if Flag[TmpPtr] neq 0 then BEGIN
+  Enable.Spool;
+  ErrorExit("Was not able to rename SPOOL.GDF","REPAIR");
+  END;
+All!Release;
+OldPtr_Opn!Read(FdfBak,m.binary,False);     ! OK if it fails;
+if OldPtr neq n!r			    ! It exists, so delete it;
+  then rename(File[OldPtr],"",AllRdNo,Flag[OldPtr]);
+TmpPtr_Opn!Read(FdfFile,m.binary,false);
+if TmpPtr = n!r then ErrorExit("Cannot Opn!Read FdfFile","REPAIR");
+rename(File[TmpPtr],FdfBak,AllRdNo,Flag[TmpPtr]_0);
+if Flag[TmpPtr] neq 0 then BEGIN
+  Enable.Spool;
+  ErrorExit("Was not able to rename SPOOL.FDF","REPAIR");
+  END;
+All!Release;
+
+OldPtr_Opn!Read(MapBak,m.binary,False);     ! OK if it fails;
+if OldPtr neq n!r			    ! It exists, so delete it;
+  then rename(File[OldPtr],"",AllRdNo,Flag[OldPtr]);
+TmpPtr_Opn!Read(MapFile,m.binary,False);    ! OK if it fails;
+if TmpPtr neq n!r
+  then rename(File[TmpPtr],MapBak,AllRdNo,
+	      Flag[TmpPtr]_0);
+if (TmpPtr neq n!r) and (Flag[TmpPtr] neq 0) then BEGIN
+  Enable.Spool;
+  ErrorExit("Was not able to rename SPOOL.MAP","REPAIR");
+  END;
+All!Release;
+
+TmpPtr_Opn!Read(NewGdfFile,m.binary,false);
+if TmpPtr = n!r then ErrorExit("Cannot Opn!Read NewGdfFile","REPAIR");
+rename(File[TmpPtr],GdfFile,AllRdNo,Flag[TmpPtr]_0);
+if Flag[TmpPtr] neq 0 then BEGIN
+  Enable.Spool;
+  ErrorExit("Was not able to rename SPOOL.GNW","REPAIR");
+  END;
+One!Release(TmpPtr);
+TmpPtr_Opn!Read(NewFdfFile,m.binary,false);
+if TmpPtr = n!r then ErrorExit("Cannot Opn!Read NewFdfFile","REPAIR");
+rename(File[TmpPtr],FdfFile,AllRdNo,Flag[TmpPtr]_0);
+if Flag[TmpPtr] neq 0 then BEGIN
+  Enable.Spool;
+  ErrorExit("Was not able to rename SPOOL.FNW","REPAIR");
+  END;
+One!Release(TmpPtr);
+
+TmpPtr_Opn!Read(NewMapFile,m.binary,false);
+if TmpPtr = n!r then ErrorExit("Cannot Opn!Read NewMapFile","REPAIR");
+rename(File[TmpPtr],MapFile,AllRdNo,Flag[TmpPtr]_0);
+if Flag[TmpPtr] neq 0 then BEGIN
+  Enable.Spool;
+  ErrorExit("Was not able to rename SPOOL.MNW","REPAIR");
+  END;
+One!Release(TmpPtr);
+
+All!Release;
+print("done!!");
+END "SplRename";
+
+
+print(Crlf,"Updating SPLCNT and REMCNT, wait... ");
+FixCounts;			! Fix up counts in SPLCNT and REMCNT;
+print("done!!");
+
+print(Crlf,"Cleaning the SPOOL directory, wait... ");
+SpoolClean;
+
+Enable.Spool;
+
+SetTime;
+print(Crlf2,"Data base repair completed at ", PrintTime);
+END "FixReq";
+simple procedure Do!Help;
+BEGIN "Help"
+print("
+CLEAN		Use this to DELETE unwanted files on the (SPOOL)
+		directory.  
+
+HELP		Repeat this message.
+
+QUIT		Graceful exit from the program.  If you exit some
+		other way, you will not get the appropriate files
+		properly updated.
+
+REPAIR		Use this to rebuild SPOOL's data base.");
+
+Confirm("Type any character to continue");
+END "Help";
+! ******************   T O P  O F  P R O G R A M *******************;
+
+
+integer var;
+
+DSCR Handle the following macros with care.
+
+     Com!List is a list of pairs, in the form <command name>,<action>.
+     The <action> must be suitable for inclusion as an entry in a case
+     statement.  The result will be semicolon & [n] <action> for the
+     appropriate n.  If <action> is not a simple SAIL statement, enclose
+     it in BEGIN/END.
+
+     Com!Str is used to preload the string array containing the command
+     names, and Com!Case becomes the body of a case statement.  
+
+     WARNINGS:  (1) Command names must be typed in UPPER case and appear
+	            in alphabetical order.
+		(2) No command can be a proper substring of another
+		    (though they can have a common initial substring).
+;
+
+DEFINE Com!List = <(> & <
+CLEAN (DIRECTORY),SpoolClean,
+HELP,Do!Help,
+QUIT,Bye!Bye,
+REPAIR (DATABASE),FixRequests
+		  > & <)>;
+
+! NO "," allowed after the last entry in the above list ;
+
+DEFINE Com!Str  = <>,
+       Com!Case = <>,
+       Com!Cnt  = 0;
+
+FORLC xxx = Com!List
+  DOC <
+	REDEFINE Com!Cnt = Com!Cnt+1;
+	IFC Com!Cnt MOD 2 = 1 THENC
+	  REDEFINE Com!Str = CVMS( Com!Str ) & <, "> & <xxx> & <">;
+	ELSEC
+	  REDEFINE The!Com!Cnt = Com!Cnt DIV 2;
+	  REDEFINE Com!Case = CVMS( Com!Case ) & <; [> & 
+			      	CVS( The!Com!Cnt ) & <] > & <xxx>;
+	ENDC
+  > ENDC
+
+IFC Com!Cnt MOD 2 = 0 THENC REDEFINE Com!Cnt = Com!Cnt DIV 2;
+  ELSEC REQUIRE CrLf & "Command list error!! FIX IT!!" MESSAGE;
+ENDC
+
+REQUIRE CrLf & "Found " & CVS( Com!Cnt ) & " commands." & CrLf MESSAGE;
+
+! We don't want the leading chars on Com!Str and Com!Case, so lop them;
+
+REDEFINE Com!Str = CVMS( Com!Str )[2 TO INF];
+REDEFINE Com!Case = CVMS( Com!Case )[2 TO INF];
+
+PRELOAD!WITH Com!Str;
+STRING ARRAY Commands[ 1 : Com!Cnt ];
+
+var_-1;
+ttyup(true);		! Force input from terminal to be upper case;
+
+require LicenseCheck initialization;
+
+setprint(NewLogFile,"B");		! Make a log file;
+
+! Print a herald giving the program name, system number, and time;
+
+PRINT(Crlf, "SPOOL Data Base Maintenance Tool, v. ", VerNum,
+      ifc Debug thenc " [DEBUGGING VERSION]", endc Crlf,
+      "System ", SysNo, " (", SysCity, ")    ", PrintTime, Crlf);
+
+if rpgsw then AlternateSys;	! Different system number needed;
+
+while true do
+  BEGIN "GetOption" integer OurCmd;
+      if (OurCmd_GetCmd("Option (? for help) *",Commands)) > 0
+	then case OurCmd of BEGIN Com!Case END;
+  END "GetOption";
+
+require " end of program" message;
+END "SplFix"
+    require " reading too far!!" message; .
+ E
+Õ
