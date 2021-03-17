@@ -1,0 +1,908 @@
+
+begin "Zork Compressor"
+require '13 version;
+require "{}{}" delimiters;
+define	tab={('11&null)}, lf={('12&null)}, ff={('14&null)},
+	cr={('15&null)}, esc={('33&null)}, eol={('37&null)},
+	spc={('40&null)}, del={('177&null)}, crlf={('15&'12)},
+	white={('11&'12&'14&'15&'40)},
+	!={Comment};
+ifcr not declaration(TENX)
+thenc	ifcr declaration(openfile)
+	thenc	define TENX(x)={x}, T10(x)={};
+	elsec	define TENX(x)={}, T10(x)={x};
+endc	endc
+
+external integer !skip!
+		 ;
+define	LowAlpha={"abcdefghijklmnopqrstuvwxyz"}
+	,UpAlpha={"ABCDEFGHIJKLMNOPQRSTUVWXYZ"}
+	,Digits={"0123456789"}
+	,Separators={",;:&=<>()[]\|^"}
+	,Punctuation "be" =b(""",./?;+!#$%&'*=_-:<>()[]{}\|^@`~")e
+	;
+integer  RdLine	 ! INCHWL-style Break (read one line);
+	,EatWhite	! consumes White Space (none out);
+	,ToWhite	! Stops on White Space (none out);
+	,OctDig 	! passes octal digits;
+	,LetDig 	! passes letters and digits;
+	,UpLetDig	! passes letters and digits, forces Up;
+	,PassPunct	! passes Punctuation;
+	,PassPunct!W	! passes Punctuation,Ignoring WhiteSpace;
+	,NoWhite	! ignore WhiteSpace, pass all else;
+	,ForceUp	! passes everything, forces up;
+	,ToSep		! stops on separators, ignores them.;
+	;
+simple procedure brkset;
+begin
+setbreak( rdLine	_getbreak, lf & ff, cr, "INS" );
+setbreak( EatWhite	_getbreak, white, white, "XNR" );
+setbreak( ToWhite	_getbreak, white, white, "INS" );
+setbreak( OctDig	_getbreak, "01234567", null, "XNR" );
+setbreak( LetDig	_getbreak, LowAlpha&UpAlpha&Digits, null, "XNR" );
+setbreak( UpLetDig	_getbreak, LowAlpha&UpAlpha&Digits, null, "XNRK" );
+setbreak( PassPunct	_getbreak, Punctuation, null, "XNRK" );
+setbreak( PassPunct!W	_getbreak, Punctuation&white, white, "XNRK" );
+setbreak( NoWhite	_getbreak, null, white, "INR" );
+setbreak( ForceUp	_getbreak, null, null, "INK" );
+setbreak( ToSep 	_getbreak, separators, null, "IS" );
+end;
+require brkset initialization;
+string simple procedure ScanTail(string s; integer breakTable);
+begin scan( s, breaktable, !skip! ); return(s) end;
+
+string simple procedure ScanS(reference string s; integer breakTable);
+	return( scan( s, breaktable, !skip! ) );
+
+string simple procedure upper(string s);
+	return( scan( s, forceUp, !skip! ) );
+
+string simple procedure scanOut(reference string s;integer breakTable);
+begin	string result;
+result_ scan( s, breaktable, !skip! );
+scan(s,eatWhite,!skip!);
+return( result );
+end;
+integer  inp
+	,brk
+	,eof
+	;
+String	 CurrentLine	! just for error reporting use;
+	;
+
+simple procedure fatal(string x);
+begin
+print(crlf & "*Hard Error in: ", CurrentLine, crlf, x, crlf );
+inchrw;
+end;
+
+simple procedure nonFatal(string x);
+begin
+print(crlf & "*Soft Error in: ", CurrentLine, crlf, x, crlf );
+end;
+
+
+string simple procedure ReadLine;
+begin	string Line;
+do scans( Line_ CurrentLine_ input(inp,Rdline), EatWhite )
+ until eof or length(Line);
+return(line);
+end;
+string simple procedure StripName( Reference String LongName, Source );
+begin	string	 result
+		,temp
+		;
+
+if length(result_ scanS(Source,UpLetDig)) = 0
+or not equ( "=", temp_scans(Source,PassPunct!W) )
+ then nonFatal("No `=': " & result & temp & Source);
+scan( Source, EatWhite, !skip! );
+LongName_ scanOut( Source, ToWhite );
+While length(Source) and !skip! neq "["
+   do LongName_ LongName & spc & scanOut( Source, ToWhite );
+return(result);
+end;
+require 200 Pnames;
+require 2000 new!items;
+item	 Synonym	! abbreviations: Synonym XOR short EQV longName;
+	;
+set	rooms,
+	directions,
+	pending;
+list	directionList;
+
+define	PendingBit= 1 lsh 11;
+
+COMMENT Data structures:
+
+Direction:	ITEM
+	props(direction) = directionBit
+	datum(direction) = directionBit
+	direction in directions
+	SYNONYM(direction)=fullName
+
+Room:		ITEM
+	props(room) = `OR' of all investigated directionBits
+			+ pendingBit if "forward referenced"
+	datum(room) = "Full-Case name"
+	room in Abbreviations
+	FromRoom(direction)=ToRoom
+	SYNONYM(room)=fullName
+
+directions:	set of all valid directions (N,S,E,W,U,D,...)
+directionList:	list of above in Dump file order
+;
+string procedure GetDirections;
+begin "getdirections"
+	string	Line;
+	integer LastProp, AssignedProps;
+	set UnassignedDirections;
+	string itemvar dir;
+
+UnassignedDirections_ PHI;
+while "=" neq lop(Line_ReadLine)
+ or not equ("DIRECTIONS",scanOut(line, UpLetDig))
+ or length(line)
+  do fatal("Bad start of File (no =DIRECTIONS line)");
+
+AssignedProps_ -PendingBit;	! turn on all high bits;
+while "=" neq Line_ ReadLine
+   do begin "new direction"	string num,abrev,longName;
+				string itemvar OtherName;
+				integer number;
+	if eof then fatal("Unexpected EOF in DIRECTIONS");
+	num_ scanOut(Line,octDig);
+	abrev_ scanOut(line,UpLetDig);
+	if not equ("=",scanS(line,PassPunct!W))
+	 then fatal("DIRECTION Line without =.");
+	longName_ scanOut(Line,LetDig);
+	if length(line) then fatal( "DIRECTION line too long");
+
+	new!Pname( dir_new(longName), abrev );
+	put dir in directions;
+	put dir in directionList after length(directionList);
+
+	if length(longName) and not equ(longName,abrev)
+	 then begin
+		new!Pname( OtherName_new(abrev), upper(longName) );
+		MAKE Synonym XOR OtherName EQV dir;
+	      end
+	 else datum(dir)_ abrev;
+
+	if length(num)=0 then put dir in UnassignedDirections;
+	if (number_cvo(num)) land AssignedProps
+	 then print( crlf, "Bad number for ", dir, "[", datum(dir), "]")
+	 else AssignedProps_ AssignedProps lor (props(dir)_ number);
+      end;
+LastProp_ PendingBit;
+foreach dir | dir in UnassignedDirections
+   do begin
+	while lastProp land AssignedProps do lastProp_ lastProp lsh -1;
+	AssignedProps_ AssignedProps lor lastProp;
+	if lastProp = 0
+	 then print(crlf, "No bit available for ", datum(dir),
+			"[", dir, "]= ", Synonym ASSOC dir);
+	props(dir)_ lastProp;
+      end;
+return(Line);
+end "getdirections";
+integer item Punct;
+
+itemvar procedure scan1( reference string line );
+begin	string name;
+	integer itemvar result;
+scans(line,EatWhite);
+if length(name_scanS(line,UpLetDig))
+ then begin	integer flag;
+	result_ cvsi(name,flag);
+	if flag
+	 then begin	string itemvar gensym;
+		new!pname( gensym_ new("{Unassigned}"),name);
+		props(gensym)_ pendingBit;
+		return(gensym);
+	      end
+      end
+ else begin
+	result_ Punct;
+	datum(result)_lop(line);
+      end;
+return(result);
+end;
+set pendingRooms;
+
+procedure DoDirections( string itemvar base; string Transitions);
+if length(Transitions) then
+begin "DoDirections"
+	string line;
+	integer itemvar way, lway, target;
+	label fail;
+lway_ any; line_ transitions;
+if punct neq (way_scan1(line))
+or datum(way) neq "["
+or punct = (lway_scan1(line))
+ then go fail;
+! now way=punct("[") and lway=direction;
+way_ scan1(line);
+neednext while length(line)
+   do begin "one assoc" 	label colok;
+	if punct = way
+	 then if datum(way) = ":"
+		 then begin next; way_scan1(line) end
+		 else done
+	 else print("Inserting missing `:'");
+	if props(base) land props(lway) 	! already set;
+	 then print(crlf, "Multiple ", lway, " for ", base );
+
+COLOK:
+	! now lway=direction and way=target room;
+	if (not lway in directions) or PendingBit land props(lway)
+	or any=way or way=punct
+	 then done;
+
+	MAKE lway XOR base EQV way;		! connect places;
+	if props(way) land PendingBit then put way in PendingRooms;
+	props(base)_ props(base) lor props(lway); ! show it;
+	next; way_ scan1(line);
+	if way=punct
+	 then if datum(way)="]" then RETURN
+	      else if datum(way)=":"
+		 then begin next; way_scan1(line); go COLOK end
+	      else if datum(way)=","
+		 then begin	next; lway_scan1(line);
+				next; way_scan1(line); end
+      end "one assoc";
+FAIL:
+print( crlf& "Bad Transition notation: ",
+	Transitions[1 to inf-length(line)], "<-"&crlf&"->", line );
+
+end "DoDirections";
+set Conflicts;
+string	 abbrev
+	,name
+	;
+procedure DumpMap;
+begin "DumpMap"
+	string itemvar dir,room,obj;
+	integer w,d;
+	list	dList;
+
+getformat(w,d); setformat(-4,0); setprint(null,"F");
+print(crlf,"  =Directions");
+dList_  directionList;
+while length(dList)
+   do print( crlf, cvos(props(dir_lop(dList))),"  ", 
+		dir, tab&"= ", datum(dir) );
+
+print(crlf," =Map");
+foreach room | room IN rooms
+   do begin	itemvar dest;
+		string separator;
+	print(crlf, cvos(props(room)), " ", room,
+		tab & "= ", datum(room), tab );
+	separator_ "[";
+	dList_  directionList;
+	while length(dList)
+	   do begin
+		dir_ lop(dList);
+		foreach dest | dir XOR room EQV dest
+		   do begin
+			print(separator,dir,":",dest);
+			separator_ ", ";
+		      end;
+	      end;
+	if separator neq "[" then print("]");
+      end;
+print(crlf,crlf);
+setformat(w,d); setprint(null,"T");
+end "DumpMap";
+procedure roomP( string itemvar x; integer format );
+if format
+ then print( datum(x,string), "[", x, "]" )
+ else print( x ); 
+procedure RoomLine( string line ); ! format: ABR = Long Name [RoomList];
+begin "RoomLine"	boolean flag;
+	string itemvar room,full; ! the room ITEMVAR (datum=full name);
+	integer investigated;
+investigated_ scanOut(line,OctDig);
+abbrev_ StripName( name, Line );
+room_ cvsi( abbrev, flag );
+if flag then new!pname( room_ new(name), abbrev )
+ else if props(room) land PendingBit
+	 then begin remove room from pendingRooms; datum(room)_name; end
+	 else begin
+		print(crlf,"Conflict over: ", room, " = ", name, crlf,
+			"->", line, " [Ignored, was: ",datum(room),"]");
+		return;
+	      end;
+Full_ cvsi( upper(name), flag );
+if flag
+ then new!Pname( Full_ new(abbrev), upper(name) )
+ else begin
+	print(crlf, "Warning: ", name, " multiply defined.",
+		"  This time as: ", abbrev, "," & crlf &
+		"  Formerly:" );
+	foreach room | Synonym XOR room EQV Full
+	   do print(" ", room, "=", Full );
+	print(crlf,"Now from line: ", line, " [Ignored] ");
+	return;
+     end;
+datum(room)_ name;
+props(room)_ 0;
+MAKE Synonym XOR Full EQV room;
+put room in rooms;
+DoDirections(room,Line);
+props(room)_ props(room) lor investigated;
+end "RoomLine";
+itemvar procedure TrueNameGet(reference string s);
+begin	itemvar var;
+	set derived;
+if (var_scan1(s))=ANY then return(ANY);
+case length(derived_synonym XOR var)
+ of begin [0];[1]var_lop(derived);
+      ELSE begin
+	     print(var," ambiguous: ", derived );
+	     return(ANY);
+	   end
+    end;
+return(var);
+end;
+procedure Path(string l; boolean addit);
+begin	itemvar r1,d,r2, triple;
+	define eif={else if}, erm(x)={outstr(crlf&"--"&cvps(x)&" ")};
+
+if (any = r1_TrueNameGet(l)) or punct=r1 then erm(Bad First Room)
+eif punct neq (d_TrueNameGet(l)) or datum(punct) neq ":"
+					then erm(Missing colon)
+eif any = (d_TrueNameGet(l))		then erm(Bad Direction)
+eif not d in directions 		then erm(Non-direction)
+eif punct neq (r2_TrueNameGet(l)) or datum(punct) neq "="
+					then erm(missing Equals)
+eif any = (r2_TrueNameGet(l)) or r2=punct
+					then erm(bad destination room)
+ else begin
+	if (d xor r1 eqv r2) = addit
+	 then print("[bad Path ",(if addit then "Add" else "Drop"),"]")
+	 else if addit
+		then make d xor r1 eqv r2
+		else erase d xor r1 eqv r2;
+	return;
+      end;
+print("[Improper format: -",r1,"-",d,"-",r2,"-...", l, "...Ignored]");
+end;
+boolean verbosity; define fromRoomBit=1,toRoomBit=2;
+procedure ptrip( string itemvar r1; itemvar dir; string itemvar r2 );
+begin
+print(if verbosity then crlf else " ");
+roomP( r1, verbosity land fromRoomBit );
+print( ":", dir, "=" );
+roomP( r2, verbosity land toRoomBit );
+end;
+set hidden;
+
+
+procedure LeadsTo(string l; Integer PathMax);
+begin "leadsTo"
+	itemvar token;
+	set known,NewTokens;
+	integer level, totalShown;
+print(" Paths leading To: "); 
+if any=(token_ TrueNameGet(l)) or length(l)
+ then begin print(" Ill-formed token "); return; end;
+newTokens_ {token};
+known_ hidden; put token in known;
+roomP(token,-1);
+totalShown_ 0;
+for level_1 step 1 until PathMax
+   do begin		itemvar rFrom, dir, rTo; set candidates;
+	print(crlf,-level,"==>");
+	candidates_ newTokens;
+	newTokens_phi;
+	foreach rFrom,dir,rTo | rTo in candidates
+			and dir in directions
+			and dir xor rFrom eqv rTo
+			and (not rFrom in known)
+	   do begin
+		ptrip( rFrom, dir, rTo );
+		put rFrom in NewTokens;
+		put rFrom in known;
+	      end;
+	if length(newTokens)=0 then done;
+	print("<==",length(newTokens));
+	totalShown_ totalShown + length(newTokens);
+      end;
+if level > 2 then print( crlf, totalShown, " in all." );
+end "leadsTo";
+procedure LeadsFrom(string l; Integer PathMax);
+begin "leadsFrom"
+	itemvar token;
+	set known,NewTokens;
+	integer level, totalShown;
+print(" Paths leading out of: "); 
+if any=(token_ TrueNameGet(l)) or length(l)
+ then begin print(" Ill-formed token "); return; end;
+newTokens_ {token};
+known_ hidden; put token in known;
+totalShown_ 0;
+roomP(token,-1);
+for level_1 step 1 until PathMax
+   do begin		itemvar rFrom, dir, rTo; set candidates;
+	print(crlf,level,"==>");
+	candidates_ newTokens;
+	newTokens_phi;
+	foreach rFrom,dir,rTo | rFrom in candidates
+			and dir in directions
+			and dir xor rFrom eqv rTo
+			and (not rTo in known)
+	   do begin
+		ptrip( rFrom, dir, rTo );
+		put rTo in NewTokens;
+		put rTo in known;
+	      end;
+	if length(newTokens)=0 then done;
+	print("<==",length(newTokens));
+	totalShown_ totalShown + length(newTokens);
+      end;
+if level > 2 then print( crlf, totalShown, " in all." );
+end "leadsFrom";
+list procedure PathList( itemvar start, dest; integer pathMax );
+begin "make path list"
+	set array path[0:pathMax];
+	set known, candidates, NewTokens; 
+	list result;
+	itemvar dir, r2;
+	integer level;
+
+known_ hidden - {dest}; put start in known;
+newTokens_ {start};
+for level_1 step 1 until PathMax
+   do begin "combine"
+	path[level-1]_ candidates_ newTokens;
+	newTokens_phi;
+	foreach start,dir,r2 | start in candidates
+			and dir in directions
+			and dir xor start eqv r2
+			and (not r2 in known)
+	   do begin
+		if r2=dest then done "combine";
+		put r2 in NewTokens;
+		put r2 in known;
+	      end;
+	if length(newTokens)=0 then return(PHI);
+      end;
+if level > PathMax then return(PHI);
+result_ {{dir,dest}};	! tail of path is: ...start :dir=dest;
+for level_level-2 step -1 until 0
+   do begin	! find the (an) element in previous level which ;
+		! points to start (must be one).;
+	foreach dest,dir | dest in path[level]
+			and dir in directions
+			and dir xor dest eqv start
+		do done;
+	! path is ...dest :dir=start...;
+	put start in result before 1;
+	put dir in result before 1;
+	start_dest;	! re-arrange;
+      end;
+return(result);
+end "make path list";
+procedure FindPath(string l; Integer PathMax);
+if PathMax leq 0 then print("What?? max <= zero??") else
+begin "findPaths"
+	itemvar start, dest;
+	list result, pieces;
+	let orelse=or;
+if any=(start_ TrueNameGet(l)) or punct=start
+orelse punct neq TrueNameGet(l)
+orelse any=(dest_ TrueNameGet(l)) or punct=dest
+ then begin print(" Ill-formed Plan "); return; end;
+result_ {{start}};
+  do  begin
+	if start=dest then continue;
+	if length(pieces_PathList(start, dest, pathMax))=0
+	 then begin
+		print(" Can't reach ", dest );
+		if length(result) < 2 then return;
+		print(" will show partial path.", crlf);
+		done;
+	      end;
+	result_ result & pieces;
+	start_ dest;
+      end
+ until punct neq TrueNameGet(l)
+orelse any=(dest_ TrueNameGet(l)) or punct=dest;
+if length(l) then print(" leftover commands: `", l, "'.");
+if length(result) < 2
+ then begin print(" Just don't move from ", start); return end;
+
+print(crlf, length(result) ash -1, " Steps from: ");
+roomP( lop(result), verbosity land toRoomBit );
+while length(result)
+   do begin
+	print( if verbosity land toRoomBit then crlf&":" else ":",
+		lop(result), "=" );
+	roomP( lop(result), verbosity land toRoomBit );
+      end;
+end "findPaths";
+itemvar home;	! the item for home associations;
+
+procedure setsto;
+begin
+	boolean flag;
+home_cvsi( "H", flag ); 
+while flag 
+   do begin 
+	print(crlf, "Cannot find home direction, please name it: ");
+	home_cvsi( inchwl, flag ); 
+      end;
+end;
+set obj,rms,homes;
+
+simple procedure insureVbls;
+begin	own string wascalled;
+if length(wascalled)=0
+ then begin
+	setsto;
+	wascalled_ cvs(length(rms));
+      end;
+obj_ home ASSOC any;
+homes_ home XOR any;
+rms_ rooms - obj;
+end;
+simple string procedure repeats(string s; integer desiredLength);
+if desiredLength leq 0 then return(null) else
+begin
+if length(s)=0 then s_ '40;	! a space;
+while length(s)<desiredLength 
+   do s_ s & (s[1 for desiredLength-length(s)]);
+return(s[1 for desiredLength]);
+end;
+
+
+simple string procedure rJust(string s; integer len;
+					string padding("           "));
+return( repeats(padding,len-length(s)) & s );
+
+
+simple string procedure padStr(string s; integer len;
+					string padding("           "));
+return( s & repeats(padding,len-length(s)) );
+
+
+simple string procedure center(string toCenter; integer len;
+					string padding("           "));
+begin	integer padLen;
+if length(toCenter) geq len then return(toCenter);
+padLen_ (len - length(toCenter)) ash -1;
+return( padStr( rJust(toCenter,padLen+length(toCenter)), len ) );
+end;
+integer numLines; string array box[-1:20];
+integer simple procedure boxlens(integer low,top);
+begin integer mx,i; mx_0; 
+for i_low step 1 until top do mx_mx max length(box[i]);
+return(mx);
+end;
+
+
+string procedure destStr(set dests; itemvar src);
+if length(dests)=0 then return("-")
+ else begin string res;
+	if src in dests
+	 then begin res_"*"; remove src from dests; end
+	 else res_ cvis(lop(dests),!skip!); 
+	while length(dests) do res_res & "," & cvis(lop(dests),!skip!);
+	return(res);
+      end;
+
+integer procedure MapBox(string itemvar room);
+if typeit(room) neq 3 then return(0) else
+begin	integer lead, len, i;
+	set zset, contents;
+	itemvar n,s,e,w,u,d, ne,nw,se,sw, z;
+  begin	item zz;	! fake direction without associations;
+	boolean flag;	! to determine whether a direction exists;
+   forlc dir=(N,S,E,W,U,D,NE,NW,SE,SW,Z)
+     doc { dir_cvsi(cvps(dir),flag); 
+	   if flag 
+	     then begin print(crlf, "Cannot find dir "); dir_zz end;
+	 } endc
+  end;
+
+arrclr(box);
+
+! first the left edge: ;
+box[0]_ "NW:" & destStr(nw xor room, room); 
+box[1]_ " U:" & destStr(u xor room, room); 
+box[2]_ " W:" & destStr( room, room); 
+zset_ z xor room;
+if length(zset)
+ then box[3]_ (if length(zset)=1 then " Z:" else "z1:") 
+	& destStr({lop(zset)},room);
+box[4]_ "SW:" & destStr(sw xor room, room); 
+lead_boxLens(0,4);
+for i_ 0 step 1 until 4 do box[i]_ padStr(box[i],lead);
+
+! now the middle: ;
+box[5]_ "N:" & destStr(n xor room, room); 
+box[6]_ datum(room);
+box[7]_ cvis(room,!skip!);
+box[9]_ "S:" & destStr(s xor room, room); 
+len_boxLens(5,9);
+contents_ home assoc room;
+len_ len + 4;
+for i_ 0 step 1 until 4 do box[i]_ box[i] & center(box[i+5],len);
+
+! now the right edge: ;
+box[0]_ box[0] & "NE:" & destStr(NE xor room, room); 
+box[1]_ box[1] & " D:" & destStr(d xor room, room); 
+box[2]_ box[2] & " E:" & destStr(e xor room, room); 
+if length(zset) then box[3]_ box[3] & "Z2:" & destStr(zset, room);
+box[4]_ box[4] & "SE:" & destStr(se xor room, room); 
+
+return( boxLens(0,numLines_4) );
+end;
+procedure placeObjects;
+begin	itemvar room, thing;
+	set	cont, nonHome;
+
+insureVbls;
+nonHome_ directions-{home};
+foreach room|room in homes do begin
+	print(crlf); roomP(room,-1);
+	cont_ home assoc room;
+	foreach thing | thing in cont 
+	   do begin 	itemvar dir, dest;
+		print(crlf&tab); 
+		roomP(thing,-1); 
+		foreach dir,dest 
+		| dir in nonHome and dir xor thing eqv dest
+		   do print("  ", dir, ":", dest );
+	      end;
+      end;
+end;
+Boolean BoxIt;	! true to surround map elements with lines;
+simple procedure changeBox(integer changeCode);	! 0=flip, -1=on,1=off;
+    print( "Boxing now ", 
+	if (boxIt_ if changeCode=0 then not boxIt else (changeCode < 0))
+	 then "ON." else "OFF.");
+
+procedure moreRooms(itemvar room);
+begin	integer i;
+	own safe string array lBuf[-1:20];
+	own integer validLines, ValidChars, newChars;
+if room=ANY and validChars=0 then return;
+newChars_ if room = ANY then 0 else mapBox(room);
+if validChars>0 and validChars+newChars+5 > 75  or  room=any
+ then begin
+	print(crlf);
+	for i_ 0 step 1 until validLines do print(crlf,lbuf[i]);
+	print(crlf);
+	arrclr(lbuf);
+	validLines_ validChars_ 0;
+      end;
+if newChars=0 then return;
+if BoxIt
+ then begin
+	newChars_ newChars + 1;
+	for i_ numlines step -1 until 0
+	 do box[i+1]_ padStr( "|" & box[i], newChars ) & "|";
+	newChars_ newChars + 1;
+	box[0]_ repeats("-----------------------------", newChars);
+	box[numlines_ numlines +2]_ box[0];
+      end;
+if validChars=0
+ then begin arrtran(lbuf,box); 
+	validLines_numLines; validChars_ newChars;
+      end
+ else begin
+	for i_ validLines+1 step 1 until numLines do lbuf[i]_null;
+	validLines_ validLines MAX numLines;
+	validChars_ validChars+5;
+	for i_ 0 step 1 until numLines
+	   do lbuf[i]_ padStr(lbuf[i],validChars) & box[i];
+	validChars_ validChars + newChars;
+      end;
+end;
+
+
+procedure mapAll;
+begin	itemvar room;
+insureVbls; 
+foreach room | room in rms do moreRooms(room);
+moreRooms(ANY);
+end;
+
+procedure showRoomMap(string l);
+begin	itemvar room;
+insureVbls; 
+if any=(room_ trueNameGet(l)) or punct=room
+ then begin print("Cannot find room. "); return; end;
+moreRooms(room);
+while length(l) and punct=(room_trueNameGet(l))
+and length(l) and any neq (room_trueNameGet(l)) and room neq punct
+   do moreRooms(room);
+moreRooms(ANY);
+end;
+boolean procedure find(reference itemvar result; string line);
+begin	string formal;
+result_ cvsi(line,!skip!); if !skip!=0 then return(true);
+formal_ scans(line,toWhite);
+while length(line_ scanTail(line,eatWhite))
+   do formal_ formal & spc & scans(line,toWhite);
+result_ cvsi(formal,!skip!);
+if !skip! then result_ cvsi(line_upper(formal),!skip!);
+if !skip! then result_ cvsi(scans(formal,noWhite),!skip!);
+if !skip! then result_ cvsi(scans(line,noWhite),!skip!);
+return(!skip!=0);
+end;
+procedure setTriple(boolean addIt);
+begin	itemvar a,b,c; string nam; boolean flag;
+print( " A(B)=C , A: " );
+if any neq (a_cvsi(nam_inchwl,flag)) or flag=false
+ then begin print(" B: ");
+	if any neq (b_cvsi(nam_inchwl,flag)) or flag=false
+	 then begin print(" C: ");
+		if any neq (c_cvsi(nam_inchwl,flag)) or flag=false
+		 then begin
+			if (a xor b eqv c) = addIt
+			 then print(" Sorry ", if addit then "already"
+					else "not", " a triple.")
+			 else if addit
+				 then make a xor b eqv c
+				 else erase a xor b eqv c;
+			return
+		      end;
+	      end;
+      end;
+print( " `", nam, "' is not an item!!");
+end;
+procedure changeName;
+begin	string token; itemvar iv,junk; boolean flag;
+print(" Rename (old name): " );
+iv_ cvsi(token_inchwl,flag);
+if flag
+ then print("No such thing as: `", token, "'." )
+ else begin
+	print(" to (new name): " );
+	junk_ cvsi(token_inchwl,flag);
+	if flag
+	 then begin
+		del!pname(iv);
+		new!pname(iv,token);
+	      end
+	 else print(" sorry `", junk, "' is in use as a name. ");
+      end;
+end;
+procedure hideOp;
+begin	integer leadch; string token,line; itemvar iv; set trn;
+print(" ", length(hidden), " rooms currently hidden: ", hidden,
+	crlf, " `-' to un-hide them all, `-room' to unhide one, " &
+	" or `room' to hide another room.", crlf, "-->");
+scan(line_inchwl, EatWhite, leadch);
+if "-"=leadch or "+"=leadch then scanS(line_line[2 to inf],Eatwhite);
+if length(line)=0
+ then begin if leadch="-" then hidden_phi; return; end;
+while length(line)
+   do begin
+	token_ scanOut(line, ToSep);
+	if find(iv,token)
+	 then begin
+		if length(trn_synonym xor iv)=0 then put iv in trn;
+		hidden_ if leadch="-"
+			 then hidden-trn else hidden union trn;
+	      end
+	 else print(" no `", token, "' found. ");
+      end;
+end;
+procedure ProcessCommands;
+while true do
+begin "ProcessCommands"
+		string line,tk;
+		own integer pathmax, searchMax;
+		itemvar room;
+		item pend,quit,dump,size,hide;
+		item rename, make, erase, draw, objects;
+pathMax_ pathMax max 1; if searchMax leq 0 then searchMax_25;
+print(crlf&"->");
+scan( line_inchwl, EatWhite, !skip! );
+case line of begin
+ [0];
+ ["@"] changeBox( cvd(line[2 to inf]) );
+ ["*"] RoomLine(line[2 to inf]);
+ ["^"] PathMax_cvd(line[2 to inf]);
+ ["%"] SearchMax_cvd(line[2 to inf]);
+ ["+"] Path(scantail(line[2 to inf],EatWhite),true);
+ ["-"] Path(scantail(line[2 to inf],EatWhite),false);
+ ["<"] LeadsFrom(scantail(line[2 to inf],EatWhite),PathMax);
+ [">"] LeadsTo(scantail(line[2 to inf],EatWhite),PathMax);
+ ["#"] ShowRoomMap(scanTail(line[2 to inf],EatWhite));
+ ["."] FindPath(scantail(line[2 to inf],EatWhite),SearchMax);
+ ["|"] verbosity_verbosity xor intscan(line,!skip!);
+ ["?"] print(crlf, "`* room-line' to add a new room,",
+	crlf, "`^ number' sets pathMax (for `<' and `>'),",
+	crlf, "`% number' sets searchMax, ",
+	crlf, "`| number' switches verbosity settings (1+2),",
+	crlf, "`@ number' boxing mode on maps (0=flip, -1=ON, 1=OFF),",
+	crlf, "`> room' shows rooms it leads to,",
+	crlf, "`< room' shows rooms leading to it,",
+	crlf, "`# room' Produces a room drawing for that room,",
+	crlf, "`. room1:room2' to find a path from room1 to room2,",
+	crlf, "`+ room:dir=room' to add a new path",
+	crlf, "`- room:dir=room' to remove an old path,",
+	crlf, "`DUMP' to save map,",
+	crlf, "`PEND' to list rooms accessed but undefined,",
+	crlf, "`HIDE' to move rooms to and from the hidden set,",
+	crlf, "`SIZE' to jist number of stored objects,",
+	crlf, "`MAKE' to make an arbitrary triple association,",
+	crlf, "`ERASE' to erase an arbitrary triple association,",
+	crlf, "`RENAME' to change the name of an item,",
+	crlf, "`OBJECTS' to list all objects and their homes,",
+	crlf, "`DRAW' to draw map pieces for all rooms,",
+	crlf, "Or `QUIT' to exit.");
+ ELSE if find( room, line )
+    then case cvn(room) of begin
+	[cvn(MAKE)] setTriple(true);
+	[cvn(ERASE)] setTriple(false);
+	[cvn(RENAME)] changeName;
+	[cvn(DUMP)] dumpMap;
+	[cvn(PEND)] print( "Unspecified rooms: ", pendingRooms );
+	[cvn(HIDE)] hideOp;
+	[cvn(SIZE)] begin
+			insureVbls;
+			print( " Rooms: ", length(rms),
+			", Objects: ", length(obj), " (in ", 
+				length(homes), " places)" &
+			", Directions: ", length(directions),
+			", Hidden: ", length(hidden) );
+		    end;
+	[cvn(DRAW)] mapall;
+	[cvn(OBJECTS)] placeObjects;
+	[cvn(QUIT)] done;
+	 ELSE begin	itemvar iv;
+		print(" Associations: XOR: ");
+		foreach iv | iv xor room eqv any
+		   do print(crlf, iv, "(", room, ")=", iv xor room );
+		print(crlf,"---- ASSOC:");
+		foreach iv | iv xor any eqv room
+		   do print(crlf, iv, "(", iv assoc room, ")=", room );
+		print(crlf,"---- EQV:");
+		foreach iv | room xor iv eqv any
+		   do print(crlf, room, "(", iv, ")=", room xor iv );
+	      end
+	end
+    else print("Try a `?'.")
+ end;
+end "ProcessCommands";
+itemvar abr;
+string line;
+external integer jobver;
+
+print(crlf,"Mapper version ", cvos(jobver), crlf, "Source: ");
+TENX({ setinput( inp_openfile(null,"RO"), 200, brk_0, eof_false ); })
+T10({	open( inp_getchan, "DSK",0, 4,0, 200, brk_0, eof_false );
+	if eof then Fatal("No Disk Input today!");
+	lookup( inp, inchwl, eof );
+	while eof
+	   do begin
+		print(" Sorry, try again: ");
+		lookup( inp, inchwl, eof_ false );
+	      end;
+})
+
+getDirections;
+
+pendingRooms_phi;
+while length(Line_ReadLine) do RoomLine(line);
+if length(pendingRooms)
+ then print(crlf,
+	"Warning, the following rooms have not been specified: ", crlf,
+	pendingRooms );
+
+release(inp);
+
+print( crlf );
+
+ProcessCommands;
+End "Zork Compressor" $$
+
+
+   n Û
