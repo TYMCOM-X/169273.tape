@@ -1,0 +1,392 @@
+BEGIN "CHGXGP"
+REQUIRE "[][]" DELIMITERS;
+DEFINE !=[COMMENT],SUPERCOMMENT(A)=[];
+
+! Standard CUSP command string, i.e.,
+  *output_input/switch/switch(switches)
+  Default extension for both output and input is .XGP. Switches are:
+	/nC	number of columns (default 2)
+	/nH	number of lines in title area at top of page (default 3)
+	/nL	1000*(column position of column 1 for even page) +
+		     (column position of column 1 for odd page)
+		(default 186206. 186 on even, 206 on odd)
+	/nR	1000*(column position of column 2 for even page) +
+		     (column position of column 2 for odd page)
+		(default 890910. 890 on even, 910 on odd)
+	/nO	move bars  n  pixels into the margin (default 16)
+	/nW	make bars  n  pixels wide (default 7).
+  Will read from TMPCOR file CHG if started in PRG mode.  Recognizes
+  exclamation point "!" as command to switch to another processor.
+
+  This program reads a specially-prepared .XGP file and produces another
+  .XGP file with "change bars" in the margins.  The changes are marked in
+  the input as text in a zero-height (and zero-width) font, thus sneaking
+  by PUB and XGPSER.  The input markings are decoded and changed into XGPSER
+  vector commands.
+
+  The changes are marked by font selects to any font which has zero height.
+  If the height of font 14 is zero, then a mark looks like
+
+	<FONT=14><colon><change #><comma><FONT=something else><changed text>
+	<FONT=14><colon><change #><semicolon><FONT=something else>
+
+  There are flags at both the begining and end of a change because two-column
+  format makes life non-trivial.
+
+  It is necessary to retain nulls (ASCII 000) when calling INPUT, because
+  some XGP escape sequences have data bytes which are 2 and 3 characters
+  long.  Hence mode "Z" in the SETBREAKs.
+
+  Be sure that the first page of the document (page 2 of the XGP file) has
+  an odd page number, and that the pages alternate odd/even throughout.
+  i.e., if portions are numbered non-consecutively then this program will
+  probably screw up.  It could be hacked to heuristically determine the page
+  number, but that was too much work.
+
+  See PUBMAC[DOC,JFR] and DOC.PUB[DOC,JFR] for the macros REV, ENDREV and
+  font 00.FNT[DOC,JFR].
+;
+
+DEFINE SRCMODE=[0],LSTMODE=[0],RELMODE=[0],
+	SRCEXT=["XGP"],LSTEXT=["XGP"],RELEXT=["XGP"],
+	PROCESSOR=["CHGXGP"],SWTSIZ=[6],GOODSWT=["CHLROW"];
+REQUIRE "SCNCMD.SAI[S,AIL]" SOURCE!FILE;
+
+DEFINE CR=['15],LF=['12],FF=['14],BS=['177],LFTAB=[1],FFTAB=[2],BSTAB=[3];
+DEFINE SEMI=[";"],COMMA=[","];
+
+RECORD!CLASS LINE(STRING TEXT; INTEGER HEIGHT; RECORD!POINTER(LINE)NEXT,PREV);
+RECORD!CLASS MARK(INTEGER X0,Y0,X1,Y1,CHG#;
+		RECORD!POINTER(LINE)L0,L1;
+		RECORD!POINTER(MARK)NEXT,PREV);
+EXTERNAL RECORD!POINTER(ANY!CLASS) PROCEDURE $REC$(INTEGER OP;
+					RECORD!POINTER(ANY!CLASS) R);
+
+RECORD!POINTER(LINE) FIRSTL,LASTL,FIRSTTEXTLINE;
+RECORD!POINTER(MARK) MARKLIST;
+RECORD!POINTER(ANY!CLASS) Q,QA;
+
+STRING A,L;
+INTEGER I,J,X0,Y0,CODE,LINEHEIGHT,DY,XV0,YV0,COLUMN,
+	Y0MAX,FONT,Y0AFTERHEADING,
+XLINE,		! XGP inter-line spaceing;
+NCOL,		! number of columns per page (1 or 2, default 2);
+TMAR,		! XGP scan lines between top of paper and first line, default 200;
+NHDRLIN,	! number of lines in title area at top of page (default 3);
+PAGE,		! printed page number. Only matters whether parity is correct;
+ODDCOLUMN1,	! XGP pixel column of column1 on odd page (default 206);
+EVENCOLUMN1,	! XGP pixel column of column1 on even page (default 186);
+ODDCOLUMN2,	! XGP pixel column of column2 on odd page (default 910);
+EVENCOLUMN2,	! XGP pixel column of column2 on even page (default 890);
+W,		! width of bars in pixels;
+OFFSET;		! move bar this far into the margin;
+
+INTEGER ARRAY HEIGHT[0:'17];	! HEIGHT OF FONT;
+
+SIMPLE PROCEDURE EAT(INTEGER N);
+L_L[N+1 TO INF]; ! REMOVE FIRST N CHARACTERS FROM L;
+
+SIMPLE PROCEDURE ERR(STRING T);
+USERERR(0,1,T);
+
+! XGPCOMMANDS NORMCOL NEWMARK CHGBAR DELMARK COLUMN1 COLUMN2;
+
+PROCEDURE XGPCOMMANDS; BEGIN "XGPCOM"
+! Read first page of .XGP file and pick up fonts, XLINE, TMAR;
+INTEGER XGPTAB;	! Breaktable number;
+INTEGER FN,EXT,PPN,CH,D; STRING FILE;
+STRING COMMAND;
+TMAR_200;	! Assume this unless overridden. Getting it from system is hairy;
+XGPTAB_GETBREAK; SETBREAK(XGPTAB,"=#/"&FF,0,"INKS");
+SRCBRK_0; COMMAND_NULL;
+WHILE SRCBRK NEQ FF DO BEGIN "XGPLUP"
+  COMMAND_INPUT(SRC,XGPTAB); OUT(BIN,COMMAND&SRCBRK);
+  IF LENGTH(COMMAND)=0 THEN CONTINUE "XGPLUP";
+  IF EQU("XLINE",COMMAND[1 FOR 5]) THEN BEGIN
+    OUT(BIN,CVS(XLINE_INTIN(SRC))); CONTINUE "XGPLUP" END;
+  IF EQU("FONT",COMMAND[1 FOR 4]) THEN BEGIN
+    OUT(BIN,CVS(FONT_INTIN(SRC))); OUT(BIN,INPUT(SRC,XGPTAB)&SRCBRK); ! Ignore "=";
+    OUT(BIN,(FILE_INPUT(SRC,XGPTAB))&SRCBRK);  FN_CVFIL(FILE,EXT,PPN);
+    IF EXT=0 THEN EXT_CVSIX("FNT"); IF PPN=0 THEN PPN_CVSIX("XGPSYS");
+    FILE_CV6STR(FN)&"."&CV6STR(EXT)&"["&CV6STR(PPN)[1 TO 3]&","&CV6STR(PPN)[4 TO 6]&"]";
+    CH_GETCHAN; D_0; OPEN(CH,"DSK",'14,2,0,D,D,D); IF D THEN ERR("No DSK today.");
+    LOOKUP(CH,FILE,D); IF D THEN ERR("Cannot find "&FILE);
+    USETI(CH,2);	! Fast way to skip '200 words;
+    WORDIN(CH); HEIGHT[FONT]_WORDIN(CH); RELEASE(CH); CONTINUE "XGPLUP" END;
+  IF EQU("TMAR",COMMAND[1 FOR 4]) THEN BEGIN
+    OUT(BIN,CVS(TMAR_INTIN(SRC))); CONTINUE "XGPLUP" END;
+END "XGPLUP";
+RELBREAK(XGPTAB);
+END "XGPCOM";
+
+
+RECORD!POINTER(MARK) PROCEDURE NEWMARK
+	(INTEGER X0,Y0,X1,Y1,CHG#; RECORD!POINTER(LINE) L0,L1);
+BEGIN "NEWMARK"
+! Get a new record, initialize its fields, link it into MARKLIST;
+  Q_NEW!RECORD(MARK);
+  MARK:X0[Q]_X0; MARK:Y0[Q]_Y0; MARK:CHG#[Q]_CHG#; MARK:L0[Q]_L0;
+  MARK:X1[Q]_X1; MARK:Y1[Q]_Y1;			   MARK:L1[Q]_L1;
+! Put new record on end of MARKLIST;
+  IF MARKLIST=NULL!RECORD THEN MARKLIST_Q
+  ELSE BEGIN RECORD!POINTER(MARK)LM;
+    LM_MARKLIST; WHILE MARK:NEXT[LM] NEQ NULL!RECORD DO LM_MARK:NEXT[LM];
+    MARK:NEXT[LM]_Q; MARK:PREV[Q]_LM;
+  END;
+RETURN(Q) END "NEWMARK";
+  
+
+PROCEDURE CHGBAR(RECORD!POINTER(LINE)Q; INTEGER Y0,X0,N);
+BEGIN "CHGBAR"
+! Add the XGPSER escape sequence for a vector to the begining of the text at line Q;
+X0_X0-OFFSET;	! Move it out into the margin;
+N_N+XLINE;	! So that consecutive vectors overlap;
+LINE:TEXT[Q]_
+    (BS&4)&
+    (Y0 LSH -7)&(Y0 LAND '177)&
+    (X0 LSH -7)&(X0 LAND '177)&
+    (0&0&0)&
+    (N LSH -7)&(N LAND '177)&
+    (W LSH -7)&(W LAND '177)&
+    LINE:TEXT[Q];
+END "CHGBAR";
+
+PROCEDURE DELMARK(RECORD!POINTER(MARK) Q);
+BEGIN RECORD!POINTER(MARK)Q1,Q2;
+Q1_MARK:PREV[Q]; Q2_MARK:NEXT[Q];
+IF Q1 NEQ NULL!RECORD THEN MARK:NEXT[Q1]_Q2;
+IF Q2 NEQ NULL!RECORD THEN MARK:PREV[Q2]_Q1;
+IF MARKLIST=Q THEN MARKLIST_Q2 END;
+
+
+SIMPLE INTEGER PROCEDURE COLUMN1;
+RETURN(IF PAGE LAND 1 THEN ODDCOLUMN1 ELSE EVENCOLUMN1);
+
+
+SIMPLE INTEGER PROCEDURE COLUMN2;
+RETURN(IF PAGE LAND 1 THEN ODDCOLUMN2 ELSE EVENCOLUMN2);
+
+
+SIMPLE INTEGER PROCEDURE NORMCOL(INTEGER COLUMN);BEGIN
+INTEGER C2;
+RETURN(IF (C2_COLUMN2) leq COLUMN THEN C2 ELSE COLUMN1); END;
+! DOLINE;
+
+PROCEDURE DOLINE;
+BEGIN "DOLINE"
+  STRING DLSTR;
+  WHILE LENGTH(L) NEQ 0 DO BEGIN "LINE"
+    DLSTR_SCAN(L,BSTAB,SRCBRK); IF LENGTH(DLSTR)>1	! BS was appended to result;
+	THEN LINEHEIGHT_HEIGHT[FONT] MAX LINEHEIGHT;	! SOME TEXT CHARS;
+    IF SRCBRK=BS THEN BEGIN "XGPESC"
+      CODE_LOP(L);
+      CASE CODE OF BEGIN
+	[1] BEGIN "ESC1"
+	    CODE_LOP(L);
+	    IF CODE<'20 THEN BEGIN "FONTSELECT"
+	      ! Keep track of height of this line, so we can simulate XGPSER;
+	      FONT_CODE; LINEHEIGHT_HEIGHT[FONT] MAX LINEHEIGHT;
+	      IF HEIGHT[FONT]=0 THEN BEGIN "CHANGE"
+		J_LOP(L);     ! REMOVE COLON;
+		I_INTSCAN(L,SRCBRK);  ! GET CHANGE NUMBER;
+		J_LOP(L);     ! GET COMMA OR SEMI;
+		IF J=SEMI THEN BEGIN "CHGEND"
+		  Q_MARKLIST; WHILE Q NEQ NULL!RECORD AND MARK:CHG#[Q] NEQ I DO
+		    Q_MARK:NEXT[Q];
+		  IF Q=NULL!RECORD THEN Q_NEWMARK(0,0,0,0,I,NULL!RECORD,LASTL);
+		  MARK:X1[Q]_NORMCOL(COLUMN);
+		  MARK:Y1[Q]_Y0; MARK:L1[Q]_LASTL;
+		END "CHGEND"
+		ELSE IF J=COMMA THEN BEGIN "CHGBEG"
+		  Q_MARKLIST; WHILE Q NEQ NULL!RECORD AND MARK:CHG#[Q] NEQ I DO
+		    Q_MARK:NEXT[Q];
+		  IF Q=NULL!RECORD THEN Q_NEWMARK(0,0,0,0,I,LASTL,NULL!RECORD);
+		  MARK:X0[Q]_NORMCOL(COLUMN);
+		  MARK:Y0[Q]_Y0; MARK:L0[Q]_LASTL;
+		END "CHGBEG"
+		ELSE ERR("BAD CHARACTER AFTER CHANGE NUMBER");
+	      END "CHANGE";
+	      END "FONTSELECT"
+	    ELSE CASE CODE-'40 OF BEGIN "MISC1"
+	      ['40-'40] BEGIN "COLSEL"
+		      I_LOP(L); J_LOP(L); COLUMN_((I LSH 7)+J) LAND 4095;
+		      END "COLSEL";
+	      ['41-'40] "UNDERSCORE" EAT(3);
+	      ['42-'40] "LINE SPACE" Y0_(DY_LOP(L))+Y0;
+	      ['43-'40] "BASELINE ADJUST" BEGIN
+		      DY_LOP(L); DY_(DY LSH 29)ASH -29;
+		      LINEHEIGHT_ABS(DY)+LINEHEIGHT END;
+	      ['44-'40] "PRINT PAGE NUMBER" ;
+	      ['45-'40] "HEADING TEXT" ERR("CANT HANDLE XGP ESCAPE 1 '45");
+	      ['46-'40] "START UNDERLINE" ;
+	      ['47-'40] "STOP UNDERLINE" EAT(1);
+	      ['50-'40] "INTERCHAR SPACE" EAT(1);
+	      ['51-'40] "STOP UNDERLINE" EAT(2);
+	      ['52-'40] "REL BASELINE ADJUST" BEGIN
+		      DY_LOP(L); DY_(DY LSH 29)ASH -29;
+		      LINEHEIGHT_ABS(DY)+LINEHEIGHT END
+	    END "MISC1" END "ESC1";
+	[2] "XGP ESCAPE 2" EAT(1);
+	[3] BEGIN "SETY0" LINEHEIGHT_0; I_LOP(L); J_LOP(L);
+	      Y0_(I LSH 7)+J; END "SETY0";
+	[4] "VECTOR" EAT(11)
+      END;
+    END "XGPESC";
+  END "LINE";
+  IF LINEHEIGHT=0 ! NO FONT SELECTS THIS LINE. PROBABLY JUST CRLF;
+  THEN LINEHEIGHT_HEIGHT[FONT]; ! HEIGHT OF LAST FONT SELECTED;
+  LINE:HEIGHT[LASTL]_LINEHEIGHT;
+  Y0_Y0+LINEHEIGHT+XLINE; LINEHEIGHT_0;
+END "DOLINE";
+! LFLINE RECLINE GETPAGE DOPAGE;
+
+SIMPLE STRING PROCEDURE LFLINE; BEGIN
+LABEL LFAGAIN;
+! Return an XGP logical line (ends in CRLF, FF, or EOF);
+L_INPUT(SRC,LFTAB); IF SRCEOF OR (SRCBRK=FF AND LENGTH(L)=1) THEN RETURN(L);
+LFAGAIN: WHILE NOT(EQU(L[INF-1 FOR 2],CR&LF)) DO L_L&INPUT(SRC,LFTAB);
+IF L[INF-2 FOR 1]<5 AND L[INF-3 FOR 1]=BS THEN BEGIN
+  ! XGP escape sequence; L_L&INPUT(SRC,LFTAB); GOTO LFAGAIN END;
+RETURN(L) END;
+
+
+PROCEDURE RECLINE; BEGIN
+Q_NEW!RECORD(LINE); LINE:TEXT[Q]_L; LINE:PREV[Q]_LASTL;
+IF LASTL NEQ NULL!RECORD THEN LINE:NEXT[LASTL]_Q; LASTL_Q;
+IF FIRSTL=NULL!RECORD THEN FIRSTL_Q;
+END;
+
+
+INTEGER PROCEDURE GETPAGE;
+WHILE TRUE DO BEGIN
+  LFLINE;
+  IF SRCEOF THEN RETURN(FALSE);
+  IF SRCBRK=FF THEN RETURN(TRUE);
+  RECLINE;
+  DOLINE;
+END;
+
+
+PROCEDURE DOPAGE; BEGIN "DOPAGE"
+INTEGER I; RECORD!POINTER(ANY!CLASS) T;
+INTEGER X1,Y1,N,C1,C2,H0,H1; RECORD!POINTER(LINE) L0,L1;
+C1_COLUMN1; C2_COLUMN2;
+
+! Assume that the page number is the last line on the page, back up to the last
+  line of text area, and record Y0MAX as XGP coord of bottom of last text line;
+Y0MAX_Y0;	! initial estimate;
+Q_LASTL;
+DO BEGIN
+  Y0MAX_Y0MAX-LINE:HEIGHT[Q]-XLINE;
+  Q_LINE:PREV[Q] END
+UNTIL Q=NULL!RECORD OR LENGTH(LINE:TEXT[Q])>2;
+
+! Process the marks;
+Q_MARKLIST;
+WHILE Q NEQ NULL!RECORD DO BEGIN "DOMARK"
+  X0_MARK:X0[Q]; X1_MARK:X1[Q]; Y0_MARK:Y0[Q]; Y1_MARK:Y1[Q];
+  L0_MARK:L0[Q]; L1_MARK:L1[Q];
+  IF L0 NEQ NULL!RECORD THEN H0_LINE:HEIGHT[L0];
+  IF L1 NEQ NULL!RECORD THEN H1_LINE:HEIGHT[L1];
+  IF X0=X1 AND X0 NEQ 0 THEN BEGIN "SAMCOL"
+    ! All in the same column;
+    IF Y1<Y0 THEN ERR("BAD Y ORDER") ELSE
+    CHGBAR(L0,Y0,X0,Y1-Y0+H1);
+  END "SAMCOL" ELSE IF X0*X1 NEQ 0 THEN BEGIN "W12"
+    ! Simple wrap from C1 to C2;
+    IF X0 NEQ C1 OR X1 NEQ C2 THEN ERR("BAD X ORDER")
+    ELSE BEGIN
+      CHGBAR(L0,Y0,X0,Y0MAX-Y0); ! First column;
+      CHGBAR(FIRSTTEXTLINE,Y0AFTERHEADING,X1,Y1-Y0AFTERHEADING+H1);
+      ! Second column;
+    END;
+  END "W12" ELSE IF X0=0 THEN BEGIN "LEADIN"
+    ! Continues from previous page;
+    IF X1=0 THEN BEGIN
+      ! Whole page;
+      N_Y0MAX-Y0AFTERHEADING;
+      CHGBAR(FIRSTTEXTLINE,Y0AFTERHEADING,C1,N);
+      CHGBAR(FIRSTTEXTLINE,Y0AFTERHEADING,C2,N);
+      ! Mark still active;
+    END ELSE IF X1=C1 THEN BEGIN
+      CHGBAR(FIRSTTEXTLINE,Y0AFTERHEADING,X1,Y1-Y0AFTERHEADING+H1);
+    END ELSE IF X1=C2 THEN BEGIN
+      ! whole first column;
+      CHGBAR(FIRSTTEXTLINE,Y0AFTERHEADING,C1,Y0MAX-Y0AFTERHEADING);
+      ! partial second column;
+      CHGBAR(FIRSTTEXTLINE,Y0AFTERHEADING,C2,Y1-Y0AFTERHEADING+H1);
+    END ELSE BEGIN
+      ERR("BAD PAGE WRAP");
+    END;
+  END "LEADIN" ELSE IF X1=0 THEN BEGIN "LEADOUT"
+    ! continues onto next page;
+    CHGBAR(L0,Y0,X0,Y0MAX-Y0); ! column of mark start;
+    IF X0=C1 THEN ! second column, too;
+      CHGBAR(FIRSTTEXTLINE,Y0AFTERHEADING,C2,Y0-Y0AFTERHEADING);
+    MARK:X0[Q]_0; ! signal that next time we wrapped from previous page;
+  END "LEADOUT";
+
+  T_Q; Q_MARK:NEXT[Q]; IF X1 NEQ 0 THEN DELMARK(T);
+END "DOMARK";
+
+! Output all text for this page;
+WHILE FIRSTL NEQ NULL!RECORD DO BEGIN
+  OUT(BIN,LINE:TEXT[T_FIRSTL]); FIRSTL_LINE:NEXT[FIRSTL]; $REC$(5,T) END;
+LASTL_NULL!RECORD;
+OUT(BIN,FF); PAGE_PAGE+1; Y0_TMAR;
+PRINT(" ",PAGE);
+
+! Next page heading;
+FOR I_1 STEP 1 UNTIL NHDRLIN DO BEGIN L_LFLINE; RECLINE; DOLINE END;
+L_NULL; RECLINE; FIRSTTEXTLINE_Q;     ! Dummy line for recordkeeping purposes;
+Y0AFTERHEADING_Y0;
+END "DOPAGE";
+! EXECUTION;
+
+SETBREAK(LFTAB,LF&FF,NULL,"INAZ");
+SETBREAK(FFTAB,FF,NULL,"INAZ");
+SETBREAK(BSTAB,BS,NULL,"INAZ");
+
+ON!ETIME_0;	! GET COMMAND FILE;
+WHILE TRUE DO BEGIN "OUTER"
+  INTEGER J;
+  NX!TFIL_FALSE;	! RESTART COMMAND SCANNING;
+  WANTBIN_TRUE;		! BIN IS PRIMARY OUTPUT;
+  WANTLST_FALSE;
+  NCOL_2; NHDRLIN_3;
+  EVENCOLUMN1_186; EVENCOLUMN2_890;
+  ODDCOLUMN1 _206; ODDCOLUMN2 _910;
+  W_7; OFFSET_16;
+  COMMAND!SCAN;		! GET A COMMAND;
+  FOR I_1 STEP 1 UNTIL LENGTH(SWTSTR) DO BEGIN
+    J_GOODSWT[0+SWTSTR[I FOR 1] FOR 1];
+    IF J="C" THEN NCOL_SWTVAL[I];
+    IF J="H" THEN NHDRLIN_SWTVAL[I];
+    IF J="L" THEN BEGIN EVENCOLUMN1_SWTVAL[I]%1000; ODDCOLUMN1_SWTVAL[I] MOD 1000; END;
+    IF J="R" THEN BEGIN EVENCOLUMN2_SWTVAL[I]%1000; ODDCOLUMN2_SWTVAL[I] MOD 1000; END;
+    IF J="W" THEN W_SWTVAL[I];
+    IF J="O" THEN OFFSET_SWTVAL[I];
+  END;
+  IF NCOL=1 THEN PRINT("1 column, at ",EVENCOLUMN1," on even pages, ",
+	ODDCOLUMN1," on odd pages.");
+  IF NCOL=2 THEN PRINT("2 columns, at (",EVENCOLUMN1,",",EVENCOLUMN2,
+	") on even pages, (",
+	ODDCOLUMN1,",",ODDCOLUMN2,") on odd pages.  ");
+  PRINT(NHDRLIN," header lines.
+Bars ",W," pixels wide, ",OFFSET," pixels into the margin.
+");
+  IF NCOL<1 OR NCOL>2 THEN BEGIN
+    PRINT("/nC bad value; must be 1 or 2"); CONTINUE "OUTER" END;
+  IF NCOL=1 THEN EVENCOLUMN2_ODDCOLUMN2_1700;
+  IF EVENCOLUMN2<EVENCOLUMN1 OR ODDCOLUMN2<ODDCOLUMN1 THEN
+	BEGIN PRINT("Column coordinates bad."); CONTINUE "OUTER" END;
+  SOURCECOUNT_250;	! 250 CHARS PER LINE MAX;
+  XGPCOMMANDS;		! Get fonts, XLINE from first page;
+  PAGE_1;
+  Y0_TMAR;
+  WHILE TRUE DO IF GETPAGE THEN DOPAGE ELSE DONE;
+  RELEASE(BIN);
+END "OUTER";
+
+END "CHGXGP"
+   
