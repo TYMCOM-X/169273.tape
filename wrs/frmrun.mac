@@ -1,0 +1,363 @@
+	title	FRMRUN	utility routine to run program in child frame
+	subttl	preface - general declarations
+if1,<	printx	version 0.1 12/27/82	>
+
+	search	UUOSYM
+
+	ARGP==1		; argument pointer
+	F==2		; flags
+	FD==3		; child frame descriptor
+	T1==4		; temps
+	T2==T1+1
+	T3==T1+2
+	P1==T1+3
+	ifge P1-10,<printx ?too many registers defined>
+			; registers 10-17 must be preserved
+	P==17		; stack pointer
+
+	entry	FRMRUN
+
+FRMRUN:	; calling convention:
+	;	MOVEI	ARGP,[exp ARG1,ARG2,ARG3,ARG4,ARG5,ARG6]
+	;	PUSHJ	P,FRMRUN
+	; offsets into arg list:
+	PNAME==	0	; byte pointer to asciz program name
+	FLAGS==	1	; value of flags (see below)
+	  F.CCL==1	; start program at start+1
+	  F.NTTY==2	; do not pass TTY: to child
+	  F.NWAI==4	; do not wait for child to terminate
+	MERR==	2	; address to store monitor error code at
+	  E.NOER==^D000	; no errors detected
+			; note - this means child completed with an EXIT
+			; or if F.NWAI then child was successfully started
+	  E.HNHS==^D001	; child frame halted with no halt status (usually ^C)
+	  E.OPN== ^D002	; open failure for device DSK:
+	  E.ENT== ^D003	; enter failure for temp file (on disk)
+	  E.OUT== ^D004	; output error for temp file (on disk)
+	  E.GTAB==^D005	; gettab failed (frame probably vanished)
+	  E.HIBR==^D006	; HIBER failed, should never happen
+	  E.HS==^D10000	; halt status (child frame halted unexpectedly,
+			; halt class in eCCtt and type in eccTT)
+	  E.FO==^D20000	; FRMOP error code (a FRMOP failed, code in eXXXX)
+	  E.RT==^D30000	; RETACH error code (RETACH UUO failed, code in eXXXX)
+	PERR==	3	; address to store program error code at
+	TNAME==	4	; byte pointer to asciz temp disk name
+	TDATA==	5	; byte pointer to asciz temp disk data
+
+; This is the main body of code for FRMRUN.  Routines called from
+; this level:
+;   must preserve F, FD and the "sacred" registers
+;   must skip-return on success
+;   must store appropriate code in MERR(ARGP) and N-S-return on error
+;
+	MOVE	F,FLAGS(ARGP)	; keep flags in register F
+	PUSHJ	P,CREFRM	; create frame FD/ frame descriptor
+	 POPJ	P,		;  can't create frame, return
+	SKIPN	TNAME(ARGP)	; if temp disk name not specified,
+	 JRST	GTTY		;  then don't write temp file
+	PUSHJ	P,WTF		; write temp disk for child
+	 JRST	ABTK		;  can't write file, cleanup and return
+GTTY:	TRNE	F,F.NTTY	; if not to pass TTY,
+	 JRST	GPRG		;  then don't retach
+	PUSHJ	P,GIVTTY	; give TTY to child frame
+	 JRST	ABTK
+GPRG:	PUSHJ	P,GETPRG	; get program in child
+	 JRST	ABTT
+	PUSHJ	P,STARTC	; start child frame
+	 JRST	ABTC
+	TRNE	F,F.NWAI	; if not to wait for termination,
+	 POPJ	P,		;  all done, return
+	PUSHJ	P,FWAIT		; wait for child frame to halt
+	 JFCL			;  timeout
+	PUSHJ	P,CHKSTS	; check child termination status
+	 JFCL
+ABTC:	PUSHJ	P,CLRFRM	; clear child frame (to get write right)
+	 JFCL
+ABTT:	TRNE	F,F.NTTY	; if TTY wasn't passed,
+	 JRST	ABTK		;  don't try to get it back
+	PUSHJ	P,TAKTTY	; get TTY back from child
+	 JFCL
+ABTK:	PUSHJ	P,KILFRM	; kill child frame	
+	 JFCL
+	POPJ	P,
+	
+	subttl	frame manipulation routines
+
+
+	HSBLEN==7
+array	FRMHSB[HSBLEN+1]	; halt status block
+intern	FRMHSB			; may be referenced by nosey program
+
+CREFRM:	; create frame
+	MOVSI	T1,.FOCFM
+	FRMOP	T1,[0]		; default all parameters
+	 JRST	FOERR
+	MOVEM	T1,FD		; save frame descriptor
+	MOVE	T1,[400,,1]	; wait for child to halt or 1 mS
+	HIBER	T1,		; to clear "child halted" condition
+	 JFCL
+	MOVEI	T1,HSBLEN
+	MOVEM	T1,FRMHSB	; setup HSB length count
+	MOVE	T1,FD
+	HRLI	T1,.FOHST
+	FRMOP	T1,FRMHSB	; read initial halt status
+	 JRST	FOERR
+	AOS	(P)		; skip return
+	POPJ	P,
+
+GETPRG:	; get program in child frame
+	MOVE	P1,PNAME(ARGP)	; byte pointer to program name
+	TLNN	P1,-1		; if null left half,
+	 HRLI	P1,(point 7,0)	;  supply default pointer
+	PUSHJ	P,PARSE		; parse name into GETARG block
+	MOVE	T1,FD		; child frame descriptor
+	HRLI	T1,.FOGET
+	FRMOP	T1,GETARG	; do the get
+	 JRST	FOERR
+	PUSHJ	P,FWAIT		; wait
+	 POPJ	P,
+	MOVE	T1,FRMHSB+1	; get CLASS,,TYPE
+	CAME	T1,[HC.EXI,,HT.JSU]
+	 JRST	HSERR
+	AOS	(P)		; skip return
+	POPJ	P,
+
+STARTC:	; here to start child frame following GET
+	HRREI	T2,SV.NSA	; normal start address
+	TRNE	F,F.CCL		; user request CCL start?
+	 HRREI	T2,SV.CCL	; then use that vector
+	MOVE	T1,FD
+	HRLI	T1,.FOSVA
+	FRMOP	T1,T2		; start at vector address
+	 JRST	FOERR
+	AOS	(P)
+	POPJ	P,
+
+CLRFRM:	; clear child frame
+	MOVE	T1,FD
+	HRLI	T1,.FOCLR
+	FRMOP	T1,		; request child to clear
+	 JRST	FOERR
+	PUSHJ	P,FWAIT		; wait for frame to clear
+	 POPJ	P,
+	AOS	(P)
+	POPJ	P,
+
+KILFRM:	; terminate the child frame
+	MOVE	T1,FD
+	HRLI	T1,.FORUN
+	FRMOP	T1,[
+		1,,3
+		sixbit	"SYS"
+		0
+		sixbit	"LOGOUT" ]
+	 JRST	FOERR
+	AOS	(P)
+	POPJ	P,
+	
+
+FWAIT:	; here to wait for child to halt
+	; takes skip-return if no error
+	MOVSI	T1,400		; wait for child frame to halt
+	HIBER	T1,
+	 JRST	[MOVEI	T1,E.HIBR
+		MOVEM	T1,MERR(ARGP)
+		POPJ	P,]
+	MOVS	T1,FD
+	HRRI	T1,.GTSTS
+	GETTAB	T1,		; get child's run state
+	 JRST	[MOVEI	T1,E.GTAB
+		MOVEM	T1,MERR(ARGP)
+		POPJ	P,]
+	JUMPL	T1,FWAIT	; try again - still running
+	MOVE	T2,FRMHSB+2	; get old halt count
+	MOVE	T1,FD
+	HRLI	T1,.FOHST
+	FRMOP	T1,FRMHSB	; read halt status
+	 JRST	FOERR
+	CAMN	T2,FRMHSB+2	; did count increment?
+	 SETOM	FRMHSB+1	; set CLASS,,TYPE = -1 for ^C (assumed)
+	AOS	(P)		; non-error return
+	POPJ	P,		; T1 < 0 if frame didn't halt yet
+
+CHKSTS:	; check termination status of child frame
+	MOVE	T1,FRMHSB+1	; get CLASS,,TYPE
+	CAMN	T1,[-1]		; ^C
+	 JRST	[MOVEI	T1,E.HNHS
+		MOVEM	T1,MERR(ARGP)
+		POPJ	P,]
+	CAMN	T1,[HC.EXI,,HT.EXI]
+	 JRST	CHKST1
+	CAMN	T1,[HC.EXI,,HT.EX1]
+	 JRST	CHKST1
+	CAMN	T1,[HC.EXI,,HT.FEX]
+	 JRST	[MOVE	T2,FRMHSB+6
+		MOVEM	T2,PERR(ARGP)
+		JRST	.+1]
+HSERR:	; save error code from HSB in 1CCTT format in MERR(ARGP)
+	HRRZM	T1,T2		; T2/ TT
+	HLRZ	T1,T1		; T1/ CC
+	IMULI	T1,^D100	; T1/ CC00
+	ADD	T1,T2		; T1/ CCTT
+	ADDI	T1,E.HS		; add in tag for halt status error code
+	MOVEM	T1,MERR(ARGP)
+	POPJ	P,
+CHKST1:	SETZM	MERR(ARGP)	; normal termination - no errors
+	SETZM	PERR(ARGP)
+	AOS	(P)
+	POPJ	P,
+	
+FOERR:	; here to return FRMOP error code from T1 and non-skip return
+	ADDI	T1,E.FO		; add tag to frmop error code
+	MOVEM	T1,MERR(ARGP)	; return error code
+	POPJ P,			; non-skip return
+
+	subttl	terminal manipulation routines
+
+GIVTTY:	; pass TTY to child frame
+	HRRO	T1,FD		; source,,target
+	HRLOI	T2,(3B2)	; user mode,,cmd port
+	JRST	TTYMOV
+
+TAKTTY:	; take TTY from child frame
+	HRLO	T1,FD		; source,,target
+	HRLOI	T2,0		; saved mode,,cmd port
+TTYMOV:	MOVEI	T3,T1
+	RETACH	T3,
+	 JRST	[ADDI	T3,E.RT	; tag for RETACH error code
+		MOVEM	T3,MERR(ARGP)
+		POPJ	P,]
+	AOS	(P)
+	POPJ	P,
+	subttl	file name manipulation routines
+
+array	GETARG[10]		; argument block
+GETCNT=	GETARG+0		; .FOGET block count (5)
+GETDEV=	GETARG+1		; .FOGET device name
+LOKCNT=	GETARG+1		; lookup block count (3)
+GETPPN=	GETARG+2		; PPN
+LOKPPN=	GETPPN
+GETNAM=	GETARG+3		; name
+LOKNAM=	GETNAM
+GETEXT=	GETARG+4		; extension
+LOKEXT=	GETEXT
+GETLIC=	GETARG+5		; license
+GETUNM=	GETARG+6		; user name (2 words)
+
+PARSE:	; parse argument from byte pointer in P1 into GETARG
+	MOVEI	T1,5		; number of args to .FOGET
+	MOVEM	T1,GETCNT
+	MOVSI	T2,(sixbit "DSK")
+	MOVEM	T2,GETDEV	; default device name
+	SETZM	GETPPN		; default PPN, etc...
+	SETZM	GETEXT
+	SETZM	GETLIC
+	SETZM	GETUNM
+	SETZM	GETUNM+1
+PARS1:	MOVE	T1,[point 6,GETNAM]
+	MOVEI	T2,^D6
+	SETZM	GETNAM
+PARS2:	ILDB	T3,P1		; get next character
+	CAIL	T3,140		; convert case
+	  SUBI	T3,40
+	CAIN	T3,"("		; check for start of username
+	  JRST	[MOVE	T1,[point 6,GETUNM]
+		MOVEI	T2,^D12
+		SETZM	GETUNM
+		SETZM	GETUNM+1
+		JRST	PARS2]
+	CAIN	T3,")"		; check for end of username (start filename)
+	  JRST	[MOVEI	T1,GETUNM
+		MOVEM	T1,GETPPN
+		JRST	PARS1]
+	CAIN	T3,":"		; check for end of device (start filename)
+	  JRST	[MOVE	T1,GETNAM
+		MOVEM	T1,GETDEV
+		JRST	PARS1]
+	CAIN	T3,"."		; check for extension
+	  JRST	[MOVE	T1,[	point 6,GETEXT]
+		MOVEI	T2,^D3
+		SETZM	GETEXT
+		JRST	PARS2]
+	CAIN	T3,"["		; check for start of PPN
+	  JRST	PARS3		; get PPN
+	SUBI	T3,40		; convert to sixbit
+	JUMPL	T3,[POPJ P,]	; return on any control char or null
+	JUMPE	T3,PARS2	; ignore blanks
+	SOJL	T2,PARS2	; check count - ignore extras
+	IDPB	T3,T1		; store sixbit character
+	JRST	PARS2
+PARS3:	SETZ	T1,		; accumulator
+	ILDB	T3,P1		; get character
+	CAIGE	T3,40		; check for end
+	  POPJ	P,		; return
+	CAIN	T3,","		; check for middle
+	  JRST	[HRLZM	T1,GETPPN
+		JRST	PARS3]
+	CAIN	T3,"]"		; check for end of PPN (start file name)
+	  JRST	[HRRM	T1,GETPPN
+		JRST	PARS1]
+	SUBI	T3,"0"		; convert octal to binary
+	ASH	T1,3
+	ADD	T1,T3
+	JRST	PARS3
+
+DSKTMP:	; make temp disk name in GETARG into disk file name
+	MOVE	T1,FD		; child frame number
+	ANDI	T1,7777		; isolate absolute frame number
+	MOVE	T3,GETNAM	; get name
+	MOVEI	P1,3		; number of digits to do
+DSKT1:	IDIVI	T1,^D10		; get digit in T2
+	ADDI	T2,'0'		; convert to sixbit
+	LSHC	T2,-6		; GETNAM := digit & GETNAM
+	SOJG	P1,DSKT1
+	MOVEM	T3,GETNAM	; put modified name back
+	MOVSI	T1,(sixbit "TMP")
+	MOVEM	T1,GETEXT
+	POPJ	P,
+
+	subttl	temp file routines
+
+array	OBUF[3]
+
+WTF:	; write temp file for child
+	MOVE	P1,TNAME(ARGP)	; byte pointer to temp file name
+	TLNN	P1,-1		; if null left half,
+	 HRLI	P1,(point 7,0)	;  supply default pointer
+	PUSHJ	P,PARSE		; parse name into GETARG block
+	SKIPN	GETNAM		; if name is null,
+	 POPJ	P,		;  don't write the file
+	PUSHJ	P,DSKTMP	; convert to temp file name for DSK:
+	MOVEI	T1,3		; number of args to .CHLK
+	MOVEM	T1,LOKCNT
+	HRLOI	T1,.CHOPN	; open channel
+	CHANIO	T1,[exp <.IOASC>,<sixbit "DSK">,<OBUF,,0>]
+	 JRST	[MOVEI	T1,E.OPN
+		MOVEM	T1,MERR(ARGP)
+		POPJ	P,]
+	HRLI	T1,.CHENT	; enter file
+	CHANIO	T1,LOKCNT
+	 JRST	[MOVEI	T1,E.ENT	
+		MOVEM	T1,MERR(ARGP)
+		POPJ	P,]
+	MOVE	P1,TDATA(ARGP)	; byte pointer to temp disk data
+	TLNN	P1,-1		; if null left half,
+	 HRLI	P1,(point 7,0)	;  supply default pointer
+WTF1:	ILDB	T3,P1		; get character
+	JUMPE	T3,WTF2		; stop on null
+	SOSGE	OBUF+2		; update counter (do output if buffer full)
+	 JRST	[HRLI	T1,.CHOUT
+		CHANIO	T1,
+		 JRST	.-1	; normal return
+		MOVEI	T1,E.OUT
+		MOVEM	T1,MERR(ARGP)
+		POPJ	P,]
+	IDPB	T3,OBUF+1
+	JRST	WTF1
+WTF2:	HRLI	T1,.CHREL	; release channel
+	CHANIO	T1,
+	AOS	(P)		; skip return
+	POPJ	P,
+
+	end
+ 
