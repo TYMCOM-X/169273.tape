@@ -1,0 +1,297 @@
+entry
+	vmcopy,
+	vmxsum
+
+;
+begin "VMCOPY"
+
+comment
+
+Revision History (also VMCOPY.INF)
+================ =================
+
+   14	Moved RDelta/WDelta adjustment after .chVMP call to insure
+	that the proper pages are where they belong.  03-Apr-84 /Carl
+
+   13	Fixed problem with RDelta adjustment when RPages goes to 0 by
+	only making the adjustment when RSize > RPages.
+	30-Mar-84 /Carl
+
+   12	Fixed problem with files less than 1 page which pass a page
+	boundary and were never written out correctly.  Need to keep
+	a separate FSize for DAddr+Size.  26-Mar-84 /Carl
+
+   11	Removed .chUGF since I "KNOW" the EOF pointer by adding the
+	size and dest-address together.  Do .chFTR using this value.
+	22-Mar-84 /Carl
+
+   10	Changed algorithm in non-simple case to avoid .chDFP and the
+	subsequent trouble deleted pages can cause to file integrity.
+	This should speed up smaller file processing by a great deal.
+	22-Mar-84 /Carl
+
+    7	Fixed condition of page-boundary check and modified the BLT
+	to only copy "real" data.  Changed start!code to use ARRBLT.
+	21-Mar-84 /Carl
+
+    6	Fixed page overruns in both directions for the non-simple
+	case having a destination start position.  21-Mar-84 /Carl
+
+    5	Added CHECK parameter which will cause a checksum to be
+	calculated for the file as it is processed.  The checksum is
+	stored in a global variable VMXSUM.  20-Mar-84 /Carl
+
+    4	Rewrote sections of VMBLT code to handle input which doesn't
+	begin at a page boundary.  (Added for FDM).  20-Mar-84 /Carl
+
+    3	Merge code from untested VM-BLT routine to allow portions of
+	files as well as entire files to be copied.  20-Mar-84 /Carl
+
+    2	 9-Sep-83 /Carl
+    1	30-Aug-83 /Carl
+    0	25-Aug-83 /Carl
+
+================
+end History;
+
+
+
+require "MYSAIL.DEF" source!file;
+require "MEMCHK.REQ" source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+
+define !chVMP     = '47;		! chanio function #47 ;
+define PagSiz     = '1000;		! size of a memory page ;
+
+define VM!!Ok     = 0			! success flag ;
+,      VM!!Page   = 1			! cache page size error ;
+,      VM!!Input  = 2			! input mfp error ;
+,      VM!!Output = 3			! output mfp/cfp error ;
+,      VM!!Write  = 4			! output vmp error ;
+,      VM!!Fixup  = 5			! output fixup error ;
+;
+
+define $ERR( val ) = {(((val lsh -9) land '777000) lor (val land '777))};
+define $XWD( val ) = { Cvos( !lh(val) ) & "," & Cvos( !rh(val) ) };
+define $COW( cnt, pag ) = { ( !PRCW lor !Xwd(cnt,pag) ) };
+define $MRW( cnt, pag ) = { ( !PRRW lor !Xwd(cnt,pag) ) };
+define $REF( cnt, pag ) = { ( !Bit(7) lor !Xwd(cnt,pag) ) };
+define $CHN( err ) = { Start!code Movem 3,err; end };
+
+Own Internal Integer VMXSUM;		! integer checksum of file ;
+
+Own Integer RPage, RPages, RSize, RBase, RDelta;
+Own Integer WPage, WPages, WSize, WBase, WDelta;
+Own Integer ABase, APages;
+
+Own Integer Index, Finish;		! loop and range variables ;
+Own Integer Err;			! uuo error flag ;
+
+Own Safe Integer Array MAP[ 0:1 ];	! to map file pages   ;
+Own Safe Integer Array PUT[ 0:1 ];	! to vmovpg next page ;
+Own Safe Integer Array REP[ 0:1 ];	! to vreplc last page ;
+Own Safe Integer Array COP[ 0:1 ];	! to  swap  last page ;
+
+
+Internal simple boolean procedure VMCopy(
+! ----------------------------------------------------------------------;
+!									;
+!	VM-Copy		Copy the contents of the file open on SChan	;
+!			beginning at SAddr into the file open on	;
+!			DChan beginning at DAddr using mapping calls.	;
+!									;
+! ----------------------------------------------------------------------;
+
+    integer DChan,		! destination file channel ;
+	    SChan,		! source file channel ;
+	    Size,		! size in words of the data to copy ;
+	    Base,		! virtual memory page to use for mapping ;
+	    Pages,		! size of the paging cache at Base ;
+	    DAddr( 0 ),		! destination file start address ;
+	    SAddr( 0 );		! source file start address (usually 0) ;
+    boolean Check( False )	! checksum flag - If TRUE do a checksum ;
+
+ );
+
+begin "VMCopy"
+
+    If ( Pages = 0 )			! insure we have enough space ;
+     then Return( !Xwd( VM!!Page, 0 ) );
+
+    If ( Check )			! if checking, start clean ;
+     then VMXSUM_ 0;
+
+    Calli( $REF( Pages, Base ), calli!VCLEAR );	! initialize cache ;
+
+    RBase_  Base;			! copy initial file cache base ;
+    ABase_  Base lsh 9;			! secure convenient address ;
+
+    RDelta_ SAddr land '777;		! source file offset (if any) ;
+    RSize_  (RDelta+Size+'777) lsh -9;	! file pages needed to read ;
+    RPage_  (SAddr lsh -9) + 1;		! source file page to start ;
+
+    WDelta_ DAddr land '777;		! destination offset (if any) ;
+    WSize_  (WDelta+Size+'777) lsh -9;	! file pages needed to write ;
+    Put[1]_ (DAddr lsh -9) + 1;		! destination page to start ;
+
+    If ( WDelta or RDelta )		! if not the simplest case ;
+     then begin "Needs Setup"		!  then lots of work ;
+
+	If ( Pages < 2 )
+	 then Return( !Xwd( VM!!Page, 2 ) );
+
+	Map[0]_ $MRW( 1, Base );	! map previous page R-W ;
+	Map[1]_ Put[1];			! so we can munch on it ;
+
+	Put[1]_ Put[1] + 1;		! increment because of mapping ;
+
+	Chnior( DChan, Map[0], !chMFP );
+	$CHN( Err );
+	If not( !Skip! )
+	 then begin "must create page"
+
+	    Chnior( DChan, Map[1], !chCFP );
+	    If not( !Skip! )
+	     then Return( !Xwd( VM!!Output, $ERR(Err) ) );
+
+	    Chnior( Dchan, Map[0], !chMFP );
+	    $CHN( Err );
+	    If not( !Skip! )
+	     then Return( !Xwd( VM!!Output, $ERR(Err) ) );
+
+	 end "must create page";
+
+	Pages_ Pages - 1;		! use a smaller range of pages ;
+	RBase_ RBase + 1;		! move the file base forward ;
+
+     end "Needs Setup";
+
+    While ( RSize > 0 )			! as long as we have more to do ;
+     do begin "Outer Loop"		! map-cow pollute vmovpg un-map ;
+
+	APages_ ( RPages_ Pages MIN RSize ) lsh 9;
+	Map[ 0 ]_ $COW( RPages, RBase );
+	Map[ 1 ]_ RPage;
+
+	Chnior( SChan, Map[ 0 ], !chMFP );
+	$CHN( Err );
+	If ( not !SKIP! )
+	 then Return( !Xwd( VM!!Input, $ERR(Err) ) );
+
+	Finish_ RBase + RPages - 1;	! calculate last page addr ;
+	For Index_ RBase step 1		! for each page of the cache ;
+		   until Finish		!  start in the pages ;
+	 do calli( Index, calli!PREREF );
+
+	WPages_ Pages MIN WSize;	! setup output page size ;
+
+	If ( WDelta or RDelta )
+	 then begin "Fixup via BLT"
+	    Integer XDst, XSrc, XSiz;
+
+	    If ( Check )
+	     then MemChk( VMXSUM, ABase+PagSiz+RDelta,
+		(If ( RSize > RPages )
+		  then APages-RDelta
+		  else (APages-RDelta) + (Size land '777) - PagSiz
+		)
+	     );
+
+	    ArrBLT( Memory[ XDst_ ABase+WDelta ],
+		    Memory[ XSrc_ ABase+PagSiz+RDelta ],
+		    XSiz_ (APages-RDelta) Min Size );
+
+	    If ( (XDst + XSiz) < (ABase+PagSiz+APages) ) 
+	     then begin "clear remainder"
+
+		Memory[ XDst_ XDst+XSiz ]_ 0;
+		If ( (XDst + 1) < (ABase+PagSiz+APages) ) 
+		 then ArrBLT( Memory[XDst+1], Memory[XDst],
+				ABase+PagSiz+APages-XDst-1 );
+
+	     end "clear remainder";
+
+	    If ( ( RDelta ) and ( RSize > RPages ) )
+	     then begin "Fixup WDelta"
+
+		If ( RDelta > WDelta )
+		 then begin "change psize"
+
+		    Calli( $REF( 1, Base+RPages ), calli!VCLEAR );
+		    RPages_ RPages - 1;
+		    APages_ RPages lsh 9;
+		    WDelta_ WDelta + PagSiz - RDelta;
+
+		 end "change psize"
+		 else WDelta_ WDelta - RDelta;
+
+		RDelta_ 0;
+
+	     end "Fixup WDelta";
+
+	    If ( WPages > 1 )
+	     then begin "now move pages"
+
+		Chnior(DChan,Put[0]_!Xwd(Pages MIN WSize-1,Base+1),!chVMP);
+		$CHN( Err );
+		If ( not !SKIP! )
+		 then Return( !Xwd( VM!!Write, $ERR(Err) ) );
+
+	     end "now move pages";
+
+	    Calli( $REF( WPages, Base ), calli!VCLEAR );
+
+	    If ( WSize > WPages )
+	     then begin "move page"
+		COP[ 0 ]_ $MRW( 1, Base );
+		COP[ 1 ]_ Base + WPages;
+		Calli( Location(COP[0]), calli!VREPLC );
+	     end "move page";
+
+	    Calli( $REF( 1, Base+WPages ), calli!VCLEAR );
+
+	 end "Fixup via BLT"
+	 else begin "Touch each page"	! make the C-O-W into R-W ;
+
+	    Finish_ Finish lsh 9;	! last memory location ;
+	    For Index_ ABase		! for each first location ;
+		       step PagSiz	!  of each page wanted ;
+		       until Finish	!  stomp on the page (copy) ;
+	     do Memory[ Index ]_ Memory[ Index ];
+
+	    Chnior( DChan, Put[ 0 ]_ !Xwd( RPages, Base ), !chVMP );
+	    $CHN( Err );
+	    If ( not !SKIP! )
+	     then Return( !Xwd( VM!!Write, $ERR(Err) ) );
+
+	    If ( Check )
+	     then MemChk( VMXSUM, ABase,
+		(If ( RSize > RPages )
+		  then APages
+		  else APages + ( Size land '777 ) - PagSiz
+		)
+	     );
+
+	    Calli( $REF( RPages, Base ), calli!VCLEAR );
+
+	 end "Touch each page";
+
+	RSize_ RSize - RPages;		! decrement file pages ;
+	RPage_ RPage + RPages;		! setup next file page ;
+	WSize_ WSize - WPages;		! decrement output pages ;
+	Put[1]_ Put[1]+WPages;		! setup next output page ;
+
+     end "Outer Loop";
+
+    Chniov(DChan, DAddr+Size, !chFTR );	! truncate the file to size ;
+    $CHN( Err );
+    If not( !Skip! )
+     then Return( !Xwd( VM!!Fixup, $ERR( Err ) ) );
+
+    Return( !Xwd( VM!!Ok, 0 ) );	! and return success to user ;
+
+end "VMCopy";
+
+
+end "VMCOPY";
+    
