@@ -1,0 +1,525 @@
+procedure MOD.PROD (PROD.NAME, PROD.VERSION, OP.SYS, RUN.DIRECTORY)
+    returning (C.PROD.NAME, C.PROD.VERSION, C.OP.SYS, C.RUN.DIRECTORY,
+    C.PROGRAMMER, C.TRANS.NO, C.TSR.NUM)
+
+%
+  Run from SOFT, MOD.PROD allows the user to make changes to a Product.
+It receives from SOFT the Product key values retrieved from either the
+command line or the current product information.  It returns to SOFT the
+information from the new current product, which is the last, if any,
+successfully accessed product.
+  To compile, MOD.PROD requires the  following texts for the indicated
+macros and functions:
+    PRODUCT.FUNCTIONS    for RECORD.CUR.PROD, SHORT.PRODUCT.LINE,
+                             ACCEPT.PROD.SPECS, and GET.UNIQUE.PROD;
+    SPEC.PARSER          for BREAK.UP.SPEC which is used by ACCEPT.PROD.SPECS.
+For descriptions of the macros and functions, how they are used, and the 
+fields they require - see the appropriate text.
+%
+
+begin
+
+controls for relation concurrent update
+
+controls for procedure separator @cr  %allows commas in versions and desc.s%
+
+fields YES.NO            as '3c',      % Yes or No Field %
+       SPACE.POSN        as '2n',      % Space Position %
+       FIELD.SPEC        as '30c',     % Field to Modify %
+       KEY.CHANGE        as 'c',       % A Key Field has been Changed flag %
+       DESC.CHANGE       as 'c',       % The Description has been Changed %
+       NEW.PROD.NAME same as PROD.NAME, % New Product Name %
+       NEW.PROD.VERSION same as PROD.VERSION, % New Product Version %
+       NEW.OP.SYS same as OP.SYS,      % New Operating System type %
+       NEW.RUN.DIRECTORY same as RUN.DIRECTORY, % New Run Directory %
+       NEW.SEC.TRANS.NO same as SECOND.TRANS.NO, % New Second Trans Date %
+       NEW.TRANS.DATE same as TRANS.DATE, % New Transmittal Date %
+       NEW.TRANS.NO same as TRANS.NO,  % New Transmittal Number %
+       NEW.LINE same as LINE,
+       DELETE.DESC       as 'c',       % Description Should be Deleted flag %
+       COPY.DESC         as 'c',       % Description Should be Copied flag %
+
+       % Fields used by GET.UNIQUE.PROD %
+       FOUND.COUNT       as '3n',      % Number of Instances Found %
+       FIRST.NAME.FOUND  as '20c',     % First Product Name Found %
+       FIRST.VERSION.FOUND same as PROD.VERSION,
+       FIRST.OP.SYS.FOUND same as OP.SYS,
+       FIRST.RUN.DIRECTORY.FOUND same as RUN.DIRECTORY,
+
+       % Fields used by ACCEPT.PROD.SPECS %
+       PROD.SPEC         as '40c',     % Product Specification %
+       ITEM              as '30c',     % An Item of a Specification %
+       I.QUOTE           as 'c',       % An Item's Quote Indicator %
+       SPEC.STATUS       as '-nn',     % Status returned from parsing a Spec %
+
+       % Fields used by the macro BREAK.UP.SPEC.  For more Information %
+       % see the text 'SPEC.PARSER'.                                   %
+       SYMBOL.INDEX      as 'nn',
+       PARAM             as '40c',
+       PARAM.INDEX       as 'nn',
+       SPEC.INDEX        as 'nnn',
+       QUOTE.FLAG        as 'c',
+       LEN.SPEC          as 'nnn',
+       CHAR              as 'c'
+
+constant MAX.PROD.SPECS = 4            % Maximum Number of Items in a %
+                                       %   Product Specification.     %
+
+array PROD.ARRAY [1 to MAX.PROD.SPECS]  % The parsed Items of a Prod. Spec.%
+  data ITEM, I.QUOTE
+
+relation TEMP.DESC is      % Temporary Description, used in modifications %
+  key COUNTER
+  data LINE
+
+macro ACCEPT.YES.NO is              % Accepts a yes/no responce, must be %
+  begin
+
+                             % be used after a promt is printed,  %
+  accept YES.NO                     % default or cr = no.                %
+  if substr(YES.NO,1,1) = "Y" or "y"
+    then let YES.NO = "Y"
+    else let YES.NO = "N"
+  end
+end.macro
+
+include text 'SPEC.PARSER'
+include text "PRODUCT.FUNCTIONS"
+
+macro CHANGE.PROD.DESC is
+  % The user is allowed keep a lines of the old description, replace   %
+  % lines of the old description, delete lines of the old description, %
+  % and add lines to the end of the old description.  The old          %
+  % description is not replaced with the new description until the user%
+  % is done making changes and KEEP.PROD.CHANGES is executed.          %
+  begin
+
+  delete from TEMP.DESC all
+  select PRODUCT.DESC where (PROD.NAME = PROD.NAME of procedure) then
+    begin
+
+    type @cr, "Old Description:", @cr
+    for each PRODUCT.DESC where ((PROD.NAME=PROD.NAME of procedure) and
+         (OP.SYS=OP.SYS of procedure)) sorted on COUNTER 
+      do type trim(LINE),@cr
+    type @cr, "Changes (cr to keep old line, '-' to delete old line):", @cr
+    let COUNTER of procedure = 1
+    for each PRODUCT.DESC where ((PROD.NAME=PROD.NAME of procedure) and
+         (OP.SYS=OP.SYS of procedure)) sorted on COUNTER  do
+      begin
+      type LINE, @cr, "=>"
+      accept NEW.LINE
+      if NEW.LINE = default then
+        begin
+        insert into TEMP.DESC using (COUNTER of procedure for COUNTER, 
+                      LINE of PRODUCT.DESC for LINE)
+        let COUNTER of procedure = COUNTER of procedure + 1
+        end
+      else if length(NEW.LINE)=1 and substr(NEW.LINE,1,1)="-"
+        then nothing
+      else begin
+        insert into TEMP.DESC using
+          (COUNTER of procedure for COUNTER, NEW.LINE for LINE)
+        let COUNTER of procedure = COUNTER of procedure + 1
+        end
+      end  %for each product.desc%
+    type "Additional Lines (blank line terminates):", @cr
+    accept NEW.LINE
+    while NEW.LINE ne default do
+      begin
+      insert into TEMP.DESC using(COUNTER of procedure for COUNTER,
+        NEW.LINE for LINE)
+      let COUNTER of procedure = COUNTER of procedure + 1
+      accept NEW.LINE
+      end
+  end
+  else begin
+    type "Description (blank line terminates): ",@cr
+    accept LINE
+    let COUNTER = 1
+    while LINE ne default do
+      begin
+      insert into TEMP.DESC
+      let COUNTER = COUNTER + 1
+      accept LINE
+      end
+    end
+  move "Y" to DESC.CHANGE
+  end
+end.macro
+
+
+macro CHANGE.OP.SYS is
+  % The user may change the Product's Operating System type only if the %
+  % Product has not been transmitted.                                   %
+GET.NEW.PROD.OP.SYS:
+  begin
+
+  if TRANS.NO ne default
+    then select TRANSMITTAL where (TRANS.NO=TRANS.NO of PRODUCT)
+           then begin
+                type "To change the Operating System Type - please delete",@cr
+                type "and re-enter Transmittal number ", TRANS.NO as '6l',
+                     ".", @cr
+                finish GET.NEW.PROD.OP.SYS
+                end
+  type "Operating System:", OP.SYS, " =>(cr for no change) "
+  accept NEW.OP.SYS
+  let NEW.OP.SYS = upper.case(NEW.OP.SYS)
+  if NEW.OP.SYS ne default
+    then select PRODUCT where
+          (((PROD.NAME=NEW.PROD.NAME and NEW.PROD.NAME ne default)
+            or (PROD.NAME=PROD.NAME of procedure and NEW.PROD.NAME = default))
+          and ((PROD.VERSION=NEW.PROD.VERSION and NEW.PROD.VERSION ne default)
+            or (PROD.VERSION=PROD.VERSION of procedure
+                and NEW.PROD.VERSION = default))
+          and (OP.SYS=NEW.OP.SYS))
+          and ((RUN.DIRECTORY=NEW.RUN.DIRECTORY and NEW.RUN.DIRECTORY ne 
+              default)
+            or (RUN.DIRECTORY=RUN.DIRECTORY of procedure
+               and NEW.RUN.DIRECTORY = default))
+           then begin
+                type "Product Already Exists", @cr
+                move default to NEW.OP.SYS
+                repeat GET.NEW.PROD.OP.SYS
+                end
+           else move "Y" to KEY.CHANGE
+  end
+end.macro
+
+
+macro CHANGE.PROD.NAME is
+GET.NEW.PROD.NAME:
+  begin
+
+  if TRANS.NO ne default
+    then select TRANSMITTAL where (TRANS.NO=TRANS.NO of PRODUCT)
+           then begin
+                type "To change the Product Name - please delete",@cr
+                type "and re-enter Transmittal number ", TRANS.NO as '6l',
+                     ".", @cr
+                finish GET.NEW.PROD.NAME
+                end
+  type "Product Name:", PROD.NAME, " =>(cr for no change) "
+  accept NEW.PROD.NAME
+  let NEW.PROD.NAME = upper.case(NEW.PROD.NAME)
+  if NEW.PROD.NAME ne default
+    then select PRODUCT where (PROD.NAME=NEW.PROD.NAME)
+           then begin
+                type "Product Name Already in Use", @cr
+                move default to NEW.PROD.NAME
+                repeat GET.NEW.PROD.NAME
+                end
+           else move "Y" to KEY.CHANGE
+  end
+end.macro
+
+
+macro CHANGE.SECOND.TRANS.NO is
+  begin
+
+  if TRANS.NO = default
+    then type "Please enter the first Transmittal Number before entering",@cr,
+              "the second Transmittal Number.", @cr
+    else begin
+         type "Second Transmittal Number:", SECOND.TRANS.NO, " =>"
+         accept NEW.SEC.TRANS.NO
+         if NEW.SEC.TRANS.NO = default
+           then move default to SECOND.TRANS.NO
+           else select TRANSMITTAL via TRANS.NO=NEW.SEC.TRANS.NO
+                  then move NEW.SEC.TRANS.NO to SECOND.TRANS.NO
+                  else type "Transmittal does not exist, Second Transmittal ",
+                            "Number NOT changed", @cr
+         end
+  end
+end.macro
+
+
+macro CHANGE.PROD.TRANS.DATE is
+  % If the attempt is made to change the Transmittal Date and the %
+  % Transmittal for the product exists, then the Transmittal Date %
+  % of Product will be set to the Transmittal Date of Transmittal.%
+  begin
+
+  type "Transmittal Date:", TRANS.DATE, " =>"
+  accept NEW.TRANS.DATE
+  if TRANS.NO = default
+    then move NEW.TRANS.DATE to TRANS.DATE
+    else select TRANSMITTAL via key
+           then begin
+                move TRANS.DATE to TRANS.DATE of procedure
+                type "For this product the transmittal number is ",
+                     TRANS.NO as '8l',".", @cr, "The date of that ",
+                     "transmittal is ", TRANS.DATE, ".", @cr
+                end
+           else move NEW.TRANS.DATE to TRANS.DATE
+  end
+end.macro
+
+
+macro CHANGE.PROD.TRANS.NO is
+  begin
+
+  type "Transmittal Number:", TRANS.NO, " =>"
+  accept NEW.TRANS.NO
+  if NEW.TRANS.NO = default
+    then if TRANS.NO = default
+           then nothing
+           else begin
+                type "Are you sure you want to delete the Transmittal Number?"
+                ACCEPT.YES.NO
+                if YES.NO = "Y"
+                  then move default to TRANS.NO
+                end
+    else select TRANSMITTAL via TRANS.NO=NEW.TRANS.NO
+           then begin
+                if (PROD.NAME ne PROD.NAME of PRODUCT)
+                  or (PROD.VERSION ne PROD.VERSION of PRODUCT)
+                  or (OP.SYS ne OP.SYS of PRODUCT)
+                  then type "Product does not match Transmittal, ",
+                            "Number NOT changed", @cr
+                  else begin
+                       move TRANS.NO to TRANS.NO of PRODUCT,
+                            TRANS.NO of procedure
+                       move TRANS.DATE to TRANS.DATE of PRODUCT,
+                            TRANS.DATE of procedure
+                       end
+                end
+           else begin
+                type "A Transmittal with the new number does not exist, ",@cr,
+                     "do you still want to use it? "
+                ACCEPT.YES.NO
+                if YES.NO = "Y"
+                  then move NEW.TRANS.NO to TRANS.NO
+                  else type "Transmittal Number NOT changed", @cr
+                end
+  end
+end.macro
+
+
+macro CHANGE.PROD.VERSION is
+GET.NEW.PROD.VERSION:
+  begin
+
+  if TRANS.NO ne default
+    then select TRANSMITTAL where (TRANS.NO=TRANS.NO of PRODUCT)
+           then begin
+                type "To change the Product Version - please delete",@cr
+                type "and re-enter Transmittal number ", TRANS.NO as '6l',
+                     ".", @cr
+                finish GET.NEW.PROD.VERSION
+                end
+  type "Product Version:", PROD.VERSION, " =>(cr for no change)"
+  accept NEW.PROD.VERSION
+  let NEW.PROD.VERSION = upper.case(NEW.PROD.VERSION)
+  if NEW.PROD.VERSION ne default
+    then select PRODUCT where
+            (((NEW.PROD.NAME=default and PROD.NAME=PROD.NAME of procedure)
+             or (NEW.PROD.NAME ne default and PROD.NAME=NEW.PROD.NAME))
+            and (PROD.VERSION=NEW.PROD.VERSION)
+            and ((NEW.OP.SYS=default and OP.SYS=OP.SYS of procedure)
+             or (NEW.OP.SYS ne default and OP.SYS=NEW.OP.SYS))
+          and ((RUN.DIRECTORY=NEW.RUN.DIRECTORY and NEW.RUN.DIRECTORY ne 
+              default)
+            or (RUN.DIRECTORY=RUN.DIRECTORY of procedure
+               and NEW.RUN.DIRECTORY = default)))
+           then begin
+                type "Product Already Exists", @cr
+                move default to NEW.PROD.VERSION
+                repeat GET.NEW.PROD.VERSION
+                end
+           else move "Y" to KEY.CHANGE
+  end
+end.macro
+
+macro CHANGE.RUN.DIRECTORY is
+GET.NEW.RUN.DIRECTORY:
+  begin
+
+  if TRANS.NO ne default
+    then select TRANSMITTAL where (TRANS.NO=TRANS.NO of PRODUCT)
+           then begin
+                type "To change the Run Directory - please delete",@cr
+                type "and re-enter Transmittal number ", TRANS.NO as '6l',
+                     ".", @cr
+                finish GET.NEW.RUN.DIRECTORY
+                end
+  type "Run Directory:", RUN.DIRECTORY, " =>(cr for no change)"
+  accept NEW.RUN.DIRECTORY
+  let NEW.RUN.DIRECTORY = upper.case(NEW.RUN.DIRECTORY)
+  if NEW.RUN.DIRECTORY ne default
+    then select PRODUCT where
+       (((NEW.PROD.NAME=default and PROD.NAME=PROD.NAME of procedure)
+         or (NEW.PROD.NAME ne default and PROD.NAME=NEW.PROD.NAME))
+       and ((PROD.VERSION=NEW.PROD.VERSION and NEW.PROD.VERSION ne default)
+         or (PROD.VERSION=PROD.VERSION of procedure))
+       and ((NEW.OP.SYS=default and OP.SYS=OP.SYS of procedure)
+         or (NEW.OP.SYS ne default and OP.SYS=NEW.OP.SYS))
+       and (RUN.DIRECTORY=NEW.RUN.DIRECTORY))
+         then begin
+              type "Product Already Exists", @cr
+              move default to NEW.RUN.DIRECTORY
+              repeat GET.NEW.RUN.DIRECTORY
+              end
+         else move "Y" to KEY.CHANGE
+  end
+end.macro
+
+
+macro KEEP.PRODUCT.CHANGES is
+  begin
+
+  if KEY.CHANGE = "Y"
+    then begin
+         delete from PRODUCT via key
+         if NEW.PROD.NAME = default
+           then move PROD.NAME to NEW.PROD.NAME
+         if NEW.PROD.VERSION = default
+           then move PROD.VERSION to NEW.PROD.VERSION
+         if NEW.OP.SYS = default
+           then move OP.SYS to NEW.OP.SYS
+         if NEW.RUN.DIRECTORY = default
+           then move RUN.DIRECTORY to NEW.RUN.DIRECTORY
+         insert into PRODUCT using (NEW.PROD.NAME for PROD.NAME,
+                NEW.PROD.VERSION for PROD.VERSION, NEW.OP.SYS for OP.SYS,
+                NEW.RUN.DIRECTORY for RUN.DIRECTORY)
+         %if another Product with old name and sys, dont delete desc.%
+         select PRODUCT where (PROD.NAME=PROD.NAME of procedure) and
+                        (OP.SYS=OP.SYS of procedure)
+           then move "N" to DELETE.DESC
+           else move "Y" to DELETE.DESC
+         %if already a desc. for new product and sys, dont copy%
+         select PRODUCT.DESC where (PROD.NAME=NEW.PROD.NAME) and
+                       (OP.SYS=NEW.OP.SYS)
+           then move "N" to COPY.DESC
+           else move "Y" to COPY.DESC
+         for each PRODUCT.DESC where (PROD.NAME=PROD.NAME of procedure) and
+                       (OP.SYS=OP.SYS of procedure) do
+           begin
+           if DELETE.DESC = "Y" 
+             then delete from PRODUCT.DESC via key
+           if COPY.DESC = "Y"
+             then insert into PRODUCT.DESC using (NEW.PROD.NAME for 
+                                  PROD.NAME, NEW.OP.SYS for OP.SYS)
+           end
+         move NEW.PROD.NAME to PROD.NAME, PROD.NAME of procedure
+         move NEW.PROD.VERSION to PROD.VERSION, PROD.VERSION of procedure
+         move NEW.OP.SYS to OP.SYS, OP.SYS of procedure
+         move NEW.RUN.DIRECTORY to RUN.DIRECTORY, RUN.DIRECTORY of procedure
+         end  %key change%
+    else alter PRODUCT
+  if DESC.CHANGE = "Y"
+    then begin
+         delete from PRODUCT.DESC via PROD.NAME=PROD.NAME of procedure
+         for each TEMP.DESC do
+           insert into PRODUCT.DESC
+         end
+  end
+end.macro
+
+
+%  BEGIN MODIFY PRODUCT  %
+
+  if PROD.NAME = default
+    then ACCEPT.PROD.SPECS
+  while PROD.NAME ne default do
+    begin
+    if (PROD.VERSION = default) or (OP.SYS = default) or  
+       (RUN.DIRECTORY = DEFAULT)
+      then GET.UNIQUE.PROD
+    if PROD.NAME ne default      %if a unique Product was found%
+      then select PRODUCT via key
+        then begin
+           move "N" to KEY.CHANGE, DESC.CHANGE
+           move default to NEW.PROD.NAME, NEW.PROD.VERSION, NEW.OP.SYS,
+           NEW.RUN.DIRECTORY
+           type @cr
+           type trim (PROD.NAME), "  v", trim(PROD.VERSION), "  sys: ",
+                    trim(OP.SYS), " <", trim(RUN.DIRECTORY), "> ",@cr,@cr
+                  type "Field to Modify (cr to keep changes): "
+                  accept FIELD.SPEC
+                  let FIELD.SPEC = upper.case(FIELD.SPEC)
+                  while (FIELD.SPEC ne default) and (FIELD.SPEC ne "ABORT") do
+                    begin
+                    conditional on substr(FIELD.SPEC,1,2)
+                      begin
+                      "CL": do begin
+                           type "Support Class: ", trim(SUPPORT.CLASS), " =>"
+                           accept SUPPORT.CLASS
+                           let SUPPORT.CLASS = upper.case(SUPPORT.CLASS)
+                            end
+                            while SUPPORT.CLASS = default
+                      "CO": begin
+                            type "Comment: ", trim(PROD.COMMENT), @cr, "=>"
+                            accept PROD.COMMENT
+                            end
+                      "DO": begin
+                            type  "Documentation: ", trim(PROD.DOC), @cr, "=>"
+                            accept PROD.DOC
+                            end
+                      "DE": CHANGE.PROD.DE                     "H " or "HE": type @cr, "Valid fields/commands are: ",
+                            "ABORT, CLass, COmment, DEscription,", @cr,
+                            "DOcumentation, Help, Manager, Operating system, ",
+                            "PRODuct, PROGrammer,", @cr,
+                            "Run directory, SEcond transmittal number, ",
+                            "SOurce directory, ", @cr,"Transmittal Date, ",
+                            "Transmittal Number, Unit, Version", @cr,@cr
+                      "M " or "MA": begin
+                                    type "Manager: ", trim(MANAGER), " =>"
+                                    accept MANAGER
+                                    let MANAGER = upper.case(MANAGER)
+                                    end
+                      "O " or "OP": CHANGE.OP.SYS
+                      "PR": conditional on substr(FIELD.SPEC,4,1)
+                              begin
+                              "D": CHANGE.PROD.NAME
+                              "G": begin
+                                 type "Programmer: ", trim(PROGRAMMER), " =>"
+                                 accept PROGRAMMER
+                                 let PROGRAMMER = upper.case(PROGRAMMER)
+                                 end
+                              end
+                            else type "Invalid Field Specification", @cr
+                      "R " or "RU": CHANGE.RUN.DIRECTORY
+                      "SO" : begin
+                             type "Source Directory: ", 
+                               trim(SOURCE.LOCATION), " =>"
+                             accept SOURCE.LOCATION
+                             let SOURCE.LOCATION = 
+                               upper.case(SOURCE.LOCATION)
+                             end
+                      "SE" : CHANGE.SECOND.TRANS.NO
+                      "T " or "TR": begin
+                                    let SPACE.POSN=position(FIELD.SPEC," ")
+                                    conditional on substr(left.trim(substr
+                                         (FIELD.SPEC,SPACE.POSN)),1,1)
+                                      begin
+                                      "D": CHANGE.PROD.TRANS.DATE
+                                      "N": CHANGE.PROD.TRANS.NO
+                                      end
+                                    else type"Invalid Field Specification",@cr
+                                    end
+                      "U " or "UN": do begin
+                                      type "Unit: ", trim(UNIT), " =>"
+                                      accept UNIT
+                                      let UNIT = upper.case(UNIT)
+                                      end
+                                    while UNIT = default
+                      "V " or "VE": CHANGE.PROD.VERSION
+                      end
+                    else type "Invalid Field Specification", @cr
+                    type "Field to Modify (cr to keep changes): "
+                    accept FIELD.SPEC
+                    let FIELD.SPEC = upper.case(FIELD.SPEC)
+                    end  %while Field Spec...do...%
+                  if FIELD.SPEC ne "ABORT"
+                    then KEEP.PRODUCT.CHANGES
+                  RECORD.CUR.PROD
+                  end  %select Product ...then...%
+             else type "Non-existent Product", @cr
+    ACCEPT.PROD.SPECS
+    end  %while prod name not default...%
+  type @cr
+
+end
+   3@F÷
