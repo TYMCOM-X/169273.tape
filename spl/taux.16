@@ -1,0 +1,562 @@
+title	TAUX	network transparent link program
+debug==0			;=1 to trace special interrupts
+minver==16			;version rh
+majver==0			;version lh
+
+twoseg
+loc	137
+xwd	majver,minver
+reloc	400000
+
+X==	0			;be careful - for null job
+P==	1			;stack pointer
+A==	2			;for interrupt routines
+B==	3
+C==	4
+D==	5
+TC==	6			;TTY character
+PC==	7			;PTY character
+T1==	10			;for TTY character interrupts
+T2==	11
+T3==	12
+T4==	13
+P1==	14			;for PTY character interrupts
+P2==	15
+P3==	16
+P4==	17
+
+if2 <ifn DEBUG,<printx [debug switch enabled]>>
+;;	gettab tables
+.GTPRV==6			;privelege word
+.GTUNM==-22			;user name
+.GTUN1==-21			;user name (continued)
+
+;;	interrupt causes
+.IACHR==1			;character received
+.IATIM==4			;SETTIM timer
+.IAORG==6			;orange ball received
+.IAZAP==7			;circuit zapper received
+.IAYEL==11			;yellow ball received
+.IAGOB==12			;character gobbler received
+.IATCC==13			;terminal characteristic changed in PTY
+.IANTQ==13			;notice to quit
+.IALIM==16			;TRU limit interrupt
+
+;;	auxcal function codes
+.AXI8C==0			;input image character and wait
+.AXI8S==1			;input image character and skip
+.AXO8==	3			;output image character
+.AXCBI==6			;clear input buffer
+.AXCBO==7			;clear output buffer (send gobbler)
+.AXLDE==11			;leave deffered echo
+.AXSYB==12			;send yellow ball
+.AXCFS==64			;change file status bits for port
+.AXSOB==70			;send orange ball
+.AXTCN==73			;read/set term char by number
+.AXTCP==74			;read changed term char from PTY
+.AXOSF==76			;output string as will fit
+
+;;	fatal error message macro
+define	fatal (M)	<
+	jrst	[reset
+		outstr [asciz "M"]
+		exit
+		]	>
+
+;;	debug error message macro
+ifn	debug,<define	bug (M)	<outstr [asciz "[M]"]>>
+ife	debug,<define	bug (M)	<;>>
+
+subttl	create circuit and initialize
+;	* initialize the stack
+;	* create circuit
+;	* set mode on our end of circuit
+;	* set mode on command port
+;	* set logout on disconnect
+
+array	PDL[40]			;stack
+array	AUXSTR[20]		;aux circuit login string
+
+START:	RESET
+	SETZM	CHRVRB		;be terse unless timed out
+	SETZM	ACCUCH		;clear accumulated character
+	SETZM	ECHOFL		;no local echo mode
+	SETZM	CHRTRN		;no display control characters mode
+	MOVEI	P,"X"-100	;use ^X as initial break character
+	MOVEM	P,CHRESC	; for user commands
+
+	MOVE	P,[iowd 40,PDL]	;init stack pointer
+
+
+	PUSHJ	P,GLOG		;get login string
+	MOVEI	T1,AUXSTR
+	CREAUX	T1,
+	 JRST	AUXERR
+	HRLM	T1,PP#		;aux circuit port number in lh(PP)
+	SETOM	TT#		;TTY port #
+
+	HRROI	T1,.AXCFS	;change file status for port
+	HRL	T1,TT
+	AUXCAL	T1,214		;image binary no echo
+
+	HRROI	T1,.GTPRV	;set logout on disconnect
+	GETTAB	T1,
+	 fatal	<?cant get JBTPRV>
+	TRZ	T1,3B20		;all off=logout on disconnect
+	SETPRV	T1,
+
+subttl	initialize interrupt system
+;	* reset and enable INTADR system
+;	* assign causes to channels
+;	* enable all channels
+
+	MOVE	T1,[VECDAT,,VECTOR]	;load the vector
+	BLT	T1,VECTOR+VECLEN-1
+
+	MOVE	T1,[6,,VECTOR]		;clear and enable system
+	INTADR	T1,
+	 fatal	<?cant initialize INTADR system>
+	
+	MOVE	T1,[.IATIM,,TIM..C]	;timer
+	INTASS	T1,
+	 fatal	<?cant assign TIM>
+
+	MOVE	T1,[.IANTQ,,NTQ..C]	;NTQ
+	INTASS	T1,
+	 fatal	<?cant assign NTQ>
+
+	MOVE	T1,[.IALIM,,LIM..C]	;tru limit
+	INTASS	T1,
+	 fatal	<?cant assign TRU limit>
+
+	HRLOI	T1,<.IAZAP>B26+ZAP..C	;PTY ZAP
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign PTY ZAP>
+
+	HRLOI	T1,<.IAORG>B26+ORG.TC	;ORANGE BALL from TTY 
+	HRR	T1,TT
+	TINASS	T1,
+	 fatal	<?cant assign ORANGE BALL for TTY>
+
+	HRLOI	T1,<.IAORG>B26+ORG.PC	;ORANGE BALL from PTY 
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign ORANGE BALL for PTY>
+
+	HRLOI	T1,<.IAYEL>B26+YEL.TC	;YELLOW BALL from TTY 
+	HRR	T1,TT
+	TINASS	T1,
+	 fatal	<?cant assign YELLOW BALL for TTY>
+
+	HRLOI	T1,<.IAYEL>B26+YEL.PC	;YELLOW BALL from PTY 
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign YELLOW BALL for PTY>
+
+	HRLOI	T1,<.IAGOB>B26+GOB.TC	;GOBBLER from TTY
+	HRR	T1,TT
+	TINASS	T1,
+	 fatal	<?cant assign GOBBLER for TTY>
+
+	HRLOI	T1,<.IAGOB>B26+GOB.PC	;GOBBLER from PTY
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign GOBBLER for PTY>
+
+	HRLOI	T1,<.IACHR>B26+CHR.TC	;CHAR from TTY
+	HRR	T1,TT
+	TINASS	T1,
+	 fatal	<?cant assign CHAR for TTY>
+
+	HRLOI	T1,<.IACHR>B26+CHR.PC	;CHAR from PTY
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign CHAR for PTY>
+
+	OUTSTR	[asciz "[network passthrough created]
+"]
+
+	SETO	X,			;enable all interrupt channels
+	INTENB	X,
+	 fatal	<?cant enable interrupt channels>
+
+WAIT:	SETZ	X,		;don't wake up for anything
+	HIBER	X,
+	 JRST	WAIT
+	JRST	WAIT
+
+subttl	interrupt routines for special things
+
+TIM..:	bug <TIM..>		;SETTIM timer interrupt
+	OUTSTR [asciz "
+TAUX: "]
+	SETOM	CHRVRB		;verbose messages for rest of command
+	DISMIS
+
+NTQ..:	bug <NTQ..>
+	OUTSTR	[ASCIZ\
+[network passthrough received notice to quit - please log off]
+\]
+	SETOM	NTQFLG#
+	DISMIS
+
+LIM..:	bug <LIM..>
+	OUTSTR	[ASCIZ\
+[network passthrough exceeded TRU limit - please log off]
+\]
+	DISMIS
+
+ZAP..:	bug <ZAP..>
+	OUTSTR	[asciz "
+[network passthrough deleted]"]
+	HRROI	A,.AXSOB	;try to send an orange ball to "terminal"
+	HRL	A,TT
+	AUXCAL	A,
+	SETZ	A,
+	SKIPE	NTQFLG
+	 LOGOFF	A,
+	EXIT
+
+ORG.T:	PUSH	P,A
+	bug <ORG.T>
+	HRROI	A,.AXSOB	;send orange ball to PTY
+	HLL	A,PP
+	AUXCAL	A,
+	POP	P,A
+	DISMIS
+
+ORG.P:	PUSH	P,A
+	bug <ORG.P>
+	SKIPE	CHRTRN
+	  OUTSTR [asciz "{ob}"]
+	HRROI	A,.AXSOB	;send orange ball to TTY
+	HRL	A,TT
+	AUXCAL	A,
+	POP	P,A
+	DISMIS
+
+YEL.T:	PUSH	P,A
+	bug <YEL.T>
+	HRROI	A,.AXSYB	;send yellow ball to PTY
+	HLL	A,PP
+	AUXCAL	A,
+	POP	P,A
+	DISMIS
+
+YEL.P:	PUSH	P,A
+	bug <YEL.P>
+	SKIPE	CHRTRN
+	  OUTSTR [asciz "{yb}"]
+	HRROI	A,.AXSYB	;send yellow ball to TTY
+	HRL	A,TT
+	AUXCAL	A,
+	POP	P,A
+	DISMIS
+
+GOB.T:	PUSH	P,A
+	HRROI	A,.AXCBO	;send gobbler to PTY
+	HLL	A,PP
+	AUXCAL	A,
+	POP	P,A
+	bug <GOB.T>
+	DISMIS
+
+GOB.P:	PUSH	P,A
+	HRROI	A,.AXCBO	;send gobbler to TTY
+	HRL	A,TT
+	AUXCAL	A,
+	POP	P,A
+	SKIPE	CHRTRN
+	  OUTSTR [asciz "{cg}"]
+	bug <GOB.P>
+	DISMIS
+
+subttl	interrupt routines for terminal originated traffic
+;	T1-T4 are reserved for these routines
+
+CHR.T:	HRROI	T1,.AXI8S	;get next character
+	HRL	T1,TT
+	AUXCAL	T1,TC
+	 DISMIS			;no more characters
+	ANDI	TC,177		;strip off parity
+	SKIPE	CHWAIT#		;waiting?
+	 JRST	CHR.TX		;yes, handle it
+	CAMN	TC,CHRESC	;escape character?
+CHR.XX:	 JRST	[SETOM 	CHWAIT	;yes, handle it
+	 	 MOVEI	T1,^d3000
+		 SETTIM	T1,	;interrupt in 3 seconds
+		  JFCL
+		 JRST  	CHR.T]	;   and get more
+CHR.T0:	HRROI	T1,.AXO8	;no, output to PTY 
+	HLL	T1,PP
+	AUXCAL	T1,TC
+	SKIPN	ECHOFL		; echo enabled?
+	 JRST	CHR.T
+	HRROI	T1,.AXO8	;yes, output to TTY
+	HRL	T1,TT
+CHR.T1:	AUXCAL	T1,TC
+	CAIE	TC,15
+	 JRST	CHR.T
+	MOVEI	TC,12
+	JRST	CHR.T1
+
+CHR.TX:	SETZ	T1,
+	SETTIM	T1,		;cancel timer interrupt
+	 JFCL
+	CAMN	TC,CHRESC	;escape character?
+	 JRST	[SETZM	CHWAIT	;yes, clear flag
+		 SKIPE	CHRVRB	;verbose?
+		   OUTSTR [asciz "<exc>"]
+		 HRROI	T1,.AXO8;output to PTY 
+		 HLL	T1,PP
+		 AUXCAL	T1,TC
+		 JRST	CHR.TD]
+	SKIPE	CHRVRB		;verbose?
+	 OUTCHR	TC		;print the character
+	CAIN	TC,"?"		;help command?
+	 MOVEI	TC,"H"		;  sort of...
+	CAIN	TC,15		;<cr>?
+	 JRST	[HRROI	T1,.AXO8;output to PTY 
+		 HLL	T1,PP
+		 AUXCAL	T1,ACCUCH
+		 SETZM	ACCUCH	;clear accumulator
+		 JRST	CHR.TD]
+	CAIL	TC,"0"
+	 CAILE	TC,"7"
+	  SKIPA
+	   JRST [MOVE	T1,ACCUCH
+	   	LSH	T1,3
+		ANDI	TC,7
+		ADD	T1,TC
+		MOVEM	T1,ACCUCH
+		JRST	CHR.T]
+	CAIE	TC,"Y"		;yellow ball command?
+	 CAIN	TC,"y"
+	  JRST	[HRROI	T1,.AXSYB
+		HLL	T1,PP
+		AUXCAL	T1,
+		JRST	CHR.TD]
+	CAIE	TC,"H"		;help command?
+	 CAIN	TC,"h"		; ...
+	  JRST	[OUTSTR CHRHLP	;  print message
+		 JRST   CHR.TD]	;  and return
+	CAIE	TC,"Q"		;quit command?
+	 CAIN	TC,"q"		; ...
+	  JRST	ZAP..		;  so act like a circuit zap
+	CAIE	TC,"D"		;display command?
+	 CAIN	TC,"d"		; ...
+	  JRST	[SETCMM CHRTRN	;  toggle translate flag
+		 JRST	CHR.T9]	;  and return
+	CAIE	TC,"E"
+	 CAIN	TC,"e"
+	  JRST	[SETCMM ECHOFL	;  toggle echo flag
+	  	 JRST	CHR.T9]
+	CAIE	TC,"X"		;eXcape command?
+	 CAIN	TC,"x"		; ...
+	  JRST	[SKIPE CHRVRB	;  verbose messages?
+		  OUTSTR [ASCIZ\
+TAUX escape character: \]
+		 HRROI T1,.AXI8C
+		 AUXCAL T1,TC
+		  MOVEI	TC,"X"-100 ; if detached???
+		 ANDI  TC,177	; remove parity
+		 MOVEM TC,CHRESC
+		 SKIPE CHRVRB	;  verbose messages?
+		  OUTSTR [ASCIZ \[ok]\]
+		 JRST	CHR.TD]	;  and return
+	SKIPN	CHRVRB		; verbose?
+	 OUTCHI	7		;  no - beep
+	SKIPE	CHRVRB		; verbose?
+	 OUTSTR [asciz " ?illegal command - type <eXc>? for help"]
+CHR.TD:	SETZM	CHWAIT		;clear waiting flag
+	SKIPE	CHRVRB		;verbose?
+	 OUTSTR	[ASCIZ\
+\]
+	SETZM	CHRVRB		;cancel verbosity
+	JRST	CHR.T		;look for more
+
+CHR.T9:	SKIPN	CHRVRB		; verbose?
+	  JRST	CHR.TD		; no -- just return
+	SKIPN	CHRTRN		; turned on?
+	 OUTSTR	[ASCIZ \ [display functions disabled]\]
+	SKIPE	CHRTRN		; turned on?
+	 OUTSTR	[ASCIZ \ [display functions enabled]\]
+	JRST	CHR.TD
+	 
+CHRHLP:	ASCIZ \
+
+network passthrough commands:
+  <eXc>n<cr> - send character with octal value n
+  <eXc>D     - toggle Display control character mode
+  <eXc>E     - toggle local Echo mode
+  <eXc>H     - type this Help message (also ?)
+  <eXc>Q     - Quit and zap network connection
+  <eXc>X     - change eXcape character
+  <eXc>Y     - send Yellow ball
+  <eXc><eXc> - send <eXc> character
+where
+  <eXc> is the current network passthrough escape character
+
+\
+
+subttl	interrupt routines for PTY originated traffic
+;	P1-P4 are reserved for these routines
+
+CHR.P:	HRROI	P1,.AXI8S	;get next character
+	HLL	P1,PP
+	AUXCAL	P1,PC
+	 DISMIS			;no more characters
+	HRROI	P1,.AXO8	;output character
+	HRL	P1,TT
+	CAIL	PC," "		;control character
+	 JRST	CHR.P0		;no, continue
+	SKIPN	CHRTRN		;do we want translations
+	 JRST	CHR.P0		;no, continue
+	CAIN	PC,12		;known format character
+	 AUXCAL	P1,PC		;  lf -- printed as <lf>^J
+	CAIN	PC,15		;  cr -- printed as ^M<cr>
+	 SETOM	CHRCRF#		; yes, set flag
+	MOVEI	PC,"@"(PC)	; make it ascii
+	AUXCAL	P1,["^"]	; with a ^ in front
+CHR.P0:	AUXCAL	P1,PC
+	SKIPN	CHRTRN		;translations?
+	 JRST	CHR.P		; no, continue
+	SKIPE	CHRCRF		; was it a <cr>?
+	 AUXCAL	P1,[15]		;  yes -- print as ^M<cr>
+	SETZM	CHRCRF		;  only once per customer
+	JRST	CHR.P		;try again
+
+subttl	command line rescan and login string parsing routines
+
+glog:	rescan			;back up input
+	inchrw T3
+	caie T3,"T"		;run by "TAUX"?
+	 cain T3,"t"
+	  skipa
+	   jrst glog1		;no - presume run (spl)taux form
+glgt1:	inchrw	t3
+	cain T3,":"
+	 jrst glogc
+	caile T3,40
+	 jrst glgt1
+	caie T3,40
+	 jrst oldlog
+	jrst glog2
+glog1:	inchrw T3
+	caige T3,40
+	 jrst oldlog
+	caie T3,";"
+	 jrst glog1
+glog2:	move T1,[point 7,auxstr]
+	movei T2,^d17
+gl2lp:	inchrw T3		;eat to first real char (non spc,tab)
+	caie T3," "
+	 cain T3,11
+	  jrst gl2lp
+	caie T3,":"		;if he says :system, use his name
+	 jrst ldlp+1		; otherwise, presume normal
+glogc:	move T1,[point 7,auxstr]
+	movei	T2,^d17
+	hrroi T4,.gtunm 	;get user name of this job
+	gettab T4,
+	 halt .
+	hrroi P1,.gtun1 	;get user name of this job
+	gettab P1,
+	 halt .
+unmlup: jumpe T4,[exch T4,P1
+		  jumpn T4,.+1
+		  movei T3,":"
+		  jrst ldlp+1]
+	setz T3,
+	lshc T3,6
+	jumpe T3,unmlup
+	addi T3,40
+	idpb T3,T1
+	soja T2,unmlup
+ldlp:	inchrw T3
+	cain T3," "
+	jrst ldlp
+	cain T3,";"
+	jrst auxdon
+	cain T3,"/"
+	 jrst	[inchrw T3
+	 	cail T3,"a"
+		 subi T3,40
+	 	cain	T3,"E"
+		 SETCMM	ECHOFL
+		cain	T3,"D"
+		 SETCMM	CHRTRN
+		JRST	ldlp]
+	cain T3,15
+	jrst	[inchrw
+		jrst auxdon]
+	caig T3,"z"
+	caige T3,"a"
+	jrst .+2
+	subi T3,40
+	idpb T3,T1
+	sojg  T2,ldlp
+	movei T3,";"
+auxdon: idpb T3,T1
+	movei T3,0
+	idpb T3,T1
+	popj p,
+oldlog: cain T3,15
+	 inchrw T3	; skip <lf>
+	outstr [asciz "Login: "]
+	jrst glog2
+
+subttl	aux circuit error routines
+
+AUXERR:	hlrz 	T2,T1
+	xct	ercod(T2)
+	outstr	(T2)
+	reset
+	exit 1,
+ercod:	move  T2,err1(T1)
+	movei T2,[asciz "?AC lic required - too many circuits"]
+	movei T2,[asciz "?AC license required"]
+	movei T2,[asciz "?Monitor out of room"]
+	movei T2,[asciz "?No response from supervisor to request "]
+	movei T2,[asciz "?No response from supervisor to user name "]
+	movei T2,[asciz "?No circuit supplied by supervisor"]
+	movei T2,[asciz "?Error response from supervisor to request"]
+err1:	[asciz "?FUBAR"]
+	[asciz "?Login string format error"]
+	[asciz "?User name not in mud"]
+	[asciz "?Bad mud"]
+	[asciz "?Host not available"]
+	[asciz "?Dialout/downline-load protocol error"]
+	[asciz "?Monitor too slow - time out"]
+	[asciz "?Access barred"]
+	[asciz "?error code 8 from supervisor"]
+	[asciz "?error code 9 from supervisor"]
+	[asciz "?error code 10 from supervisor"]
+
+subttl	define interrupt vector and channel numbers
+
+VECDAT:	;; interrupt vectors
+define	INTDEF (x) < irp x <
+EXP 0,x				;;load vector table
+x'C==<.-VECDAT>/2		;;define interrupt channel number
+>>
+intdef	<TIM..,LIM..>
+intdef	<GOB.T,GOB.P>
+intdef	<CHR.T,ORG.T,YEL.T>
+intdef	<CHR.P,ORG.P,YEL.P>
+intdef	<NTQ..,ZAP..>
+VECLEN==.-VECDAT
+
+lit
+reloc	0
+var
+ECHOFL:	block 1			; flag for local echo
+CHRTRN:	block 1			; flag for translation "on"
+CHRESC:	block 1			; character to use for escape
+CHRVRB:	block 1			; verbose mode
+ACCUCH:	block 1			; character accumulator
+VECTOR:	block ^D72		; interrupt vector space
+
+end	START
+   
