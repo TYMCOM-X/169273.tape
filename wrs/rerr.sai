@@ -1,0 +1,505 @@
+begin	"RERR" 
+comment
+
+    Detect and report disk read errors:
+	May select structure, unit, or directory for testing.
+	Maps pages into 256 page ring buffer and prereferences them.
+	Pages are touched before being unmapped to be sure they were
+	    read in.
+	Report SDAT, SDEV, HDAT, HDEV errors occuring durring execution.
+	Report all available error data on errors.
+	Pages may be scanned in sequential or random order.
+	Typeing a character will reveal current status.
+
+    Known problems:
+	Random scan not implimented.
+	Unit and directory scan not implimented.
+	Not very much error data reported yet.
+;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+
+record!class	UNI (
+	integer	CHR;		! characteristics word;
+	integer	SIZ;		! size in pages;
+	integer	NAM;		! logical name in structure (DSKB1);
+	integer	UNI;		! unit name (BPA1);
+	integer	HID;		! home block ID (330101);
+	integer	SC;		! soft error count;
+	integer HC;		! hard error count;
+	integer HTC;		! hung transfer count;
+	integer HPC;		! hung position count;
+	integer	DVF );		! DVF argument to get UDB;
+record!pointer(UNI) array UNITAB[0:'77];
+
+boolean	RanMode;		! random mode flag;
+boolean	SoftMode;		! full error checking (SOFT too);
+
+simple integer procedure RANDOM;
+comment
+	RANDOM number generator [G.J.Mitchell and D.P.Moore]
+	See Knuth, Seminumerical Algorithms, 3.2.2 (7).
+	This generator has a period of at least 2^55 - 1.
+	Returns positive integers in the range [0,2^35).
+
+	X[n] = ( X[n-55] + X[n-24] ) mod M,	n > 54
+;
+begin
+    preload!with
+	06693921087, 20916145920, 03726381665, 02120791808, 21918499327,
+	23045633792, 13028978177, 30369457152, 27482946303, 00677319520,
+	23329909505, 10237407104, 12562863615, 23583478528, 15699061761,
+	32838424832, 14838849663, 01282136400, 12425015681, 19059337216,
+	01310745183, 19731324929, 30331201280, 22848134149, 09907614720,
+	04986725952, 34328998143, 12837635584, 14206509313, 20223206144,
+	00459723944, 05825805697, 01142353968, 19448749825, 07753103936,
+	19144464640, 17951801609, 22790188288, 10110877697, 27558003200,
+	06357807105, 32026519808, 30390099969, 14667759744, 22807002881,
+	01946453616, 09568725633, 05086190912, 29614639369, 33188376832,
+	23942436864, 26744828417, 33624058880, 23854376703, 27080177921;
+    own safe integer array X[0:54];
+    own integer N; 
+    N_ (N + 1) mod 55; 
+    return( X[N]_ X[N] + X[(N+31) mod 55] land '377777777777 );
+end;
+
+
+comment		NOERR
+
+    Process errors, allow user to select options.
+    Typical call is
+	do <operation> until NOERR ("operation failed")
+    where <operation> must set E to the error code,
+    and must set !SKIP! to fase in case of error.
+    Message is typed indicating nature of error, and contents of E.
+    User is given option of Retry, Continue, BAIL, DDT or Quit.
+;
+
+integer	E;		! global error variable;
+
+simple boolean procedure NOERR (string MSG);
+if !SKIP!
+    then return(true)
+    else begin
+	print (
+	    "?error: ", MSG, crlf,
+	    "? E=", cvos(!lh(E)), ",,", cvos(!rh(E)) );
+	while true do begin
+	    outstr( crlf&"?" );
+	    case inchrw of begin
+		["R"] begin outstr("etry"&crlf); return(false) end;
+		["C"] begin outstr("ontinue"&crlf); return(true) end;
+		["B"] begin outstr("AIL"); usererr(0,0,0,"B") end;
+		["D"] begin outstr("DT"); usererr(0,0,0,"D") end;
+		["Q"]["X"] begin outstr("uit"); usererr(0,0,0,"X") end;
+		[else] outstr("
+enter one of:
+  R	retry operation and continue
+  C	continue program (no retry)
+  B	enter BAIL
+  D	enter DDT
+  Q	quit")
+	    end;
+	end;
+    end;
+
+comment		printing form conversion routines
+
+    Convert certain internal data structures to printing form.
+;
+
+simple string procedure CVDP (integer DP);
+begin	
+    return( "DP="&cvos(DP land '000777777777) );
+end;
+
+simple string procedure UniText (record!pointer(UNI) U);
+return (
+    cvxstr(UNI:nam[u])& " ("&
+    cvxstr(UNI:uni[u])& ","&
+    cvxstr(UNI:hid[u])& ")"&
+    (if UNI:chr[u] land DC!OFL then " [offline]" else null)&
+    (if UNI:chr[u] land DC!HWP then " [protect]" else null)&
+    (if UNI:chr[u] land DC!USF then " [unsafe]" else null) );
+
+comment		Load structure data into internal data structures
+
+    Build a record structure of UNI records containing useful unit data.
+    Records are pointed to by UNITAB[ unit number ].
+;
+procedure LoadStr;
+begin
+    integer UNO,DVF;
+    own record!pointer(UNI) U;
+    own integer array A[0:'22];
+    A[0]_ 0; 
+    arrclr(UNITAB,null!record);
+    while A[0]_ calli(DVF_ A[0],calli!SYSPHY) do begin "UNIT"
+	do E_ calli(!xwd(arrinfo(A,0),location(A[0])),calli!DSKCHR)
+	    until NOERR("DSKCHR "&cv6str(A[0])&":");
+	UNO_ cvo(cvxstr(A['14])[5 to 6]);
+	if UNITAB[uno] then usererr(0,0,"?UNITAB["& cvos(UNO)& "]="&
+	    cv6str(UNI:NAM[UNITAB[uno]])& " adding "& cv6str(A['14]) );
+	U_ UNITAB[uno]_ new!record(UNI);
+	UNI:CHR[u]_ A['5];
+	UNI:SIZ[u]_ A['6];
+	UNI:NAM[u]_ A['14];
+	UNI:UNI[u]_ A['15];
+	UNI:HID[u]_ A['16];
+	UNI:DVF[u]_ DVF;
+    end "UNIT";
+end;
+
+comment		Check for SDAT, SDEV, HDAT, HDEV, etc
+
+    Check particular unit for recent device/data errors.
+    Report error to terminal in detail.
+;
+procedure ErrCheck ( record!pointer(UNI) U );
+begin
+!
+	unit data block locations defined in COMMOD (sorta guarenteed)
+;
+    define UNINAM = '00;	! unit name;
+    define UNIHCT = '10;	! # hard errors;
+    define UNISCT = '11;	! # soft+hard errors;
+    define UNIMCT = '12;	! # monitor detected errors;
+    define UNIERR = '13;	! last hard error status;
+    define UNISOF = '14;	! last soft or hard error status;
+    define UNIHBN = '15;	! logical block of last hard error;
+    define UNIHNG = '24;	! # trans hung,,# posn hung;
+    define UNISDI = '32;	! last soft error DATAI;
+    define UNIHDI = '33;	! last hard error DATAI;
+    define UNIECT = '34;	! # retries on last error;
+    define UNISBN = '35;	! logical block of last soft error;
+    define UNISBH = '57;	! hard error status block;
+    define UNISBS = '63;	! soft error status block;
+    define UNILEN = '67;	! number of words to read;
+!
+	register print conversion
+;
+    simple procedure print!CONI( integer CONI );
+    begin
+	print( "  CONI=", cvos(CONI), ";" );
+	if CONI land !bit(09) then print( " WPT" );
+	if CONI land !bit(10) then print( " SEL" );
+	if CONI land !bit(11) then print( " CON" );
+	if CONI land !bit(12) then print( " LEN" );
+	if CONI land !bit(13) then print( " EQC" );
+	if CONI land !bit(14) then print( " EQP" );
+	if CONI land !bit(15) then print( " UXC" );
+	if CONI land !bit(16) then print( " ATN" );
+	if CONI land !bit(17) then print( " BSY" );
+	if CONI land !bit(18) then print( " CNT" );
+	if CONI land !bit(19) then print( " DTA" );
+	if CONI land !bit(20) then print( " RCV" );
+	if CONI land !bit(21) then print( " INV" );
+	if CONI land !bit(22) then print( " SRC" );
+	if CONI land !bit(23) then print( " PAR" );
+	if CONI land !bit(24) then print( " NXM" );
+	if CONI land !bit(25) then print( " OVR" );
+	if CONI land !bit(26) then print( " UNK" );
+	if CONI land !bit(27) then print( " PRT" );
+	if CONI land !bit(28) then print( " BIP" );
+	if CONI land !bit(29) then print( " BOP" );
+	if CONI land !bit(30) then print( " CMR" );
+    end;
+    simple procedure print!RMA( integer RMA );
+    begin
+	print( "  RMA=",cvos( RMA ) );
+    end;
+    simple procedure print!RDA( integer RDA ); ! aka DATAI ;
+    begin
+	print( "  UNO=",cvos( ldb( point( 3,RDA,6 ))),
+	    " CYL=",cvos( ldb( point( 12,RDA,19 ))),
+	    " TRK=",cvos( ldb( point( 8,RDA,27 ))),
+	    " SEC=",cvos( ldb( point( 8,RDA,35 ))) );
+    end;
+    simple procedure print!RCMD( integer RCMD );
+    begin
+	integer I;
+	print( "  RCMD=", cvos(RCMD), ";" );
+	if RCMD land !bit(00) then print( " UNT" );
+	if RCMD land !bit(01) then print( " UWP" );
+	if RCMD land !bit(02) then print( " UNR" );
+	if RCMD land !bit(03) then print( " UOC" );
+	if RCMD land !bit(04) then print( " USE" );
+	if RCMD land !bit(05) then print( " UF" );
+	if RCMD land !bit(06) then print( " UA" );
+	if RCMD land !bit(07) then print( " HDECC" );
+	if RCMD land !bit(08) then print( " CI" );
+!	if RCMD land !bit(09) then print( " SECC" );
+	if RCMD land !bit(10) then print( " HECC" );
+	if RCMD land !bit(11) then print( " ROE" );
+	if RCMD land !bit(12) then print( " WOE" );
+	if RCMD land !bit(13) then print( " SOE" );
+	if RCMD land !bit(14) then print( " IPE" );
+	if RCMD land !bit(15) then print( " USC" );
+	if RCMD land !bit(16) then print( " REL" );
+	if RCMD land !bit(17) then print( " RECAL" );
+	if RCMD land !bit(18) then print( " FC" );
+	if RCMD land !bit(19) then print( " ?19" );
+	if RCMD land !bit(20) then print( " ?20" );
+	if RCMD land !bit(21) then print( " SOM" );
+	if RCMD land !bit(22) then print( " SOP" );
+	if RCMD land !bit(23) then print( " CFM" );
+	case I_ ldb(point(3,RCMD,26)) of begin
+	    [0] print( " READ" );
+	    [1] print( " WRPG" );
+	    [3] print( " WRSF" );
+	    [4] print( " CTLF" );
+	    [5] print( " SEEK" );
+	    [else] print( " ?CMD",I )
+	end;
+	if RCMD land !bit(27) then print( " M32" );
+	if RCMD land !bit(35) then print( " MPE" );
+    end;
+    simple procedure print!LBN( integer LBN );
+    begin
+	print( "  LBN=", cvos(LBN) );
+    end;
+!
+	local variables
+;
+    integer SDEV,SDAT;		! soft errors since last check;
+    integer HDEV,HDAT;		! hard errors since last check;
+    integer HTI;		! hung transfers since last check;
+    integer HPI;		! hung positions since last check;
+    own integer array UDB[-3:UNILEN];! SYSDVF argument block;
+!
+	Get UDB for unit
+;
+    UDB[-3]_ !SDUNI;		! get disk unit data block;
+    UDB[-2]_ UNI:DVF[u];	! logical pointer;
+    do E_ calli( !xwd(arrinfo(UDB,0),location(UDB[-3])), calli!SYSDVF )
+	until NOERR( "SYSDVF .SDUNI "&cv6str(UDB[-2]) );
+    if UDB[uninam] land cvsix("__") neq cvsix("AP") 
+	then usererr(0,0,"?compiled for APX: "&cv6str(UDB[uninam]),"X");
+!
+	Compute number of errors since last time
+;
+    HDEV_ !lh(UDB[unihct]) - !lh(UNI:HC[u]); 
+    HDAT_ !rh(UDB[unihct]) - !rh(UNI:HC[u]); 
+    SDEV_ !lh(UDB[unisct]) - !lh(UNI:SC[u]) - HDEV; 
+    SDAT_ !lh(UDB[unisct]) - !lh(UNI:SC[u]) - HDAT; 
+    UNI:HC[u]_ UDB[unihct];
+    UNI:SC[u]_ UDB[unisct];
+    HTI_ !lh(UDB[unihng]) - UNI:HTC[u]; 
+    HPI_ !rh(UDB[unihng]) - UNI:HPC[u];
+    UNI:HTC[u]_ !lh(UDB[unihng]);
+    UNI:HPC[u]_ !rh(UDB[unihng]);
+!
+	report errors
+;
+    if SDEV or SDAT then begin
+	if SDEV + SDAT > 1 then print( "%",SDEV+SDAT-1," soft errors unaccounted",crlf );
+	print( if SDEV then "SDEV:" else "SDAT:" );
+	print!LBN( UDB[unisbn] );
+	print!CONI( UDB[unisof] );
+	print( "  CNT=",UDB[uniect],"." );
+	print( crlf );
+	print!RCMD( UDB[unisbs] );
+	print( crlf );
+	print!RDA ( UDB[unisdi] );
+	print( crlf );
+    end;
+    if HDEV or HDAT then begin
+	if HDEV + HDAT > 1 then print( "%",HDEV+HDAT-1," hard errors unaccounted",crlf );
+	print( if HDEV then "HDEV:" else "HDAT:" );
+	print!LBN( UDB[unihbn] );
+	print!CONI( UDB[unierr] );
+	print( "  CNT=",UDB[uniect],"." );
+	print( crlf );
+	print!RCMD( UDB[unisbh] );
+	print( crlf );
+	print!RDA ( UDB[unisdi] );
+	print( crlf );
+    end;
+    if HTI then begin
+	print( "Hung transfer: ",crlf );
+    end;
+    if HPI then begin
+	print( "Hung position: ",crlf );
+    end;
+
+end;
+
+comment		Virtual memory management and mapping routines
+
+    Array bounds of PGDP determine pages used for buffer ring.
+    PGDP[ VM page ] is zero if the page is free, or is the disk pointer
+    if the page is in use.  PG is the ring pointer for both filling and
+    emptying.
+;
+integer array PGDP['400:'777];	! VM to DP translation;
+integer PG;			! page to map next;
+integer C;			! channel for super maps;
+integer	EOF;			! channel EOF variable;
+
+simple procedure SuperMapIni;
+begin
+    arrclr( PGDP );		! clear page translation table;
+    PG_ arrinfo( PGDP, 1 );	! start with first page in ring;
+end;
+require SuperMapIni initialization;
+
+simple procedure ClearPage (integer PG);
+comment
+    Touch page to make sure its been read in.
+    Check for errors and report them.
+    Unmap page.
+;
+if PGDP[pg] then begin
+    integer S;
+    S _ memory[PG lsh 9];	! reference the page;
+    do S_ E_ calli( PG, calli!PAGSTS ) until NOERR( "PAGSTS" );
+    if S land ( PS!DER+PS!DTE+PS!OER+PS!PAR ) then begin
+	print( "Page:  ", CVDP(PGDP[pg]), "  PAGSTS=", cvos(S), ";" );
+	if S land PS!DER then print( " PS.DER" );
+	if S land PS!DTE then print( " PS.DTE" );
+	if S land PS!OER then print( " PS.OER" );
+	if S land PS!PAR then print( " PS.PAR" );
+	print( crlf );
+    end;
+    do E_ calli( !xwd( 1, PG ),calli!VCLEAR ) until NOERR( "VCLEAR" );
+    PGDP[pg] _ 0;
+end;
+
+procedure FlushPages ( record!pointer(UNI) U );
+comment
+    ClearPage all pages still in use.
+;
+begin
+    for PG_ arrinfo( PGDP, 1 ) upto arrinfo( PGDP, 2 ) do
+	if PGDP[pg] then begin
+	    ClearPage( PG );
+	    if SoftMode then ErrCheck( U );
+	end;
+    PG_ arrinfo( PGDP, 1 );
+end;
+
+procedure SuperMap ( record!pointer(UNI) U; integer DP );
+comment
+    If next slot in ring is busy, ClearPage it.
+    Super map a new disk page into next slot in ring.
+    Add it to the working set.
+    Pre-reference it.
+;
+begin	"SUPERMAP"
+    own integer array A[0:1];
+    if PGDP[pg] then ClearPage( PG );
+    PGDP[pg] _ DP lor !bit(0);
+    A[0] _ !bit(7) + !hl(1) + PG;
+    A[1] _ ldb( point( 19,DP,35 ));
+    do E_ chnior(C,A[0],!chSMP) until NOERR(".CHSMP, "&CVDP(DP));
+    do E_ calli(A[0],calli!PERSET) until NOERR("PERSET");
+    A[0] _ !hl( !WSRNG ) + location( A[1] );
+    A[1] _ !bit(7) + !hl(1) + PG;
+    do E_ calli(A[0],calli!WSCTL) until NOERR("WSCTL fn .WSRNG");
+    do E_ calli(PG,calli!PREREF) until NOERR("PREREF");
+    if PG = arrinfo( PGDP, 2 )
+	then PG _ arrinfo( PGDP, 1 )
+	else PG _ PG +1;
+    if SoftMode then ErrCheck( U );
+end;
+
+comment		Top Level Test Procedures
+
+	TestUnit (UNO)		- test unit UNO
+;
+
+procedure TestUnit( integer UNO );
+begin "UNIT"
+    integer I;			! temp;
+    integer DP;			! used for disk pointer;
+    record!pointer(UNI) U;	! points to unit data record;
+    if null!record = U_ UNITAB[uno] then return;
+    print( UniText( U ), crlf );
+!
+    open channel to unit for super IO
+;
+    do begin
+	open( C_GETCHAN,cv6str(UNI:nam[u]),0,0,0, 0,0,EOF );
+	!SKIP! _ EOF = 0; E _ EOF;
+    end until NOERR("OPEN("&cv6str(UNI:nam[u])&")");
+!
+    map all disk pages from unit
+;
+    for I_ 0 upto UNI:siz[u]-1 do begin "PAGE"
+	DP_ if RanMode then Random mod UNI:siz[u] else I;
+	case INCHRS of begin
+	    ["S"][" "] outstr( "  "&CVDP(DP)&crlf );
+	    ["Q"] begin outstr( "uit"&crlf ); return end;
+	    ["?"] outstr( "One of: Status Quit"&crlf );
+	    [else]
+   	end;
+	SuperMap( U, DP );
+    end "PAGE";
+!
+    cleanup pages left in ring 
+;
+    FlushPages( U );
+    release( C );
+end "UNIT";
+
+procedure DoSystem; 
+outstr("?not implimented"&crlf);
+
+procedure DoUnit( string ARG );
+begin
+    Testunit( cvd(ARG) );
+end;
+
+procedure DoUser( string ARG );
+outstr("?not implimented"&crlf);
+
+begin	"MAIN"
+    integer BT;			! break table for commands;
+    setbreak( BT_getbreak," "&#lf,#cr,"SINK");
+    ttyup( true );		! convert TTY input to upper case;
+    LoadStr;			! load structure data into records;
+    SoftMode_ true;		! default is SOFT ON;
+    RanMode_ false;		! default is SEQUENTIAL;
+    do begin 
+	integer B;		! break character;
+	string CMD,ARG;		! command and arguments;
+	simple boolean procedure C( string T );
+	return( equ(T[1 to length(CMD)],CMD) );
+	define !!CMD!BEG = {if length(CMD)=0 then begin};
+	define !!CMD(XXX) = {end else if C("XXX") then begin};
+	define !!CMD!END = {end else outstr( "?illegal command: "&CMD&crlf )};
+	outstr( "*" );
+	ARG_ inchwl;
+	CMD_ scan( ARG,BT,B );
+	if CMD="?" then CMD_ "HELP";
+	!!CMD!BEG		! check for command, process it;
+	    !!CMD(SYSTEM) DoSystem;
+	    !!CMD(UNIT) DoUnit( ARG );
+	    !!CMD(USER) DoUser( ARG );
+	    !!CMD(RANDOM) RanMode_ true;
+	    !!CMD(SEQUENTIAL) RanMode_ false;
+	    !!CMD(SOFT) if equ(ARG,"ON") or equ(ARG,"OFF") or length(ARG)=0
+		then SoftMode_ not equ(ARG,"OFF")
+		else outstr( "?use SOFT ON or SOFT OFF"&crlf );
+	    !!CMD(LOG) setprint( ARG,(if length(ARG) then "B" else "T") );
+	    !!CMD(BAIL) usererr(0,0,0,"B");
+	    !!CMD(DDT) usererr(0,0,0,"D");
+	    !!CMD(QUIT)	done;
+	    !!CMD(HELP) outstr( "One of:
+  System	- run diagnostic on system structure
+  Unit <name>	- run diagnostic on unit
+  User <name>	- run diagnostic on directory
+  Random	- set random mode
+  Sequential	- set sequential mode (default)
+  Soft [ON]	- check for soft errors (default)
+  Soft OFF	- don't check for soft errors
+  Log <file>	- log output to file
+  Bail		- enter SAIL interactive debugger
+  DDT		- enter DDT
+  Help
+  Quit
+");	!!CMD!END;
+    end until false;
+end	"MAIN"
+end $
