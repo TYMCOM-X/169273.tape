@@ -1,0 +1,913 @@
+entry;
+begin	"MAILIB"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+require "FLIB.REQ" source!file;
+
+! 20-Jun-86 WRS		changed address scanning to prevent possible loops;
+
+define MyNetwork = {"Tymnet"};
+
+define gettab(i,t) = {calli(!xwd(i,t),calli!GETTAB)};
+redefine calli!SETNMW = -'145;	! new mail waiting;
+
+internal boolean maiNeedMailer;
+! indicates an operation was performed which requires the MAILER;
+
+integer LineBreak,LabelBreak,AddrBreak,QuoteBreak,TrimBreak;
+integer EOTBreak,TokenBreak,SlantBreak;
+simple procedure BrkIni;
+begin
+    setbreak( LineBreak:=getbreak,#lf&#ff,#cr,"IS" );
+    setbreak( LabelBreak:=getbreak,":"," "&#ht,"IS" );
+    setbreak( AddrBreak:=getbreak,"<>:;,.@{}\""()"&#lf," "&#ht&#cr,"IS" );
+    setbreak( QuoteBreak:=getbreak,"""",null,"IS" );
+    setbreak( TrimBreak:=getbreak," "&#ht&#cr&#lf&#ff,null,"RX" );
+    setbreak( EOTBreak:=getbreak,#eot,null,"IS" );
+    setbreak( TokenBreak:=getbreak,#lf&#ht&" ,;",#cr&#ht&" ","TIS" );
+    setbreak( SlantBreak:=getbreak,"/\"," ","IS" );
+    maiNeedMailer := false;
+end;
+require BrkIni initialization;
+
+internal record!class mai (
+    string	RCPT;
+    string	Received;
+    string	Return.path;
+    string	Reply.to;
+    string	From;
+    string	Sender;
+    string	Date;
+    string	To;
+    string	Cc;
+    string	Bcc;
+    string	Message.ID;
+    string	Keywords;
+    string	Subject;
+    string	Resent.from;
+    string	Resent.date;
+    string	Resent.to;
+    string	Resent.cc;
+    string	Other;
+    string	Text );
+    
+internal record!class adr (
+    string	User;
+    string	SubHost;
+    string	Host;
+    string	Net );
+
+comment
+    AddrScan - scan an address string using the breaktable AddrBreak and
+    handle the "" {} and \ quoting conventions.  Return one token and
+    break character.
+;
+string procedure AddrScan( reference string Addr; reference integer B );
+begin
+    string S;
+    integer CurlyCnt, QuoteCnt;
+    S := null;
+    B := QuoteCnt := CurlyCnt := 0;
+    while length(Addr) do begin
+	S := S& scan( Addr, AddrBreak, B );
+	case B of begin
+	    ["\"] lop(Addr);
+	    [""""] if not CurlyCnt then QuoteCnt := QuoteCnt xor 1;
+	    ["{"] if not QuoteCnt then CurlyCnt := CurlyCnt + 1;
+	    ["}"] if CurlyCnt > 0 then CurlyCnt := CurlyCnt - 1;
+	    [else] if CurlyCnt = 0 and QuoteCnt = 0 then done
+	end;
+	S := S& B;
+    end;
+    return( S );
+end;
+
+internal string procedure maiTrim( string S );
+begin
+    integer B;
+    scan( S, TrimBreak, B );
+    while length(S) and S[inf for 1] leq " " do S := S[1 to inf-1];
+    return( S );
+end;
+
+internal string procedure maiCatList( reference string L; string S );
+begin
+    return( L := if length(L)
+	then L& ","& S
+	else S
+    );
+end;
+
+preload!with
+    " ??? "," Jan "," Feb "," Mar "," Apr "," May ",
+    " Jun "," Jul "," Aug "," Sep "," Oct "," Nov "," Dec ";
+string array MONTH[0:12];
+
+simple string procedure cvDate( integer DECD );
+begin
+    integer Y,M,D;
+    D := DECD mod 31 + 1;
+    M := DECD % 31 mod 12 + 1;
+    Y := DECD % (31*12) + 64;
+    if DECD < 0 or Y > 94
+	then return( "?? ??? ??" );
+    return( cvs(D) & MONTH[M] & cvs(Y) );
+end;
+
+simple string procedure cvTime( integer SECS );
+begin
+    integer A,B;
+    string S;
+    getformat( A,B );
+    S := cvs( SECS % 3600 ) &  ":";
+    setformat(-2,0);
+    S := S & cvs( SECS % 60 mod 60 ) & ":" &
+        cvs( SECS mod 60 );
+    setformat( A,B );
+    return( S );
+end;
+
+simple string procedure cvZone( integer Z,D(0),T(0) );
+begin
+    own safe integer array X[0:2];
+    X[0] := D;
+    X[1] := T;
+    X[2] := !xwd( Z, Z land '37 );
+    calli( location(X[0]), calli!DATUUO );
+    return( if X[1] neq T
+	then case Z land '37 of (	! daylight time;
+	    ['06] "HDT", ['10] "PDT", ['11] "MDT", ['12] "CDT",
+	    ['13] "EDT", ['14] "ADT",
+	    [else] "???YXWVUTSRQPONZABCDEFGHIJKLM???"[Z to Z] & "+" )
+	else case Z land '37 of (	! standard time;
+	    ['06] "HST", ['10] "PST", ['11] "MST", ['12] "CST",
+	    ['13] "EST", ['14] "AST", ['20] "UT",
+	    [else] "???YXWVUTSRQPONZABCDEFGHIJKLM???"[Z to Z] )   );
+end;
+
+internal string procedure maiDate;
+!
+    Date:
+	Return current local date and time in form
+		WWW, DD MMM YY HH:MM:SS ZZZ
+	as recommended in RFC #822.
+;
+begin
+    integer D;			! date - days past 1 Jan 1964, UT;
+    integer T;			! time - tics past midnight UT;
+    integer Z;			! zone - user local time zone w/daylight flag;
+    string DOW;			! day of week (local);
+    integer array X[0:2];
+    define DaysPast = '400000;	! flag for days past format date;
+    define DecForm  = '000000;	! flag for DEC format date;
+    define UT       = '20;	! monitor's offset for UT;
+    do begin
+	D := calli( !xwd( !cnDAT, !gtCNF ), calli!GETTAB );
+	T := calli( !xwd( !cnTIM, !gtCNF ), calli!GETTAB );
+    end until D = calli( !xwd( !cnDAT, !gtCNF ), calli!GETTAB );
+    Z := (calli(!xwd(-1,!gtPRV),calli!GETTAB) lsh (7-35)) land '77;
+    if Z = 0 then Z := UT;	! default to Universal Time;
+    X[0] := D;
+    X[1] := T;
+    X[2] := !xwd( DaysPast+UT, DaysPast+Z );
+    calli( location(X[0]), calli!DATUUO );	! convert to local time;
+    DOW := case X[0] mod 7 of ("Wed","Thu","Fri","Sat","Sun","Mon","Tue");
+    X[2] := !xwd( DaysPast+Z, DecForm+Z );
+    calli( location(X[0]), calli!DATUUO );	! convert to DEC format;
+    return(
+	DOW& ", "&
+	cvDate( X[0] )& " "&
+	cvTime( X[1] % 60 )& " "&
+	cvZone( Z, X[0],X[1] )   );
+end;
+
+internal string maiName;
+internal string maiHost;
+internal string maiNet;
+internal r!p(adr) maiMyAddress;
+
+procedure MyIni;
+begin
+    maiMyAddress := new!record( adr );
+    maiName := adr:User[maiMyAddress] :=
+	cv6str(calli(!xwd(-1,-'22),'41))&
+	cv6str(calli(!xwd(-1,-'21),'41));
+    maiHost := adr:Host[maiMyAddress] :=
+	cvstr(calli(!xwd(0,'11),'41))[1 to 1]&
+	cvs(calli(!xwd('33,'11),'41));
+    maiNet := adr:Net[maiMyAddress] :=
+	MyNetwork;
+end;
+simple procedure MyIniSimple; MyIni;
+require MyIniSimple initialization[0];
+
+internal r!p(mai) procedure maiMParse( string TXT );
+!
+    Mail Parse:
+	Return record containing parsed message supplied in TXT.
+;
+begin
+    r!p(mai) T;
+    integer B;
+    string F,V;
+    T := new!record(mai);
+    while length( V := scan( TXT, LineBreak, B ) ) do begin
+	while TXT = #ht or TXT = " " do
+	    V:= V& " "& maiTrim( scan( TXT, LineBreak, B ));
+	F := scan( V, LabelBreak, B );
+	V := maiTrim( V );
+	if kequ(F,"RCPTto") then maiCatList( mai:RCPT[t], V )
+	else if kequ(F,"Received") then mai:Received[t] :=
+	    maI:Received[t]& "Received: "& V& crlf
+	else if kequ(F,"Return-path") then mai:Return.path[t] := V
+	else if kequ(F,"Reply-to") then mai:Reply.to[t] := V
+	else if kequ(F,"From") then mai:From[t] := V
+	else if kequ(F,"Sender") then mai:Sender[t] := V
+	else if kequ(F,"Date") then mai:Date[t] := V
+	else if kequ(F,"To") then maiCatList( mai:To[t], V )
+	else if kequ(F,"Cc") then maiCatList( mai:Cc[t], V )
+	else if kequ(F,"Bcc") then maiCatList( mai:Bcc[t], V )
+	else if kequ(F,"Message-id") then mai:Message.id[t] := V
+	else if kequ(F,"Keyword") or kequ(F,"Keywords")
+	    then mai:Keywords[t] := V
+	else if kequ(F,"Subject") then mai:Subject[t] := V
+	else if kequ(F,"Resent-From") then mai:Resent.from[t] := V
+	else if kequ(F,"Resent-Date") then mai:Resent.Date[t] := V
+	else if kequ(F,"Resent-To") then maiCatList( mai:Resent.To[t], V )
+	else if kequ(F,"Resent-Cc") then maiCatList( mai:Resent.Cc[t], V )
+	else mai:Other[t] := mai:Other[t]& F& ": "& V& crlf;
+    end;
+    mai:Text[t] := TXT;
+    if not equ(TXT[inf-1 for 2],crlf) then mai:Text[t] := mai:Text[t]& crlf;
+    return( T );
+end;
+
+procedure cat!wrap( reference string S; string S0,S1(null),S2(null),S3(null) );
+begin
+    string SS;
+    integer B, N, POS;
+    POS := 0;
+    for N := 0 upto 3 do begin
+	SS := case N of (S0,S1,S2,S3);
+	while length(SS) do begin
+	    string T;
+	    T := scan( SS, TokenBreak, B );
+	    if B > " " then T := T& B;
+	    if POS + length(T) + 1 geq 80	! longest line is 79 chars;
+		then begin
+		    S := S& crlf& #ht& T;
+		    POS := 8 + length(T);
+		end
+		else if POS
+		    then begin
+			S := S& " "& T;
+			POS := POS + 1 + length(T);
+		    end
+		    else begin
+			S := S& T;
+			POS := POS + length(T);
+		    end;
+	    if B = #lf then begin
+		S := S& crlf;
+		POS := 0;
+	    end;
+	end;
+    end;
+end;
+
+internal string procedure maiMMake( r!p(mai) T );
+!
+    Mail Make:
+	Make (or unparse) the parsed message in record T.
+;
+begin
+    string S;
+    S := null;
+    if length(mai:RCPT[t])
+	then cat!wrap( S, "RCPT To: ", mai:RCPT[t], crlf );
+    if length(mai:Received[t])
+	then cat!wrap( S, mai:Received[t] );
+    if length(mai:Return.path[t])
+	then cat!wrap( S, "Return-path: ", mai:Return.path[t], crlf );
+    if length(mai:Reply.to[t])
+	then cat!wrap( S, "Reply-to: ", mai:Reply.to[t], crlf );
+    if length(mai:From[t])
+	then cat!wrap( S, "From: ", mai:From[t], crlf );
+    if length(mai:Sender[t])
+	then cat!wrap( S, "Sender: ", mai:Sender[t], crlf );
+    if length(mai:Date[t])
+	then cat!wrap( S, "Date: ", mai:Date[t], crlf );
+    if length(mai:To[t])
+	then cat!wrap( S, "To: ", mai:To[t], crlf );
+    if length(mai:Cc[t])
+	then cat!wrap( S, "Cc: ", mai:Cc[t], crlf );
+    if length(mai:Bcc[t])
+	then cat!wrap( S, "Bcc: ", mai:Bcc[t], crlf );
+    if length(mai:Message.ID[t])
+	then cat!wrap( S, "Message-id: ", mai:Message.ID[t], crlf );
+    if length(mai:Keywords[t])
+	then cat!wrap( S, "Keywords: ", mai:Keywords[t], crlf );
+    if length(mai:Subject[t])
+	then cat!wrap( S, "Subject: ", mai:Subject[t], crlf );
+    if length(mai:Resent.From[t])
+	then cat!wrap( S, "Resent-from: ", mai:Resent.From[t], crlf );
+    if length(mai:Resent.Date[t])
+	then cat!wrap( S, "Resent-date: ", mai:Resent.Date[t], crlf );
+    if length(mai:Resent.To[t])
+	then cat!wrap( S, "Resent-to: ", mai:Resent.To[t], crlf );
+    if length(mai:Resent.Cc[t])
+	then cat!wrap( S, "Resent-cc: ", mai:Resent.Cc[t], crlf );
+    if length(mai:Other[t])
+	then cat!wrap( S, mai:Other[t] );
+    S := S& crlf& mai:Text[t];
+    if not equ(S[inf-1 for 2],crlf) then S := S& crlf;
+    return( S );
+end;
+
+internal string procedure maiAScan(
+    reference string RawAddr;
+    reference integer B );
+comment
+    Address Scan:
+	Return the first address from an address or path list in RawAddr.
+	Addresses are seperated by colon, semicolon or comma.
+;
+begin
+    integer PB;		! parenthesis brackets;
+    integer AB;		! angle brackets;
+    string ADR;
+    while length(RawAddr) do begin
+	Adr := RawAddr;
+	PB := AB := 0;
+	while true do begin
+	    AddrScan( RawAddr, B );
+	    case B of begin
+		["("] PB := PB + 1;
+		[")"] if PB>0 then PB := PB - 1;
+		["<"] AB := AB + 1;
+		[">"] if AB>0 then AB := AB - 1;
+		[";"][","][":"] if PB=0 and AB=0 then done;
+		[0] done;
+		[else]
+	    end;
+	end;
+	Adr := maiTrim( Adr[1 to inf-length(RawAddr)-(if B then 1 else 0)] );
+	RawAddr := maiTrim( RawAddr );
+	if length(Adr)
+	    then return( Adr );
+    end;
+    return( null );
+end;
+
+internal string procedure maiPLop(
+	reference string Path;
+	reference integer B  );
+comment
+	Lop the first At-Domain off the front of PATH.  If none exist,
+	return the mailbox and do not alter the PATH.
+;
+begin
+    integer PB;		! parenthesis brackets;
+    integer AB;		! angle brackets;
+    string ADR;
+    while length(Path) do begin
+	Adr := Path;
+	PB := AB := 0;
+	while true do begin
+	    AddrScan( Path, B );
+	    case B of begin
+		["("] PB := PB + 1;
+		[")"] if PB>0 then PB := PB - 1;
+		["<"] begin
+		    if AB=0 then Adr := Path;
+		    AB := AB + 1;
+		end;
+		[">"] begin
+		    if PB=0 and AB<2 then done;
+		    if AB>0 then AB := AB - 1;
+		end;
+		[";"][","][":"] if PB=0 and AB<2 then done;
+		[0] done;
+		[else]
+	    end;
+	end;
+	Adr := Adr[1 to inf-length(Path)-(if B then 1 else 0)];
+	Path := maiTrim( Path );
+	if B=">"
+	    then Path := Adr& ">"& Path
+	    else if length(Path) = 0
+		then Path := Adr;
+	if AB then Path := "<"& Path;
+	if length(Adr)
+	    then return( Adr );
+    end;
+    return( null );
+end;
+
+internal string procedure maiFPath( r!p(mai) T );
+!
+    Forward Path:
+	Return the forward path in string form based on the
+	To, Cc and Bcc fields in parsed message T.
+;
+begin
+    string S;
+    if length(mai:RCPT[T]) then return( mai:RCPT[T] );
+    S := mai:To[t];
+    maiCatList( S, mai:Cc[t] );
+    maiCatList( S, mai:Bcc[t] );
+    return( S );
+end;
+
+internal string procedure maiRPath( r!p(mai) M );
+!
+    Return Path:
+	Return the return path in string form based on the
+	Return-path, From and Sender fields in parsed message T.
+;
+begin
+    string S;
+    integer B;
+    if length(mai:Return.path[M]) then return(mai:Return.path[M]);
+    S := if length(mai:Resent.from[M])
+	then mai:Resent.from[M]
+	else if length(mai:Sender[M]) 
+	    then mai:Sender[M]
+	    else mai:From[M];
+    return( maiAScan( S, B ));
+end;
+
+preset!with
+	"TYMNET",
+	"ARPA",
+	"UUCP";
+internal string array maiTopDomains[1:3];
+
+internal boolean procedure maiIsTop( string DOMAIN );
+begin
+    integer I;
+    for I := 1 upto 3 do
+	if kequ( DOMAIN, maiTopDomains[i] ) then
+	    return( true );
+    return( false );
+end;
+
+internal r!p(adr) procedure maiAParse( string Addr );
+begin
+    r!p(adr) A;
+    integer STATE, PNC, ABC;
+    string SaveToken;
+    procedure PUSH( string S );
+    begin
+	if length(adr:SubHost[A])
+	    then adr:SubHost[A] := adr:SubHost[A]& "."& adr:Host[A]
+	    else adr:SubHost[A] := adr:Host[A];
+	adr:Host[A] := adr:Net[A];
+	adr:Net[A] := S;
+    end;
+    A := new!record(adr);
+    STATE := 0;		! initially scanning local-part;
+    PNC := 0;		! initially no parenthesis nesting count;
+    ABC := 0;		! angle bracket count;
+    while length( Addr ) do begin
+	string S;
+	integer B;
+	label DoQuote;
+	S := AddrScan( Addr, B );
+	case B of begin
+	    ["@"] if PNC = 0 then begin
+		adr:User[a] := adr:User[a]& S;
+		STATE := 1;
+	    end;
+	    ["."] if PNC = 0 then case STATE of begin
+		[0] adr:User[a] := adr:User[a]& S& ".";
+		[1] PUSH( S )
+	    end;
+	    ["("] begin
+		if PNC = 0 then SaveToken := S;
+		PNC := PNC + 1;
+	    end;
+	    [")"] begin
+		if PNC > 0 then PNC := PNC - 1;
+		if PNC = 0 then Addr := SaveToken& Addr;
+	    end;
+	    ["<"] if PNC = 0 then begin
+		adr:User[a] := adr:Host[a] := adr:Net[a] := null;
+		STATE := 0;
+	    end;
+	    [">"][","][":"][";"][0] if PNC = 0 then begin
+		case STATE of begin
+		    [0] adr:User[a] := adr:User[a]& S;
+		    [1] PUSH( S )
+		end;
+		done;
+	    end
+	end;
+    end;
+    if not maiIsTop( adr:Net[a] ) then
+	PUSH( adr:Net[maiMyAddress] );
+    if length(adr:User[a])=0 then adr:User[a] := adr:User[maiMyAddress];
+    if length(adr:SubHost[a])=0 then adr:SubHost[a]:=adr:SubHost[maiMyAddress];
+    if length(adr:Host[a])=0 then adr:Host[a] := adr:Host[maiMyAddress];
+    if length(adr:Net[a])=0 then adr:Net[a] := adr:Net[maiMyAddress];
+    return( a );
+end;
+
+internal string procedure maiAMake( r!p(adr) A );
+begin
+    string S;
+    S := adr:User[a];
+    if length(adr:SubHost[a]) or length(adr:Host[a]) or length(adr:Net[a])
+	then S := S& "@";
+    if length(adr:SubHost[a])
+	then S := S& adr:SubHost[a]& ".";
+    if length(adr:Host[a])
+	then S := S& adr:Host[a]& ".";
+    S := S& adr:Net[a];
+    return( S );
+end;
+
+internal boolean procedure maiRunMailer;
+!
+    Run Mailer:
+	Unconditionally run the mailer program (MAIL)MAILER in a child
+	frame.  Do not wait for completion, ignore errors.
+;
+begin "MAILER"
+    preload!with 5,cvsix("DSK"),0,cvsix("MAILER"),0,0,cvsix("MAIL"),0;
+    own safe integer array MAILER[0:7];
+    MAILER[2] := location(MAILER[6]);
+    start!code
+	define T1=1;
+	protect!acs T1;
+	SETOM	!SKIP!;
+	MOVSI	T1,!FOCFM;
+	uuo!FRMOP  T1,[0];		! create frame ;
+	 SETZM	!SKIP!;
+	HRLI	T1,!FORUN;
+	uuo!FRMOP  T1,MAILER[0];	! run MAILER in the frame ;
+	 SETZM	!SKIP!;
+    end;
+    maiNeedMailer := maiNeedMailer and not !skip!;
+    return( !skip! );
+end	"MAILER";
+
+internal boolean procedure maiSend;
+!
+    Send:
+	Cause immediate processing of queued messages by running the
+	mailer.  If no messages have been queued, no action is taken.
+;
+return( if maiNeedMailer then maiRunMailer else true );
+
+integer	DataPtr,DataLen;
+
+procedure NeedData;
+begin
+    own integer array X[0:5];
+    integer PG,NPG;
+    r!p(FILE) F;
+    label fail;
+    if DataPtr then return;
+    F := fOpen( "(MAIL)MAILER.DAT", "r" );
+    if not !SKIP! then goto fail;
+    DataLen := file:LKB[f][!rbSIZ];
+    NPG := (DataLen + '777) lsh (-9);
+    PG := fAlloc( NPG );
+    if not PG then goto fail;
+    DataPtr := PG lsh 9;
+    X[0] := !bit(7) + !hl(NPG) + PG;
+    X[1] := 1;
+    chnior( file:Chan[f], X[0], '35 );
+    if not !SKIP! then begin
+fail:	usererr(0,0,"MAILIB: failure(s) mapping (MAIL)MAILER.DAT","C");
+	DataPtr := location( X[0] := 0 );
+	DataLen := 0;
+    end;
+    fClose( f );
+end;
+
+string procedure UserHash( string UNAME );
+begin
+    integer Chan;
+    integer array LKB[-2:3];		! block for extended lookup;
+    LKB[-2] := cvsix(UNAME[1 for 6]);	! save user name in sixbit;
+    LKB[-1] := cvsix(UNAME[7 for 6]);
+    LKB[0] := 3;			! size of LKB;
+    LKB[1] := calli('16,'41);		! MFD PPN;
+    LKB[2] := location(LKB[-2]);	! addr of SIXBIT user name;
+    LKB[3] := cvsix("UFD");		! extension;
+    open( Chan:=getchan, "DSK", 0,0,0, 0,0,!SKIP! );
+    chnior( Chan, LKB[0], !chLK );	! lookup UFD to get PPN;
+    release( Chan );
+    return( if !lh(LKB[2]) then "'"&cvos(LKB[2])&".MAI" else null );
+end;
+
+string procedure CheckLocal( string UName );
+begin
+    string QFile,User,FName;
+    integer B;
+    boolean NoForward;
+    label FWD;
+    r!p(FILE) f;
+    if kequ( UName, "POSTMASTER" )
+	then UName := "MAIL";
+    NoForward := UName = "!";
+    if NoForward then lop(UName);
+    User := scan( FName := UName, SlantBreak, B );
+    if B then begin
+	QFile := "("& User& ")"& FName;
+	F := fOpen( QFile, "rbx:.TUM" );
+	QFile := file:Name[F];
+	if not file:EOF[F]
+	and kequ( input( file:Chan[F], TokenBreak ), "#TUMS" ) then begin
+	    string S;
+	    S := input( file:Chan[F], TokenBreak );
+	    qu( S, "ARCHIVE" ) then begin
+		fClose( F );
+		return( QFile );
+	    end;
+	    if kequ( S, "DISTRIBUTION" )
+	    or kequ( S, "LIST" ) then begin
+		if file:Break[F] neq #lf then
+		    input( file:Chan[F], LineBreak );
+		goto FWD;
+	    end;
+	end;
+	fClose( F );
+	return( null );
+    end;
+    QFile := UserHash( UName );
+    if length(QFile) and not NoForward then begin
+	f := fOpen( "("&UName&")MAIL.FWD", "rbx" );
+	if not file:EOF[f] then begin
+FWD:	    QFile := '1;
+	    while not file:EOF[f] do
+		QFile := QFile& input( file:Chan[f], 0 );
+	end;
+	fClose( f );
+    end;
+    return( QFile );
+end;
+
+internal string procedure maiQFile( string RCPT );
+begin
+    r!p(adr) A;
+    string S;
+    A := maiAParse( RCPT );
+    if kequ(adr:Net[a],adr:Net[maiMyAddress])
+	then begin
+	    if cvd(adr:Host[a])=0 and cvd(adr:Host[a][2 to inf])
+		then lop(adr:Host[a]);
+	    if kequ(adr:Host[a],adr:Host[maiMyAddress][2 to inf])
+		then return( CheckLocal( adr:User[a] ))
+		else return( adr:Host[a]& ".Q" );
+	end
+	else return( adr:Net[a]& ".Q" );    
+end;
+
+internal procedure maiWaiting( integer AUN; string FROM(null) );
+begin
+    integer JOB,MYJOB,HIGHJB;
+    MYJOB := calli(0,calli!PJOB);
+    HIGHJB := gettab(!nsHJB,!gtnsw);
+    if not !SKIP! then usererr(0,0,"?maiWaiting: license SY required","X");
+    for JOB := 1 upto HIGHJB do
+	if AUN = gettab( JOB, !gtAUN ) and JOB neq MYJOB then begin
+	    string MSG;
+	    integer PORT;
+	    integer array X[0:1];
+	    MSG := #bel&
+		"  [mail "&
+		(if length(FROM)
+		    then "from "&FROM
+		    else "waiting")&
+		"]"& crlf&
+		(if gettab(JOB,!gtPRV) land (3*!bit(28))
+		    then "-"
+		    else (if !rh(gettab(JOB,!gtLIC))
+			then "!"
+			else "."))&
+		#nul;
+	    PORT := cvo(cvxstr(gettab(JOB,!gtLIN))[4 to 6]);
+	    if (gettab( JOB, !gtSTS ) geq 0)
+	    and (gettab( PORT, !gtLPS ) = 1) then begin
+		X[0] := JOB;
+		X[1] := memory[location(MSG)];
+		calli( !xwd('10,location(X[0])), calli!SETUUO );
+	    end
+	    else begin
+		X[0] := gettab(JOB,!gtUNM);
+		X[1] := gettab(JOB,!gtUN1);
+		calli( location(X[0]), calli!SETNMW );
+		calli( JOB, calli!SETNMW );
+	    end;
+	end;
+end;
+
+!	maiQueue:	support routines and data structures
+
+    maiQueue scans addresses of all recipients and builds a data structure off
+    of qHead.  qHead points to a list of Q records linked through q:Link[].
+    Each Q record describes a queue file to be used for local queing.
+    q:File[] is the name of the file including extension, but not user name.
+    q:qeHead[] points to a list of QE records linked through qe:Link[].
+    Each QE record describes a recipient for that instanciation of the
+    message.  For example, for a particular message, if q:File[] contains
+    EMSAA.Q, q:qeHead[] would point to a list of all recipients on EMSAA
+    (Ontyme).  Duplicate entries are removed from the queue by ENQ.  After
+    the data structure has been completely built, maiQueue loops through
+    appending one copy of the message to each file denoted by each Q
+    record.  The header will contain a RCPT field for all associated
+    recipients (QE records).
+;
+
+record!class QE (
+    string	Addr;
+    r!p(QE)	Link );
+record!class Q (
+    string	File;
+    r!p(QE)	qeHead;
+    r!p(Q)	Link );
+
+procedure ENQ( reference r!p(Q) qHead; string File, Addr );
+begin
+    r!p(Q) QI;
+    r!p(QE) QEI;
+    QI := qHead;
+    while QI do if kequ(q:File[qi],File)
+	then done
+	else QI := q:Link[qi];
+    if not QI then begin
+	QI := new!record( Q );
+	q:File[qi] := File;
+	q:Link[qi] := qHead;
+	qHead := qi;
+    end;
+    QEI := q:qeHead[qi];
+    while QEI do if kequ(qe:Addr[qei],Addr)
+	then done
+	else QEI := qe:Link[qei];
+    if not QEI then begin
+	QEI := new!record( QE );
+	qe:Addr[qei] := Addr;
+	qe:Link[qei] := q:qeHead[qi];
+	q:qeHead[qi] := qei;
+    end;
+end;
+
+external recursive procedure maiRTS(
+    r!p(mai) M;
+    string LINE1(null), LINE2(null), LINE3(null), LINE4(null) );
+
+procedure EnqList( reference r!p(Q) qHead; string FPath );
+begin
+    string array QQ[1:10];	! recursion stack;
+    integer QI;			! stack pointer;
+    string QFile,RCPT;
+    integer B;
+    QQ[QI_1] := FPath;
+    while QI > 0 do begin
+	while length( QQ[QI] ) do begin
+	    RCPT := maiAScan( QQ[QI], B );
+	    QFile := maiQFile( maiPLop( RCPT, B ) );
+	    case QFile of begin
+		[1] if QI < arrinfo(QQ,2) 
+		    then QQ[QI_QI+1] := QFile[2 to inf];
+		[else] ENQ( qHead, QFile, RCPT )
+	    end;
+	end;
+	QI := QI - 1;
+    end;
+end;
+
+internal boolean recursive procedure maiQueue( r!p(mai) T );
+!
+    Queue mail for delivery:
+	Parsed message in T is checked, processed and appended to the
+	appropriate queue(s).  Local delivery takes place immediately.
+	MaiSend may be called following one or more maiQueue calls to
+	effect immediate delivery to non-local destinations (if any).
+;
+if T then begin
+    r!p(adr) A;
+    r!p(Q) qHead;
+    string MSG,FPath;
+    if length(mai:To[t])=0 and length(mai:Cc[t])=0 and length(mai:Bcc[t])=0
+	then return( false );
+    if length(mai:From[t])=0
+	then mai:From[t] := maiAMake( A := maiMyAddress );
+    if length(mai:To[t])=0 and length(mai:Bcc[t])=0
+	then mai:To[t] swap mai:Cc[t];
+    if length(mai:Date[t])=0
+	then mai:Date[t] := maiDate;
+    FPath := maiFPath( T );
+    mai:RCPT[t] := null;
+    MSG := maiMMake( T );
+    EnqList( qHead, FPath );
+    while qHead do begin
+	r!p(QE) QEI;
+	mai:RCPT[t] := null;
+	QEI := q:qeHead[qHead];
+	while QEI do begin
+	    maiCatList( mai:RCPT[t], qe:Addr[qei] );
+	    QEI := qe:Link[qei];
+	end;
+	if length(q:File[qHead])
+	    then begin
+		r!p(FILE) F;
+		F := fOpen( q:File[qHead], "ab300T0E:(MAIL)" );
+		if not file:EOF[F]
+		    then begin "Send Message"
+			boolean Local;
+			Local := !lh(file:LKB[F][!rbEXT]) = !lh(cvsix("MAI"));
+			maiNeedMailer := maiNeedMailer or not Local;
+			cprint( file:Chan[f],
+			    "RCPT To: ", mai:RCPT[t], crlf,
+			    MSG, #eot );
+			if Local then
+			    maiWaiting( cvo(q:File[qHead][2 to inf]),
+				mai:From[t] );
+		    end "Send Message"
+		    else begin "Return Message"
+			maiRTS( T, fErrMsg );
+		    end "Return Message";
+		fClose( f );
+	    end
+	    else maiRTS( T, "Invalid address(s):", mai:RCPT[t] );
+	qHead := q:Link[qHead];
+    end;
+    return( true );
+end;
+
+internal recursive procedure maiRTS(
+    r!p(mai) M;
+    string LINE1(null), LINE2(null), LINE3(null), LINE4(null) );
+!
+    Return To Sender:
+	Take parsed message M and return it to its sender as
+	indicated by the Return Path (maiRPath).  The returned
+	message is included in the body of the return notice
+	along with comments LINE1-LINE4.
+;
+begin	"Return To Sender"
+    r!p(mai) X;
+    X := new!record(mai);
+    mai:From[X] := "Postmaster";
+    mai:To[X] := maiRPath( M );
+    mai:Subject[X] := "Returned MAIL";
+    mai:Text[X] :=
+	"The following message was not delivered because:"& crlf&
+	LINE1& crlf& LINE2& crlf& LINE3& crlf& LINE4& crlf&
+	"----------"& crlf&
+	maiMMake( M );
+    if not kequ( mai:To[X], mai:To[M] )
+	then maiQueue( X )
+	else print( "?maiRTS: dead letter follows..."& crlf, mai:Text[X] );
+end	"Return To Sender";
+
+internal integer procedure maiFEMessage(
+    procedure UserProc;
+    string QName;
+    boolean DeleteQ(false) );
+!
+    For Each Message (in file QName):
+	Call user procedure UserProc.  The message is passed
+	unparsed as a reference string argument to UserProc.
+	If DeleteQ is true, the file will be deleted.
+;
+begin
+    integer CNT;
+    r!p(FILE) F;
+    string S;
+    CNT := 0;
+    F := fOpen( QName, if DeleteQ then "ux300T4b4E" else "rx4b4E" );
+    if not file:EOF[F] then begin
+	if DeleteQ then begin
+	    file:LKB[F][!rbNAM] := !xwd( gettab(-1,!gtUID),gettab(-1,!gtPNO) );
+	    file:LKB[F][!rbEXT] := cvsix("FEM") lor !rh(file:LKB[F][!rbEXT]);
+	    fRename( F );
+	    fSelect( F, !chLK );
+	end;
+	while not file:EOF[f] do begin
+	    S := null;
+	    do S := S& input( file:Chan[f], EOTBreak )
+	    until file:Break[f] or file:EOF[f];
+	    scan( S, TrimBreak, file:Break[f] );
+	    if length( S ) then begin
+		UserProc( S );
+		CNT := CNT + 1;
+	    end;
+	end;
+	if DeleteQ then
+	    fRename( F, null );
+	fClose( F );
+    end
+    else if file:EOF[F] neq !xwd(-1,!erFNF) then usererr( 0,0,fErrMsg,"X" );
+    return( CNT );
+end;
+
+end	"MAILIB"
+$
+ 	@vã
