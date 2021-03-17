@@ -1,0 +1,640 @@
+comment 
+! NODLOD: - Node loader program for 2020
+! Author: - J.M.Stammers May 29, 1980
+! Revised:- J.M.Stammers July 1, 1980 ( include node adjacent load)
+!
+!
+!
+! Revised:- J.W.Rice August 21, 1980  ( remove completion time-out msg)
+! "  "  ":      Comment out 4th line from end of "LOAD" procedure.
+! "  "  ":      Add "outstr("[Process complete.]"&CRLF)"
+!
+! Revised:- D.R.Ernst June 1,1981: add message for acquiring PDP-11
+!	    Eliminate KMC question.
+!	    Changed resetting and loading messages.
+!	    Require confirmation for adjacent question and dr11 #.
+!	    Delay several seconds before declaring 11 active to KMC.
+!	    Changed quit to not set PDP-11 active if load did not 
+!		succeed. 
+!	    Added checks for existant pdp-11s and adjusted range of 
+!		valid numbers to type or eliminated asking of question 
+!		if one dr.
+!	    Fixed bug that sent zero length blocks as the last block
+!		of a load. A zero length message will cause the node to
+!		start prematurely.  When the real start message is sent,
+!		the node did not respond and gave the "Can't send word 
+!		to node" error message.
+!	    Added code to send "leave load mode" message to load device 
+!		and zap aux cir immediately.
+!	    Added check for oper license.
+!	    Changed "CINT" to remove all characters in circuit after an 
+!		interrupt and to ignore line-feeds.
+!	    Added some help info in response to a typed "?".
+!	    Fixed terminal mode setting bug.
+!	    Added "cursor wiggling" to inform user of progress in 
+!		loading. 
+!
+! Revised:- S.D.Daniels 6-October-1983 (August/Tops20)
+!	remove all node adjacent code, allow AUGUST/SYSTEMXXV
+!	eliminate the need for character interrupts on AUGUST
+!		(since AUGUST cannot provide such an interrupt)
+!	... incomplete
+!
+! Purpose:-
+!	   This program is intended to be used to down line
+!	   a node image into a node on a local network to the
+!	   host 2020, running TYMCOM - XX. It goes through a
+!	   question and answer period and then loads the data
+!	   into the specified node.
+;
+begin	"nodlod"
+define august=true;
+define	! = "COMMENT";
+
+IFCR declaration(tymcom.x) and not declaration(august)
+	THENC define august = not tymcom.x; ENDC 
+IFCR not declaration(august)
+	THENC define august = declaration(gtjfn); ENDC 
+IFCR not declaration(tymcom.x) 
+	THENC define tymcom.x = not august; ENDC
+
+IFCR tymcom.x THENC require " Tymcom-X version" message; ENDC
+IFCR august THENC require " August version" message; ENDC
+IFCR (tymcom.x=0)=(august=0) 
+	THENC require " OS contradiction " message; ENDC
+
+require processes;
+require 25 polling!interval;
+
+item intpro;
+simple procedure intini; intset(intpro,0);
+require intini initialization[2];
+
+item cctblt;
+simple procedure eventini; mkevtt(cctblt);
+require eventini initialization[2];
+
+! strings (mostly one-character strings);
+define	CRLF	=	"('15&'12)"
+,	CTRLC	=	"('3&null)"
+,	BELL	=	"('7&null)"
+,	BS	=	"('10&null)"
+,	TAB	=	"('11&null)"
+,	LF	=	"('12&null)"
+,	CR	=	"('15&null)"
+,	CTRLU	=	"('25&null)"
+,	ESC	=	"('33&null)"
+,	DEL	=	"('177&null)"
+;
+
+define	PREFIX	=	'2307
+,	BLKLEN	=	10
+,	DEFALT	=	128
+,	START	=	0	
+,	  long!pause  = 5
+,	  short!pause = 1
+;
+
+
+! replies from the node:
+;
+define	Link.reply.OK = '100	
+,	Link.reply.Illegal.node.name	= '101
+,	Link.reply.No.such.node		= '102
+,	Link.reply.node.not.idle	= '103
+,	Link.reply.checksum.error	= '104
+,	Link.reply.packet.overflow	= '105
+,	Link.reply.protocol.error	= '106
+,	Link.reply.finished		= '107
+,	Link.reply.node.timed.out	= '110
+,	Link.reply.refused.by.protocol.module = '111
+,	Link.reply.no.hardware.present	='112
+;
+! adjacent=false, want!kmc11=false, selected=false;
+
+integer	dskchn	! file with the node image in it.;
+,	dskeof	! eof associated with the above;
+,	port	! the port to the node to be loaded;
+; 
+
+boolean	connected
+;
+
+string	nodnam
+,	lognod
+,	imgfil
+;
+external 
+boolean	!SKIP!;
+
+
+integer simple procedure lh(integer word); ! return left halfword;
+start!code  hlrz 1,word; end;
+
+
+integer simple procedure rh(integer word); ! return right halfword;
+start!code  hrrz 1,word; end;
+
+forward procedure quit(string s);
+IFCR TYMCOM.X THENC
+! TYMCOM-X page: ;
+
+require "(sys)proces.def" source!file;
+require "(sailib)tymint.def" source!file;
+
+define getchar="inchrw", getstr="inchwl";
+
+string procedure default!image!name( string node!name );
+	return( "(SYS)SV" & node!name & ".IMG" );
+
+procedure pre!lookup;
+begin
+open(dskchn _ getchan, "DSK", '750010, 5,0, 0,0,dskeof);
+	! the mode is: return all errors, binary i/o;
+if dskeof then quit("[Can't open disk channel]");
+end;
+
+boolean procedure do!lookup( string name );
+begin	boolean flag;
+dskeof := false;
+lookup(dskchn, name, flag);
+if flag or dskeof then print(CRLF, "[Can't lookup ", name, "]" & CRLF);
+return( not flag );
+end;
+
+
+define	gettab	= '41
+,	gtlic	= -'20
+,	creaux	= -'44
+,	zapcir	= -'45
+,	ciopr	= -'140
+,	hiber	= '72
+,	echon	= '0
+,	echoff	= '210
+,	axi8s	= '1
+,	axo8	= '3
+,	axcfs	= '1000064
+;
+
+
+! I/O procedures;
+simple procedure pause( integer time(long!pause) );
+	calli( time+(1 lsh 18), HIBER ); 
+
+simple procedure echo( boolean turn!it!on );
+if false
+ then auxclv(-1, if turn!it!on then ECHON else ECHOFF, AXCFS)
+ else print("Ignoring echo ",(if turn!it!on then "ON" else "OFF"),crlf);
+
+boolean procedure confirm( string proposition );
+	begin print( proposition ); return( getchar = CR ); end;
+
+! TYMNET port procedures;
+
+boolean simple procedure port!read( reference integer ch );
+	begin ch _ auxclv(port,0,AXI8S); return(!SKIP!); end;
+
+simple procedure port!write( integer byte );
+	auxclv( port, byte, AXO8 );
+
+simple procedure port!zap;
+	calli(port,ZAPCIR);
+
+forward procedure cint; 
+forward procedure zint;
+
+procedure getaux(string logstr; integer drn); 
+				! create aux cct to load device;
+begin "getaux"
+	integer array foo[0:length(logstr)%5];
+	integer i;
+print(CRLF,"Connecting to node ", lognod, "..");
+for i _ 1 step 5 until length(logstr)
+  do foo[i%5] _ cvasc(logstr[i for 5]);
+port _ calli(location(foo[0]) + (drn lsh 33), CREAUX);
+if !SKIP!	! set up interrupts;
+ then begin	own safe integer array intblock, zapblock[1:2];
+	connected _ true;
+	intblock[1] _ 2;
+	intblock[2] _ (-1 lsh 18) + location(cint);
+	intmap(tinass(port,1,'10),dfrint,
+	      (-2 lsh 18) + location(intblock[1]));
+	enable(newenb('10));
+	zapblock[1] _ 2;
+	zapblock[2] _ (-1 lsh 18) + location(zint);
+	intmap(tinass(port,7,'11),dfrint,
+	      (-2 lsh 18) + location(zapblock[1]));
+	enable(newenb('11));
+  end
+else case lh(port) of begin
+     [0][7] case rh(port) of begin
+		 [1] quit(CRLF&"[Format error]");
+		 [2] quit(CRLF&"[Tymnet username error]");
+		 [3] quit(CRLF&"[Tymnet mud error]");
+		 [4] quit(CRLF&"[Can't access load device]");
+		 [5] quit(CRLF&"[Tymnet downline request error]");
+		 [6] quit(CRLF&"[Timeout]");
+		 [7] quit(CRLF&"[Access barred]");
+		 [8] quit(CRLF&"[Out of originating ports]");
+		 [9] quit(CRLF&"[Aux circuit queue full]");
+		 ELSE quit(CRLF&"Unknown error: " & cvos(port))
+	    end;
+     [1][2]	quit(CRLF&"[Insufficient license - AC not set]");
+     [3]	quit(CRLF&"[No room for DDB]");
+     [4][5][6]	quit(CRLF&"[No response from node "&lognod&"]");
+     [8]	quit(CRLF & "[Node " & lognod 
+			& " or intervening node not up]");
+     ELSE	quit(CRLF&"Unknown error: " & cvos(port))
+    end;
+end "getaux";
+
+procedure check!user!status;
+begin	integer license; 
+license _ calli(GTLIC,GETTAB);
+if (license land '100000) = 0 or !SKIP! = 0
+ then quit("[Insufficient license]");
+end;
+
+ENDC
+IFCR AUGUST THENC
+! AUGUST page: ;
+! DEFINE QUANTUM(X)= "(X LSH 18)",
+!	STRINGSTACK(X)="(X LSH 14)",
+!	PSTACK(X)="(X LSH 8)",
+!	SUSPHIM="'10",
+!	SUSPME="'2",
+;
+define	priority(x)="(x lsh 4)"	! for sprout;
+,	runme=1			! for sprout;
+,	wait=2			! for interrogate;
+;
+
+
+string procedure default!image!name( string node!name );
+	return( "<SYSTEM>SV" & node!name & ".IMG" );
+
+define getstr="intty";
+
+simple integer procedure getchar;  
+begin	integer character;
+return( if '37 neq (character _ charin('100)) then character else CR );
+end;
+
+procedure pre!lookup; begin end;
+
+boolean procedure do!lookup( string name );
+begin
+if 0 > dskchn _ openfile( name, "ROE" )
+ then print(CRLF, "[Can't lookup ", name, "]" & CRLF)
+ else setinput( dskchn, 0,0,dskeof );
+return( 0 <= dskchn );
+end;
+
+
+! I/O procedures;
+simple integer procedure !jsys( integer jsys!number, ac1, ac2(0) );
+start!code
+	setom	!skip!;
+	move	1,ac1;
+	move	2,ac2;
+	jsys	@jsys!number;
+	 setzm	!skip!;
+end;
+
+simple procedure pause( integer time(long!pause) );
+	!jsys( '167, time * 1000 );	! disms: dismissal in millisecs;
+
+simple procedure echo( boolean turn!it!on );
+    print("Ignoring echo ", (if turn!it!on then "ON" else "OFF"),crlf);
+
+boolean procedure confirm( string proposition );
+	begin print( proposition ); return( getchar = CR ); end;
+
+! TYMNET port procedures;
+
+simple integer procedure !tymop( integer subop, ac2(0) );
+	return(!jsys('654, (subop lsh 18) + (port land '777777), ac2));
+
+boolean simple procedure port!read( reference integer ch );
+start!code	label readit, return;
+	move	1,port;
+	jsys	'102;	! sibe;
+	 jrst	readit;
+	movei	1,0;	! false: no character to get;
+	jrst	return;
+readit:	jsys	'50;	! bin;
+	movem	2,ch;
+	hrroi	1,-1;	! true: got a character;
+return:
+end;
+
+simple procedure port!write( integer byte );
+	!jsys( '51, port, byte );	! BOUT;
+
+simple procedure port!zap;
+	!tymop( '14 );	! auxrls;
+
+forward procedure cint; 
+forward procedure zint;
+
+procedure timer;
+begin
+    cint;
+reset!timer!for!1!second;
+end;
+
+procedure getaux(string logstr; integer drn); 
+				! create aux cct to load device;
+begin "getaux"
+	integer array foo[0:length(logstr)%5];
+	integer i;
+print(CRLF,"Connecting to node ", lognod, "..");
+for i _ 1 step 5 until length(logstr)
+  do foo[i%5] _ cvasc(logstr[i for 5]);
+
+port _ !tymop( '540001, point(7,foo[0],-1) );	
+	! auxbld + wait + no host-to-host + loginstring in ac2;
+if !SKIP!	! set up interrupts, it succeeded;
+ then begin	own safe integer array intblock, zapblock[1:2];
+	connected _ true;
+	intblock[1] _ 2;
+	intblock[2] _ (-1 lsh 18) + location(timer);
+	psimap( 1, dfrint, (-2 lsh 18) + location(intblock[1]), 3 );
+	enable( 1 );
+!...; ati( 1, '31 );	! really wanted for port, not controlling tty;
+	zapblock[1] _ 2;
+	zapblock[2] _ (-1 lsh 18) + location(zint);
+	psimap( 2, dfrint, (-2 lsh 18) + location(zapblock[1]), 3 );
+	enable( 2 );
+	ati( 2, 35 );	! cause is: zap on some held circuit.;
+  end
+else case lh(port) of begin
+     [0][7] case rh(port) of begin
+		 [1] quit(CRLF&"[Format error]");
+		 [2] quit(CRLF&"[Tymnet username error]");
+		 [3] quit(CRLF&"[Tymnet mud error]");
+		 [4] quit(CRLF&"[Can't access load device]");
+		 [5] quit(CRLF&"[Tymnet downline request error]");
+		 [6] quit(CRLF&"[Timeout]");
+		 [7] quit(CRLF&"[Access barred]");
+		 [8] quit(CRLF&"[Out of originating ports]");
+		 [9] quit(CRLF&"[Aux circuit queue full]");
+		 ELSE quit(CRLF&"Unknown error: " & cvos(port))
+	    end;
+     [1][2]	quit(CRLF&"[Insufficient license - AC not set]");
+     [3]	quit(CRLF&"[No room for DDB]");
+     [4][5][6]	quit(CRLF&"[No response from node "&lognod&"]");
+     [8]	quit(CRLF & "[Node " & lognod 
+			& " or intervening node not up]");
+     ELSE	quit(CRLF&"Unknown error: " & cvos(port))
+    end;
+end "getaux";
+
+procedure check!user!status; begin end;	! just let it fail;
+
+ENDC
+procedure quit(string	arg); ! exit procedure, optional diag message;
+begin	"quit"	own string recursion;
+if length(recursion) then call(0,"EXIT") else recursion := arg&"x";
+print(BELL, arg);		! give message;
+port!zap;			! kill the aux circuit;
+echo(true);
+call(1,"EXIT");
+end	"quit";
+IFCR not declaration(getstr) THENC
+string procedure getstr; ! general string input routine with editting;
+begin	"getstr"
+	integer chr;
+	string local;
+local _ NULL;
+while (chr _ getchar) neq CR and chr neq LF do
+  begin if chr = DEL then 
+	  begin local _ local[1 for INF-1];
+		print(BELL & BS & " " & BS);
+	  end
+	else if chr = TAB then
+	  begin print(" ");
+		local _ local & chr;
+	  end
+	else if chr = CTRLU then
+	  begin while length(local) > 0 do
+		  begin local _ local[1 for INF-1];
+			print(BS & " " & BS);
+		  end;
+		print(BELL);
+	  end
+	else if chr = ESC or
+		chr = CTRLC then quit(NULL)
+	else if chr < " " then print(BELL)
+	else 
+	  begin if "a" leq chr leq "z" then chr _ chr - '40;
+		print(chr & null);
+		local _ local & chr;
+	  end;
+  end;
+return(local);
+end	"getstr";
+ENDC
+procedure cint;	! call when there may be characters on the circuit;
+begin "cint"
+integer ch;
+
+while TRUE do
+begin
+    if not port!read(ch) then return;
+    case ch of begin
+	[LF] begin end; ! OK but ignore [was return: SDD];
+	[Link.reply.OK] [Link.reply.finished] cause(cctblt,ANY);
+	[Link.reply.Illegal.node.name]	quit(CRLF&"[Illegal node name]");
+	[Link.reply.No.such.node]	quit(CRLF&"[No such node]");
+	[Link.reply.node.not.idle]	quit(CRLF&"[Node not idle]");
+	[Link.reply.checksum.error]	quit(CRLF&"[Checksum error]");
+	[Link.reply.packet.overflow]	quit(CRLF&"[Packet overflow]");
+	[Link.reply.protocol.error]	quit(CRLF&"[Protocol error]");
+	[Link.reply.node.timed.out]	quit(CRLF&"[Node timed out]");
+	[Link.reply.refused.by.protocol.module] 
+				quit(CRLF&"[Refused by protocol module]");
+	[Link.reply.no.hardware.present]
+				quit(CRLF&"[No hardware present]");
+    ELSE
+	quit(CRLF&"[Unknown node error "&cvos(ch)&"]")
+    end;
+end;
+end "cint";
+
+procedure zint; ! circuit zapper software interrupt routine;
+begin "zint"
+if connected then quit(CRLF&"[Lost circuit to node "&lognod&"]");
+end "zint";
+
+item nulljob;
+procedure nulljobproc;
+begin "nulljobproc"
+ while TRUE do begin pause; poll; end;
+end "nulljobproc";
+
+simple procedure nulljobini;
+sprout(nulljob,nulljobproc,priority(15)+runme);
+require nulljobini initialization[2];
+procedure getnod; ! ask for node number to load;
+begin "getnod"
+pre!lookup;
+setbreak(1,",",null,"IS");
+while TRUE do
+  begin		string line;
+		integer	brchar;
+	print("Specify node number to load: ");
+	while equ((line _ getstr), NULL) do
+	   print(CRLF, "[Enter node number]", CRLF,
+		  "[Specify node number to load]: ");
+	nodnam _ scan(line,1,brchar);
+	if equ(nodnam,"?") then
+	    begin
+		print(CRLF, "Enter the node name of the PDP-11"&
+			" you wish to load", CRLF&CRLF);
+		continue;
+	    end;
+	if brchar = 0 then
+		imgfil _ default!image!name( nodnam )
+	    else if equ(imgfil _ line,"?") then
+			   begin
+				print(CRLF,"Type an alternate file to load",CRLF);
+				continue;
+			   end;
+	if do!lookup(imgfil) then done;
+  end;
+print(CRLF);
+end "getnod";
+integer procedure getdr; ! get dr11c logical number;
+begin "getdr"
+integer drbits,drmax;
+drmax _ 3;
+
+if drmax < 1 then return(0);
+while TRUE do
+    begin	integer dr.number;
+	print("Specify DR11C [0:", cvos(drmax), "]: ");
+	dr.number _ getchar;
+	if dr.number = CR then dr.number _ "0";
+	if dr.number = ESC or dr.number = CTRLC then quit(NULL);
+	if dr.number = "?" then print("?",CRLF,
+	    "Enter the DR11C number of the node directly connected",CRLF,
+	    "to the host computer which is being loaded,", CRLF,
+	    "or the directly connected node from which to build", CRLF,
+	    "a circuit to the neighbor node", CRLF, CRLF)
+	else begin
+		dr.number _ dr.number - "0";
+		if (0 leq dr.number leq drmax)
+		 then if confirm( cvos( dr.number ) & " [Confirm]") 
+			then return( dr.number )
+			else begin end
+		 else print(dr.number, CRLF & BELL, 
+				"[Invalid DR11C]", CRLF)
+	    end;
+    end;
+end "getdr";
+procedure getlog; ! ask for node to load from;
+begin "getlog"
+integer i,ch;
+
+while TRUE do
+    begin
+	print("Specify neighbor node of ", nodnam, ": ");
+	if equ((lognod _ getstr), NULL) then
+	    begin
+		print(CRLF, "[Enter node number to load from]", CRLF);
+		continue;
+	    end;
+	if equ(lognod,"?") then
+	    begin
+		print(CRLF,"Enter the neighbor of ", nodnam, " which is"
+				&" capable of loading ", nodnam, CRLF,
+			"and is reachable from the host on which this"
+				&" program is running.",CRLF,CRLF);
+		continue;
+	    end;
+	done;
+    end;
+print(CRLF);
+getaux( ":WD1@" & lognod & ";", getdr );
+    begin string node!id;
+	node!id _ (nodnam & "      ")[1 for 6];
+	while length(node!id) do port!write( lop(node!id) );
+    end;
+interrogate(cctblt, wait);
+end "getlog";
+
+! some IO control primitives;
+procedure send(integer	word);
+begin	"send" 
+  port!write( word );
+  port!write( word lsh -8 );
+end	"send";
+procedure load; ! down line load routine;
+begin	"load"
+	own integer array buffer[1:DEFALT];	! pdp10 words;
+
+	integer procedure getbuf(integer pdp10);
+	begin	"getbuf"
+	arryin(dskchn, buffer[1], pdp10);
+	return( if dskeof then dskeof land '777777 else pdp10 );
+	end	"getbuf";
+
+	integer i,j,k,word,cs;
+
+if getbuf(DEFALT) neq DEFALT or dskeof then
+  quit("[Node image too short]");
+print("Loading ", nodnam, "..");
+i _ 1;			! start block;
+while not dskeof do
+  if (j _ getbuf(BLKLEN)) neq 0 then	! j is in pdp10 words;
+    begin cs _ 0;
+	send(((j * 2) + 3) * 2); ! Packet size Pdp11 (bytes);
+	send(PREFIX);
+	send(j * 2);		! BLKLEN * 2 Pdp11 words;
+	k _ 1;
+	while k leq j do
+	  begin send(word _ lh(buffer[k]));
+		cs _ cs + word;
+		send(word _ rh(buffer[k]));
+		cs _ cs + word;
+		k _ k + 1;
+	  end;
+	send(cs);	! send checksum;
+	i _ i + 1;
+	if (i mod 5) = 0 then if (i mod 10) = 0 then print(bs)
+						else print(" ");
+  end;
+if (i mod 10) > 4 then print(bs);
+send(6);
+print(".");
+send(PREFIX);
+print(".");
+send(START);
+print(".");
+send(0);
+print("Booting...");
+	send(-6);
+	interrogate(cctblt,wait);
+	connected _ false;	! say we are no longer connected;
+	port!zap;		! kill the aux circuit;
+release(dskchn);
+print(BELL & "Done!" & CRLF & BELL);
+end	"load";
+! nodcod - main line code;
+
+echo(false);
+connected _false;
+print(CRLF, "Nodlod - Tymshare V1.6?", CRLF);
+check!user!status;
+getnod;
+getlog;
+
+print(".done!",CRLF);
+load;
+echo(true);
+call(1,"EXIT");
+end	"nodlod"
+
+
+  
