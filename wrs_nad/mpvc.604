@@ -1,0 +1,745 @@
+    SUBTTL	MPVC.601 - THIS MODULE HANDLES MULTIPLEXED PVC
+: ******************************************************************
+: **                  PROPRIETARY INFORMATION                     **
+: **                                                              **
+: **  This  source code listing constitutes the proprietary pro-  **
+: **  perty of TYMNET, Incorporated. The recipient, by receiving  **
+: **  this program listing, agrees that neither this listing nor  **
+: **  the   information  disclosed herein nor any  part  thereof  **
+: **  shall be  reproduced or transferred to other documents  or  **
+: **  used  or  disclosed to others for manufacturing or for any  **
+: **  other purpose except as specifically authorized in writing  **
+: **  by  TYMNET, Incorporated.                                   **
+: ******************************************************************
+: **                   MODULE IDENTIFICATION                      **
+: **                                                              **
+: **  File Name          :  MPVC.601        last change: 09/10/86 **
+: **                                                              **
+: **  File Description   :  M.MUX - MPVC multiplexer polls input  **
+: **			    ports and translates control signals  **
+: **			    from port form to MPVC form.  M.PER   ** 
+: **			    periodically checks the inactivity    **
+: **			    timeout for each physical input port. **
+: **			    If ports are active, MPSCAN is capable**
+: **			    of recognizing a particular port's    **
+: **			    username and assigning it to a speci- **
+: **			    fic MPVC port.  M.DMX - MPVC demulti- **
+: **			    plexed performs the handling of signal**
+: **			    exceptions and the translation of     **
+: **			    control signals from MPVC form to port**
+: **			    form. Finally M.ACCT is used to update**
+: **			    the accounting periodically.          **
+: **                                                              **
+: **  File Abstract      :  The main purpose of MPVC is to speed  **
+: **			    the response and to reduce the port   **
+: **			    tie-up time for each interaction of   **
+: **			    transaction-oriented terminals which  **
+: **			    are characterized by short sessions   **
+: **			    and low volume traffic.               **
+: **                                                              **
+: ******************************************************************
+: **                    CHANGE LOG                                **
+: **                                                              **
+: **  Ver   Date    By   PIR/NSR  Changes (most recent at top)    **
+: ** ----- -------- ---  -------- ------------------------------- **
+: ** 06.01 09/11/86 DLG		  changed instructions to RX3 to  **
+: **				  prevent assembly errors	  **
+: ** 04.02 03/03/86 SDW           changed crash code              **
+: ** 04.02 02/27/86 SDW           Fixed MPVCscan to ignore control**
+: **                              characters.                     **
+: ** 04.02 02/07/86 SDW           Changed series of compares to a **
+: **                              single TBT in MPSCAN.           **
+: ** 04.02 01/07/86 LH            Add proprietary banner.         **
+: **                                                              **
+: ******************************************************************
+	SUBTTL	(MPVC) MULTIPLEXED PVC'S
+
+	 IF	NMPVC
+
+
+:	*   * *   * *     ***** ***** ****  *     ***** *   * ***** ****
+:	** ** *   * *       *     *   *   * *     *      * *  *     *   *
+:	* * * *   * *       *     *   ****  *     ****    *   ****  *   *
+:	*   * *   * *       *     *   *     *     *      * *  *     *   *
+:	*   *  ***  *****   *   ***** *     ***** ***** *   * ***** ****
+
+:				****  *   *  ***
+:				*   * *   * *   *
+:				****  *   * *
+:				*      * *  *   *
+:				*       *    ***
+
+	GL	MPSCAN,M.MUX,M.DMX	:definitions
+	GL	M.PER,M.INIT,M.STAT,MPINIT
+	GL	IGCSCN,GCSCN,AIDPVC	:References
+	GL	LGRET,CIRDSC,M.SACT,ZAPPER,IZ.PRT,M.ASNP,PVCOUT
+
+	SEG	A.CODE
+	MO	.,MPVC
+
+	LO	DATA
+
+:		MPVC User-name Scanner
+:	The MPVCUS STRING may contain the following "wild" characters:
+:	"|"	Match ANY valid user-name character.  Will not match
+:		user-name terminator characters (":", "semi-:", <CR>).
+:	"}"	END-OF-MPVCUS!  Encountering this character during the
+:		matching process signals successful matching of username,
+:		even if entire username has not yet been scanned.  (Also
+:		matches user-name terminator characters).
+
+:	RBP -	From-terminal buffer-pointer
+:	RPI -	Port-table pointer
+:	RP -	Port-number
+:	RLINK -	Link register -- return if no match
+
+MLCCHR  WC      0,0,0,7FFFFFE0          :a-z are the Lowercase chars
+MLGEND  WC      00040000                :CR
+        WC      00000030                : colon and semicolon
+        WC      0,0
+MPSCAN	TBT	RP,UNAME		:only interested if in user-name field
+	JER	RLINK			:password...exit
+	TBT	RP,MPVC.C		:Is this port a MPVC candidate?
+	JER	RLINK			:others have normal service
+	L	RBP,.LGBUF,RPI		:ok...set logon buffer-pointer
+	LA	R9,MPVCUS,,		:set pointer to start of list
+	JFS	MPVCS2			:skip to begin search
+
+MPVCS1	L	R9,MPU.PT,R9		:get new list-pointer
+	JER	RLINK			:list exhausted...return
+MPVCS2	LIS	R6,MPU.US-1		:...else set cursor
+	JAL	RBF,IGCSCN		:set first character in buffer
+	 J	0,RLINK			:unexpected normal return...quit
+
+MPVCS3	JAL	RBF,GCSCN		:get next character in buffer
+	J	MPVCS1			: MPVCUS longer than name typed in
+	NHI	RBC,7F			:reduce to 7-bit
+        TBT     RBC,MLGEND              :end of username?  CR : ;
+        JEFS    MPCS31                  :0 is not end
+        LIS     R0,0
+	JFS	MPVCS4
+MPCS31	CLHI	RBC,20			:ignore all other control chars
+	JLBS	MPVCS3			:*402sdw-left out by mistake
+	TBT	RBC,MLCCHR			:is this a LC character?
+	JEFS	MPVCS4			:0 if not LC
+	SHI	RBC,20			:else convert to upper-case
+MPVCS4	AIS	R6,1			:advance cursor
+	LB	R5,0,R6,R9		:and get next character in list-entry
+	JE	MPVCS7			:skip if end-of-string
+	NHI	R5,7F			:convert to 7-bit
+	TBT	R5,MLCCHR			:is it a LC char?
+	JEFS	MPVCS5			:0 if not LC
+	SHI	R5,20			:yes...force to upper-case
+MPVCS5	CLHI	R5,7D			:"}" ?
+	JE	MPVCS8			:yes
+	CLHI	R5,7C			:"|" ?
+	JNFS	MPVCS6			:no...chars must match
+	LR	R0,R0			:yes...match anything but terminator
+	JN	MPVCS3			:match succeeded
+	J	MPVCS1			:match failed
+MPVCS6	CR	R5,RBC			:characters MUST match!
+	JE	MPVCS3			:yes!
+	J	MPVCS1			:no...abort this entry
+
+MPVCS7	LR	R0,R0			:check if terminator
+	JN	MPVCS1			:no...abort ths entry, go on to next
+
+:: ***	NOTE -- MPVCUS TABLE CONTAINS RANGE OF PORT NUMBERS...
+:: ***	CURRENTLY WE ONLY USE FIRST ONE!!!!!
+MPVCS8	LHL	R1,MPU.FI,R9		:success...get MPVC port number
+	LR	R5,R1
+	SLLS	R5,2			:PORT # * 4
+	L	R5,MPVCFO,R5,		:look up pointer
+	LHL	R6,MP.VAR,R5		:get pointer to variables
+	STH	R6,MPV.T2		:save address
+	SBT	RP,MPV.AP,R6		:set this port active for MPVC
+	LIS	R0,1
+	AHM	R0,MPV.PA,R6
+	AHM	R0,MPV.LP,R6		:count another logon
+	LHI	R0,.MPORT,R1		:set actual MPVC port number
+	STH	R0,MPV.T1		:save it for now
+	MAKEBF(R1,TOMPVC,RP)		:compute new BF for this port
+	L	RBP,.FTBUF,RPI
+	JAL	R3,CHNGBF
+	ST	R5,MPV.T5		:save pointer
+	LO	SIGNAL
+	LHI	R5,SHDSIG+1		:send state of hafdux to host
+	FO	SIGNAL
+	LO	CONSAT
+	JAL	RLINK,SIGNAL		:to 'prime' polling logic in M.MUX
+	FO	CONSAT
+	L	R5,MPV.T5		:restore pointer
+	L	R6,MPF.SP,R5		:get success message pointer
+	L	RBP,.TTBUF,RPI		:place into to-terminal buffer
+	TBT	RP,PVCARY,,		:is this a pvc port ?
+	JEFS	MPVCS9
+	JAL	R9,PVCOUT		:yes
+	JFS	MPVCSA
+MPVCS9	JAL	R9,MSG			:no
+MPVCSA	JAL	RLINK,CIRDSC		:disconnect port
+	RBT	RP,NEWLOG		:...no longer first time for session
+	LR	R1,RP			:save port number
+	LHL	RP,MPV.T1		:set up MPVC now
+	SBT	RP,RLA			:is MPVC active?
+	JN	LGRET			:yes...just exit to logon polling
+	SBT	RP,NEWLOG		:first time for MPVC 
+	SBT	RP,MPCLOG		:MPVC must be built before subport built
+	LHL	R6,MPV.T2		:initialize YB timeout
+	STH	RP,MPV.YB,R6		:...>0
+	GETPTP(RPI,RP,RP)
+	JAL	RLINK,IZ.PRT		:for Tymnet-II
+	JAL	R0,M.ASNP		:record physical port number for MPVC
+	JAL	RLINK,AIDPVC		:perform AID
+	J	MSAERR			:normal return...error!
+					:skip return...port established
+	J	LGRET			:exit to logon polling
+M.SAER	EQ	89
+MSAERR	ABORT(R8,M.SAER)	
+	SUBTTL	(MPVC) Multiplexed PVC -- Periodic logic
+
+:	RP -	MPVC port number
+:	RPI -	MPVC port port-table pointer
+:	RPOL -	Polling index
+:	RLINK -	MPVC port format-table pointer
+:	R9 -	MPVC port variable-block pointer
+
+
+:		MPVC PERiodic logic
+:		==== ======== =====
+:	On time-out list, runs every 1.0 seconds
+M.PER	LHI	RP,.MPORT		:for all MPVC ports...
+M.PER1	TBT	RP,RLA			:is this port active?
+	JNFS	M.PER3			:yes...service it
+M.PER2	AIS	RP,1			:done...next MPVC port
+	CLHI	RP,.MPORT+NMPVC
+	JLBS	M.PER1
+	J	CSDISM,,		:done...exit
+
+:	active MPVC port...service it
+M.PER3	LR	R13,RP                  :r13 is 2*rp
+	AR	R13,R13
+	GETPTP(RPI,RP,RP)		:set port-table pointer
+	L	RLINK,MPVCFO-(4*.MPORT),R13,R13 :set format-table pointer
+	LHL	R9,MP.VAR,RLINK		:set variable-area pointer
+	L	R0,SLOWC,,		:check for YB time
+	THI	R0,3F			:...every 64 seconds
+	JNFS	M.PER4
+	TS	MPV.YB,R9		:set YB out
+	JL	M.PER7			:abort if already out
+	L	RBP,.FTBUF,RPI		:else send YB
+	 LO	SIGNAL
+	LHI	R4,YBSIG
+	 FO	SIGNAL
+	JAL	RCH,PUTSIG
+M.PER4	LHL	R0,MPV.PA,R9		:are any ports active?
+	JEFS	M.PER5			:no...check out why
+	AM	R0,MPV.PS,R9		:yes...update port-second accumulation
+	LIS	R0,0			:cancel timeouts
+	ST	R0,MPV.TO,R9
+	J	M.PER2			:and quit
+
+:	Nothing active...check timeout
+M.PER5	L	R0,MPV.TO,R9		:when should time expire?
+	JNFS	M.PER6			:something there
+	L	R0,SLOWC,,		:nothing there yet...start time-out
+	AH	R0,MPF.IA,RLINK		:"now" + inactivity timer
+	ST	R0,MPV.TO,R9
+M.PER6	S	R0,SLOWC,,		:has timeout expired?
+	JGE	M.PER2			:not yet...just wait a while
+	JAL	R5,M.SACT		:yes...terminate accounting
+	JAL	RLINK,CIRDIS		:disconnect circuit
+	RBT	RP,RLA			:set port not-active
+	RBT	RP,C.ACP
+	SBT	RP,AH.TO		:cancel timeouts
+	SBT	RP,AH.TO1
+	SBT	RP,AH.TO2
+	J	M.PER2			:and exit
+
+:	No response to last yellow-ball
+M.PER7	L	RBP,.TTBUF,RPI		:inject a ZAPPER to clean up
+	JAL	RCH,EMPTY
+	 LO	SIGNAL
+	LIS	R4,ZAPSIG
+	 FO	SIGNAL
+	JAL	RCH,PUTSIG
+	J	M.PER2			:and proceed
+	SUBTTL	(MPVC) Multiplexed PVC -- Multiplexer
+
+:	RP -	MPVC port number
+:	R13 -	2*MPVC port number
+:	RPI -	MPVC port port-table pointer
+:	RPOL -	Polling index
+:	RLINK -	MPVC port format-table pointer
+:	R9 -	MPVC port variable-block pointer
+
+
+:		MPVC MUX
+:		==== ===
+:	On time-out list, runs every .25 seconds
+M.MUX	LHI	RP,.MPORT		:for all MPVC ports...
+M.MUX1	TBT	RP,RLA			:is this port active?
+	JNFS	M.MUX3			:yes...service it
+M.MUX2	AIS	RP,1			:done...next MPVC port
+	CLHI	RP,.MPORT+NMPVC
+	JLBS	M.MUX1
+	J	CSDISM,,		:done...exit
+
+:	active MPVC port...service it
+M.MUX3	LR	R13,RP
+	AR	R13,R13
+	GETPTP(RPI,RP,RP)		:set master port-table pointer
+	L	RLINK,MPVCFO-(4*.MPORT),R13,R13 :set format-table pointer
+	LHL	R9,MP.VAR,RLINK		:set variable-area pointer
+	LHI	RPOL,(NGRP-2)*2		:prepare to poll all ports on this MPVC
+
+:	Poll all ports for this MPVC
+M.MUX4	L	R0,TOMPVC,RPOL		:data present
+	N	R0,MPV.AP,RPOL,R9	:...on active port
+	JFFO	R0,M.MUX5		:skip if anything there
+	SIS	RPOL,4			:repeat for all groups
+	JGEBS	M.MUX4
+	J	M.MUX2			:...then proceed to next port
+
+:	Found an active port (sub-channel)...service it
+M.MUX5	LR	R0,RPOL			:compute port number
+	SLLS	R0,3
+	AR	R0,R1
+	CLH	R0,MPV.CI		:is this sub-port same as last
+	JE	M.MX05			:then skip blocking
+	STH	R0,MPV.CI		:set current input port
+	L	RBP,.FTBUF,RPI		:MPVC From-terminal Buffer-pointer
+	LB	RBC,MPF.BL,RLINK	:New-block indicator
+	JAL	RCH,PUTCHR
+	LHL	RBC,MPV.CI		:port-number
+	JAL	RCH,PUTCHR
+M.MX05	LHL	RBC,MPV.CI		:port-number
+	GETPTP(R4,RBC,RBC)		:sub-channel port-descriptor
+	LA	R5,TOMPVC		:assume continuing port
+	L	R6,.FTBUF,R4
+	ST	R6,MPV.T2		:origination buffer
+	STH	R5,MPV.T3		:Flag array
+	RBT	RBC,LOGING		:New port?
+	JE	M.MUX6			:no...just copy data
+	TBT	RP,MPCLOG		:is mpvc circuit built
+	JEFS	M.MX06			:if so, continue
+	TS	MPV.CI			:else, set not current
+	SBT	RBC,LOGING		:and still loging
+	J	M.MUX2			:...proceed to next port
+
+M.MX06	LA	R5,GOLOG		:yes...data from login-buffer
+	L	R6,.LGBUF,R4
+	LHL	R4,.TERMT,R4		:locate terminal-type descriptor
+	LB	RBC,VID.ID,R4,		:and terminal NID
+	STB	RBC,MPV.T1		:save TID
+	ST	R6,MPV.T2		:origination buffer
+	STH	R5,MPV.T3		:Flag array
+	LB	RBC,MPF.SI,RLINK	:signal new port
+	JAL	RCH,PUTCHR
+	 LO	SIGNAL
+	LIS	RBC,CNTSIG		:"connect"
+	 FO	SIGNAL
+	JAL	RCH,PUTCHR
+	LB	RBC,MPV.T1		:get the TID
+	JAL	RCH,PUTCHR		:sent it too
+
+:	Move the data
+M.MUX6	LHL	R0,MPV.CI		:current port
+	LHL	R7,MPV.T3		:bit-array pointer
+	TBT	R0,0,R7			:any more data there?
+	JE	M.MUX4			:no...proceed to other ports
+	L	RBP,MPV.T2		:yes...from-terminal buffer-pointer
+	JAL	RCH,GETCHR
+	 J	M.MUX9			:Signal! - go encode it
+	L	RBP,.FTBUF,RPI		:MPVC From-terminal Buffer-pointer
+	CLB	RBC,MPF.BL,RLINK	:need escapes?
+	JEFS	M.MUX7
+	CLB	RBC,MPF.SI,RLINK
+	JEFS	M.MUX7
+	CLB	RBC,MPF.EX,RLINK
+	JNFS	M.MUX8
+M.MUX7	STB	RBC,MPV.T1		:escape required...save the char
+	LB	RBC,MPF.EX,RLINK	:Escape the char
+	JAL	RCH,PUTCHR
+	LB	RBC,MPV.T1		:restore the char
+M.MUX8	JAL	RCH,PUTCHR		:send the character
+	J	M.MUX6			:and go do another
+
+:	Got a signal...pass it on, check for zappers
+M.MUX9	STB	R5,MPV.T1		:save signal
+	STB	RBC,MPV.T1+1		:save (possible) value
+	L	RBP,.FTBUF,RPI		:from-terminal buffer-pointer for MPVC
+	LB	RBC,MPF.SI,RLINK	:indicate signal
+	JAL	RCH,PUTCHR
+	LB	RBC,MPV.T1		:...followed by signal
+	JAL	RCH,PUTCHR
+	LB	RBC,MPV.T1		:does signal have data?
+	TBT	RBC,M.D.ML
+	JEFS	M.MUXA			:no...skip to check for zappers
+	LB	RBC,MPV.T1+1		:yes...get data
+	JAL	RCH,PUTCHR		:...and pass it too
+	J	M.MUX6			:and continue with data-stream
+
+:	Special test for zapper
+	 LO	SIGNAL
+M.MUXA	CLHI	RBC,ZAPSIG		:is this zapper?
+	 FO	SIGNAL
+	JN	M.MUX6			:no...just proceed
+
+:	Sub-channel Zapped...clean up
+	LHL	R0,MPV.CI		:check if current output port
+	CLH	R0,MPV.CO,R9
+	JNFS	M.MUXB			:skip if not
+	TS	MPV.CO,R9		:else disconnect it
+M.MUXB	RBT	R0,MPV.AP,R9		:set not active
+	LCS	R0,1			:and count it gone
+	AHM	R0,MPV.PA,R9
+	STH	R0,MPV.CI		:set current input port -1
+	LIS	R1,0
+	L	RBP,MPV.T2			:return port buffer
+	JAL	R3,CHNGBF		:disconnect buffer from MPVC
+	J	M.MUX4			:and proceed
+
+
+
+:	MPVC error
+M.ERR	ABORT(0,8A)
+V.MPV	EQ	M.ERR			:error if polling discovers MPVC input
+	SUBTTL	(MPVC) Multiplexed PVC -- Demultiplexer
+
+:	RP -	MPVC port number
+:	R13 -	2*MPVC port number
+:	RPI -	MPVC port port-table pointer
+:	RPOL -	Polling index (preserved)
+:	RLINK -	MPVC port format-table pointer
+:	R9 -	MPVC port variable-block pointer
+:	R8 -	sub-channel port-table pointer
+
+
+:		MPVC DE-MUX
+:		==== == ===
+:	Driver by port-polling logic
+:	We start here when circuit first comes up
+M.DMX	LR	R13,RP
+        AR      R13,R13                 :calculate 2*rp
+        L       RLINK,MPVCFO-(4*.MPORT),R13,R13 :set up MPVC table pointer
+	LHL	R9,MP.VAR,RLINK		:get pointer to variables
+	TS	MPV.CO,R9		:set no port current
+	J	M.DMX1			:and skip to main loop
+
+:	Block-change exit for M.D.GC
+M.DM.B	LH	R0,MPV.BC,R9		:check mode
+	JE	M.DMB0			:if no mode get port number
+	JL	M.DMB1			:if in block change mode, store port #
+	LH	R7,MPV.CO,R9		:check out port
+	JL	M.D.GC			:ignore if no port active
+	GETPTP(R8,R7,R7)		:get sub-channel port-table pointer
+	L	RBP,.TTBUF,R8		:get its to-terminal buffer-pointer
+	JR	R6			:take return
+M.DMB0	TS	MPV.BC,R9		:set in block change mode
+	JAL	R6,M.D.GC		:get the port number
+M.DMB1	STH	RBC,MPV.CO,R9		:and save port #
+	LIS	R6,0			:set not in block change mode
+	STH	R6,MPV.BC,R9
+
+
+:	Get next multiplexed character
+M.DMX1	JAL	R6,M.D.GC		:get next char
+	CLB	RBC,MPF.SI,RLINK	:check for signal
+	JE	M.DM.S			:yes...skip to process
+	CLB	RBC,MPF.EX,RLINK	:check for escape
+	JNFS	M.DMX2			:no...data
+	LIS	R6,1			:set in escape mode
+	STH	R6,MPV.BC,R9
+	JAL	R6,M.D.GC		:yes...get escaped data
+M.DMX2	JAL	RCH,PUTCHR		:pass data to port
+	LIS	R6,0			:not in escape mode
+	STH	R6,MPV.BC,R9
+	J	M.DMX1			:...and process additional bytes
+
+:	got a sub-channel signal...one or more bytes follow
+M.DM.S	LIS	R6,1			:set in signal mode
+	STH	R6,MPV.BC,R9
+	JAL	R6,M.D.GC		:get the signal code
+	LIS	R6,0			:not in signal mode
+	STH	R6,MPV.BC,R9
+	LR	R4,RBC			:copy it
+	TBT	R4,M.D.VS		:is it valid?
+	JNFS	M.DS01			:proceed if valid
+	TBT	R4,M.D.ML		:is invalid signal multiple bytes
+	JE	M.DMX1			:if not single byte is tossed
+	LIS	R6,1			:in signal mode
+	STH	R6,MPV.BC,R9		
+	JAL	R6,M.D.GC		:get second byte of mult byte signal
+					:3rd byte of mult byte signal valid
+					:or invalid will be passed as data
+					:since not expected
+	LIS	R6,0			:set not in signal mode
+	STH	R6,MPV.BC,R9
+	J	M.DMX1			:tossed, proceed
+M.DS01	TBT	R4,M.D.ML		:Multiple-char?
+	JNFS	M.DMS1			:skip if multiple char
+	TBT	R4,M.D.IN		:is it potentially interesting signal?
+	JE	M.DMS2			:no...just pass it on
+	JAL	R0,M.DM.E		:yes...process exception
+	J	M.DMX1			:...and proceed with next element
+
+M.DMS1	STB	R4,MPV.TD,R9		:Multiple character...save signal
+	LIS	R6,1			:set in signal mode
+	STH	R6,MPV.BC,R9
+	JAL	R6,M.D.GC		:get second (value) character
+	LIS	R6,0			:set not in signal mode
+	STH	R6,MPV.BC,R9
+	LB	R4,MPV.TD,R9		:restore signal
+M.DMS2	JAL	RCH,PUTSIG		:transmit the signal
+	J	M.DMX1			:and proceed with next element
+
+:	GETCHR for MPVC DE-MUX
+:	Gets the next data-char for this MPVC circuit, dismisses if necessary
+:	Services all signals for this MPVC circuit
+:	R6 -	Link register
+:	RBP -	buffer-pointer
+:	RLINK -	MPVC port format-table pointer
+:	R8 -	sub-channel port-table pointer
+M.D.GC	TBT	RP,TOPORT		:is there data for us?
+	JNFS	M.D.G1			:yes...skip to get it
+	ST	R6,.XSAVE,RPI		:no...save return address
+	JAL	R0,XSTATE		:and dismiss for now
+
+:	return from dismiss...restore return, MPVC table pointer
+	L	R6,.XSAVE,RPI
+        LR      R13,RP
+        AR      R13,R13                 :calcul 2*rp
+	L	RLINK,MPVCFO-(4*.MPORT),R13,R13
+	LHL	R9,MP.VAR,RLINK		:get pointer to variables
+M.D.G1	L	RBP,.TTBUF,RPI		:to-terminal buffer-pointeAL	RCH,GETCHR		:get the next character
+	 J	M.DSIG			:signal...special action
+
+	CLB	RBC,MPF.BL,RLINK	:check for  block-change
+	JE	M.DM.B			:skip if so, abort current sequence
+	LH	R7,MPV.BC,R9		:are we in block change mode
+	JL	M.DMB1			:go complete block change
+	LH	R7,MPV.CO,R9		:check out port
+	JL	M.D.GC			:ignore if no port active
+        TBT     R7,MPV.AP,R9            :added check (was hole in logic
+        JE      M.D.GC                  :if not current port hung up *sdw
+	GETPTP(R8,R7,R7)		:get sub-channel port-table pointer
+	L	RBP,.TTBUF,R8		:and get its to-terminal buffer-pointer
+	JR	R6			:return
+
+
+:	We've gotten a signal over main MPVC circuit...process it
+M.DSIG	TBT	R5,M.D.IN		:are we even interested?
+	JE	M.D.GC			:no...just ignore
+	 LO	SIGNAL
+	CLHI	R5,OBSIG		:orange ball?
+	JNFS	M.DS1			:no
+	STH	R5,MPV.YB,R9		:yes...clear YB flag
+	J	M.D.GC			:and proceed
+
+M.DS1	CLHI	R5,YBSIG		:Yellow ball?
+	 FO	SIGNAL
+	JNFS	M.DS2			:no
+	LHI	R4,-1,R5		:yes...bounce it
+	L	RBP,.FTBUF,RPI
+	JAL	RCH,PUTSIG
+	J	M.D.GC			:and proceed
+
+M.DS2	LR	R4,R5			:must broad-cast to all ports
+	ST	R6,MPV.T5		:save return for .XSAVE
+
+:	Broadcast signal (in R4) to all active ports
+M.D.BC	LHI	R6,(NGRP-2)*2		:for all ports...
+M.D.B1	L	R7,MPV.AP,R6,R9		:get an entry
+M.D.B2	JFFO	R7,M.D.B3		:any ports to process?
+	SIS	R6,4			:not now...do for all
+	JGEBS	M.D.B1
+	L	R6,MPV.T5		:restore return for .XSAVE
+	 LO	SIGNAL
+	CLHI	R4,ZAPSIG		:Zapper?
+	 FO	SIGNAL
+	JN	M.D.GC			:no...go back for another
+	JAL	R5,M.SACT		:yes...send accounting
+	RBT	RP,RLA			:set port not active
+	J	ZAPPER			:and exit via circuit-zapper logic
+
+M.D.B3	STH	R6,MPV.T1		:save index
+	ST	R7,MPV.T2		:and bits
+	RBT	R8,MPV.T2		:won't look at this port again
+	SLLS	R6,3			:compute port number
+	AR	R8,R6
+	STH	R8,MPV.CO,R9		:save it
+	GETPTP(R8,R8,R8)		:look up port-table for this port
+	L	RBP,.TTBUF,R8		:set to-terminal buffer-pointer
+	JAL	R0,M.DM.E		:send exception signal to this port
+	L	R7,MPV.T2		:restore registers
+	LHL	R6,MPV.T1
+	J	M.D.B2			:and proceed with broadcast
+
+:	Service eXception signals for port
+:		(zappers, gobblers, yellow & black balls)
+:	R0 -	Link register
+:	RBP -	to-terminal buffer-pointer for the port
+:	R4 -	Signal to send (preserved)
+:	RP -	MPVC port number
+:	R13 -	2*MPVC port number
+:	RPI -	MPVC port port-table pointer
+:	RLINK -	MPVC port format-table pointer
+:	R9 -	MPVC port variable-block pointer
+:	R8 -	sub-channel port-table pointer
+M.DM.E	ST	R0,MPV.T4		:save return
+	STB	R4,MPV.T3		:save signal
+	 LO	SIGNAL
+	CLHI	R4,GOBSIG		:gobbler?
+	JE	M.DME1			:yes...go flush output
+	CLHI	R4,ZAPSIG		:Zapper?
+	JN	M.DME2			:no...just pass on
+	 FO	SIGNAL
+	LHL	R0,MPV.CO,R9		:zapper...get current output port
+	TS	MPV.CO,R9		:...and clear it
+	RBT	R0,MPV.AP,R9		:set not active
+	LCS	R4,1
+	CLH	R0,MPV.CI		:is this the last input port
+	JNFS	M.DME0			:if not continue
+	STH	R4,MPV.CI		:else set last port to -1
+M.DME0	AHM	R4,MPV.PA,R9		:reduce number of active ports
+	L	RBP,.FTBUF,R8		:From-terminal buffer-pointer
+	LIS	R1,0
+	JAL	R3,CHNGBF		:go change BF
+	L	RBP,.TTBUF,R8		:to-terminal buffer-pointer
+M.DME1	JAL	RCH,EMPTY		:empty to-terminal buffer
+	LB	R4,MPV.T3		:Restore signal
+M.DME2	JAL	RCH,PUTSIG		:transmit the signal
+	LB	R4,MPV.T3		:restore signal value
+	L	R0,MPV.T4		:restore return
+	JR	R0			:and return
+
+:	Valid signals (1 = valid)
+M.D.VS	HC	30FF,0FF00,0FFF0,-1,0FF00,0,0,0,0,0,0,0,0,0,0,0
+
+:	(Potentially) interesting signals
+M.D.IN	HC	0C,0B000,0,0,0,0	:zapper,gobbler,,orange,yellow&black ball
+
+:	Multiple-character signals
+M.D.ML	HC	0,0,0AAA0,0AAAA,0AA00,0
+
+	SUBTTL	(MPVC) Subport Zapper Logic
+
+:	RP -	Subport number
+:	RPI -	Subport port-table pointer
+:	R3 -	MPVC port number
+:	R4 -	2*MPVC port number
+:	R5 - 	MPVC port port-table pointer
+:	R6 -	MPVC port format-table pointer
+:	R9 -	MPVC port variable-block pointer
+
+:	Subport Zapper Logic
+:	====================
+:	Called from async answer/hang logic when RLA subport bit
+:	changes from 1 to 0
+MPVZSP	TBT	RP,MPVC.C		:is this port an MPVC candidate
+	JER	RLINK			:look no further
+	LHI	R3,.MPORT		:for all MPVC ports
+MPVZ1	TBT	R3,RLA			:is this mpvc port active
+	JNFS	MPVZ3			:if so, check and see if subport active
+					:on this mpvc port
+MPVZ2	AIS	R3,1			:Else, look at next MPVC port
+	CLHI	R3,.MPORT+NMPVC
+	JLBS	MPVZ1			:til done
+	JR	RLINK			:return to answer hang
+
+:	this is active MPVC port, see if subport active
+MPVZ3	LR	R4,R3
+	AR	R4,R4			:2*subport
+	GETPTP(R5,R3,R3)		:get master port table pointer
+	L	R6,MPVCFO-(4*.MPORT),R4,R4 :get format table pointer
+	LHL	R9,MP.VAR,R6		:get variable-block pointer
+	TBT	RP,MPV.AP,R9		:is subport active on MPVC port
+	JE	MPVZ2			:if not, look at next MPVC port
+
+:	put a zapper into MPVC from terminal buffor for this subport
+	L	RBP,.FTBUF,R5		:get mpvc from terminal buffer pointer
+	CLH	RP,MPV.CI		:is this the current input port
+	JEFS	MPVZ4			:if not skip
+	STH	RP,MPV.CI		:else, maki it curretn
+	LB	RBC,MPF.BL,R6		:get block change character
+	JAL	RCH,PUTCHR		:and send it
+	LR	RBC,RP			:get sub port number
+	JAL	RCH,PUTCHR		:and send it
+MPVZ4	LB	RBC,MPF.SI,R6		:indicate signal
+	JAL	RCH,PUTCHR
+	 LO	SIGNAL
+	LHI	RBC,ZAPSIG		:get zapper
+	 FO	SIGNAL
+	JAL	RCH,PUTCHR
+
+:	do some cleanup
+	CLH	RP,MPV.CO,R9		:check if current output port
+	JNFS	MPVZ5			:skip if not
+	TS	MPV.CO,R9		:disconnect it
+MPVZ5	RBT	RP,MPV.AP,R9		:set not active
+	LCS	R0,1			:and count it gone
+	AHM	R0,MPV.PA,R9
+	STH	R0,MPV.CI		:set not current input
+	LIS	R1,0
+	TBT	RP,LOGING		:are we in login mode
+	JEFS	MPVZ6			:if not skip
+	L	RBP,.LGBUF,RPI		:return port buffer
+	JFS	MPVZ7
+MPVZ6	L	RBP,.FTBUF,RPI		:return port buffer
+MPVZ7	JAL	R3,CHNGBF		:disconnect buffer from MPVC
+	JR	RLINK			:return to answer hang
+
+:	MPVC initialization routine.  Sets current input port
+:	to -1.  (Allows use of subport 0)
+
+MPINIT	TS	MPV.CI			:current port is -1
+	JR	R0			:and return
+
+
+:	Port establishment routine called from AIDPVC.  Sets up port
+:	to request and handle extended logon messages.
+
+
+M.INIT	STH	R5,TIIEST
+	LIS	R5,0			:clear data
+	LIS	R0,1			:initial port #
+        LR      R13,RP                  :cal 2*rp
+        AR      R13,R13
+	L	R1,MPVCFO-(4*.MPORT),R13,R13	:set format-table pointer
+	LHL	R1,MP.VAR,R1		:set variable-area pointer
+	STH	R0,MPV.LP,R1		:clear logon ports
+	ST	R5,MPV.PS,R1		:clear port seconds
+	LA	R5,M.STAT		:get addres of xtended log msg handler
+	ST	R5,.LSTAT,RPI		:put into port table
+	LHI	R5,4000			:request extended logon messages
+	OH	R5,TIIEST		:get indicator form PSTATE for Tymnet II
+	J	ESTPRT			:go establish port
+
+	SUBTTL	(MPVC) MPVC Extended logon status handler
+
+:	Extended Logon status handler.  Called from TEXT routine
+:	and returns there after examining message types.  Zaps 
+:	MPVC port and all subports for all extended message types
+:	(Host unavailable, etc.)
+:	R8	link register
+:	R9	message type
+:	RBP	to terminal buffer pointer for MPVC port
+
+M.STAT	CLHI	R9,8			:is there an xtended msg
+	JLR	R8			:if not, return
+	CLHI	R9,13			:is msg out of range
+	JGR	R8			:if so, return
+	ST	R8,MPV.T5		:save return
+	JAL	RCH,EMPTY		:ZAP MPVC port
+	 LO	SIGNAL
+	LIS	R4,ZAPSIG
+	 FO	SIGNAL
+	JAL	RCH,PUTSIG
+	L	R8,MPV.T5		:get return
+	JR	R8			:and return
+
+	 FO	DATA
+	EM	:MPVC
+
+	EI	:NMPVC
+   j  e
