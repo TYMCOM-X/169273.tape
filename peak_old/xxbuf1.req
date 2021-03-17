@@ -1,0 +1,2380 @@
+!! title Part One of Tops-20 Buffer Sources ;
+! *************************************************************************
+*                                                                         *
+*                               XxBuf1.Req                                *
+*                                                                         *
+*             The Buffer/Checkpoint manager.  Tops20 version.             *
+*                       Ken Dawson   25-August-1983                       *
+*                                                                         *
+**************************************************************************;
+
+! These routines are not particularly homogeneous, taken as a whole, but
+! they fit into a smaller space than they did before.
+;
+
+forward internal simple procedure ShowMap (integer Pg);
+
+
+! ----------------------------------------------------------------------- ;
+!! title Rtn SetupHeaderAndEDT ;
+! Initialize Buffer-state variables and flush them into the EDT area.
+;
+
+forward internal simple procedure B!FlushToEDT;
+forward internal simple procedure B!SetM (integer M, P);
+forward internal simple integer procedure B!AllocateMark;
+
+simple procedure SetupHeaderAndEDT (string TName, TAlias);
+begin "SetupHeaderAndEDT"
+  integer
+    I;
+
+  $H$ICBM   _ ICBMBase;
+  $H$PPM    _ PPMBase;
+  $H$EDT    _ EDTBase;
+  $H$Data   _ ICBBase;
+  $H$DedVer _ B!DedVer;
+
+    ! Setup the Header portion of the giant array.
+    ;
+
+  B!File  _ TName;
+  B!Alias _ TAlias;
+
+  if (not length(B!Mode)) then
+    B!Mode _ "Normal";
+
+  B!Point   _ 0;
+  B!ModP    _ false;
+  B!Lock    _ 0;
+  B!CkPtSer _ 0;
+  B!BegP    _
+  B!EndP    _ true;
+
+  for I _ 0 step 1 until MaxMarks - 1 do
+    Marks[I] _ -1;
+
+    ! Initialize our Mark Structure.
+    ;
+
+  B!SetM((B!LastP _ B!AllocateMark), 0);
+  B!SetM((B!WS0   _ B!AllocateMark), 0);
+  B!SetM((B!WS1   _ B!AllocateMark), -1);
+  
+    ! Initialize some important Marks.
+    ;
+
+  B!FlushToEDT;
+end "SetupHeaderAndEDT";
+!! title Rtn EvictFromMemory ;
+! Force an ICB-resident page to be written to the Checkpoint file, and
+! the corresponding ICBM entry to be made ready for reuse.
+;
+
+simple procedure EvictFromMemory (integer ICBPgIdx);
+begin "EvictFromMemory"
+  if ($ICBM.VFPg(ICBPgIdx) >= 0) then
+  begin
+    ! Only if the page in question is mapped...
+    ;
+
+    pmap(-1, !MPg($ICBM.MemPg(ICBPgIdx)), 0);
+
+      ! Unmap the page from memory.  This causes it to updated in the
+      ! Checkpoint file.
+      ;
+
+    $VFPg.ICBIdx($ICBM.VFPg(ICBPgIdx)) _
+    $ICBM.VFPg(ICBPgIdx)               _ -1;
+    $ICBM.MissCnt(ICBPgIdx)            _ largeinteger;
+
+      ! Sanitize PPM and ICBM entries.
+      ;
+  end;
+end "EvictFromMemory";
+!! title Rtn EvictICBFromMemory ;
+! Remove all resident Virtual File pages from the ICB.
+;
+
+simple procedure EvictICBFromMemory;
+begin "EvictICBFromMemory"
+  integer
+    I;
+
+  for I _ 0 step 1 until MaxICBMIdx do
+    EvictFromMemory(I);
+end "EvictICBFromMemory";
+!! title Rtn MapVFPgToMemory ;
+! Map the specified Virtual File page into the specified ICB page.  The
+! physical memory page should already be unmapped.
+;
+
+simple procedure MapVFPgToMemory (integer VFPg, ICBPgIdx);
+begin "MapVFPgToMemory"
+  $VFPg.ICBIdx(VFPg)      _ ICBPgIdx;
+  $ICBM.VFPg(ICBPgIdx)    _ VFPg;
+  $ICBM.MissCnt(ICBPgIdx) _ 0;
+
+  pmap(!CPg($VFPg.ChkPg(VFPg)), !MPg($ICBM.MemPg(ICBPgIdx)),
+      (!RdWt! lor !PreRef!));
+
+    ! Map the page, with read/write access, pre-referenced.
+    ;
+end "MapVFPgToMemory";
+!! title Rtn GetICBPage ;
+! Allocate a page of the ICB by locating the next availible or most
+! eligible page in the ICB, evicting it from memory, if necessary, and
+! returning its index.
+;
+
+simple integer procedure GetICBPage;
+begin "GetICBPage"
+  own integer
+    I,                                  ! ICBM index iterator.
+                                        ;
+    MaxMissCnt,                         ! The largest number of misses
+                                        ! achieved by a single ICB page.
+                                        ;
+    MaxMissIdx;                         ! The index of the ICB page with
+                                        ! the largest number of misses.
+                                        ;
+
+  MaxMissCnt _ -1;
+  MaxMissIdx _ 0;
+
+  for I _ 0 step 1 until MaxICBMIdx do
+  begin
+    ! For each ICB page.
+    ;
+
+    if ($ICBM.VFPg(I) >= 0) then
+    begin
+      ! There is a Virtual File page mapped to this ICB page.
+      ;
+
+      incr($ICBM.MissCnt(I));
+
+      if ($ICBM.MissCnt(I) > MaxMissCnt) then
+      begin
+        MaxMissCnt _ $ICBM.MissCnt(I);
+        MaxMissIdx _ I;
+      end;
+    end
+    else
+    begin
+      ! This ICB page is availible.
+      ;
+
+      if ($ICBM.MissCnt(I) > MaxMissCnt) then
+      begin
+        MaxMissIdx _ I;
+        MaxMissCnt _ largeinteger;
+      end;
+
+        ! Note: We do not stop here because we must adjust all MissCnts.
+        ;
+    end;
+  end;
+
+  if ($ICBM.VFPg(MaxMissIdx) >= 0) then
+    ! The selected page is mapped to some page in the Checkpoint file.
+    ;
+
+    EvictFromMemory(MaxMissIdx);
+
+  return(MaxMissIdx);
+end "GetICBPage";
+!! title Rtn VFPToMemory ;
+! Map the specified Virtual File page into the ICB, and return the
+! identity of the memory page in which it resides.
+;
+
+simple integer procedure VFPToMemory (integer VFPg);
+begin "VFPToMemory"
+  integer
+    T;                                  ! ICBM index corresponding to
+                                        ! VFPg.
+                                        ;
+
+  if ((T _ $VFPg.ICBIdx(VFPg)) >= 0) then
+  begin
+    ! The page is already in memory.
+    ;
+
+    if ($ICBM.MissCnt(T) > 0) then
+      decr($ICBM.MissCnt(T));
+
+    return($ICBM.MemPg(T));
+  end
+  else
+  begin
+    ! The page is not in memory.
+    ;
+
+    integer
+      ICBPg;
+
+    MapVFPgToMemory(VFPg, (ICBPg _ GetICBPage));
+    return($ICBM.MemPg(ICBPg));
+  end;
+end "VFPToMemory";
+!! title Rtn LocatePoint ;
+! Given a point specification, return a description of the leftmost
+! location of the character just to the left of that point, as follows:
+!
+!   Reference Parameters:
+!
+!     ChPg:     The index of the Virtual File page that the character
+!               resides on.
+!                   ([0, B!MaxPgIdx]             - always)
+!
+!     ChChr:    The character index of the first character on the page
+!               that the character resides on.
+!                   ([0, B!Size - 1]             - normally)
+!                   (-1                          - if B!Size = 0)
+!                   (-1                          - if Point  = 0)
+!
+!     ChOfst:   The character index of the location where the character
+!               resides on the page.
+!                   ([0, CharactersPerPage - 1]  - normally)
+!                   (-1                          - if B!Size = 0)
+!                   (-1                          - if Point  = 0)
+!
+! "(Leftmost" above means that there may be any number of empty pages
+! which intervene between the current page and the page containing the
+! next character).
+;
+
+! ((  (This uses the safe but inefficient method of counting up
+!     from page 0.  Another approach using a set of variables defining
+!     the location of the current page should be substituted later.)
+;
+
+! <<  This process must be as efficient as possible.  It is referenced
+!     every time a character is inserted into, deleted from, or read from
+!     the Buffer.
+;
+
+simple boolean procedure LocatePoint
+    (integer Point; reference integer ChPg, ChChr, ChOfst);
+begin "LocatePoint"
+  integer
+    Pg,                                 ! Index iterator over Virtual
+                                        ! File pages.
+                                        ;
+    ChrCnt,                             ! The character number of the
+                                        ! first character on a given
+                                        ! Virtual File page.
+                                        ;
+    Tl,                                 ! Value of a TxtLen entry in the
+                                        ! PPM.
+                                        ;
+    PPMAdr;                             ! Index of an entry in the PPM.
+                                        ;
+
+  ChPg   _ 0;
+  ChChr  _
+  ChOfst _ -1;
+
+    ! Initially, assume that there is no predceding character.
+    ;
+
+  if (Point < 0 or Point > B!Size) then
+  begin
+    ! The specified point doesn't exist.  Return an error indication.
+    ;
+
+    return(false);
+  end
+  else if (Point = 0 or B!Size = 0) then
+  begin
+    ! At the beginning of the Buffer, or there is no text in the Buffer.
+    ! The initial assumption stands.
+    ;
+
+    return(true);
+  end;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  ChrCnt _ 0;
+
+    ! We know that there is at least one character in the Buffer.
+    ;
+
+  PPMAdr _ $VFPg.Adr(0);
+
+    ! Pick up the location of the first entry in the PPM.
+    ;
+
+  for Pg _ 0 step 1 until B!MaxPgIdx do
+  begin
+    Tl _ $VFPg.TL(PPMAdr);
+
+      ! Get the TxtLen value for this Virtual File page.
+      ;
+
+    if (Point <= ChrCnt + Tl) then
+      done;
+
+    incr(ChrCnt, Tl);
+    incr(PPMAdr, PPMWordsPerEntry);
+  end;
+
+  ChPg    _ Pg;
+  ChChr   _ ChrCnt;
+  ChOfst  _ Point - ChrCnt + $VFPg.LG(PPMAdr) - 1;
+
+  return(true);
+end "LocatePoint";
+!! title Rtn BldMemPtr ;
+! Build a byte pointer to the specified byte in memory.  Return 0 if the
+! page or character position specified is bogus.
+;
+
+simple integer procedure BldMemPtr (integer ChPage, ChPos);
+begin "BldMemPtr"
+  if ((ChPage < 0 or ChPage >= PagesPerAddressSpace) or
+      (ChPos < 0 or ChPos >= CharactersPerPage)) then
+    return(0);
+
+  return(B!BPLeft[ChrNo(ChPos)] lor Addrs(ChPage, WrdNo(ChPos)));
+end "BldMemPtr";
+!! title Rtn BldVFPtr ;
+! Build a byte pointer to the specified byte.  Insure that the Virtual
+! File page it resides on is in memory, first.  Return 0 if the  page or
+! character position specified is bogus.
+;
+
+simple integer procedure BldVFPtr (integer ChPage, ChPos);
+begin "BldVFPtr"
+  if ((ChPage < 0 or ChPage > B!MaxPgIdx) or
+      (ChPos < 0 or ChPos >= CharactersPerPage)) then
+    return(0);
+
+  return(B!BPLeft[ChrNo(ChPos)] lor
+      Addrs(VFPToMemory(ChPage), WrdNo(ChPos)));
+end "BldVFPtr";
+!! title Rtn MoveTextPL ;
+! Perform a page-limited transfer of text from one place to another in
+! the Virtual File in the most reasonable way possible.
+!
+! Note:  This is a page-limited transfer!  It is up to the caller to
+!        insure that the text involved will not exceed a page boundry,
+!        on either the source or the destination side.
+;
+
+! <<  For the time being, "most reasonable" means the easiest.
+!     (Cop Out!!!)
+;
+
+simple procedure MoveTextPL
+    (integer SrcPg, SrcByte, SrcLen, DstPg, DstByte);
+begin "MoveTextPL"
+  integer
+    DstPtr,                             ! Pointer to the destination
+                                        ! region.
+                                        ;
+    SrcPtr;                             ! Pointer to the source region.
+                                        ;
+
+  SrcPtr _ BldVFPtr(SrcPg, SrcByte);
+  DstPtr _ BldVFPtr(DstPg, DstByte);
+
+  MoveBytes(SrcPtr, DstPtr, SrcLen);
+end "MoveTextPL";
+!! title Rtn GarbageCollectGaps ;
+! Make room for text in the Buffer by removing all the gaps from the
+! Checkpoint file.
+;
+
+simple procedure GarbageCollectGaps;
+begin "GarbageCollectGaps"
+  integer
+    DPg,                                ! Destination file page number.
+                                        ;
+    Fill1,                              ! The first page of the fill
+                                        ! area.
+                                        ;
+    Fill1Adr,                           ! The address of the same.
+                                        ;
+    Fill2,                              ! The second page of the fill
+                                        ! area.
+                                        ;
+    Fill2Adr,                           ! The address of the same.
+                                        ;
+    FillLength,                         ! Length in bytes of the text in
+                                        ! the fill area.
+                                        ;
+    I,                                  ! General index iterator.
+                                        ;
+    OutPgNo,                            ! Output page number, used to
+                                        ! measure the size of the new
+                                        ! Virtual File.
+                                        ;
+    Src,                                ! Memory page into which pages
+                                        ! are mapped.
+                                        ;
+    SrcAdr,                             ! Address of the same.
+                                        ;
+    SPg;                                ! Source file page number.
+                                        ;
+
+  EvictICBFromMemory;
+
+    ! Flush all memory-resident pages to disk.
+    ;
+
+  Src        _ $ICBM.MemPg(0);
+  Fill1      _ $ICBM.MemPg(1);
+  Fill2      _ $ICBM.MemPg(2);
+
+  SrcAdr     _ Addrs(Src, 0);
+  Fill1Adr   _ Addrs(Fill1, 0);
+  Fill2Adr   _ Addrs(Fill2, 0);
+
+  FillLength _ 0;
+  OutPgNo    _ 0;
+
+  for I _ 0 step 1 until B!MaxPgIdx do
+  begin
+    ! For each page in the existing Virtual File.
+    ! (Only if we can GUARANTEE that I >= OutPgNo will this scheme work.)
+    ;
+
+    pmap(!CPg(SPg _ $VFPg.ChkPg(I)), !MPg(Src), !Cow!);
+
+      ! Map Virtual File page I into memory page Src, copy-on-write.
+      ;
+
+    memory[SrcAdr] _ memory[SrcAdr];
+
+      ! Make the page private.  (Is this necessary, since we delete the
+      ! page right after this?)
+      ;
+
+    pmap(-1, !CPg(SPg), 0);
+
+      ! Delete the Virtual File page from the file.
+      ;
+
+    MoveTextPL
+    (
+      Src, $VFPg.LftGap(I), $VFPg.TxtLen(I),
+      Fill1, FillLength
+    );
+
+      ! Copy text to the fill area.
+      ;
+
+    incr(FillLength, $VFPg.LftGap(I));
+
+    if (FillLength >= CharactersPerPage) then
+    begin
+      DPg _ ffffp(B!Chan);
+
+      pmap(!MPg(Fill1), !CPg(DPg), !Cow!);
+
+        ! Map the compressed page to the Checkpoint file, and delete the
+        ! page from memory.
+        ;
+
+      decr(FillLength, CharactersPerPage);
+      Blt(Fill2Adr, Fill1Adr, ceiling(FillLength, CharactersPerWord));
+
+      $VFPg.LftGap(OutPgNo) _ 0;
+      $VFPg.TxtLen(OutPgNo) _
+      $VFPg.RgtGap(OutPgNo) _ CharactersPerPage;
+      $VFPg.ICBIdx(OutPgNo) _ -1;
+      $VFPg.ChkPg(OutPgNo)  _ DPg;
+
+        ! Create PPM entry for new Virtual File page OutPgNo.
+        ;
+
+      incr(OutPgNo);
+    end;
+  end;
+
+  if (FillLength) then
+  begin
+    DPg _ ffffp(B!Chan);
+
+    pmap(!MPg(Fill1), !CPg(DPg), !Cow!);
+
+      ! Map the compressed page to the Checkpoint file, and delete the
+      ! page from memory.
+      ;
+
+    $VFPg.LftGap(OutPgNo) _ 0;
+    $VFPg.TxtLen(OutPgNo) _
+    $VFPg.RgtGap(OutPgNo) _ FillLength;
+    $VFPg.ICBIdx(OutPgNo) _ -1;
+    $VFPg.ChkPg(OutPgNo)  _ DPg;
+
+      ! Create PPM entry for new Virtual File page OutPgNo.
+      ;
+
+    incr(OutPgNo);
+  end;
+
+  for I _ OutPgNo step 1 until B!MaxPgIdx do
+  begin
+    $VFPg.TxtLen(I) _
+    $VFPg.LftGap(I) _ 0;
+    $VFPg.ChkPg(I)  _
+    $VFPg.ICBIdx(I) _ -1;
+    $VFPg.RgtGap(I) _ CharactersPerPage;
+  end;
+
+    ! Set all remaining entries in the old Virtual File to the empty
+    ! state.
+    ;
+
+  B!MaxPgIdx _ OutPgNo - 1;
+end "GarbageCollectGaps";
+!! title Rtn InsertPage ;
+! Insert a new page at the specified page in the Virtual File, and either
+! map it to an existing ICB page (if ICBPg >= 0 on entry), or allocate an
+! ICB page and map it to that (otherwise).  Return the success of the
+! operation. (The insert will fail if we are at the end of the PPM
+! already.  A garbage-collect of gaps will take place, but the caller
+! must deal with the fact that the specified Virtual File page reference
+! may now be meaningless.)
+;
+
+simple boolean procedure InsertPage (integer VFPg, ICBPg(-1));
+begin "InsertPage"
+  if (VFPg >= 0) then
+  begin
+    ! The specified page number is legitimate.
+    ;
+
+    if (B!MaxPgIdx = MaxPPMIdx) then
+    begin
+      ! The PPM is full.
+      ;
+
+      GarbageCollectGaps;
+
+        ! Attempt to make room by removing gaps from the Checkpoint file.
+        ;
+
+      if (B!MaxPgIdx = MaxPPMIdx) then
+      begin
+        T!Bell;
+        W!Msg("The Buffer is full; " &
+            "You may delete characters but you may not insert them.");
+        set(InsertLock);
+        clear(DeleteLock);
+      end;
+
+      return(false);
+    end;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+    begin
+      ! The PPM is not full.  Move pages [VFPg, B!MaxPgIdx] down one slot
+      ! and adjust the ICBM accordingly.
+      ;
+
+      integer
+        ChPg,                             ! Checkpoint file page index.
+                                          ;
+        Dest,                             ! Address of the destination
+                                          ! region.
+                                          ;
+        I,                                ! ICB iteration index.
+                                          ;
+        Len,                              ! Length in words of the region
+                                          ! of the PPM to be Blted.
+                                          ;
+        Start;                            ! Address of the source region.
+                                          ;
+
+
+      if (VFPg <= B!MaxPgIdx) then
+      begin
+        ! The new page is being inserted into the existing page range.
+        ;
+
+        Start  _ $VFPg.Adr(VFPg);
+        Dest   _ Start + PPMWordsPerEntry;
+        Len    _ (B!MaxPgIdx + 1 - VFPg) * PPMWordsPerEntry;
+
+        Bart, Dest, Len);
+
+          ! Move the entries in the PPM after VFPg down one slot.
+          ;
+
+        for I _ 0 step 1 until MaxICBMIdx do
+          if ($ICBM.VFPg(I) >= VFPg) then
+            incr($ICBM.VFPg(I));
+
+          ! Where necessary, bump the Virtual File page number associated
+          ! with each ICB page.
+          ;
+      end;
+
+      if (ICBPg < 0) then
+        ICBPg              _
+        $VFPg.ICBIdx(VFPg) _ GetICBPage
+      else
+      begin
+        $VFPg.ICBIdx(VFPg) _ ICBPg;
+      end;
+
+        ! Establish which ICB page to associate with the new Virtual File
+        ! page.
+        ;
+
+      ChPg                 _
+      $VFPg.ChkPg(VFPg)    _ ffffp(B!Chan);
+      $ICBM.VFPg(ICBPg)    _ VFPg;
+      $ICBM.MissCnt(ICBPg) _ 0;
+
+        ! Allocate a page in the Checkpoint file for the new Virtual File
+        ! page.
+        ;
+
+!      print("InsertPage: ",
+          "ICBPg (", cvos(ICBPg), "q)",
+          ", $ICBM.MemPg(ICBPg) (", cvos($ICBM.MemPg(ICBPg)), "q)",
+          ", ChPg (", cvos(ChPg), "q)", crlf);
+
+      pmap(!MPg($ICBM.MemPg(ICBPg)), !CPg(ChPg), !RdWt!);
+      pmap(!CPg(ChPg), !MPg($ICBM.MemPg(ICBPg)), !RdWt!);
+
+        ! Map the selected ICB page to the selected Virtual File page,
+        ! with read/write access.
+        ;
+
+      $VFPg.LftGap(VFPg) _
+      $VFPg.TxtLen(VFPg) _
+      $VFPg.RgtGap(VFPg) _ 0;
+
+        ! Initialize the PPM entry for the new page.
+        ;
+
+      incr(B!MaxPgIdx);
+    end;
+  end
+  else
+  begin
+    print("InsertPage got a bad page number (", VFPg, ")", crlf);
+    exit;
+  end;
+
+  return(true);
+end "InsertPage";
+!! title Rtn B!ForceGap ;
+! Force a (possibly empty) gap to appear to the right of the Point in the
+! Virtual file, and return a description of the location of the character
+! to the left of the Point.
+;
+
+forward internal simple integer procedure B!GetP;
+
+simple procedure B!ForceGap (reference integer RPg, ROfst);
+begin "B!ForceGap"
+  integer
+    Bias,                               ! A charcter offset variable
+                                        ! used in conjunction with Blt
+                                        ! calls.
+                                        ;
+    ChOfst,                             ! Character offset of the
+                                        ! character preceding the Point
+                                        ! on the page. 
+                                        ;
+    Dummy,                              ! A filler.
+                                        ;
+    DWrd,                               ! Destination word designator.
+                                        ;
+    LenLftTxt,                          ! Length of the text to the left
+                                        ! of the Point.
+                                        ;
+    LenRgtTxt,                          ! Length of the text to the right
+                                        ! of the Point.
+                                        ;
+    NxtChOfst,                          ! The charcter offset of the
+                                        ! character to the right of the
+                                        ! Point.
+                                        ;
+    NxtPg,                              ! The next page.
+                                        ;
+    PrvPg,                              ! The previous page.
+                                        ;
+    SWrd,                               ! Source word designator. 
+                                        ;
+    ThisPg,                             ! Virtual File page containing
+                                        ! the Point.
+                                        ;
+    WrdCnt,                             ! The number of words to
+                                        ! transfer.
+                                        ;
+    TLG,                                ! This page's left gap.
+                                        ;
+    TTL,                                ! This page's text length.
+                                        ;
+    TRG,                                ! This page's right gap.
+                                        ;
+    TIX,                                ! This page's ICB index.
+                                        ;
+    TMA,                                ! This page's map address.
+                                        ;
+    TMP,                                ! This page's memory page.
+                                        ;
+    PLG,                                ! The previous page's left gap.
+                                        ;
+    PTL,                                ! The previous page's text length.
+                                        ;
+    PRG,                                ! The previous page's right gap.
+                                        ;
+    PIX,                                ! The previous page's ICB index.
+                                        ;
+    PMA,                                ! The previous page's map address.
+                                        ;
+    PMP,                                ! The previous page's memory page.
+                                        ;
+    NLG,                                ! The next page's left gap.
+                                        ;
+    NTL,                                ! The next page's text length.
+                                        ;
+    NRG,                                ! The next page's right gap.
+                                        ;
+    NIX,                                ! The next page's ICB index.
+                                        ;
+    NMA,                                ! The next page's map address.
+                                        ;
+    NMP;                                ! The next page's memory page.
+                                        ;
+
+
+  if (not LocatePoint(B!GetP, ThisPg, Dummy, ChOfst)) then
+    usererr("B!ForceGap: LocatePoint failed (" & cvs(B!GetP) & ")", 0, 0);
+
+  RPg       _ ThisPg;
+  ROfst     _ ChOfst;
+
+    ! Our first guess is that the located point will abut the right gap.
+    ;
+
+  NxtChOfst _ ChOfst + 1;
+  TMA       _ $VFPg.Adr(ThisPg);
+  TRG       _ $VFPg.RG(TMA);
+
+  if (B!Size = 0 or (NxtChOfst = TRG)) then
+  begin
+    ! The Buffer is empty, or we are on the edge of the right gap
+    ! already.  Do nothing.
+    ;
+  end 
+  else
+  begin
+    ! We must move some text off of this page.
+    ;
+
+    PrvPg _ ThisPg - 1;
+    NxtPg _ ThisPg + 1;
+
+    TLG   _ $VFPg.LG(TMA);
+    TTL   _ $VFPg.TL(TMA);
+    TIX   _ $VFPg.IX(TMA);
+
+    if (TIX < 0) then
+    begin
+      TMP _ VFPToMemory(ThisPg);
+      TIX _ $VFPg.IX(TMA);
+    end
+    else
+      TMP _ $ICBM.MemPg(TIX);
+
+    if (PrvPg >= 0) then
+    begin
+      PMA _ TMA - PPMWordsPerEntry;
+      PLG _ $VFPg.LG(PMA);
+      PTL _ $VFPg.TL(PMA);
+      PRG _ $VFPg.RG(PMA);
+      PIX _ $VFPg.IX(PMA);
+
+      if (PIX < 0) then
+      begin
+        PMP _ VFPToMemory(PrvPg);
+        PIX _ $VFPg.IX(PMA);
+      end
+      else
+        PMP _ $ICBM.MemPg(PIX);
+    end;
+
+    if (NxtPg <= MaxPPMIdx) then
+    begin
+      NMA _ TMA + PPMWordsPerEntry;
+
+      if (NxtPg <= B!MaxPgIdx) then
+      begin
+        NLG _ $VFPg.LG(NMA);
+        NTL _ $VFPg.TL(NMA);
+        NRG _ $VFPg.RG(NMA);
+
+        NIX _ $VFPg.IX(NMA);
+
+        if (NIX < 0) then
+        begin
+          NMP _ VFPToMemory(NxtPg);
+          NIX _ $VFPg.IX(NMA);
+        end
+        else
+          NMP _ $ICBM.MemPg(NIX);
+      end;
+    end;
+
+    LenRgtTxt _ TRG - NxtChOfst;
+    LenLftTxt _ TTL - LenRgtTxt;
+
+    if (NxtPg <= B!MaxPgIdx and NTL = 0) then
+    begin
+      ! The next page is empty.  Move the right text to it.
+      ;
+
+      SWrd   _ WrdNo(NxtChOfst);
+      Bias   _ ChrNo(NxtChOfst);
+      WrdCnt _ WrdNo(TRG - 1) - SWrd + 1;
+      DWrd   _ 0;
+
+      Blt
+      (
+        Addrs(TMP, SWrd),
+        Addrs(NMP, DWrd),
+        WrdCnt
+      );  
+
+      $VFPg.LG(NMA) _ Bias;
+      $VFPg.TL(NMA) _ LenRgtTxt;
+      $VFPg.RG(NMA) _ LenRgtTxt + Bias;
+      decr($VFPg.RG(TMA), LenRgtTxt);
+      decr($VFPg.TL(TMA), LenRgtTxt);
+    end
+    else if (NxtPg <= B!MaxPgIdx and LenRgtTxt <= NLG) then
+    begin
+      ! Text to the right of the Point fits in the left gap of the next
+      ! page.
+      ;
+
+      MoveTextPL
+      (
+        ThisPg, NxtChOfst,
+        LenRgtTxt,
+        NxtPg, (NLG - LenRgtTxt)
+      );
+
+      decr($VFPg.RG(TMA), LenRgtTxt);
+      decr($VFPg.TL(TMA), LenRgtTxt);
+      decr($VFPg.LG(NMA), LenRgtTxt);
+      incr($VFPg.TL(NMA), LenRgtTxt);
+    end
+    else if (PrvPg >= 0 and PTL = 0) then
+    begin
+      ! The previous page is empty.  Move the left text to it.
+      ;
+
+      SWrd   _ WrdNo(TLG);
+      Bias   _ ChrNo(TLG);
+      WrdCnt _ WrdNo(ChOfst) - SWrd + 1;
+      DWrd   _ 0;
+
+      Blt
+      (
+        Addrs(TMP, SWrd),
+        Addrs(PMP, DWrd),
+        WrdCnt
+      );  
+
+      $VFPg.LG(PMA) _ Bias;
+      $VFPg.TL(PMA) _ LenLftTxt;
+      $VFPg.RG(PMA) _ LenLftTxt + Bias;
+      incr($VFPg.LG(TMA), LenLftTxt);
+      decr($VFPg.TL(TMA), LenLftTxt);
+      RPg   _ PrvPg;
+      ROfst _ LenLftTxt + Bias - 1;
+    end
+    else if (PrvPg >= 0 and LenLftTxt <= CharactersPerPage - PRG) then
+    begin
+      ! Text left of the Point fits in the right gap of the previous
+      ! page.
+      ;
+
+      MoveTextPL
+      (
+        ThisPg, TLG,
+        LenLftTxt,
+        PrvPg, PRG
+      );
+
+      incr($VFPg.RG(PMA), LenLftTxt);
+      incr($VFPg.TL(PMA), LenLftTxt);
+      incr($VFPg.LG(TMA), LenLftTxt);
+      decr($VFPg.TL(TMA), LenLftTxt);
+      RPg   _ PrvPg;
+      ROfst _ PRG + LenLftTxt - 1;
+    end
+    else
+    begin
+      ! Cannot move text backwards or forwards to an existing page.  We
+      ! must create a new page and move the right-text to it.  The text
+      ! is right-justified within the new page.
+      ;
+
+      if (not InsertPage(NxtPg)) then
+      begin
+        ! A garbage-collect of gaps has taken place, because we reached
+        ! the capacity of the PPM. We have lost the location of the
+        ! Point, and must start over again.
+        ;
+
+        if (not LocatePoint(B!GetP, ThisPg, Dummy, ChOfst)) then
+          usererr("B!ForceGap: LocatePoint failed (" & cvs(B!GetP) & ")",
+              0, 0);
+
+        NxtPg _ ThisPg + 1;
+
+        TMA   _ $VFPg.Adr(ThisPg);
+        TLG   _ $VFPg.LG(TMA);
+        TTL   _ $VFPg.TL(TMA);
+        TRG   _ $VFPg.RG(TMA);
+        TMP   _ $ICBM.MemPg($VFPg.IX(TMA));
+
+        if (NxtPg <= MaxPPMIdx) then
+        begin
+          NMA _ TMA + PPMWordsPerEntry;
+
+          if (NxtPg <= B!MaxPgIdx) then
+          begin
+            NLG _ $VFPg.LG(NMA);
+            NTL _ $VFPg.TL(NMA);
+            NRG _ $VFPg.RG(NMA);
+
+            NIX _ $VFPg.IX(NMA);
+
+            if (NIX < 0) then
+            begin
+              NMP _ VFPToMemory(NxtPg);
+              NIX _ $VFPg.IX(NMA);
+            end
+            else
+              NMP _ $ICBM.MemPg(NIX);
+          end;
+        end;
+
+        LenLftTxt _ TRG - NxtChOfst;
+        LenRgtTxt _ TTL - LenLftTxt;
+
+        if (not InsertPage(NxtPg)) then
+        begin
+          B!FlushToEDT;
+          cfile(B!Chan);
+          usererr("B!ForceGap: PPM full. Checkpoint File is intact.",
+              0, 0);
+        end;
+      end;
+
+      NMP    _ $ICBM.MemPg($VFPg.IX(NMA));
+      SWrd   _ WrdNo(NxtChOfst);
+      Bias   _ ChrNo(NxtChOfst);
+      WrdCnt _ WrdNo(TRG - 1) - SWrd + 1;
+      DWrd   _ 0;
+
+      Blt
+      (
+        Addrs(TMP, SWrd),
+        Addrs(NMP, DWrd),
+        WrdCnt
+      );  
+
+      $VFPg.LG(NMA) _ Bias;
+      $VFPg.TL(NMA) _ LenRgtTxt;
+      $VFPg.RG(NMA) _ LenRgtTxt + Bias;
+      decr($VFPg.RG(TMA), LenRgtTxt);
+      decr($VFPg.TL(TMA), LenRgtTxt);
+    end;
+  end;
+end "B!ForceGap";
+!! title Rtn DeletePage ;
+! Delete a page from the Virtual File.
+;
+
+simple procedure DeletePage (integer Pg);
+begin "DeletePage"
+  integer
+    DstAdr,                             ! Address of the destination
+                                        ! region.
+                                        ;
+    I,                                  ! Iteration index over ICB
+                                        ! entries.
+                                        ;
+    SrcAdr,                             ! Address of the source region.
+                                        ;
+    SrcLen,                             ! Length in words of the source
+                                        ! region.
+                                        ;
+    T;                                  ! Temp for keeping the ICB index
+                                        ! of Pg.
+                                        ;
+
+  if (0 <= Pg <= B!MaxPgIdx) then
+  begin
+    ! Pg is not out of range.
+    ;
+
+    pmap(-1, !CPg($VFPg.ChkPg(Pg)), 0);
+
+      ! Delete the Checkpoint file page corresponding to this Virtual
+      ! File page.
+      ;
+
+    $ICBM.VFPg(T _ $VFPg.ICBIdx(Pg)) _ -1;
+    $ICBM.MissCnt(T) _ largeinteger;
+
+      ! Mark the page as availible in the ICB.
+      ;
+
+    DstAdr _ $VFPg.Adr(Pg);
+    SrcAdr _ DstAdr + PPMWordsPerEntry;
+    SrcLen _ (B!MaxPgIdx - Pg) * PPMWordsPerEntry;
+    Blt(SrcAdr, DstAdr, SrcLen);
+    decr(B!MaxPgIdx);
+
+      ! Remove the entry for Pg by closing the PPM down.
+      ;
+
+    for I _ 0 step 1 until MaxICBMIdx do
+      if ($ICBM.VFPg(I) > Pg) then
+        decr($ICBM.VFPg(I));
+
+      ! Adjust Virtual File page links in the ICBM.
+      ;
+  end;
+end "DeletePage";
+!! title Rtn B!WriteTextFile ;
+! Write the contents of the Buffer to a new incarnation of the specified
+! Text file.  Return true if successful.  This routine doesn't delete or
+! close the Checkpoint file.
+;
+
+forward internal simple procedure B!SetP (integer Pt);
+forward internal simple procedure B!Insert (integer Chr);
+
+internal simple boolean procedure B!WriteTextFile (string FName);
+begin "B!WriteTextFile"
+  integer
+    DPtr,                               ! Destination byte pointer
+                                        ;
+    F!Chan,                             ! Text File channel.
+                                        ;
+    SavePt,                             ! Remember our location.
+                                        ;
+    SPtr;                               ! Source byte pointer.
+                                        ;
+
+  SavePt _ B!GetP;
+  B!SetP(B!Size);
+  B!Insert(null);
+  B!Insert(null);
+  B!Insert(null);
+  B!Insert(null);
+
+    ! Put 4 nulls at the end of the file in order to sanitize the last
+    ! word.
+    ;
+
+  F!Chan _ openfile(FName, "WE");
+
+  if (!skip!) then
+  begin
+    DoErStr;
+    return(false);
+  end;
+
+  EvictICBFromMemory;
+
+  ! Flush the contents of the ICB to disk.
+  ;
+
+  begin
+    ! Perform the write by garbage collecting gaps on the fly and mapping
+    ! packed pages to the Text file.
+    ;
+
+    integer
+      DPg,                              ! Destination (Text) file page
+                                        ! number.
+                                        ;
+      DPgCnt,                           ! The count of actual output file
+                                        ! pages. 
+                                        ;
+      Fill1,                            ! The first page of the fill
+                                        ! area.
+                                        ;
+      Fill1Adr,                         ! The address of the same.
+                                        ;
+      Fill2,                            ! The second page of the fill
+                                        ! area.
+                                        ;
+      Fill2Adr,                         ! The address of the same.
+                                        ;
+      FillLength,                       ! Length in bytes of the text in
+                                        ! the fill area.
+                                        ;
+      I,                                ! Iterates over Virtual File
+                                        ! pages.
+                                        ;
+      Src;                              ! Memory page into which pages
+                                        ! are mapped.
+                                        ;
+
+
+    DPgCnt     _
+    FillLength _ 0;
+
+    Src        _ $ICBM.MemPg(0);
+    Fill1      _ $ICBM.MemPg(1);
+    Fill2      _ $ICBM.MemPg(2);
+
+    Fill1Adr   _ Addrs(Fill1);
+    Fill2Adr   _ Addrs(Fill2);
+
+    DPg        _ ffffp(F!Chan);
+
+    for I _ 0 step 1 until B!MaxPgIdx do
+    begin
+      ! For each page in the Virtual File.
+      ;
+
+      pmap(!CPg($VFPg.ChkPg(I)), !MPg(Src), !Rd!);
+
+        ! Map Virtual File page I to memory, with read access.
+        ;
+
+      SPtr _ BldMemPtr(Src, $VFPg.LftGap(I));
+      DPtr _ BldMemPtr(Fill1, FillLength);
+
+      MoveBytes(SPtr, DPtr, $VFPg.TxtLen(I));
+
+        ! Move text into the fill area.
+        ;
+
+      pmap(-1, !MPg(Src), 0);
+
+        ! Unmap the Checkpoint file page.
+        ;
+
+      incr(FillLength, $VFPg.TxtLen(I));
+
+      if (FillLength >= CharactersPerPage) then
+      begin
+        incr(DPgCnt);
+
+          ! Bump the output file page count
+          ;
+
+        pmap(!MPg(Fill1), !TPg(DPg), !RdWt!);
+
+          ! Map a packed page to the Text file, and delete the page from
+          ! memory.
+          ;
+
+        decr(FillLength, CharactersPerPage);
+        Blt(Fill2Adr, Fill1Adr, ceiling(FillLength, CharactersPerWord));
+        DPg _ ffffp(F!Chan);
+      end;
+    end;
+
+    if (FillLength) then
+    begin
+      incr(DPgCnt);
+
+        ! Bump the output file page count.
+        ;
+
+      pmap(!MPg(Fill1), !TPg(DPg), !RdWt!);
+
+        ! Map the last little bit to the Text file.
+        ;
+    end;
+
+    decr(B!Size, 4);
+
+      ! Remove the nulls we inserted before from the character count.
+      ;
+
+    closf(F!Chan);
+
+      ! Close the Text file, but do not release the Jfn.
+      ;
+
+    chfdb(F!Chan, '11, bit(!mask(6), 11), bit(7, 11));
+
+      ! Set byte size to 7 bits.
+      ;
+
+    chfdb(F!Chan, '12, !mask(36), B!Size);
+
+      ! Set character count to the appropriate value.
+      ! <<  This will have trouble on very large files (for which the
+      !     number of pages = 13,421,773).
+      ;
+
+    rljfn(F!Chan);
+
+      ! Release the Jfn on the Text file.
+      ;
+  end;
+
+  B!SetP(SavePt);
+
+    ! Restore the point.
+    ;
+
+  return(true);
+end "B!WriteTextFile";
+!! title Rtn CheckForSeqNos ;
+! Check to see if the first word of the specified page is a sequence
+! number according to the classic SOS convention.
+!
+!     The classic SOS convention defines a line sequence number as a word
+!     with bit 35 set containing 5 ASCII decimal numerals, followed by a
+!     tab as the first character of the next word.  Because of the
+!     word-aligned character of the line sequence number, the previous
+!     word will contain up to 4 nulls.
+;
+
+simple boolean procedure CheckForSeqNos (integer MemPg);
+begin "CheckForSeqNos"
+  integer
+    C,                                  ! A character temporary.
+                                        ;
+    I,                                  ! A character index iterator.
+                                        ;
+    W;                                  ! A word in which we look for
+                                        ! sequence numbers.
+                                        ;
+  W _ memory[Addrs(MemPg)];
+
+  if (W land bit(35)) then
+  begin
+    W _ W lsh -1;
+
+    for I _ 1 step 1 until CharactersPerWord do
+    begin
+      C _ W land !mask(7);
+
+      if (C < "0" or C > "9") then
+        return(false);
+
+      W _ W lsh -7;
+    end;
+
+    W _ memory[Addrs(MemPg, 1)];
+
+    if (W lsh -((CharactersPerWord - 1) * 7 + 1) neq TAB) then
+      return(false);
+
+    return(true);
+  end
+  else
+    return(false);
+end "CheckForSeqNos";
+!! title Rtn CheckForNulls ;
+! Check to see if the specified text page contains any nulls.
+;
+
+simple boolean procedure CheckForNulls (integer MemPg, ByteCnt);
+begin "CheckForNulls"
+  integer
+    BC,                                 ! A byte-count variable.
+                                        ;
+    I,                                  ! A fun variable.
+                                        ;
+    W,                                  ! A word in which we look for
+                                        ! nulls.
+                                        ;
+    WC,                                 ! A word-count variable.
+                                        ;
+    Wrd;                                ! A word index iterator.
+                                        ;
+
+  define
+    IsNull (W, X) =
+        {(not ((!mask(7) lsh
+        ((CharactersPerWord - 1 - X) * 7 + 1)) land W))};
+
+      ! This thing selects the Xth byte (in [0, 4]) from a word of ASCII
+      ! characters, but does not bother to right-justify it.
+      ;
+
+
+  if (ByteCnt <= 0) then
+    return(false);
+
+  WC  _ WrdNo(ByteCnt - 1);
+  BC  _ ChrNo(ByteCnt - 1);
+  Wrd _ Addrs(MemPg);
+
+  for I _ 0 step 1 until (WC - 1) do
+  begin
+    W _ memory[Wrd];
+
+    if (IsNull(W, 0) or IsNull(W, 1) or IsNull(W, 2) or IsNull(W, 3) or
+        IsNull(W, 4)) then
+      return(true);
+
+    incr(Wrd);
+  end;
+
+  W _ memory[Wrd];
+
+  for I _ 0 step 1 until BC do
+  begin
+    if (IsNull(W, I)) then
+      return(true);
+  end;
+
+  return(false);
+end "CheckForNulls";
+!! title Rtn InitPPMandICBM ;
+! Initialize the buffer to virgin condition.  This must take place after
+! the Checkpoint file has been opened and the pages in question mapped
+! from the Checkpoint file to the appropriate memory pages.  It is done
+! (obviously) for each new Buffer that we create.
+;
+
+simple procedure InitPPMandICBM;
+begin "InitPPMandICBM"
+  integer
+    I,                                  ! Random iterator.
+                                        ;
+    ICBBas;                             ! Base address of the In-Core
+                                        ! Buffer.
+                                        ;
+
+  ICBBas _ PgNo(ICB);
+
+  for I _ 0 step 1 until MaxPPMIdx do
+  begin
+    $VFPg.TxtLen(I) _
+    $VFPg.LftGap(I) _
+    $VFPg.RgtGap(I) _ 0;
+    $VFPg.ChkPg(I)  _
+    $VFPg.ICBIdx(I) _ -1;
+  end;
+
+    ! Initialize all PPM entries to an empty state.
+    ;
+
+  for I _ 0 step 1 until MaxICBMIdx do
+  begin
+    $ICBM.MemPg(I)   _ ICBBas + I;
+    $ICBM.VFPg(I)    _ -1;
+    $ICBM.MissCnt(I) _ largeinteger;
+  end;
+
+    ! Establish the physical memory location and mark the emptiness of
+    ! each ICB page.
+    ;
+end "InitPPMandICBM";
+!! title Rtn SqueezeText ;
+! Copy text from the input memory page to the output memory page,
+! removing sequence numbers and nulls as indicated.  Return the actual
+! length of the resulting text page.
+;
+
+simple integer procedure SqueezeText (integer InMemPg, OutMemPg, ChLen;
+    boolean RemoveNulls, HasSeqNos);
+begin "SqueezeText"
+  integer
+    C,                          ! A character temporary.
+                                ;
+    InPtr,                      ! Pointer to the character to be
+                                ! read.
+                                ;
+    InByteIdx,                  ! Byte index of the character
+                                ! being read.
+                                ;
+    OutByteIdx,                 ! Byte index of the character
+                                ! being output.
+                                ;
+    OutPtr;                     ! Pointer to the character
+                                ! position to be written.
+                                ;
+
+
+  InPtr  _ BldMemPtr(InMemPg, 0);
+  OutPtr _ BldMemPtr(OutMemPg, 0);
+
+  OutByteIdx _ 
+  InByteIdx  _ 0;
+
+  while (ChLen) do
+  begin
+    ! For each character on the page.
+    ;
+
+    if (HasSeqNos and
+        (ChrNo(InByteIdx) = 0) and
+        memory[Addrs(InMemPg) + WrdNo(InByteIdx)] land bit(35)) then
+    begin
+      ! The current input word contains a sequence number.
+      ;
+
+      ibp(InPtr);
+      ibp(InPtr);
+      ibp(InPtr);
+      ibp(InPtr);
+      ibp(InPtr);
+      ibp(InPtr);
+
+      incr(InByteIdx, 6);
+      decr(ChLen, 6);
+
+      if (not RemoveNulls and OutByteIdx > 0) then
+      begin
+        ! We need to remove nulls that preceed the
+        ! sequence-number word.
+        ;
+
+        OutPtr _ DecrBP(OutPtr);
+        decr(OutByteIdx);
+
+        while (OutByteIdx > 0 and not (C _ ldb(OutPtr))) do
+        begin
+          OutPtr _ DecrBP(OutPtr);
+          decr(OutByteIdx);
+        end;
+
+        if (C) then
+        begin
+          ibp(OutPtr);
+          incr(OutByteIdx);
+        end;
+      end;
+    end
+    else
+    begin
+      ! Process an individual character.
+      ;
+
+      if ((C _ ldb(InPtr)) or not RemoveNulls) then
+      begin
+        dpb(C, OutPtr);
+        ibp(OutPtr);
+        incr(OutByteIdx);
+      end;
+
+      ibp(InPtr);
+      decr(ChLen);
+      incr(InByteIdx);
+    end;
+  end;
+
+  return(OutByteIdx + 1);
+end "SqueezeText";
+!! title Rtn CountSomeNulls ;
+! Count the number of nulls which may have been applied to the last word
+! of the input file, to compensate for some filler which may have been
+! put there by foreign agents.  Return the number of nulls discovered.
+;
+
+simple integer procedure CountSomeNulls (integer Src, ChLen);
+begin "CountSomeNulls"
+  integer
+    Ptr,                                ! A byte pointer with which to
+                                        ! look around.
+                                        ;
+    I;                                  ! An index variable.
+                                        ;
+
+  if (ChrNo(ChLen) <= 0) then
+    return(0)
+  else
+  begin
+    Ptr _ BldMemPtr(Src, ChLen);
+    I   _ 0;
+
+    while (I < CharactersPerWord and not ldb(Ptr)) do
+    begin
+      Ptr _ DecrBp(Ptr);
+      incr(I);
+    end;
+
+    return(I);
+  end;
+end "CountSomeNulls";
+!! title Rtn PgSiz ;
+! Determine the size of this particular page, based upon whether it is
+! the last page or not, and the original size in characters.
+;
+
+simple integer procedure PgSiz (integer Pg, MaxPg, Size);
+begin "PgSiz"
+  return
+  (
+    if (Pg < MaxPg) then
+      CharactersPerPage
+    else
+      ((Size - 1) mod CharactersPerPage + 1)
+  );
+end "PgSiz";
+!! title Rtn B!CreateChkPntFile ;
+! Create a new Checkpoint file, by adding a new Buffer to the Chain, and
+! copying the contents of the specified Text file to the Checkpoint,
+! removing line sequence numbers and/or nulls in the process, if
+! necessary. 
+!
+! Return true if a new Checkpoint was successfully created, and return
+! false at the slightest hint of trouble.
+!
+! Further, the caller should insure that a Buffer slot actually is
+! availible before calling this routine, since it will die if one is
+! not.
+!
+! Note: The reason "ICBBase" works throughout this routine is a
+!       correspondence between the layouts of the giant array and the
+!       front section of the Checkpoint file.
+;
+
+forward simple string procedure NameChkPntFile (integer BufNum);
+forward simple integer procedure GetFreeSlot;
+forward simple procedure PositionTo (integer Page, Line, Char);
+
+internal simple boolean procedure B!CreateChkPntFile
+    (string TName, TAlias(null); integer TPage(0), TLine(0), TChar(0));
+begin "B!CreateChkPntFile"
+  boolean
+    FileEmpty,                          ! True if the Text file is
+                                        ! empty, either because it has
+                                        ! no text in it, or because it
+                                        ! does not exist.
+                                        ;
+    FileNonExistent;                    ! True iff Text file does not
+                                        ! exist.
+                                        ;
+  integer
+    BufNum,                             ! The index of the new Buffer in
+                                        ! the Buffer Chain.
+                                        ;
+    F!Chan,                             ! The channel number of the Text
+                                        ! file.
+                                        ;
+    NextHole,                           ! The page index of the next hole
+                                        ! in the Text file.
+                                        ;
+    InMemAdr,                           ! Address of a memory page we use
+                                        ! for moving text from the Text
+                                        ! file to the Checkpoint file.
+                                        ;
+    InMemPg;                            ! Page number of a memory page we
+                                        ! use for moving text from the
+                                        ! Text file to the Checkpoint
+                                        ! file.
+                                        ;
+
+
+  set(FileNonExistent, (not F!FileExists(TName)));
+  clear(FileEmpty);
+
+  if (length(TName)) then
+  begin
+    ! There is actually a file that we want to edit.
+    ;
+
+    integer
+      Err;                              ! A copy of the error code
+                                        ! returned in !skip!.
+                                        ;
+
+
+    if (FileNonExistent) then
+      set(FileEmpty)
+    else
+    begin
+      F!Chan _ openfile(TName, "RE");
+
+      if (Err _ !skip!) then
+      begin
+        DoErStr;
+        print("B!CreateChkPntFile: Open Error (", xwdstr(Err),
+            ") on TName = ", TName, crlf);
+        return(false);
+      end;
+
+      if (sizef(F!Chan) = 0) then
+        set(FileEmpty);
+
+      begin
+        ! Gather interesting information about the file for later use.
+        ! Stuff into meaningful globals.
+        ;
+
+        B!MaxPgIdx _ sizef(F!Chan) - 1;
+        B!Size     _ chsizef(F!Chan);
+      end;
+
+      if ((NextHole _ ffffp(F!Chan, 0)) neq sizef(F!Chan)) then
+      begin
+        ! Text file has holes (The first free file page should be the
+        ! first page beyond the end of the file).
+        ;
+
+        if (not C!Ask("Text file has holes.  Ignore them? ")) then
+          return(false);
+      end;
+    end;
+  end
+  else
+  begin
+    set(FileEmpty);
+    B!Size     _
+    B!MaxPgIdx _ 0;
+
+      ! This is the extent of the Checkpoint File.
+      ;
+  end;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+
+  B!ChkPntFile _ NameChkPntFile(BufNum _ GetFreeSlot);
+  B!Chan       _ openfile(B!ChkPntFile, "RWNE");
+
+    ! <<  Should do "open-close-open" on the same Jfn to establish the
+    !     "legitimacy" of the Checkpoint file with the Monitor.
+    !     Otherwise, if the system goes down, all is lost.
+    ;
+
+  if (!skip!) then
+  begin
+    ! An error was detected while opening the Checkpoint file.
+    ;
+
+    ! <<  If the error is (file exists), then we should handle it as
+    !     follows:
+    !
+    !       Prompt for
+    !         1) Use existing file or
+    !         2) Delete existing file
+    ;
+
+    print("B!CreateChkPntFile: Open Error on B!ChkPntFile = ",
+        B!ChkPntFile, crlf);
+    exit;
+  end;
+
+  W!SetB(BufNum);
+
+    ! Notify the Window module of the identity of the current buffer.
+    ;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  pmap(!CPg(0), !MPg(GiantBase), (!RdWt! lor !Count!(ICBBase)));
+
+    ! Map the Header, the ICBM, the PPM, and the EDT pages into the
+    ! beginning of the Checkpoint file, with read/write access.
+    ;
+
+  InitPPMandICBM;
+
+    ! Initialize PPM and ICB.
+    ;
+
+  SetupHeaderAndEDT(TName, TAlias);
+
+    ! Instantiate all values in the Header and EDT portions of the giant
+    ! array.
+    ;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  InMemPg  _ $ICBM.MemPg(0);
+  InMemAdr _ Addrs(InMemPg);
+
+  if (FileEmpty) then
+  begin
+    pmap(!CPg(ICBBase), !MPg(InMemPg), !RdWt!);
+    memory[InMemAdr] _ 0;
+
+      ! Map the first page in the ICB to the first (empty) data page in
+      ! the Checkpoint file.
+      ;
+
+    $VFPg.LftGap(0) _
+    $VFPg.TxtLen(0) _
+    $VFPg.RgtGap(0) _
+    $VFPg.ICBIdx(0) _ 0;
+    $VFPg.ChkPg(0)  _ ICBBase;
+
+    B!Size          _
+    B!MaxPgIdx      _ 0;
+
+      ! Setup the PPM entry for the first Virtual File page.
+      ;
+  end
+  else
+  begin
+    ! Copy the contents of the Text file to the Checkpoint file, worrying
+    ! if necessary about removing line sequence numbers and nulls in the
+    ! process.
+    ;
+
+    boolean
+      HasNulls,                         ! Indicate that nulls have been
+                                        ! detected in this Text file.
+                                        ;
+      HasSeqNos;                        ! Indicate that this Text file
+                                        ! contains sequence numbers.
+                                        ;
+
+    integer
+      TxtFPg,                           ! Page index into the Text file.
+                                        ;
+      ChkFPg,                           ! Page index into the Checkpoint
+                                        ! file.
+                                        ;
+      OutMemPg,                         ! Memory page out of which text
+                                        ! is mapped to the Checkpoint
+                                        ! file.
+                                        ;
+      ActLen;                           ! The actual length of the
+                                        ! current Checkpoint File page.
+                                        ;
+
+
+    ChkFPg _ ICBBase - 1;
+
+      ! This is 1 less than the correct value because it is incremented
+      ! later on before it is used.
+      ;
+
+    OutMemPg _ InMemPg;
+    clear(HasNulls);
+    clear(HasSeqNos);
+
+    begin
+      ! Map a page and check for sequence numbers.
+      ;
+
+      pmap(!TPg(0), !MPg(InMemPg), !Rd!);
+
+        ! Map the first Text file page, with read-only access.
+        ;
+
+      HasSeqNos _ CheckForSeqNos(InMemPg);
+
+      pmap(-1, !MPg(InMemPg), 0);
+
+        ! Remove the page from memory.
+        ;
+    end;
+
+    if (HasSeqNos) then
+      OutMemPg _ InMemPg + 1;
+
+    for TxtFPg _ 0 step 1 until B!MaxPgIdx do
+    begin
+      ! For each page TxtFPg in the Text file.
+      ;
+
+      ActLen _ 0;
+
+      if (NextHole neq TxtFPg) then
+      begin
+        ! The Virtual File page is not empty.
+        ;
+
+        integer
+          ChLen;                        ! Length of the text region to be
+                                        ! read.
+                                        ;
+
+        ChLen _ PgSiz(TxtFPg, B!MaxPgIdx, B!Size);
+
+        incr(ChkFPg);
+
+          ! Increment the Checkpoint file page index.
+          ;
+
+        pmap(!TPg(TxtFPg), !MPg(InMemPg), !Cow!);
+
+          ! Bring Text file page TxtFPg into memory, copy on write.
+          ;
+
+        if (TxtFPg = B!MaxPgIdx) then
+        begin
+          integer
+            Cnt;
+
+          decr(ChLen, (Cnt _ CountSomeNulls(InMemPg, ChLen - 1)));
+          decr(B!Size, Cnt);
+
+            ! Ignore nulls which might have appeared at the end of the
+            ! file to pad the last word.
+            ;
+        end;
+
+        if (not HasNulls) then
+        begin
+          HasNulls _ CheckForNulls(InMemPg, ChLen);
+
+          if (HasNulls) then
+          begin
+ifcr false thenc
+  ! This is commented out for the benefit of Magnum hackers who need a
+  ! version which runs more than they need nulls removed. 1.11.84
+  ;
+
+            if (G!RNulls) then
+            begin
+              print("Removing Nulls", crlf);
+              OutMemPg _ InMemPg + 1;
+            end
+            else
+endc
+              print("Nulls Exist", crlf);
+          end;
+        end;
+
+ifcr false thenc
+  ! This is commented out for the benefit of Magnum hackers who need a
+  ! version which runs more than they need nulls removed. 1.11.84
+  ;
+
+        if (HasSeqNos or (HasNulls and G!RNulls)) then
+        begin
+          ActLen _ SqueezeText(InMemPg, OutMemPg, ChLen, G!RNulls,
+              HasSeqNos);
+
+            ! Copy from the input page to the output page, removing
+            ! unsightly imperfections.
+            ;
+
+          pmap(-1, !MPg(InMemPg), 0);
+
+            ! Remove the input memory page from memory.
+            ;
+        end
+        else
+endc
+        begin
+          ! No sequence numbers or nulls to remove.
+          ;
+
+          ActLen _ ChLen;
+
+            ! Actually, we keep all characters.
+            ;
+
+          memory[InMemAdr] _ memory[InMemAdr];
+
+            ! Touch the page to force copy-on-write to occur.
+            ;
+        end;
+
+        pmap(!MPg(OutMemPg), !CPg(ChkFPg), 0);
+
+          ! Map the output page to the proper place in the Checkpoint
+          ! file, and delete the page from memory.
+          ;
+
+        $VFPg.TxtLen(TxtFPg) _
+        $VFPg.RgtGap(TxtFPg) _ ActLen;
+
+        $VFPg.LftGap(TxtFPg) _ 0;
+        $VFPg.ChkPg(TxtFPg)  _ ChkFPg;
+        $VFPg.ICBIdx(TxtFPg) _ -1;
+
+          ! Create the PPM entry for this page.
+          ;
+      end
+      else
+        ! The Text file page is empty.
+        ;
+
+        NextHole _ ffffp(F!Chan, TxtFPg + 1);
+
+          ! Find the next hole in the Text file.
+          ;
+    end;
+  end;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  if (FileEmpty) then
+    $ICBM.MissCnt(0) _
+    $ICBM.VFPg(0)    _ 0
+  else
+  begin
+    ! Text file is non-empty.  Instantiate the ICB with the Text file.
+    ;
+
+    integer
+      I;                                ! ICBM index iterator.
+                                        ;
+
+    for I _ 0 step 1 until MaxICBMIdx do
+    begin
+      if ($VFPg.TxtLen(I)) then
+      begin
+         pmap(!CPg($VFPg.ChkPg(I)), !MPg($ICBM.MemPg(I)), !RdWt!);
+
+          ! Map the Ith Virtual File page to the Ith ICB Page, read/write
+          ! access.
+          ;
+
+        $VFPg.ICBIdx(I)  _
+        $ICBM.VFPg(I)    _ I;
+        $ICBM.MissCnt(I) _ 0;
+      end
+      else
+        ! The Virtual File is shorter than the ICB.
+        ;
+
+        done;
+    end;
+
+    PositionTo(TPage, TLine, TChar);
+
+      ! Move the Point to the proper location.
+      ;
+  end;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  if (length (TName) and (not FileNonExistent)) then
+    cfile(F!Chan);
+
+  return(true);
+end "B!CreateChkPntFile";
+!! title Rtn InitMappingStructures ;
+! This is done once at module initialization time in order to establish
+! our sense of direction.
+;
+
+simple procedure InitMappingStructures;
+begin "InitMappingStructures"
+  integer
+    BegOfIt,                            ! The beginning of the Giant Array.
+                                        ;
+    EndOfIt,                            ! The end of the Giant Array.
+                                        ;
+    GiantAdr;                           ! The address of the GiantBase.
+                                        ;
+
+  BegOfIt   _ location(GiantArray[0]);
+  EndOfIt   _ location(GiantArray[(EndOfBuffer + 1) * WordsPerPage]);
+  GiantBase _ ceiling(BegOfIt, WordsPerPage);
+  GiantAdr  _ Addrs(GiantBase, 0);
+
+  HEAD      _ GiantAdr + Addrs(HEADBase);
+  ICBM      _ GiantAdr + Addrs(ICBMBase);
+  PPM       _ GiantAdr + Addrs(PPMBase);
+  EDT       _ GiantAdr + Addrs(EDTBase);
+  ICB       _ GiantAdr + Addrs(ICBBase);
+
+!  print
+  (
+    "MaxPPMIdx:   ", MaxPPMIdx, crlf,
+    "MaxICBMIdx:  ", MaxICBMIdx, crlf2,
+
+    "GiantArray:  ", xwdstr(hl(BegOfIt) lor hr(EndOfIt)), crlf2,
+
+    "HEAD:        ", xwdstr(hl(HEAD) lor hr(HEAD + Addrs(HEADSize) - 1)), crlf,
+    "ICBM:        ", xwdstr(hl(ICBM) lor hr(ICBM + Addrs(ICBMSize) - 1)), crlf,
+    "PPM:         ", xwdstr(hl(PPM) lor hr(PPM + Addrs(PPMSize) - 1)), crlf,
+    "EDT:         ", xwdstr(hl(EDT) lor hr(EDT + Addrs(EDTSize) - 1)), crlf,
+    "ICB:         ", xwdstr(hl(ICB) lor hr(ICB + Addrs(ICBSize) - 1)), crlf2
+  );
+
+  B!MaxPgIdx _
+  B!Size     _
+  B!Point    _ 0;
+
+    ! Initialize critical variables.
+    ;
+end "InitMappingStructures";
+!! title Rtn InitChain ;
+! Initialize the Buffer Chain by grounding the active list pointer and
+! linking all Buffers into the free list.
+;
+
+simple procedure InitChain;
+begin "InitChain"
+  own integer
+    I;
+
+  B!!Head  _
+  B!!List  _ 0;
+
+    ! There are no buffers on the active list.
+    ;
+
+  B!!Free  _ 1;
+
+  for I _ 1 step 1 until BUFMAX - 1 do
+    B!!Next[I] _ I + 1;
+
+  B!!Next[BUFMAX] _ 0;
+
+    ! Link all buffers into the free list.
+    ;
+end "InitChain";
+!! title Rtn B!Init ;
+! Perform a pre-dawn initialization of the Buffer Module.
+;
+
+simple procedure B!Init;
+begin "B!Init"
+  InitChain;
+  InitMappingStructures;
+end "B!Init";
+require B!Init initialization;
+!! title Rtn PositionTo ;
+! Move the Point to the specified text page, line and character position.
+;
+
+forward internal simple integer procedure B!GetC;
+forward internal simple procedure B!Move(integer Dir);
+
+simple procedure PositionTo (integer Page, Line, Char);
+begin "PositionTo"
+  B!SetP(0);
+
+  decr(Page);
+
+  while (Page > 0) do
+  begin
+    if (B!EndP) then
+      done;
+
+    if (B!GetC = FF) then
+      decr(Page);
+
+    B!Move(FORWARDS);
+  end;
+
+  decr(Line);
+
+  while (Line > 0) do
+  begin
+    if (B!EndP) then
+      done;
+
+    if (B!GetC = LF) then
+      decr(Line);
+
+    B!Move(FORWARDS);
+  end;
+
+  decr(Char);
+
+  while (Char > 0) do
+  begin
+    if (B!EndP) then
+      done;
+
+    decr(Char);
+    B!Move(FORWARDS);
+  end;
+end "PositionTo";
+!! title Rtn GetFreeSlot ;
+! Remove a Buffer slot from the free list, and add it to the Chain.  We
+! assume that the caller has insured that there is a slot availible.
+;
+
+simple integer procedure GetFreeSlot;
+begin "GetFreeSlot"
+  integer
+    Next;                               ! Next free slot
+                                        ;
+
+  if (B!!Free = 0) then
+    ! We are out of slots.  This shouldn't happen at this point, since
+    ! the caller should have checked to see if there were any slots
+    ! availible before calling.  Hence, we die.
+    ;
+
+    ! << This is an ugly requirement, a throwback to DWS code. We should
+    !     really return -1.
+    ;
+
+    usererr(0, 0, "Out of Chain slots in GetFreeSlot.");
+
+  Next    _ B!!Free;
+  B!!Free _ B!!Next[B!!Free];
+
+  if (B!!List = 0) then
+  begin
+    ! Pick up the first Buffer slot.
+    ;
+
+    B!!List       _
+    B!!Head       _ Next;
+    B!!Next[Next] _
+    B!!Last[Next] _ 0;
+  end
+  else
+  begin
+    ! At least 1 Buffer already exists.
+    ;
+    B!!Next[Next] _ B!!Next[B!!List];
+    B!!Last[Next] _ B!!List;
+
+    if (B!!Next[B!!List] neq 0) then
+      B!!Last[B!!Next[B!!List]] _ Next;
+
+    B!!Next[B!!List] _ Next;
+    B!!List          _ Next;
+  end;
+
+  return(B!!List);
+end "GetFreeSlot";
+!! title Rtn B!FreeP ;
+! Routine to tell us if we have any free buffers left.
+;
+
+  internal simple boolean procedure B!FreeP;
+    return(B!!Free neq null);
+!! title Rtn NameChkPntFile ;
+! Return the name of the Checkpoint file corresponding to the specified
+! Buffer. 
+;
+
+simple string procedure NameChkPntFile (integer BufNum);
+begin "NameChkPntFile"
+  return
+  (
+    cvs(1000 + call(0, "Pjob"))[2 for 3] &
+    DED!Alias[1 for 3] &
+    "." &
+    cvs(1000 + BufNum)[2 for 3]
+  );
+end "NameChkPntFile";
+!! title Rtn B!FlushToEDT ;
+! Flush information that we keep in static locations back into the EDT
+! area of the Checkpoint file.
+;
+
+internal simple procedure B!FlushToEDT;
+begin "B!FlushToEDT"
+  integer
+    I;                          ! Loop variable.
+                                ;
+
+  for I _ EDT step 1 until (EDT + (EDTSize * WordsPerPage) - 1) do
+    memory[I] _ 0;
+
+    ! Zero the EDT area.
+    ;
+
+  B!!Alias[B!!List]      _ B!Alias;
+  B!!ChkPntFile[B!!List] _ B!ChkPntFile;
+  B!!File[B!!List]       _ B!File;
+  B!!Mode[B!!List]       _ B!Mode;
+  B!!ModP[B!!List]       _ B!ModP;
+
+    ! Keep the Magnum Alias, Checkpoint file name, Text file name, edit
+    ! mode(s) and modification status around constantly as we edit.
+    ;
+
+  !B!EdName  _ cvasc("Peak!");
+  !B!DedVer  _ B!DedVer;
+  !B!CkPtSer _ B!CkPtSer _ B!CkPtSer + 1;
+  !B!BufNum  _ B!!List;
+
+    ! Preserve the name and version number of the current Editor (!), the
+    ! new Checkpoint file serial number and location in the Buffer Chain
+    ! for posterity.  
+    ;
+    
+  !B!Point _ B!Point;
+  !B!WS0   _ B!WS0;
+  !B!WS1   _ B!WS1;
+
+    ! Preserve our own marks.
+    ;
+
+  !B!Size  _ B!Size;
+  !B!ModP  _ B!ModP;
+  !B!Lock  _ B!Lock;
+  !B!Prot  _ B!Prot;
+
+    ! Preserve miscellaneous quantities of enduring interest to those
+    ! who care.
+    ;
+
+  !B!Mode1 _ cvasc(B!Mode[1 for 5]);
+  !B!Mode2 _ cvasc(B!Mode[6 for 5]);
+
+    ! Decompose the mode string and preserve its constituent parts.
+    ;
+
+  !B!File1  _ cvasc(B!File[1 for 5]);
+  !B!File2  _ cvasc(B!File[6 for 5]);
+  !B!File3  _ cvasc(B!File[11 for 5]);
+  !B!File4  _ cvasc(B!File[16 for 5]);
+  !B!File5  _ cvasc(B!File[21 for 5]);
+
+    ! Decompose the Text file name and preserve its constituent parts.
+    ;
+
+  !B!Alias1 _ cvasc(B!Alias[1 for 5]);
+  !B!Alias2 _ cvasc(B!Alias[6 for 5]);
+  !B!Alias3 _ cvasc(B!Alias[11 for 5]);
+  !B!Alias4 _ cvasc(B!Alias[16 for 5]);
+  !B!Alias5 _ cvasc(B!Alias[21 for 5]);
+  !B!Alias6 _ cvasc(B!Alias[26 for 5]);
+  !B!Alias7 _ cvasc(B!Alias[31 for 5]);
+
+    ! Decompose the Magnum Alias and preserve its constituent parts.
+    ;
+
+  !B!MarkCnt _ MarkCnt;
+
+  for I _ 0 step 1 until MaxMarks - 1 do
+    memory[location(!B!Marks) + I] _ Marks[I];
+
+    ! Preserve all Marks.
+    ;
+
+  !B!LstWrd _ cvasc(">>>>>");
+end "B!FlushToEDT";
+!! title Rtn B!RestoreFromEDT ;
+! Restore information that we keep in static locations from the EDT area
+! of the Checkpoint file.
+!
+! (Note that nothing special is done with !B!BufNum at this point.  Its
+! significance emerges when we are recovering Checkpoint files on
+! command, where we expect usurpation of the existing order to take
+! place.)
+;
+
+internal simple procedure B!RestoreFromEDT;
+begin "B!RestoreFromEDT"
+  integer
+    I;
+
+  B!CkPtSer _ !B!CkPtSer;
+
+    ! Recover the Checkpoint file serial number from the EDT area.
+    ;
+
+  B!Point _ !B!Point;
+  B!WS0   _ !B!WS0;
+  B!WS1   _ !B!WS1;
+
+    ! Recover our own marks.
+    ;
+
+  B!Size _ !B!Size;
+  B!ModP _ !B!ModP;
+  B!Lock _ !B!Lock;
+  B!Prot _ !B!Prot;
+
+    ! Recover miscellaneous quantities of enduring interest to those
+    ! who care.
+    ;
+
+  B!Mode _ cvastr(!B!Mode1) & cvastr(!B!Mode2);
+  
+  set(G!TextMode, kequ(B!Mode[1 for 4], "Text"));
+
+    ! Recreate the mode string from its constituent parts.
+    ;
+
+  B!File _
+      cvastr(!B!File1) &
+      cvastr(!B!File2) &
+      cvastr(!B!File3) &
+      cvastr(!B!File4) &
+      cvastr(!B!File5);
+
+    ! Recreate the Text file name from its constituent parts.
+    ;
+
+  B!Alias _
+      cvastr(!B!Alias1) &
+      cvastr(!B!Alias2) &
+      cvastr(!B!Alias3) &
+      cvastr(!B!Alias4) &
+      cvastr(!B!Alias5) &
+      cvastr(!B!Alias6) &
+      cvastr(!B!Alias7);
+
+    ! Recreate the Magnum Alias from its constituent parts.
+    ;
+
+  B!!Alias[B!!List] _ B!Alias;
+  B!!File[B!!List]  _ B!File;
+  B!!Mode[B!!List]  _ B!Mode;
+  B!!ModP[B!!List]  _ B!ModP;
+
+    ! Restore the Magnum Alias, Text file name, edit mode(s) and
+    ! modification status from the archives.
+    ;
+
+  MarkCnt _ !B!MarkCnt;
+
+  for I _ 0 step 1 until MaxMarks - 1 do
+    Marks[I] _ memory[location(!B!Marks) + I];
+
+    ! Restore our Marks structure.
+    ;
+
+  if (!B!DedVer neq B!DedVer) then
+  begin
+    W!Msg("B!RestoreFromEDT: Editor versions disagree! " &
+        "Checkpoint: " & xwdstr(!B!DedVer) & ", " &
+        "Editor: " & xwdstr(B!DedVer));
+
+    exit;
+
+      ! <<  This is a terrible hack!
+      ;
+  end;
+end "B!RestoreFromEDT";
+!! title Rtn B!RestoreChkPnt ;
+! Routine to reset the static definitions from a descriptor.
+!
+!                       (Formerly called B!Restore.)
+;
+
+internal simple procedure B!RestoreChkPnt (string Bfr);
+begin "B!RestoreChkPnt"
+  B!Chan _ openfile(Bfr, "RWE");
+    ! <<  Make sure that B!Chan is not already in use.
+    ;
+
+  pmap(!CPg(0), !MPg(GiantBase), (!RdWt! lor !Count!(HeadSize)));
+
+    ! Map the Header from the Checkpoint file.
+    ;
+    ;
+
+  if ($H$DedVer = B!DedVer) then
+  begin
+    pmap(!Cpg(HeadSize), !MPg(GiantBase + HeadSize),
+        (!RdWt! lor !Count!(EndOfBuffer - (HeadSize + 1))));
+
+      ! Map the ICBM, the PPM, the EDT pages and ICB from the beginning
+      ! of the Checkpoint file, with read/write access.
+
+    B!RestoreFromEDT;
+  end
+  else
+  begin
+    T!Bell;
+    W!Msg("Editor versions disagree");
+  end;
+end "B!RestoreChkPnt";
+
+
+! **************************  End XxBuf1.Req  *************************** ;
+ @"~-
