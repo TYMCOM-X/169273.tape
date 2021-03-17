@@ -1,0 +1,382 @@
+entry;
+begin	"MAILOG"
+
+require "(SAILIB)SAIL.DEF" source!file;
+!get!definitions(GOGTAB);
+require "(MPL)UUOSYM.SAI" source!file;
+require "MAILIB.DCL" source!file;
+require "FLIB.REQ" source!file;		! used only for fAlloc and fFree;
+
+! 18-Dec-86 WRS		made logCopy more apathetic to page errors;
+!  3-Dec-86 WRS		fixed bug in logCopy regarding files i*512 words long;
+! 19-Jun-86 WRS		changed to include command line in header line;
+
+redefine calli!FLEXIT = -'142;
+
+define gettab( i,t ) =
+{ calli( !xwd( i,t ), calli!GETTAB ) };
+
+internal integer logChan;
+
+external integer !ERRP!;
+external safe integer array GOGTAB[0:ENDREN];
+
+simple integer procedure CHNIOR(
+    integer C; reference integer A; integer X );
+comment
+	Special cnhior because real one doesn't return error codes.
+;
+start!code
+    external integer !skip!;
+    define R1 = 1;
+    protect!acs R1;
+	hrl	 R1,access(X);
+	hrr	 R1,access(C);
+	setom	 !skip!;
+	chanio	 R1,access(A);
+	 setzm	 !skip!;
+end;
+
+simple integer procedure CHNIOV(
+    integer C, A, X );
+comment
+	Special cnhiov because real one doesn't return error codes.
+;
+start!code
+    external integer !skip!;
+    define R1 = 1;
+    protect!acs R1;
+	hrl	 R1,access(X);
+	hrr	 R1,access(C);
+	setom	 !skip!;
+	chanio	 R1,access(A);
+	 setzm	 !skip!;
+end;
+
+internal string procedure logUFD( integer PPN );
+begin	"logUFD"
+    integer C,E;
+    string UN;
+    own safe integer array X[0:!RBUNM+1];
+    open(C_getchan,"DSK",0,0,0,0,0,E);
+    X[0] := !RBUNM+1;
+    X[!rbPPN] := !xwd(1,1);
+    X[!rbNAM] := PPN;
+    X[!rbEXT] := cvsix("UFD");
+    chnior(C,X[0],!chLK);
+    UN := if !SKIP!
+	then "("& cv6str(X[!rbUNM])& cv6str(X[!rbUNM+1])& ")"
+	else "["& cvos(PPN LSH -18)& ","& cvos(PPN LAND '777777)& "]";
+    release( C );
+    return( UN );
+end	"logUFD";
+
+internal string logModule;
+
+simple procedure moduleini;
+logModule := cv6str( gettab( -1, !gtNAM ));
+require moduleini initialization[0];
+
+internal simple procedure logCTY( string MSG );
+begin
+    own integer array BUF[0:20];
+    BUF[20] := 0;
+    while length( MSG ) do begin
+	own integer I;
+	for I := 0 upto 19 do begin
+	    BUF[i] := cvasc( MSG );
+	    MSG := MSG[6 to inf];
+	end;
+	calli( !xwd( !stTYO, location(BUF[0]) ), calli!SETUUO );
+	auxclr( -1, BUF[0], !axOST );
+    end;
+end;
+
+internal simple procedure logDIE(
+    string CODE;
+    string MSG1(null),MSG2(null),MSG3(null),MSG4(null),MSG5(null) );
+begin
+    logCTY( crlf& "?TUMS: error " );
+    logCTY( CODE );
+    logCTY( " in module " );
+    logCTY( logModule );
+    logCTY( ", message is"& crlf );
+    logCTY( MSG1 );
+    logCTY( MSG2 );
+    logCTY( MSG3 );
+    logCTY( MSG4 );
+    logCTY( MSG5 );
+    logCTY( "Please notify TUMS.SUP via Ontyme."& crlf );
+    logCTY( maiDate );
+    logCTY( crlf& crlf );
+    require " [halt hack]" message;
+    start!code
+	JRST	4,;
+    end;
+    calli( cvsix(CODE), calli!FLEXIT );
+end;
+
+internal procedure logExit;
+begin
+    external procedure logClose;
+    logClose;
+    if !lh(calli(!xwd(-1,!gtlin),calli!GETTAB))
+	then calli(0,calli!EXIT)
+	else calli(0,calli!LOGOFF);
+end;
+
+simple procedure ErrorTrap( integer LOC; string MSG, RESPONSE );
+begin
+    string S;
+    own string DeJaVu;
+    if DeJaVu then logDIE( "NSTERR", "Nested USERERRs:", DeJaVu, MSG );
+    DeJaVu := MSG[1 to inf-2];
+    if equ(MSG[1 to 10],"String GC:") then begin "String GC"
+	print( "?USERERR: string garbage collect failure", MSG );
+	cprint( logChan, "?USERERR: string garbage collect failure", MSG );
+	logExit;
+    end;
+    S := "?USERERR: location '"& cvos(!rh(LOC))&
+	"; "& maiDate& MSG;
+    print( S );
+    cprint( logChan, S, crlf );
+    if RESPONSE neq "C" then logExit;
+end;
+
+internal boolean logDirty;
+internal string logFile;
+integer logPG, logCNT, logPTR, logEOF;
+
+internal procedure logOS( string S );
+begin
+    integer E;
+    logDirty := true;
+    while length(S) do begin
+	integer CHR;
+	CHR := lop(S);
+	if CHR = 0 then continue;
+	if logCNT <= 0 then begin
+	    integer FP, Eu;
+	    integer array X[0:1];
+	    if logPG
+		then fFree( logPG )
+		else logPG := fAlloc;
+	    if not logPG then logDIE( "fAlloc", "no more memory"& crlf );
+	    E := chnior( logChan, FP := -1, !chCFP );
+	    if not !SKIP! then logDIE( "LOGCFP",
+		"(logOS) log failure !chCFP AC/ ", cvos(E), crlf );
+	    X[0] := '6001000000 + logPG; X[1] := FP;
+	    E := chnior( logChan, X[0], !chMFP );
+	    if not !SKIP! then logDIE( "LOGMFP",
+		"(logOS) log failure !chMFP AC/ ", cvos(E), crlf );
+	    logPTR := point( 7, memory[logPG lsh 9], -1 );
+	    logCNT := 512 * 5;
+	end;
+	idpb( CHR, logPTR );
+	logCNT := logCNT - 1;
+    end;
+end;
+
+
+integer Old$$PROU;		! previous print routine (if any);
+
+simple procedure logTrap( integer CHAN; string S );
+begin
+    if CHAN = logChan then begin
+	if not logDirty then begin
+	    external string ARGS;
+	    logOS( "* " );
+	    logOS( maiDATE );
+	    logOS( "; " );
+	    logOS( cv6str(gettab( -1, !gtNAM )) );
+	    logOS( " " );
+	    if !lh(memory[!jbVER]) then begin
+		logOS( cvos(!lh(memory[!jbVER])) );
+		logOS( "." );
+	    end;
+	    logOS( cvos(!rh(memory[!jbVER])) );
+	    logOS( "; " );
+	    logOS( ARGS );
+	    logOS( crlf );
+	    if gettab(-1,!gtUNM) neq cvsix("MAIL") then begin
+		logOS( "[ run by " );
+		logOS( cv6str(gettab(-1,!gtUNM)) );
+		logOS( cv6str(gettab(-1,!gtUN1)) );
+		logOS( " ]"& crlf );
+	    end;
+	end;
+	logOS( S );
+    end
+    else begin
+	if CHAN = -1
+	    then outstr( S )
+	    else out( CHAN, S );
+!	GOGTAB[$$PROU] := Old$$PROU;
+!	cprint( CHAN, S );
+!	GOGTAB[$$PROU] := location( logTrap );
+    end;
+end;
+
+internal boolean procedure logCopy( string logFile );
+begin
+    integer array X[0:6];
+    integer RETRY!CNT, iC, oC ,E, I;
+    integer iFP, iPG, iCNT, iPTR, oFP, oPG, oCNT, oPTR, WD;
+    label RETRY;
+    iPG := oPG := oFP := 0;
+    open( iC_getchan, "DSK", 0,0,0, 0,0,E_-1 );
+    if E then return( false );
+    lookup( iC, logFile, E_-1 );
+    if E then begin
+	release( iC );
+	return( false );
+    end;
+    fileinfo( X );
+    if X[5] = 0 then begin
+	rename( iC, null, null, E );
+	release( iC );
+	return( true );
+    end;
+    oC := -1;
+    RETRY!CNT := 600;
+    if false then begin
+RETRY:	if RETRY!CNT leq 0 then logDIE( "LOGBSY",
+	    "log busy for 5 minutes"& crlf );
+	RETRY!CNT := RETRY!CNT - 1;
+	if oC geq 0 then release( oC );
+	calli( 1, calli!SLEEP );
+    end;
+    open( oC_getchan,"DSK",0,0,0, 0,0,E_-1 );
+    if E then begin oC := -1; goto RETRY end;
+    lookup( oC, "(MAIL)LOG", E_-1 );
+    if E then begin
+	enter( oC, "(MAIL)LOG", E_-1 );
+	if E then goto RETRY;
+	close( oC );
+	lookup( oC, "(MAIL)LOG", E_-1 );
+    end;
+    fileinfo( X );		! X[5] is size in words (from RIB);
+    enter( oC, "(MAIL)LOG", E_-1 );
+    if E then goto RETRY;
+    oFP := (X[5] + '777) lsh -9;
+    if oFP and ( X[5] land '777 ) then begin
+	if oPG
+	    then fFree( oPG )
+	    else oPG := fAlloc;
+	if not oPG then logDIE( "fAlloc", "no more memory"& crlf );
+	X[0] := '6001000000 + oPG;
+	X[1] := oFP;
+	E := chnior( oC, X[0], !chMFP );
+	if !SKIP!
+	    then begin
+		oPTR := (oPG lsh 9) + (X[5] land '777);
+		oCNT := -X[5] land '777;
+	    end
+	    else
+		oCNT := 0;
+    end
+    else
+	oCNT := 0;
+    iCNT := 0;
+    iFP := 0;
+    do begin "copy"
+	if iCNT leq 0 then begin
+	    if iPG
+		then fFree( iPG )
+		else iPG := fAlloc;
+	    if not iPG then logDIE( "fAlloc", "no more memory"& crlf );
+	    do begin
+		X[0] := '2001000000 + iPG;
+		X[1] := iFP := iFP + 1;
+		E := chnior( iC, X[0], !chMFP );
+		if not !SKIP! and !rh(E) = FLPHP# then done "copy";
+	    end until !SKIP!;
+	    iCNT := 512;
+	    iPTR := iPG lsh 9;
+	end;
+	WD := memory[iPTR];
+	iCNT := iCNT - 1;
+	iPTR := iPTR + 1;
+	if WD then begin
+	    if oCNT leq 0 then begin
+		if oPG
+		    then fFree( oPG )
+		    else oPG := fAlloc;
+		if not oPG then logDIE( "fAlloc", "no more memory"& crlf );
+		E := chnior( oC, oFP := -1, !chCFP );
+		if not !SKIP! then logDIE( "LOGCFP",
+		    "log failure !chCFP AC/ ", cvos(E), " in LOGCOPY"& crlf );
+		X[0] := '6001000000 + oPG; X[1] := oFP;
+		E := chnior( oC, X[0], !chMFP );
+		if not !SKIP! then logDIE( "LOGMFP",
+		    "log failure !chMFP AC/ ", cvos(E), " in LOGCOPY"& crlf );
+		oCNT := 512;
+		oPTR := oPG lsh 9;
+	    end;
+	    memory[oPTR] := WD;
+	    oCNT := oCNT - 1;
+	    oPTR := oPTR + 1;
+	end;
+    end until false;
+    rename( iC, null, 0, E_-1 );
+    if E then logDIE( "LOGDEL", "log failure RENAME ", LogFile, crlf );
+    fFree( iPG );
+    release( iC );
+    chniov( oC, (oFP lsh 9) - oCNT, !chFTR );
+    fFree( oPG );
+    release( oC );
+    return( true );
+end;
+
+internal procedure logClose;
+begin
+    logCNT := 0;
+    if logPG then
+	fFree( logPG );
+    logPG := 0;
+    if logChan then
+	release( logChan );
+    logChan := 0;
+    if logFile then 
+	if not logCopy( logFile ) then
+	    logDIE( "LOGCLS", "failure(s) copying log file"& crlf );
+    logFile := null;
+end;
+
+internal procedure logOpen;
+begin
+    integer array X[0:1];
+    if logChan then logClose;
+    logFile := "(MAIL)'"&
+	cvos(!xwd( gettab(-1,!gtUID), gettab(-1,!gtPNO) ))& ".LOG";
+    open( logChan:=getchan, "DSK", 0,0,0, 0,0,logEOF_-1 );
+    if logEOF then
+	logDIE( "LOGOPN", "log file OPEN failure ", logFile, crlf );
+    enter( logChan, logFile, logEOF_-1 );
+    if logEOF then
+	logDIE( "LOGENT", "log file ENTER failure ", logFile, crlf );
+    close( logChan );
+    lookup( logChan, logFile, logEOF_-1 );
+    if logEOF then
+	logDIE( "LOGLUK", "log file LOOKUP failure ", logFile, crlf );
+    enter( logChan, logFile, logEOF_-1 );
+    if logEOF then
+	logDIE( "LOGUPD", "log file ENTER (upd) failure ", logFile, crlf );
+    logPG := 0;
+    logCNT := 0;
+    Old$$PROU := location( logTrap );
+    GOGTAB[$$PROU] swap Old$$PROU;
+    logDirty := false;
+end;
+
+simple procedure logIni;
+begin
+    logChan := 0;
+    logOpen;				! create temporary log file;
+    !ERRP! := location( ErrorTrap );	! trap USERERRs;
+    cprint( logChan, null );		! force startup message;
+end;
+require logIni initialization[1];
+
+end	"MAILOG" $
+   
