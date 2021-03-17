@@ -1,0 +1,631 @@
+entry
+	AtLine,		comment Line by Line read from file;
+	BufPnt,		comment Create a buffer byte pointer;
+	CmdEOL,		comment EOL character (or best guess);
+	CmdLin,		comment Single command scanner;
+	CmdScn,		comment Main command scan loop;
+	CmdSet,		comment Setup command-line info;
+	CmdTYP,		comment TYPE flag for AtLine routine;
+	CReadL,		comment Read CMD line setting CMDEOL;
+	CToken,		comment Token by Token read from string;
+	FndCmd,		comment Find legal keyword/command;
+	FndKey,		comment Find matching keyword;
+	MsgSet,		comment Setup message-line info;
+	ReScan,		comment Re-Scan command line;
+	SPrint,		comment Print next line on screen;
+	SubSet,		comment String subset checker;
+	TxtSet		comment Setup text area info;
+;
+Begin "Command Scan Module"
+
+
+require "MYSAIL.DEF" source!file;
+require "BRKINI.REQ" source!file;
+require "SYDISP.REQ" source!file;
+
+define	MaxCol = 132;			! maximum col in screen array ;
+define	MxBCol = (MaxCol+4) div 5;	! maximum col in buffer array ;
+define	MaxRow = 24;			! maximum row in screen array ;
+
+define	spaces = { "                                             " &
+		   "                                             " &
+		   "                                             " };
+
+
+
+External Integer RPGSW;			! start offset     ;
+Internal Own Integer CmdEOL;		! EOL character    ;
+Internal Own Boolean CmdTYP;		! Type-out flag    ;
+
+Own Boolean Interactive;		! what type of run ;
+Own Boolean InSide;			! reading cmd file ;
+Own Integer Escape;			! hold <^C> or <$> ;
+Own Integer CmdLength;			! length of prompt ;
+Own Integer CmdRow, CmdCol;		! command row, col ;
+Own Integer MsgRow, MsgCol;		! message row, col ;
+Own Integer TxtRow, TxtCol;		! text row, column ;
+Own Integer ByteC, ByteM, ByteT;	! cmd, msg, txt BP ;
+Own Integer AChan, EndOfFile;		! input file vars  ;
+Own Integer Low, High, Dummy;		! array indicies   ;
+Own Integer Cmd, Cmd.Index;		! command indicies ;
+
+Own String  CmdPrompt;			! global prompt    ;
+Own String  AtChan, AtText;		! stacked channels ;
+Own String  Command, Line, Tok, More;	! various strings  ;
+Own String  RescanLine, RescanText;	! rescan line text ;
+
+Own Safe Integer Array Buffer[ 1 : MaxRow , 1 : MxBCol ];
+
+Preset!with	"R", "RUN", "START", "CONTINUE", "EXECUTE",
+		"COMPILE", "DEBUG", "TRY", "PERFORM", "DO";
+Own Safe String Array MonitorNames[ 1 : 10 ];
+
+
+Internal Simple String Procedure ReScan;
+! ----------------------------------------------------------------------;
+!									;
+!	ReScan		Routine to query the monitor to determine if	;
+!			a rescan line is avaliable, and to return that	;
+!			line.  The variable !SKIP! can be checked to	;
+!			obtain the line-termination character.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "rescan command line"
+
+    Own Integer Flag;
+    Label EndRescan;
+
+    start!code
+	setom	Flag;			! setup for self ;
+	ttcall	'6,Flag;		! getlch ;
+	movsi	'100000;		! get rescan-line bit;
+	andb	Flag;			! mask result;
+	jumpe	EndRescan;		! no line, jump;
+	ttcall	'10,;			! rescan ;
+	ttcall	'14,;			! skpinl ;
+	setzm	Flag;			!  no input ;
+EndRescan:
+
+    end;
+
+    Return( If ( Flag ) then inchwl else NULL );
+
+
+end "rescan command line";
+
+
+
+Internal simple string procedure CToken (reference string S);
+! ----------------------------------------------------------------------;
+!									;
+!	CToken		Scan the string S and return the first word	;
+!			or punctuation character to the caller.		;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    Scan( S, BrkWht, Brk );	! clear whitespace;
+    Tok _ scan(S, BrkBrk, Brk);	! get the next word;
+    If length(Tok) = 0		! null?;
+	then if length(S) = 0	!   null source also?;
+	    then return (null)	!    yes - return null;
+	    else Tok _ lop(S);	!    no  - get a character;
+    Return(Tok);		! return the token;
+end;
+
+
+Internal Integer Procedure FndKey(
+			String Key;
+			String Array CMD.Names );
+begin "Find Key"
+    High_ ArrInfo( CMD.Names, 2 );	! initialize high index  ;
+    Low_  ArrInfo( CMD.Names, 1 );	! initialize low index   ;
+
+    CMD.Index_ Low - 1;			! setup default: invalid ;
+
+    For Cmd_ Low step 1 until High	! for each keyword;
+     do
+	If KEqu( Key, CMD.Names[ Cmd ][1 for length(Key)] )
+	 then if KEqu( Key, CMD.Names[ Cmd ] )
+	     then Return( Cmd )		!  -- exact match --;
+	     else if CMD.Index < Low	!  -check ambiguity-;
+		then CMD.Index_ Cmd	!  Ok, set instance ;
+		else Return( Low - 2 );	!  No, set error    ;
+
+    Return ( CMD.Index );		! return result;
+end "Find Key";
+
+
+Internal Integer Procedure FndCmd(
+			String Key;
+			String Array CMD.Names;
+			Boolean Procedure CMD.Legal );
+begin "Find Key"
+    High_ ArrInfo( CMD.Names, 2 );		! initialize high index  ;
+    Low_  ArrInfo( CMD.Names, 1 );		! initialize low index   ;
+
+    CMD.Index_ Low - 1;				! setup default: invalid ;
+
+    For Cmd_ Low step 1 until High		! for each keyword;
+     do
+	If KEqu( Key, CMD.Names[ Cmd ][1 for length(Key)] )
+	 then If CMD.Legal( Cmd )		!  match?  and legal;
+	     then if KEqu( Key, CMD.Names[ Cmd ] )
+		 then Return( Cmd )		!  -- exact match --;
+		 else if CMD.Index < Low	!  -check ambiguity-;
+		    then CMD.Index_ Cmd		!  Ok, set instance ;
+		    else Return( Low - 2 );	!  No, set error    ;
+
+    Return ( CMD.Index );			! return result;
+end "Find Key";
+
+
+
+Internal Simple Integer Procedure BufPnt( Integer R, C );
+! ----------------------------------------------------------------------;
+!									;
+!	BufPnt		Routine to generate a byte pointer to ILDB	;
+!			data into the buffer array at Row (R) and	;
+!			column (C).					;
+!									;
+! ----------------------------------------------------------------------;
+begin "Buf Set"
+
+    decr( C );
+
+    Return( Point( 7, Buffer[R,(C div 5)+1], ((C mod 5) * 7)-1 ) );
+
+end "Buf Set";
+
+
+
+Internal Simple Procedure CmdSet( string Prompt; integer X, Y );
+! ----------------------------------------------------------------------;
+!									;
+!	CmdSet		Routine to initialize the command prompt	;
+!			line for various other routines.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "Command Set"
+
+    CmdPrompt_  Prompt;
+    ByteC_ BufPnt( CmdRow_ Y, CmdCol_ X );
+
+end "Command Set";
+
+
+Internal Simple Procedure MsgSet( integer X, Y );
+! ----------------------------------------------------------------------;
+!									;
+!	MsgSet		Routine to initialize the message line		;
+!			for various other routines.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "Message Set"
+
+    ByteM_ BufPnt( MsgRow_ Y, MsgCol_ X );
+
+end "Message Set";
+
+
+Internal Simple Procedure TxtSet( integer X, Y );
+! ----------------------------------------------------------------------;
+!									;
+!	TxtSet		Routine to initialize the text line		;
+!			for various other routines.			;
+!									;
+! ----------------------------------------------------------------------;
+begin "Text Set"
+
+    ByteT_ BufPnt( TxtRow_ Y, TxtCol_ X );
+
+end "Text Set";
+
+
+Simple Integer Procedure Install( integer BP; string S );
+! ----------------------------------------------------------------------;
+!									;
+!	Install		Put the characters from string S into the	;
+!			memory pointed to by the byte-pointer BP.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "install string"
+
+    while ( length( S ) )
+     do idpb( lop( S ), BP );
+
+    return( BP );
+
+end "install string";
+
+
+Simple procedure SPrint( string Text );
+! ----------------------------------------------------------------------;
+!									;
+!	SPrint		Routine to print a line to the screen.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "S Print"
+
+    Install( ByteT, spaces[1 for T!Width min T!TWid] );
+    If ( length( Text ) )
+     then ByteT_ Install( ByteT, Text );	! if text, print it ;
+
+    TxtRow_ TxtRow + 1;				! increment row number ;
+    If ( TxtRow > MaxRow )
+     then TxtRow_ 1;				! if > max, set to 1 ;
+
+    If not( (CmdRow min MsgRow) < TxtRow < (CmdRow max MsgRow) )
+     then TxtRow_ (CmdRow min MsgRow) + 1;	! out of range, fix it ;
+
+    TxtSet( 1, TxtRow );			! setup ByteT ;
+
+end "S Print";
+
+
+Procedure InitDisp;
+! ----------------------------------------------------------------------;
+!									;
+!	InitDisp	Rescan command line				;
+!			Verify if monifor cmd				;
+!			Initialize terminal	( T!INIT )		;
+!			Initialize re-display	( R!INIT )		;
+!			Clear screen		( ArrClr )		;
+!									;
+! ----------------------------------------------------------------------;
+begin "initialization"
+
+    RescanLine_ Rescan;			! check for vestigial cmds ;
+    CmdEOL_ !Skip!;			! save EOL character ;
+
+    If ( Length( RescanLine ) )		! check for vestigial cmds ;
+     then begin "check out line"	! if non-null, then do check ;
+
+	RescanText_ RescanLine;		! save text of line ;
+
+	If ( FndKey( CToken( RescanLine ), MonitorNames ) )
+	 then				! read 'til valid brk or eol ;
+	    Do Scan( RescanLine, BrkCmd, Brk )
+	     until (Brk = ";") or (Brk = 0)
+	 else
+	    RescanLine_ RescanText;	! reset line for below ;
+
+     end "check out line";
+
+    Interactive_ not( RPGSW or length( RescanLine ) );
+
+    If ( calli( !Xwd( -1,'6 ), '41 ) land '600 )
+     then Escape_ '33			! XEXEC(J) or SUDS mode ;
+     else Escape_ '3;			! PDP-10 mode ;
+
+    If ( Interactive )			! we have a "real" user ;
+     then begin "setup screen"
+
+      T!Init;				! initialize terminal type ;
+      R!Init;				! initialize re-display ;
+
+      ArrClr( Buffer, CvAsc("     ") );	! clear the screen buffer ;
+      CmdSet( Null, 1,1 );		! default to null, line 1 ;
+      MsgSet( 1, CmdRow+1 );		! default to cmd + 1 ;
+      TxtSet( 1, MsgRow+1 );		! default to msg + 1 ;
+  
+   end "setup screen";
+
+end "initialization";
+require InitDisp initialization;
+
+
+simple procedure MsgTxt( String Msg );
+! ----------------------------------------------------------------------;
+!									;
+!	MsgTxt		Routine to put a message on the message line.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Msg Txt"
+
+    Install( ByteM, spaces[1 for T!Width min T!TWid] );
+    If ( length( Msg ) )
+     then Install( ByteM, Msg );
+
+end "Msg Txt";
+
+
+
+simple procedure Fatal( String Reason );
+! ----------------------------------------------------------------------;
+!									;
+!	Fatal		Routine for AtLine for printing error messages.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Fatal Msg"
+
+    MsgTxt( "Unable to open file: "&AtText &"("& Reason &")."  );
+
+end "Fatal Msg";
+
+
+Internal Simple Boolean Procedure SubSet( String Str, Sub );
+! ----------------------------------------------------------------------;
+!									;
+!	SubSet		Return TRUE if all the characters in string	;
+!			STR are some subset of those in string SUB.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "SUBSET"
+    own boolean array Chars[ 0:'177 ];
+
+    if not( length( Sub ) )
+     then return( false );
+
+    arrclr( Chars );
+    while ( length( Sub ) )
+     do Chars[ lop( Sub ) ]_ true;
+
+    while ( length( Str ) )
+     do if not( Chars[ lop( Str ) ] )
+	 then return( false );
+
+    return( true );
+
+end "SUBSET";
+
+
+
+Simple Procedure GetLine;
+! ----------------------------------------------------------------------;
+!									;
+!	GetLine		Read a line from the terminal never going	;
+!			into actual input-wait.  Sleep or make a	;
+!			pass through the re-display code to update	;
+!			the screen.					;
+!									;
+! ----------------------------------------------------------------------;
+begin "Get Line"
+
+    while ( T!ChrP )
+     do begin "get a character"
+
+	CmdEol_ T!GetC;
+
+	if (( CmdEol = Escape ) or ( CmdEol = #CR ) or ( CmdEol = #Esc ))
+	 then return;
+
+	if (( CmdEol = '177 ) or ( CmdEol = #SOH ) or ( CmdEol = #BS ))
+	 then If Length( AtText )
+	       then begin
+		  Install( ByteC, Spaces[1 for length(AtText)+CmdLength] );
+		  AtText_ AtText[1 to inf-1];
+	       end
+	       else T!Bell
+	 else if ( ( CmdEol = ("U" - '100) ) or
+		   ( CmdEol = ("Q" - '100) ) or
+		   ( CmdEol = #Bel ) )
+	       then begin
+		  Install( ByteC, Spaces[1 for length(AtText)+CmdLength] );
+		  AtText_ Null;
+	       end
+	 else if ( CmdEol = ("W" - '100) )
+	       then if ( length( AtText ) )
+		   then begin "strip token"
+			Install( ByteC, Spaces[1 for length(AtText)+CmdLength] );
+			while ( ( length( AtText ) ) and
+				( ( AtText[inf for 1] = " " ) or
+				  ( AtText[inf for 1] = '11 ) ) )
+			 do AtText_ AtText[1 to inf-1];
+			If ( length( AtText ) and
+			     not( ("a" leq AtText[inf for 1] leq "z") or
+				  ("A" leq AtText[inf for 1] leq "Z") or
+				  ("0" leq AtText[inf for 1] leq "9") ) ) 
+			 then AtText_ AtText[1 to inf-1];
+			while ( ( length( AtText ) ) and
+				( ("a" leq AtText[inf for 1] leq "z") or
+				  ("A" leq AtText[inf for 1] leq "Z") or
+				  ("0" leq AtText[inf for 1] leq "9") ) ) 
+			 do AtText_ AtText[1 to inf-1];
+		   end "strip token"
+		   else T!Bell
+
+	 else if ( " " leq CmdEol leq "z" )
+	       then
+		  If ( Length( AtText ) < ( T!TWid min T!Width ) )
+		   then AtText_ AtText & CmdEol
+		   else T!Bell
+	 else
+		T!Bell;
+
+       end "get a character";
+
+end "Get Line";
+
+
+internal recursive string procedure AtLine( Boolean Typeit (False) );
+! ----------------------------------------------------------------------;
+!									;
+!	AtLine		Routine to allow input from either the TTY or	;
+!			any level of indirect files until SAIL runs	;
+!			out of channels one line at a time.		;
+!									;
+! ----------------------------------------------------------------------;
+begin "AtLine"
+
+    AtText_ Null;					! Clear field ;
+    CmdLength_ length( CmdPrompt );			! setup length ;
+    R!Disp( Buffer, false, CmdRow, CmdLength+1 );	! display screen ;
+
+    If ( InSide_ Length( AtChan ) )			! Check for channel;
+     then begin "read from file"			!  then use a file;
+
+	AtText_ Input( AtChan, BrkLin );		! read initial line;
+	While ( CmdEol = 0 and not EndOfFile )		! ? eof, ? crlf;
+	 do AtText_ AtText & Input( AtChan, BrkLin );	!  then read more;
+
+	If ( Typeit and not EndOfFile )			! ? wants it printed;
+	 then begin
+	    Install( ByteC, Spaces[1 for T!Width max T!TWid] );
+	    Install( ByteC, CmdPrompt & AtText );	! put into buffer ;
+	    R!Disp( Buffer, true, CmdRow, length(AtText)+CmdLength+1 );
+	 end;
+
+	If ( EndOfFile )				! if this was a read;
+	 then begin "end of reading"			!   past end of file;
+	    Release( Dummy_ Lop(AtChan) );		! forget chan;
+	    Return( AtLine( Typeit ) );			! and return self;
+	 end "end of reading";
+
+     end "read from file"
+     else
+      do begin "read from terminal"
+
+	If ( T!ChrP )
+	 then begin
+	    GetLine;					! get some data ;
+	    Install( ByteC, CmdPrompt & AtText );	! put into buffer ;
+	    R!Disp( Buffer, true, CmdRow, length(AtText)+CmdLength+1 );
+	 end
+         else begin
+	    calli( !Xwd( '631, 10 ), '72 );		! CALLI   HIBER ;
+	    auxclv( -1, 0, '11 );			! AUXCAL .AXLDE ;
+	 end
+      end "read from terminal" until
+	    ( ( CmdEol = #CR ) or ( CmdEol = #Esc ) or	! read until an ;
+	      ( CmdEol = Escape ) );			!  Eol is found. ;
+
+
+    If ( AtText = "@" )					! If first char = "@";
+     then begin "nest command files"			! ? command file;
+
+	Dummy_ Lop( AtText );				! remove "@" char;
+
+	If ( 0 geq AChan_ GetChan )			! If any channels ;
+	 then begin "no channels available"
+	    fatal( "no channels" );			! No, none left ;
+	    Return( AtLine( Typeit ) );			! Try again ;
+	 end;	    
+
+	Open( AtChan_ AChan & AtChan,
+	      "DSK", 1, 1,0, 512,CmdEol, EndOfFile_-1);	! get channel;
+
+	If Not ( EndOfFile )
+	 then Lookup( AtChan, AtText, EndOfFile_ -1);	! ? file found;
+
+	If ( EndOfFile )
+	 then begin "cant find file"
+	    Release( Dummy_ Lop(AtChan) );		! chop channel list;
+	    Fatal( "open error" );			! complain about file;
+	 end "cant find file"
+	 else If ( Typeit )
+	       then MsgTxt( "(from file """& AtText &"""): " );
+
+	Return( AtLine( Typeit ) );			! try file-line;
+     end "nest command files";
+
+    Return( AtText );					! Return text read ;
+end "AtLine";
+
+Internal simple string procedure CReadL( String P );
+! ----------------------------------------------------------------------;
+!									;
+!	CReadL		Routine to prompt and read a command line	;
+!			being sure to set CmdEOL to the EOL character.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    String S;
+
+    If ( (not InSide) or ( CmdTyp ) )	! If wanting prompts ;
+     then begin
+	CmdPrompt swap P;		! use this prompt ;
+	S_ AtLine( CmdTyp );		!  and read user's response ;
+	CmdPrompt swap P;		! restore old one ;
+     end
+     else S_ AtLine( CmdTyp );		! else just read response ;
+
+    Return( S );
+
+end;
+
+
+Internal String Procedure CmdLin(
+			String Array CMD.Names;
+			Boolean Procedure CMD.Legal;
+			Procedure CMD.Action;
+			Boolean CMD.FileLine (True) );
+begin "perform command"
+
+    Low_ ArrInfo( CMD.Names, 1 );		! initialize low index ;
+
+    If ( Length( RescanLine ) )			! Do we have an initial ;
+     then begin
+	Line_ RescanLine;			! Copy command line ;
+	RescanLine_ Null;			! Forget this happenned ;
+						! CmdEOL already setup ;
+     end
+     else Line_ AtLine( CMD.FileLine );		! Get a command ;
+
+    If ( CmdEol = Escape )			! user typed <esc> ;
+     then begin
+	T!Fini;					! finish up the screen ;
+	Interactive_ False;			! clear flag for exit ;
+	Return( Null );				! and return immediate ;
+     end;
+
+    If Length( Line ) = 0			! Ignore blank lines;
+     then Return( Null );
+
+    Command_ CToken( Line );			! Get the first word;
+    If KEqu(Command, "?")			! "?" means "HELP";
+     then Command_ "HELP";
+
+    If Low leq CMD.Index_ FndCmd( Command, CMD.Names, CMD.Legal )
+ hen begin "setup command"			! If legal command;
+
+	If ((Line = #SP) or (Line = #HT))	!   then strip any;
+	 then Scan( Line, BrkWht, Brk );	!      whitespace and;
+
+	CMD.Action( CMD.Index, Line, Brk );	!      call dispatch;
+	Return( Null );				!      and return;
+
+     end "setup command"
+     else If CMD.Index = Low - 1		!  else complain;
+	   then Return( "Invalid command." )	!    invalid or ;
+	   else Return( "Ambigious command." );	!    ambigious ;
+
+end "perform command";
+
+Internal Procedure CmdScn(
+			String CMD.Heading;
+			String CMD.Prompt;
+			String Array CMD.Names;
+			Boolean Procedure CMD.Legal;
+			Procedure CMD.Action;
+			Boolean CMD.FileLine (True) );
+
+begin "command scan"
+
+    InSide_ False;			! initially impossible ;
+    CmdTYP_ CMD.FileLine;		! copy line input flag ;
+
+    If ( Interactive )			! if interactive, print msgs ;
+     then begin
+	SPrint( CMD.Heading );		! print the heading ;
+	SPrint( Null );			! blank line ;
+     end;
+
+    CmdSet( CMD.Prompt, CmdCol, CmdRow );
+
+    While TRUE				! loop for eternity ;
+     do begin "command loop"
+
+	More_ CmdLin( CMD.Names, CMD.Legal, CMD.Action, CmdTYP );
+
+	If Length(More)			! was something printed? ;
+	 then MsgTxt( More );		! yes, print message ;
+
+	If ( not Interactive )		! was this a real user? ;
+	 then Call( 0, "EXIT" );	! no, so say bye-bye ;
+
+       end "command loop";
+   end "command scan";
+
+end "Command Scan Module";
+
+  = >‡
