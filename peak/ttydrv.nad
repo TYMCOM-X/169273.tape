@@ -1,0 +1,2711 @@
+        SUBTTL  Port device driver                       ttydrv.nad
+        REMARK  %TTYDRV  V 1.17 07-10-84 AWT
+
+: See the file (ISIS2)NUCLUS.MEM for more revision information.
+
+: V 1.17, 07-10-84, AWT
+:       Bug fixed in ACTPRT for bell -- initialize BELCOL.
+:
+:       Bug fixed in FILBUF for TBREAK -- change RBT to TBT.
+:
+:       Bug fixed in FBCHR6's black balls handling where R4 were changed
+:       to R9 (port number).
+:
+:       Change made in Line Delete operation so it will be carried out
+:       "locally" -- use backspaces instead of carriage return -- and
+:       therefore control Q will work properly for CRT terminal.
+:
+:       Change made in Normal Circuit operation so in case of failure
+:       the ISIS error code will return to ARG 2 as specified in User's
+:       Guide (not to ARG 1 as before).
+:
+: V 1.16, 01-03-84, AWT
+:       Changes made to solve the echo problem when MUX users try
+:       to build an aux circuit to host in BUBB-NET.
+:
+:       Bug fixed in the Readline operation to avoid a crash (14)
+:       condition by limiting the maximum number of chars exceeding
+:       pascal buffer size to be 0fff (hex).
+:
+: V 1.15, 09-30-83, AWT
+:       Improve the efficiency of data flow by putting data 
+:       directly onto ORING, bypassing output buffer.
+:  
+: V 1.14, 07-25-83, AWT
+:       A bug is fixed for line review (crash 6) so only the actual number
+:       of characters stored in pascal data buffer are displayed. In addi-
+:       tion, port backpressured, reserved bufferlet pool usage and output
+:       threshhold for port are all considered in deciding whether line
+:       review is allowed to use or not.
+: V 1.13, 05-23-83, RNP
+:       Bug fixes for line review (crash 3) and bad store
+: V 1.12, 05-09-83, AWT
+:       A bug is fixed so the alternate break character can be
+:       recognized with echo off.
+: V 1.11, 03-10-83, AWT
+:       Subhost Option support
+: V 1.10, 01-26-83, RNP
+:       Extended Memory Option support
+: V 1.9, 11-15-82, SCY
+:	Added a new system default editing character Control-R to
+:	be able to review the current line during the read.
+:	Added option for user to set up the terminal type -
+:	(hard-copy or CRT)
+: V 1.8, 09-10-82, SCY
+:	Added a time-out option for the get_needle operation.
+: V 1.7, 05-19-82, SCY
+:	Added a wait option for the TERM_INFO operation.
+: V 1.6, 04-05-82, SCY
+:	Bugs fixed for handling incoming data in FILBUF.
+:	Added a new crash code (32) in FILBUF to crash the slot if
+:	 there is a unknown data in the input buffer.
+: V 1.5, 03-18-82, SCY
+:	Added two new I/O opreation - SEND_SIIX $ SEND_TIIX.
+:	Added two new ioresult retruned of read operations which are
+:	 start_medium and end_medium for SIIX and TIIX detect in the 
+:	 input buffer.
+:	Added an host intelligent flag in STATUS2 for successful
+:	 get_needle and circuit_built operations.
+: V 1.4, 03-15-82, MDS
+:	Added code in PTNED3 for port to start in No-Echo mode
+: V 1.3, 01-26-82, SCY
+:	Changed link register R4 to R9 when called RDYENT
+: V 1.2, 12-10-81, SCY
+:	Added new I/O operation - Normal circuit request.
+:	Added two new i/o operations - set alternate char as breakkey
+:	 and Set Bell 
+: V 1.1, 10-14-81, SCY
+:	Expand sys console operation so that multiple ports can be sys console
+: V 1.0, 09-01-81, SMF
+:	Initial version
+:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+:								:
+:	Port device driver module				:
+:								:
+:	Note: This module assumes that the microcode		:
+:	      bufferlet library 'MBUFER.LIB' is being used.	:
+:								:
+:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+	MO	.,TTYDRV
+	RA	0
+
+	LO	COMMON			:Get common symbols
+	LO	FRONT			:Use FRONT.LIB symbols
+
+	GL	TSTART,TCHECK,TINIT	:Module entry points
+	GL	CONMSG
+	GL	TRMDEV,AUXDEV		:Symbols visible outside
+	GL	TTYTBL			:Table defined elsewhere
+
+	GL	IOEXIT,RDYENT		:External routines called
+       IF       \XTRACE
+       ELSE
+        REMARK  %*** DEFINE XTRACE EQ 1 IF DEBUG TRACE DESIRED
+XTRACE  EQ      0
+       EI       :XTRACE
+	GL	DVREQ			:External variable used
+       IF       XTRACE
+        GL      XMTRAC
+       EI       : XTRACE
+        GL      STKBOT
+       IF       XMEMRY
+        GL      XMCURR,XMPCUR
+       EI       :XMEMRY
+
+	IF	\MBUFER
+	ELSE				:If MBUFER.LIB is not being used
+	REMARK	%%Error - MBUFER.LIB is not being used!
+	EI
+:
+: Constant definitions
+:
+
+TRMDEV	EQ	$A 5		:Device type of terminal devices
+AUXDEV	EQ	$A 6		:Device type of aux circuit devices
+
+COLON   EQ      $0 3A           :ASCII colon
+PERIOD  EQ      $0 2E           :ASCII period
+ZERO    EQ      $0 30           :ASCII zero
+NINE    EQ      $0 39           :ASCII nine
+
+TRMPRI	EQ	0		:Extra priority for terminal operations
+AUXPRI	EQ	0		:Extra priority for aux operations
+
+:
+: 	Valid port operations:
+:
+:		 0 = Read characters
+:		 1 = Read line
+:		 2 = Send
+:		 3 = Disconnect
+:		 4 = Clear "Break" status
+:		 5 = Set system editing characters
+:		 6 = Set terminal information
+:		 7 = Send "Yellow Ball"
+:		 8 = Detect "Orange Ball"
+:		 9 = Aux Circuit Request
+:		10 = Get terminal information
+:		11 = Send "B1" message
+:		12 = Read needle
+:		13 = Zap
+:		14 = Send supervisor log message
+:		15 = Set alternate char as breakkey
+:		16 = Set bell column
+:		17 = Normal circuit request
+:		18 = Send_siix
+:		19 = Send_tiix
+:
+:	Note: There may not be more than 32 operations defined on a
+:	    port device.  This is due only to the size of NCBITS (which
+:	    is currently a fullword).  If more than 32 operations are
+:	    wanted, it will be necessary to make NCBITS and NCFAIL larger.
+
+NTTYOP	EQ	$A 20		:Number of valid operations
+MTTYOP	EQ	NTTYOP-1	:Highest legal operation number
+
+NCBITS	EQ	$2 00000100010010100100000000000000
+					:Bit array of operations legal when
+					:there is no circuit on that device.
+					:There must be 16 bits.
+
+NTGRP	EQ	(NTERM+NAUX+0F)/10	:# of halfwords in device bit array
+:
+: Port driver data structures
+:
+
+TTYENT	EQ	.		:TTY info table entry
+	ORG	0
+TTPORT	HS	1		:Port number or state
+TTLNES	HS	1		:Number of lines waiting to be read
+TTRPTR	WS	1		:Read buffer pointer
+TTRPRM	WS	1		:Read parameter block address
+TTRPHD	WS	1		:Read process header
+TTRFCT	HS	1		:Number of characters read into buffer
+TTRLFT	HS	1		:Space left in read buffer
+TTROP	HS	1		:Read operation (-1=None, 0=Char, 1=Line
+				:		 10=Term_info)
+TTWLFT	HS	1		:Number of characters left to send
+TTWPTR	WS	1		:Write buffer pointer
+TTWPRM	WS	1		:Write parameter block address
+TTWPHD	WS	1		:Write process header address
+TTWTIM	WS	1		:SLOWC time to timeout operation
+
+TTEDIT	WS	1		:Editing characters
+TTBRK	BS	$A 256/8	:Input break char bit array
+TTFLAG	BS	1		:BIT0 =1 ->NORMAL_CIR_REQ, =0 ->AUX_CIR_REQ
+				:Bit1 = data buffer empty flag
+TBRKEY	BS	1		:Storage for the alternate breakkey
+TTEDAK	BS	1		:Bit array for edit chars to acknowledge
+TTRMSK	BS	1		:Mask for stripping parity if wanted
+TTSHST  HS      1               :Subhost number
+	WS	0		:Make sure it ends on word boundary
+TTSIZE	EQ	.		:Size of table entry
+	ORG	TTYENT
+
+NEDREC	EQ	.		:Needle record
+	ORG	0
+NEDINV	WS	1		:Invoice number
+NEDPRT	WS	1		:Local port #
+NEDHST	WS	1		:Local host #
+NEDNOD	WS	1		:Originating node #
+NEDOHO	WS	1		:Originating host #
+NEDOPO	WS	1		:Originating port #
+NEDNUM	WS	1		:Number of characters in username
+NEDTID	BS	1		:Terminal id
+	BS	1		:*Unused*
+NEDNAM	BS	$A 24		:Username
+NEDSIZ	EQ	.		:Size of needle record
+	ORG	NEDREC
+:
+: Storage for the port driver
+:
+
+	SEG	A.DATA
+
+TCRET	WS	1		:Return address for TCHECK
+OTCHW	HS	1		:Temp storage for OUTCHK
+OCRET	WS	1		:Return address for OUTCHK
+TIRET	WS	1		:Return address for TINIT
+DEFEDI	WS	1		:Default editing characters
+DEFBRK	BS	$A256/8		:Default char break table
+TOTAB	WS	NTERM+NAUX	:Timeout table for needle and aux requests
+OUTREQ	HS	NTGRP		:Bit array for output requests
+TFLSHO	HS	NGRP		:Bit array for flushing output
+DEVSEQ	HS	NAUX		:Array of AC request keys
+OTHRSH	HS	NPORT		:Output threshhold array
+LATEB4	WS	1		:Number of late B4's seen
+LATEB6	WS	1		:Number of late B6's seen
+LATEB5	WS	1		:Number of late B5's seen
+LATE09	WS	1		:Number of late 09's seen
+ORBALL	HS	NGRP		:Orange ball bit array
+ACSEQ	HS	1		:Last AC sequence number used
+TTENT	HS	NTERM+NAUX	:TTY table addresses
+TBREAK	HS	NGRP		:Break bit array
+PORTDF	HS	NPORT		:Port to device mapping
+FLAGS	HS	1		:Waste an HW so first bit won't be #0
+FISIS	HS	NGRP		:Flags for buffer input started
+TISIS	HS	NGRP		:Flags for buffer output started
+
+	IF	BBMSG
+BBTOT	WS	1		:Total number of black balls received
+BBCNTR	HS	NPORT		:# black balls not processed yet
+BBCT	HS	NPORT		:# chars until first black ball
+	EI
+
+NAMBUF  BS      $A 24           :Temp. buffer for username
+
+XBUFR   HS      1
+
+R6SAV   WS      1
+REGSAV	WS	1
+MSGADR	WS	1
+RREGSV	WS	1		:Storage for register
+PORTCT	HS	1		:Count of ports available for login
+PTSHST  HS      1               :Storage for subhost # request
+
+DEFACK	BS	1		:Default TTEDAK array (on HW bound!)
+SYSCON	HS	NGRP		:Bit array of system console port
+SYSREQ	HS	NGRP		:Temporary bit array of system console port
+COLUMN	HS	NPORT		:The bell column # for each port
+BELCOL	HS	NPORT
+TRMTYP	HS	NGRP		:Bit array of terminal type (0=hard copy,1=CRT)
+       IF       XTRACE
+XTRCPT  HC      0
+XTRCTB  HS      800
+XR3SAV  WS      1
+XR4SAV  WS      1
+       EI       :XTRACE
+:
+: In-core constants
+:
+
+	SEG	A.CODE		:Code segement
+
+NCFAIL	WC	NCBITS		:Storage for NCBITS (see above)
+
+MSGTAB	HS	0		:Table of ISIS messages to break on
+	HC	0,0,0		:00-2F
+	HC	0,0,0		:30-5F
+	HC	0,0,0		:60-8F
+	HC	3,806,2E01	:90-BF	  9E,9F,A4,AD,AE,B2,B4,B5,B6,BF
+	HC	8000,0,0	:C0-EF    C0
+	HC	0		:F0-FF
+
+UMTOTB	HS	0		:Table of ISIS messages not to put in buffer
+	HC	0,0,0		:00-2F
+	HC	0,0,0		:30-5F
+	HC	0,0,0		:60-8F
+	HC	0,806,0		:90-BF	  A4,AD,AE (blk ball, org ball, brk)
+	HC	0,0,0		:C0-EF
+	HC	0		:F0-FF
+
+THRMAP	BC	2,0,0,0,0,0,0,0	:TID -> Threshhold class map
+	BC	0,0,0,0,1,1,2,0	:  0=class A, 1=class B, 2=class C
+	BC	1,2,2,0,0,0,0,0
+	BC	0,0,0,0,0,0,0,0
+
+
+TEN     HC      $A 10                   :Used in process needle (for MH)
+
+THRTBL	HC	LIMITA,LIMITB,LIMITC	:Threshhold table
+:
+: TSTART - Start an I/O operation on a port device.
+:	Called by NUCIO in module NUCIO:
+:		R1 = Address of Pascal Data Buffer
+:		R2 = Address of Pascal I/O Parameter Block
+:		R3 = Device type # (Terminal or Aux Ckt)
+:		R5 = Terminal or Aux Ckt #
+:		R8 = Calling process header addr.
+:	Return by jumping to IOEXIT in module NUCLUS
+:
+
+TSTART	LR	R10,R1		:Copy Pascal buffer addr
+      	LR	R11,R2		:Copy parameter block address
+	CLHI	R3,AUXDEV	:Aux device?
+	JEFS	TSTRT1		:Yes, skip
+	LIS	R12,0		:Table offset for terminal devices
+	CLHI	R5,NTERM	:Terminal number out of range?
+	JFS	TSTRT2		:Skip to test
+TSTRT1	LHI	R12,NTERM	:Table offset for aux ckt devices
+	CLHI	R5,NAUX		:Circuit number out of range?
+TSTRT2	JGE	TSBDUN		:Out of range -- Unit does not exist
+
+	AR	R12,R5		:Internal device number
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+	LHL	R7,OPER,R11	:Get operation number
+	CLHI	R7,MTTYOP	:Compare with maximum allowable
+	JG	TSPRGE		:Return "Program Error" status if too high
+	LH	R9,TTPORT,R13	:Get port number
+	JG	TSTRT3		:Skip ahead if device connected
+	TBT	R7,NCFAIL	:Check if valid on unconnected device
+	JG	TSTRT3		:
+        IF      XTRACE
+        LR      R9,R8
+        LR      R0,R8
+        JAL     R8,XMTRAC,,
+        LR      R8,R9
+        EI
+        J       TSFAIL
+
+TSTRT3	LR	R4,R7		:Copy operation number
+	SLLS	R4,1		:Make halfword offset
+	LH	R4,TSTTAB,R4	:Get routine offset for operation
+	J	TSTTAB,R4	:Branch to routine
+:
+:       Terminal Operation Table
+:
+TSTTAB	EQ	.
+	HC	TRMRDC-TSTTAB	:Read characters
+	HC	TRMRDL-TSTTAB	:Read line
+	HC	TRMSND-TSTTAB	:Send
+	HC	TRMDIS-TSTTAB	:Disconnect
+	HC	TRMCLB-TSTTAB	:Clear Break
+	HC	TRMSS-TSTTAB	:Set system
+	HC	TRMST-TSTTAB	:Set terminal
+	HC	TRMYEL-TSTTAB	:Send yellow ball
+	HC	TRMDET-TSTTAB	:Detect orange ball
+	HC	TRMCRQ-TSTTAB	:Request Aux Circuit
+	HC	TRMINF-TSTTAB	:Terminal info
+	HC	TRMSB1-TSTTAB	:Send B1 message
+	HC	TRMNED-TSTTAB	:Read needle
+	HC	TRMZAP-TSTTAB	:Zap circuit
+	HC	TRMSUP-TSTTAB	:Send supervisor log message
+	HC	TRMBRK-TSTTAB	:Set a char as a breakkey
+	HC	TRMBEL-TSTTAB	:Set bell
+	HC	TRMCRQ-TSTTAB	:Normal circuit request
+	HC	TRMSIX-TSTTAB	:Send SIIX cmd
+	HC	TRMTIX-TSTTAB	:Send TIIX cmd
+:
+: Routines to start or perform specific port operations
+:	Upon entry:
+:		R3 = Device type (terminal or aux)
+:		R7 = Operation number
+:		R8 = Calling process header
+:		R9 = Port number field from term. info table
+:		R10 = Pascal data buffer address
+:		R11 = Pascal parameter block address
+:		R12 = Internal device # (0 - NTERM+NAUX-1)
+:		R13 = Terminal information table entry pointer
+:
+
+:
+: Read character
+:
+
+TRMRDC	LH	R0,TTROP,R13	:Any input operation pending?
+	JGE	TSBUSY		:Yes, return busy status
+	L	R0,ARG1,R11	:Get ARG1 (number of characters to read)
+	LR	R1,R0		:Assume we want all at once
+	CLHI	R0,MAXCHAR	:Want more than MAXCHAR?
+	JLEFS	TRMRC1		:No, skip
+	LHI	R1,MAXCHAR	:Else get MAXCHAR at a time
+TRMRC1	STH	R1,CHRLIM,R9,R9	:Ask to be awakened in (R1) chars
+	J	TRMRD2		:Else get all characters
+
+:
+: Read line
+:
+
+TRMRDL	LH	R0,TTROP,R13	:Any input operation pending?
+	JGE	TSBUSY		:Yes, return busy status
+	LHL	R1,COLUMN,R9,R9	:Get bell column #
+	STH	R1,BELCOL,R9,R9	:Save for front.lib
+	LHI	R1,MAXCHAR	:
+	STH	R1,CHRLIM,R9,R9	:Reset CHRLIM to MAXCHAR
+	L	R0,ARG1,R11	:Get ARG1 (max # of characters to store)
+TRMRD2	STH	R0,TTRLFT,R13	:Save ARG1 as # chars left in buffer
+	ST	R10,TTRPTR,R13	:Save Pascal buffer pointer
+	ST	R11,TTRPRM,R13	:Save parameter address
+	STH	R7,TTROP,R13	:Save operation type
+	ST	R8,TTRPHD,R13	:Save requesting process header addr.
+	LIS	R0,0
+	STH	R0,TTRFCT,R13	:Set # chars read to zero
+	LR	R1,R9		:Copy port number
+	SLLS	R1,3		:Convert to input buffer pointer
+	L	R0,ARG2,R11	:Get # seconds to timeout
+	JLEFS	TRMRD3		:None wanted--skip
+	JAL	R4,PTTOUT	:Set timeout on port
+TRMRD3	JAL	R14,FILBUF	:Try to do the request now
+	J	IOEXIT		:Return
+
+:
+: Send
+:
+
+TRMSND  SBT     R12,OUTREQ,,    :Set output request bit for device
+	JN	TSBUSY		:Return busy if output in progress
+	ST	R1,TTWPTR,R13	:Save Pascal buffer pointer
+	ST	R2,TTWPRM,R13	:Save parameter address
+	ST	R8,TTWPHD,R13	:Save requesting process header addr.
+	L	R0,ARG1,R11	:Get ARG1 (number of characters to send)
+	STH	R0,TTWLFT,R13	:Save as # chars left to send
+	L	R0,ARG2,R11	:Get ARG2 (seconds until timeout)
+	JLEFS	TRMSN2		:Skip if no timeout wanted
+	A	R0,SLOWC,,	:Timeout time
+TRMSN2	ST	R0,TTWTIM,R13	:Save timeout time
+	J	IOEXIT		:Return
+
+:
+: Disconnect
+:
+
+TRMDIS	LR	R14,R8		:Copy proc hdr out of the way
+	JAL	R4,ZCLEAN	:Clean up tables for port and device
+	LR	R1,R9		:Copy port number
+	SLLS	R1,3		:Convert to input buffer pointer for port
+	JAL	R4,EMPTY	:Empty the input buffer
+	AIS	R1,4		:Point to output buffer
+	LIS	R0,0		:
+	JAL	R4,WCI		:Send special message escape
+	LHI	R0,DETMSG	:
+	JAL	R4,WCI		:Send Detach message
+	LR	R8,R14		:Restore proc hdr
+	J	TSCOMP		:Return 'Complete' status
+
+:
+: Clear Break status
+:
+
+TRMCLB  RBT     R9,TBREAK,,     :Clear break received bit 
+        RBT     R9,TFLSHO,,     :Clear flush output bit
+	J	TSCOMP		:Return 'Complete' status
+
+:
+: Set system parameters
+:
+
+TRMSS	L	R1,ARG1,R11	:Get sub-operation
+	JL	TSPRGE		:Program error if negative
+	CLHI	R1,5		:Too high?
+	JG	TSPRGE		:Program error if too high
+	JE	TRMSC		:Skip if sub-op = set CRT type terminal
+	CLHI	R1,4		:Set hard-copy type terminal's operation?
+	JE	TRMSH		:Skip if yes
+				:Otherwise, set system editing character
+        LA      R2,DEFEDI,,     :R2 -> default edit char table
+        LA      R3,DEFBRK,,     :R3 -> default char bit tables
+        LA      R5,DEFACK,,     :R5 -> default ack table
+	JAL	R4,SETEDI	:Set new default character
+	J	TSCOMP		:Return 'Complete' status
+
+TRMSC
+	LHI	R2,NPORT-1	:Port # of last port
+TRMSC1  SBT     R2,TRMTYP,,     :Set to CRT type
+	SIS	R2,1
+	JGEBS	TRMSC1
+	J	TSCOMP
+
+TRMSH
+	LHI	R2,NPORT-1	:Port # of last port
+TRMSH1  RBT     R2,TRMTYP,,     :Set to hard-copy type
+	SIS	R2,1
+	JGEBS	TRMSH1
+	J	TSCOMP
+
+
+:
+: Set terminal parameters
+:
+
+TRMST	L	R1,ARG1,R11	:Get sub-operation
+	JL	TSPRGE		:Program error if negative
+	CLHI	R1,$A 11	:Too high?
+	JG	TSPRGE		:Program error if so
+	LHL	R2,STTBL,R1,R1	:Get sub-operation routine offset
+	J	STTBL,R2	:And go to the routine
+
+STTBL	EQ	.
+	HC	STECHO-STTBL	:Echo off
+	HC	STECHO-STTBL	:Echo on
+	HC	STETM-STTBL	:Enter transparency mode
+	HC	STLTM-STTBL	:Leave transparency mode
+	HC	STNCN-STTBL	:New system console
+	HC	STEDIT-STTBL	:Set backspace char
+	HC	STEDIT-STTBL	:Set word delete char
+	HC	STEDIT-STTBL	:Set line delete char
+	HC	STLWID-STTBL	:Set line input char width
+	HC	STEDIT-STTBL	:Set line review char
+	HC	STTYPH-STTBL	:Set terminal to be hard-copy type
+	HC	STTYPC-STTBL	:Set terminal to be CRT type
+
+:
+: Echo off/on - These send the appropriate B1 message to ISIS.
+:	The Tymsat will (should!) reflect the message, and FRONT.LIB
+:	will catch the echo and set its flags accordingly.
+:
+
+STECHO	LR	R1,R9		:Copy port number
+	SLLS	R1,3		:Make input buffer index
+	AIS	R1,4		:Make output buffer index
+	LIS	R0,0		:Escape code
+	JAL	R4,WCI
+	LHI	R0,0B1		:B1 message (set terminal param)
+	JAL	R4,WCI
+	LIS	R0,0		:N = 0 (echo control)
+	JAL	R4,WCI
+	L	R0,ARG1,R11	:Value (0=off, 1=on)
+	JAL	R4,WCI
+	J	TSCOMP		:Operation 'complete'
+
+:
+: Enter/Leave transparency mode
+:	Sends the appropriate message to ISIS
+:
+
+STETM	LR	R1,R9		:Copy port number
+	SLLS	R1,3		:Make input buffer index
+	AIS	R1,4		:Make output buffer index
+	LIS	R0,0		:Escape code
+	JAL	R4,WCI
+	LHI	R0,0A8		:A8 message (Enter transparency mode)
+	JAL	R4,WCI
+	J	TSCOMP		:Operation 'complete'
+
+STLTM	LR	R1,R9		:Copy port number
+	SLLS	R1,3		:Make input buffer index
+	AIS	R1,4		:Make output buffer index
+	LIS	R0,0		:Escape code
+	JAL	R4,WCI
+	LHI	R0,0A9		:A9 message (Leave transparency mode)
+	JAL	R4,WCI
+	J	TSCOMP		:Operation 'complete'
+
+:
+: Set new system console
+:
+
+STNCN   TBT     R9,SYSCON,,     :Test urrent console port #
+        JE      STNCN1
+        IF      XTRACE
+        LR      R9,R8
+        LR      R0,R8
+        JAL     R8,XMTRAC,,
+        LR      R8,R9
+        EI
+	J	TSFAIL		:Failure if there already is one
+STNCN1  SBT     R9,SYSCON,,     :Else set new one
+	J	TSCOMP		:And return 'complete'
+
+:
+: Set new editing character
+:
+
+STEDIT	CLHI	R1,9		:Set line_review sub-op?
+	JNFS	STEDIA		:Skip if not
+	SIS	R1,6		:Convert sub-op to edit function #
+	JFS	STEDIB
+STEDIA	SIS	R1,5		:Convert sub-op to edit function #
+STEDIB	LA	R2,TTEDIT,R13	:Address of edit chars
+	LA	R3,TTBRK,R13	:Address of break table
+	LA	R5,TTEDAK	:Address of ack bit table
+	JAL	R4,SETEDI	:Set edit char
+	J	TSCOMP		:Operation 'Complete'
+
+:
+: Set line input width
+:	0 = strip parity, non-zero = keep parity
+:
+
+STLWID	LHL	R0,0FF		:Assume we'll want all 8 bits
+	L	R1,ARG2,R11	:Get ARG2
+	JNFS	STLW2		:Non-zero, skip
+	LHL	R0,7F		:Else only want 7 bits
+STLW2	STB	R0,TTRMSK,R13	:Set input mask
+	J	TSCOMP		:Operation 'Complete'
+
+:
+:  Set the terminal type  (0 -> hard copy  1 -> CRT)
+:
+
+STTYPH  RBT     R9,TRMTYP,,     :Set the port to be hard-copy type
+	J	TSCOMP
+
+STTYPC  SBT     R9,TRMTYP,,     :Set the port to be CRT type
+	J	TSCOMP
+
+:
+: Send Yellow Ball
+:
+
+TRMYEL  RBT     R9,ORBALL,,     :Clear orange-ball-received bit for port
+	LR	R1,R9		:Copy port number
+	SLLS	R1,3		:Make input buffer index
+	AIS	R1,4		:Make output buffer index
+	LIS	R0,0		:Escape code
+	JAL	R4,WCI
+	LHI	R0,YBMSG	:Yellow ball
+	JAL	R4,WCI
+	J	TSCOMP		:Return 'Complete' status
+	
+:
+: Detect Orange Ball
+:
+
+TRMDET  RBT     R9,ORBALL,,     :Has an orange ball come in?
+	JE	TSCOMP		:Return 'Complete' if not
+	J	TSORBL		:Else return 'Orange-Ball' status
+
+:
+: Request Aux/Normal Circuit
+:
+
+TRMCRQ	LIS	R0,0
+	CLHI	R7,9		:Is this an aux_cir_req ?
+	JNFS	TRMCN		:No , skip
+	RBT	R0,TTFLAG,R13	:Yes, reset the bit
+	J	TRMCA		:Do the aux_cir_req
+TRMCN	SBT	R0,TTFLAG,R13	:Set the bit, indicate this is a nor_cir_req
+	ST	R10,TTRPTR,R13	:Save pascal data buffer pointer
+	ST	R11,TTRPRM,R13	:Save pascal param. block addr
+TRMCA	CLHI	R3,AUXDEV	:Is this an Aux Ckt device?
+	JN	TSPRGE		:No, do program error return.
+	LR	R9,R9		:Test port #/status field
+	JN	TSBUSY		:Busy return if device already in use
+	LCS	R9,2		:State for building circuit
+	STH	R9,TTPORT,R13	:Put in TTY info table
+	LHI	R5,-NTERM,R12	:Compute aux device number
+	TBT	R0,TTFLAG,R13	:Test the bit if this is nor/aux_cir_req?
+	JN	TRMCN0
+	LIS	R0,$A 11	:Length of aux ckt request msg
+	L	R6,ARG1,R11	:Get length of username string
+	AR	R0,R6		:Add to total msg length
+	LIS	R1,0		:Message is meant for port 0
+	LIS	R2,BLDAUX	:Aux-Circuit-Request message
+	J	TRMCA1
+TRMCN0	L	R6,ARG1,R11	:GET LOGON STRING'S LENGTH FROM ARG1
+	LB	R0,0,R10
+	CLHI	R0,0D		:COMPARE WITH CR
+	JE	TRMCN1
+	SIS	R6,1
+	JL	TSPRGE
+	AIS	R10,1
+	J	TRMCN0
+TRMCN1	LIS	R0,$A 11
+	LIS	R1,0
+	LIS	R2,07		:Pseudo needle req msg code
+TRMCA1  JAL     R4,SLOR,,       :Start message directly to output ring
+	LIS	R0,0		:External key (meaningless)
+	JAL	R4,PUTCH
+        LHL     R0,ACSEQ,,      :R0 = previous sequence number
+	AIS	R0,1		:Increment
+	NHI	R0,$07FFF	:Wrap at 32767 (never becomes negative)
+        STH     R0,ACSEQ,,      :Save new sequence number
+	STH	R0,DEVSEQ,R5,R5	:Put in table for device
+	JAL	R4,PUTH
+	LHI	R0,HIQ0		:Load host intelligent flag
+	SLHLS	R0,0F
+	OHI	R0,$04000	:Set the extended login status return
+	JAL	R4,PUTH
+	LHI	R0,HOST0	:Originating host number
+	JAL	R4,PUTH
+	LIS	R0,0
+	TBT	R0,TTFLAG,R13
+	JN	TRMCN2
+	LR	R0,R6		:Size of login string
+	JAL	R4,PUTCH
+TRMCR1	SIS	R6,1		:Decrement counter
+	JLFS	TRMCR2		:Exit loop if negative
+	LB	R0,0,R10	:Get character from Pascal buffer
+	JAL	R4,PUTCH	:Put in ring
+	AIS	R10,1		:Increment buffer pointer
+	JBS	TRMCR1		:Loop
+
+TRMCN2	LHI	R0,0CC		:Get TID
+	JAL	R4,PUTCH
+
+TRMCR2	JAL	R4,ELOR		:End message
+	LIS	R0,1
+	SBT	R0,TTFLAG,R13	:Set data buffer is not empty flag
+	SLLS	R12,2		:Make fullword pointer for device
+	L	R0,SLOWC,,	:Get the current time
+	AHI	R0,AUXTIM	:Calculate wakeup time
+        ST      R0,TOTAB,R12,   :Put in timeout table
+	ST	R8,TTRPHD,R13	:Save process header address
+	ST	R11,TTRPRM,R13	:Save parameter block address
+	J	IOEXIT		:Exit Nucleus
+
+:
+: Get terminal info
+:
+
+TRMINF
+	LH	R0,TTROP,R13	:Any input operation pending
+	JGE	TSBUSY		:Yes, return busy status
+	LR	R1,R9		:Copy port number
+	SLLS	R1,3		:Make input buffer index
+	L	R0,ARG2,R11	:Any timeout value set
+	JE	TRMIN1		:No, skip
+	JL	TSPRGE
+	LHL	R0,BCT,R1	:Any data in bufferlets
+	JG	TRMIN1		:Yes, skip
+        TBT     R9,TFLSHO,,
+	JN	TRMIN1
+	LIS	R0,1
+	STH	R0,CHRLIM,R9,R9	:Set chrlim to 1
+	ST	R11,TTRPRM,R13	:Save pascal param. block addr
+	STH	R7,TTROP,R13	:Save operation type
+	ST	R8,TTRPHD,R13	:Save requesting proecss header addr
+	L	R0,ARG2,R11	:Get # seconds to timeout
+	JAL	R4,PTTOUT
+	J	IOEXIT
+TRMIN1
+        LHL     R0,DCT,R1,      :R0 = # of DATA characters in bufferlets
+:	LH	R2,TTROP,R13	:Read operation pending?
+:	JLFS	TRMIF1		:Skip if not
+:	AH	R0,TTRFCT,R13	:Add number of chars in Pascal buffer
+TRMIF1	ST	R0,ARG1,R11	:Return in ARG1
+	LH	R0,TTLNES,R13	:Get number of lines to be read
+	ST	R0,ARG2,R11	:Return in ARG2
+
+	IF	BBMSG		:If black ball option set
+	LHL	R0,BBCNTR,R9,R9	:Any black balls?
+	JE	TRMIF2		:No, skip
+	LH	R0,BBCT,R9,R9	:Number of characters preceding BB
+	ST	R0,ARG1,R11	:Use as # chars available
+	J	TSTRAN		:Transmission error status
+	EI	:BBMSG
+
+TRMIF2  TBT     R9,TFLSHO,,     :Flushing output?
+	JN	TSBRK		:Yes, return 'Break' status
+	J	TSCOMP		:Else return 'Complete' status
+
+:
+: Send B1 message
+:
+
+TRMSB1	LR	R1,R9		:Copy port number
+	SLLS	R1,3		:Make input buffer index
+	AIS	R1,4		:Make output buffer index
+	LIS	R0,0		:Escape code
+	JAL	R4,WCI
+	LHI	R0,0B1		:B1 message
+	JAL	R4,WCI
+	L	R0,ARG1,R11	:First byte of argument
+	JAL	R4,WCI
+	L	R0,ARG2,R11	:Second byte of argument
+	JAL	R4,WCI
+	J	TSCOMP		:Return 'Complete' status
+
+:
+: Read needle
+:
+
+TRMNED	CLHI	R3,TRMDEV	:Terminal device?
+	JN	TSPRGE		:No, return prog. err.
+	LR	R9,R9		:Check port #/status
+	JN	TSBUSY		:Busy status if port is in use
+	LCS	R9,1		:Code for needle wait status
+	STH	R9,TTPORT,R13	:Save in TTY information table
+        L       R0,ARG1,R11     :Get subhost # from Port_Param record
+        JL      TSPRGE          :If less than 0, return prog. err.
+        CLHI    R0,$A 9999      :If greater than 9999,
+        JG      TSPRGE          :Return prog. error
+        STH     R0,TTSHST,R13   :Save subhost # in TTY inform. table
+	ST	R8,TTRPHD,R13	:Save calling process header
+	ST	R10,TTRPTR,R13	:Save Pascal buffer address
+	ST	R11,TTRPRM,R13	:Save parameter block address
+	L	R0,ARG2,R11	:Get # seconds to timeout
+	JLE	TRMND1		:Skip if no timeout wanted
+	SLLS	R12,2		:Compute fullword ptr for device
+	A	R0,SLOWC,,
+        ST      R0,TOTAB,R12,   :Put in timeout table
+TRMND1  LHL     R1,PORTCT,,     :R1 = port count
+	AIS	R1,1		:Increment
+        STH     R1,PORTCT,,     :Save new port count
+	CLHI	R1,1		:Was it zero before?
+	JG	IOEXIT		:No, exit
+	JAL	R5,REPPRT	:Yes, report to network
+	J	IOEXIT		:Exit Nucleus
+
+
+:
+: Send zapper
+:
+
+TRMZAP
+	LR	R14,R8		:Copy process header addr
+	JAL	R4,ZCLEAN	:Clean up
+	LR	R1,R9		:Copy port number
+	JAL	R5,ZAPPRT	:Call FRONT.LIB routine to zap
+	SLLS	R1,3		:Convert to input buffer pointer
+	JAL	R4,EMPTY	:Empty input buffer
+	LR	R8,R14		:Restore process header
+	J	TSCOMP		:Operation complete
+
+
+:
+: Send supervisor log message
+:
+
+TRMSUP	LIS	R1,0		:Message for port zero
+	LIS	R2,REPSUP	:Message type
+	LIS	R0,9		:Message length
+        JAL     R4,SLOR,,       :Start message to output ring
+	LHL	R0,SLOTNO,,	:Get slot number
+	JAL	R4,PUTCH	:Put in message
+	L	R0,0,R10	:Get first 4 bytes of msg
+	JAL	R4,PUTW		:Put in ring
+	LB	R0,4,R10	:Get 5th byte
+	JAL	R4,PUTCH	:Put in ring
+	JAL	R4,ELOR		:End message
+	J	TSCOMP		:Operation complete
+
+:
+:  SET A CHARACTER AS A BREAKKEY
+:
+
+TRMBRK	LB	R0,0,R10	:Get the new char from pascal data buffer
+	LB	R1,TBRKEY,R13	:Get the old break char
+	CR	R0,R1		:Compare
+	JE	TSCOMP		:Return if they are the same
+        LA      R3,DEFBRK,,     :R3 -> default break char bit table
+	TBT	R0,0,R3		:Chk if the char had been used as system break
+	JN	TSPRGE		:Program error if so
+	LA	R3,TTBRK,R13	:Get port break char table
+	TBT	R0,0,R3		:Chk if the char'd been used as port edit char
+	JN	TSPRGE		:Prog. err if so
+	CLHI	R1,0		:Has ever set the break key?
+	JE	TRMBR1		:Skip if no
+	RBT	R1,0,R3	:Otherwise, reset the old breakkey from break table
+	RBT	R1,10,R3
+TRMBR1	STB	R0,TBRKEY,R13	:Save the breakkey
+	SBT	R0,0,R3		:Break on this char
+	SBT	R0,10,R3	:Break on this char with parity
+	J	TSCOMP
+
+:
+:  SET BELL
+:
+
+TRMBEL	L	R1,ARG1,R11	:Get bell column #
+	JL	TSPRGE
+	STH	R1,COLUMN,R9,R9	:Store in column table
+	J	TSCOMP
+
+:
+:  Send SIIX
+: 
+
+TRMSIX	LIS	R0,3		:Msg length
+	LR	R1,R9		:Load port #
+	LHI	R2,0BF		:SIIX Cmd
+        JAL     R4,SLOR,,
+	JAL	R4,ELOR
+	J	TSCOMP
+
+:
+:  Send TIIX
+:
+
+TRMTIX	LIS	R0,3		:Msg length
+	LR	R1,R9		:Load port #
+	LHI	R2,0C0		:TIIX Cmd
+        JAL     R4,SLOR,,
+	JAL	R4,ELOR
+	J	TSCOMP
+:
+: Set return status in parameter block and return
+:
+
+TSBUSY	LIS	R0,BUSY		:'Busy' status
+	J	TSRET
+
+TSBDUN	LCS	R0,1		:'Unit does not exist' code (-1)
+	ST	R0,STATS2,R11	:Save in STATUS2
+TSFAIL	LIS	R0,FAIL		:'Failure' status
+	JFS	TSRET
+
+TSPRGE	LIS	R0,PRGERR	:'Program error' status
+	JFS	TSRET
+
+TSBRK	LIS	R0,BKSTAT	:'Break' status
+	JFS	TSRET
+
+TSTRAN	LIS	R0,TRANS	:'Transmission error' status
+	JFS	TSRET
+
+TSCOMP	LIS	R0,COMPLE	:'Complete' status
+	JFS	TSRET
+
+TSORBL	LIS	R0,OBSTAT	:'Orange Ball' status
+
+TSRET	STH	R0,STATUS,R11	:Save status in parameter block
+	JAL	R9,RDYENT	:Place calling process in ready queue
+	J	IOEXIT		:Exit Nucleus
+:
+: TCHECK - Check for port I/O
+:	Called by NIOCP in module NUCIO
+:
+
+TCHECK  ST      R2,TCRET,,      :Save return address
+	JAL	R0,INPUT	:Check rings for input
+	JAL	R0,OUTCHK	:Check on pending output operations
+	JAL	R0,OUTPUT	:Check buffers for output to ISIS
+	JAL	R0,ACTOUT	:Check for Aux Ckt request timeouts
+        L       R2,TCRET,,      :Restore return address
+	JR	R2		:Return
+
+:
+: P0PROC - Activation routine for messages on port 0
+:	Called by FRONT.LIB:
+:		R1 = Port 0 input buffer index
+:		R15 = Return address
+:	Return through R15 with R0 set to -1.
+:
+
+P0PROC	JAL	R4,GCI		:Get message type
+	CLHI	R0,AUXERR	:Aux circuit request failure?
+	JN	PTFLSH		:No, flush buffer and exit
+
+	JAL	R4,GCI		:Toss external key
+	JAL	R4,GCI		:Get local key - high byte
+	LIS	R6,0		:Clear register for key
+	EXBR	R6,R0		:Put byte in high part of key register
+	JAL	R4,GCI		:Get low byte of key
+	OR	R6,R0		:Assemble key
+	LHI	R5,NAUX	:Get number of aux devices
+PT0A	SIS	R5,1		:Decrement counter
+	JL	PT0IGN		:Flush message if key not in table
+	CH	R6,DEVSEQ,R5,R5	:Is this it?
+	JNBS	PT0A		:No, keep trying
+
+	LCS	R0,1
+	STH	R0,DEVSEQ,R5,R5	:Clear key entry
+	LR	R12,R5		:Copy aux device number
+	AHI	R12,NTERM	:Convert to port device number
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+       IF       XMEMRY
+        L       R10,TTRPHD,R13  :R10 -> Process Header Record
+        LH      R10,XMPSET+4,R10        :R10 = XM Mac set
+        JAL     R4,XMCURR       :Make this Proc's Mac set current
+       EI       :XMEMRY
+	LH	R0,TTPORT,R13	:Get state
+	CLHI	R0,-2		:Waiting for aux ckt?
+	JL	PT0IGN		:No, ignore msg
+	L	R11,TTRPRM,R13	:Get Pascal parameter block address
+	JAL	R4,GCI		:Get error code
+	ST	R0,ARG2,R11	:Save in ARG2
+	LIS	R0,0		:Zero
+	STH	R0,TTPORT,R13	:Clear state of device
+	SLLS	R12,2		:Convert aux # to fullword pointer
+        ST      R0,TOTAB,R12,   :Clear timeout entry
+        IF      XTRACE
+        L       R0,TTRPHD,R13
+        JAL     R8,XMTRAC,,
+        EI
+	J	PTFAIL		:Failure return to process
+
+PT0IGN	LIS	R0,1		:Request had already timed out...
+        AM      R0,LATE09,,     :Increment late '09' msg counter
+	J	PTFLSH		:Flush the rest of the message
+:
+: PTPROC - Activation routine for messages on user ports
+:	Called by FRONT.LIB:
+:		R0 = Activation reason
+:			(0 = data, -1 = needle, -2 = too many chars,
+:			 -3 = flush, -4 = timeout,
+:			 otherwise ISIS message type)
+:		R1 = Port input buffer index
+:		R2 = Activation char (if data)
+:		R5 = Invoice number (if needle)
+:		R6 = Destination Host # (if needle)
+:		R7 = Originating Node # (if needle)
+:		R8 = Originating Host # (if needle)
+:		R9 = Originating Port # (if needle)
+:		R10 = Dialect code (if needle)
+:		R11 = TID (if needle)
+:		R12 = Number of characters in username (if needle)
+:		R15 = Return address
+:		In addition, the condition codes will be set for R0.
+:	Return through R15 with R0 set to -1.
+:
+
+PTPROC	JG	PTMSG		:If R0 > 0, go handle ISIS message
+	JE	PTDATA		:If R0 = 0, go handle data
+				:It must be some weird FRONT.LIB code.
+
+	CLHI	R0,-4		:Input timeout?
+	JE	PTIMOT		:Yes, go handle it
+
+	CLHI	R0,-2		:Too much data?
+	JE	PTDATA		:Yes, it counts as as normal data.
+	JG	PTNEDL		:If needle, process it
+	J	PTEXIT		:Otherwise ignore it.
+
+:
+: Process a needle
+:
+
+PTNEDL  LHL     R4,PORT,,       :Get port number
+	LH	R2,PORTDF,R4,R4	:Get Device number for port
+	JGE	PTERR		:Error if already assigned to device!
+
+:
+: Get the subhost number, if any, and store it in PTSHST. PTSHST will
+: have a value of zero by default.
+:
+        LIS     R14,0           :New username length
+        STH     R14,PTSHST,,    :Also clear PTSHST to zero
+        LA      R13,NAMBUF,,    :Get address of username buffer
+
+:
+: get the real username first, a colon indicating the end of this name,
+: and store it in NAMBUF buffer. R14 now has the true length of this
+: username. If no colon is found, subhost number is 0 by default.
+:
+PTNEDM  JAL     R4,GCI          :Get username character
+        NHI     R0,7F           :Mask any high bit
+        CLHI    R0,COLON        :Is it a colon?
+        JEFS    CHKPRD          :Yes, check if a period followed
+        STB     R0,0,R13        :No, put it in username buffer
+        AIS     R14,1           :Update the length of username
+        AIS     R13,1           :Point at next place in NAMBUF
+        SIS     R12,1           :Decrement length count
+        JGBS    PTNEDM          :Loop until whole name read
+        J       PTNEDN          :If gets here, subhost is 0 by default
+
+:
+: Search for a period, which must exist if there is a subhost # 
+: other than a zero (which is the value by default).
+:
+CHKPRD  SIS     R12,1           :Decrement length count
+NEXTPD  JAL     R4,GCI          :Get next character
+        NHI     R0,7F           :Mask any high bit
+        CLHI    R0,PERIOD       :Is it a period?
+        JEFS    CHKDIG          :Yes, check if a digit followed
+        SIS     R12,1           :Decrement length count
+        JGBS    NEXTPD          :Keep checking for a period
+        J       SAVECR          :If gets here, subhost is 0 by default
+                                :and also go to save the last char CR 
+
+:
+: Immediately after a period there can be up to 4 digits (in decimal)
+: to represent a subhost number. A nondigit character right after a
+: period means a zero for subhost number by default.
+:
+CHKDIG  SIS     R12,1           :Decrement length count
+        LIS     R13,4           :Max. number of subhost digits
+NEXTDG  JAL     R4,GCI          :Get next character
+        NHI     R0,7F           :Mask any high bit
+        CLHI    R0,ZERO         :Is it less than a zero?
+        JL      CHECK           :If < 0, is it first char after the . ?
+        CLHI    R0,NINE         :Is it greater than a nine?
+        JG      CHECK           :If > 9, is it first char after the . ?
+        SI      R0,30           :Convert ASCII to decimal
+        LHL     R4,PTSHST,,     :Get last decimal number
+        MH      R4,TEN          :Multiply by 10
+        AR      R4,R0           :Add on the value of last digit
+        STH     R4,PTSHST,,     :Save the total as subhost number
+        SIS     R12,1           :Decrement length count
+        JE      SAVECR          :If it is 0, then end of reading username
+                                :and save the last char CR.
+        SIS     R13,1           :If not, decrement subhost digits count
+        JG      NEXTDG          :If count is not 0, look for next digit
+        JFS     NEXTCH          :If it is 0, scan the rest chars in buffer
+
+CHECK   SIS     R12,1           :Decrement length count
+        JEFS    SAVECR          :If count is 0, save the last char CR.
+
+:
+: Scan the rest of characters in buffer
+:
+NEXTCH  JAL     R4,GCI          :Scan the rest of chars in input buffer
+        SIS     R12,1           :Decrement length count        
+        JGBS    NEXTCH          :If count > 0, continue to scan
+SAVECR  NHI     R0,7F           :Otherwise, mask any high bit and 
+        STB     R0,0,R13        :save the last char CR in NAMBUF.
+        AIS     R14,1           :Update the username length
+
+:
+: Identify the first TTY device awaiting a needle on the Port's SubHost.
+: If none is found, ignore the needle by essentially dropping the circuit.
+: (If no TTY device is availible for the Port's SubHost (but it is a valid
+: SubHost number), output a message saying "subhost out of ports" before
+: dropping the circuit.)
+:
+OUT     eq      0B                      : Output to TTY SVC code
+
+PTNEDN
+        lr      R12,R14                 : Save the new username length
+        lis     R2,0                    : TTY Idx (=[0,NTERM-1])
+        stb     R2,AvailP,,             : clear AvailP
+        stb     R2,MatchP,,             : clear MatchP
+        stb     R2,OK,,                 : clear OK  
+        lhi     R3,NTERM                : TTY Idx (=[NTERM-1,0])
+        la      R13,TTYTBL,,            : Pointer to TTYTBL[R2]
+PTL2
+        sis     R3,1                    : For each TTY device
+        jl      PTL5                    : Exit when loop done
+
+        lh      R0,TTSHST,R13           : Does TTY subhost match
+        clh     R0,PTSHST,,             : the Port subhost?
+        jn      PTL4                    : No - keep looking
+
+        lcs     R4,1                    : Show that a match has occured
+        stb     R4,MatchP,,             :   by setting the damn flag
+
+        lh      R0,TTPORT,R13           : Is TTY awaiting a needle?
+        clhi    R0,-1                   : 
+        jn      PTL3                    : No
+
+        lcs     R4,1                    : Show that we found the right TTY
+        stb     R4,OK,,                 :   by setting the damn flag
+        j       PTL5                    : Go take care of it
+PTL3
+        lr      R0,R0                   : Is the TTY availible?
+        jn      PTL4                    : No - keep looking
+
+        lcs     R4,1                    : Show that the a TTY is availible
+        stb     R4,AvailP,,             :   by setting the damn flag
+PTL4
+        ais     R2,1                    : Increment TTY index
+        ahi     R13,TTSIZE              : Adjust the pointer accordingly
+        j       PTL2                    : And repeat loop
+PTL5
+        lhl     R4,OK,,                 : Did we find a TTY for our needle?
+        je      PTL6                    : No
+
+        lhl     R4,PORT,,               : Restore the previous intent of R4
+        j       PTNED2                  : Go process needle
+PTL6
+        lhl     R4,MatchP,,             : Did any TTY match this subhost?
+        je      PTL7                    : No - ignore the needle
+
+        lhl     R4,AvailP,,             : Was a TTY availible for this
+                                        : subhost?
+        jl      PTL7                    : Yes - ignore the needle
+
+        stm     R0,PTSRegs,,            : Save the cosmos from certain
+                                        :   destruction
+        lr      R2,R9                   : Send "subhost out of ports"
+        la      R3,SHOPMsg              :   message to the originating port
+        jal     R5,OCS
+        lm      R0,PTSRegs,,            : Unsave the cosmos
+PTL7
+        lhl     R4,PORT,,               : Restore the previous intent of R4
+        rbt     R4,ACP,,                : Tell Front.Lib to make it go away
+        jal     R4,EMPTY                : Clear the input buffer
+        ais     R1,4                    : Point to the output buffer
+        jal     R4,EMPTY                : Clear it too
+        j       PTEXIT                  : Ignore needle
+
+        KILL    OUT                     : Get rid of unsightly symbols
+        
+SHOPMsg sc      /subhost out of ports"8D"8A/
+
+        seg     a.data
+PTSRegs ws      $a 16                   : A place to save the registers
+MatchP  bs      1                       : True if some TTY's SubHost #
+                                        :   matches the Port SubHost #
+AvailP  bs      1                       : True if a matching TTY is
+                                        :   availible (ie, unused)
+OK      bs      1                       : True if a matching TTY is waiting
+                                        :   for a needle 
+        seg     a.code
+
+:
+: Bind the device to port and continue to process the needle
+:
+PTNED2  STH     R2,PORTDF,R4,R4 :Bind device to port
+	SLLS	R2,2		:Convert to fullword ptr
+	LIS	R0,0
+        ST      R0,TOTAB,R2,    :Clear timeout table entry for this device
+	STH	R4,TTPORT,R13	:And vice-versa
+       IF       XMEMRY
+        LR      R3,R10          :Save R10
+        L       R10,TTRPHD,R13  :R10 -> Process Header Record
+        LH      R10,XMPSET+4,R10        :R10 = XM Mac set
+        JAL     R4,XMCURR       :Make this Proc's Mac set current
+        LR      R10,R3          :Restore R10
+        LHL     R4,TTPORT,R13   :Restore R4
+       EI       :XMEMRY
+	L	R3,TTRPTR,R13	:Get data address
+	ST	R4,NEDPRT,R3	:Save destination port # in data block
+	ST	R5,NEDINV,R3	:Save invoice number
+	ST	R6,NEDHST,R3	:Save destination host #
+	ST	R7,NEDNOD,R3	:Save originating node #
+	ST	R8,NEDOHO,R3	:Save originating host #
+	ST	R9,NEDOPO,R3	:Save originating port #
+	L	R2,TTRPRM,R13	:Get addr of pascal param. block
+	SRHLS	R10,0F
+	ST	R10,STATS2,R2	:Save the source intelligent flag
+	STB	R11,NEDTID,R3	:Save terminal identifier
+	ST	R12,NEDNUM,R3	:Save length of username
+	LR	R9,R4		:Copy port number
+	LA	R10,NEDNAM,R3	:Point R10 at where username goes
+
+PTNED3  LA      R14,NAMBUF,,    :Get address of username buffer
+
+NEXTC   LB      R0,0,R14        :Get username character
+        STB     R0,0,R10        :Put in data block
+        AIS     R14,1           :Point to next char in NAMBUF
+        AIS     R10,1           :Point to next position in NEDNAM
+        SIS     R12,1           :Decrement username length count
+        JGBS    NEXTC           :Loop until whole name read
+
+
+  IF	INECHO			:Initial No-echo state?
+        SBT     R9,ECHOFF,,     :Yes, set off
+  ELSE
+        RBT     R9,ECHOFF,,     :Clear echo off bit for port
+  EI
+
+	NHI	R11,1F		:Mask status bits off TID
+	LB	R2,THRMAP,R11	:Get circuit class for this TID
+	LHL	R2,THRTBL,R2,R2	:Get output threshhold for this class
+	STH	R2,OTHRSH,R9,R9	:Put in table for prt
+
+	IF	ACECHO		:If aux ckt echo wanted
+	LR	R11,R11
+	JEFS	PTNED4		:Jump if aux ckt
+	CLHI	R11,$A 14	:Aux ckt through gateway?
+	JNFS	PTNED5		:No, skip
+PTNED4  SBT     R9,DEM,,        :Start port in deferred echo mode
+PTNED5
+	EI	:ACECHO
+
+	IF	LPROMP		:If login prompt wanted
+	AIS	R1,4		:Point at output buffer
+	LHI	R0,20		:Space
+	JAL	R4,WCI
+	LHI	R0,0A		:Linefeed
+	JAL	R4,WCI
+	LHI	R0,0D		:Carriage return
+	JAL	R4,WCI
+	LHI	R0,3E		:'>'
+	JAL	R4,WCI
+	EI	:LPROMP
+
+	LCS	R1,1		:Get -1
+        AHM     R1,PORTCT,,     :Decrement PORTCT
+	JGFS	ACTPRT		:Skip if ports still available
+        ST      R15,RREGSV,,    :Save return address
+	JAL	R5,REPPRT	:Report no ports available
+        L       R15,RREGSV,,    :Restore return address
+:
+: Common code to activate the port
+:
+
+ACTPRT
+	LIS	R0,0
+	STB	R0,TBRKEY,R13	:No breakkey set initially
+        L       R0,DEFEDI,,     :R0 = default editing characters
+	ST	R0,TTEDIT,R13	:Save in table for device
+        LB      R0,DEFACK,,     :Editing chars to acknowledge
+	STB	R0,TTEDAK,R13	:Put in TTY table
+	LA	R2,TTBRK,R13	:Get address of device break table
+	LR	R4,R9		:Copy port number
+	SLLS	R4,2		:Convert to fullword pointer
+        ST      R2,BREAK,R4,    :MAKE THIS THE PORT'S BREAK TABLE
+        LA      R1,DEFBRK+1E,,  :Last halfword of default break table
+	AHI	R2,1E		:Last halfword of device break table
+	LHI	R3,0F0		:Move 16 halfwords [10x * (n - 1)]
+	COPY	R1,R3		:Copy default break table to device's table
+	LHI	R0,7F		:Init mask to strip parity
+	STB	R0,TTRMSK,R13	:Save in TTY table
+
+	LIS	R0,0
+	STH	R0,TTLNES,R13	:Initialize to no lines in buffer
+        RBT     R9,TBREAK,,     :Clear break detect
+        RBT     R9,TFLSHO,,     :Clear flush output
+        RBT     R9,ORBALL,,     :Clear orange ball
+	STH	R0,COLUMN,R9,R9	:Initialize to no bell at column #
+        STH     R0,BELCOL,R9,R9 :Clear out the leftover from last connection.
+
+	IF	BBMSG
+	STH	R0,BBCT,R9,R9	:Start with no black balls
+	STH	R0,BBCNTR,R9,R9
+	EI
+
+	J	PTCOMP		:Activate process with 'Complete' status
+:
+: Process an ISIS mesage
+:	R0 = Message type
+:
+:	Note that Orange Balls, Breaks, and Black Balls are not put
+:	into the input buffer by FRONT.LIB.
+:
+
+PTMSG	CLHI	R0,OBMSG	:Orange ball?
+	JN	PTMSG1		:No, try another
+
+        LHL     R9,PORT,,       :Get port number
+        SBT     R9,ORBALL,,     :Set Orange-Ball-Received for port
+	J	PTEXIT		:Done processing message
+
+
+
+PTMSG1	CLHI	R0,BRKMSG	:Break detect?
+	JN	PTMSG2		:No, try another
+
+PTMSGB	LH	R12,PORTDF,R9,R9	:Get device number for prt
+	JL	PTEXIT		:Ignore if port not assigned
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+       IF       XMEMRY
+        L       R10,TTRPHD,R13  :R10 -> Process Header Record
+        LH      R10,XMPSET+4,R10        :R10 = XM Mac set
+        JAL     R4,XMCURR       :Make this Proc's Mac set current
+       EI       :XMEMRY
+	JAL	R4,EMPTY	:Empty input buffer
+	AIS	R1,4		:Point to output buffer
+	JAL	R4,EMPTY	:Empty output buffer
+        LHL     R9,PORT,,       :Get port number
+        SBT     R9,TFLSHO,,     :Set Flush-Output for port
+	LIS	R0,0
+        STH     R0,TTLNES,R13   :No lines in buffer
+
+	IF	BBMSG		:If we want black ball info
+	STH	R0,BBCT,R9,R9	:Cancel any black balls which came in
+	STH	R0,BBCNTR,R9,R9
+	EI	:BBMSG
+
+	JAL	R4,WCI		:Send escape code
+	LHI	R0,GOBMSG	:Send gobbler
+	JAL	R4,WCI
+	LHI	R0,BBELL	:Send bell
+	JAL	R4,WCI
+
+        SBT     R9,TBREAK,,     :Set Break Received 
+	SIS	R1,4		:Back to input buffer
+	J	PTDCHK		:See if input operation pending
+PTMSG2	CLHI	R0,PNDMSG	:Pseudo needle?
+	JN	PTMSG3		:No, try another
+	JAL	R4,GCI		:Skip over escape code
+	JAL	R4,GCI		:Skip msg type (B2)
+	JAL	R4,GCI		:Skip external key
+	JAL	R4,GCI		:Get local key - high byte
+	LIS	R6,0		:Clear register for key
+	EXBR	R6,R0		:Put byte in high part of key register
+	JAL	R4,GCI		:Get low byte of key
+	OR	R6,R0		:Assemble key
+	LHI	R5,NAUX	:Get number of aux devices
+PT2A	SIS	R5,1		:Decrement counter
+	JL	PTEXIT		:Ignore message if key not in table
+	CH	R6,DEVSEQ,R5,R5	:Is this it?
+	JNBS	PT2A		:No, keep trying
+
+	LCS	R0,1
+	STH	R6,DEVSEQ,R5,R5	:Remove key entry
+	LR	R12,R5		:Copy aux device number
+	AHI	R12,NTERM	:Convert to port device number
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+	LH	R0,TTPORT,R13	:Get state
+	CLHI	R0,-2		:Waiting for aux ckt?
+	JN	PTEXIT		:No, ignore msg
+        LHL     R9,PORT,,       :Get port number
+	STH	R12,PORTDF,R9,R9	:Save device number for port
+	LIS	R0,0
+	TBT	R0,TTFLAG,R13	:Check if this is an nor_cir_req ?
+	JN	PT2N1		:Yes, go to handle the sent of logon string
+	J	PTEXIT		:Done processing message
+
+PT2N1	ST	R15,RREGSV,,	:Store the link reg15
+	L	R12,TTRPTR,R13	:Get the pascal data buffer addr
+       IF      XMEMRY
+        LR      R9,R10
+        L       R10,TTRPHD,R13
+        LH      R10,XMPSET+4,R10
+        JAL     R4,XMCURR
+        LR      R10,R9
+       EI       :XMEMRY
+	LIS	R9,1		:R9 is a counter
+PT2N2	LB	R0,0,R12
+	CLHI	R0,3B		:Compare with semi_column
+	JE	SEM1
+	CLHI	R0,0D		:Compare with carrage_return
+	JE	SEM1
+	AIS	R9,1		:Incre. counter
+	AIS	R12,1		:Update buffer addr
+	J	PT2N2
+
+SEM1	L	R12,TTRPTR,R13	:Get the pascal data buffer addr
+        LHL     R1,PORT,,
+	LHI	R2,NLOGCH	:Load char B3
+SEMLOP	LIS	R0,$A 4		:4 Byte length
+        JAL     R4,SLOR,,
+	LB	R0,0,R12
+	OHI	R0,80		:Force high order bit on
+	JAL	R4,PUTCH
+	JAL	R4,ELOR
+	AIS	R12,1
+	SIS	R9,1
+	JG	SEMLOP
+	L	R15,RREGSV,,
+	J	PTEXIT
+:
+:       Circuit Build Message
+:
+PTMSG3	CLHI	R0,LOGOK	:Circuit built message?
+	JN	PTMSG4		:No, try another
+
+        LHL     R9,PORT,,       :Get port number
+	LH	R12,PORTDF,R9,R9	:Get device number
+	JL	PT3IGN		:Ignore message if port not assigned
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+	STH	R9,TTPORT,R13	:Bind port to device
+       IF       XMEMRY
+        LR      R2,R10
+        L       R10,TTRPHD,R13
+        LH      R10,XMPSET+4,R10
+        JAL     R4,XMCURR
+        LR      R10,R2
+       EI
+	LR	R2,R12		:Copy it
+	SLLS	R2,2		:Convert to fullword pointer
+	LIS	R0,0		:Get zero
+        ST      R0,TOTAB,R2,    :Clear timeout entry
+	LHI	R0,LIMITC	:Class C output threshhold
+	STH	R0,OTHRSH,R9,R9	:Put in table for port
+
+	JAL	R4,GCI		:Pass over all chars in B6
+	JAL	R4,GCI		:(B6)
+	JAL	R4,GCI		:(IIX)
+	NHI	R0,1
+	L	R4,TTRPRM,R13
+	ST	R0,STATS2,R4
+	JAL	R4,GCI		:(Invoice # - 4 bytes)
+	JAL	R4,GCI
+	JAL	R4,GCI
+	JAL	R4,GCI
+	JAL	R4,GCI		:(Orig. host - 2 bytes)
+	JAL	R4,GCI
+	J	ACTPRT		:Finish activation for port
+
+PT3IGN	LIS	R0,1		:Request had already timed out...
+        AM      R0,LATEB6,,     :Increment late 'B6' msg counter
+	AIS	R1,4		:Point at output buffer
+	LIS	R0,0		:Escape code
+	JAL	R4,WCI
+	LHI	R0,DETMSG	:Detach message
+	JAL	R4,WCI
+	SIS	R1,4		:Point back to input buffer
+	J	PTFLSH		:Flush message
+PTMSG4	CLHI	R0,LOGFAL	:Logon failure?
+	JN	PTMSG5		:No, try another
+
+        LHL     R9,PORT,,       :Get port number
+	LH	R12,PORTDF,R9,R9	:Get device #
+	JL	PT4IGN		:Ignore message if port not assigned
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+       IF       XMEMRY
+        LR      R2,R10
+        L       R10,TTRPHD,R13
+        LH      R10,XMPSET+4,R10
+        JAL     R4,XMCURR
+        LR      R10,R2
+       EI       :XMEMRY
+	LR	R2,R12		:Copy it
+	SLLS	R2,2		:Convert to fullword pointer
+	LIS	R0,0		:Get zero
+        ST      R0,TOTAB,R2,    :Clear timeout entry
+	STH	R0,TTPORT,R13	:Clear state of device
+	LCS	R2,1		:Get -1
+	STH	R2,PORTDF,R9,R9	:Unbind port
+	L	R11,TTRPRM,R13	:Get parameter block address
+	JAL	R4,GCI		:Skip escape code
+	JAL	R4,GCI		:Skip B5 code
+	JAL	R4,GCI		:Get reason
+	ST	R0,ARG2,R11	:Return in ARG2
+        IF      XTRACE
+        L       R0,TTRPHD,R13
+        JAL     R8,XMTRAC,,
+        EI
+	J	PTFAIL		:Failure return to process
+
+PT4IGN	LIS	R0,1		:Request had already timed out...
+        AM      R0,LATEB5,,     :increment late 'B5' msg counter
+	J	PTFLSH		:Flush the message
+PTMSG5	CLHI	R0,ZAPMSG	:Zapper or detach?
+	JG	PTMSG6		:No, try something else
+
+	JAL	R4,GCI		:Clear from buffer
+	JAL	R4,GCI
+        LHL     R9,PORT,,       :Get port number
+	LH	R12,PORTDF,R9,R9	:Get device #
+	JL	PTEXIT		:Ignore if device not connected
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+       
+       IF       XMEMRY
+        LR      R1,R10
+        L       R10,TTRPHD,R13
+        LH      R10,XMPSET+4,R10
+        JAL     R4,XMCURR
+        LR      R10,R1
+       EI       :XMEMRY
+	JAL	R4,ZCLEAN	:Clean up tables for port and device
+	J	PTEXIT		:Done processing msg
+
+
+
+PTMSG6	CLHI	R0,BLKMSG	:Black ball?
+	JN	PTMSG7		:No, try something else
+
+	IF	BBMSG		:Process only if we want to see them
+        LHL     R9,PORT,,       :Get port #
+	LH	R12,PORTDF,R9,R9	:Get device number for prt
+	JL	PTEXIT		:Ignore if port not assigned
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+       IF       XMEMRY
+        LR      R3,R10
+        L       R10,TTRPHD,R13
+        LH      R10,XMPSET+4,R10
+        JAL     R4,XMCURR
+        LR      R10,R3
+       EI       :XMEMRY
+	LHL	R3,BBCNTR,R9,R9	:Get number of black balls waiting
+	JNFS	PTMS61		:Skip if not first black ball
+        LHL     R0,DCT,R1,      :Get input char count (ahead of black ball)
+	STH	R0,BBCT,R9,R9	:Save # chars ahead of BB
+
+PTMS61	LIS	R0,1
+	AHM	R0,BBCNTR,R9,R9	:Increment # of black balls seen
+        AM      R0,BBTOT,,      :AND TOTAL # FOR SLOT
+	J	PTDCHK		:Go check for read on port
+	ELSE
+	J	PTEXIT		:Ignore msg
+	EI	:BBMSG
+
+
+PTMSG7	CLHI	R0,NLOGST	:Normal logon status
+	JN	PTMSG8		:No, try something else
+        LHL     R9,PORT,,
+	LH	R12,PORTDF,R9,R9	:Get device #
+	JL	PT7IGN		:Ignore if port not assigened
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+       IF       XMEMRY
+        LR      R12,R10
+        L       R10,TTRPHD,R13
+        LH      R10,XMPSET+4,R10
+        JAL     R4,XMCURR
+        LR      R10,R12
+       EI       :XMEMRY
+	L	R12,TTRPTR,R13	:Get pascal data buffer addr
+	ST	R15,RREGSV,,
+	L	R11,TTRPRM,R13	:Get pascal param. block addr
+PT7G0	JAL	R4,GCI
+	LR	R0,R0		:
+	JNBS	PT7G0		:Loop until skip the escape code
+	JAL	R4,GCI
+	LR	R0,R0
+	JE	PT7G0		:Loop until skip the B4 code
+	JAL	R4,GCI		:Get status
+	NHI	R0,$001F
+	ST	R0,ARG2,R11	:Save the B4 status in ARG1
+	CLHI	R0,0		:Continue status ?
+	JN	ZB2CIR		:Jump to zap the pseudo circuit
+
+PT7A
+	LIS	R0,1
+	RBT	R0,TTFLAG,R13	:Reset the data buffer empty flag
+	JE	PTEXIT		:Ignore if data buffer is empty
+PT7A0	LB	R0,0,R12
+	CLHI	R0,3B		:Is the semi column?
+	JE	PT7A1
+	CLHI	R0,0D		:Is the CR?
+	JE	PT7A1
+	AIS	R12,1		:Update the data buffer addr
+	J	PT7A0		:Loop until find the semi_column or CR
+PT7A1   LHL     R1,PORT,,
+	LHI	R2,NLOGCH	:Get B3
+PT7A2	LIS	R0,$A 4
+        JAL     R4,SLOR,,
+	AIS	R12,1
+	LB	R0,0,R12
+	OHI	R0,80		:Force the high order bit on
+	JAL	R4,PUTCH
+	JAL	R4,ELOR
+	CLHI	R0,08D		:Is CR?
+	JN	PT7A2
+	L	R15,RREGSV,,
+	J	PTEXIT
+
+PT7IGN	LIS	R0,1		:Request had already timed out
+        AM      R0,LATEB4,,     :Increment late 'B4' msg counter
+	J	PTFLSH		:Flush the msg
+
+PTMSG8
+	CLHI	R0,SIIX
+	JN	PTMSG9
+	LH	R12,PORTDF,R9,R9	:GET DEVICE # FOR PORT
+	JL	PTEXIT		:IGNORE IF NOT ASSIGNED
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+	LIS	R2,1
+        AHM     R2,DCT,R1,      :Increment DCT
+	J	PTDCHK		:GO HANDLE IT
+
+
+PTMSG9
+	CLHI	R0,TIIX
+	JN	PTFLSH
+	LH	R12,PORTDF,R9,R9	:GET DEVICE # FOR PORT
+	JL	PTEXIT
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+	LIS	R2,1
+        AHM     R2,DCT,R1,
+	J	PTDCHK
+:
+: Data message on port
+:	R2 = Activation character
+:
+
+PTDATA  LHL     R9,PORT,,       :Get port number
+	LH	R12,PORTDF,R9,R9	:Get device #
+	JL	PTFLSH		:Not connected to device, flush message
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry addr
+       IF       XMEMRY
+        L       R10,TTRPHD,R13  :R10 -> Process Header Record
+        LH      R10,XMPSET+4,R10        :R10 = XM Mac set
+        JAL     R4,XMCURR       :Make this Proc's Mac set current
+       EI       :XMEMRY
+	LR	R0,R0		:Was this a data activation?
+	JL	PTDCHK		:No, go try to put in Pascal buffer
+	NHI	R2,7F		:Remove parity bit from activation char
+	CLHI	R2,0D		:Carriage return?
+	JNFS	PTD1		:No, try something else
+	LIS	R0,1
+	AHM	R0,TTLNES,R13	:Increment line count
+        TBT     R9,DEM,,        :Deferred echo mode?
+	JNFS	PTD2		:Yes, echo a linefeed
+	J	PTDCHK		:Else try to put in Pascal buffer
+
+PTD1	CLHI	R2,0A		:Linefeed?
+	JN	PTD3		:No, must be an edit character.
+        TBT     R9,DEM,,        :Deferred echo mode?
+	JE	PTDCHK		:No, try to put in Pascal buffer
+
+PTD2    TBT     R9,ECHOFF,,     :Echoing off on this port?
+	JN	PTDCHK		:Yes, don't echo
+	LR	R0,R2		:Activation character (CR or LF)
+	XHI	R0,0D%0A	:Convert to the other
+	AIS	R1,4		:Point to output buffer
+	JAL	R4,WCI		:Output char
+	SIS	R1,4		:Point back to input buffer
+	J	PTDCHK		:Go try to fill Pascal buffer
+
+
+PTD3    CLB     R2,TTEDIT,R13   :Backspace character?
+	JN	PTD4		:No, try another
+        TBT     R9,ECHOFF,,     :Echoing off on this port?
+        JN      PTDCHK          :Yes, don't echo
+	LIS	R0,0		:Position of BS bit
+	TBT	R0,TTEDAK,R13	:Acknowledge BS?
+	JE	PTDCHK		:No, go try to read data
+	AIS	R1,4		:Point to output buffer
+        TBT     R9,TRMTYP,,     :Test the terminal type bit
+	JE	PTD3B		:Skip if it is hard-copy terminal
+	CLHI	R2,BACKSP	:Is backspace char?
+	JE	PTD3A		:Skip if yes
+	LHI	R0,BACKSP	:Echo backspace character
+	JAL	R4,WCI		:Send it
+PTD3A	LHI	R0,BLANK
+	JAL	R4,WCI
+	LHI	R0,BACKSP
+	J	PTD6
+PTD3B	LHI	R0,CHDEL	:Echo character delete symbol
+	J	PTD6		:Go send it
+
+PTD4	CLB	R2,TTEDIT+1,R13	:Word delete character?
+        JN      PTD5            :no, try another
+        TBT     R9,ECHOFF,,     :Echoing off on this port?
+        JN      PTDCHK          :Yes, don't echo
+	LIS	R0,1		:Position of WD bit
+	TBT	R0,TTEDAK,R13	:Acknowledge WD?
+	JE	PTDCHK		:No, go try to read data
+        TBT     R9,TRMTYP,,     :Check what type of terminal?
+	JN	PTDCHK		:Skip if CRT type
+	LHI	R0,WDDEL	:Echo word delete character
+	AIS	R1,4		:Point to output buffer
+	J	PTD6		:Go send it
+
+PTD5	CLB	R2,TTEDIT+2,R13	:Line delete char
+	JN	PTD7		:No, try another
+        TBT     R9,ECHOFF,,     :Echoing off on this port?
+        JN      PTDCHK          :Yes, don't echo
+	LIS	R0,2		:Position of LD bit
+	TBT	R0,TTEDAK,R13	:Acknowledge LD?
+	JE	PTDCHK		:No, go try to read data
+        TBT     R9,TRMTYP,,     :Check what type of terminal?
+	JNFS	PTDCHK		:Skip if CRT type
+	LIS	R0,0D		:Carriage return
+	AIS	R1,4		:Point to output buffer
+	JAL	R4,WCI		:Send it
+	LIS	R0,0A		:Linefeed
+
+PTD6	JAL	R4,WCI		:Send it
+	SIS	R1,4		:Point back to input buffer
+
+PTDCHK	JAL	R14,FILBUF	:Try to fill Pascal buffer
+	J	PTEXIT		:Done with msg
+
+PTD7
+	CLB	R2,TTEDIT+3,R13	:Line review key?
+	JN	PTMSGB		:No, must be break char. go handle it.
+	J	PTDCHK		:Go try to handle the line review
+
+:
+: Timeout on port
+:
+
+PTIMOT  LHL     R9,PORT,,       :Get port number
+	LH	R12,PORTDF,R9,R9	:Get device # for port
+	JL	PTEXIT		:Ignore if not attached
+	LHL	R13,TTENT,R12,R12	:Get TTY info block addr
+       IF       XMEMRY
+        L       R10,TTRPHD,R13  :R10 -> Process Header Record
+        LH      R10,XMPSET+4,R10        :R10 = XM Mac set
+        JAL     R4,XMCURR       :Make this Proc's Mac set current
+       EI       :XMEMRY
+	LH	R0,TTROP,R13	:Get read operation
+	JL	PTEXIT		:Ignore if no read pending
+	CLHI	R0,$A 10	:Is term_info operation
+	JN	PTIMO1
+	L	R11,TTRPRM,R13	:Get pascal param. block addr
+	LIS	R0,0
+	ST	R0,ARG1,R11
+	ST	R0,ARG2,R11
+	LHI	R0,MAXCHAR
+	STH	R0,CHRLIM,R9,R9	:Set limit
+	J	PTIMO2
+PTIMO1
+	JAL	R14,FILBUF	:Get rest of input
+	LH	R0,TTROP,R13	:Get operation
+	JL	PTEXIT		:Exit if op finished
+	LHL	R0,TTRFCT,R13	:Get # of chars in Pascal buffer
+	ST	R0,ARG2,R11	:Save in ARG2
+PTIMO2
+	LCS	R0,1	
+	STH	R0,TTROP,R13	:Clear read/term_info operation
+	LIS	R0,TIMEOU	:Timeout status
+	J	PTACT		:Go activate process
+:
+: ZAP THE PSEUDO NEEDLE CIRCUIT BECAUSE OF THE INCORRECT LOGON STRING
+:
+ZB2CIR	LIS	R0,0
+	LCS	R1,1
+	STH	R0,TTPORT,R13
+	STH	R1,PORTDF,R9,R9
+        LHL     R1,PORT,,       :Copy port #
+	JAL	R5,ZAPPRT	:Call Front.lib routine to zap
+	SLLS	R1,3		:Convert to input buffer pointer
+	JAL	R4,EMPTY	:Empty input buffer
+	L	R15,RREGSV,,
+
+:
+: Return 'failure' status to process
+:
+
+PTFAIL	LIS	R0,FAIL		:Failure status
+	JFS	PTACT		:Activate process	
+:
+: Return 'completion' status to process
+:
+
+PTCOMP	LIS	R0,COMPLE	:Complete status
+
+PTACT	L	R11,TTRPRM,R13	:Get addr of Pascal parameter block
+	STH	R0,STATUS,R11	:Save return status
+PTACT1	L	R8,TTRPHD,R13	:Get process header addr
+	JAL	R9,RDYENT	:Put process on ready queue
+	J	PTEXIT		:Return
+
+:
+: Flush the input buffer, then return
+:
+
+PTFLSH	JAL	R4,EMPTY	:Empty input buffer
+
+PTEXIT	LCS	R0,1		:Don't change timeout status
+	JR	R15		:Return to FRONT.LIB
+
+:
+: Fatal error!!!
+:
+
+PTERR	JAL	R10,CRASH,,	:Kill the slot
+	BC	0,0,0,30
+:
+: FILBUF - Routine to try to move characters from input bufferlets to the
+:		Pascal data buffer.
+:	Expects:
+:		R1 = Input buffer pointer
+:		R9 = Port number
+:		R13 = TTY table entry pointer
+:		Link on R14
+:
+
+FILBUF
+	LH	R2,TTROP,R13	:Get read operation for device
+	JLR	R14		:Return if none pending
+       IF       XMEMRY
+        LR      R11,R10
+        L       R10,TTRPHD,R13
+        LH      R10,XMPSET+4,R10
+        JAL     R4,XMCURR
+        LR      R10,R11
+       EI       :XMEMRY
+	L	R11,TTRPRM,R13	:Get Pascal parameter block address
+        TBT     R9,TBREAK,,     :Break detected on this port?
+	JN	FBBRK		:Yes, abort read operation
+	CLHI	R2,$A 10	:Is term_info operation?
+	JN	FILBU1		:Skip if not
+        LHL     R0,DCT,R1,      :Get # of data characters in bufferlets
+	ST	R0,ARG1,R11	:Return in arg1
+	LH	R0,TTLNES,R13	:Get # of lines to be read
+	ST	R0,ARG2,R11	:Return in arg2
+	LHI	R0,MAXCHAR	:
+	STH	R0,CHRLIM,R9,R9	:Set limit
+	LIS	R8,COMPLE
+	J	FBACT
+FILBU1
+
+	LR	R2,R2		:Check operation type
+	JG	FBLIN		:Jump if read line
+
+	LIS	R8,COMPLE	:Assume complete status
+	LHL	R5,TTRLFT,R13	:Get number of characters left to read
+
+	IF	BBMSG		:If we are handling black balls
+	LH	R3,BBCNTR,R9,R9	:Any black balls?
+	JLE	FBCHR		:No, normal
+	LH	R2,BBCT,R9,R9	:Get # chars ahead of BB
+	SR	R2,R5		:Subtract # chars left in request
+	STH	R2,BBCT,R9,R9	:Save new BBCT
+	JGE	FBCHR		:Finish request if possible
+	LIS	R8,TRANS	:Transmission error code
+	LIS	R3,0		:Clear char count
+	STH	R3,BBCT,R9,R9	:Save it
+	AR	R5,R2		:Shorten request to BBCT chars
+	JG	FBCHR		:Finish request if any chars
+	STH	R3,BBCNTR,R9,R9	:Otherwise clear BB count
+	ST	R3,ARG2,R11	:Returning no characters
+	J	FBACT		:Request finished
+	EI	:BBMSG
+
+FBCHR
+:	LR	R6,R5		:Assume we'll finish request
+:       CLH     R6,DCT,R1,      :Is that much in the bufferlets?
+:	CLH	R6,BCT,R1
+:	JLFS	FBCHR1		:Yes, skip
+	LHL	R6,BCT,R1	:Else use the lesser amount
+
+FBCHR1
+	L	R10,TTRPTR,R13	:Get Pascal buffer pointer
+	LHL	R7,TTRFCT,R13	:Get count of chars in buffer
+FBCHR2
+	SIS	R6,1		:Decrement counter
+	JL	FBCHR4		:Exit loop if done
+	JAL	R4,GCI		:Get character
+	LR	R0,R0		:Is escape char?
+	JN	FBCH2A		:Skip if not
+	SIS	R6,1		:Decrement counter
+	JAL	R4,GCI		:Get msg code
+	LR	R0,R0		:Is null data?
+	JE	FBCH2A		:Skip if yes
+	ST	R7,ARG2,R11	:Store # chars read in arg2
+	CLHI	R0,0BF		:Is SIIX command code?
+	JE	FBSIX		:Yes, return the startmedium status
+	CLHI	R0,0C0		:Is TIIX command code?
+	JE	FBTIX		:Yes, return end medium status
+	JAL	R10,CRASH,,	:Crash with unknown data
+	BC	0,0,4*R14,$032
+FBCH2A	LCS	R3,1
+        AHM     R3,DCT,R1,      :Decrement the data counts
+	STB	R0,0,R10	:Store in Pascal data buffer
+	NHI	R0,7F		:Strip parity
+	CLHI	R0,0D		:Carriage return?
+	JNFS	FBCHR3		:No, skip
+	LCS	R0,1		:Get a -1
+	AHM	R0,TTLNES,R13	:Decrement line count
+FBCHR3
+	AIS	R7,1		:Increment # in buffer
+	AIS	R10,1		:Increment PDB pointer
+	SIS	R5,1		:Decrement # left to completion
+	JG	FBCHR2		:Loop
+	J	FBCHR6		:Operation done
+
+FBCHR4	STH	R5,TTRLFT,R13	:Store number of chars left to be read
+	STH	R7,TTRFCT,R13	:Store number of chars read
+	ST	R10,TTRPTR,R13	:Store buffer pointer
+	LR	R5,R5		:Operation done?
+	JEFS	FBCHR6		:Yes, go finish up
+
+	CLHI	R5,MAXCHAR	:More than MAXCHAR characters left?
+	JLEFS	FBCHR5		:No, skip
+	LHI	R5,MAXCHAR	:Only get MAXCHAR at a time
+FBCHR5	STH	R5,CHRLIM,R9,R9	:Set limit
+	JR	R14		:Return
+
+FBCHR6	LHI	R5,MAXCHAR	:Finish up read char request
+	STH	R5,CHRLIM,R9,R9	:Reset input limit to MAXCHAR
+	ST	R7,ARG2,R11	:Return # chars read in ARG2
+
+	IF	BBMSG		:If handling Black Balls
+	CLHI	R8,TRANS	:Working on a black ball?
+	JN	FBACT		:No, finish request
+	LCS	R3,1		:Get -1
+	AHM	R3,BBCNTR,R9,R9	:Decrement BB count
+	JE	FBACT		:Finish request if none left
+	LIS	R3,0
+	STH	R3,BBCNTR,R9,R9	:Clear BB count
+	STH	R3,TTLNES,R13	:No lines in buffer
+	JAL	R4,EMPTY	:Remove garbage from input buffer
+	EI	:BBMSG
+
+	J	FBACT		:Go finish request
+:
+: Read line
+:
+
+FBLIN
+	IF	BBMSG		:If we are handling black balls
+	LH	R3,BBCNTR,R9,R9	:Get # of BB's
+	JLE	FBLIN1		:None, go on with request
+	LIS	R3,0
+	STH	R3,BBCNTR,R9,R9	:Clear BB count
+	STH	R3,BBCT,R9,R9	:Clear BB character count
+	STH	R3,TTLNES,R13	:Clear line count
+	STH	R3,ARG2,R11	:Return no characters
+	JAL	R4,EMPTY	:Clear input buffer
+	LIS	R8,TRANS	:Return 'Transmission error' status
+	J	FBACT		:Finish I/O operation
+	EI
+
+FBLIN1	L	R10,TTRPTR,R13	:Get Pascal buffer pointer
+	LH	R5,TTRLFT,R13	:Get # chars empty in buffer
+        LIS     R6,0
+        LHI     R7,0FFF
+        SR      R6,R7
+        CR      R5,R6           :IF IT HAS OVERREAD THAT MUCH CHARS
+        JLE     FBCOMX          :IF YES, GO TO COMPLETION ANYWAY
+	LHL	R7,TTRFCT,R13	:Get line length (so far)
+	LHL	R6,BCT,R1	:Get # chars in bufferlets
+	LB	R8,TTRMSK,R13	:Character mask
+
+FBLIN2	SIS	R6,1		:Any chars left to read?
+	JL	FBLIN5		:No, exit loop
+	JAL	R4,GCI		:Read character
+	LR	R0,R0		:Is escape char?
+	JN	FBLINA
+	SIS	R6,1		:Decrement counter
+	JAL	R4,GCI		:Get msg code
+	LR	R0,R0
+	JE	FBLINA		:Skip if data null char
+	ST	R7,ARG2,R11	:Store # chars read in arg2
+	CLHI	R0,0BF		:Is SIIX?
+	JE	FBSIX		:Go return the start_medium status
+	CLHI	R0,0C0		:Is TIIX?
+	JE	FBTIX		:Yes, go return the end_medium status
+	JAL	R10,CRASH,,	:Otherwise, crash the slot with unknown data
+	BC	0,0,4*R14,$032
+FBLINA	LCS	R3,1
+        AHM     R3,DCT,R1,
+	TBT	R0,TTBRK,R13	:Is this a special character?
+	JN	FBSPCL		:Yes, go see what kind.
+FBLIN3	SIS	R5,1		:Decrement space left
+	JLFS	FBLIN4		:Skip if buffer filled
+	NR	R0,R8		:Remove unwanted bits (if any)
+	STB	R0,0,R10	:Put character in buffer
+FBLIN4	AIS	R7,1		:Increment line length
+	AIS	R10,1		:Increment pointer (maybe beyond buffer)
+	J	FBLIN2
+
+FBLIN5	STH	R5,TTRLFT,R13	:Store number of chars left to be read
+	STH	R7,TTRFCT,R13	:Store number of chars read
+	ST	R10,TTRPTR,R13	:Store buffer pointer
+	JR	R14		:Return
+
+FBSPCL	LR	R2,R0		:Copy special character
+	NHI	R2,7F		:Remove parity bit
+	CLHI	R2,0D		:Carriage return?
+	JNFS	FBSPC2		:No, try another
+	SIS	R5,1		:Decrement space left
+	JLFS	FBCR1		:Skip if buffer filled
+	NR	R0,R8		:Remove unwanted bits (if any)
+	STB	R0,0,R10	:Put CR in buffer
+FBCR1	AIS	R7,1		:Increment line length
+	ST	R7,ARG2,R11	:Return length in ARG2
+	LCS	R0,1		:Get -1
+	AHM	R0,TTLNES,R13	:Decrement line count
+	J	FBCOMP		:Request complete
+
+FBSPC2	CLB	R2,TTEDIT,R13	:Backspace?
+	JNFS	FBSPC3		:No, try another
+	LR	R7,R7		:Anything in buffer?
+	JE	FBLIN2		:No, ignore
+	SIS	R10,1		:Decrement pointer
+	SIS	R7,1		:Decrement char count
+	AIS	R5,1		:Increment space left
+	J	FBLIN2		:Done with backspace
+
+FBSPC3	CLB	R2,TTEDIT+1,R13	:Word delete?
+	JN	FBSPC4		:No, try another
+	LR	R7,R7		:Is buffer empty?
+	JE	FBLIN2		:Yes, ignore
+	LR	R5,R5		:Is buffer full?
+	JL	FBLIN2		:Yes, ignore
+	LIS	R9,0		:R9 is a counter
+FBWD1	SIS	R10,1		:Back up a character
+	AIS	R9,1		:Increment the counter
+	AIS	R5,1		:Increment space left
+	SIS	R7,1		:Decrement char count
+	JE	FBWD4		:Stop if buffer empty
+	LB	R0,0,R10	:Get character
+	NHI	R0,7F		:Strip parity
+	CLHI	R0,20		:Space?
+	JEBS	FBWD1		:Yes, back up more
+	CLHI	R0,09		:Tab?
+	JEBS	FBWD1		:Yes, back up more
+				:Else must be end of word
+FBWD2	SIS	R10,1		:Back up a character
+	AIS	R9,1		:Increment the counter
+	AIS	R5,1		:Increment space left
+	SIS	R7,1		:Decrement char count
+	JE	FBWD4		:Stop if buffer empty
+	LB	R0,0,R10	:Get character
+	NHI	R0,7F		:Strip parity
+	CLHI	R0,20		:Space?
+	JEFS	FBWD3		:Yes, done backspacing
+	CLHI	R0,09		:Tab?
+	JNBS	FBWD2		:No, back up more
+				:Else must be start of word
+FBWD3	AIS	R10,1		:Put the space or tab back
+	SIS	R9,1
+	AIS	R7,1
+	SIS	R5,1
+
+FBWD4   LHL     R4,PORT,,
+        TBT     R4,TRMTYP,,     :Check what kind of terminal type
+        JE      FBWD8           :Skip if hard copy type
+	AIS	R1,4		:Point to output buffer
+        ST      R9,REGSAV,,
+FBWD5	LHI	R0,BACKSP
+	JAL	R4,WCI
+	SIS	R9,1
+	JNBS	FBWD5		:Back up # of chars
+        L       R9,REGSAV,,
+FBWD6	LHI	R0,BLANK
+	JAL	R4,WCI
+	SIS	R9,1
+	JNBS	FBWD6		:Rub out # of chars
+        L       R9,REGSAV,,
+FBWD7	LHI	R0,BACKSP
+	JAL	R4,WCI
+	SIS	R9,1
+	JNBS	FBWD7		:Back up # of chars
+	SIS	R1,4		:Point to input buffer
+FBWD8   LHL     R9,PORT,,       :Restore R9 = port
+	J	FBLIN2		:Done with CRT type's word delete
+FBSPC4	CLB	R2,TTEDIT+2,R13	:Line delete?
+	JN	FBSPC5		:No, try another
+	SR	R10,R7		:Back to beginning of buffer
+	AR	R5,R7		:All the space is left
+        TBT     R9,TRMTYP,,     :Check what kind of terminal
+	JN	FBLD1		:Skip if it is CRT type
+	LIS	R7,0		:None filled
+	J	FBLIN2		:Done processing hard-copy line delete
+
+FBLD1	LR	R7,R7		:Is buffer empty?
+	JE	FBLIN2		:Yes, ignore
+	AIS	R1,4		:Point to output buffer
+        ST      R7,REGSAV,,
+FBLD0   LHI     R0,BACKSP
+        JAL     R4,WCI
+        SIS     R7,1
+        JNBS    FBLD0
+        L       R7,REGSAV,,
+FBLD2	LHI	R0,BLANK	:Echo blank
+	JAL	R4,WCI
+	SIS	R7,1
+	JGBS	FBLD2		:Back up # of length of blanks
+        L       R7,REGSAV,,
+FBLD3   LHI     R0,BACKSP
+        JAL     R4,WCI
+        SIS     R7,1
+        JGBS    FBLD3
+	SIS	R1,4		:Point to input buffer
+	J	FBLIN2		:Done processing CRT type line delete
+
+FBSPC5
+	CLB	R2,TTEDIT+3,R13	:Line review key?
+	JN	FBLIN3		:No, must be a linefeed--put in buffer
+        LHL     R9,PORT,,
+        TBT     R9,TOISIS,,     :Port backpressured?
+        JE      FBLIN2          :Yes, ignore
+        LHL     R0,REBL         :Reserve bufferlet pool in use?
+        JE      FBLIN2          :Yes,ignore
+	AIS	R1,4		:Point to output buffer
+        LHL     R4,OTHRSH,R9,R9 :Output threshhold for port
+        SH      R4,BCT,R1       :# of chars which will fit
+        JLE     FBREV4          :None will, ignore
+	LIS	R0,0D		:Echo carriage return
+	JAL	R4,WCI,,
+	LIS	R0,0A
+	JAL	R4,WCI,,		:Echo linefeed
+	LR	R7,R7		:Is buffer empty?
+	JE	FBREV4		:Yes, ignore
+	LR	R9,R10		:Copy pascal data buffer pointer to R9
+	LR	R4,R7		:Copy linelength to R4
+FBREV1	SIS	R9,1		:Decrement buffer pointer
+	SIS	R4,1		:Decrement linelength
+	JNBS	FBREV1		:Loop till the start of word
+        ST      R7,REGSAV,,
+        LR      R5,R5           :Is buffer full?
+        JGEFS   FBREV2          :No, skip to use actual R7
+        L       R7,ARG1,R11     :Buffer full, so use real linelength
+FBREV2	LB	R0,0,R9		:Get content of data buffer
+        JNFS    FBREV3          :Skip if not null
+        JAL     R4,WCI,,        :Escape nulls
+FBREV3  JAL     R4,WCI,,        :Output data character
+	AIS	R9,1		:Increment data buffer pointer
+	SIS	R7,1		:Decrement linelength
+	JGBS	FBREV2
+        L       R7,REGSAV,,
+FBREV4  SIS     R1,4            :Back to input buffer
+        LHL     R9,PORT,,       :Restore R9 = port
+	J	FBLIN2		:Done processing line review
+:
+: Return 'Break' status to the calling program
+:
+
+FBBRK	LIS	R8,BKSTAT	:Break status
+	J	FBACT		:Reactivate caller
+
+
+:
+:  Return 'STARTMEDIUM' status to calling process
+:
+
+FBSIX	LIS	R8,STARTM
+	JFS	FBTI1
+
+:
+:  Return 'ENDMEDIUM' status to caling process
+:
+
+FBTIX	LIS	R8,ENDM
+FBTI1
+	LCS	R3,1
+        AHM     R3,DCT,R1,      :Decrement DCT counter
+	J	FBACT
+
+:
+: Return 'Complete' status to the calling program
+:
+
+FBCOMX  LHL     R7,TTRFCT,R13
+        ST      R7,ARG2,R11
+        LCS     R0,1
+        AHM     R0,TTLNES,R13
+FBCOMP	LIS	R8,COMPLE
+
+FBACT	STH	R8,STATUS,R11	:Save return status
+	LIS	R0,0
+	JAL	R4,PTTOUT	:Cancel any timeouts
+	LCS	R0,1		:Get -1
+	STH	R0,TTROP,R13	:Set no read operation pending
+	L	R8,TTRPHD,R13	:Get header of calling process
+	JAL	R9,RDYENT	:Put in ready queue
+	JR	R14		:Return	
+:
+: OUTCHK - See if there is any output ready to be sent
+:
+
+OUTCHK  ST      R0,OCRET,,      :Save return address
+	LHI	R6,(NTGRP-1)*2	:Last HW in output request bit array
+	LHI	R7,(NTGRP-1)*10	:Device # of leftmost bit
+OUTCH1  LHL     R11,OUTREQ,R6,  :Get halfword of bit array
+OUTCH2	JFFOH	R11,CHKDEV	:See if bit set
+	SHI	R7,10		:Decrement device #
+	SIS	R6,2		:Decrement bit array pointer
+	JGEBS	OUTCH1		:Loop until all checked
+        L       R0,OCRET,,      :R0 -> return
+	JR	R0		:Return
+
+CHKDEV  STH     R11,OTCHW,,     :Save current halfword
+        RBT     R12,OTCHW,,     :Clear this bit
+	AR	R12,R7		:Compute device number
+	LHL	R13,TTENT,R12,R12	:Get TTY table entry for device
+       IF       XMEMRY
+        L       R10,TTWPHD,R13  :R10 -> Process Header Record
+        LH      R10,XMPSET+4,R10        :R10 = XM Mac set
+        JAL     R4,XMCURR       :Make this Proc's Mac set current
+       EI       :XMEMRY
+	LHL	R9,TTPORT,R13	:Get port for device
+	JLE	OTFAIL		:Failure if port not active
+	L	R0,TTWTIM,R13	:Get timeout time
+	JLEFS	CHKDV0		:Skip if not set
+	CL	R0,SLOWC,,	:Time up?
+	JLE	OTTOUT		:Yes, give up on send
+
+CHKDV0  TBT     R9,TFLSHO,,     :Flushing output?
+	JN	OTBRK		:Yes, return 'breakey' status
+        TBT     R9,TOISIS,,     :Port backpressured?
+	JE	OTCONT		:Yes, don't send yet
+        ST      R6,R6SAV,,      :Save bit array pointer
+	LR	R1,R9		:Copy port number
+        SLLS    R1,3            :Make input buffer index
+        AIS     R1,4            :Output buffer index
+        STH     R1,XBUFR,,      :Save it
+        LHL     R5,BCT,R1       :Check for empty buffer
+        JE      CHKDVA          :If empty, do the send operation now
+XOUT2   JAL     R4,GCI,,        :Peek at next char
+        LR      R5,R0           :
+        JNFS    XOUT3           :Skip if not an escape
+        JAL     R4,GCI,,        :Else get escaped char
+        LR      R5,R0           :Save copy
+        JN      XOUT7           :Skip if not a "0"
+XOUT3   LR      R1,R9           :Copy port number
+        LB      R6,XLIMIT,R1,   :Limit of chars we can send at once
+        LHI     R0,3,R6         :How big the record will be
+        JAL     R4,SLOR,,       :Start logical output record
+        LR      R0,R5           :Send first char
+XOUT4   JAL     R4,PUTCH,,      :Send char
+        LHL     R1,XBUFR,,      :Get any further chars from buffer
+        SIS     R6,1
+        JGFS    XOUT6           :Don't make message too big
+XOUT5   JAL     R4,ELODR,,      :Big enough...stop now
+        L       R6,R6SAV,,      :Restore bit array pointer
+        LHL     R1,XBUFR,,      :Get buffer number
+        J       XOUT10
+XOUT6   LHL     R0,BCT,R1       :Check state of buffer
+        JLEBS   XOUT5           :Quit now if buffer is empty
+        JAL     R4,GCI,,        :OK...look at next char
+        LR      R5,R0
+        JN      XOUT4           :Not Escaped, so send it now
+        JAL     R4,GCI,,        :Escaped...look at next char
+        LR      R5,R0           :Copy it
+        JE      XOUT4           :Pass if data
+        JAL     R4,ELODR,,      :End logical output data record
+
+:       WE GOT A CONTROL MESSAGE
+XOUT7   LB      R6,LENGTH,R5    :Copy it
+        LHI     R0,2,R6         :...to the ISIS buffer too
+        LR      R1,R9           :Copy port number
+        LR      R2,R5
+        JAL     R4,SLOR,,
+        LHL     R1,XBUFR,,      :Get any subsequent chars from buffer
+XOUT8   SIS     R6,1            :Copy the whole message
+        JLEFS   XOUT9           :No more...skip
+        JAL     R4,GCI,,          :Copy another char of message
+        JAL     R4,PUTCH,,
+        JBS     XOUT8           :And go back for more
+XOUT9   JAL     R4,ELOR,,       :End logical output record
+        L       R6,R6SAV,,      :Restore bit array pointer
+        SHI     R5,DETMSG       :Check if circuit zapper
+        JLFS    XOUT10          :Skip if not
+        SIS     R5,ZAPMSG-DETMSG
+        JGFS    XOUT10
+        LR      R5,R9           :Yes, get port number
+  IF    WAITZA
+        SBT     R5,WTZA,,       :Remember to clean up when zapack comes
+  ELSE
+        RBT     R5,ACP,,        :Clean up now
+        RBT     R5,DEM,,
+        RBT     R5,OUTCRT,,
+        RBT     R5,GBALL,,
+       
+  EI
+        J       OTCONT          :Repeat for next port
+
+XOUT10  LHL     R0,BCT,R1       :Check for empty buffer
+        JN      XOUT11          :
+        LR      R1,R9
+        RBT     R1,GBALL,,
+        JE      XOUT12          :
+        LIS     R0,3
+        LHI     R2,GBMSG
+        JAL     R4,SLOR,,
+        JAL     R4,ELOR,,
+        J       XOUT12
+XOUT11  TBT     R9,TOISIS,,     :
+        JE      OTCONT          :
+        J       XOUT2           :
+XOUT12  TBT     R9,TOISIS,,     :
+        JE      OTCONT          :
+
+CHKDVA  LHL     R5,OTHRSH,R9,R9 :Output threshhold for port
+	L	R10,TTWPTR,R13	:Pascal data buffer pointer
+	LHL	R8,TTWLFT,R13	:# of chars left to be sent
+        LR      R1,R9
+        LB      R6,XLIMIT,R9,   :Limit of chars we can send at once
+        LHI     R0,3,R6         :How big the record will be
+        JAL     R4,SLOR,,       :Start logical output record
+CHKDV1	SIS	R5,1		:Decrement # chars which fit
+	JLFS	CHKDV2		:Exit loop if threshhold reached
+        SIS     R6,1
+        JLFS    CHKDV2          :Record big enough...stop now
+	SIS	R8,1		:Decrement # chars left
+	JLFS	CHKDV2		:Exit loop if done sending
+	LB	R0,0,R10	:Get char to send
+        JAL     R4,PUTCH,,      :Send it
+	AIS	R10,1		:Increment pointer
+	JBS	CHKDV1		:Loop
+CHKDV2  JAL     R4,ELODR,,      :End of logical data record
+        L       R6,R6SAV,,      :Restore R6
+CHKDV3	ST	R10,TTWPTR,R13	:Save new pointer
+	STH	R8,TTWLFT,R13	:Save # left to send
+	LR	R8,R8		:Request complete?
+	JLE	OTCOMP		:Yes, return 'complete' status
+
+OTCONT  LHL     R11,OTCHW,,     :R11 = current bit array HW
+	J	OUTCH2		:Loop
+:
+: Output request finished
+:
+
+OTBRK	LIS	R0,BKSTAT	:Get 'Breakey' status
+	JFS	OTACT		:Finish request
+
+OTFAIL	LIS	R0,FAIL		:Get 'Failure' status
+        IF      XTRACE
+        L       R0,TTWPHD,R13
+        L       R11,TTWPRM,R13
+        JAL     R8,XMTRAC,,
+        LIS     R0,FAIL
+        EI      :XTRACE
+	JFS	OTACT		:Finish request
+
+OTTOUT	LIS	R0,TIMEOU	:Get 'Timeout' status
+	JFS	OTACT		:Finish request
+
+OTCOMP	LIS	R0,COMPLE	:Get 'Complete' status
+
+OTACT	L	R11,TTWPRM,R13	:Get parameter block address
+	STH	R0,STATUS,R11	:Save return status
+        RBT     R12,OUTREQ,,    :Clear request bit for device
+	L	R8,TTWPHD,R13	:Get process header addr
+	LR	R1,R6		:Save counters
+	LR	R2,R7		:  (R6, R7 destroyed by RDYENT)
+	JAL	R9,RDYENT	:Enter process in ready queue
+	LR	R6,R1		:Restore counters
+	LR	R7,R2		:  (destroyed by RDYENT)
+	J	OTCONT		:Continue searching
+:
+: ZCLEAN - Clean up after a zapper (incoming or outgoing)
+:	Link on R4
+:
+
+ZCLEAN	LIS	R0,0
+	LCS	R1,1
+        TBT     R9,SYSCON,,     :Test if the console bit on?
+	JE	ZCLN2		:No, skip
+        RBT     R9,SYSCON,,     :Else clear console bit
+
+ZCLN2	STH	R0,TTPORT,R13	:Clear device state
+	STH	R1,PORTDF,R9,R9	:Unbind device from port
+
+	LH	R2,TTROP,R13	:Get pending read operation
+	JLR	R4		:Return if none
+	STH	R1,TTROP,R13	:Clear pending request
+       IF       XMEMRY
+        LR      R0,R4
+        LR      R11,R10
+        L       R10,TTRPHD,R13
+        LH      R10,XMPSET+4,R10
+        JAL     R4,XMCURR
+        LR      R4,R0
+        LR      R10,R11
+       EI       :XMEMRY
+	L	R11,TTRPRM,R13	:Get read parameter address
+	LHI	R0,MAXCHAR
+	STH	R0,CHRLIM,R9,R9	:Reset input limit to MAXCHAR
+        IF      XTRACE
+        L       R0,TTRPHD,R13
+        JAL     R8,XMTRAC,,
+        EI      :XTRACE
+        LIS     R0,FAIL         :'FAILURE' CODE
+	STH	R0,STATUS,R11	:Return to process
+	L	R8,TTRPHD,R13	:Process header
+	LR	R0,R4		:Save return address
+	LR	R3,R9		:Save port #
+	JAL	R9,RDYENT	:Reactivate process
+	LR	R9,R3		:Restore R9
+	JR	R0		:Return
+:
+: SETEDI - Set editing character
+:	Link on R4
+:	Expects:
+:		R1 = Index of char to change (0, 1, 2, or 3)
+:		R2 = Address of edit char table to change
+:		R3 = Address of break table
+:		R5 = Address of acknowledgment bit table
+:		R10 = Address of Pascal data buffer
+:		R11 = Address of Pascal parameter block
+:
+
+SETEDI	LB	R0,0,R2,R1	:Get old editing char
+	RBT	R0,0,R3		:Clear char in break table
+	RBT	R0,10,R3	:Clear char with parity in break table
+	LB	R0,0,R10	:Get new editing char
+	NHI	R0,7F		:Strip parity
+	STB	R0,0,R2,R1	:Put in port control char table
+	SBT	R0,0,R3		:Break on this char
+	SBT	R0,10,R3	:Break on this char with parity
+	L	R3,ARG2,R11	:Get ARG2
+	JEFS	STEDNK		:No acknowledgment if = 0
+	JGFS	STEDAK		:Acknowlege if > 0
+	CLHI	R0,20		:Else is char printable?
+	JGEFS	STEDNK		:Don't ack if so
+
+STEDAK	SBT	R1,0,R5		:Set to acknowledge char
+	JR	R4		:Return
+
+STEDNK	RBT	R1,0,R5		:Set not to acknowledge char
+	JR	R4		:Return
+:
+: ACTOUT - Needle and Aux Circuit request timeout checker
+:	Link on R0
+:
+
+ACTOUT	LHI	R1,4*(NTERM+NAUX)	:Index after last entry
+ACLOOP	SIS	R1,4		:Decrement
+	JLR	R0		:Return if done
+        L       R3,TOTAB,R1,    :R3 = timeout entry
+	JLEBS	ACLOOP		:Loop if entry not set
+	CL	R3,SLOWC,,	:Compare with current time
+	JGBS	ACLOOP		:Loop if before wakeup time
+
+	LIS	R2,0		:Get a zero
+        ST      R2,TOTAB,R1,    :Clear timeout entry
+	LR	R5,R1		:Copy index
+	SRLS	R5,2		:Convert to internal device #
+	LR	R12,R5		:Copy it
+	LHL	R13,TTENT,R12,R12	:Get TTY info table entry addr
+       IF       XMEMRY
+        L       R10,TTRPHD,R13  :R10 -> Process Header Record
+        LH      R10,XMPSET+4,R10        :R10 = XM Mac set
+        JAL     R4,XMCURR       :Make this Proc's Mac set current
+       EI       :XMEMRY
+	LH	R9,TTPORT,R13	:Get port # or state
+	CLHI	R9,-2		:Circuit building state?
+	JE	ACTO1
+	CLHI	R9,-1		:NEEDLE REQUEST STATE
+	JN	ACLOOP		:NO, IGNORE
+	L	R11,TTRPRM,R13	:Get pascal parameter addr
+	LIS	R4,TIMEOU	:'TIMEOUT' return code
+	J	ACTO11
+ACTO1	LHI	R5,-NTERM,R12	:GET DEVICE #
+	LCS	R3,1		:Get -1
+	STH	R3,DEVSEQ,R5,R5	:Clear sequence number
+	L	R11,TTRPRM,R13	:Get Pascal parameter addr
+	LIS	R4,TIMAUX	:Timeout error code
+	ST	R4,ARG2,R11	:Return in ARG2
+        IF      XTRACE
+        LR      R4,R0
+        L       R0,TTRPHD,R13
+        JAL     R8,XMTRAC,,
+        LR      R0,R4
+        EI
+        LIS     R4,FAIL         :'FAILURE' RETURN CODE
+ACTO11	STH	R4,STATUS,R11	:Put in parameter block
+
+	LHI	R6,2*NPORT-2	:Index to last PORTDF entry
+ACTO2   CLH     R12,PORTDF,R6,  :Is port bound to this dev?
+	JEFS	ACTO3		:Yes, exit loop
+	SIS	R6,2		:Decrement counter
+	JGBS	ACTO2		:Loop through all ports
+	JFS	ACTO4		:Skip if done
+
+ACTO3   STH     R3,PORTDF,R6,   :Unbind port
+ACTO4	STH	R2,TTPORT,R13	:Clear device state
+	L	R8,TTRPHD,R13	:Get process header addr
+	JAL	R9,RDYENT	:Put process in ready queue
+	J	ACLOOP		:Rejoin loop
+:
+: REPPRT - Send port availability message to port 0
+:	Gets port count from PORTCT
+:	Link on R5
+:	Destroys registers R1 - R4, R14, R15
+:
+
+REPPRT	LIS	R0,$A 10	:10 byte message
+	LIS	R1,0		:Send to port 0
+	LIS	R2,0A		:Report port availability msg
+        JAL     R4,SLOR,,       :Send msg to ring
+	LIS	R0,0		:Key
+	JAL	R4,PUTCH,,
+	LHI	R0,HOST0	:Host number
+	JAL	R4,PUTH,,
+        LHL     R0,PORTCT,,     :R0 = number of free ports
+	JAL	R4,PUTH,,
+	LIS	R0,0		:Relative host #0
+	JAL	R4,PUTH,,
+	JAL	R4,ELOR,,		:End msg
+	JR	R5		:Return
+:
+: CONMSG - Print console message
+:
+:	Used by other Nucleus modules for error reporting.
+:	Expects:
+:		R3 = Message address
+:		Link on R6
+:
+:	Message must be in SC format.
+:
+
+CONMSG  ST      R7,REGSAV,,
+        ST      R3,MSGADR,,
+	LHI	R7,(NGRP-1)*2
+CONMS0  LHL     R1,SYSCON,R7,   :R1 -> console port bit array
+	JE	CONMS3
+        STH     R1,SYSREQ,R7,   :Save bit array
+CONMS1  LHL     R1,SYSREQ,R7,   :Get processed bit array
+	JFFO	R1,CONMS2	:Jump if any requests left to look at
+	J	CONMS3
+CONMS2	SHI	R2,10
+        RBT     R2,SYSREQ,R7,   :Clear bit for this system console port
+        TBT     R2,ACP,R7,      :Port active ?
+	JE	CONMS1		:Loop if port is not active
+	SLLS	R7,3
+	AR	R2,R7		:GET PORT #
+	SRLS	R7,3
+	JAL	R5,OCS,,		:Send msg to console port
+        L       R3,MSGADR,,
+	J	CONMS1		:LOOP
+CONMS3	SIS	R7,2
+	JGE	CONMS0
+        L       R7,REGSAV,,
+	JR	R6
+:
+: TINIT - Initialize the port I/O driver
+:	Link on R2
+:
+
+TINIT   ST      R2,TIRET,,      :Save return address
+	LHI	R1,NTERM+NAUX-1	:Number of devices
+	LA	R3,TTYTBL+(NTERM+NAUX-1)*TTSIZE,,
+				:Address of TTY info table end
+	LIS	R0,0		:Get 0
+	LCS	R4,1		:Get -1
+
+TINIT1	STH	R3,TTENT,R1,R1	:Save TTY table address
+	STH	R0,TTPORT,R3	:Set port to zero (unused)
+	STH	R4,TTROP,R3	:Set no read operation pending
+	STB	R0,TTFLAG,R3	:Init. set to aux req. & data buffer empty
+        RBT     R1,OUTREQ,,     :Set no send operation pending
+	STH	R0,TTWLFT,R3	:Set no characters to send
+	SHI	R3,TTSIZE	:Point at previous entry
+	SIS	R1,1		:Decrement device counter
+	JGE	TINIT1		:Loop for all devices
+
+	LHI	R1,NPORT-1	:Port # of last port
+	LHI	R2,(FISIS-FLAGS)*8+NPORT-1	:FISIS bit index
+	LHI	R3,(TISIS-FLAGS)*8+NPORT-1	:TISIS bit index
+	LHI	R5,(NBUF-2)*4	:Index into BF
+	LA	R6,PTPROC	:Address of port activation routine
+	LA	R7,MSGTAB	:Address of message break array
+	LHI	R8,(NPORT-1)*4	:Index to port word tables
+
+TINIT2	STH	R4,PORTDF,R1,R1	:Port not connected
+	ST	R2,BF,R5	:Set input BF for port
+	ST	R3,BF+4,R5	:Set output BF for port
+        ST      R6,PROCESS,R8,  :Set activation routine
+        ST      R7,MBREAK,R8,   :Set message break table
+        ST      R0,BREAK,R8,    :USE DEFAULT CHAR BREAK TABLE (FOR NOW)
+        RBT     R1,SYSCON,,     :Set no system console
+        RBT     R1,TRMTYP,,     :Set to hard-copy type of terminal
+	SIS	R8,4		:Decrement word index
+	SIS	R5,8		:Decrement BF index
+	SIS	R3,1		:Decrement TISIS index
+	SIS	R2,1		:Decrement FISIS index
+	SIS	R1,1		:Decrement port counter
+	JGE	TINIT2		:Loop for all ports (even port 0)
+
+	IF	NAUX
+	LHI	R1,(NAUX-1)*2	:2 * last aux ckt #
+TINIT3  STH     R4,DEVSEQ,R1,   :Set invalid sequence #
+	:ST	R0,TOTAB,R1,R1	:Set no timeout
+	SIS	R1,2		:Previous device
+	JGEBS	TINIT3
+	EI
+
+	LHI	R1,(NTERM+NAUX-1)*2
+TINI3A	ST	R0,TOTAB,R1,R1	:Set no timeout
+	SIS	R1,2
+	JGEBS	TINI3A
+
+
+	LA	R6,P0PROC	:Port 0 msg handler
+        ST      R6,PROCESS,,    :Set as port 0 activation routine
+        STH     R0,ACSEQ,,      :Initialize AC sequence number
+	LI	R1,08171112	:ASCII ^H, ^W, ^Q, ^R (edit chars)
+        ST      R1,DEFEDI,,     :Put in default edit char table
+	LHI	R1,0E0		:Acknowledge all three chars
+        STB     R1,DEFACK,,
+	LI	R1,00A46100	:Bit table for CR,LF,^H,^Q,^W,^R
+        ST      R1,DEFBRK,,     :Put in default break table
+        ST      R1,DEFBRK+10,,  :Ditto for chars with parity
+        ST      R0,DEFBRK+4,,   :Zero out the rest
+        ST      R0,DEFBRK+8,,
+        ST      R0,DEFBRK+0C,,
+        ST      R0,DEFBRK+14,,
+        ST      R0,DEFBRK+18,,
+        ST      R0,DEFBRK+1C,,
+	
+	JAL	R5,IZBF,,		:Initialize bufferlet library
+	JAL	R0,IZFRONT	:Initialize FRONT.LIB
+	LIS	R0,TRMDEV	:Terminal device #
+	SBT	R0,DVREQ,,	:Tell NUCIO we want to be polled
+
+TINIT4	LHI	R6,HIQ0
+	SLHLS	R6,7
+	LHI	R7,HID0
+	L	R0,GMT,,	:Get GMT clock
+	JG	TINIT5		:Jump if valid
+	LIS	R5,SHUT		:Set host "Shut"
+	SETHST(R5,R6,R7)
+	SVC	DISMISS,5	:Wait 5 seconds
+	LIS	R5,DOWN		:Set host "Down"
+	SETHST(R5,R6,R7)
+	SVC	DISMISS,$A 10	:Wait 10 seconds
+	J	TINIT4		:Try the clock again
+
+TINIT5	LIS	R5,HSTATE	:Set initial host state
+	SETHST(R5,R6,R7)
+	LIS	R0,0
+        STH     R0,PORTCT,,     :Start with no available ports
+	JAL	R5,REPPRT	:Report this to the network
+        L       R2,TIRET,,      :R2 -> return
+	JR	R2		:Return
+
+         
+        IF      XTRACE
+XMTRAC  ST      R3,XR3SAV,,
+        ST      R4,XR4SAV,,
+        LHL     R3,XTRCPT,,
+        ST      R8,XTRCTB,R3,
+        ST      R11,XTRCTB+4,R3,
+        STH     R0,XTRCTB+8,R3,
+        LR      R4,R0
+        LH      R0,XMPSET+4,R4
+        STH     R0,XTRCTB+0A,R3,
+        LH      R0,XMPCUR,,
+        STH     R0,XTRCTB,R3,       : CURRENT MAC NUMBER
+        L       R0,PRSPSW-HEAD0+4,R4
+        ST      R0,XTRCTB+0C,R3,
+        AHI     R3,10
+        NHI     R3,0FFF
+        STH     R3,XTRCPT,,
+        L       R3,XR3SAV,,
+        L       R4,XR4SAV,,
+        JR      R8
+        EI      :XTRACE
+:
+: Entry point definitions for NUCIO
+:
+
+	GL	STRT|TRMDEV|,COMP|TRMDEV|,INIT|TRMDEV|,DPRI|TRMDEV|
+	GL	STRT|AUXDEV|,DPRI|AUXDEV|
+
+
+STRT|TRMDEV|	EQ	TSTART		:Start terminal requests
+STRT|AUXDEV|	EQ	TSTART		:Start aux requests
+COMP|TRMDEV|	EQ	TCHECK		:Check completion
+INIT|TRMDEV|	EQ	TINIT		:Initialize driver
+
+DPRI|TRMDEV|	EQ	TRMPRI		:Priority
+DPRI|AUXDEV|	EQ	AUXPRI
+
+	EM
+ X ^¯
