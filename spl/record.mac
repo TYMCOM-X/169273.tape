@@ -1,0 +1,506 @@
+title	RECORD - record terminal output in file
+debug==	0			;=1 to trace special interrupts
+minver==14			;version rh
+majver==0			;version lh
+
+;0.13 WRS 17-Mar-86
+;0.14 JMS 18-Nov-86 Output name of log file when done
+
+;;twoseg
+;;reloc	400000
+loc	137
+xwd	majver,minver
+reloc
+
+X==	0			;be careful - for null job
+P==	1			;stack pointer
+A==	2			;for interrupt routines
+B==	3
+C==	4
+D==	5
+TC==	6			;TTY character
+PC==	7			;PTY character
+T1==	10			;for TTY character interrupts
+T2==	11
+T3==	12
+T4==	13
+P1==	14			;for PTY character interrupts
+P2==	15
+P3==	16
+P4==	17
+
+if2 <ifn DEBUG,<printx [debug switch enabled]>>
+;;	CALLI's
+opdef	CREPTY	[CALLI -141]	;create PTY
+    CPNPT%==1			;PTY capacity exceeded
+opdef	RETACH	[CALLI -135]	;reattach a port to another frame
+opdef	VPEEK	[CALLI -136]	;peek at virtual address
+
+;;	interrupt causes
+.IACHR==1			;character received
+.IAORG==6			;orange ball received
+.IAZAP==7			;circuit zapper received
+.IAYEL==11			;yellow ball received
+.IAGOB==12			;character gobbler received
+.IATCC==13			;terminal characteristic changed in PTY
+.IANTQ==13			;notice to quit
+
+;;	auxcal function codes
+.AXI8S==1			;input image character and skip
+.AXO8==	3			;output image character
+.AXCBI==6			;clear input buffer
+.AXCBO==7			;clear output buffer (send gobbler)
+.AXLDE==11			;leave deffered echo
+.AXSYB==12			;send yellow ball
+.AXCFS==64			;change file status bits for port
+.AXSOB==70			;send orange ball
+.AXTCN==73			;read/set term char by number
+.AXTCP==74			;read changed term char from PTY
+.AXOSF==76			;output string as will fit
+
+;;	frmop function codes
+.FOCFM==1			;create frame
+    CF.FCE==1			;frame capacity exceeded
+
+;;	gettab table numbers
+.GTLOG==-24			;LDBLOG(U)
+.GTLIC==-20			;JBTLIC(J)
+.GTPRV==6			;JBTPRV(J)
+.GTTTY==10			;TTYTAB(J)
+.GTSLF==23			;NUMTAB(I)
+
+;;	fatal error message macro
+define	fatal (M)	<
+	jrst	[reset
+		outstr [asciz "M"]
+		exit
+		]	>
+
+;;	debug error message macro
+ifn	debug,<define	bug (M)	<outstr [asciz "[M]"]>>
+ife	debug,<define	bug (M)	<;>>
+
+subttl	create frame and PTYs
+;	* initialize the stack
+;	* create PTY
+;	* create frame
+;	* set frame license
+;	* initialize PTY terminal characteristics
+;	* set mode on our end of PTY
+;	* attach PTY to frame
+;	* set mode on command port
+;	* set logout on disconnect
+
+array	PDL[40]			;stack
+
+START:	MOVE	P,[iowd 40,PDL]	;init stack pointer
+
+	PUSHJ	P,LOGOPN	;open log file
+
+	SETZ	T1,		;create PTY pair
+	CREPTY	T1,
+	 JRST	[CAIN	T1,CPNPT%
+		  fatal	<?PTY capacity exceeded>
+		fatal	<?error creating PTYs>
+		]
+	MOVEM	T1,PP#		;PTY port #
+	SETOM	TT#		;TTY port #
+
+	MOVSI	T1,.FOCFM	;create frame with default parameters
+	FRMOP	T1,[0]
+	 JRST	[CAIN	T1,CF.FCE
+		  fatal	<?frame capacity exceeded>
+		fatal	<?error creating frame>
+		]
+	MOVEM	T1,FD#
+	
+	HRROI	T1,.GTLIC	;copy frame license
+	GETTAB	T1,		;get our license
+	 JRST	LICDON
+	MOVE	T2,[.GTLIC,,.GTSLF]
+	GETTAB	T2,		;get address of JBTLIC
+	 JRST	LICDON
+	MOVE	T3,FD		;get child frame number
+	ANDI	T3,7777		;mask off abs frame number
+	ADD	T2,T3		;T2/ JBTLIC+(frame#)
+	TLO	T2,(1B0)	;virtual memory reference
+	MOVEI	T3,T1		;arg block at T1
+	POKE	T3,
+	 JRST	LICDON
+	bug <LIC>
+	SKIPA
+LICDON:	 OUTSTR [asciz "[JBTLIC not patched]
+"]
+	;; here set LDBLOG on PTY's LDB
+	MOVE	A,[.GTLOG,,.GTSLF]
+	GETTAB	A,
+	 JRST	NOLOG
+	HRRZM	A,B		;(B)=GETLOG temporarily
+	HRLI	A,(1b0)
+	VPEEK	A,
+	 JRST	NOLOG
+	HLRZ	T1,A
+	CAIE	T1,(PUSHJ 1,)
+	 fatal	<?GETLOG not a PUSHJ P,>
+	ADDI	A,4		;offset into LINCHK of LINTAB
+	HRLI	A,(1b0)
+	VPEEK	A,
+	 JRST	NOLOG
+	HLRZ	T1,A
+	CAIE	T1,(<SKIPA 5,(5)>)
+	 fatal	<?CHKLIN+4 not a SKIPA U,(U)>
+	HRRZM	A,C		;(C)=LINTAB
+	ADDI	B,2		;offset from GETLOG of LDBLOG
+	HRLI	B,(1b0)
+	VPEEK	B,
+	 JRST	NOLOG
+	HLRZ	T1,B
+	CAIE	T1,(<SKIPA 6,(5)>)
+	 fatal	<?GETLOG+2 not a SKIPA T1,(U)>
+	HRRZM	B,B		;(B)=LDBLOG
+	HRRZ	T1,PP		;port number
+	ADD	T1,C		;+LINTAB
+	HRLI	T1,(1b0)
+	VPEEK	T1,
+	 JRST	NOLOG
+	TLNE	T1,-1
+	 fatal	<?left half of LINTAB(port) non-zero>
+	ADD	T1,B		;(T1)=LDBLOG(U)
+	HRLI	T1,(1b0)
+	MOVE	T2,[17b11!1b16!77b19!77b27!177b35]
+	HRROI	T3,.GTLOG
+	HRL	T3,TT
+	GETTAB	T3,
+	 JRST	NOLOG
+	AND	T3,T2
+	MOVE	A,T1
+	VPEEK	A,
+	 JRST	NOLOG
+	HRROI	B,.GTLOG
+	HRL	B,PP
+	GETTAB	B,
+	 JRST	NOLOG
+	CAME	A,B
+	 fatal	<?.GTLOG(p) neq LDBLOG(u)>
+	MOVEI	A,T1
+	BITPOK	A,
+	 JRST	NOLOG
+	bug <LOG>
+	SKIPA
+NOLOG:	 OUTSTR	[asciz "[LDBLOG not patched]
+"]
+	HRROI	T1,.AXTCN	;copy terminal characteristics
+	HRL	T1,TT
+	HRROI	T2,.AXTCN	
+	HRL	T2,PP
+	SETZ	T3,		;start with characteristic 0
+TCINI:	HLLOS	T3		;read characteristics
+	AUXCAL	T1,T3		;get characteristic from real TTY
+	 JRST	TCDON		;no more characteristics
+	AUXCAL	T2,T3		;set it on other end of PTY
+	 fatal	<?cant set terminal characteristic>
+	ADD	T3,[1,,0]	;increment terminal char #
+	JRST	TCINI
+TCDON:
+
+	HLL	T1,PP		;set mode on our end of PTY
+	HRRI	T1,.AXCFS	;change file status for port
+	AUXCAL	T1,214		;image binary no echo
+
+	HRRO	T1,FD		;move PTY to child
+	HRLI	T2,(2B2)	;attach in command mode
+	HRR	T2,PP		;his port number
+	MOVEI	T3,T1		;address of arg block
+	RETACH	T3,
+	 fatal	<?cant retach PTY to child frame>
+	
+	HRROI	T1,.AXCFS	;change file status for port
+	HRL	T1,TT
+	AUXCAL	T1,214		;image binary no echo
+
+	HRROI	T1,.GTPRV	;set logout on disconnect
+	GETTAB	T1,
+	 fatal	<?cant get JBTPRV>
+	TRZ	T1,3B20		;all off=logout on disconnect
+	SETPRV	T1,
+
+	HRROI	A,.AXTCP	;get next characteristic
+	HLL	A,PP
+TCCCLR:	AUXCAL	A,B
+	 fatal	<?cant read terminal characteristics from PTY>
+	JUMPGE	B,TCCCLR	;more?
+
+subttl	initialize interrupt system
+;	* reset and enable INTADR system
+;	* assign causes to channels
+;	* enable all channels
+
+	MOVE	T1,[VECDAT,,VECTOR]	;load the vector
+	BLT	T1,VECTOR+VECLEN-1
+
+	MOVE	T1,[6,,VECTOR]		;clear and enable system
+	INTADR	T1,
+	 fatal	<?cant initialize INTADR system>
+	
+	MOVE	T1,[.IANTQ,,ZAP..C]	;NTQ
+	INTASS	T1,
+	 fatal	<?cant assign NTQ>
+
+	HRLOI	T1,<.IAZAP>B26+ZAP..C	;PTY ZAP
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign PTY ZAP>
+
+	HRLOI	T1,<.IAORG>B26+ORG.TC	;ORANGE BALL from TTY
+	HRR	T1,TT
+	TINASS	T1,
+	 fatal	<?cant assign ORANGE BALL for TTY>
+
+	HRLOI	T1,<.IAORG>B26+ORG.PC	;ORANGE BALL from PTY
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign ORANGE BALL for PTY>
+
+	HRLOI	T1,<.IAYEL>B26+YEL.TC	;YELLOW BALL from TTY
+	HRR	T1,TT
+	TINASS	T1,
+	 fatal	<?cant assign YELLOW BALL for TTY>
+
+	HRLOI	T1,<.IAYEL>B26+YEL.PC	;YELLOW BALL from PTY
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign YELLOW BALL for PTY>
+
+	HRLOI	T1,<.IAGOB>B26+GOB.TC	;GOBBLER from TTY
+	HRR	T1,TT
+	TINASS	T1,
+	 fatal	<?cant assign GOBBLER for TTY>
+
+	HRLOI	T1,<.IAGOB>B26+GOB.PC	;GOBBLER from PTY
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign GOBBLER for PTY>
+
+	HRLOI	T1,<.IATCC>B26+TCC.PC	;TERM CHAR from PTY
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign TERM CHAR for PTY>
+
+	HRLOI	T1,<.IACHR>B26+CHR.TC	;CHAR from TTY
+	HRR	T1,TT
+	TINASS	T1,
+	 fatal	<?cant assign CHAR for TTY>
+
+	HRLOI	T1,<.IACHR>B26+CHR.PC	;CHAR from PTY
+	HLR	T1,PP
+	TINASS	T1,
+	 fatal	<?cant assign CHAR for PTY>
+
+	OUTSTR	[asciz "[logging passthrough created]"]
+	OUTSTR	[byte (7)15,12]
+
+	SETO	X,			;enable all interrupt channels
+	INTENB	X,
+	 fatal	<?cant enable interrupt channels>
+
+WAIT:	SETZ	X,		;don't wake up for anything
+	HIBER	X,
+	 JRST	WAIT
+	JRST	WAIT
+
+subttl	interrupt routines for special balls
+
+ZAP..:	bug <ZAP..>
+	MOVEI	A,10
+	SLEEP	A,
+	OUTSTR	[asciz "
+[logging passthrough deleted, log file is "]
+	OUTSTR	LOGNAM
+	OUTSTR	[asciz "]"]
+	PUSHJ	P,LOGCLS
+	EXIT
+
+ORG.T:	PUSH	P,A
+	bug <ORG.T>
+	HRROI	A,.AXSOB	;send orange ball to PTY
+	HLL	A,PP
+	AUXCAL	A,
+	POP	P,A
+	DISMIS
+
+ORG.P:	PUSH	P,A
+	bug <ORG.P>
+	HRROI	A,.AXSOB	;send orange ball to TTY
+	HRL	A,TT
+	AUXCAL	A,
+	POP	P,A
+	DISMIS
+
+YEL.T:	PUSH	P,A
+	bug <YEL.T>
+	HRROI	A,.AXSYB	;send yellow ball to PTY
+	HLL	A,PP
+	AUXCAL	A,
+	POP	P,A
+	DISMIS
+
+YEL.P:	PUSH	P,A
+	bug <YEL.P>
+	HRROI	A,.AXSYB	;send yellow ball to TTY
+	HRL	A,TT
+	AUXCAL	A,
+	POP	P,A
+	DISMIS
+
+GOB.T:	PUSH	P,A
+	HRROI	A,.AXCBO	;send gobbler to PTY
+	HLL	A,PP
+	AUXCAL	A,
+	POP	P,A
+	bug <GOB.T>
+	DISMIS
+
+GOB.P:	PUSH	P,A
+	HRROI	A,.AXCBO	;send gobbler to TTY
+	HRL	A,TT
+	AUXCAL	A,
+	POP	P,A
+	bug <GOB.P>
+	DISMIS
+
+subttl	interrupt routines for terminal characteristics
+;	no TCC.T because can't do anything with them
+
+TCC.P:	PUSH	P,A
+	PUSH	P,B
+TCC.P0:	HRROI	A,.AXTCP	;get next characteristic
+	HLL	A,PP
+	AUXCAL	A,B
+	 fatal	<?cant read terminal characteristics from PTY>
+	JUMPL	B,TCC.P1	;none left?
+	bug <TCC.P>
+	HRROI	A,.AXTCN
+	HRL	A,TT
+	AUXCAL	A,B		;go set it on real TTY:
+	 fatal	<?cant set terminal characteristic on TTY>
+	JRST	TCC.P0
+TCC.P1:	POP	P,B
+	POP	P,A
+	DISMIS
+
+subttl	interrupt routines for terminal originated traffic
+;	T1-T4 are reserved for these routines
+
+CHR.T:	HRROI	T1,.AXI8S	;get next character
+	HRL	T1,TT
+	AUXCAL	T1,TC
+	 DISMIS			;no more characters
+	HRROI	T1,.AXO8	;output to PTY
+	HLL	T1,PP
+	AUXCAL	T1,TC
+	JRST	CHR.T
+
+subttl	interrupt routines for PTY originated traffic
+;	P1-P4 are reserved for these routines
+
+CHR.P:	HRROI	P1,.AXI8S	;get next character
+	HLL	P1,PP
+	AUXCAL	P1,PC
+	 DISMIS			;no more characters
+	HRROI	P1,.AXO8	;output character
+	HRL	P1,TT
+	AUXCAL	P1,PC
+	PUSHJ	P,LOGCHR	;write character to log file
+	JRST	CHR.P		;try again
+
+array	LOGFIL[4],LOGBUF[3]
+
+LOGOPN:	; call here to open the log file
+	PUSHJ	P,SCANER
+	INIT	1,
+	 sixbit	"DSK"
+	 xwd	LOGBUF,0
+	  fatal	<?INIT failure for device DSK>
+	ENTER	1,LOGFIL
+	  fatal	<?ENTER failure on log file>
+	OUTPUT	1,		;setup buffers
+	POPJ	P,
+
+LOGCH1:	OUTPUT	1,
+LOGCHR:	; call here with character in PC to output to log file
+	SOSGE	LOGBUF+2
+	 JRST	LOGCH1
+	IDPB	PC,LOGBUF+1
+	POPJ	P,
+
+LOGCLS:	; call here to close the log file
+	CLOSE 	1,
+	RELEAS	1,
+	POPJ	P,
+
+array	USRNAM[2],LOGNAM[10]
+
+SCANER:	OUTSTR [ASCIZ "log file: "]
+	SETZM USRNAM
+	SETZM USRNAM+1
+	MOVEI T1,3
+	MOVEM T1,LOGFIL+0
+	SETZM LOGFIL+1
+	SETZM LOGFIL+2
+	SETZM LOGFIL+3
+	MOVE T4,[POINT 7,LOGNAM]
+S1:	MOVE T1,[POINT 6,LOGFIL+2]
+	MOVEI T2,6
+	SETZM LOGFIL+2
+S2:	INCHWL T3
+	CAIN T3,15	; IF <CR> EAT LF
+	  INCHWL T3
+	CAIL T3,140
+	  SUBI T3,40
+	IDPB T3,T4	;Save file name
+	CAIN T3,"("
+	  JRST [MOVEI T1,USRNAM
+		MOVEM T1,LOGFIL+1
+		MOVE T1,[point 6,USRNAM]
+		MOVEI T2,14
+		SETZM USRNAM
+		SETZM USRNAM+1
+		JRST S2]
+	CAIN T3,")"
+	  JRST S1
+	CAIN T3,"."
+	  JRST [MOVE T1,[POINT 6,LOGFIL+3]
+		MOVEI T2,3
+		SETZM LOGFIL+3
+		JRST S2]
+	SUBI T3,40
+	JUMPL T3,S9
+	JUMPE T3,S2
+	SOJL T2,S2
+	IDPB T3,T1
+	JRST S2
+
+S9:	MOVEI T3,0
+	DPB T3,T4	;Replace LF with null
+	POPJ P,
+subttl	define interrupt vector and channel numbers
+
+VECDAT:	;; interrupt vectors
+define	INTDEF (x) < irp x <
+EXP 0,x				;;load vector table
+x'C==<.-VECDAT>/2		;;define interrupt channel number
+>>
+intdef	<GOB.T,GOB.P>
+intdef	<CHR.T,ORG.T,YEL.T>
+intdef	<TCC.P>
+intdef	<CHR.P,ORG.P,YEL.P>
+intdef	<ZAP..>
+VECLEN==.-VECDAT
+
+lit
+;;reloc	0
+var
+VECTOR:	block ^D72
+
+end	START
+      
