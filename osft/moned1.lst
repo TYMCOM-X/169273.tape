@@ -1,0 +1,870 @@
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 1
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+1	begin	"MONED1"
+2	
+3	require '13 version;
+4	
+5	comment
+6		This program replaces MONED1.MAC (kludge).  This version will
+7		derive the correct system name as follows:
+8			1. It will find the largest value of NNNN such that
+9			the file Pnnnn.MEM exists.  This will be used for
+10			the major version number.
+11			2. It will find the last entry in this file P####.MEM
+12			of the form
+13				/LDD
+14				----
+15			Where "L" is one or more letters, and "DD" is two or
+16			more digits.  This will become the minor version number.
+17			3. If there are non blank lines following this entry,
+18			a new entry will be made at the end of the file of
+19			the same form, with the same letters, with a one larger
+20			numeric part.
+21		The program will derive the next SYStemID from the first word of
+22		(M33)SYSID.DAT (which is mapped and AOS'd to allow simultaneous
+23		update).  This SYSID will be written to the CNFN##.MAC file
+24		along with the monitor version name and assembly date. Then RPG 
+25		will be called with the proper command in SVC to assemble, load 
+26		and save the monitor.  A short log is kept in CNFN##.MAC of all
+27		the data from the past few assemblies for that particular system.
+28	;
+29	
+30	require "(SAILIB)SAIL.DEF" source!file;
+31	require "(CARL)VMFILE.REQ" source!file;
+32	require "(SAILIB)EXTEND.REQ" source!file;
+33	require "(SAILIB)MAPLIB.REQ" source!file;
+34	
+35	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 2
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+36	string MySys,SDate,UName;
+37	simple procedure Ini;
+38	begin
+39	    setformat(-2,0);
+40	    MySys _ cvs(calli(!xwd('33,'11),'41));
+41	    SDate _ StDate(calli(0,'14),0);
+42	    UName _ cv6str(calli(-'22,'41)) & cv6str(calli(-'21,'41));
+43	end;
+44	require ini initialization;
+45	
+46	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 3
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+47	recursive string procedure INCR(string S);
+48	! incriment the first letter of string S...skip I and O;
+49	begin	"INCR"
+50	    integer C;
+51	    case C _ lop(S) of begin
+52		[0] return( "A" );
+53		["I"-1] return( ("I"+1) & S );
+54		["O"-1] return( ("O"+1) & S );
+55		["Z"] return( "A" & INCR(S) );
+56		else return( (C+1) & S )
+57	    end;
+58	end	"INCR";
+59	
+60	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 4
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+61	define	Dashes = {"------------------------------------------------"};
+62	integer MemChan;		! channel for .MEM file;
+63	integer MemSize;		! # of last existant .MEM file page;
+64	integer MemVer;			! numeric MEM file version;
+65	integer MemPtr;			! word pointer to file;
+66	integer AppPtr;			! append pointer to file;
+67	r!p(MAP1) MemPages;		! list of pages;
+68	
+69	procedure OpenMemFile (string FileName);
+70	begin	"OpenMemFile"
+71	    MemChan _ OpFile (FileName,"RWOM",16);
+72	    if MemChan < 0 then usererr(!rh(MemChan),2,
+73		"?OpFile error in phase "& cvs(-!lh(MemChan))& ": ","X");
+74	    chnior (MemChan, MemSize, '10);! UGETF;
+75	    MemPtr _ !rh(MemSize) * '200 -1;
+76	    MemSize _ (!rh(MemSize) + 3) % 4;! convert to pages;
+77	    MemPages _ null!record;
+78	    AppPtr _ -1;
+79	end	"OpenMemFile";
+80	
+81	procedure CloseMemFile;
+82	begin	"CloeMemFile"
+83	    integer I;
+84	    while MemPages do begin "unmap"
+85		getmap (MemPages,"U",0,0);	! unmap and delete;
+86		MemPages _ MAP1:up[MemPages];
+87	    end "unmap";
+88	    I _ chniov (MemChan,AppPtr+1,'45);	! set end of file pointer;
+89	    if not !SKIP! then usererr(I,2,"?!CHFTR failed: ","X");
+90	    chniov (MemChan, 0, 0);	! release channel;
+91	end	"CloeMemFile";
+92	
+93	procedure MapRW (integer Ptr);
+94	begin	"MapRW"
+95	    r!p(MAP1) H;
+96	    H _ MAP1CR (0,511,0);
+97	    MAP1:ui[h] _ Ptr land '777000;
+98	    MAP1:up[h] _ MemPages;
+99	    MemPages _ h;
+100	    if getmap (H,"O",MemChan,1+ Ptr lsh -9) < 0 then 
+101		usererr(1+Ptr lsh -9,2, "?getmap failed for page ","X");
+102		! creates page if necessary;
+103	end	"MapRW";
+104	
+105	simple integer procedure ReadWord;
+106	begin	"ReadWord"
+107	    integer W;
+108	    if MemPtr < 0 then return(0);
+109	    while MemPages = null!record or MemPtr < MAP1:ui[MemPages] 
+110		do MapRW (MemPtr);
+111	    W _ MAP1:a[MemPages][MemPtr land '777];
+112	    MemPtr _ MemPtr -1;
+113	    return (W);
+114	end	"ReadWord";
+115	
+116	simple string procedure ReadLine;
+117	begin	"ReadLine"
+118	    own integer W,P,C; string S;
+119	    S _ null;
+120	    do begin "getchar"
+121		if P=0 then begin 
+122		    if MemPtr < 0 then return (S);
+123		    W _ ReadWord; 
+124		    if W and AppPtr < 0 then AppPtr _ MemPtr +1;
+125		    P _ 5; 
+126		end;
+127		C _ W lsh (P*7-36) land '177;
+128		P _ P -1;
+129		if C > '40 then S _ C & S;
+130	    end until C=#lf;
+131	    return (S);
+132	end	"ReadLine";
+133	
+134	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 5
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+135	simple procedure WriteLine (string S);
+136	begin	"WL"
+137	    while MemPages = null!record or AppPtr > MAP1:ui[MemPages]+'777
+138		do MapRW (AppPtr);
+139	    S _ cvastr(MAP1:a[MemPages][AppPtr land '777]) & S & crlf;
+140	    while length(S) do begin
+141		while MemPages = null!record or AppPtr > MAP1:ui[MemPages]+'777
+142		  do MapRW (AppPtr);
+143		MAP1:a[MemPages][AppPtr land '777] _ cvasc(S[1 for 5]);
+144		S _ S[6 to inf];
+145		AppPtr _ AppPtr + 1;
+146	    end;
+147	    AppPtr _ AppPtr - 1;
+148	end	"WL";
+149	
+150	simple procedure WriteHeading (string S);
+151	begin	"WH"
+152	    WriteLine (null);
+153	    WriteLine (S);
+154	    WriteLine (Dashes[1 for length(S)]);
+155	end	"WH";
+156	
+157	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 6
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+158	string	MinVer,			! global for default if <CR>;
+159		MajVer;			! global for default if <ESC>;
+160	string	LastMaj;		! global for last major version #;
+161	boolean	TextMin,		! no min head follows last text;
+162		TextMaj;		! no maj head follows last text;
+163	
+164	simple procedure ParseMEM;
+165	comment
+166		There are two types of headers in the file: major and minor.
+167		MinVer is the last minor header which has text after it.
+168		MajVer is the last major header which has text after it.
+169		Note that this routine scans the file backwards.
+170	;
+171	begin	"ParseMEM"
+172	    boolean TextFlag;
+173	    string S,Min1,Maj1;
+174	    TextFlag_ TextMin_ TextMaj_ false; 
+175	    LastMaj_ MinVer_ MajVer_ Min1_ Maj1_ null;
+176	    setformat(-3,0);
+177	    do begin
+178		S _ ReadLine;
+179		if equ(S,dashes[1 for length(S)]) then S _ null;
+180		if length(LastMaj)=0 and S="P" and S[5 to 5]="/"
+181		    then LastMaj _ S;
+182		if S="P" and S[5 to 5]="/" 
+183		    then if TextFlag 
+184			then if length(MajVer)=0 
+185			    then MajVer _ S 
+186			    else
+187			else Maj1 _ S
+188		else if S="/" and length(S)<7 
+189		    then if TextFlag 
+190			then if length(MinVer)=0 
+191			    then MinVer _ S 
+192			    else
+193			else Min1 _ S
+194		else if length(S) then begin
+195		    TextFlag _ true;
+196		    if length(Min1)=0 then TextMin _ true;
+197		    if length(Maj1)=0 then TextMaj _ true;
+198		end;
+199	    end until MemPtr < 0 or (length(MinVer) and length(MajVer));
+200	    if length(MinVer)=0 or length(MajVer)=0 then
+201		if TextFlag or length(Min1)=0 or length(Maj1)=0
+202		    then usererr(0,0,"?cant parse .MEM file","X")
+203		    else begin
+204			MinVer_ Min1;
+205			MajVer_ Maj1;
+206		    end;
+207	    if equ("/A",MajVer[inf-1 to inf]) ! kludge to handle new files;
+208		then MinVer _ "P"& cvs(MemVer-1)& MinVer
+209		else MinVer _ "P"& cvs(MemVer)& MinVer;
+210	end	"ParseMEM";
+211	
+212	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 7
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+213	string procedure NameMEM;
+214	! return the version number from the name of the appropriate .MEM file;
+215	begin	"NameMEM"
+216	    integer Flag, Chan,Eof;
+217	    MEMver _ 030;
+218	    setformat(-3,0);		! 3 digits;
+219	    open(Chan_getchan,"DSK",0,0,0, 0,0,EOF);
+220	    if EOF then usererr(EOF,2,"?open failure for DSK: ","X");
+221	    Flag _ false;
+222	    do begin
+223		lookup(Chan,"P"&cvs(MEMver_MEMver+1)&".MEM",Eof);
+224	    end until (MEMver > 099) or ((Flag _ Flag or not Eof) and Eof);
+225	    if MEMver > 099 then return(null);
+226	    MEMver _ MEMver - 1;
+227	    release(Chan);
+228	    return("P" & cvs(MEMver) & ".MEM");
+229	end 	"NameMEM";
+230	
+231	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 8
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+232	integer MNB1,MNB2,MNB3,MNB4;
+233	
+234	simple procedure IniBreak;
+235	begin
+236	    setbreak(MNB1_getbreak,"-",null,"SINK");
+237	    setbreak(MNB2_getbreak,"0123456789",null,"RINK");
+238	    setbreak(MNB3_getbreak,"/",null,"SINK");
+239	    setbreak(MNB4_getbreak,"-0123456789",null,"RINK");
+240	end;
+241	require IniBreak initialization;
+242	
+243	simple procedure MonParse (
+244		string S;
+245		reference string A,B,C );
+246	!
+247		P033/FA01-2
+248	         AAA B CC
+249	;
+250	begin
+251	    own integer I;
+252	    scan(S,MNB2,I);
+253	    A_scan(S,MNB3,I);
+254	    B_scan(S,MNB4,I);
+255	    C_scan(S,MNB1,I);
+256	end ;
+257	
+258	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 9
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+259	string procedure NextSYSID;
+260	begin
+261	    integer A,B,I,C;
+262	    string S;
+263	
+264	    C_ VMFile( "(M33)SYSID.DAT", VM$Multi );
+265	    if ( C < 0 )
+266	     then usererr(C,2,"Cannot open file (M33)SYSID.DAT: ","X");
+267	
+268	    I_ VMGetC( C, VM$Base ) lsh 9;	! memory address for data ;
+269	    if ( VMPMap( C, 1 ) )		! if map file page 1 ok ;
+270	     then start!code
+271		protect!acs 1;
+272		MOVE	1,I;		! get address of mapped counter word;
+273		AOS	1,(1);		! increment counter and save new value in AC;
+274		SOS	1;		! compute original value;
+275		MOVEM	1,I;		! keep it around for later;
+276	     end
+277	     else usererr(C,2,"Cannot increment SYSID","X");
+278	
+279	    VMFree( C );			! close file ;
+280	
+281	    getformat(A,B);			! setup for 5 digits ;
+282	    setformat(-5,0);
+283	    S _ "M"& cvs(I);			! generate M00000 name ;
+284	    setformat(A,B);			! restore previous setting ;
+285	    return(S);
+286	
+287	end;
+288	
+289	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 10
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+290	integer ApoTab,HypTab,SemTab;
+291	simple procedure P10INI;
+292	begin
+293	    setbreak (ApoTab_getbreak,"'",null,"FINS");
+294	    setbreak (HypTab_getbreak,"-",null,"FINA");
+295	    setbreak (SemTab_getbreak,";",null,"FINS");
+296	end;
+297	require P10INI initialization;
+298	
+299	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 11
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+300	
+301	simple boolean procedure Find( reference string S; string M );
+302	begin
+303	    while length( S )
+304	     do if ( M = lop( S ) )
+305		  then return( true );
+306	    return( false );
+307	end;
+308	
+309	string procedure CnfnVersion( string SysNo );
+310	begin	"CnfnVersion"
+311	    integer IChan, Brk;
+312	    string FName, S, Ver;
+313	
+314	    FName _ "CNFN"& SysNo& ".MAC";
+315	    if ( 0 > Ichan_ VMFile( FName, VM$Read ) )
+316	     then return( null );
+317	
+318	    do Ver_ VMLine( Ichan, Brk ) until Find(Ver,"'") or ( BRK = 0 );
+319	    if Brk = 0 then usererr(0,0,"?format error 1 in "& FName,"X");
+320	    if not Find( Ver, "-" )
+321	     then usererr(0,0,"?format error 3 in "& FName,"X");
+322	    if not Find( S_ Ver, "'" )
+323	     then usererr(0,0,"?format error 4 in "& FName,"X");
+324	    S_ null;
+325	    while length( Ver ) and Ver neq "'"
+326	     do S_ S & lop( Ver );
+327	
+328	    VMFree( IChan ); 
+329	    return( S );
+330	
+331	end	"CnfnVersion";
+332	
+333	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 12
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+334	
+335	procedure CnfnUpdate( string SysNo, SName, SDate );
+336	begin	"CnfnUpdate"
+337	    integer IChan,OChan, Brk,I;
+338	    string FName, OSName, OSDate, OSysid, S, NSysid, More;
+339	
+340	    FName_ "CNFN"& SysNo& ".MAC";
+341	    if ( 0 > Ichan_ VMFile( FName, VM$Read ) )
+342	     then usererr(Ichan,2,"?unable to lookup "& FName& ": ","X");
+343	    if ( 0 > Ochan_ VMFile( Fname, VM$Write ) )
+344	     then usererr(Ochan,2,"?unable to enter "& FName& ": ","X");
+345	
+346	    do begin "copy"
+347		S_ OSName_ VMLine( IChan, Brk );
+348		if not Find( OSName, "'" )
+349		 then VMText( Ochan, S & crlf )
+350		 else begin
+351		    VMText( Ochan, S[1 for length(S)-length(OSName)] );
+352		    done;
+353		 end;
+354	    end "copy" until BRK = 0;
+355	    if Brk = 0 then usererr(0,0,"?format error 1 in "& FName,"X");
+356	
+357	    S_ OSName;
+358	    if not Find( OSName, "-" )
+359	     then usererr(0,0,"?format error 2 in "& FName,"X");
+360	    VMText( Ochan, S[1 for length(S)-length(OSName)] );
+361	
+362	    if not Find( OSName, "'" )
+363	     then usererr(0,0,"?format error 3 in "& FName,"X");
+364	    VMText( OChan, SName & "'" & OSName & crlf );
+365	
+366	    do begin "copy"
+367		S_ OSDate_ VMLine( IChan, Brk );
+368		if not Find( OSDate, "'" )
+369		 then VMText( Ochan, S & crlf )
+370		 else begin
+371		    VMText( Ochan, S[1 for length(S)-length(OSDate)] );
+372		    done;
+373		 end;
+374	    end "copy" until BRK = 0;
+375	    if Brk = 0 then usererr(0,0,"?format error 4 in "& FName,"X");
+376	
+377	    if not Find( OSDate, "'" )
+378	     then usererr(0,0,"?format error 5 in "& FName,"X");
+379	    VMText( OChan, SDate & "'" & OSDate );
+380	
+381	    do begin "copy"
+382		S_ OSysid_ VMLine( IChan, Brk );
+383		if not Find( OSysid, "'" )
+384		 then VMText( Ochan, S & crlf )
+385		 else begin
+386		    VMText( Ochan, S[1 for length(S)-length(OSysid)] );
+387		    done;
+388		 end;
+389	    end "copy" until BRK = 0;
+390	    if Brk = 0 then usererr(0,0,"?format error 6 in "& FName,"X");
+391	
+392	    if not Find( OSysid, "'" )
+393	     then usererr(0,0,"?format error 7 in "& FName,"X");
+394	    NSysid_ NextSysID;
+395	    VMText( Ochan, NSysid & "'" & OSysid & crlf );
+396	
+397	    do begin "copy"
+398		S_ More_ VMLine( IChan, Brk );
+399		if not Find( More, ";" )
+400		 then VMText( Ochan, S )
+401		 else done;
+402	    end "copy" until BRK = 0;
+403	
+404	    SDate_ (SDate & "    ") [1 for 10];
+405	    VMText( OChan, "; "& SName & #ht & SDate & NSysid &"   "& UName & crlf );
+406	    for I _ 75 downto 0 do begin "copy"
+407		! don't let history make file too big, keep to 1 data page;
+408		if not Brk then done;
+409		S_ VMLine( Ichan, Brk );
+410		VMText( Ochan, S & crlf );
+411	    end "copy";
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 12.1
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+412	
+413	    if Brk then VMText( OChan, "; ---prior history deleted---"& crlf );
+414	
+415	    VMFree( Ichan ); VMFree( Ochan );
+416	
+417	end	"CnfnUpdate";
+418	
+419	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 13
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+420	
+421	procedure MsgUpdate( string SysNo, SName, SDate );
+422	begin	"MsgUpdate"
+423	    integer IChan,OChan,Brk;
+424	    string FName, S;
+425	
+426	    FName _ "ACCESS.MSG";
+427	    Ichan_ VMFile( FName, VM$Read );
+428	    if ( 0 > Ochan_ VMFile( FName, VM$Write ) )
+429	     then usererr(Ochan,2,"?unable to enter "& FName& ": ","X");
+430	    VMText(OChan,"[ "& SysNo &" "& SName &" "& SDate &" /"& UName &" ]"&crlf);
+431	    if ( 0 > Ichan )
+432	     then while Brk do begin "copy"
+433		string L;
+434		if BRK = 0 then done;
+435		L_ VMLine( Ichan, Brk );
+436		if not (kequ(L[1 for 2],"[ ") and kequ(L[inf-1 for 2]," ]"))
+437		    then VMText( Ochan, L & crlf );
+438	    end "copy";
+439	    VMFree( IChan ); VMFree( OChan );
+440	
+441	end	"MsgUpdate";
+442	
+443	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 14
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+444	procedure MemUpdate (string S);
+445	begin	"MemUpdate"
+446	    string Q,A,B,C;
+447	    setformat(-2,0);
+448	
+449	    MonParse(S, A,B,C);
+450	    if length(C)
+451		then begin "minor release"
+452		    WriteHeading ( "/"&B&cvs(cvd(C)+1) );
+453		end
+454		else begin "major release"
+455		    WriteLine (#ff);
+456		    WriteHeading ( "P"&A&"/"&incr(B) );
+457		    WriteHeading ( "/"&B&"01" );
+458		end;
+459	end	"MemUpdate";
+460	
+461	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 15
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+462	label	SuperLabel;
+463	integer	BTSM1,BTSM2;
+464	simple procedure BTSMini;
+465	begin
+466	setbreak(BTSM1_getbreak,#ff&#lf,#cr&" "&#ht,"KINS");
+467	setbreak(BTSM2_getbreak,#ff&#lf,null,"FINS");
+468	end; require BTSMini initialization;
+469	
+470	proc SuperMajor(string S);
+471	begin
+472	    integer CI,CO,E,BRK;
+473	    string A,B,C;
+474	    open (CI_getchan,"DSK",0,1,0, 256,BRK,E);
+475	    MonParse(LastMaj, A,B,C);
+476	    lookup(CI,"P"&A&".MEM",E);
+477	    open (CO_getchan,"DSK",0,0,1, 0,0,E);
+478	    MonParse(S, A,B,C);
+479	    enter(CO,"P"&A&".MEM",E);
+480	    while not E do if equ(input(CI,BTSM1),LastMaj) then done;
+481	    if E then usererr(0,0,"?end of .MEM file looking for "&LastMaj,"X");
+482	    cprint(CO,S,crlf,dashes[1 for length(S)],crlf);
+483	    input(CI,BTSM2);		! skip the ----'s;
+484	    while not E do out(CO,input(CI,BTSM2)&BRK);
+485	    print("[P",A,".MEM created]",crlf);
+486	    release(CI); release(CO);
+487	    WriteLine(null);
+488	    WriteLine("[this file last modified "&SDate&" by "&UName&"]");
+489	    WriteLine(null);
+490	    WriteLine("******************************************");
+491	    WriteLine("***  make further changes in P"&A&".MEM  ***");
+492	    WriteLine("******************************************");
+493	    CloseMemFile;
+494	    OpenMemFile(NameMEM);
+495	    ParseMem;
+496	    goto SuperLabel;
+497	end;
+498	
+499	
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 16
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+500	!	M A I N   P R O G R A M	;
+501	
+502	string A,B,C;			! monitor name fragments;
+503	string SysID;			! system "id";
+504	string SName;			! temp name;
+505	string SvcCmd;			! command string for RPG;
+506	boolean NoMEM;		       	! there is no .MEM file;
+507	
+508	ttyup(true);
+509	if equ(MySys,"118") then MySys _ "KS";
+510	if equ(MySys,"930") then MySys _ "F3";
+511	
+512	while true do begin
+513		print ("System id [",MySys,"]: ");
+514		SysID _ inchwl;
+515	  	if !SKIP!=#esc then print(" = ",SysID_MySys,crlf);
+516		if SysID = "?" then begin print(
+517	"Enter the id for the system to assemble for in the form:
+518	   ##
+519	such that MON##.CMD and CNFN##.MAC are relavent
+520	or enter <cr> or <esc> to use ",MySys,"
+521	");		continue end;
+522		if length(SysID) > 2 then begin print(
+523	"?too many characters, type ""?"" for help
+524	");		continue end;
+525		if length(SysID)=0 then SysID _ MySys;
+526		done;
+527	end;
+528	
+529	if length(SName _ NameMEM) then begin "MemFileFound"
+530	    print("[default version from ",SName,"]",crlf);
+531	    OpenMemFile ( SName );
+532	    ParseMEM;
+533	    if AppPtr < 0 then usererr(0,0,
+534	    	"?.MEM file is empty! Don't do that to me!","X");
+535	    NoMEM _ false;
+536	end "MemFileFound" 
+537	else if length(SName _ CnfnVersion(SysID)) then begin "CnfnVersionFound"
+538	    print("[default version as per CNFN",SysID,".MAC]",crlf);
+539	    NoMEM _ true; MinVer _ MajVer _ SName;
+540	end "CnfnVersionFound"
+541	else usererr(0,0,"?no CNFN"&SysID&".MAC file","X");
+542	
+543	while true do begin
+544		string A,B,C;
+545		MonParse (MinVer, A,B,C);
+546		print ("Version [", MinVer, "]: ");
+547		SName _ inchwl;
+548		if length(SName)=0 then SName_MinVer;
+549		if !SKIP!=#esc then print(" = ",SName_MajVer,crlf);
+550		if SName = "?" then begin print(
+551	"Enter the desired monitor version in one of these forms:
+552	   ",B,C,"
+553	   /",B,C,"
+554	   P",A,"/",B,C,"
+555	or enter <cr> to use ",MinVer); 
+556		    if not NoMEM then print("
+557	or enter <esc> to use ",MajVer);
+558		    print(crlf); 
+559		    continue 
+560		end;
+561		if length(SName) then begin
+562		    string A1,B1,C1;
+563		    if SName="/" then SName _ "P"& A& SName;
+564		    if length(SName)<6 then SName _ "P"& A& "/"& SName;
+565		    MonParse (SName, A1,B1,C1);
+566		    if length(A1)=0 or length(B1)=0 then begin print(
+567			"?type ? for help",crlf); continue end;
+568		    if NoMEM then done;
+569		    if cvd(A)+1 = cvd(A1) and equ(B1,"A") and length(C1)=0
+570			then SuperMajor(SName);
+571		    if cvd(A) neq cvd(A1) then begin print(
+572			"?must be in current .MEM file",crlf); continue end;
+573		end;
+574		done;
+575	end;
+576	
+577	SuperLabel:
+
+MONED1.SAI                              created 01-Jul-86 02:05                                          Page 16.1
+Program Listing                         by CRFSYM %5 at 18-Sep-86 20:06
+
+578	CnfnUpdate (SysID, SName, SDate);
+579	MsgUpdate (SysID, SName, SDate);
+580	if not NoMEM then begin
+581	    if kequ(SName,MinVer) and TextMin
+582	    or kequ(SName,MajVer) and TextMaj
+583	    or not(kequ(SName,MinVer) or kequ(SName,MajVer))
+584		then MemUpdate (SName);
+585	    CloseMemFile;
+586	end;
+587	
+588	MonParse (SName, A,B,C); B _ lop(B);
+589	SvcCmd _ "LOAD /SAVE:"& SysID& (if C then "X"&B&C else A&B&C)& 
+590		" @(M33)MON"& SysID& 0; 
+591	
+592	print(SvcCmd,crlf);
+593	tmpout ("SVC", SvcCmd, !SKIP!);
+594	if !SKIP! then begin "disk!"
+595	    integer C,E;
+596	    setformat(-3,0);
+597	    open(C_getchan,"DSK",0,0,1, 0,0,E);
+598	    enter(C,cvs(call(0,"PJOB"))&"SVC.TMP",E);
+599	    out(C,SvcCmd);
+600	    release(C);
+601	end "disk!";
+602	start!code "RUNER"
+603	    label RUNBLK;
+604		MOVEI	1,RUNBLK;
+605		HRLI	1,1;
+606		CALLI	1,'35;
+607		JRST	4,;
+608	RUNBLK:	0+cvsix("SYS");
+609		0+cvsix("RPG");
+610		0; 0; 0; 0; 0;
+611	end "RUNER";
+612	
+613	end	"MONED1" .
+
+MONED1.SAI                User defined Screated 01-Jul-86 02:05                                          Page 17
+Cross Reference                         by CRFSYM %5 at 18-Sep-86 20:06
+
+!LH                         73
+!RH                         72    76
+!SKIP!                      89   515   549   593   594
+!XWD                        40
+#CR                        466
+#ESC                       515   549
+#FF                        455   466   467
+#HT                        405   466
+#LF                        130   466   467
+.                          613
+A                          111   139   143   245   253   261   281   284   446   449   456   473   475   476   478   479
+                           485   491   502   544   545   554   563   564   569   571   588   589
+A1                         562   565   566   569   571
+AOS                        273
+APOTAB                     290   293
+APPPTR                      66    78    88   124   124   137   138   139   141   142   143   145   145   147   147   533
+B                          245   254   261   281   284   446   449   452   456   457   473   475   478   502   544   545
+                           552   553   554   588   588   588   589   589
+B1                         562   565   566   569
+BRK                        311   318   318   319   337   347   354   355   367   374   375   382   389   390   398   402
+                           408   409   413   423   432   434   435   472   474   484
+BTSM1                      463   466   480
+BTSM2                      463   467   483   484
+BTSMINI                    464   468
+C                           50    51    56   118   127   129   129   130   245   255   261   264   265   266   268   269
+                           277   279   446   449   450   452   473   475   478   502   544   545   552   553   554   588
+                           589   589   589   595   597   598   599   600
+C1                         562   565   569
+CALL                       598
+CALLI                       40    41    42    42   606
+CHAN                       216   219   223   227
+CHNIOR                      74
+CHNIOV                      88    90
+CI                         472   474   476   480   483   484   486
+CLOSEMEMFILE                81   493   585
+CNFNUPDATE                 335   578
+CNFNVERSION                309   537
+CO                         472   477   479   482   484   486
+CRLF                       139   349   364   369   384   395   405   410   413   430   437   482   482   485   515   530
+                           538   549   558   567   572   592
+CV6STR                      42    42
+CVASC                      143
+CVASTR                     139
+CVD                        452   569   569   571   571
+CVS                         40    73   208   209   223   228   283   452   598
+CVSIX                      608   609
+DASHES                     154   179   482
+DOWNTO                     406
+E                          472   474   476   477   479   480   481   484   595   597   598
+ENTER                      479   598
+EOF                        216   219   220   220   223   224   224
+EQU                        179   207   480   509   510   569
+FILENAME                    69    71
+FIND                       301   318   320   322   348   358   362   368   377   383   392   399
+FLAG                       216   221   224   224
+FNAME                      312   314   315   319   321   323   338   340   341   342   343   344   355   359   363   375
+                           378   390   393   424   426   427   428   429
+GETBREAK                   236   237   238   239   293   294   295   466   467
+GETCHAN                    219   474   477   597
+GETFORMAT                  281
+GETMAP                      85   100
+H                           95    96    97    98    99   100
+HRLI                       605
+HYPTAB                     290   294
+I                           83    88    89   251   252   253   254   255   261   268   272   275   283   337   406
+ICHAN                      311   315   318   328   337   341   342   347   367   382   398   409   415   423   427   431
+                           435   439
+INCHWL                     514   547
+INCR                        47    55   456
+INI                         37    44
+INIBREAK                   234   241
+INPUT                      480   483   484
+JRST                       607
+KEQU                       436   436   581   582   583   583
+L                          433   435   436   436   437
+LASTMAJ                    160   175   180   181   475   480   481
+LOOKUP                     223   476
+
+MONED1.SAI                User defined Screated 01-Jul-86 02:05                                          Page 18
+Cross Reference                         by CRFSYM %5 at 18-Sep-86 20:06
+
+M                          301   304
+MAJ1                       173   175   187   197   201   205
+MAJVER                     159   175   184   185   199   200   205   207   539   549   557   582   583
+MAP1                        67    86    95    97    98   109   111   137   139   141   143
+MAP1CR                      96
+MAPRW                       93   110   138   142
+MEMCHAN                     62    71    72    72    73    74    88    90   100
+MEMPAGES                    67    77    84    85    86    86    98    99   109   109   111   137   137   139   141   141
+                           143
+MEMPTR                      65   108   109   110   111   112   112   122   124   199
+MEMSIZE                     63    74    76    76
+MEMUPDATE                  444   584
+MEMVER                      64   208   209   217   223   223   224   225   226   226   228
+MIN1                       173   175   193   196   201   204
+MINVER                     158   175   190   191   199   200   204   208   208   209   209   539   545   546   548   555
+                           581   583
+MNB1                       232   236   255
+MNB2                       232   237   252
+MNB3                       232   238   253
+MNB4                       232   239   254
+MONPARSE                   243   449   475   478   545   565   588
+MORE                       338   398   399
+MOVE                       272
+MOVEI                      604
+MOVEM                      275
+MSGUPDATE                  421   579
+MYSYS                       36    40   509   509   510   510   513   515   520   525
+NAMEMEM                    213   494   529
+NEXTSYSID                  259   394
+NOMEM                      506   535   539   556   568   580
+NSYSID                     338   394   395   405
+OCHAN                      337   343   344   349   351   360   364   369   371   379   384   386   395   400   405   410
+                           413   415   423   428   429   430   437   439
+OPEN                       219   474   477   597
+OPENMEMFILE                 69   494   531
+OPFILE                      71
+OSDATE                     338   367   368   371   377   379
+OSNAME                     338   347   348   351   357   358   360   362   364
+OSYSID                     338   382   383   386   392   395
+OUT                        484   599
+P                          118   121   125   127   128   128
+P10INI                     291   297
+PARSEMEM                   164   495   532
+PTR                         93    97   100   101
+Q                          446
+R!P                         67    95
+READLINE                   116   178
+READWORD                   105   123
+RELEASE                    227   486   486   600
+RUNBLK                     603   604   608
+S                           47    51    53    54    55    56   118   119   122   129   129   131   135   139   139   140
+                           143   144   144   150   153   154   173   178   179   179   179   180   180   181   182   182
+                           185   187   188   188   191   193   194   244   252   253   254   255   262   283   285   301
+                           303   304   312   322   324   326   326   329   338   347   349   351   351   357   360   360
+                           367   369   371   371   382   384   386   386   398   400   409   410   424   444   449   470
+                           478   482   482
+SCAN                       252   253   254   255
+SDATE                       36    41   335   379   404   404   405   421   430   488   578   579
+SEMTAB                     290   295
+SETBREAK                   236   237   238   239   293   294   295   466   467
+SETFORMAT                   39   176   218   282   284   447   596
+SNAME                      335   364   405   421   430   504   529   530   531   537   539   547   548   548   549   550
+                           561   563   563   563   564   564   564   565   570   578   579   581   582   583   583   584
+                           588
+SOS                        274
+STDATE                      41
+SUPERLABEL                 462   496   577
+SUPERMAJOR                 470   570
+SVCCMD                     505   589   592   593   599
+SYSID                      503   514   515   516   522   525   525   537   538   541   578   579   589   590
+SYSNO                      309   314   335   340   421   430
+TEXTFLAG                   172   174   183   189   195   201
+TEXTMAJ                    162   174   197   582
+TEXTMIN                    161   174   196   581
+TMPOUT                     593
+TTYUP                      508
+UI                          97   109   137   141
+
+MONED1.SAI                User defined Screated 01-Jul-86 02:05                                          Page 19
+Cross Reference                         by CRFSYM %5 at 18-Sep-86 20:06
+
+UNAME                       36    42   405   430   488
+UP                          86    98
+USERERR                     72    89   101   202   220   266   277   319   321   323   342   344   355   359   363   375
+                           378   390   393   429   481   533   541
+VER                        312   318   318   320   322   325   325   326
+VM$BASE                    268
+VM$MULTI                   264
+VM$READ                    315   341   427
+VM$WRITE                   343   428
+VMFILE                     264   315   341   343   427   428
+VMFREE                     279   328   415   415   439   439
+VMGETC                     268
+VMLINE                     318   347   367   382   398   409   435
+VMPMAP                     269
+VMTEXT                     349   351   360   364   369   371   379   384   386   395   400   405   410   413   430   437
+W                          107   111   113   118   123   124   127
+WRITEHEADING               150   452   456   457
+WRITELINE                  135   152   153   154   455   487   488   489   490   491   492
+  {@8×
