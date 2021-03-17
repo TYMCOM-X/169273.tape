@@ -1,0 +1,13 @@
+rtsym=rtsym 
+iosym=iosym 
+passym=passym 
+q10die=q10die 
+tmpcor=tmpcor 
+fioutl=fioutl 
+pasnew=pasnew 
+corout=corout 
+dumpio=dumpio 
+autoru=autoru 
+run=run 
+pasasm=pasasm 
+
