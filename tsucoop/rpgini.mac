@@ -1,0 +1,523 @@
+Title	RPGINI	Module to handle user's RPG.INI parameter file
+Subttl	....
+
+	Search	RPGUNV
+
+	Entry	GETPAR		; Lookup a parameter
+	Entry	SETPAR		; Set a parameter
+	Entry	WRTPAR		; Write the parameter file (RPG.TMP)
+	Entry	MAKINI		; Write the parameter file (RPG.INI)
+	Entry	SETPRO,ADDPRO	; Procedures
+	Entry	SETPTH,ADDPTH	; Path (DO command)
+	Entry	SETNSD,ADDNSD	; Non-Standard processors
+	Entry	SETRPG,SETDDT	; Special RPG or DDT
+	Entry	SETDFL		; Special default processor
+	Entry	PRCTRN
+	Entry	SETML		; Set mailbox
+	Entry	DOCMD		; Process the DO command
+
+	Intern	RPGPAR,MODPAR	; List pointer/length & modification flag
+
+	Extern	SCAN,SCANS,SCANHW,SWSCAN
+	Extern	SETRNF,TRANUN,GETNAM,TMNER,SYNERR
+	Extern	CPOPJ,CPOPJ1,XPAND,XIT
+
+	Extern	TMPFIL,JOBNAM,LOGPPN,SVJBFF,CORTOP
+	Extern	SVDEV,SVNAM,SVEXT,SVPPN,ALTRUN,ALTLOD,ACCUM
+
+	TWOSEG
+
+RPGPAR:	Block	1		; Address of RPGINI block
+MODPAR:	Block	1		; Whether to write RPGINI (-1) or not
+
+	Reloc	400000
+
+COMMENT %
+ROUTINES TO HANDLE RPG PARAMETER FILE
+
+THE RPG PARAMETER FILE, TMPCOR:RPG OR DSK:###RPG.TMP,
+CONSISTS OF A SERIES OF PARAMETER BLOCKS.	EACH BLOCK
+BEGINS WITH A HEADER WORD WHICH HAS THE FORMAT
+
+<TYPE>,,<LENGTH>
+
+WHERE <TYPE> IS A POSITIVE INTEGER SPECIFYING WHICH PARAMETER
+THE BLOCK IS FOR, AND <LENGTH> IS THE NUMBER OF DATA WORDS
+WHICH FOLLOW THE HEADER WORD.	ONLY ONE BLOCK
+OF EACH TYPE MAY APPEAR, AND THE LAST HEADER WORD IN THE FILE
+IS ZERO, INDICATING END OF FILE.
+
+THE PARAMETER FILE IS READ INTO CORE AT INITIALIZATION TIME,
+AND RPGPAR CONTAINS THE LOCATION OF THE FIRST WORD.	AS RPG
+RUNS, THE COPY OF THE FILE IN CORE MAY BE MODIFIED.	THIS
+IS DONE BY REPRESENTING THE FILE AS A LINKED LIST AS ENTRIES
+ARE ADDED OR DELETED.	WHEN THE FILE IS IN CORE, AN ADDITIONAL
+BLOCK TYPE -1 IS USED, WHICH INDICATES THAT THE <LENGTH>
+FIELD OF THE WORD IS A POINTER TO THE NEXT PART OF THE FILE.
+A LINK WILL ALWAYS CONTAIN AN ADDRESS GREATER THAN THE
+LOCATION CONTAINING THE LINK, AND THE ROUTINE WHICH COLLAPSES
+THE FILE INTO ITS DISK FORMAT DEPENDS ON THIS.
+%
+
+;ROUTINE TO LOOK UP A PARAMETER.	CALLED WITH T1=TYPE.
+;RETURNS SKIPPING WITH T2->BLOCK HEADER, T1->DATA BLOCK (T2+1).
+;NO SKIP IF NOT FOUND.
+
+GETPAR:	MOVE T2,RPGPAR	;GET PARAMETER POINTER
+GETPRL:	HLRE T3,(T2)	;GET BLOCK TYPE
+	JUMPE T3,CPOPJ	;RETURN IF NOT FOUND
+	JUMPL T3,[HRRZ T2,(T2)	;LINK, GET NEXT
+		JRST GETPRL]
+	CAMN T1,T3	;DOES IT MATCH DESIRED TYPE?
+	JRST GETPRR
+	ADD T2,(T2)
+	MOVEI T2,1(T2)	;NO, GO TO NEXT HEADER AND CONTINUE
+	JRST GETPRL
+GETPRR:	MOVEI T1,1(T2)	;YES, SET DATA POINTER AND SKIP RETURN
+	JRST CPOPJ1
+
+;ROUTINE TO SET A PARAMETER.	CALLED WITH T1=TYPE, T2=LENGTH,
+;AND T3=LOCATION OF DATA FOR PARAMETER.
+
+SETPAR:	PUSH P,T1	;-2(P)=TYPE
+	PUSH P,T2	;-1(P)=LENGTH
+	PUSH P,T3	;(P)=LOC OF DATA
+SETPRF:	PUSHJ P,GETPAR	;LOOK UP TYPE
+	JRST SETPRE	;NOT FOUND, T2 POINTS TO END OF FILE
+	ADD T1,(T2)
+	HRROM T1,(T2)	;FOUND, DELETE OLD ENTRY
+	MOVE T1,-2(P)	;GET TYPE BACK
+	JRST SETPRF	;GO BACK TO SET UP T2
+SETPRE:	SKIPN -1(P)
+	JRST SETPRX	;DONE IF LENGTH=0 (DELETED ENTRY)
+	HRRO T1,SVJBFF	;GET FIRST AVAILABLE WORD
+	MOVEM T1,(T2)	;SET UP LINK TO NEW BLOCK
+	ADD T1,-1(P)	;GET TOP OF NEW DATA BLOCK
+	MOVEI T1,2(T1)	;NEW FREE CORE LOC
+	PUSH P,SVJBFF
+	MOVEM T1,SVJBFF	;ALLOCATE IT
+	CAMLE T1,CORTOP
+	PUSHJ P,XPAND	;EXPAND CORE IF NECESSARY
+	POP P,T1	;GET BACK PTR TO OUR AREA
+	HRLZ T2,-2(P)
+	HRR T2,-1(P)	;SET UP HEADER WORD: TYPE,,LENGTH
+	MOVEM T2,(T1)	;PUT IN FILE
+	ADDI T1,1	;POINT TO DATA AREA
+	HRL T1,(P)	;SET UP BLT WORD
+	MOVE T2,SVJBFF	;JUST ABOVE TOP OF OUR AREA
+	BLT T1,-2(T2)	;MOVE DATA INTO FILE
+	SETZM -1(T2)	;ZERO TO TERMINATE
+SETPRX:	SUB P,[3,,3]	;POP PARAMETERS OUT OF STACK
+	SETOM MODPAR	;SHOW FILE HAS BEEN MODIFIED
+	POPJ P,
+
+;ROUTINE TO COLLAPSE AND WRITE OUT PARAMETER FILE.	CALLED
+;BEFORE RPG EXITS OR RUNS ANOTHER PROGRAM.
+
+MAKINI:	SETOM MODPAR	;WRITE TO RPG.INI
+	PUSHJ P,WRTINI
+	JRST XIT	;AND DONE (WILL NOT WRITE AGAIN)
+
+WRTPAR:	TDZA FLT,FLT	;FORCE TO 0
+WRTINI:	MOVEI FLT,1	;FORCE NON-ZERO FOR INI FILE
+	RESET		;CLOSE ALL I/O FIRST
+	AOSE MODPAR	;CHECK WHETHER FILE HAS BEEN MODIFIED
+	POPJ P,		;NO MODS OR ALREADY WRITTEN
+	MOVE T1,RPGPAR
+	MOVE T2,T1	;SET UP TO COLLAPSE LIST
+WRTPRL:	MOVE T3,T2	;TAKE MY WORD FOR IT THAT THIS ROUTINE DOES INDEED COLLAPSE THE LIST.	IT IS MUCH TOO OBSCURE TO COMMENT.
+WRTPRF:	HLRE T4,(T3)	; Get parameter block type
+	JUMPLE T4,WRTPRB; If -1, then it is a link -- skip
+	ADD T3,(T3)	; Else, Add length to point to end of block
+	MOVEI T3,1(T3)	; Adding 1 points to next block header
+	JRST WRTPRF	; Loop till find 0 type
+WRTPRB:	MOVE T4,T1	; Found end of current block so get start point
+	HRL T4,T2	; Copy start point of current data area
+	MOVE T5,T3	; Calculate the length
+	SUB T5,T2	;   of this contigious block set
+	ADD T5,T1	; Add in the beginning offset
+	BLT T4,(T5)	; Then copy into the data area
+	MOVE T1,T5	; Set new start for next block set
+	SKIPE T2,(T5)	; See if this was the end
+	JRST WRTPRL	; No-- a link, so repeat from link area
+	SUB T5,RPGPAR	;DONE COLLAPSING, GET LENGTH
+	MOVNI T5,1(T5)	;  (this is where blocks must be higher address)
+	HRLZ T5,T5	; Turn into an IOWD
+	HRR T5,RPGPAR	;   -Length ,, Address-1
+	SUBI T5,1	;SET UP IOWD FOR WRITING FILE
+	JUMPN FLT,WRTPDS; If non-zero we're writing RPG.INI, so use DSK
+	MOVEM T5,TMPFIL+1
+	MOVSI T4,'RPG'	; Else setup for TMPCOR  using TMP:RPG
+	MOVEM T4,TMPFIL
+	MOVE T1,[3,,TMPFIL]
+	TMPCOR T1,	;TRY TMPCOR FIRST
+	JRST WRTPDS	; No good -- Try DSK
+	POPJ P,		;IT WORKED, WHEW!
+WRTPDS:	INIT LOOK,17	;OH WELL, TRY DISK
+	SIXBIT/DSK/
+	0
+	HALT .
+	JUMPN FLT,[MOVSI T1,'RPG'
+		MOVSI T2,'INI'	;SET NAME
+		JRST WRTPD2]
+	MOVE T1,JOBNAM
+	HRRI T1,'RPG'	;SET UP FILE NME
+	MOVSI T2,'TMP'
+WRTPD2:	SETZ T3,
+	move t4,logppn	;use logged in directory
+	ENTER LOOK,T1
+	HALT .
+	MOVE T1,T5	;SET UP OUTPUT LIST
+	MOVEI T2,0
+	OUT LOOK,T1	;WRITE THE FILE
+	JRST .+2
+	HALT .
+	RELEAS LOOK,
+	POPJ P,
+
+;ROUTINE TO HANDLE SETPROCS COMMAND
+
+SETPRO:	PUSH P,SVJBFF	;(P) BEGINNING OF OUR SCRATCH AREA
+SPRLP:	PUSHJ P,SCAN	;SCAN PROCESSOR NAME
+	CAIN C,","
+	JRST SPRLP
+	TRNN FL,IDF
+	JRST SPREND
+	MOVEI T1,7
+	ADDB T1,SVJBFF	;WAS A NAME THERE, RESERVE SPACE
+	CAMLE T1,CORTOP
+	PUSHJ P,XPAND	;MAKE ROOM IF NECESSARY
+	MOVE T1,SVJBFF
+	MOVE T2,ACCUM
+	MOVEM T2,-7(T1)	;SAVE PROCESSOR NAME
+	PUSHJ P,SCAN
+	CAIE C,"="	;BETTER HAVE = AFTER NAME
+	JRST SYNERR
+	PUSHJ P,SETRNF	;CONVERT IT TO A RUN BLOCK
+	MOVE T1,SVJBFF
+	MOVSI T2,ALTRUN
+	HRRI T2,-6(T1)
+	BLT T2,-1(T1)	;MOVE INTO TABLE
+	JRST SPRLP	;GO FOR ANOTHER
+SPREND:	MOVEI T1,P.SPROC
+SPRND1:	TLNN CS,TERMF
+	JRST SYNERR	;BETTER HAVE ENDED RIGHT
+	POP P,T3	;START OF BLOCK
+	MOVE T2,SVJBFF
+	SUB T2,T3	;SIZE OF BLOCK
+	PUSHJ P,SETPAR	;SET UP PARAMETER BLOCK
+	JRST XIT	;ALL DONE
+
+ADDPRO:	MOVEI T1,P.SPROC
+	PUSHJ P,MOVEND	;MOVE OLD BLOCK TO END
+	 JRST SETPRO	;NO OLD BLOCK. TREAT LIKE SETPROC
+	JRST SPRLP	;GO
+
+MOVEND:	PUSHJ P,GETPAR	;GET OLD BLOCK
+	 POPJ P,		;NONE
+	PUSH P,SVJBFF
+	PUSH P,T1		;DATA LOCATION
+	HRRZ T1,(T2)	;SIZE
+	HRLM T1,(P)	;SAVE IT TOO
+	ADD T1,SVJBFF
+	CAMLE T1,CORTOP
+	PUSHJ P,XPAND
+	POP P,T1
+	MOVSS T1
+	HRRZ T2,T1	;SIZE
+	HRR T1,SVJBFF
+	ADDI T2,(T1)
+	MOVEM T2,SVJBFF
+	BLT T1,-1(T2)
+	POP P,T2	;THIS IS SAVE SVJBFF
+	EXCH T2,(P)	;RETURN WITH IT STACKED
+	JRST 1(T2)
+SETRPG:	PUSHJ P,SCANS	;PEEK AHEAD TO CHECK FOR NAME
+	TLNN CS,TERMF
+	PUSHJ P,SETRNF	;SET UP FILE NAME IF GIVEN
+	MOVEI T1,P.RPGRN
+	MOVEI T2,6
+	MOVEI T3,ALTRUN
+	SKIPN ALTRUN
+	MOVEI T2,0	;ZERO LENGTH (TO DELETE ENTRY) IF NO NAME
+	PUSHJ P,SETPAR	;SET UP SPECIAL RPG TO RUN
+	JRST XIT
+
+SETDDT:	AOBJP SVPT,TMNER
+	PUSHJ P,SCAN
+	TLNE CS,TERMF
+	JRST CLRDDT	;GET RID OF SPECIAL NAME
+	PUSHJ P,GETNAM
+	TLNN CS,TERMF
+	JRST SYNERR
+	MOVEI T1,4
+	ADD T1,SVJBFF
+	CAMLE T1,CORTOP
+	PUSHJ P,XPAND
+	MOVE T3,SVJBFF
+	MOVE T1,SVDEV(SVPT)
+	MOVEM T1,(T3)
+	MOVE T1,SVNAM(SVPT)
+	MOVEM T1,1(T3)
+	HLLZ T1,SVEXT(SVPT)
+	MOVEM T1,2(T3)
+	MOVE T1,SVPPN(SVPT)
+	MOVEM T1,3(T3)
+	MOVEI T2,4
+	MOVEI T1,4(T3)
+	MOVEM T1,SVJBFF
+CLRDT1:	MOVEI T1,P.DDT
+	PUSHJ P,SETPAR
+	JRST XIT
+
+CLRDDT:	MOVEI T2,0
+	JRST CLRDT1
+;TRNASLATE PROCESSORS. NAME IN T3. NON-SKIP, NO TRANS
+;SKIP RETURN HAS 1(T3) POINTING TO RUN BLOCK FOR PROCESSOR
+
+PRCTRN:	CAMN T3,[SIXBIT /LOADER/]
+	SKIPN ALTLOD	;ALTERNATE LOADER?
+	JRST NOTRN	;DO NOT TRANSLATE
+	MOVEI T3,ALTLOD-1
+	JRST CPOPJ1
+NOTRN:	MOVEI T1,P.SPROC
+	PUSH P,T3	;SAVE NAME
+	PUSHJ P,GETPAR
+	 JRST	[POP P,T3	;NO TRANSLATION
+		POPJ P,]
+	HRRZ T2,(T2)	;COUNT
+	IDIVI T2,7
+	POP P,T3	;NAME
+TRNLP:	CAMN T3,(T1)
+	JRST	[HRRZ T3,T1
+		JRST CPOPJ1]
+	ADDI T1,7
+	SOJG T2,TRNLP
+	POPJ P,
+
+SETML:	AOBJP SVPT,TMNER
+	PUSHJ P,SCAN
+	TLNE CS,TERMF
+	  JRST CLRMAL
+	PUSHJ P,GETNAM
+	TLNN CS,TERMF
+	  JRST SYNERR
+	MOVE T1,SVDEV(SVPT)
+	JUMPN T1,SYNERR		; NO DEVICE ALLOWED
+	MOVE T1,SVPPN(SVPT)
+	JUMPN T1,SYNERR		; NO PPN ALLOWED
+	MOVEI T1,6
+	ADD T1,SVJBFF
+	CAMLE T1,CORTOP
+	PUSHJ P,XPAND
+	MOVE T3,SVJBFF
+	MOVE T1,SVNAM(SVPT)
+	MOVEM T1,2(T3)		; SAVE FILENAME
+	MOVE T1,SVEXT(SVPT)
+	MOVEM T1,3(T3)		; SAVE EXTENSION
+	SETZM 4(T3)		; PRV WORD
+	HRROI T1,GETAUN
+	GETTAB T1,
+	  HALT .
+	MOVEM T1,1(T3)		; FILE ALWAYS ON HOME DIRECTORY
+	MOVEI T1,5		; NUMBER OF LOOKUP ARGUMENTS
+	MOVEM T1,(T3)
+	MOVEI T2,6		; LENGTH OF RECORD
+	MOVEI T1,6(T3)
+	MOVEM T1,SVJBFF		; NEW FREE-CORE PTR
+CLRML1:	MOVEI T1,P.MAIL
+	PUSHJ P,SETPAR		; SAVE IT IN CORE
+	JRST XIT
+
+CLRMAL:	MOVEI T2,0
+	JRST CLRML1
+SETNSD:	PUSH P,SVJBFF	;A LOT LIKE SETPRO
+SNSLP:	PUSHJ P,SCAN
+SNSLP1:	CAIN C,","
+	JRST SNSLP
+	TLNE CS,TERMF
+	JRST SNSEND	;FINISHED
+	MOVEI T1,10
+	ADDB T1,SVJBFF
+	CAMLE T1,CORTOP
+	PUSHJ P,XPAND
+	PUSHJ P,GETNAM
+	MOVE T1,SVJBFF	;NOW TO STORE
+	MOVE T2,SVDEV(SVPT)
+	MOVEM T2,-5(T1)	;DEVICE
+	MOVE T2,SVPPN(SVPT)
+	MOVEM T2,-6(T1)	;PPN
+	MOVE T2,SVEXT(SVPT)
+	MOVEM T2,-7(T1)	;EXT
+	MOVE T2,SVNAM(SVPT)
+	MOVEM T2,-10(T1)	;NAME
+	MOVEM T2,-4(T1)	;USE AS SWITCH IF NO OTHER GIVEN
+	HLLZM T2,-3(T1)	;AND AS EXTENSION
+	SETZM -2(T1)	;NO NEXT PROCESSOR
+	SETZM -1(T1)	;AND OUTPUT EXTENSION (WILL USE REL)
+NSDSL1:	PUSHJ P,SCAN
+	TRNN FL,IDF	;IS THERE AN IDENT THERE?
+	JRST SNSLP1	;NO, LOOK FOR COMMA SEPERATING
+	MOVE T1,[-NSTBS1,,NSWTAB]
+	PUSHJ P,SWSCAN
+	 JRST SYNERR
+	 JFCL		;EXACT AND PARTIAL MATCH THE SAME
+	MOVEI T2,NSWTB2-NSWTAB(T1)	;GET DISPATCH
+	PUSHJ P,SCAN
+	CAIE C,"="
+	 JRST SYNERR
+	PUSHJ P,SCAN
+	TRNN FL,IDF
+	JRST SYNERR
+	MOVE T1,SVJBFF
+	MOVE T3,ACCUM
+	XCT (T2)	;NOW DO IT
+	JRST NSDSL1	;LOOK FOR MORE
+
+DEFINE TABLE
+<SWITCH SWITCH,<MOVEM T3,-4(T1)>
+SWITCH EXTENSION,<HLLZM T3,-3(T1)>
+SWITCH NEXT,<HLLZM T3,-2(T1)>
+SWITCH OUTPUT,<HLLZM T3,-1(T1)>>
+
+TBGEN(NSWTAB,NSTBS1,NSWTB2)
+SNSEND:	MOVEI T1,P.NSD
+	JRST SPRND1
+
+ADDNSD:	MOVEI T1,P.NSD
+	PUSHJ P,MOVEND
+	 JRST SETNSD
+	JRST SNSLP
+
+SETDFL:	PUSHJ P,SCAN
+	TLNE CS,TERMF
+	JRST CLRDFL
+	TRNN FL,IDF
+	JRST SYNERR
+	MOVEI T1,P.DEF
+	MOVEI T3,ACCUM
+	MOVEI T2,1
+	PUSHJ P,SETPAR
+	JRST XIT
+
+CLRDFL:	MOVEI T1,P.DEF
+	MOVEI T2,0
+	PUSHJ P,SETPAR
+	JRST XIT
+docmd:	pushj	p,setrnf
+	skipe	svppn(svpt)	;did he specify a PPN anyway?
+	 jrst	dothis		;then go do specified file
+	movei	t1,p.path	;get the list of ppns to try
+	pushj	p,getpar	;go find run path
+	 movei	t1,defpth	;no path set, use the default path
+	hrrz	t2,-1(t1)	;pick up the length
+	idivi	t2,3		;figure out how many entries
+docmdl:	move	t3,(t1)		;get a ppn to try
+	cain	t3,1		;1 is a special value (login PPN)
+	 move	t3,logppn
+	movem	t3,altrun+4	;store ppn from this entry
+	sojle	t2,dothis	;if this is the last entry, must go
+	movei	t4,altrun	;set up t4 for the run
+	run	t4,		;attempt to run the program
+	addi	t1,3		;run failed, advance pointers
+	jrst	docmdl		;and try another ppn
+
+dothis:	movei	t1,altrun	;try one final time
+	run	t1,		;but in no case should we return
+	halt			;so let system give error message
+
+
+	xwd	p.path,9	;simulated path block in case none set
+
+defpth:	0			;first try system default (GFD)
+	SIXBIT /DEFAUL/
+	SIXBIT /T/
+
+	1			;then try logged in directory
+	SIXBIT /LOG/
+	0
+
+	xwd	1,4		;then use SYS
+	sixbit	/SYS/
+	0
+
+addpth:	movei	t1,p.path	;get current path block
+	pushj	p,movend	;to end of store, push base on
+				;on stack and skip.  If no old
+				;then stack is normal, do setpath
+setpth:	push	p,svjbff	;top of stack is base of list
+	pushj	p,scans		;peek at next non-null character
+	cain	c,"="		;skip over "=" if present
+	 pushj	p,scan		;by removing it from buffer
+pathlp:	pushj	p,scan		;grab another thing from terminal
+	cain	c,"["
+	 jrst	patppn		;try for [gan,uun]
+	cain	c,"("
+	 jrst	patopn		;try for user name
+	trnn	fl,idf		;perhaps an identifier
+	 jrst	pthend		;nope, must be end of line
+	jumpn	c,synerr	;must be log or default, else error
+	move	t4,accum
+	move	t5,accum+1
+	camn	t4,[sixbit /LOG/]
+	 jrst	patlog
+	camn	t4,[sixbit /DEFAUL/]	;did he say default
+	came	t5,[sixbit /T/]
+	camn	t4,[sixbit /DEF/]	;or DEF
+	 jrst	patdef		;so he did, use it
+				;well, lets be nice and try for
+				;a user name, rather than complaining
+patusr:				;attempt to use user name in t4,t5
+	pushj	p,tranun	;and go translate it into ppn
+patsto:				;have a new entry in t3,t4,t5, use it
+	movei	t1,3		;length of new entry
+	addb	t1,svjbff	;add it in
+	camle	t1,cortop	;will we pass top of core ?
+	 pushj	p,xpand		;yes, go get more (only t1,t2 changed)
+	move	t1,svjbff	;pick up top of new space
+	movem	t3,-3(t1)	;save 3 word entry (ppn,name)
+	movem	t4,-2(t1)
+	movem	t5,-1(t1)
+	pushj	p,scans		;sneek a look for a comma
+	cain	c,","
+	 pushj	p,scan		;and remove it if its there
+	jrst	pathlp		;loop until no more entries
+
+pthend:	tlnn	cs,termf	;make sure we ended properly
+	 jrst	synerr
+	movei	t1,p.path
+	jrst	sprnd1		;go store current block as type p.path
+
+patdef:	tdza	t3,t3		;default should be taken
+patlog:	movei	t3,1		;use logged in PPN
+	jrst	patsto
+
+patopn:	pushj	p,scan		;read in user name
+	trnn	fl,idf		;make sure it was an ident
+	 jrst	synerr
+	push	p,accum		;save user name
+	push	p,accum+1
+	pushj	p,scan		;and make sure we have a matching close
+	caie	c,")"
+	 jrst	synerr
+	pop	p,t5		;put user name into acs
+	pop	p,t4		;as argument
+	jrst	patusr		;and go use it
+patppn:	pushj	p,scanhw	;get first part of gan,uun
+	push	p,t1		;save first half
+	pushj	p,scan
+	cain	c,"]"		;form was [number], use it (0 or 1)
+	 jrst	patpp1
+	caie	c,","		;otherwise must use gan,uun format
+	 jrst	synerr
+	pushj	p,scanhw	;read second part
+	hrl	t1,(p)		;get left half (former number)
+	movem	t1,(p)		;and store full ppn
+	pushj	p,scan		;and now get closing square
+	caie	c,"]"		;make sure it is there
+	 jrst	synerr
+patpp1:	pop	p,t3
+	setzb	t4,t5		;clear name part (since PPN specified)
+	jrst	patsto
+	End
+ 
