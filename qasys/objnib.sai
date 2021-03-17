@@ -1,0 +1,297 @@
+BEGIN "OBJNIB"   COMMENT  Prog to convert CONCURRENT PASCAL E-code
+                          to NAD image-binary format for downline
+                          loading of ISIS slot   ;
+
+COMMENT  Program source in directory EPASCAL (master sys 39).
+
+Revision history -
+
+Version 1.5 Added Product Identification at run time. MDS 10/11/83
+
+Version 1.4 Set Virtual Address undefined bit 15 June 83 MDS
+	Also, default load address changed back to 20000 (??)
+
+Deleted file confirmations & print out correct record count 24sep80  ebs
+
+Changed block size to 32k bytes   23 sept 80   ebs
+
+Added 30000 as default for code loading address July 11 '80 MDS
+
+Original code  September '78 MDS
+
+         Refer to the document 'NIB.DOC' which may be found in
+         an 'ISIS' account on various machines for a description
+         of the output file format of this program. We are not
+         currently putting out compressed data.
+         The input file is simply a word stream of data, each word
+         containing 4 8-bit characters left justified. Four unused
+         bits are at the right end of each word.
+;
+COMMENT  Following is a description of the purpose of program variables.
+
+IMAGE     - The IMAGE array is used to build each succesive data
+            record.
+IDRECORD  - The IDRECORD array is used to build up the header
+            record, containing a sub-array which is a list of
+            pointers to the data records.
+FILEINF   - The FILEINF array is the target for a FILEINFO operation
+            to retrieve the file name and extension for prettying
+            up the header.
+INNAME    - contains the name of the input file.
+OUTNAME   - contains the name of the output file.
+BREAKCHAR - unused except to permit file opening.
+PCODEWORD - current word from input file.
+PCODECHAR - current character extracted from input (PCODEWORD).
+CHARCOUNT - number of characters remaining to be extracted from
+            PCODEWORD.
+HPOS      - used by the debugging routine 'SHOWCHAR' - current line
+            cursor position (horizontal).
+LNIBBLE   - left 4-bits of PCODECHAR.  ('SHOWCHAR')
+RNIBBLE   - right 4-bits of PCODECHAR.
+MIRX      - index of next available word in IMAGE array.
+BYTEX     - index (0-3) of where to put next outgoing character
+            into the outgoing data word.
+BCNT      - current no. of characters in current IMAGE array.
+BLOCKX    - block address of next record to be output. (N.B. -
+            NAD expects this field to be one less than the actual
+            PDP10 logical block addr. )
+HEADX     - block address of current header record, init = 0.
+VADX      - ENGINE virtual memory address that the current
+            output record should load into.
+PADX      - ENGINE physical memory address that the current
+            output record should eventually load into.
+IDRX      - next word in ID record to store an IMAGE record header.
+TOTALCHARS - total number of character (bytes) seen on input.
+;
+
+DEFINE INFILE = 1;  DEFINE INCOUNT = 100 ;
+DEFINE INMODE = 8;  DEFINE INBUFNO =2 ;
+DEFINE OUTMODE = '16 ;
+DEFINE OUTBUFNO = 0;
+DEFINE MIRSIZE ='17777;  DEFINE IDSIZE ='177;
+DEFINE BLOCKINCR ='100;
+DEFINE CRLF = "'15&'12";
+DEFINE MIRID = '100000000000;  DEFINE IDID = '040000000000;
+INTEGER  BREAKCHAR, PCODEWORD, PCODECHAR, CHARCOUNT
+         , HPOS, LNIBBLE, RNIBBLE, MIRX, BYTEX, RECORDX
+         , BCNT, BLOCKX, VADX, PADX, IDRX, TOTALCHARS, HEADX
+         , OUTFILE
+;
+STRING   INNAME,OUTNAME,ANSWER
+;
+BOOLEAN   INFLAG, INFILEEND, OUTERROR, OUTFLAG,  TRACE
+;
+INTEGER ARRAY IMAGE[0:MIRSIZE]
+             ,IDRECORD[0:IDSIZE]
+             ,FILEINF[0:5]
+;
+
+COMMENT  Routine to pretty up header records with filename
+         author and date   ;
+PROCEDURE PRETTYID;   BEGIN "PRETTYID"  INTEGER X;
+IDRECORD[2]_CALLI(X,'14);   COMMENT date ;
+IDRECORD[3]_CALLI(X,'23);   COMMENT time ;
+IDRECORD[6]_FILEINF[0];     COMMENT  filename ;
+IDRECORD[7]_FILEINF[1] LAND '777777000000;  COMMENT  extension ;
+IDRECORD['10]_CVSIX("PASCAL");    COMMENT author ;
+END "PRETTYID";
+
+
+
+COMMENT  Logic to flush current header when it is full and allocate
+         a fresh new one. Header blocks are mixed among the data
+         blocks, we just grab BLOCKX for an unused block addr. and go ;
+PROCEDURE NEWIDREC; BEGIN "NEWIDREC"
+IDRECORD[0]_IDID LOR (HEADX LSH 20);  IDRECORD[1]_-1;
+
+COMMENT  build link to new header   ;
+IDRECORD['177]_BLOCKX;
+PRETTYID;
+USETO(OUTFILE,HEADX+1);  ARRYOUT(OUTFILE,IDRECORD[0],IDSIZE+1);
+
+COMMENT  steal next block for new header ;
+HEADX_BLOCKX;  BLOCKX_BLOCKX+BLOCKINCR;
+RECORDX_RECORDX+1;
+ARRCLR(IDRECORD);  IDRX_'12;
+END "NEWIDREC";
+
+
+
+COMMENT  add record indices to ID record ;
+PROCEDURE PUTINDEX; BEGIN "PUTINDEX"
+IF IDRX>'175 THEN NEWIDREC;
+IDRECORD[IDRX]_IMAGE[0];  IDRECORD[IDRX+1]_IMAGE[1];
+IDRX_IDRX+2;
+END "PUTINDEX";
+
+
+
+COMMENT  handle logic to dump out current image array as a record.
+         build word 0 and 1. enter word 0 and 1 in ID record.
+         maintain engine memory load addr (VADX) and current block
+         counter (BLOCKX).  ;
+PROCEDURE PUTRECORD; BEGIN "PUTRECORD"
+COMMENT  for now we want PADX to be the same as VADX all cases ;
+PADX_VADX;
+IMAGE[0]_MIRID LOR (BLOCKX LSH 20) LOR PADX;
+
+COMMENT Force Virtual Address Undefined bit ON next, version 1.4;
+IMAGE[1]_(BCNT LSH 21) LOR VADX LOR (1 LSH 20);
+
+USETO(OUTFILE,BLOCKX+'1);  ARRYOUT(OUTFILE,IMAGE[0],MIRSIZE+1);
+VADX_VADX+BCNT;  BCNT_0;  BLOCKX_BLOCKX+BLOCKINCR;
+RECORDX_RECORDX+1;
+PUTINDEX;
+END "PUTRECORD";
+
+
+
+COMMENT  procedure to put a word of the memory image array into
+         the output record. When the record is full we flush it   ;
+PROCEDURE PUTWORD; BEGIN "PUTWORD"
+IF MIRX = MIRSIZE THEN BEGIN
+                  PUTRECORD; MIRX_1;
+                  END;
+MIRX_MIRX+1;
+END "PUTWORD";
+
+
+
+COMMENT  procedure to output a character .. 1st into a word in
+         the memory image array   ;
+PROCEDURE PUTCHAR; BEGIN "PUTCHAR"
+IF BYTEX=4 THEN BEGIN
+           PUTWORD; BYTEX_0; IMAGE[MIRX]_0;
+           END;
+IMAGE[MIRX]_IMAGE[MIRX] LOR (PCODECHAR LSH ((3-BYTEX)*9));
+BCNT_BCNT+1;
+BYTEX_BYTEX+1;
+END "PUTCHAR";
+
+COMMENT  procedure (temp) to display PCODE characters as input ;
+PROCEDURE SHOWCHAR; BEGIN "SHOWCHAR"
+LNIBBLE_PCODECHAR LSH -4;
+RNIBBLE_PCODECHAR LAND '000000000017;
+IF LNIBBLE<10 THEN LNIBBLE_LNIBBLE+48 ELSE LNIBBLE_LNIBBLE+55;
+IF RNIBBLE<10 THEN RNIBBLE_RNIBBLE+48 ELSE RNIBBLE_RNIBBLE+55;
+IF (HPOS MOD 5) = 0 THEN BEGIN
+          HPOS_HPOS+1; PRINT(" ");
+          END;
+IF HPOS>80 THEN BEGIN
+           HPOS_1; PRINT(('15&'12&'12)); 
+           END;
+PRINT(LNIBBLE&RNIBBLE); HPOS_HPOS+2;
+END "SHOWCHAR";
+
+
+
+COMMENT  procedure to return next character from PCODE
+         the 8-bit character is returned right-justified in the
+         variable 'PCODECHAR'.
+         IF INFILEEND THEN 'PCODECHAR' IS MEANINGLESS.
+;
+PROCEDURE GETCHAR; BEGIN "GETCHAR"
+IF CHARCOUNT=0 THEN BEGIN
+    PCODEWORD_WORDIN(INFILE);
+    CHARCOUNT_4;
+    END;
+IF NOT INFILEEND THEN BEGIN
+    PCODECHAR_(PCODEWORD LAND '776000000000) LSH -28;
+    COMMENT  leftmost 8 bits put in PCODECHAR and shifted to far right;
+    PCODEWORD_PCODEWORD LSH 8;
+    COMMENT  next 8 bits moved to left end of PCODEWORD;
+    CHARCOUNT_CHARCOUNT-1;
+    TOTALCHARS_TOTALCHARS+1;
+    END;
+END "GETCHAR";
+
+
+
+COMMENT  routine to put out the header block (ID record)
+         at end-of-job   ;
+PROCEDURE PUTIDREC;  BEGIN "PUTIDREC"
+IDRECORD[0]_IDID;
+IDRECORD[1]_-1;
+RECORDX_RECORDX+1;
+PRETTYID;
+USETO(OUTFILE,HEADX+1);
+ARRYOUT(OUTFILE,IDRECORD[0],IDSIZE+1);
+END "PUTIDREC";
+
+
+
+COMMENT  routine to display results at end-of-job.   ;
+PROCEDURE DONE; BEGIN "DONE"
+IF BCNT>0 THEN PUTRECORD;   COMMENT flush last (partial block) ;
+PUTIDREC;   COMMENT put out the header ID record    ;
+PRINT(CRLF&CRLF); PRINT("Total bytes input: "&CVS(TOTALCHARS));
+PRINT(CRLF); PRINT("Total records output: "&CVS(RECORDX));
+END "DONE";
+
+
+
+COMMENT  get and checkout the E-code engine loading address  ;
+PROCEDURE GETLOADADDR;  BEGIN "GETLOADADDR"
+STRING DIGIT; INTEGER J,DUMMY; BOOLEAN VALID;
+DO BEGIN
+   PRINT("Hex value of E-code load address (Default 20000) : ");
+   ANSWER_INCHWL;  VALID_TRUE;
+   IF DUMMY_LENGTH (ANSWER) = 0 THEN ANSWER_"20000" ;
+   WHILE DUMMY_LENGTH(ANSWER)>0 DO
+      BEGIN
+      DIGIT_LOP(ANSWER); J_DIGIT;
+      IF J<'60 OR J>70 THEN VALID_FALSE;
+      IF J<65 AND J>'71 THEN VALID_FALSE;
+      IF J<65 THEN J_J-'60 ELSE J_J-55;
+      VADX_16*VADX+J;
+      END;
+   END
+   UNTIL VALID;
+END "GETLOADADDR";
+
+COMMENT  here begins the mainline code  *************** ;
+COMMENT  identify ourselves ;
+PRINT ("PASCAL E-code to NAD image binary converter - Version 1.5"&'15&'12);
+PRINT ("                Product ID is 006F"&'15&'12);
+
+COMMENT  suitable initializations of stuff   ;
+TRACE_FALSE; OUTFILE_2;  HEADX_0;  PADX_0;
+HPOS_1;  CHARCOUNT_0;  IDRX_'12;  BLOCKX_1;  MIRX_2;  BYTEX_0;
+IMAGE[MIRX]_0; RECORDX_0;
+
+COMMENT  code to open channel and suitable files ;
+SETBREAK(1,'15,NULL,"INA");
+OPEN(INFILE,"DSK",INMODE,INBUFNO,0,INCOUNT,BREAKCHAR,INFILEEND);
+OPEN(OUTFILE,"DSK",OUTMODE,0,OUTBUFNO,0,BREAKCHAR,OUTERROR);
+
+COMMENT  get file name, try to open it  ;
+PRINT("Concurrent PASCAL OBJECT <input> file : "); INNAME_INCHWL;
+LOOKUP(INFILE,INNAME,INFLAG);
+WHILE INFLAG DO BEGIN
+     PRINT(INNAME&" not found. Respecify input : ");
+     INNAME_INCHWL; LOOKUP(INFILE,INNAME,INFLAG);
+     END;
+IF NOT INFLAG THEN 
+     BEGIN
+        PRINT("NAD <output> file name : "); OUTNAME_INCHWL;
+        LOOKUP(OUTFILE,OUTNAME,OUTFLAG);
+		OUTFLAG_FALSE;
+     ENTER(OUTFILE,OUTNAME,OUTFLAG);
+     IF OUTFLAG THEN PRINT("error on open "&OUTNAME) ELSE
+          BEGIN
+          FILEINFO(FILEINF);  COMMENT get filename from sys ;
+          GETLOADADDR;
+          GETCHAR;
+          WHILE NOT INFILEEND DO  COMMENT do record transmogrification ;
+              BEGIN
+              PUTCHAR;
+              GETCHAR;
+              END;
+          DONE;
+          END;
+     END;
+
+COMMENT   code to close the files ;
+CLOSE(INFILE);  CLOSE(OUTFILE);
+END "OBJNIB";
+  
