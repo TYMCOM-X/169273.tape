@@ -1,0 +1,1232 @@
+Entry	S!Init, S!BDate, S!Scan, S!Str,
+	S!IUser, S!XUser, S!IProg, S!XProg,  S!XOwner,
+	S!INode, S!XNode, S!IPort, S!XPort,
+	S!Job, S!Node, S!Port, S!Opr, S!Tru;
+
+begin "stream scanning module"
+
+  require "(sailib)sail.def" source!file;
+  require "(sailib)maprd.req" source!file;
+
+  !			*********************
+  !			**   S T R E A M   **
+  !			*********************
+  !
+  !  A set of routines to make scanning the stream accounting a bit easier.
+  !  Calling sequences are documented in STREAM.REQ, which also contains the
+  !  'require' of this module as a library.
+  !
+  !  Edit History
+  !   4-Dec-81 DWS  Created from void, with much plagiarism from SCAN.SAI.
+  !   9-Dec-81 DWS  1. Keep login records around in an internal array.
+  !		    2. Add routines to return node, port for a given job.
+  !		    3. Make most of the formatting routines internal.
+  !		    4. Scan until we run out of days or can't find five
+  !		       consecutive files.
+  !   ?-Dec-81 WRS  1. Pass the stream record when calling the user daemon.
+  !		    2. If not running silently, tell us what file we're
+  !			reading as we open it.
+  !   7-Jan-82 DWS  Mapped I/O.
+  !  10-Jan-82 DWS  Handle 0 length files correctly when mapping.
+  !  27-Jan-82 DWS  1.  User may supply page to scan.
+  !		    2.  Keep track of last OPR name a job uses.
+  !		    speed things up even more.
+  !   3-Mar-82 DWS  Modify to use the MAPRD mapped input system.
+  !  25-Mar-82 WRS  1. defined new type '44 (TATTLE)
+  !		    2. changed old TATTLE ('17) to fake new one
+  !		    3. new constant TypMax replaces '43 in source
+  !  21-Jul-82 LFL  Changed def of Local!Zone to include daylight savings.
+  !  23-Nov-82 LFL  1. added type '41 (CHKPNT)
+  !                 2. read in entire record
+  !   7-May-84 WRS  Added CvTru to convert TRUs to long real.
+  !  28-May-86 WRS  Changed size of node name array.
+  ! ;
+
+  define DEBUG = false;
+
+  define rh( x ) = {((x) land '777777)},
+	 lh( x ) = {((x) lsh -18)};
+
+
+
+  ! We have to keep track of what we're running on. F3's can't do
+  ! some of the double precision stuff needed for TRU calculations. ;
+
+  own string CPUType;
+  integer SAT!Eof, Consecutive!Misses;
+  integer StreamVPageNum, SATPage, StreamPageAddr, SATWord;
+  integer SATLength, SATPages;
+  integer Day, Month, Year, DaysAdvanced, DaysToAdvance, EndDate;
+
+  integer GMT, Local!Zone, Jiffies;
+
+  define TypeMax = '44;
+
+  preload!with		null,
+	"RUN",		"EXIT",		"NEXIT",	"SETNAM",
+	"START",	"REENTER",	"DDT",		"PJC",
+	"XCHARGE",	"INIT",		null,		"PUTLSA",
+	"SETLIC",	"SETE",		"RUNLIC",	"TRANSACTION",
+	null,		null,		"CREAUX",	null,
+	null,		null,		null,		null,
+	null,		null,		null,		null,
+	null,		null,		null,		null,
+	"LOGIN",	"CHKPNT",	"LOGOUT",	null,
+	"TATTLE";
+  string array Type!Name[ -1 : TypeMax ];
+
+  preload!with	false,
+    [10]true,false,[6]true,false,true,[13]false,true,false,true,false,true;
+  boolean array Type!Flag[ -1 : TypeMax ];
+
+  ! a stream record and associated information extracted therefrom. ;
+
+  own safe integer array Rec[ 0 : 29 ];
+  own integer Rec!Type, Rec!Len, Rec!Job;
+
+  own integer Rec!Type!Pnt, Rec!Len!Pnt, Rec!Job!Pnt;
+  own integer Rec!Node!Pnt1, Rec!Node!Pnt2, Rec!Port!Pnt;
+  own integer Rec!TID!Pnt;
+
+  ! per job data ;
+
+  define JOBMAX = 128;
+  own integer array Job!Node[ 0 : JOBMAX ];
+  own integer array Job!Port[ 0 : JOBMAX ];
+  own string array Job!OpNam[ 0 : JOBMAX ];
+
+  ! Node map storage. ;
+
+  define NODEMAPSIZE = 4096;
+  own integer Node!Map!Size;
+  own integer array Node!Map[ 1 : NODEMAPSIZE ];
+  own string array Node!Name[ 1 : NODEMAPSIZE ];
+
+  ! The LRU PPN/UserName cache.  Prevents needless queries of the DUL ;
+
+  define CACHESIZE = 250;
+  own integer Cache!Sequence;				! cache serial # ;
+  own safe integer array Cache!Seq[ 1 : CACHESIZE ];
+  own safe integer array Cache!PPN[ 1 : CACHESIZE ];
+  own safe string array Cache!User[ 1 : CACHESIZE ];
+
+  ! DUL stuff ;
+
+  own integer DUL, DUL!EOF, DUL!Block!Number;
+  own integer array DUL!Block[ 0 : 127 ];
+! Inclusion/exclusion stuff ;
+
+  ! Inclusion/exclusion by record type.  This gets set at init time to
+  ! match Type!Flag[].  I!Type!Flag tells if any inclusion/exclusions
+  ! have yet been done. ;
+
+  own boolean array I!Type[ -1 : TypeMax ];
+  own boolean I!Type!Flag;
+
+  ! inclusion/exclusion by user name.  (name gets translated to ppn).
+  ! a non-zero index into the include table implies non-wildcarding.
+  ! PPN inclusion/exclusion also uses this table.
+  ! NOTE: zeroeth element is pointer to end of table ;
+
+  define TABLESIZE = 250;
+
+  own safe integer array I!User[ 0 : TABLESIZE ];
+  own safe integer array X!User[ 0 : TABLESIZE ];
+
+  ! inclusion/exclusion by program. ;
+
+  own safe integer array I!PrgPPN[ 0 : TABLESIZE ];
+  own safe integer array I!PrgNam[ 0 : TABLESIZE ];
+  own safe integer array X!PrgPPN[ 0 : TABLESIZE ];
+  own safe integer array X!PrgNam[ 0 : TABLESIZE ];
+
+  ! exclusion of program owners. ;
+
+  own boolean X!Owners;
+
+  ! Inclusion/exclusion by node and port. ;
+
+  own safe integer array I!Node[ 0 : TABLESIZE ];
+  own safe integer array X!Node[ 0 : TABLESIZE ];
+  own safe integer array I!Port[ 0 : TABLESIZE ];
+  own safe integer array X!Port[ 0 : TABLESIZE ];
+
+! Routine to convert a user name to a PPN by looking up the user's
+!  UFD and extracting the PPN.  In the special case where the user
+!  name is null, return our GFD'd PPN as found via gettab. ;
+
+internal simple integer procedure CVPPN( string UserName );
+  begin
+    own integer array lookupblock[ 0 : 5 ];
+    own integer chan, flag1, flag2;
+
+    arrclr( lookupblock );
+
+    if ( UserName = NULL ) then
+      return( call( '777777000002, "GETTAB" ) );
+
+    open( chan := getchan, "DSK", '17,0,0,flag1,flag1,flag1:=0 );
+    if ( flag1 ) then
+      begin
+	release( chan );
+	return( 0 );
+      end;
+    lookup( chan, "(" & UserName & ")******.***", flag2 );
+    fileinfo( lookupblock );
+    close( chan );  release( chan );
+    return( lookupblock[ 3 ] );
+  end;
+! Convert a PPN to a username.  Check first in the cache.  If not found
+!  go to the DUL and cache the result. ;
+
+simple string procedure CVUser( integer PPN );
+  begin
+    own integer i, hash, lowitem, lowvalue;
+    own string username;
+
+    Cache!Sequence := Cache!Sequence + 1;
+
+    for i := 1 upto CACHESIZE do
+      if ( Cache!PPN[ i ] = PPN ) then
+	begin
+	  Cache!Seq[ i ] := Cache!Sequence;	! record the hit ;
+	  return( Cache!User[ i ] );
+	end;
+
+! continued ... ;
+! continued ... ;
+
+    ! Didn't find the PPN in the cache.  Go to the DUL for it. ;
+
+    if ( DEBUG ) then
+      print( crlf,"[",cvos(lh(PPN)),",",cvos(rh(PPN)),"] -> " );
+
+    if ( DUL < 0 ) then
+      begin
+	open( DUL := getchan, "DSK", '16,0,0,DUL!EOF,DUL!EOF,DUL!EOF );
+	lookup( DUL, "DUL.SYS[1,4]", DUL!EOF );
+	if ( DUL!EOF ) then
+	  usererr( 0,0,"Can't access (SYS)DUL.SYS" );
+	DUL!Block!Number := -1;
+      end;
+
+    hash := PPN mod 101 + 1;
+    useti( DUL, hash );
+    if ( DUL!EOF ) then
+      begin
+	username := "[" & cvos(lh(PPN)) & "," & cvos(rh(PPN)) & "]";
+      end
+    else
+      begin
+	while true do
+	  begin "search DUL"
+	    if ( hash neq DUL!Block!Number ) then
+	      arryin( DUL, DUL!Block[ 0 ], 128 );
+	    DUL!Block!Number := hash;
+	    for i := 0 step 3 until 127 do
+	      begin "search block"
+		if ( DUL!Block[ i ] = PPN ) then done "search DUL"
+		else if ( DUL!Block[ i ] = 0 ) then done "search DUL"
+		else if ( DUL!Block[ i ] < 0 ) then done "search block";
+	      end "search block";
+	    hash := DUL!Block[ i ] land '777777 + 1;
+	    useti( DUL, hash );
+	  end "search DUL";
+      end;
+
+    if ( DUL!Block[ i ] ) then
+      begin
+	username := cvxstr( DUL!Block[ i+1 ] ) & cvxstr( DUL!Block[ i+2 ] );
+	while ( username[ inf for 1 ] = " " ) do
+	  username := username[ 1 for inf-1 ];
+	username := "(" & username & ")";
+      end
+    else
+      username := "[" & cvos(PPN lsh -18) & "," & cvos(PPN land '777777) & "]";
+
+    if ( DEBUG ) then
+      print( username, crlf );
+
+! continued ... ;
+! continued ... ;
+
+    ! Save this PPN and username in the cache, discarding the oldest entry. ;
+
+    lowitem := 1;  lowvalue := Cache!Seq[ 1 ];
+    for i := 1 upto CACHESIZE do
+      begin
+	if ( Cache!Seq[ i ] < lowvalue ) then
+	  begin
+	    lowitem := i;
+	    lowvalue := Cache!Seq[ i ];
+	  end;
+      end;
+    Cache!PPN[ lowitem ] := PPN;
+    Cache!User[ lowitem ] := username;
+    Cache!Seq[ lowitem ] := Cache!Sequence;
+
+    return( username );
+
+  end;
+! Convert a node number to a node name ;
+
+simple string procedure CVNode( integer Node );
+  begin
+    own integer i;
+    for i := 1 upto Node!Map!Size do
+      if ( Node < Node!Map[ i ] ) then
+	return( cvos( Node ) )
+      else if ( Node = Node!Map[ i ] ) then
+	return( Node!Name[ i ] );
+    return( cvos( Node ));
+  end;
+
+
+! Convert a node name to a node number ;
+
+simple integer procedure CVName( string Name );
+  begin
+    own integer i, node;
+    node := cvo( Name );
+    for i := 1 upto Node!Map!Size do
+      if ( kequ( Node!Name[ i ], Name )) then
+	return( Node!Map[ i ] );
+    return( node );
+  end;
+
+
+! Build a login string ;
+
+  own integer LSBreak;
+simple procedure LSBreakIni;
+  setbreak( LSBreak := getbreak, '15&";"&0,null,"sinkz" );
+require LSBreakIni initialization;
+
+simple string procedure LoginString;
+  begin
+    own integer i;  own string s;
+    s := null;
+    for i := 6 upto Rec!Len do s := s & cvastr( Rec[ i ] );
+    return( scan( s, LSBreak, i ));
+  end;
+! Routine to convert a RAD45 value stored in two integers into a string.
+! This code lifted almost directly from the old stream scanner. ;
+
+preload!with
+  " ","A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P",
+  "Q","R","S","T","U","V","W","X","Y","Z",",","-",".","/","0","1","2",
+  "3","4","5","6","7","8","9",":","*","'","$";
+safe integer array RadTable[ 0 : 45 ];
+
+string procedure CVR45( integer Nam1, Nam2 );
+  begin
+    own string s;
+    own integer XNam1, XNam2;
+
+    recursive procedure R45;
+      begin
+	integer p;
+	start!code
+	  label nampr;
+	  move 3,XNam1;
+	  move 4,XNam2;
+nampr:	  move 1,3;
+	  idivi 1,45;
+	  movem 2,3;
+	  divi 3,45;
+	  exch 3,4;
+	  exch 1,3;
+	  jumpe 1,nampr;
+	  movem 3,XNam1;
+	  movem 4,XNam2;
+	  movem 1,p;
+	end;
+	if ( XNam1 or XNam2 ) then R45;
+	s := s & RadTable[ p ];
+      end;
+
+    s := null;
+    XNam1 := Nam1;  XNam2 := Nam2;
+    if ( XNam1 or XNam2 ) then R45;
+    return( s );
+  end;
+! Convert a doubleword TRU entry to a floating point number. ;
+
+internal simple long real procedure CVTRU( reference integer R );
+  begin
+    own long real T;
+    if ( R land '777000000000 ) then
+      return( 0.0 );
+    start!code
+	dmove 1,R;
+	dmovem 1,T;
+	movsi 1,'276000;
+	iorm 1,T;
+	setzb 1,2;
+	dfad 1,T;
+	dmovem 1,T;
+    end;
+    return( T / 10000.0 );
+  end;
+! Date/Time conversion. ;
+
+preload!with
+  "jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec";
+safe string array Months[ 1 : 12 ];
+
+internal simple string procedure CVTime( integer UDT );
+  begin
+    own integer date, time, temp1, temp2;
+    own safe integer array cnv[ 0 : 2 ];
+    own string s;
+
+    cnv[ 0 ] := lh( UDT );
+    cnv[ 1 ] := rh( UDT ) * Jiffies;
+    cnv[ 2 ] := GMT lsh 18 + Local!Zone;
+    calli( location( cnv[0] ), -'55 );
+    date := cnv[ 0 ];
+    time := cnv[ 1 ] % Jiffies;
+
+    getformat( temp1, temp2 );
+    setformat( 2, 1 );
+    s := cvs( date mod 31 + 1 );
+    date := date % 31;
+    s := s & Months[ date mod 12 + 1 ];
+    date := date % 12;
+    s := s & cvs( date + 64 ) & " ";
+
+    s := s & cvs( time div 3600 ) & ":";
+    setformat( -2, 1 );
+    s := s & cvs( time div 60 mod 60 ) & ":" & cvs( time mod 60 );
+    setformat( temp1, temp2 );
+
+    return ( s );
+  end;
+
+! Initialize the module by clearing out various arrays, building byte
+!  pointers, and reading (TYMNET)NODES.MAP. ;
+
+internal procedure S!Init;
+  begin
+    integer map, eof, flag, i;
+
+    ! initialize variables ;
+
+    arrclr( Job!Node );  arrclr( Job!Port );
+    arrclr( Job!OpNam, NULL );
+    arrclr( Node!Map );  arrclr( Node!Name );
+    arrclr( Cache!Seq );  arrclr( Cache!PPN );  arrclr( Cache!User );
+    arrclr( I!User );  arrclr( X!User );  arrclr( I!PrgPPN );
+    arrclr( I!PrgNam );  arrclr( X!PrgPPN );  arrclr( X!PrgNam );
+    arrclr( I!Node );  arrclr( I!Port );
+    arrclr( I!Node );  arrclr( X!Node );
+
+    X!Owners := false;
+
+    arrtran( I!Type, Type!Flag );
+    I!Type!Flag := false;
+
+    DaysAdvanced := 0;  DaysToAdvance := 1000000;
+    Cache!Sequence := 0;
+    DUL := -1;
+
+    GMT := '400020;	! *** ??? should be '400040 ??? ;
+    Local!Zone := call( '777777000006, "GETTAB" ) lsh -28 land '77;
+    Jiffies := call( '000026000011,"GETTAB" );
+
+    ! build various byte pointers ;
+
+    Rec!Type!Pnt := point( 9, Rec[ 0 ], 8 );
+    Rec!Len!Pnt := point( 6, Rec[ 0 ], 35 );
+    Rec!Job!Pnt := point( 9, Rec[ 0 ], 17 );
+    Rec!Node!Pnt1 := point( 6, Rec[ 6 ], 19 );
+    Rec!Node!Pnt2 := point( 6, Rec[ 6 ], 27 );
+    Rec!Port!Pnt := point( 7, Rec[ 6 ], 35 );
+    Rec!TID!Pnt := point( 5, Rec[ 6 ], 11 );
+
+    ! find out what type of CPU we're on ;
+
+    case ( call( '000041000011, "GETTAB" )) of
+      begin
+	[1] CPUType := "KI";
+	[2] CPUType := "KL";
+	[3] CPUType := "KS";
+	[4] CPUType := "F3";
+	[else] CPUType := "?"
+      end;
+
+! continued ... ;
+! continued ... ;
+
+    ! read (TYMNET)NODES.MAP ;
+
+    open( map := getchan, "DSK", '14,4,0,0,0, eof );
+    lookup( map, "(TYMNET)NODES.MAP", flag );
+    i := 1;
+    if ( not flag ) then
+      begin
+	do begin
+	  integer NodeNumber;
+	  string NodeName;
+	  NodeNumber := wordin( map );
+	  NodeName := cvastr( wordin(map) ) & cvastr( wordin(map) );
+	  if NodeNumber neq 0 and length(NodeName) neq 0 then begin
+	      if i > arrinfo( Node!Map, 2 ) then begin
+		  print( "% Too many nodes in (TYMNET)NODES.MAP"& crlf );
+		  done;
+	      end;
+	      Node!Map[ i ] := NodeNumber;
+	      Node!Name[ i ] := NodeName;
+	      i := i + 1;
+	  end;
+	end until eof;
+      end
+    else
+      print( "% Can't read (TYMNET)NODES.MAP"& crlf );
+    close( map );  release( map );
+    Node!Map!Size := i - 1;
+
+  end;
+! Routine to set the start date ;
+
+internal simple procedure S!BDate( integer M, D, Y );
+  begin
+    Month := M;
+    Day := D;
+    Year := Y;
+  end;
+
+
+! Routine to set up the number of days to do ;
+
+internal simple procedure S!NDays( integer N );
+  begin
+    DaysToAdvance := N;
+  end;
+
+
+! Set the "ignore program owner's" bit. ;
+
+internal simple procedure S!XOwners;
+  X!Owners := true;
+! Add a user to the inclusion list ;
+
+internal simple boolean procedure S!IUser( string username );
+  begin
+    own integer  ppn;
+
+    if ( username = "(" ) then		! lop off parens ;
+      begin
+	lop( username );
+	if ( username[ inf for 1 ] = ")" ) then
+	  username := username[ 1 to inf - 1 ];
+      end;
+
+    ppn := CVPPN( username );
+    if ( lh( ppn ) = 0 ) then
+      return( false );
+
+    if ( I!User[ 0 ] = TABLESIZE ) then
+      usererr( 0,0,"Inclusion table is full" );
+
+    I!User[ 0 ] := I!User[ 0 ] + 1;
+    I!User[ I!User[ 0 ] ] := ppn;
+
+    return( true );
+  end;
+
+! Add a PPN to the inclusion list ;
+
+internal simple boolean procedure S!IPPN( integer PPN );
+  begin
+
+    if ( I!User[ 0 ] = TABLESIZE ) then
+      usererr( 0,0,"Inclusion table is full" );
+
+    I!User[ 0 ] := I!User[ 0 ] + 1;
+    I!User[ I!User[ 0 ] ] := PPN;
+
+    return( true );
+  end;
+! Add a user to the exclusion table ;
+
+internal simple boolean procedure S!XUser( string username );
+  begin
+    own integer ppn;
+
+    if ( username = "(" ) then		! lop off parens ;
+      begin
+	lop( username );
+	if ( username[ inf for 1 ] = ")" ) then
+	  username := username[ 1 to inf - 1 ];
+      end;
+
+    ppn := CVPPN( username );
+    if ( lh( ppn ) = 0 ) then
+      return( false );
+    if ( X!User[ 0 ] = TABLESIZE ) then
+      usererr( 0,0,"Exclusion table is full" );
+
+    X!User[ 0 ] := X!User[ 0 ] + 1;
+    X!User[ X!User[ 0 ] ] := ppn;
+
+    return( true );
+  end;
+
+! Add a PPN to the exclusion list ;
+
+internal simple boolean procedure S!XPPN( integer PPN );
+  begin
+
+    if ( X!User[ 0 ] = TABLESIZE ) then
+      usererr( 0,0,"Exclusion table is full" );
+
+    X!User[ 0 ] := X!User[ 0 ] + 1;
+    X!User[ X!User[ 0 ] ] := ppn;
+
+    return( true );
+  end;
+! Add a program to the inclusion list ;
+
+internal simple boolean procedure S!IProg( string Name );
+  begin
+    own string ufd, prog;
+    own integer ppn;
+
+    ufd := null;
+    prog := null;
+    if ( Name = "(" ) then
+      begin
+	lop( Name );
+	while (( Name ) and ( Name neq ")" )) do
+	  ufd := ufd & lop( Name );
+	lop( Name );
+      end;
+    prog := Name;
+
+    if ( ufd ) then
+      begin
+	ppn := CVPPN( ufd );
+        if ( lh( ppn ) = 0 ) then
+	  return( false );
+      end
+    else
+      ppn := 0;
+
+    if ( I!PrgNam[ 0 ] = TABLESIZE ) then
+      usererr( 0,0,"Program inclusion table full" );
+
+    I!PrgNam[ 0 ] := I!PrgNam[ 0 ] + 1;
+    I!PrgNam[ I!PrgNam[ 0 ] ] := cvsix( prog );
+
+    I!PrgPPN[ 0 ] := I!PrgPPN[ 0 ] + 1;
+    I!PrgPPN[ I!PrgPPN[ 0 ] ] := ppn;
+
+    return( true );
+  end;
+! Add a program to the exclusion list. ;
+
+internal simple boolean procedure S!XProg( string Name );
+  begin
+    own string ufd, prog;
+    own integer ppn;
+
+    ufd := null;
+    prog := null;
+    if ( Name = "(" ) then
+      begin
+	lop( Name );
+	while (( Name ) and ( Name neq ")" )) do
+	  ufd := ufd & lop( Name );
+	lop( Name );
+      end;
+    prog := Name;
+
+    if ( ufd ) then
+      begin
+	ppn := CVPPN( ufd );
+        if ( lh( ppn ) = 0 ) then
+	  return( false );
+      end
+    else
+      ppn := 0;
+
+    if ( X!PrgNam[ 0 ] = TABLESIZE ) then
+      usererr( 0,0,"Program inclusion table full" );
+
+    X!PrgNam[ 0 ] := X!PrgNam[ 0 ] + 1;
+    X!PrgNam[ X!PrgNam[ 0 ] ] := cvsix( prog );
+
+    X!PrgPPN[ 0 ] := X!PrgPPN[ 0 ] + 1;
+    X!PrgPPN[ X!PrgPPN[ 0 ] ] := ppn;
+
+    return( true );
+  end;
+! "Include" a record t Actually, the first time this gets called
+! the array I!Type, (which tells if a type is good), gets set to false,
+! then types are set to true by this and subsequent calls to S!IType. ;
+
+internal simple boolean procedure S!IType( string TypeName );
+  begin
+    label gotit;
+    own integer idx;
+
+    for idx := -1 upto arrinfo( I!Type, 2 ) do
+      if ( kequ( TypeName, Type!Name[ idx ] )) then goto gotit;
+    return( false );
+
+    gotit:
+    if ( not I!Type!Flag ) then
+      begin
+	arrclr( I!Type );
+	I!Type!Flag := true;
+      end;
+
+    I!Type[ idx ] := true;
+    return( true );
+  end;
+
+
+! "Exclude" a record type. ;
+
+internal simple boolean procedure S!XType( string TypeName );
+  begin
+    label gotit;
+    own integer idx;
+
+    for idx := -1 upto arrinfo( I!Type, 2 ) do
+      if ( kequ( TypeName, Type!Name[ idx ] )) then goto gotit;
+    return( false );
+
+    gotit:
+
+    I!Type[ idx ] := false;
+
+    return( true );
+  end;
+! Add a node to the inclusion list.   Returns true iff the node name
+!  was good. ;
+
+internal simple boolean procedure S!INode( string Node );
+  begin
+    own integer n;
+    if ( I!Node[ 0 ] = TABLESIZE ) then
+      usererr( 0,0,"Inclusion table is full" );
+    n := CVName( Node );
+    if (( n = 0 ) and ( length( Node ) > 0 )) then
+      return( false );
+    I!Node[ 0 ] := I!Node[ 0 ] + 1;
+    I!Node[ I!Node[ 0 ] ] := n;
+    return( true );
+  end;
+
+! Add a node to the exclusion list. ;
+
+internal simple boolean procedure S!XNode( string Node );
+  begin
+    own integer n;
+    if ( X!Node[ 0 ] = TABLESIZE ) then
+      usererr( 0,0,"Exclusion table is full " );
+    n := CVName( n );
+    if (( n = 0 ) and ( length( Node ) > 0 )) then
+      return( false );
+    X!Node[ 0 ] := X!Node[ 0 ] + 1;
+    X!Node[ X!Node[ 0 ] ] := n;
+    return( true );
+  end;
+! Add a port to the inclusion list. ;
+
+internal simple boolean procedure S!IPort( integer Port );
+  begin
+    if ( I!Port[ 0 ] = TABLESIZE ) then
+      usererr( 0,0,"Inclusion table is full" );
+    I!Port[ 0 ] := I!Port[ 0 ] + 1;
+    I!Port[ I!Port[ 0 ] ] := Port;
+    return( true );
+  end;
+
+
+! Add a port to the exclusion list. ;
+
+internal simple boolean procedure S!XPort( integer Port );
+  begin
+    if ( X!Port[ 0] = TABLESIZE ) then
+      usererr( 0,0,"Exclusion table is full" );
+    X!Port[ 0 ] := X!Port[ 0 ] + 1;
+    X!Port[ X!Port[ 0 ] ] := Port;
+    return( true );
+  end;
+! Routine to do the mapped I/O read of the stream.   Sets SAT!Eof
+!  when the last word has been read. ;
+
+integer procedure ReadStreamWord;
+  begin
+    own integer word;
+
+    if ( StreamPageAddr = 0 ) then return( MapWord );
+
+    Word := memory[ StreamPageAddr + SATWord ];
+    SATWord := SATWord + 1;
+    if ( SATWord = 512 ) then SAT!Eof := true;
+    return( word );
+
+  end;
+
+! Read the next record from the stream accounting file and do some
+!  fixups or special actions as needed. ;
+
+procedure Read!Stream;
+  begin
+    integer i;
+
+    Rec[ 0 ] := ReadStreamWord;
+    Rec!Type := ldb( Rec!Type!Pnt );
+    Rec!Len  := ldb( Rec!Len!Pnt );
+    Rec!Job  := ldb( Rec!Job!Pnt );
+
+    if ( Rec!Job > 128 ) then		! bad job # ;
+      Rec!Job := 0;
+
+    if ( Rec!Type > TypeMax ) then	! bad record type ;
+      begin
+	Rec!Type := -1;
+	for i := 1 upto Rec!Len - 1 do
+	  ReadStreamWord;
+      end
+    else if ( Rec!Type = '16 ) then	! "license" records ;
+      begin
+	Rec[ 1 ] := ReadStreamWord;
+	Rec[ 7 ] := ReadStreamWord;
+	for i := 4 upto Rec!Len do
+	  ReadStreamWord;
+      end
+    else				! normal record ;
+      begin
+	for i := 1 upto Rec!Len - 1 do
+	  if ( i < 33 ) then
+	    Rec[ i ] := ReadStreamWord
+	  else
+	    Rec[ 33 ] := ReadStreamWord;
+	if (( Rec!Type = '17 ) and ( Rec[ 6 ] = '1000004 ) and
+	    (( Rec[ 5 ] = cvsix( "OPER" )) or
+	     ( Rec[ 5 ] = cvsix( "SETE" )))) then
+	  begin
+	    Rec!Type := '44;
+	    Rec[3] := Rec[5];			! copy cusp name;
+! ***	    arrblt( Rec[4], Rec[9], 12 );	! copy data;
+	  end;
+	if ( Rec!Type = '44 ) and ( Rec[3] = cvsix( "OPER" )) then
+	  Job!OpNam[ Rec!Job ] := CVR45( Rec[4], Rec[5] )
+	else if ( Rec!Type = '44 ) and ( Rec[3] = cvsix( "SETE" )) then
+	  Job!OpNam[ Rec!Job ] := cvos( Rec[6] );
+      end;
+
+    ! extract data from "login" records ;
+
+    if ( Rec!Type = '40 ) then
+      begin
+	Job!Node[ Rec!Job ] := ldb( Rec!Node!Pnt1 ) lsh 6 +
+	  ldb( Rec!Node!Pnt2 );
+	Job!Port[ Rec!Job ] := ldb( Rec!Port!Pnt );
+	Job!OpNam[ Rec!Job ] := NULL;
+      end;
+
+  end;
+! Routine to advance to the next date ;
+
+preload!with
+  31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31;
+safe integer array DaysThisMonth[ 1 : 12 ];
+
+simple procedure AdvanceDate;
+  begin
+    own integer leap;
+
+    if (( Month = 2 ) and ( Day = 28 ) and (( Year mod 4 ) = 0 )) then
+      leap := 1
+    else
+      leap := 0;
+
+    Day := Day + 1;
+    if ( Day > ( DaysThisMonth[ Month ] + leap )) then
+      begin
+	Day := 1;
+	Month := Month + 1;
+      end;
+    if ( Month > 12 ) then
+      begin
+	Month := 1;
+	Year := Year + 1;
+      end;
+
+    DaysAdvanced := DaysAdvanced + 1;
+
+  end;
+! Check this record against inclusion criteria. ;
+
+simple boolean procedure Include!Record;
+  begin
+    own integer i;  own boolean p;
+
+    if ( Rec!Job = 0 ) then return( false );
+    if ( not I!Type[ Rec!Type ] ) then return( false );
+
+    p := true;
+    if ( I!User[ 0 ] neq 0 ) then
+      begin
+	p := false;
+	for i := 1 upto I!User[ 0 ] do
+	  if ( rh( I!User[ i ] ) = 0 ) then
+	    begin
+	      if ( lh( I!User[ i ] ) = lh( Rec[2] )) then p := true;
+	    end
+	  else if ( I!User[ i ] = Rec[ 2 ] ) then p := true;
+      end;
+    if ( not p ) then return( false );
+
+    if ( I!PrgNam[ 0 ] neq 0 ) then
+      begin
+	p := false;
+	for i := 1 upto I!PrgNam[ 0 ] do
+	  if ((( I!PrgNam[ i ] = 0 ) or ( I!PrgNam[ i ] = Rec[5] )) and
+	      (( I!PrgPPN[ i ] = 0 ) or ( I!PrgPPN[ i ] = Rec[6] ))) then
+	  p := true;
+      end;
+    if ( not p ) then return( false );
+
+  ! Check node and port. ;
+
+    if ( I!Node[ 0 ] neq 0 ) then
+      begin
+	p := false;
+	for i := 1 upto I!Node[ 0 ] do
+	  if ( I!Node[ i ] = Job!Node[ Rec!Job ] ) then
+	    p := true;
+      end;
+    if ( not p ) then return( false );
+
+    if ( I!Port[ 0 ] neq 0 ) then
+      begin
+	p := false;
+	for i := 1 upto I!Port[ 0 ] do
+	  if ( I!Port[ i ] = Job!Port[ Rec!Job ] ) then
+	    p := true;
+      end;
+
+    ! We've passed all of the above tests.  We win. ;
+
+    return( true );
+
+  end;
+
+! Check this record against exclusion criteria. ;
+
+simple boolean procedure Exclude!Record;
+  begin
+    own integer i;
+
+    if ( X!User[ 0 ] neq 0 ) then
+      begin
+	for i := 1 upto X!User[ 0 ] do
+	  if ( rh( X!User[ i ] ) = 0 ) then
+	    begin
+	      if ( lh( X!User[ i ] ) = lh( Rec[2] )) then return( true );
+	    end
+	  else if ( X!User[ i ] = Rec[ 2 ] ) then
+	    return( true );
+      end;
+
+    if ( X!PrgNam[ 0 ] neq 0 ) then
+      begin
+	for i := 1 upto X!PrgNam[ 0 ] do
+	  if ((( X!PrgNam[ i ] = 0 ) or ( X!PrgNam[ i ] = Rec[5] )) and
+	      (( X!PrgPPN[ i ] = 0 ) or ( X!PrgPPN[ i ] = Rec[6] ))) then
+	    return( true );
+      end;
+
+    ! Check owner exclusion. ;
+
+    if (( X!Owners ) and ( Rec[2] = Rec[6] )) then return( true );
+
+    ! Check node and port exclusion. ;
+
+    if ( X!Node[ 0 ] neq 0 ) then
+      begin
+	for i := 1 upto X!Node[ 0 ] do
+	  if ( X!Node[ i ] = Job!Node[ Rec!Job ] ) then return( true );
+      end;
+
+    if ( X!Port[ 0 ] neq 0 ) then
+      begin
+	for i := 1 upto X!Port[ 0 ] do
+	  if ( X!Port[ i ] = Job!Port[ Rec!Job ] ) then return( true );
+      end;
+
+    return( false );
+  end;
+
+! Here to scan the stream file(s), checking each record against the
+!  inclusion and exclusion criteria, and invoking the caller's Daemon
+!  when desired records are found.  If invoked with Silence=true, then
+!  don't issue error messages (we may be detached, or something like
+!  that). Also, the user may ask S!Scan to scan a page which is
+!  supplied elsewhere in memory. ;
+
+internal procedure S!Scan( procedure Daemon;
+			   boolean Silence;
+			   integer UserPage(0) );
+  begin
+    string StreamFile, FileName;
+    integer flag;
+    integer array LookupBlock[ 0 : 5 ];
+
+    Consecutive!Misses := 0;
+
+    while (( DaysAdvanced < DaysToAdvance ) and
+	   ( Consecutive!Misses < 5 )) do
+      begin "next stream file"
+
+	StreamPageAddr := UserPage lsh 9;
+        if ( StreamPageAddr > 0 ) 
+	then 
+	    SATWord := 1
+	else
+	  begin
+	    setformat( -2, 1 );
+	    streamfile := cvs( Month ) & cvs( Day ) & cvs( Year ) & ".SAT";
+	    setformat( 0, 1 );
+	    AdvanceDate;
+	    MapRead( FileName := streamfile, flag, SAT!Eof, 500,10 );
+	    if ( flag ) then
+	      MapRead(FileName:="(BILLING10)"&streamfile,flag,SAT!Eof,500,10);
+	    if ( flag ) then
+	      MapRead(FileName:="(UN1)"&streamfile,flag,SAT!Eof,500,10);
+	    if ( flag ) then
+	      begin
+		Consecutive!Misses := Consecutive!Misses + 1;
+		if ( not Silence ) then
+		  print( "% Can't find ", StreamFile, crlf );
+		continue "next stream file";
+	      end;
+	    Consecutive!Misses := 0;
+	    if not Silence then print( "[Reading ", FileName, "]", crlf );
+	  end;
+
+! continued ... ;
+! continued ... ;
+
+	while ( not SAT!Eof ) do
+	  begin "next record"
+	    Read!Stream;
+	    if ( Rec!Type < 0 ) then continue "next record";
+	    if ( not Include!Record ) then continue "next record";
+	    if ( Exclude!Record ) then continue "next record";
+	    Daemon ( Rec );
+	  end "next record";
+	if ( UserPage > 0 ) then
+	  begin
+	    done "next stream file" ;
+	  end
+	else
+	  begin
+	    MapRelease;
+	    SAT!Eof := false;
+	  end;
+
+      end "next stream file";
+
+    if ( DUL > 0 ) then release( DUL );
+
+  end;
+! return a neatly formatted string for the current record ;
+
+internal string procedure S!Str;
+  begin
+    own string s;
+
+    s := "- '" & cvos( Rec!Type ) & " -" & crlf;
+
+    case Rec!Type of
+      begin
+	['0]['1]['2]['3]['4]['5]['6]['10]['13]['14]['15]
+	  begin
+	    s := CVTime( Rec[1] ) & " #" & cvs( Rec!Job ) & 
+		 " " & CVUser( Rec[2] ) & " " & Type!Name[ Rec!Type ] &
+		 " " & ( if ( Rec[6] ) then CVUser( Rec[6] ) else null ) &
+		 cv6str( Rec[5] );
+	    if ( Rec!Type > '10 ) then
+	      s := s & " LIC=" & cvos(lh(Rec[7]))&",,"&cvos(rh(Rec[7]));
+	    s := s & crlf;
+	  end;		
+	['7]
+	  begin
+	    s := CVTime( Rec[1] ) & " #" & cvs( Rec!Job ) &
+		 " " & CVUser( Rec[2] ) & " " & Type!Name[ Rec!Type ] &
+		 " PJC=" & cvastr(Rec[5]) & cvastr(Rec[6]) &
+			cvastr(Rec[7] land '777760000000) &
+		 ", VFY=" & cvs( Rec[7] land 1 ) & crlf;
+	  end;
+	['11]['12]
+	  begin
+	    s := CVTime( Rec[1] ) & " " & Type!Name[ Rec!Type ] & crlf;
+	  end;
+	['16]
+	  begin
+	    s := CVTIME( Rec[1] ) & " #" & cvs( Rec!Job ) &
+		 " " & CVUser( Rec[2] ) & " RUNLIC " &
+		 cvos( lh( Rec[7] )) & ",," & cvos( rh( Rec[7] )) & crlf;
+	  end;
+	['17]
+	  begin
+	    s := CVTime( Rec[1] ) & " #" & cvs( Rec!Job ) & 
+		 " " & CVUser( Rec[2] ) & " " & Type!Name[ Rec!Type ] &
+		 " " & ( if ( Rec[6] ) then CVUser( Rec[6] ) else null ) &
+		  cv6str( Rec[5] ) & crlf;
+	  end;
+
+! continued ... ;
+! continued ... ;
+
+	['17]
+	  begin
+	    s := CVTime( Rec[1] ) & " #" & cvs( Rec!Job ) &
+		 " " & CVUser( Rec[2] ) & " TATTLE " & cv6str( Rec[3] ) &
+		 " ";
+	    if ( Rec[3] = cvsix( "SETE" )) then 
+	      begin
+		s := s & cvos(Rec[7]) & "," & cvos(Rec[6]) & " ";
+		if ( Rec[8] ) then
+		  s := s & "failed: " & cvos(Rec[4]) & ",," & cvos(Rec[5])
+		else
+		  s := s & "ok";
+	      end
+	    else if ( Rec[3] = cvsix( "OPER" )) then
+	      begin
+		s := s & CVR45( Rec[4], Rec[5] ) & " " &
+			 cvos(rh( Rec[7])) & " ";
+		if ( rh(Rec[7]) neq rh(Rec[8]) ) then
+		  s := s & "(" & cvos(rh(Rec[8])) & ") ";
+		s := s & ( case Rec[9] of ( [0]"okay", [1]"bad name",
+			[2]"bad pswd:"&cvos(Rec[6]), [3]"not auth",
+			[else]"bad value:"&cvos(Rec[9])  ));
+	      end
+	    else if ( Rec[3] = cvsix( "SETOP" )) then
+	      begin
+		s := s & CVR45( Rec[5], Rec[6] ) & " " &
+		  cv6str( Rec[4] ) & " " &
+		  CVR45( Rec[8], Rec[9] );
+	      end
+	    else if ( Rec[3] = cvsix( "OPPS" )) then
+	      begin
+		s := s & CVR45( Rec[4], Rec[5] );
+	      end ;
+	    s := s & crlf;
+	  end;
+	['22]
+	  begin
+	    s := CVTime( Rec[1] ) & " #" & cvs( Rec!Job ) & 
+		 " " & CVUser( Rec[2] ) & " CREAUX " & LoginString &
+		 " port=" & cvos( rh( Rec[5] )) &
+		 ( if ( lh( Rec[5] )) then
+		   ( if ( Rec[5] < 0 ) then " monerr=" else " superr= " ) &
+		   cvos( lh( Rec[5] ) land '377777 )
+		 else null ) & crlf;
+	  end;
+	['40]
+	  begin
+	    s := CVTime( Rec[1] ) & " #" & cvs( Rec!Job ) &
+		 " " & CVUser( Rec[2] ) & " LOGIN " &
+		 CVNode( Job!Node[ Rec!Job ] ) & ":" &
+		 cvos( Job!Port[ Rec!Job ] ) & " TID=" &
+		 ( case ldb( Rec!TID!Pnt ) of (
+			"AUX","A","C","E","G","B","F","J",
+			"'10","<CR>","D","2780","1200","'15","'16","'17",
+			"'20","'21","'22","9600","'24","'25","'26","'27",
+			"'30","'31","'32","'33","'34","'35","'36","'37",
+			[else]"?" )) &
+		 crlf;
+	  end;
+
+! continued ... ;
+! continued ... ;
+
+	['41]
+	  begin
+	    s := CVTime( Rec[1] ) & " #" & cvs( Rec!Job ) &
+		 " " & CVUser( Rec[2] ) & " CHKPNT ";
+	    if ( not kequ( CPUType, "F3" )) then
+	      s := s & "TRUs =" & cvf( CVTRU( Rec[3] ));
+	    s := s & crlf;
+	  end;
+	['42]
+	  begin
+	    s := CVTime( Rec[1] ) & " #" & cvs( Rec!Job ) &
+		 " " & CVUser( Rec[2] ) & " LOGOUT ";
+	    if ( not kequ( CPUType, "F3" )) then
+	      s := s & "TRUs =" & cvf( CVTRU( Rec[3] ));
+	    s := s & crlf;
+	  end;
+	['44]
+	  begin "type '44"
+	    s := CVTime( Rec[1] ) & " #" & cvs( Rec!Job ) &
+		 " " & CVUser( Rec[2] ) & " TATTLE " & cv6str( Rec[3] ) &
+		 " ";
+	    if ( Rec[3] = cvsix( "SETE" )) then 
+	      begin "sete record"
+		s := s & cvos(Rec[7]) & "," & cvos(Rec[6]) & " ";
+		if ( Rec[8] ) then
+		  s := s & "failed: " & cvos(Rec[4]) & ",," & cvos(Rec[5])
+		else
+		  s := s & "ok";
+	      end "sete record"
+	    else if ( Rec[3] = cvsix( "OPER" )) then
+	      begin "oper record"
+		s := s & CVR45( Rec[4], Rec[5] ) & " " &
+			 cvos(rh( Rec[7])) & " ";
+		if ( rh(Rec[7]) neq rh(Rec[8]) ) then
+		  s := s & "(" & cvos(rh(Rec[8])) & ") ";
+		s := s & ( case Rec[9] of ( [0]"okay", [1]"bad name",
+			[2]"bad pswd:"&cvos(Rec[6]), [3]"not auth",
+			[else]"bad value:"&cvos(Rec[9])  ));
+	      end "oper record"
+	    else if ( Rec[3] = cvsix( "SETOP" )) then
+	      begin "setop record"
+		s := s & CVR45( Rec[5], Rec[6] ) & " " &
+		  cv6str( Rec[4] ) & " " &
+		  CVR45( Rec[8], Rec[9] );
+	      end "setop record"
+	    else if ( Rec[3] = cvsix( "OPPS" )) then
+	      begin "opps record"
+		s := s & CVR45( Rec[4], Rec[5] );
+	      end "opps record";
+	    s := s & crlf;
+	  end "type '44";
+	[else]
+	  begin
+	    s := "? Record type " & cvs( Rec!Type ) & crlf;
+	  end
+      end;
+    return( S );
+  end;
+! procedure to return the job number of the current record ;
+
+internal simple integer procedure S!Job;
+  return( Rec!Job );
+
+! procedure to return the node name for a given job ;
+
+internal simple string procedure S!Node( integer Job );
+  return( CVName( Job!Node[ Job ] ) );
+
+! return the port number for a given job ;
+
+internal simple integer procedure S!Port( integer Job );
+  return( Job!Port[ Job ] );
+
+! return the last OPER name that this job used. ;
+
+internal simple string procedure S!Opr( integer Job );
+  return( Job!OpNam[ Job ] );
+
+end "stream scanning module"
+   :H|a6
