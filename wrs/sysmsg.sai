@@ -1,0 +1,376 @@
+begin	"SYSMSG"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "ARGS.REQ" source!file;
+require "AUXLIB.REQ" source!file;
+require "FLIB.REQ" source!file;
+require !xwd( '1, '2 ) version;
+
+define MAXMSGLEN = 251;		! 1 sector - 1 byte count - 4 byte date;
+
+string SUP;
+
+string item LOGFILE;
+string item FILENAME;
+string item HOSTS;
+item READ;
+item SEND;
+string item SUPS;
+integer item TIMEOUT;
+item TRACE;
+integer item WINDOWSIZE;
+
+label NextSup;
+
+!
+    SYSMSG slave command codes
+;
+define	SYSMSG!RDSMS = 1
+,	SYSMSG!CLSMS = 2
+,	SYSMSG!WRSMS = 3
+;
+
+define	lhw(X) = {((X lsh -16) land '177777)};
+define	rhw(X) = {(X land '177777)};
+define	xhw(L,R) = {((rhw(L) lsh 16) lor (rhw(R)))};
+
+integer LineBreak,CommaBreak;
+simple procedure BrkIni;
+begin
+    setbreak( LineBreak:=getbreak,#lf,#cr,"SIN" );
+    setbreak( CommaBreak:=getbreak,#lf&",", ",", "STIN" );
+end;
+require BrkIni initialization;
+
+! cvhs - return string containing hex representation of integer
+;
+string procedure cvhs( integer X, N(1) );
+begin
+    string S;
+    S := null;
+    while X or length(S) < N do begin
+	S := "0123456789abcdef"[(X land '17)+1 for 1] & S;
+	X := X lsh -4;
+    end;
+    return( S );
+end;
+
+! cvh - return integer from hex string
+;
+integer procedure cvh( string S );
+begin
+    integer I;
+    I := 0;
+    while length(S) do begin
+	integer C;
+	C := lop(S);
+	if "0" leq C leq "9" then I := I*16 + C - "0"
+	else if "A" leq C leq "F" then I := I*16 + C - "7"
+	else if "a" leq C leq "f" then I := I*16 + C - "W";
+    end;
+    return( I );
+end;
+
+! cvq - return quoted string where controls are replaced by "hh
+;
+string procedure cvq( string S );
+begin
+    string NS;
+    NS := null;
+    while length(S) do begin
+	string C;
+	NS := NS&( case C := lop(S) of (
+	    [#cr] if #lf = C := lop(S)
+		then "\"
+		else """0d"""& cvhs(C,2),
+	    ["\"] """\",
+	    [""""] """""",
+	    [else] if " " leq C leq "~" then C else """"& cvhs(C,2)
+	));
+    end;
+    return( NS );
+end;
+
+! cvuq - return string with quoted characters processed
+;
+string procedure cvuq( string S );
+begin
+    string NS;
+    NS := null;
+    while length(S) do begin
+	string C;
+	case C := lop(S) of begin
+	    ["\"] C := crlf;
+	    [""""] if S = "\"
+		then C := lop(S)
+		else begin
+		    C := cvh( S[1 to 2] );
+		    S := S[3 to inf];
+		end;
+	    [else]
+	end;
+	NS := NS& C;
+    end;
+    return( NS );
+end;
+
+procedure SupFail( string MSG );
+begin
+    ifcr compiler!switch("B")
+	thenc
+	    usererr( 0, 0, MSG, "B" );
+	elsec
+	    usererr( 0, 0, MSG, "C" );
+	    auxZap;
+	    goto NextSup;
+    endc
+end;
+
+procedure mainZapped;
+begin
+    SupFail( "?circuit zapped waiting for response from SUP "& SUP );
+    goto NextSup;
+end;
+
+string procedure lopsup( reference string SUPS );
+begin
+    integer C;
+    while length(SUPS) do
+	case C := lop(SUPS) of begin
+	    ["1"]["2"]["3"]["4"]["5"]["6"]["7"] return( "12"& C );
+	    ["*"] return( C )
+	end;
+    return( null );
+end;
+
+comment
+	Circuit input routines.
+;
+
+integer procedure rdbyte( integer N(1) );
+begin
+    integer B,I,X;
+    X := 0;
+    for I := 1 upto N do begin
+	X := (X lsh 8) lor (B := auxIn(datum(TIMEOUT)) );
+	if B < 0 then SupFail(
+	    "?rdbyte("& cvs(N)&
+	    "): timeout waiting for response from SUP "& SUP );
+    end;
+    if props(TRACE) then print( "rd", N, " ", cvhs( X, N*2 ), crlf );
+    return( X );
+end;
+
+procedure rdarry( integer array A );
+begin
+    integer I;
+    for I := arrinfo(A,1) upto arrinfo(A,2) do
+	A[I] := rdbyte(4);
+end;
+
+comment
+	Circuit output routines.
+;
+
+procedure wrbyte( integer X, N(1) );
+begin
+    redefine !axO8 = '3;
+    integer I;
+    for I := N downto 1 do
+	auxclv( auxPort, X lsh (8-I*8), !axO8 );
+    if props(TRACE) then print( "wr", N, " ", cvhs( X, N*2 ), crlf );
+end;
+
+procedure wrarry( integer array A );
+begin
+    integer I;
+    for I := arrinfo(A,1) upto arrinfo(A,2) do
+	wrbyte( A[I], 4 );
+end;
+
+procedure handshake;
+begin
+    define hs = (1 lsh 24)+(2 lsh 16)+(3 lsh 8)+(4 lsh 0);
+    integer I;
+    I := 0;
+    wrbyte( hs, 4 );
+    while I neq hs do
+	I := (I lsh 8) lor rdbyte;
+end;
+
+! ReadMsgs - read host message from sup SUPN
+;
+procedure ReadMsgs( integer SUPN, H1, H2 );
+begin
+    r!p(file) F;
+    integer H,W,CNT;
+    label restart,finish;
+    procedure flush;
+    begin
+	while 0 leq auxin(8) do;	! flush input;
+	H1 := H + 1;			! skip current host;
+	goto restart;			! restart pipeline;
+    end;
+    procedure zapped;
+    begin
+	print( "Circuit zapped while reading data for host ", H-W, "."& crlf );
+	goto finish;
+    end;
+    CNT := 0;
+    assign( auxDead, zapped );
+    F := fOpen( if props(FILENAME) then datum(FILENAME) else "TTY:",
+	"wb4E:SYSMSG."& cvs(SUPN) );
+    W := ( datum(windowSize) - 1 ) max 0;
+    print( "Reading messages."& crlf );
+restart:    
+    for H := H1 upto H2+W do begin
+	if H leq H2 then begin
+	    wrbyte( SYSMSG!RDSMS );
+	    wrbyte( H, 2 );
+	end;
+	if H-W geq H1 then begin
+	    string S;
+	    integer Date;
+	    integer C;
+	    S := null;
+	    while C := rdbyte( 1 ) do begin
+		S := S& C;
+	    end;
+	    if length(S) then begin
+		Date := rdbyte( 4 );
+		cprint( file:Chan[F],
+		    cvs(100000+H-W)[inf-4 to inf], ",",
+		    cvhs(Date,8), ",",
+		    cvq(S), crlf );
+		CNT := CNT + 1;
+	    end;
+	    if length(S) > MAXMSGLEN then begin
+		print( "Message too long (", length(S),
+		    ") for host ", H-W, ":"& crlf, cvq(S), crlf );
+		flush;
+	    end;
+	end;
+    end;
+finish:
+    assign( auxDEAD, mainZapped );
+    print( file:Name[F], ": ", CNT, " messages read."& crlf );
+    fClose( F );
+end;
+
+! SendMsgs - Send host message to sup SUPN
+;
+procedure SendMsgs( integer SUPN, H1, H2 );
+begin
+    r!p(file) F;
+    integer H,CNT,LINE,RC,Date;
+    label finish;
+    procedure zapped;
+    begin
+	print( "Circuit zapped while sending data for host ", H, "."& crlf );
+	goto finish;
+    end;
+    CNT := LINE := 0;
+
+    assign( auxDead, zapped );
+    if not props(FILENAME) then outstr( "Enter records, end with ^Z:"& crlf );
+    F := fOpen( if props(FILENAME) then datum(FILENAME) else "TTY:",
+	"rb4E:SYSMSG."& cvs(SUPN) );
+    print( "Sending messages."& crlf );
+    while not file:EOF[F] do begin
+	string S;
+	LINE := LINE + 1;
+	H := intin( file:Chan[F] );
+	if file:EOF[F] then done;
+	if H=0 or file:Break[F] neq "," then begin
+	    print( "File ", file:Name[F], " line ", LINE,
+		": syntax error, no host number."& crlf );
+	    input( file:Chan[F], LineBreak );
+	    continue;	! skip to next record;
+	end;
+	Date := cvh( S := input( file:Chan[F], CommaBreak ) );
+	if file:Break[F] neq "," or length(S) > 8 then begin
+	    print( "File ", file:Name[F], " line ", LINE,
+		": syntax error, timeout missing or illegal."& crlf );
+	    if file:Break[F] neq #lf then input( file:Chan[F], LineBreak );
+	    continue;	! skip to next record;
+	end;
+	S := cvuq( input( file:Chan[F], LineBreak ) );
+	if length(S) > MAXMSGLEN then begin
+	    print( "File ", file:Name[F], " line ", LINE,
+		": message too long (", length(S),
+		") for host ", H, "."& crlf );
+	    continue;	! skip to next record;
+	end;
+	S := S& #nul;			! terminate string with null;
+	if H1 leq H leq H2 then begin
+	    wrbyte( SYSMSG!WRSMS );	! write command;
+	    wrbyte( H, 2 );		! host number;
+	    wrbyte( length(S) );	! length (including null);
+	    while length(S) do
+		wrbyte( lop(S) );	! data;
+	    wrbyte( Date, 4 );		! send timeout;
+	    if 6 neq RC := rdbyte( 1 )
+		then print( "Error code ", RC, " for host ", H, "."& crlf );
+	    CNT := CNT + 1;
+	end;
+    end;
+finish:
+    assign( auxDEAD, mainZapped );
+    print( file:Name[F], ": ", CNT, " messages sent."& crlf );
+    fClose( F );
+end;
+
+integer H1,H2,BRK;
+string S;
+
+datum(SUPS) := "1234567";
+datum(TIMEOUT) := 30;
+datum(WINDOWSIZE) := 16;
+if ARGC < 2 then print( "
+Too few arguments.  Correct form is:
+
+    SYSMSG filename/option1/option2.../optionN
+    SYSMSG ?			(create quick list of options)
+
+Options:
+    /HOST:n		operate on sysmsg for host ""n"" only
+    /HOST:n:m		operate on sysmsgs for hosts ""n"" through ""m""
+    /READ		transfer data from supervisor
+    /SEND		transfer data to supervisor
+    /SUPS:s		list of sups (e.g. /SUPS:34 or /SUPS:*)
+    /TIMEOUT:n		set timeout to ""n"" seconds
+    /TRACE		trace circuit traffic in hex
+    /WINDOWSIZE:n	set transmit windowsize to n
+", call(0,"EXIT") );
+    
+argparse( LOGFILE, FILENAME,
+    {HOSTS,READ,SEND,SUPS,TIMEOUT,TRACE,WINDOWSIZE}, ARGS );
+if not props(HOSTS) then datum(HOSTS) := "1:65535";
+S := datum(HOSTS);
+H1 := H2 := intscan( S, BRK );
+if BRK then H2 := intscan( S, BRK );
+if props(LOGFILE) then setprint( datum(LOGFILE), "B" );
+if not props(READ) and not props(SEND) then usererr(0,0,
+    "Must specify /SEND or /READ.", "X" );
+
+NextSup:
+auxDEAD := new;
+while SUP := lopsup(datum(SUPS)) do begin
+    integer SUPN,H;
+    print( "Building circuit to sup ", SUP, "..." );
+    if props(TRACE) then print( crlf );
+    assign( auxDEAD, mainZapped );
+    creaux( 4&"SYSMSG1:"& SUP );
+    if not !SKIP! then SupFail( "Unable to build circuit." );
+    handshake;
+    SUPN := rdbyte;
+    print( "SUP Host ", SUPN );
+    if not equ(cvs(SUPN),SUP) then print( " (", SUP, ")" );
+    print( crlf );
+    if props(READ) then ReadMsgs( SUPN, H1, H2 );
+    if props(SEND) then SendMsgs( SUPN, H1, H2 );
+    auxZap;
+end;
+
+end	"SYSMSG"
+$
