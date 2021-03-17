@@ -1,0 +1,710 @@
+OPTPAS.TXT, last modified 10/24/83, zw
+
+                  AN OPTIMIZING PASCAL COMPILER
+
+          R. Neil Faiman, Jr.   and   Alan A. Kortesoja
+
+                            ABSTRACT
+
+     The architecture of a  production  optimizing  compiler  for
+Pascal  is  described,  and  the  structure  of  the optimizer is
+detailed.  The compiler performs both interprocedural and  global
+optimizations,  in  addition to optimization of basic blocks.  We
+have found that a high-level structured language such  as  Pascal
+provides  unique  opportunities  for  effective optimization, but
+that standard optimization techniques must be  extended  to  take
+advantage of these opportunities.  These issues are considered in
+our discussion of the optimization algorithms we  have  developed
+and the sequence in which we apply them.
+
+                        I.   INTRODUCTION
+
+     It  is commonly assumed that it ought to be easy to generate
+efficient code for structured programs written  in  a  structured
+language.  Wirth  proposed  the  development  of  implementations
+"which are both reliable and  efficient  on  presently  available
+computers"  as  a  principal  aim  of  the  language Pascal [15].
+However, the very advantages of high-level, structured  languages
+such  as Pascal present unique challenges to the compiler writer.
+For  example,  the  structure  of  Pascal   programs   introduces
+opportunities  for  interprocedural  optimizations  which are not
+available in compiling a language  such  as  Fortran.  Similarly,
+techniques can be devised to improve the optimization of programs
+which use structured data.
+
+     We have designed and  implemented  a  production  optimizing
+compiler   for   Pascal   on   the   DECsystem-10.  Our  compiler
+incorporates algorithms  from  a  variety  of  sources.  We  have
+adapted these algorithms to optimize Pascal more effectively, and
+have  modified  them  to  work  together.  This  paper  discusses
+several of these algorithms as they are used in our compiler.
+
+     Our  compiler  accepts  the  full Pascal language, including
+features posing particular problems  for  optimization,  such  as
+goto  statements out of procedures, and procedural and functional
+parameters.  Our language also provides certain useful extensions
+[17].  For  example,  we allow separate compilation of "modules,"
+which may share procedures,  functions,  and  variables;  and  we
+permit  functions  to  return  values  of any type.  All of these
+standard and extended language features are  accomodated  by  our
+optimization algorithms.
+
+     We  have  found  that  seemingly  minor language changes can
+result  in  disproportionate  improvements  in  the  use  of  the
+language  and  the  effectiveness of the optimization algorithms.
+For example, in standard Pascal,  call-by-value  parameters  must
+always  be  copied  since  they may be modified.  The overhead of
+doing this is such that the Pascal User Manual [15] suggests that
+it may be better to pass certain structured variables as variable
+parameters, even  when  they  are  not  modified  by  the  called
+procedure.  This  subverts  the  distinction  between  value  and
+variable parameters, and makes it unreasonable for a compiler  to
+assume  that variable parameters are modified by their procedures
+and  value  parameters  are  not.  An  optimizing  compiler  must
+therefore  perform  extensive  analysis  to  determine  whether a
+variable parameter is really modified.  In our implementation, we
+forbid assignment to a call-by-value parameter within a procedure
+or function.  This allows us to pass the address instead  of  the
+value  of  an  array  or  record  parameter.  Thus,  there  is no
+efficiency penalty for the use of value  parameters;  programmers
+use  value  parameters  when  they  want  a  value  and  variable
+parameters when they want a  reference;  and  the  optimizer  can
+reasonably  assume that variable parameters are modified by their
+procedures.
+
+     The structure of our compiler  differs  from  that  of  most
+Pascal  compilers,  which  have  fundamentally the same one-pass,
+recursive descent structure as Wirth's CDC Pascal compiler  [22].
+The  program representation used in our optimizer is novel, as it
+assumes two different forms during optimization.  These forms are
+not  related to the PCODE representation produced by the Portable
+Pascal compiler [4], on which  other  multi-pass  compilers  have
+been    based   [18].   Our   original   intermediate   form   is
+machine-independent, and manipulates data represented as records,
+arrays,  sets,  etc.  This is converted to a low-level form which
+more closely models the actual memory accesses  and  computations
+required  on  the target machine.  Our intermediate form allows a
+great deal of flexibility for optimization; we  apply  optimizing
+transformations  to  both the original and low-level intermediate
+forms.
+
+     The code generated  by  our  compiler  is  typically  30-40%
+smaller  than that produced by the DECsystem-10 compiler of Nagel
+et al. [13], which is  representative  of  many  one-pass  Pascal
+compilers.  (These  results  are  discussed  further  in  section
+VII.)  It should  be  noted  that  this  reduction  was  achieved
+without  attempting  to  recognize many special-case optimization
+opportunities (e.g., assignments of the form "X := X op Y"),  and
+with a primitive register allocation algorithm.  We intend to add
+such improvements in the future.
+
+     Our compiler runs in three passes, as  shown  in  figure  1.
+The  parser  reads  the program source code and produces a symbol
+table and a  high-level  intermediate  form  representation.  The
+optimizer  transforms  the  initial, high-level intermediate form
+(HLIF) into optimized low-level  intermediate  form  (LLIF).  The
+code  generator  converts  the  low-level  intermediate form into
+machine code.  In this paper, we  consider  only  the  optimizing
+pass of the compiler.
+
+                  II.   OPTIMIZER ARCHITECTURE
+
+     Both the high-level and the low-level intermediate forms are
+composed of n-tuples, which are divided into statement tuples and
+expression  tuples.  All  tuples  have  explicit  pointers to the
+expression tuples representing their operands, so expressions may
+be  processed  recursively  as tree structures.  In addition, all
+the tuples in the intermediate form  are  linked  together  in  a
+linear list, in which a tuple follows all of its operands, so the
+intermediate form may be processed in a simple linear scan.  This
+hybrid  form  simplifies  the  recovery  of  tuples  which become
+unreferenced during optimization and  the  computation  of  usage
+counts for register allocation [11].
+
+     The  structure  of  the optimizer is shown in figure 2.  The
+optimization pass begins with application of the  interprocedural
+analysis  algorithm (section III).  It then applies the following
+steps to each  procedure  in  the  program  (including  the  main
+program itself):
+
+(a)  Flow  graph analysis.  Basic blocks are recognized, jumps to
+     jumps are eliminated, and boolean operators are converted to
+     branch  logic.  If  there  are  procedure  or function calls
+     which might result in  non-local  gotos  to  labels  in  the
+     procedure,  special flow graph edges are introduced from the
+     calls to  the  labels,  using  information  obtained  during
+     interprocedural   analysis.   The   basic   blocks   of  the
+     intermediate  form  are  reordered,  using  the  depth-first
+     spanning  tree  (DFST) ordering on the flow graph [2], which
+     allows easy detection of loops and improves  the  efficiency
+     of a number of the algorithms which are applied later.
+
+(b)  High-level  optimization  (sections  IV  and  V).  The basic
+     blocks of the program are reduced by elimination  of  common
+     subexpressions,  and  global (intraprocedural) optimizations
+     are applied.
+
+(c)  Shaping.  This step  converts  the  high-level  intermediate
+     form  into  the  low-level  intermediate form.  The HLIF and
+     LLIF use the same statement tuples, and  most  of  the  same
+     expression  operator tuples.  They differ in their treatment
+     of data references.  In  the  HLIF,  there  are  tuples  for
+     references   to   constants,   variable  identifiers,  array
+     elements, fields of records, etc.  In the  LLIF,  these  are
+     replaced  by  tuples  representing  immediate values, memory
+     addresses, and the contents of  memory  words  in  terms  of
+     constant  or  symbolic  offsets  and computed base and index
+     operands.   The   general    form    of    the    LLIF    is
+     machine-independent,  but  the  transformations in this step
+     may be tailored to the addressing structure  of  the  target
+     machine.  The  LLIF  is  simplified by application of simple
+     algebraic  rules.  For  example,  the  constant  part  of  a
+     subscript  calculation  may be replaced by a constant offset
+     in an indexed memory reference.
+
+(d)  Low-level  optimization  (section  VI).  The  shaping   step
+     frequently  introduces  redundant computations, particularly
+     in the code generated to  compute  the  addresses  of  array
+     elements.  These  redundant  computations  are eliminated by
+     the low-level optimization step.
+
+     Figure 3(a) shows a fragment  of  Pascal  source  code.  The
+high-level intermediate form into which this is translated by the
+analysis pass is given  in  figure  3(b),  while  the  optimized,
+low-level  intermediate form produced by the optimization pass is
+given in figure 3(c).
+
+     In this paper, we will only consider the algorithms used  in
+interprocedural   analysis   and   in  high-level  and  low-level
+optimization,  since  the  flow   graph   analysis   is   largely
+conventional,  and  the  shaping  step is more closely related to
+code generation than to optimization.
+
+                 III.   INTERPROCEDURAL ANALYSIS
+
+     Interprocedural analysis  actually  comprises  two  distinct
+tasks, quick block analysis and summary data flow analysis.
+
+     Two   language   features   make   interprocedural  analysis
+particularly interesting.  The first is the ability to  define  a
+routine  (i.e., a procedure or function) or a variable as PUBLIC,
+meaning that  it  may  be  referred  to  in  separately  compiled
+programs,  or  as EXTERNAL, meaning that its actual definition is
+in a separately compiled program.  The second is the  ability  to
+specify  procedural  and functional parameters and variables.  We
+require that all such parameters and variables be declared with a
+"routine type," which fully specifies their parameterization.
+
+     Interprocedural  analysis  makes  use  of  the  program call
+graph.  The call graph contains nodes for the main  program,  all
+external  routines,  all routine variables, each defined routine,
+and each procedural or functional parameter.  Edges in  the  call
+graph  represent  calling  and  binding relationships.  We assume
+that a  call  on  a  routine  with  a  procedural  or  functional
+parameter  will  result in a call on its parameter (an assumption
+which is both conservative and reasonable), and define the  edges
+in the call graph to reflect this assumption.
+
+A.   Quick Block Analysis
+
+     The  performance  of  a highly modularized, block structured
+program is strongly affected by the procedure  linkage  protocol.
+The  need  to  initialize  stack  frames and to maintain a static
+chain or display imposes an overhead on all routine calls.  Quick
+block analysis determines when a routine is non-recursive and can
+be called (directly or indirectly) only from some other  routine.
+Such a routine (a "quick routine") can have its storage allocated
+in the same area of the stack and at the same time as the routine
+from  which  it is always called (its "owner").  This has several
+advantages.
+
+     First, since the quick routine  does  not  need  a  separate
+stack  area  of  its  own,  calls to it do not incur the overhead
+associated with initializing a stack area.  This  saving  can  be
+significant:  in  our  implementation, the call, entry and return
+code for a quick routine requires only two instructions, compared
+with nine instructions for a non-quick routine.
+
+     Another  saving  occurs  when one routine is declared within
+another.  An inner routine can refer to variables declared in the
+outer  routine.  In  a  conventional  implementation, such global
+references require indirection via a static chain, a display,  or
+some  other  mechanism.  However, if the inner routine is a quick
+routine (as it frequently is), then it will use  the  same  stack
+area  as  the  outer  routine, and can access the outer routine's
+variables the same way it accesses its own.
+
+     Quick block analysis also improves the  performance  of  the
+optimizer  itself.  The  execution  time of our summary data flow
+analysis algorithm (section III.B) is proportional to the maximum
+depth  of  nesting  of procedure and function declarations in the
+program.  By  effectively  reducing  this  depth,   quick   block
+analysis makes summary data flow analysis run faster.
+
+     Recognition  of  quick  routines  is  based on the following
+observations:
+
+(1)  The main program and any public routines  are  non-quick  by
+     definition,  since  they  are  entry  points  of  the entire
+     program, and must have their own stack areas.
+
+(2)  A recursive routine is non-quick, since it must create a new
+     stack area for each version of its local variables.
+
+(3)  A  routine  which  is  called  by  two  other  routines with
+     different owners is non-quick, since it must have  a  unique
+     owner.
+
+(4)  A  routine  which  is passed as a parameter or assigned to a
+     variable is non-quick, since the set of its possible callers
+     is unknown.
+
+(5)  If a routine does not fall into any of the above categories,
+     then all the routines which call it have the same owner,  so
+     it too may share the stack area of that common owner.
+
+A non-quick routine owns itself.  A quick routine is owned by the
+common owner of all its callers.
+
+     We have developed an algorithm for determining the owners of
+all routines in the program, and for overlaying the local storage
+for routines sharing the same stack area.  Our algorithm is based
+on  depth-first  search  [20],  and  therefore its time and space
+requirements are linear in the number  of  routines  and  calling
+relations  in  the  call  graph.  Since the call graph is usually
+quite sparse, this can be considerably more  efficient  than  the
+algorithm  of Walter [21], which represents the calling relations
+with  bit  matrices,  and  therefore  requires  time  and   space
+proportional  to the square of the number of routines in the call
+graph.
+
+B.   Summary Data Flow Analysis
+
+     Summary data flow analysis determines which variables may be
+used  and/or  modified  by  a  routine call.  This information is
+needed  to   deal   properly   with   calls   during   subsequent
+optimization.
+
+     Our algorithm for summary data flow analysis [10] is derived
+from  algorithms  due  to  Barth  [5,6]  and  Hecht  [14].  Using
+cross-reference  information saved by the parser, we compute, for
+each  routine  P,  the  sets   DIRECTMOD(P)   and   DIRECTUSE(P).
+DIRECTMOD(P)  is  the  set  of  variables which are modified by P
+itself, and DIRECTUSE(P) is the set of variables whose values are
+used  in  P.  Using  these sets and the call graph, the algorithm
+computes MOD(P) and USE(P), the sets of all the  variables  which
+may be modified or used as a consequence of a call on P.
+
+     For  purposes  of  our  algorithm,  the set of all variables
+includes all declared variables and variable parameter symbols in
+the   program.   For  each  pointer  type,  all  the  dynamically
+allocated variables which can be accessed with pointers  of  that
+type  are  treated  as a single variable.  We also treat declared
+labels as variables, including a label symbol in DIRECTMOD(P)  if
+P contains a goto statement to that symbol.  This artifice allows
+us to obtain the  information  about  non-local  goto  statements
+which is needed for flow graph analysis.
+
+     We   make  two  important  simplifying  assumptions  in  our
+algorithm.  First, we assume  that  a  variable  parameter  of  a
+routine  is modified by the routine.  (The justification for this
+assumption is discussed in section I.)
+
+     We also specify that if a routine accesses the same variable
+by  more than one name, i.e., if two parameters refer to the same
+actual variable, or if the routine makes a global reference to  a
+variable  which  is  passed to it as a parameter, the results are
+undefined.  In conjunction with the first assumption above,  this
+obviates   the   need  for  any  sort  of  aliasing  analysis  on
+parameters.   This   simplifies   the   algorithm   considerably.
+Furthermore,  if  a  procedure  has a variable parameter which it
+modifies, Barth's algorithm will indicate that any call  on  this
+procedure  will  modify all variables which are ever bound to the
+parameter.  Our algorithm, in  contrast,  will  only  indicate  a
+modification  of the variable actually passed in each call to the
+procedure.
+
+     Let N be the number of procedures in the call graph,  and  E
+the  number  of  edges.  The  algorithm  described  by Barth uses
+bit-matrix representations of the CALLS, DIRECTMOD, and DIRECTUSE
+relations, and computes the MOD and USE relations with bit-matrix
+operations.  Its run time is therefore  at  least  of  order  N2.
+Hecht's  algorithm is based on Tarjan's depth-first spanning tree
+algorithm for strongly connected components [3,20], and therefore
+has  run  time  on  the  order  of  N+E,  but it was designed for
+SIMPL-T,  a  non-block  structured  language   in   which   scope
+considerations  do  not arise.  By applying Tarjan's algorithm to
+nested subgraphs of the call graph at successive levels of scope,
+our algorithm computes MOD and USE as precisely as possible under
+the assum that all statements in a procedure are executable.
+Since  the  quick  block  analysis  described  above  reduces the
+effective depth of nesting,  the  worst-case  run  time  for  our
+algorithm  is  on  the  order  of (N+E)*L, where L is the maximum
+effective  nesting  level  of  routine   definitions.   This   is
+typically less than the true maximum depth of nesting.
+
+                   IV.   BASIC BLOCK REDUCTION
+
+     Common  subexpression  elimination  within  a basic block is
+well understood.  A number of algorithms have been published (for
+example,  [1,2,12,14]),  most of them based to some extent on the
+value number method  of  Cocke  and  Schwartz  [7].  While  these
+algorithms  will  produce  optimal results in programs containing
+only simple variables, their treatment of structured variables is
+limited.  In  general,  they  consider  only array variables, and
+treat  an  assignment  to  any  component  of  an  array   as   a
+redefinition of the entire array.
+
+     In  modern  programming languages such as Pascal, structured
+variables are used extensively.  Therefore, a prime objective  in
+the  design of our optimization algorithm was that it should give
+good results in the presence of structured  variables,  and  that
+where  possible  it  should  take  advantage  of information from
+declarations to give better results than would be  possible  with
+unstructured data.
+
+     On  the  other  hand,  optimal  algorithms for programs with
+structured variables can be very expensive.  For example,  it  is
+shown  in  [8]  that  the  equivalence  problem for straight line
+programs with array assignments is NP-Hard.  Therefore,  we  have
+developed  a  heuristic  algorithm  [9]  based  on  the Cocke and
+Schwartz common subexpression elimination algorithm.
+
+     Like the Cocke and Schwartz algorithm, ours  keeps  a  value
+for   each   symbolic  variable  and  a  hash  table  of  current
+expressions, each with a unique value number.  However, we update
+the  value  number  of  a  structured variable (i.e., an array or
+record) only when an assignment is made to the  entire  variable.
+We  also  keep  an  auxiliary  table  of  statements which modify
+variables; when  we  find  a  common  subexpression  which  is  a
+component  of  a  structured  variable, we check the table to see
+whether any statement has been processed which  could  invalidate
+this expression.
+
+     Our  algorithm is more expensive than the Cocke and Schwartz
+algorithm, since it requires a check of the modifying  statements
+table whenever a common component reference is found.  Our return
+comes in the  latitude  which  we  have  in  deciding  whether  a
+statement invalidates a reference.  This test may be as simple or
+as complex as the compiler  writer  desires;  it  may  check  for
+special  cases  where  that  seems  appropriate;  and  it  may be
+modified  to   allow   for   different   data   types.   In   our
+implementation, we use a simple recursive test function.
+
+     Consider the program fragment shown in figure 4.  Our common
+subexpression  algorithm  will  conclude  that,   in   the   last
+statement, "p^.c1" must indeed be equal to "10".  This conclusion
+is valid because it is illegal in Pascal to refer to a field of a
+record  which  is in a variant other than the one selected by the
+current value of the record's tag field.  Thus, the assignment to
+"q^.c2" could interfere with the value of "p^.c1" only if "p" and
+"q" pointed to the same record; but if "p" and "q" pointed to the
+same  record,  then  one of the two assignments would be illegal,
+and the program would be erroneous to begin with.
+
+     In general,  we  have  not  hesitated  to  assume  that  the
+programs  processed  by  our  compiler  will satisfy all language
+restrictions.  Therefore, we will allow optimized and unoptimized
+versions of a program to yield different results, if our language
+specification [17] indicates that those results are  "undefined."
+If  a  programmer  truly needs to evade some language restriction
+which causes problems only when optimization is in  effect  (such
+as   the   variant   record   access   restriction  above),  then
+optimization  can  be  suppressed  for  the  compilation   of   a
+particular routine.
+
+     The   reduction   algorithm   can   also   detect  redundant
+assignments.  An assignment whose left and right sides  have  the
+same  values is simply eliminated.  An assignment whose left side
+is later reassigned is eliminated, but the right  side  is  still
+evaluated if it could have side effects.
+
+                    V.   GLOBAL OPTIMIZATION
+
+     One block in the flow graph of a program is said to dominate
+another if all control flow paths from the start of  the  program
+to the second block must pass through the first block.  The heart
+of our global optimization is the observation that global  common
+subexpression  elimination may be performed by the same algorithm
+as  local  common  subexpression  elimination,  by  applying  the
+algorithm  along  paths  in the dominator tree, instead of within
+basic blocks.
+
+     The dominator tree  can  be  computed  efficiently  with  an
+algorithm  by  Lengauer  and  Tarjan [16].  Using an algorithm by
+Reif [19], we can then find the sets of variables  which  can  be
+modified  along each control flow path from a dominating block to
+a dominated block, and thence the earliest dominating block  from
+which  the value of each reference is unchanged.  Finally, we use
+this information to reapply the basic block reduction  algorithm,
+reducing entire dominator chains instead of basic blocks.
+
+     Since  the  algorithms  used  in this process are bit-vector
+algorithms,  we  need  a  mapping  from  the  intermediate   form
+expressions to the bit-vector indices which minimizes the size of
+the bit-vectors without losing too much useful information  about
+the  data  flow  in  the  program.  Rather  than using the actual
+variables of the program, we introduce a set of "Formal Reference
+Expressions", or FREs.  These FREs are defined recursively:
+
+  o  There is a unique FRE for each symbolic variable.
+
+  o  For  each  FRE  representing  an  array,  there  is  an  FRE
+     representing all of the elements of the array.
+
+  o  For each pointer type, there is an FRE representing all  the
+     dynamically  allocated  variables to which pointer variables
+     of that type might point.
+
+  o  For each FRE representing a record, there is  a  unique  FRE
+     for each field of that record.
+
+                  VI.   LOW-LEVEL OPTIMIZATION
+
+     Like the high-level global optimization algorithm, low-level
+optimization finds common subexpressions along  dominator  chains
+of  the  flow graph.  However, this algorithm makes no attempt to
+optimize assignments or memory  references,  since  optimizations
+involving  the  values  and  lifetimes  of  variables are applied
+during high-level optimization.  Low-level optimization  is  only
+concerned  with  new  expressions  which may be introduced during
+shaping.  Consequently, the low-level optimization algorithm is a
+very  simplified  version of the algorithm that is used for basic
+block and global reduction during high-level optimization.
+
+                   VII.  PRACTICAL EXPERIENCE
+
+     In  developing  our   optimization   algorithms,   we   have
+concentrated  on  reducing generated code size.  Code size is our
+first concern because our compiler will ultimately be used in the
+implementation of large systems on small computers.  Furthermore,
+the elimination  of  instructions  will  generally  result  in  a
+corresponding improvement in execution speed.
+
+     We  have compared the code produced by our new compiler with
+that produced by the Pascal compiler we  used  previously.  (This
+was  based  on  the DECsystem-10 compiler described in [13], with
+many  of  the  same  language  extensions  that  we  have   since
+incorporated  in  the  new  compiler.)   Some  sample  code  size
+improvements are:  40% smaller on a quick-sort procedure, 27%  on
+a  program  to  solve  the  Dutch national flag problem, 58% on a
+program  which  solved  a   heat   diffusion   problem   with   a
+two-dimensional  finite  difference  algorithm  (this program was
+particularly  susceptible  to  elimination  of  common  subscript
+calculations), and 36% on the flow graph analysis routines of the
+new compiler itself.
+
+     Compilation time comparisons have  been  less  satisfactory.
+Initially, compilation with the new compiler was much slower than
+with our previous compiler -- frequently by a factor of four.  To
+some extent, this was attributable to our consistent adherence to
+a design philosophy of making the compiler work first,  and  then
+making  it  faster.  However,  it was also due to the fundamental
+differences between a one-pass  compiler,  which  transforms  the
+source  code directly into object code, and a multi-pass compiler
+which  makes  successive  transformations  between  source  code,
+abstract  parse  tree,  high-level  intermediate  form, low-level
+intermediate form, and object code.
+
+     We have developed two solutions for this problem.  The first
+is  based  on  the  observation that, during program development,
+optimization is not only unnecessary (modules may  be  used  only
+once  or twice between recompilations), but undesirable, since it
+makes it harder to relate any errors that occur in the program to
+its   source   structure.  Therefore,  users  generally  suppress
+optimization  during  program  development.  However,  even  with
+optimization  suppressed,  the  compiler still had to convert the
+high-level  intermediate  form  to  low-level  intermediate  form
+before  it  could  generate code.  Therefore, we wrote a new code
+generator, the checkout  code  generator,  which  generates  code
+directly  from  the high-level intermediate form (figure 5).  The
+code generated by the checkout code  generator  is  generally  as
+good  as  code  generated by the optimization-path code generator
+when optimization is suppressed, but eliminating  the  conversion
+to  the low-level intermediate form reduces the total compilation
+cost considerably.  Since the  checkout  and  optimization  paths
+share the same analysis pass, no special effort is needed to make
+sure that they compile the same language.
+
+     Our second solution is based on the observation that modules
+of  a  large  program  must  contain  all  the  constant and type
+definitions needed to manipulate the data of that program.  These
+definitions  do  not impose any cost on the optimization and code
+generation passes, but we found that in many cases,  as  much  as
+80%  of  the  analysis pass execution time could be attributed to
+definition  processing.  Since  these  definitions  are   largely
+common  to  all  the  modules  of  a program, our solution was to
+provide a compiler feature to  allow  the  pre-compilation  of  a
+collection  of declarations.  Modules could then be compiled with
+these declarations in their initial environment, just as  modules
+are  normally  compiled  with  the  standard language identifiers
+(type  names,  built-in  functions,  etc.)   in   their   initial
+environment.
+
+     With  these two new features, we have been able to halve the
+cost of using our new compiler.  This means that our new compiler
+is  still  twice  as  expensive  to  use as our previous one, due
+largely to the cost of translating to  intermediate  form  before
+generating  code.  However, in exchange for this additional cost,
+we have the ability to use the same compiler to generate code for
+any target machine, simply by writing a new code generator to use
+the same intermediate form.  For example, it took us  only  eight
+man-months  to  produce  a  checkout  code  generator for the DEC
+VAX-11/780; and using this new code  generator,  a  multi-program
+system  of  approximately  85,000  lines of Pascal which had been
+developed on the DEC-10 was  transferred  to  the  VAX  in  three
+weeks.
+
+                           REFERENCES
+
+[1]   A. V. Aho and J. D. Ullman, "Optimization of straight line
+      programs," SIAM J. Comput., vol. 1, pp. 1-19, March 1972.
+
+[2]   A. V. Aho, J. E. Hopcroft, and J. D. Ullman, Principles of
+      Compiler Design, Addison-Wesley, Reading, Mass., 1977.
+
+[3]   A. V. Aho and J. D. Ullman, The Design and Analysis of
+      Computer Algorithms, Addison-Wesley, Reading, Mass., 1974.
+
+[4]   U. Ammann, "The method of structured programming applied to
+      the development of a compiler," in Proc. ACM Intern.
+      Compiler Symp. 1973, North-Holland, New York, 1973, p. 93.
+
+[5]   J. M. Barth, "A practical interprocedural data-flow
+      analysis algorithm," Comm. ACM, vol. 21, pp. 724-736,
+      Sept. 1978.
+
+[6]   J. M. Barth, "A practical interprocedural data flow
+      analysis algorithm and its applications," Ph.D. Th., U. of
+      California, Berkeley, 1977.
+
+[7]   J. Cocke and J. T. Schwartz, Programming Languages and
+      their Compilers:  Preliminary Notes, New York University,
+      1970.
+
+[8]   P. J. Downey and R. Sethi, "Assignment commands with array
+      references," J. ACM, vol. 25, pp. 652-666, Oct. 1978.
+
+[9]   R.  N.  Faiman, "Reduction of basic blocks to DAGs,"
+      Compiler Implementation Notes #5, Manufacturing Data
+      Systems, Inc.  (Programming Languages Dept.), Ann Arbor,
+      MI, 1978.
+
+[10]  R. N. Faiman, "Summary Data Flow Analysis," Compiler
+      Implementation Notes #7, Manufacturing Data Systems, Inc.
+      (Programming Languages Dept.), Ann Arbor, MI, 1979.
+
+[11]  R. A. Freiburghouse, "Register allocation via usage
+      counts," Comm. ACM, vol. 17, pp. 638-642, Nov. 1974.
+
+[12]  D.  Gries, Compiler Construction for Digital Computers,
+      Wiley, New York, 1971, pp. 377-382.
+
+[13]  C. O. Grosse-Lindemann and H. H. Nagel, "Postlude to a
+      Pascal-compiler bootstrap on a DECsystem-10,"
+      Software--Practice and Experience, vol. 6, pp. 29-42,
+      Jan. 1976.
+
+[14]  M. S. Hecht, Flow Analysis of Computer Programs,
+      North-Holland, New York, 1977.
+
+[15]  K. Jensen and N. Wirth, Pascal:  User Manual and Report,
+      Springer-Verlag, New York, 1974.
+
+[16]  T. Lengauer and R. E. Tarjan, "A fast algorithm for finding
+      dominators in a flow graph," ACM Trans. on Prog. Lang. and
+      Systems, vol. 1, pp. 121-141, July 1979.
+
+[17]  MDSI Pascal Report, Manufacturing Data Systems, Inc.
+      (Programming Languages Dept.), Ann Arbor, MI, 1979.
+
+[18]  D. R. Perkins and R. L. Sites, "Machine-independent Pascal
+      code optimization," in Proc. of the SIGPLAN Symp. on
+      Compiler Construction, ACM SIGPLAN Notices, vol. 14,
+      pp. 201-207, Aug. 1979.
+
+[19]  J. H. Reif, "Combinatorial aspects of symbolic program
+      analysis," Ph.D. Th., Harvard U., 1977.
+
+[20]  R. E. Tarjan, "Depth-first search and linear graph
+      algorithms," SIAM J. Comput., vol. 1, pp. 146-160, June
+      1972.
+
+[21]  K. G. Walter, "Recursion Analysis for Compiler
+      Optimization," Comm. ACM, vol. 19, pp. 514-516, Sept. 1976.
+
+[22]  N. Wirth, "The design of a Pascal compiler,"
+      Software--Practice and Experience, vol. 1, pp. 309-333,
+      1971.
+
+      FOOTNOTES
+
+      Affiliation of authors
+
+      The authors are with Manufacturing Data Systems, Inc., 4251
+      Plymouth Road, P. O. Box 986, Ann Arbor, Michigan 48106.
+
+      AUTHORS' BIOGRAPHIES
+
+      Neil  Faiman  received  the  B.S.  and  M.S.   degrees   in
+      computer  science  in  1974  and  1975  from Michigan State
+      University, East Lansing.
+
+      He worked for Burroughs Corp.  from  1975  to  1977.  Since
+      1977  he has been with the Programming Languages Department
+      of Manufacturing Data Systems, Inc., Ann Arbor,  MI,  where
+      he  has  participated  in  the development of MDSI's Pascal
+      compiler and programming environment.  His interests are in
+      programming language development, code optimization, formal
+      semantics, and software tools.
+
+      Mr. Faiman is a member of  the  Association  for  Computing
+      Machinery, the IEEE Computer Society, and Tau Beta Pi.
+
+      Alan  A. Kortesoja is presently Acting Director of Software
+      Technology   at   MDSI.   His   responsibilities    include
+      management  of  the Programming Languages Department, which
+      he has headed since joining the company in 1975.  He was  a
+      member  of the technical staff at Comshare, Inc., from 1972
+      to 1975, and  was  employed  by  Willow  Run  Labs  at  the
+      University of Michigan from 1970 to 1972, and by Conductron
+      Corp., a subsidiary of McDonnell Douglas, in 1969 and 1970.
+      His interests include software tools, software engineering,
+      and programming languages, and  he  has  published  several
+      papers in these fields.
+
+      Mr. Kortesoja  is  a graduate of the University of Michigan
+      in computer science, and is a member of the Association for
+      Computing  Machinery,  the  IEEE  Computer Society, and the
+      IEEE/X3J9 Pascal Standards Committee.
+
+      FIGURE CAPTIONS
+
+      Figure 1.  Compiler Structure
+      Figure 2.  Optimizer Structure
+      Figure 3.  Intermediate Form Example
+         -- (a)  Source Code
+         -- (b)  Original High-Level Intermediate Form
+         -- (c)  Optimized Low-Level Intermediate Form
+      Figure 4.  Pascal Program Fragment
+      Figure 5.  Checkout Compilation Path
+
+      INDEX TERMS
+
+                Compilers
+                Code Optimization
+                Programming Languages
+                Structured Programming
+                Pascal
+
+      Address for Correspondence
+
+                R. Neil Faiman, Jr.
+                MDSI
+                4251 Plymouth Road
+                P. O. Box 986
+                Ann Arbor, Michigan 48106
+
+      You have the authors' permission to distribute their
+      manuscript through the repository system.
+#I|wP
