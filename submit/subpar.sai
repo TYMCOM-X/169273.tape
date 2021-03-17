@@ -1,0 +1,1277 @@
+entry
+	ModCheck, Mos, WkDay,
+	Keys, GoodKey, Modifiers,
+
+	GS!ERR, GI!Runtime,
+
+	Express, Display, Look, Test,
+	GetExpFromUser
+;
+
+begin "SUBPAR"
+
+require "(SAILIB)SAIL.DEF"   source!file;
+require "(EXECX)JQUEUE.DEF"  source!file;
+require "SUBMIT.DEF"         source!file;
+require "SUBMSC.REQ"         source!file;
+require "NEXTIM.REQ"         source!file;
+require "(CARL)DAYTIM.REQ"   source!file;
+
+external integer Debug;
+external string  GS!Params;
+external integer array Template[ 0:E!Length-1 ];
+
+define DatHelp = {
+"
+Examples of date expressions.
+  EVERY DAY.
+  EVERY DAY AT 12:25.
+  EVERY OTHER DAY.
+  EVERY 3RD DAY AT 19:30.
+  EVERY FRIDAY.
+  EVERY OTHER FRIDAY.
+  THE 23RD DAY OF EVERY MONTH.
+  THE 2ND WEDNESDAY OF EVERY MONTH AT 13:45.
+
+NOTE:
+  Date expressions are terminated with a <cr>.
+  The default run-time is 00:00 (midnight).
+  All times are in 24 hour time (3:00 PM = 15:00).
+" };
+
+
+internal integer
+	GI!Runtime	! calculated runtime for this expression ;
+;
+
+integer
+	GI!Pos		! Position in the descriptor. ;
+,	GI!DayCyc	! Number of days in a day cycle. ;
+;
+
+internal string
+	GS!UsrsExp, 	  ! date expression attempted by user;
+	GS!Undef, 	  ! depository for bad terms thrown out during ScanStr;
+	GS!Scanned, 	  ! date expression after scanning;
+	GS!OneUnit, 	  ! 12 char code string for one unit date exp;
+	GS!DatCod, 	  ! One or more GS!OneUnits;
+	GS!ERR; 	  ! explanation for problem encountered during parse;
+
+boolean
+	GB!MonUnit	! set true when a valid month-unit is parsed;
+,	GB!SpecDat	! set true when a valid unit such as 9/9/85 or;
+			! jan 3, 1986 is parsed;
+,	GB!Coded	! true when date code for a given unit has been started;
+,	GB!DayCyc
+,	GB!Week;	! True is "WEEKDAYS" was found in date expression;
+
+
+internal string array ModCheck[ 0:NumMods - 1   ];
+
+preset!with "JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE",
+	    "JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER";
+internal string array Mos[ 0:NumMnths - 1 ];
+
+preset!with "SATURDAY","SUNDAY","MONDAY",
+	    "TUESDAY","WEDNESDAY","THURSDAY","FRIDAY";
+internal string array WkDay[ 0:NumWkDay - 1 ];
+
+
+preset!with "EVERY","TODAY","TOMORROW","DAYS","MONTH","2",
+	    "SUNDAY","SUNDAY","AND","EVERY DAY","31 DAY","31",
+	    "EVERY SUNDAY","1 DAY EVERY MONTH",
+	    "MONTH","WEEKDAYS",
+	    "HOURS","MINUTES",
+	    "STARTUP";
+internal string array GoodKey[ 0:NumKeys - 1 ];
+
+preset!with "EVERY","TODAY","TOMORROW","DAYS","MONTHS","OTHER",
+	    "WEEK","WEEKS","AND","DAILY","END","LAST","WEEKLY","MONTHLY",
+	    "MONTH","WEEKDAYS",
+	    "HOURS","MINUTES",
+	    "STARTUP";
+internal string array Keys[ 0:NumKeys - 1 ];
+
+preset!with "AFTER","BEFORE",
+	    "AFTER","BEFORE",
+	    "EXCEPT","EXCEPT","AND";
+string array GoodMods[ 0:NumMods - 1   ];
+
+preset!with "AFTER","BEFORE",
+	    "STARTING","UNTIL",
+	    "EXCEPT","NOT","AND";
+internal string array Modifiers[ 0:NumMods - 1   ];
+
+
+simple string procedure ScanStr( string EnglishStr );
+! ----------------------------------------------------------------------;
+!									;
+! 		Deletes un-identifyable words and redundant spaces	;
+!		from the date expression typed by the user.		;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "scan string"
+  string Target,GoodStr;
+  integer index;
+
+  GoodStr_ GS!Undef_ null;
+  do
+    BEGIN "each word"
+    scan( EnglishStr,SkJunk,BrkChr ); 	! Discard preceeding junk. ;
+    Target_ scan( EnglishStr,NxtWrd,BrkChr ); ! get next word;
+
+    ! Now check the arrays to see if words are valid;
+    ! Good words are assembled in GoodStr;
+    if ( -1 < index_ Vik( Modifiers,Target ) )
+     then GoodStr_ GoodStr & GoodMods[ index ] & " "
+    else
+    if ( -1 < index_ Vik( Keys, Target ) )
+     then GoodStr_ GoodStr & GoodKey[ index ] & " "
+    else
+    if ValNum( Target )
+     then GoodStr_ GoodStr & Target & " "
+    else
+    if ( -1 < Vik( WkDay,Target ) )
+     then GoodStr_ GoodStr & Target & " "
+    else
+    if ValidTimeStr( Target )
+     then GoodStr_ GoodStr & Target & " "
+    else
+    if ValDateStr( Target )
+     then GoodStr_ GoodStr & Target & " "
+    else
+    if ValOrd( Target )
+     then GoodStr_ GoodStr & Target & " "
+    else
+    if ( -1 < Vik( Mos,Target ) )
+     then GoodStr_ GoodStr & Target & " "
+    else
+    if ValNmOrd( Target ) then
+      GoodStr_ GoodStr & Target & " "
+    else
+    if not kequ( Target,"THE" ) and 	! Save all bad words except these 3;
+       not kequ( Target,"OF" ) and	! They will be printed later if;
+       not kequ( Target,"AT" ) then	!   GoodStr proves to be invalid;
+      GS!Undef_ GS!Undef & '42 & Target & '42 & " "; 
+    END "each word"
+  until length( EnglishStr ) = 0;
+
+  return( GoodStr[ 1 to inf-1 ] );
+
+
+END "scan string";
+
+
+simple procedure GetDateSpec;
+! ----------------------------------------------------------------------;
+!									;
+! 		Prompt user for his date expression. 			;
+! 		Returns what user types until <cr>.			;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "Get date expression"
+	string word;
+
+  while true do
+    BEGIN "keep trying"
+
+    if length( GS!Params ) then			! Something after "DATES"? ;
+      BEGIN "command string"			! Yes ;
+      GS!UsrsExp_ GS!Params & " ";		!   Assume its a date exp. ;
+      return;
+      END "command string"
+    else					! No, so prompt for it. ;
+      BEGIN "ask for date expression"
+      GS!UsrsExp_ prompt( "Enter your date-time expression:"& crlf );
+      word_ LopWrd( GS!UsrsExp );		! grab first word. ;
+
+      if CryForHelp( word ) then 		! "?" or "HELP" ? ;
+        BEGIN "help then reprompt"		! HELP requested at DATES;
+        print( DatHelp );			!  so provide then;
+        continue "keep trying";			!  ask again. ;
+        END "help then reprompt"
+      else
+        BEGIN "OK to return"
+        GS!UsrsExp_ word & " " & GS!UsrsExp; 	! else put it back. ;
+        return;					! return for parser. ;
+	END "OK to return";
+      END "ask for date expression";
+    END "keep trying";
+
+END "Get date expression";
+
+
+
+define D!Bug( m ) = { if DeBug then print( m ) };
+
+simple procedure SetCode( integer a,b,c,d,e; Integer Array Current );
+! ----------------------------------------------------------------------;
+!									;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN
+  GB!Coded_ true;
+
+  if GetMult = 0 then 
+    PutMult( a );
+  if GetType = 0 then 
+    PutType( b );
+  if GetMoMult = 0 then 
+    PutMoMult( c );
+  if GetBody = 0 then 
+    PutBody( d );
+  if GetConn = 0 then 
+    PutConn( e );
+  SREF( TodaysIntrnDat );
+END;
+
+simple procedure ClearCode( integer array Current );
+! ----------------------------------------------------------------------;
+!									;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN
+  PutMult( 0 );
+  PutType( 0 );
+  PutMoMult( 0 );
+  PutBody( 0 );
+  PutConn( 0 );
+END;
+
+simple procedure Connect( integer Con; integer array Current );
+! ----------------------------------------------------------------------;
+!									;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN
+  D!Bug( Con );
+  GI!Pos_ GI!Pos - D!Length;
+  PutConn( Con );
+  GI!Pos_ GI!Pos + D!Length;
+END;
+
+
+simple boolean procedure UNIT( string S;
+				reference string GS!ERR;
+				integer array Current
+			     );
+! ----------------------------------------------------------------------;
+!									;
+! Returns true with GS!ERR = null if a valid unit was passed.		;
+! Returns false with GS!ERR = null if a fragment of a valid unit was passed.  ;
+! Returns false with GS!ERR containing an error message if what was passed    ;
+!   contains a violation of the syntax.					;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "unit"
+	boolean DOW,MOY,Cyclic;
+	integer MM,DD,YY,cycle,diff,TGTDay,BaseDayNum,NextDate,base;
+	string Str,BaseDay;
+
+  D!Bug( crlf&"UNIT: "&S );
+  Cycle_ 0;
+  Cyclic_ false; 		! becomes true if "every" is found;
+  GB!SpecDat_ false; 		! becomes true if the unit was a specific date;
+  Str_ LopWrd( S ); 		! get first word;
+
+  if KEQU( Str,"STARTUP" ) then
+    BEGIN
+    SetCode( 0,TypS,0,0,EndCon, Current );
+    SREF( -1 );
+    return( true );
+    END;
+
+  if KEQU( Str,"TODAY" ) then
+    BEGIN
+    SetCode( 0,TypS,0,0,EndCon, Current );
+    GB!SpecDat_ true;
+    return( true );
+    END;
+
+  if KEQU( Str[ 1 for 7 ],"WEEKDAY" ) then
+    BEGIN
+	integer i;
+    for i_ 2 upto 5 do
+      BEGIN
+      SetCode( 1,TypW,0,i,AndCon, Current );
+      SREF( TodaysIntrnDat );
+      GI!Pos_ GI!Pos + D!Length;
+      END;
+    GB!Week_ true;
+    SetCode( 1,TypW,0,6,EndCon, Current );
+    return( true );
+    END
+  else
+    if GB!Week then
+      BEGIN
+      GS!ERR_ "?WEEKDAYS CAN BE FOLLOWED ONLY BY A TIME, A MODIFIER, OR 'AND'";
+      return( false );
+      END;
+
+  if KEQU( Str,"TOMORROW" ) then
+    BEGIN
+    SetCode( 0,TypS,0,0,EndCon, Current );
+    GB!SpecDat_ true;
+    SREF( TodaysIntrnDat + 1);
+    return( true );
+    END;
+
+  if KEQU( Str,"EVERY" ) then
+    BEGIN
+    Cyclic_ true;
+    Cycle_ 1;
+    if length( S ) = 0 then
+      return( false )
+    else
+      Str_ LopWrd( S ); 			! get word after "every";
+    END;
+
+  !------------------;
+  !	AS: "APRIL 3, 1986"						;
+  !------------------;
+  if ValidMOY( Str ) then 			! is the word as "MARCH"?;
+    BEGIN  "units"
+    if Cyclic then 		! "every" was encountered previously;
+      BEGIN 		! expressions such as "every August" are invalid;
+      GS!ERR_ "?EVERY cannot be followed by a date or month";
+      return( false );
+      END;
+    MM_ Vik( Mos, Str ); 	! convert the month name to a number 0-11;
+    if length( S ) = 0 then 	! month name must be followed by something.;
+      return( false )		! false but no error since it may come next ;
+    else	  	
+      Str_ LopWrd( S ); 		! more to string so get next word;
+
+    if ValNum( Str ) then     ! month had better be followed by a number;
+      BEGIN
+      DD_ cvd( Str ); 		! DD holds the day;
+      if length( S ) = 0 then   ! so far so good but return false for more;
+        return( false );
+      Str_ LopWrd( S ); 	! there is more so check for year number;
+      if ValNum( Str ) then   ! need number for year here;
+        BEGIN
+        YY_ cvd( Str[inf - 1 to inf] );  	! store the year in YY;
+	if ( YY < cvd( CvSDat( TodaysIntrnDat )[inf-1 to inf] ) )
+	 then
+          BEGIN
+          GS!ERR_ "?DATE TOO FAR IN THE PAST OR YEAR > 1999";
+          return( false );
+          END
+	else
+	  BEGIN 					! Date is OK ;
+          SetCode( 0,TypS,0,0,EndCon, Current );
+          SREF( CvDate( MM + 1,DD,YY ) );
+          GB!SpecDat_ true;
+          return( true );
+	  END
+        END
+      else
+        BEGIN 	! month and day followed by something other than a year;
+        GS!ERR_ "?Month must be followed by DD YYYY";
+        return( false );
+        END
+      END
+    else
+      BEGIN 	! month followed by something other than a day number;
+      GS!ERR_ "?Month must be followed by DD YYYY";
+      return( false );
+      END
+    END;
+
+  if KEQU( Str,"EVERY" ) then 		! "EVERY" here means fatal trouble;
+    BEGIN
+    if Cyclic then
+      GS!ERR_ "?CONSECUTIVE EVERY'S."
+    else
+      GS!ERR_ "?EVERY must be in first position of a unit ";
+    return( false ); 
+    END;
+
+  !------------------;
+  !	AS: "EVERY 5 DAYS" OR "10TH DAY OF EVERY MONTH" OR "2ND MONDAY" etc.  ;
+  !------------------;
+  if ValNum( Str ) then 	! a number encountered at BEGINning of unit or;
+    BEGIN                  	!   after an "EVERY";
+    cycle_ cvd( Str ); 		! store the number in "cycle";
+    if cycle = 0 then
+        BEGIN
+      GS!ERR_ "?CYCLE MUST BE GREATER THAN ZERO";
+      return( false );
+        END;
+    if length( S ) = 0 then 	! so far so good, return for more;
+      return( false )
+    else
+      Str_ LopWrd( S ); 	! stuff left in string so get next word;
+
+    if KEQU( Str,"EVERY" ) then 	! such as in "10TH [OF] EVERY MONTH";
+      BEGIN
+      Str_ LopWrd( S ); 		! get next;
+      if kequ( Str,null ) then
+        return( false );
+      END;
+
+    if KEQU( Str[ 1 for 5 ],"MONTH" ) then
+      BEGIN 
+      if not GB!Coded then 	! must be expression such as "EVERY nTH MONTH";
+        BEGIN
+        SetCode( 0,TypN,Cycle,1,EndCon, Current );
+        return( true );
+        END
+      else 				! such as "... OF EVERY nTH MONTH";
+        BEGIN
+        if cycle > 9 then ! multiplier must be < 10;
+          cycle_ 9;
+        END;
+    
+      if GB!DayCyc then 		! first unit of this same expression was days;
+        SetCode( 0,TypN,Cycle,GI!DayCyc,EndCon, Current )
+      else 	     ! second part of exp as "1ST WED OF EVERY [cycle] MONTH";
+        SetCode( 0,0,Cycle,0,EndCon, Current );
+  
+      GB!MonUnit_ true; 		! second unit of 2 unit exp must be month unit;
+      return( true );
+      END ;
+
+    if ValidDaOfWk( Str ) then 	! for example: "EVERY MONDAY" or "2ND WED";
+      BEGIN
+      SetCode( Cycle,TypW,0,Vik( WkDay,  Str), EndCon, Current );
+      return( true );
+      END;
+
+    if KEQU( Str[1 for 3], "DAY" ) then 	! as in "EVERY nTH DAY";
+      BEGIN
+      GI!DayCyc_ Cycle;
+      SetCode( 1,TypN,0,Cycle,EndCon, Current );
+      GB!DayCyc_ true; 			! a cyclic day unit has been coded;
+      return( true );
+      END;
+
+    if KEQU( Str[1 for 6], "MINUTE" ) then 	! as in "EVERY nTH MINUTE";
+      BEGIN
+      if Cycle > 1439 then
+        BEGIN
+        GS!ERR_ "?MINUTES MUST NOT BE > 1439";
+	return( false );
+        END;
+      SetCode( 0,TypT,0,Cycle,EndCon, Current );
+      STIM( Tfract( TheTime ) ); 	  ! Default ref-time is current time. ;
+      ! SREF( Cycle );
+      return( true );
+      END;
+
+    if KEQU( Str[1 for 4], "HOUR" ) then 	! as in "EVERY nTH HOUR";
+      BEGIN
+      if Cycle > 23 then
+        BEGIN
+        GS!ERR_ "?HOURS MUST NOT BE > 23";
+	return( false );
+        END;
+      SetCode( 0,TypT,0,Cycle * 60,EndCon, Current );
+      STIM( Tfract( TheTime ) );	  ! Default ref-time is current time. ;
+      ! SREF( Cycle * 60 );
+      return( true );
+      END;
+
+    GS!ERR_ GS!ERR & "(" & Str & ")" &
+		 "EXPECTED 'MONTH' OR 'DAY' OR A DAY OF THE WEEK";
+    return( false ); 			! Fall-through to here means error ;
+
+    END; 						! if ValNum;
+
+  if KEQU( Str[ 1 for 5 ],"MONTH" ) then 		! as "EVERY MONTH";
+    BEGIN 
+    if not GB!Coded then 	! whole exp is "EVERY MONTH" or "MONTH";
+      BEGIN
+      if Cycle = 0 then
+        Cycle_ 1; 		! "MONTH" becomes "EVERY MONTH" ;
+      SetCode( 0,TypN,Cycle,1,EndCon, Current );
+      END
+    else
+      BEGIN
+      if GB!DayCyc then ! second half of exp as: "nTH DAY EVERY [cycle] MONTHS";
+        SetCode( 0,TypN,Cycle,GI!DayCyc,EndCon, Current )
+      else 	    ! it's the second unit of exp as "3RD MOND OF EVERY MONTH";
+        SetCode( 0,0,1,0,EndCon, Current );
+      END;
+    GB!MonUnit_ true; 		! second unit of 2 unit exp must be month unit;
+    return( true );
+    END;
+  
+  !------------------;
+  !									;
+  !------------------;
+  if ValidDaOfWk( Str ) then 			! as in "EVERY MONDAY" (  );
+    BEGIN
+    if Cycle = 0 then ! Only the next DOW is required so figure the date ;
+      BEGIN
+      base_ TodaysIntrnDat;		! base is disp from 1-jan-64 ;
+      TGTday_ Vik( WkDay,  Str );
+      BaseDayNum_ ( base + 4 ) mod 7;	! +4 = sat when mod 7 ;
+      BaseDay_ WkDay[ BaseDayNum ];
+      if BaseDayNum = TGTday then
+        diff_ 0
+      else
+        if BaseDayNum < TGTday then
+          diff_ abs( BaseDayNum - TGTday )
+        else
+          diff_ 7 - ( BaseDayNum - TGTday );
+      NextDate_ base + diff; 
+      SetCode( 0,TypS,0,0,EndCon, Current );
+      if NextDate = base then
+        SREF( NextDate + 7 )
+      else
+        SREF( NextDate );
+      GB!SpecDat_ true;
+      return( true );
+      END
+    else
+      BEGIN
+      SetCode( Cycle,TypW,0,Vik( WkDay,  Str ),EndCon, Current );
+      return( true );
+      END
+    END;
+
+  if KEQU( Str[1 for 3], "MIN" ) then 		! as in "EVERY MINUTE" ;
+    GS!ERR_ "?FORMAT IS 'EVERY n MINUTES'.";
+
+  if KEQU( Str[1 for 3], "HOU" ) then 			! as in "EVERY HOUR" ;
+    GS!ERR_ "?FORMAT IS 'EVERY n HOURS'." ;
+
+  !------------------;
+  !	as: "EVERY DAY".						;
+  !------------------;
+  if KEQU( Str[1 for 3], "DAY" ) then 			! as in "EVERY DAY" ;
+    BEGIN
+    if cycle = 0 then 				! need to know how many days;
+      BEGIN
+      GS!ERR_ "?NEED HOW MANY DAYS OR EVERY DAY";
+      return( false );
+      END
+    else
+      BEGIN
+      GB!DayCyc_ true; 			   ! a cyclic day unit has been coded;
+      SetCode( 1,TypN,0,cycle,EndCon, Current );
+      return( true );
+      END
+    END;
+  return( false );		! Valid Unit will never get to this point ;
+END "unit";
+
+
+simple boolean procedure ValidExpression( string S;
+					  reference string GS!ERR;
+					  integer array Current
+					);
+! ----------------------------------------------------------------------;
+!									;
+! returns true with GS!ERR = null if a valid expression was passed.	;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "ValidExpression"
+  string ExpSoFar;
+  integer i;
+
+  D!Bug( crlf&"EXPR: "&S );
+  ExpSoFar_ null;
+  GB!Week_ false;		! Will become true if expression is WEEKDAYS;
+
+  while true do				 ! get rid of leading blanks;
+    if kequ( S[1 for 1] , " " ) then
+      S_ S[ 2 to inf ]
+    else
+      done;
+
+  while not UNIT( ExpSoFar,GS!ERR,Current ) do
+    BEGIN "first unit"
+    if kequ( S,null ) and kequ( GS!ERR,null )  then 
+      GS!ERR_ "?INVALID EXPRESSION ";
+    ExpSoFar_ ExpSoFar & LopWrd( S ) & " ";   ! add next word, then retry UNIT;
+    if kequ( GS!ERR,null ) then   ! string passed to UNIT was not enough to be;
+      continue                    ! valid but no detectable error yet.;
+    else
+      return( false ); ! error;
+    END "first unit";
+
+  GB!DayCyc_ false;
+  ExpSoFar_ null;
+
+  if length(> 0 then
+    BEGIN "possible second unit"
+    GB!MonUnit_ false; ! true if unit found is a month unit;
+
+    while not UNIT( ExpSoFar,GS!ERR,Current ) do 	! same routine as above;
+      BEGIN "find month unit or time"
+      if kequ( S,null ) and kequ( GS!ERR,null )  then 
+        BEGIN "nothing valid yet but no more"
+        if kequ( ExpSoFar[ inf for 1 ]," " ) then
+          ExpSoFar_ ExpSoFar[ 1 to inf - 1 ];
+        if ValidTimeStr( ExpSoFar ) or ValNum( ExpSoFar ) then
+          BEGIN "the run time"
+ 	  if ValNum( ExpSoFar ) and cvd( ExpSoFar ) > 24 then
+	    BEGIN "invalid hour"
+            GS!ERR_ "?Hour of THE DAY MUST NOT BE GREATER THAN 24.";
+	    return( false );
+	    END "invalid hour"
+          else
+	    BEGIN "load time"
+	    if GB!Week then
+	      BEGIN "load time for WEEKDAYS"
+	      GI!Pos_ GI!Pos - ( 4 * D!Length ); ! Back up to Monday. ;
+              for i_ 1 upto 5 do ! Insert the required time in each weekday. ;
+                BEGIN "WEEKDAY times"
+                STIM( TFract( ExpSoFar ) );
+                GI!Pos_ GI!Pos + D!Length;
+                END "WEEKDAY times";
+	      END "load time for WEEKDAYS"
+	    else
+	      BEGIN "regular load time"
+              STIM( TFract( ExpSoFar ) );
+	      END "regular load time";
+            GB!MonUnit_ GB!SpecDat_ true;
+            return( true );
+	    END "load time";
+          END "the run time"
+        else
+          BEGIN "nothing left but not enough"
+          GS!ERR_ "?INVALID EXPRESSION ";
+          END "nothing left but not enough"
+        END "nothing valid yet but no more";
+
+      ExpSoFar_ ExpSoFar & LopWrd( S ) & " ";
+      if kequ( GS!ERR,null ) then
+        continue
+      else
+        return( false ); 			! error detected in UNIT;
+
+      END "find month unit or time";
+
+    if NOT GB!MonUnit then
+      BEGIN 
+      GS!ERR_ "?SECOND UNIT IN TWO UNIT EXPRESION MUST BE A MONTH UNIT.";
+      return( false );
+      END
+
+    END "possible second unit";
+
+  if kequ( S[ inf for 1 ]," " ) then
+    S_ S[ 1 to inf - 1 ];
+
+  if length( S ) > 0 then 
+    BEGIN "time was after month unit"
+    if ValidTimeStr( S ) or ValNum( S ) then
+      BEGIN
+      if ValNum( ExpSoFar ) and cvd( ExpSoFar ) > 24 then
+        BEGIN
+        GS!ERR_ "?(3)Hour of THE DAY MUST NOT BE GREATER THAN 24.";
+        return( false );
+        END;
+      STIM( TFract( S ) );
+      return( true );
+      END
+    else
+      BEGIN
+      GS!ERR_  "UNKNOWN TERMS: <" & s & ">";
+      return( false );
+      END
+    END "time was after month unit"
+  else
+    BEGIN
+    return( true );
+    END
+END "ValidExpression";
+
+
+boolean procedure ValidGroup( string OrigStr;
+			      reference string GS!ERR;
+			      integer array Current
+			    );
+! ----------------------------------------------------------------------;
+!									;
+! 		Gets all up to next "AND" or the END of expression.	;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "ValidGroup"
+  integer ModDate,ModTime,ModNum;
+  string OneExpSoFar,NxtWrd,LatestMod;
+
+  boolean procedure TooLong;
+  BEGIN "TooLong"
+    If GI!Pos = E!Length then
+      BEGIN "too large"
+      GS!ERR_ "?TOO MANY EXPRESSIONS. MAX = " & cvs( E!MaxItem );
+      return( true );
+      END "too large"
+    else
+      return( false );
+  END "TooLong";
+
+  D!Bug( crlf&"Grou: "&OrigStr );
+  OneExpSoFar_ LatestMod_ null;
+  NxtWrd_ LopWrd( OrigStr );
+
+  while true do
+    BEGIN "assemble first expression"
+    if ValModifier( NxtWrd ) then	! mod found;
+      BEGIN "modifier encountered"
+      LatestMod_ NxtWrd; 		! store the modifier;
+      done;	 			! first expression cpmplete. ;
+      END "modifier encountered"
+    else
+      BEGIN "add latest word to our expression"
+      OneExpSoFar_ OneExpSoFar & NxtWrd & " ";
+      if length( OrigStr ) = 0 then
+        done
+      else
+        NxtWrd_ LopWrd( OrigStr );
+      END "add latest word to our expression"
+    END "assemble first expression";
+
+  if ValidExpression( OneExpSoFar,GS!ERR,Current ) then ! evaluate what we've got ;
+    BEGIN "first expression was valid"
+    if length( OrigStr ) = 0 then  ! if END of string;
+      BEGIN "no more"
+      if kequ( LatestMod,null ) then
+        BEGIN "wrap up"
+
+        GI!Pos_ GI!Pos + D!Length;			D!Bug( "<1>" );
+
+        if TooLong then
+          return( false );
+
+        return( true );
+
+        END "wrap up"
+      else
+        BEGIN		
+        GS!ERR_ "?MODIFIER MUST BE FOLLOWED BY A DATE";
+        return( false );
+        END
+      END "no more"
+    END "first expression was valid"
+  else
+    BEGIN 
+    return( false );
+    END;
+
+  if TooLong then
+    return( false );
+
+  OrigStr_ LatestMod & " " & OrigStr;    ! modifier which caused break is Put back;
+
+  ! OrigStr now consists of a modifier followed by more words. ;
+  while true do
+    BEGIN "loop once for each mod followed by a date"
+    OneExpSoFar_ LatestMod_ null;
+    while true do
+      BEGIN  "loop once for each word"
+      NxtWrd_ LopWrd( OrigStr );
+      if ValModifier( NxtWrd ) then
+        BEGIN "found a modifier"		D!Bug( " '"&NxtWrd&"' " );
+        if kequ( LatestMod,null ) then
+          BEGIN "first mod on this loop"
+          LatestMod_ NxtWrd;
+          case LatestMod[1 for 1] of
+            BEGIN
+            [ "A" ] [ "a" ] ModNum_ ( AftCon );
+            [ "B" ] [ "b" ] ModNum_ ( BefCon );
+            [ "S" ] [ "s" ] ModNum_ ( StaCon );
+            [ "U" ] [ "u" ] ModNum_ ( UntCon );
+            [ "E" ] [ "e" ] ModNum_ ( ExcCon )
+            END;
+
+          if length( OrigStr ) > 0 then
+	    BEGIN "there is more"
+            continue
+	    END "there is more"
+          else
+	    BEGIN "nothing left"
+            if kequ( OneExpSoFar,null ) then
+              BEGIN "nothing between modifiers"
+              GS!ERR_ "?CONTIGUOUS MODIFIERS";
+              return( false );
+              END "nothing between modifiers"
+            else
+	      BEGIN "enough for a new expression"
+              done;
+	      END "enough for a new expression"
+	    END "nothing left"
+          END "first mod on this loop"
+        else
+          BEGIN "replace newfound modifier"
+          OrigStr_ NxtWrd & " " & OrigStr;
+          done;
+          END "replace newfound modifier"
+        END "found a modifier"
+      else
+        BEGIN "not a mod so add it on"
+        OneExpSoFar_ OneExpSoFar & " " & NxtWrd;
+        if length( OrigStr ) > 0 then
+          BEGIN "more to come"				D!Bug( " "&NxtWrd );
+          continue;
+          END "more to come"
+        else
+          done;
+        END "not a mod so add it on"
+
+      END "loop once for each word";
+
+    GI!Pos_ GI!Pos + D!Length;   			D!Bug( "<f2>" );
+
+    ! Modififier followed by some expression has been found so check it. ;
+    if ValidExpression( OneExpSoFar,GS!ERR,Current ) then
+      BEGIN  "expression was valid"
+      ModDate_ GREF;
+      ModTime_ GTIM;
+
+      if ModNum < 4 and Not GB!SpecDat then
+        BEGIN
+        print( crlf,"ModNum=<",ModNum,">" );
+        GS!ERR_ "?NEED A DATE WITH AFTER/UNTIL" & crlf &
+                  "  EX: STARTING MMM DD, YYYY .";
+        return( false );                
+        END;
+
+      GB!Coded_ true;
+
+      if ModNum = AftCon then			
+        BEGIN
+        GI!Pos_ GI!Pos - D!Length; 		D!Bug( "<b1>" );
+        SREF( ModDate );			D!Bug( "(3)SREF" );
+        GI!Pos_ GI!Pos + D!Length; 		D!Bug( "<f3>" );
+        ClearCode( Current );
+        END
+      else
+        BEGIN  "mod was not after"
+        Connect( ModNum, Current );		D!Bug("PConn(1):"&ModNum&" ");
+        END "mod was not after";
+
+      if TooLong then
+        return( false );
+
+      if length( OrigStr )  > 0 then
+        continue
+      else
+        BEGIN
+!        GI!Pos_ GI!Pos + D!Length; 	!	D!Bug( "<f4>" );
+        return( true );
+	END;
+
+      END "expression was valid"
+    else
+      BEGIN
+      return( false );
+      END
+    END  "loop once for each mod followed by a date";
+
+END "ValidGroup";
+
+
+simple boolean procedure ParsedOK( string S;
+				   reference string GS!ERR;
+				   integer array Current
+				 );
+! ----------------------------------------------------------------------;
+!									;
+! takes user's date expression up to the end and sends it to routines	;
+! to parse.  If the expression contains "and"'s, this procedure takes	;
+! everything between AND's and individually parses each until whole	;
+! expression is done.  	Returns true if no errors detected.		;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN
+  string Onestring;
+  integer ANDcount;
+
+  D!Bug( crlf&"PaOK: "&S );
+  GI!Pos_ E!Descriptor;
+  if HowMany( S,"BEFORE" ) > 1 then
+    BEGIN
+    GS!ERR_ "?NO MORE THEN 1 BEFORE/UNTIL PER DATE SPECIFIER";
+    return( false );
+    END;
+
+  ANDcount_ HowMany( S,"AND" );
+  while true do
+    BEGIN
+    Onestring_ S_ " " & S; 	! first word not a modifier so replace.;
+    if ANDcount > 0 then
+      Onestring_ LopTo( S,"AND" ); 	  ! get everthing upto next "and";
+    if ValidGroup( Onestring,GS!ERR,Current ) then 	! should be a valid group;
+      BEGIN
+      if ANDcount > 0 then 		! there is another "and" ahead;
+        BEGIN
+        GB!Coded_ true;
+        Connect( AndCon, Current );
+        END;
+      ANDcount_ ANDcount - 1;
+      if ANDcount < 0 then
+        BEGIN 
+	PutConn( EndCon );
+        return( true );
+	END
+      else
+        continue;
+      END
+    else
+      BEGIN
+      return( false );
+      END
+    END 						! while true;
+END;
+
+
+
+simple boolean procedure NoDateExpression( integer array Current );
+! ----------------------------------------------------------------------;
+!									;
+! 		See if there is a date expression in the array.		;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "NoDateExpression"
+  if GetConn = 0 then				! Empty. ;
+    BEGIN "array is empty"
+    print( "NO REQUEST HAS BEEN ENTERED",crlf );
+    return( true );
+    END "array is empty"
+  else
+    return( false );
+END "NoDateExpression";
+
+
+
+internal simple procedure express( integer array Current );
+! ----------------------------------------------------------------------;
+!									;
+! 		Translates date code into English and displays. 	;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "express"
+  integer Multiplier,MoMultiplier,Body,NumExps,i,j,refDate,
+  Type,Connector,ExpS,TimFrac,Minutes,Hours;
+
+  GI!Pos_ E!Descriptor;				! Start from beginning. ;
+
+  if NoDateExpression( Current ) then
+    return;
+
+  for GI!Pos_ E!Descriptor step D!Length until E!Length - 1 do
+    BEGIN "do each expression"
+    Multiplier_   GetMult;
+    type_         GetType;
+    MoMultiplier_ GetMoMult;
+    body_         GetBody;
+    Connector_    GetConn;
+    refDate_      GREF;
+
+    case type of
+      BEGIN
+      [ typW ]
+        BEGIN "type W"
+        if MoMultiplier > 0 then
+          BEGIN "day in cyclic month"
+          print(       if Multiplier = 1 then "THE FIRST "
+                  else if Multiplier = 2 then "THE SECOND "
+                  else if Multiplier = 3 then "THE THIRD "
+                  else if Multiplier = 0 then " ONCE ONLY:A "
+                  else if Multiplier = 9 then "THE LAST "
+                  else  "THE " & cvs( Multiplier ) & "TH " 
+                );
+          print( WkDay[ body ] );		 ! Some day-of-the-week. ;
+          print(       if MoMultiplier = 1 then " OF EVERY MONTH "
+                  else if MoMultiplier = 2 then " OF EVERY OTHER MONTH"
+                  else if MoMultiplier = 3 then " OF EVERY THIRD MONTH"
+                  else if MoMultiplier > 3 then " OF EVERY " 
+                                            & cvs( MoMultiplier ) & "TH MONTH"
+                  else null
+                );
+          END "day in cyclic month"
+        else
+          BEGIN "cyclic day"
+          print(       if Multiplier = 1 then "EVERY "
+                  else if Multiplier = 2 then "EVERY OTHER "
+                  else if Multiplier = 0 then ""
+                  else if Multiplier = 3 then "EVERY 3RD "
+                  else "EVERY " & cvs( Multiplier ) & "TH "
+                );
+          print( WkDay[ body ] );		! Some day-of-the-week. ;
+          END "cyclic day"
+        END "type W";
+
+      [ typN ]
+        BEGIN "type N"
+        if MoMultiplier > 0 then
+          BEGIN "day number in cyclic month"
+          print( "THE " );
+          print(       if body = 32 then "LAST DAY " 
+                  else if body = 1  then "FIRST DAY " 
+                  else if body = 2  then "SECOND DAY " 
+                  else if body = 3  then "THIRD DAY "
+                  else cvs( body ) & "TH DAY "
+                );
+          print(      if MoMultiplier = 1  then "OF EVERY MONTH "
+                  else if MoMultiplier = 2 then "OF EVERY OTHER MONTH"
+                  else if MoMultiplier = 3 then "OF EVERY THIRD MONTH"
+                  else if MoMultiplier > 3 then "OF EVERY " 
+                       & cvs( MoMultiplier ) & "TH MONTH"
+                  else null
+                );
+          END "day number in cyclic month"
+        else
+          BEGIN "every n days"
+          print( "EVERY " );
+          print(           if body = 1 then "DAY " 
+                      else if body = 2 then "SECOND DAY " 
+                      else if body = 3 then "THIRD DAY "
+                      else cvs( body ) & "TH DAY "
+                );
+          END "every n days"
+        END "type N";
+
+      [ TypT ]
+        BEGIN "type T"
+        Minutes_ body;
+        Hours_   Minutes Div 60;
+        Minutes_ Minutes mod 60;
+        if Hours > 0 then
+          BEGIN "every n hours"
+          print( "EVERY " , Hours , " HOURS" );
+          if Minutes > 0 then
+            BEGIN "and every n minutes"
+            print( " AND " , Minutes , " MINUTES" );
+            END "and every n minutes"
+          END "every n hours"
+        else
+          BEGIN "every n minutes"
+          print( "EVERY ", Minutes ," MINUTES" );
+          END "every n minutes";
+        print( " REFERENCE " );
+        print( CvSTim( GTIM ) );
+        END "type T";
+
+      [ TypS ]
+        BEGIN "type S"
+        if refDate = 262143 then
+          print( "STARTUP" )
+        else
+          print( CvSDat( refDate ) );
+        END "type S"
+      END; ! case ;
+
+      if not type = TypT and		! Time of day. ;
+       not refDate = 262143 then
+      BEGIN "time of day"
+      TimFrac_ GTIM;
+      print( if TimFrac = 0 then " AT MIDNIGHT"
+            else " AT " & CvsTim( TimFrac )
+            );
+      END "time of day";
+
+    if refDate > TodaysIntrnDat and
+        not type = TypS       then
+      print( " AFTER ",CvSDat( GREF ) );
+
+    case connector of 
+      BEGIN "show connector"
+      [  AndCon  ] print( crlf,"AND " );
+      [  StaCon  ] print( " STARTING: " );
+      [  BefCon  ] print( " BEFORE: " );
+      [  ExcCon  ] print( " EXCEPT: " );
+      [  UntCon  ] print( " UNTIL: " );
+      [  EndCon  ] print( "." );
+      else 	! event of an unknown connector ( should never happen );
+        print( crlf," ?" ,connector,"?",crlf,"              " )
+      END "show connector";
+    if Connector = EndCon then
+      done;
+    END "do each expression";
+  print( crlf );
+
+END "express"; 
+
+
+internal simple procedure Display( integer array Current );
+! ----------------------------------------------------------------------;
+!									;
+! 		Generates sample dates based on users date expression. 	;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "display"
+	string  date,		! Temp hold for dd-mmm-yy string. ;
+		DOW;		! Gets a day of the week (ex: MONDAY). ;
+	integer GMTbase,	! After-Date supplied to nextime.;
+				!   Nextime will find next run after GMTbase;
+		dis,		! Gets date/time returned by NextTime;
+		Count;		! Keep track of how many run dates have been;
+				!   displayed on the screen. ;
+
+  GI!Pos_ E!Descriptor;				! start at beginning. ;
+
+  if NoDateExpression( Current ) then
+    return;
+
+  Count_ 0;
+  GMTbase_ GetTDT;		! First base date for NextTime will be NOW. ;
+  while true do			! Go until no further dates or user stops it. ;
+    BEGIN "once for each date"
+    Count_ Count + 1;				! Keep track of how many dates;
+
+    dis_ NexTim( Current[0],GMTbase ); 		! returns 0 if no more dates. ;
+
+    GMTbase_ dis;				! base for next time around. ;
+
+    if dis = 0 or !lh( dis ) > 13148 then 	! no dates after 12/31/1999;
+      BEGIN "Out of dates"
+      print( crlf,"no further dates.",crlf );
+      done;
+      END "Out of dates"
+    else
+      BEGIN "show the latest date"
+
+      dis_ CvtDTM( dis, 0, '20 ); 		! Convert to local from GMT. ;
+      Date_ CvSDat( !lh( dis ) );		! Convert to dd-mmm-yy. ;
+      DOW_ WkDay[ ( !lh( dis ) + 4 ) mod 7 ]; 	! Figure the day of the week;
+      print( date," ",DOW );			! Display the date and day. ;
+      print( "          "[ 1 for ( 10 - length( DOW ) ) ] );
+      print( " AT ",CvSTim( !rh( dis ) ) );	! Include time of day. ;
+
+      if Count = 10 then 			! Display 10 at a time. ;
+        BEGIN "pause after ten"
+        print( crlf&"- <cr> ends list, any char for more:" );
+        if kequ( inchrw,#cr ) then		! User typed <cr> only. ;
+          BEGIN "thats all"			! So that's it. ;
+	  print( crlf );
+          return;
+          END "thats all"
+        else					! Else re-initialize counter;
+          Count_ 0;				!   and continue. ;
+        END "pause after ten";
+
+      END "show the latest date";
+
+    print( crlf );
+    END "once for each date";
+
+END "display";
+
+
+internal simple procedure Look( integer array Current );
+! ----------------------------------------------------------------------;
+!									;
+! 		Shows date code generated by a date expression.		;
+! 		This procedure will screw up if the date expression	;
+!		  is greater than the screen width.			;
+! ----------------------------------------------------------------------;
+BEGIN "look"
+
+    if NoDateExpression( Current )
+     then return
+     else begin "print date code"
+
+	! first print the heading. ;
+	for GI!Pos_ E!Descriptor step D!Length
+		    until ( E!Length - D!Length - 1 )
+	 do begin "heading"
+	    print( "/T  bbbbC      ( time )" );
+	    if GetConn = EndCon
+	     then done;
+	 end "heading";
+
+	print( "/" );
+	print( crlf );
+
+	! Now the actual contents of the descriptor. ;
+	for GI!Pos_ E!Descriptor step D!Length
+		    until ( E!Length - D!Length - 1 )
+	 do begin "show code"
+	    print( GetMult    );
+	    print( GetType    );
+	    setformat( -2,2 );
+	    print( GetMoMult  );
+	    setformat( -4,4 );
+	    print( GetBody    );
+	    setformat( 0,7 );
+	    print( GetConn    );
+	    setformat( -5,5 );
+	    print( GREF );
+!	    print( !lh( Current[ GI!Pos + D!Daytime ] ) );
+!	    setformat( -6,6 );
+	    print( "," );
+	    print( CvSTim( GTIM ) );
+	    setformat( 0,7 );
+	    if ( GetConn = EndCon )	! Quit at end of the date spec. ;
+	     then done;
+	 end "show code"
+
+     end "print date code";
+
+    print( crlf );
+
+END "look";
+
+
+internal simple procedure Test( integer array MyRec );
+! ----------------------------------------------------------------------;
+!									;
+! 		Performs "express" and "display" commands. 		;
+!									;
+! ----------------------------------------------------------------------;
+if NoDateExpression( MyRec )
+ then return
+ else begin "do both"
+
+    Express( MyRec );
+    Display( MyRec );
+
+ end "do both";
+
+
+
+internal simple procedure GetExpFromUser( integer array MyRec );
+! ----------------------------------------------------------------------;
+!									;
+!		Get the date expression from the user.			;
+!		NewRecord parameter is true if the date expression	;
+!		  is being entered after a DATES command at the		;
+!		  SUBMIT prompt, in which case the array is cleared.	;
+!		NewRecord parameter is false if the user is at the	;
+!		  OPTIONS prompt, in which case a backup of the 	;
+!		  queue rec is made and the date area of the queue	;
+!		  rec is cleared to receive a new date expression.	;
+!		If the new date expression entered at OPTIONS is bad	;
+!		  then the queue rec is restored to its original state.	;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "GetExpFromUser"
+
+    arrclr( ModCheck ); 		! clear modify check array ;
+
+    arrblt( Template[ E!Runtime ], MyRec[ E!Runtime ], E!Length ); 
+
+    for GI!Pos_ E!Descriptor step D!Length until E!Length-1
+     do ClearCode( Template );		! clear expression area ;
+
+    GB!Coded_ false;			! Set true during parser. ;
+    GS!ERR_ null;			! Clear error message. ;
+    GetDateSpec;			! Prompt for date expression. ;
+    GS!Scanned_ ScanStr( GS!UsrsExp );	! Clear out illegal words. ;
+
+    if not( ParsedOK( GS!Scanned, GS!ERR, Template ) )
+     then begin "bad date expression"	! No good, ;
+	print( GS!ERR,crlf );		! Print error message. ;
+
+	if ( length( GS!Undef ) > 3 )	! Junk found earlier. ;
+	 then print( crlf, "Unimplemented terms: ", GS!Undef, crlf );
+
+	GI!Runtime_ 0;
+     end "bad date expression"
+     else begin "good parse"
+
+	arrblt( MyRec[ E!Runtime ], Template[ E!Runtime ], E!Length );
+	GI!Runtime_ NexTim( MyRec[0], 0 );	! calculate first runtime ;
+
+     end "good parse";
+
+END "GetExpFromUser";
+
+END "SUBPAR";
+    Zc"c
