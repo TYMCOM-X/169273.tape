@@ -1,0 +1,11 @@
+sv2r53/img
+/b:1000:lowmem:sx:inidat:inibyt:main:second:tenths:init:.xdt.:once:vectbl
+/b:10000:falcbt/b:10040
+/T:167400:pdata:ddb:ldb:adb:sdb:impure,
+MP2r53=cg2r53.nbj,ru2353.nbj,
+exec.nbj,errrom.nbj,pkt1.nbj,pkt2.nbj,pkt3d.nbj,
+cmdsat.nbj,cmdsst.nbj,trmstR.nbj,trmfst.nbj,trmpst.nbj,
+trmtst.nbj,xltcrs.nbj,xltebc.nbj,zapbuf.nbj,
+lnk1.nbj,lnkiSH.nbj,lkist1.nbj,lkist2.nbj,
+tyma.nbj,lingst.nbj,ATCMGR.nbj,
+autR11.nbj,oncrom.nbj,end.nbj
