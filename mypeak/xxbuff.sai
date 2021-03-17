@@ -1,0 +1,818 @@
+Entry;
+begin "DED - Buffer / Checkpoint manager"
+  require "DED.DEF" source!file;
+!! title Tops20 Buffer/Checkpoint Manager ;
+
+  ifcr TymcomX thenc
+    require "!!!! You're compiling the wrong buffer module !!!!" message;
+    require "!!!! This one is for Tops20 only.             !!!!" message;
+    TryAgainWithTheCorrectModule
+  endc
+
+
+! *************************************************************************
+*                                                                         *
+*             The Buffer/Checkpoint manager.  Tops20 version.             *
+*                       Ken Dawson   25-August-1983                       *
+*                                                                         *
+**************************************************************************;
+
+!                  From the Language / Operating System.
+;
+
+  external integer
+    !skip!;                             ! Skip-return flag for SAIL/OS
+                                        ! operations.
+                                        ;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                        From the Utility Module.
+;
+
+  external simple integer procedure
+    chsizef (integer Chan);             ! Return the size in characters
+                                        ! of the file open on the
+                                        ! indicated channel.
+                                        ;
+  external simple procedure
+    Blt (integer SrcStart, DstStart, SrcLen);
+                                        ! General block transfer
+                                        ! routine.
+                                        ;
+  external simple integer procedure
+    DecrBP (integer BP);                ! Return a decremented byte
+                                        ! pointer. 
+                                        ;
+  external simple procedure
+    DoErstr;                            ! Produce an error message
+                                        ! corresponding to the last
+                                        ! detected error condition.
+                                        ;
+  external simple integer procedure
+    ffffp (integer Jfn, StartPage(0));  ! Find first free file page jsys.
+                                        ;
+  external simple procedure
+    MoveBytes (integer SrcPtr, TgtPtr, BytCnt);
+                                        ! Transfer byte strings from one
+                                        ! place to another.
+                                        ;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                        From the Command Module.
+;
+
+  external safe integer array
+    C!Tab ['0:'177];                    ! Character-translation table.
+                                        ;
+
+  external integer
+    C!Debug;                            ! True if we are debugging.
+                                        ;
+
+  external boolean
+    G!TextMode,                         ! True iff we are in Text Mode.
+                                        ;
+    G!RNulls;                           ! True if we want to remove nulls
+                                        ! automatically on startup.
+                                        ;
+
+  external boolean procedure
+    C!Ask (string Question);            ! Ask the user a question through
+                                        ! the message line.
+                                        ;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                          From the File Module.
+;
+
+  external  simple boolean procedure
+    F!FileExists (string FName);        ! True if the named file exists.
+                                        ;
+  external boolean procedure
+    F!Writ (string FileName);           ! ???
+                                        ;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                         From the Window Module.
+;
+
+  external procedure
+    W!SetB (integer BufNum);            ! ???
+                                        ;
+  external procedure
+    W!Msg (string Msg);                 ! Display a message.
+                                        ;
+  external procedure
+    W!FixS;                             ! To cause update of status line.
+                                        ;
+  external procedure
+    W!NewS;                             ! Set to build new status line.
+                                        ;
+  external procedure
+    W!BClr;                             ! ???
+                                        ;
+  external procedure
+    W!BAdd (string Msg);                ! Add a string to the little
+                                        ! display window.
+                                        ;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                        From the Redisplay Module.
+;
+  external procedure
+    T!Bell;                             ! Do a beep on the terminal.
+                                        ;
+  external integer
+    T!Lines;                            ! Size of physical window.
+                                        ;
+
+
+! ------------------------------------------------------------------------;
+!! title Internal Storage ;
+
+!                     Storage for buffer descriptors.
+;
+
+  own integer
+    B!!Head,                            ! Head of active buffer list.
+                                        ;
+    B!!List,                            ! Pointer into list.
+                                        ;
+    B!!Free;                            ! Head of free list.
+                                        ;
+
+  own trusted string array
+    B!!Alias      [1:BUFMAX],
+    B!!ChkPntFile [1:BUFMAX],
+    B!!File       [1:BUFMAX],
+    B!!Mode       [1:BUFMAX];
+
+  own trusted integer array
+    B!!Last       [1:BUFMAX],
+    B!!Next       [1:BUFMAX];
+
+  own trusted boolean array
+    B!!ModP       [1:BUFMAX];
+
+
+  ! Static per-buffer storage.
+  ;
+
+  internal string
+    B!Alias,                            ! "alias" for filename.
+                                        ;
+    B!ChkPntFile,                       ! Name of the current Checkpoint
+                                        ! file.
+                                        ;
+    B!File,                             ! Filename the buffer came from.
+                                        ;
+    B!Mode;                             ! Mode(s) that apply to this
+                                        ! buffer.
+                                        ;
+
+  internal boolean
+    B!BegP,                             ! True iff point is at 0.
+                                        ;
+    B!EndP,                             ! True iff point is at B!Size.
+                                        ;
+    B!ModP;                             ! True iff buffer has been
+                                        ! modified.
+                                        ;
+
+  internal integer
+    B!Size,                             ! The number of characters in the
+                                        ! buffer at any given time.
+                                        ;
+    B!Lock,                             ! State of the write-lock on the
+                                        ! buffer. 
+                                        ;
+    InsertLock,                         ! Indicates that the Buffer is
+                                        ! locked against character
+                                        ! insertions.
+                                        ;
+    DeleteLock,                         ! Indicates that the Buffer is
+                                        ! locked against character
+                                        ! deletions.
+                                        ;
+    B!Prot,                             ! Buffer's protection code.
+                                        ;
+
+    B!WS0,                              ! Mark Index of the starting point
+                                        ! of the first window.
+                                        ;
+    B!WS1,                              ! Mark Index of the starting point
+                                        ! of the second window.
+                                        ;
+    B!CkPtSer,                          ! Serial number of the checkpoint
+                                        ! file.
+                                        ;
+    B!DedVer;                           ! Version number of the editor
+                                        ! that created the checkpoint
+                                        ! file. 
+                                        ;
+
+  own integer
+    B!Point,                            ! The Point is the position
+                                        ! indicator for the cursor,
+                                        ! located between characters in
+                                        ! the buffer.  Its value is the
+                                        ! number of characters to the
+                                        ! left of the cursor.
+                                        ;
+    B!LastP;                            ! Mark Index of the Last Position
+                                        ! indicator. 
+                                        ;
+
+
+! ************************************************************************;
+
+
+  ! Storage for things other than buffers.
+  ;
+
+  preset!with
+    hl('350700),
+    hl('260700),
+    hl('170700),
+    hl('100700),
+    hl('010700);
+
+  own safe integer array
+    B!BPLeft [0:4];
+
+    ! This magic is used to build byte pointers.  The five numbers point
+    ! to the 0th, 1st, ... 4th 7 bit characters in a 36 bit word.
+    ;
+
+
+! ------------------------------------------------------------------------;
+
+!                    Regarding User and Internal Marks
+!
+!
+!       We define two areas in the array which contains all marks
+!       maintained by Peak, the User Marks area (in the range [0,
+!       #UserMarks - 1]) and the Real Marks area ([FirstMark, MaxMarks]).
+!
+!
+!                          --------------------
+!                          |                  | User Marks
+!                          |                  |
+!                          --------------------
+!                          |                  | Real Marks
+!                          |                  |
+!                          |                  |
+!                          |                  |
+!                          |                  |
+!                          --------------------
+!
+!
+!       User Marks are distinguished in the sense that they are finite in
+!       number (determined at compile time), and that they are
+!       pre-allocated to the index range [0, #UserMarks - 1].
+!
+!       When the user sets a mark, a slot in the Real Marks area is
+!       allocated, and its index placed in the appropriate User Mark
+!       slot.
+!
+!       When an internal routine allocates a mark, the index in the Real
+!       Marks range of the allocated mark is returned
+!
+!       Mark-updating procedures in the insert and delete operations deal
+!       only with marks allocated in the Real Marks area, thus minimizing
+!       the amount of work done to what is necessary.
+!
+!
+;
+
+  define
+    #UserMarks     = {10},
+    FirstMark      = {#UserMarks},
+    #InternalMarks = {30},
+    MaxMarks       = {((2 * #UserMarks) + #InternalMarks)};
+
+  own integer
+    MarkCnt;
+
+      ! The number of Real Marks allocated at the current time.
+      ;
+
+  own integer array
+    Marks[0 : MaxMarks - 1];
+
+      ! The array containing the entire Mark structure.
+      ;
+
+
+! ------------------------------------------------------------------------;
+!! title Some Definitions ;
+! <<  Encyphering: Enter with no lookup will allegedly cause the file to
+!     be hidden from the file system until a close is done on it.
+;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                                Globally
+;
+
+! <<  Global Lock variables for (1) Insert    lock
+!                               (2) Delete    lock
+!                               (3) Read-Only lock
+;
+
+  define
+    !ChrMask (X) = {!mask(36 - ((X + 1) * 7))};
+
+  preset!with
+      !ChrMask(0),
+      !ChrMask(1),
+      !ChrMask(2),
+      !ChrMask(3),
+      !ChrMask(4);
+
+  own safe integer array
+    ChrMsk [0:4];                       ! This is a set of character
+                                        ! masks for composing a word of
+                                        ! bytes from two different
+                                        ! source words.  (See MoveTextPL)
+                                        ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                             Process-Related
+;
+
+  define
+    !fhslf = {bit(18)};                 ! The Tops-20 designator for the
+                                        ! current process.
+                                        ;
+
+  integer
+    B!Chan;                             ! The channel related to the
+                                        ! Checkpoint file.
+                                        ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                          Page-Mapping Related
+;
+
+
+  define
+    !CPg (X) = {xwd(B!Chan, X)},
+    !MPg (X) = {xwd(!fhslf, X)},
+    !TPg (X) = {xwd(F!Chan, X)};
+
+    ! These define a series of device designators for the pmap calls.
+    ;
+
+  define
+    !Count! (X)  = {(bit(0) lor (X land !mask(18)))}
+
+                                        ! A repeat count is specified.
+                                        ;,
+    !Cow!        = {bit(9)}             ! Copy-on-write acccess.
+                                        ;,
+    !Rd!         = {bit(2)}             ! Read access.
+                                        ;,
+    !Wt!         = {bit(3)}             ! Write access.
+                                        ;,
+    !RdWt!       = {(!Rd! lor !Wt!)}    ! Read-Write access.
+                                        ;,
+    !PreRef!     = {bit(5)}             ! Pre-Reference the page.
+                                        ;;
+
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                       Regarding the Virtual File
+;
+
+  internal integer
+    B!MaxPgIdx;                         ! Index of the last page in the
+                                        ! Virtual File.
+                                        ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                         Regarding the EDT Area
+;
+
+! The EDT area contains all checkpointable quantities associated with the
+! individual buffer.  These are the variables which are remembered when
+! we return to a buffer after having edited another buffer.
+;
+
+  define
+    EDTSize = {1};                      ! Size in pages of the EDT
+                                        ! portion of the giant buffer.
+                                        ;
+
+
+  integer
+    EDT;                                ! The location of the base of the
+                                        ! EDT portion of the giant array.
+                                        ;
+
+
+  define
+    !B!EdName  = {memory[EDT + 0]},
+    !B!DedVer  = {memory[EDT + 1]},
+    !B!CkPtSer = {memory[EDT + 2]},
+
+    !B!Point   = {memory[EDT + 3]},
+    !B!Size    = {memory[EDT + 4]},
+    !B!ModP    = {memory[EDT + 5]},
+    !B!Lock    = {memory[EDT + 6]},
+    !B!Prot    = {memory[EDT + 7]},
+    !B!WS0     = {memory[EDT + 8]},
+    !B!WS1     = {memory[EDT + 9]},
+
+    !B!File1   = {memory[EDT + 10]},
+    !B!File2   = {memory[EDT + 11]},
+    !B!File3   = {memory[EDT + 12]},
+    !B!File4   = {memory[EDT + 13]},
+    !B!File5   = {memory[EDT + 14]},
+    !B!File6   = {memory[EDT + 15]},
+
+    !B!Alias1  = {memory[EDT + 16]},
+    !B!Alias2  = {memory[EDT + 17]},
+    !B!Alias3  = {memory[EDT + 18]},
+    !B!Alias4  = {memory[EDT + 19]},
+    !B!Alias5  = {memory[EDT + 20]},
+    !B!Alias6  = {memory[EDT + 21]},
+    !B!Alias7  = {memory[EDT + 22]},
+
+    !B!Mode1   = {memory[EDT + 23]},
+    !B!Mode2   = {memory[EDT + 24]},
+
+    !B!BufNum  = {memory[EDT + 25]},
+    !B!MarkCnt = {memory[EDT + 26]},
+    !B!Marks   = {memory[EDT + 27]},
+
+    !B!LstWrd  = {memory[EDT + 28 + MaxMarks - 1]};
+
+
+    ! These are the offsets used to designate the locations corresponding
+    ! to the named objects in the EDT area.
+    ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                      Regarding the Checkpoint file
+;
+
+
+  ! The format of the Checkpoint file is as follows:
+
+                  -------------------------     memory[HEAD]
+                  |                       |
+                  |       Header          |         HEADSize
+                  |                       |
+                  -------------------------     memory[ICBM]
+? Should this     |                       |
+? be here?        |        ICBM           |         ICBMSize
+?                 |                       |
+                  -------------------------     memory[PPM]
+                  |                       |
+                  |         PPM           |         PPMSize
+                  |                       |
+                  -------------------------     memory[EDT]
+                  |                       |
+                  |         EDT           |         EDTSize
+                  |                       |
+                  -------------------------     memory[ICB]
+                  |                       |
+                  |                       |         ICBSize
+                  |        Data           |
+                  |                       |
+                  |                       |
+                  --------------------
+  ;
+
+
+  integer
+    HEAD;                               ! The address of the base of the
+                                        ! Header portion in the giant
+                                        ! array.
+                                        ;
+
+  define
+    HEADSize = {1};                     ! Size in pages of the Header
+                                        ! portion of the giant array.
+                                        ;
+
+  define
+    $H$ICBM   = {memory[HEAD + 0]}      ! Page offset of the ICBM Block.
+                                        ;,
+    $H$PPM    = {memory[HEAD + 1]}      ! Page offset of the PPM Block.
+                                        ;,
+    $H$EDT    = {memory[HEAD + 2]}      ! Page offset of the EDT Block.
+                                        ;,
+    $H$Data   = {memory[HEAD + 3]}      ! Page offset of the Data Block.
+                                        ;,
+    $H$DedVer = {memory[HEAD + 4]}      ! The signature of the editor
+                                        ! version that created this
+                                        ! CheckPoint file.
+                                        ;;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                           Regarding the ICBM
+;
+
+! The ICBM currently occupies 1 page of memory.
+! The ICBM is indexed (=[0, MaxICBMIdx]).
+! An ICBM entry is empty iff $ICBM.VFPg is < 0.
+;
+
+
+  integer
+    ICBM;                               ! Location of the In-Core Buffer
+                                        ! Map.
+                                        ;
+
+  define
+    ICBMWordsPerEntry = {4};            ! The number of words which
+                                        ! constitute an entry in the ICB
+                                        ! map.  This number should be a
+                                        ! factor of WordsPerPage.
+                                        ;
+
+  define
+    ICBMSize = {1};                     ! The size in pages of the ICBM
+                                        ! portion of the giant array.
+                                        ;
+
+  define
+    ICBMEntries = {((ICBMSize * WordsPerPage) div ICBMWordsPerEntry)};
+
+      ! The number if entries in the ICBM.
+      ;
+
+  define
+    MaxICBMIdx = {ICBMEntries - 1};     ! The maximum value which an
+                                        ! index into the ICBM can
+                                        ! attain.
+                                        ;
+
+  define
+    IWPE              = {ICBMWordsPerEntry};
+
+      ! Generally useful substitution.
+      ;
+
+  define
+    $I.MP             = {0},
+    $I.VP             = {1},
+    $I.MC             = {2};
+
+      ! These are the offsets of the various fields within the ICBM
+      ! entry.
+      ;
+
+  define
+    $ICBM.Adr   (Pg)    = {ICBM + (Pg * IWPE)},
+    $ICBM.MP    (Adr)   = {memory[Adr + $I.MP]},
+    $ICBM.VP    (Adr)   = {memory[Adr + $I.VP]},
+    $ICBM.MC    (Adr)   = {memory[Adr + $I.MC]};
+
+      ! These are primitives for accessing the fields of a ICBM entry,
+      ! given that we know the entry's address.
+      ;
+      ! 
+      ;
+  define
+    $ICBM.MemPg   (I) = {memory[ICBM + (I * IWPE) + 0]},
+    $ICBM.VFPg    (I) = {memory[ICBM + (I * IWPE) + 1]},
+    $ICBM.MissCnt (I) = {memory[ICBM + (I * IWPE) + 2]};
+
+      ! The access-methods for the various fields of an ICBM entry.
+      ;
+
+      ! We define these fields as follows:
+      !
+      !   $ICBM.MemPg   (I)
+      !     The physical page in memory where the contents of the Ith ICB
+      !     page reside.
+      !
+      !   $ICBM.VFPg    (I)
+      !     The index of the Virtual File page mapped to the Ith ICB page.
+      !
+      !   $ICBM.MissCnt (I)
+      !     The number of times which the Ith ICB page has not been
+      !     selected, and yet has remained in memory.
+      ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                            Regarding the ICB
+;
+
+  integer
+    ICB;                                ! Location of the In-Core Buffer.
+                                        ;
+
+  define
+    ICBSize = {ICBMEntries};            ! The size in pages of the ICB
+                                        ! portion of the giant array.
+                                        ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                            Regarding the PPM
+;
+
+    ! ((  Note that this assumes that the PPM consists of only 1
+    !     (resident) section.
+    ;
+
+  integer
+    PPM;                                ! The memory address of the PPM
+                                        ! buffer.
+                                        ;
+
+  define
+    PPMWordsPerEntry  = {8};            ! The number of words in a single
+                                        ! page's entry in the PPM.  This
+                                        ! number must be a factor of
+                                        ! WordsPerPage.
+                                        ;
+
+  define
+    PPMEntries = {1024};                ! The number of entries in the
+                                        ! PPM.
+                                        ;
+
+  define
+    MaxPPMIdx = {PPMEntries - 1};       ! The maximum value that an index
+                                        ! into the PPM can attain.
+                                        ;
+
+  define
+    PPMSize = {((PPMWordsPerEntry * PPMEntries) div WordsPerPage)};
+
+      ! The size of the portion of the giant buffer occupied by the PPM.
+      ;
+
+  define
+    PWPE               = {PPMWordsPerEntry};
+
+      ! Generally useful substitution.
+      ;
+
+  define
+    $V.LG             = {0},
+    $V.TL             = {1},
+    $V.RG             = {2},
+    $V.IX             = {3},
+    $V.CP             = {4};
+
+      ! These are the offsets of the various fields within the PPM entry.
+      ;
+
+  define
+    $VFPg.Adr   (Pg)  = {PPM + (Pg * PWPE)},
+    $VFPg.LG    (Adr) = {memory[Adr + $V.LG]},
+    $VFPg.TL    (Adr) = {memory[Adr + $V.TL]},
+    $VFPg.RG    (Adr) = {memory[Adr + $V.RG]},
+    $VFPg.IX    (Adr) = {memory[Adr + $V.IX]},
+    $VFPg.CP    (Adr) = {memory[Adr + $V.CP]};
+
+      ! These are primitives for accessing the fields of a PPM entry,
+      ! given that we know the entry's address.
+      ;
+
+  define
+    $VFPg.LftGap (Pg) = {memory[PPM + (Pg * PWPE) + $V.LG]},
+    $VFPg.TxtLen (Pg) = {memory[PPM + (Pg * PWPE) + $V.TL]},
+    $VFPg.RgtGap (Pg) = {memory[PPM + (Pg * PWPE) + $V.RG]},
+    $VFPg.ICBIdx (Pg) = {memory[PPM + (Pg * PWPE) + $V.IX]},
+    $VFPg.ChkPg  (Pg) = {memory[PPM + (Pg * PWPE) + $V.CP]};
+
+      ! These are primitives for accessing the fields of a PPM entry at
+      ! random.
+      ;
+
+      !   We define these fields as follows:
+      !
+      !     $VFPg.LftGap (I)
+      !       The location of the first character after the left gap on
+      !       page I.  This is equivalent to saying that it is the length
+      !       of the gap preceding the text on this page.
+      !
+      !         length($VFPg.LftGap(I)) =
+      !             $VFPg.LftGap(I)
+      !
+      !     $VFPg.TxtLen (I)
+      !       The length of the text residing on page I.
+      !
+      !     $VFPg.RgtGap (I)
+      !       The location of the first character following the last text
+      !       character on page I.  When the text ends at the end of the
+      !       page, this value is CharactersPerPage.
+      !
+      !         length($VFPg.RgtGap(I)) =
+      !             CharactersPerPage - $VFPg.RgtGap(I) 
+      !
+      !     $VFPg.ICBIdx (I)
+      !       The index of page I in the In-Core Buffer.
+      !
+      !     $VFPg.ChkPg  (I)
+      !       The index of page I in the Checkpoint file.  This is the
+      !       actual file page on which Virtual File page I resides.
+      !
+      !     In General,
+      !       length($VFPg.LftGap(I)) + $VFPg.TxtLen(I) =
+      !           CharactersPerPage
+      !
+      ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                        Giant page-mapped buffer
+;
+
+! Note: We exploit the correspondence in layout between the beginning of
+!       the Checkpoint file and the beginning of the giant array by using
+!       ICBBase to denote the first data page in the Checkpoint file.
+!       This consitutes a mixed metaphor.
+;
+
+  define
+    HEADBase    = {0},
+    ICBMBase    = {HEADBase  + HEADSize},
+    PPMBase     = {ICBMBase  + ICBMSize},
+    EDTBase     = {PPMBase   + PPMSize},
+    ICBBase     = {EDTBase   + EDTSize},
+    EndOfBuffer = {ICBBase   + ICBSize};
+
+    ! Define the bases of the various portions of the giant array.
+    ;
+
+  integer
+    GiantBase;                          ! The address of the first page
+                                        ! boundry in the giant array.
+                                        ;
+
+  preload!with
+    [((EndOfBuffer + 1) * WordsPerPage + 1)] 0;
+
+    ! This incantation is included in order to avoid the fuss Sail would
+    ! otherwise go through to initialize the venerable giant.
+    ;
+
+  safe integer array
+    GiantArray[0: (EndOfBuffer + 1) * WordsPerPage];
+
+    ! The physical array for holding all the current page-mapped buffers.
+    ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+ifcr false thenc
+require crlf message;
+require "ICBMEntries: " & cvs(ICBMEntries) & crlf message;
+require "MaxICBMIdx:  " & cvs(MaxICBMIdx) & crlf message;
+require "MaxPPMIdx:   " & cvs(MaxPPMIdx) & crlf message;
+require "PPMSize:     " & cvs(PPMSize) & crlf message;
+require "HeadBase:    " & cvs(HeadBase) & crlf message;
+require "ICBMBase:    " & cvs(ICBMBase) & crlf message;
+require "PPMBase:     " & cvs(PPMBase) & crlf message;
+require "EDTBase:     " & cvs(EDTBase) & crlf message;
+require "ICBBase:     " & cvs(ICBBase) & crlf message;
+require "EndOfBuffer: " & cvs(EndOfBuffer) & crlf message;
+require "Length:      " & cvs((EndOfBuffer + 1) * WordsPerPage) message;
+require crlf message; 
+endc
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+!! title File Inclusions ;
+! The source is large enough to warrant being split up, especially since
+! we must edit it on Tops20 with version 0.145, which does file I/O a
+! character at a time!
+;
+
+  require "xxbuf1.req" source!file;
+  require "xxbuf2.req" source!file;
+
+end "DED - Buffer / Checkpoint manager"
+
+
+! **************************  End XXBuff.Sai  *************************** ;
+  ~ 8
