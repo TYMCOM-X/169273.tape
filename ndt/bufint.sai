@@ -1,0 +1,285 @@
+begin "chstor"
+require "(SAILIB)SAIL.DEF" source!file;
+!get!definitions(tymint);
+!get!definitions(proces);
+define !axi8s = 1;
+record!class buffer( 
+	integer	room		! used by interrupt: -left,,written;
+	,	bytePointer	! used by interrupt to write;
+	;
+	r!p(buffer) next	! chased by interrupt for more storage;
+	;
+	integer basePointer 	! deferred interrupt: reset bytePointer;
+	);
+define #room=1, #bytptr=2, #next=3; ! indices for immediate interrupt;
+
+! add fields at end only!;
+
+
+record!class oneCircuit(
+ r!p(buffer) forInterrupt	! buffer(s) with room for output;
+				! seen by immediate interrupt;
+ ;
+ integer auxArg			! for ease/speed: holds port,,!axI8S;
+ ,	spaceCount		! -1 means "noSpace" is ok to defer;
+  				! (prevents over-filling queue);
+ ,	doneComing		! dones since sent "ranout";
+ ;
+! the above are seen by the immediate interrupt;
+
+ r!p(buffer) pending		! buffer(s) not yet consumed;
+ ;				! seen by deferred interrupt;
+
+ integer enableCode		! the "character arrived" interrupt;
+ ,	buffering.proc		! called: end-of-buffer and when empty;
+ ,	immed.proc0		! the "immediate interrupt procedure";
+ ,	immed.proc1		! which is just "movei 1,rec / jrst do";
+);
+define	#forInterrupt=1, #auxArg=2, #spaceCount=3, #doneComing=4, 
+	#p.loc=8;
+! so the immediate interrupt can access these things;
+! the interrupt on and off routines;
+
+simple procedure !causeInt( integer intChan );
+start!code
+	move	1,intChan;
+	tlo	1,'400000;
+	calli	1,-'35;		! intact;
+	 setom	!skip!;
+end;
+
+! this is just a cheat to get around SAIL;
+
+procedure does!call!proc( r!p(oneCircuit) why; r!p(buffer) what;
+				procedure Perform );
+perform( why, what );
+
+
+simple procedure call!proc( r!p(oneCircuit) why; r!p(buffer) what;
+				integer toPerform );
+start!code jrst does!call!proc; end;
+recursive procedure noSpace( r!p(oneCircuit) which );
+! scheduled on interrupt with no room.  (After the bufferFinished's);
+begin	integer ichan;
+ichan_ onecircuit:enableCode[which];
+disable( ichan );
+if oneCircuit:forInterrupt[which] = null!record
+and oneCircuit:doneComing[which] = 0
+ then begin	r!p(buffer) blank; integer proc;
+	! no hope for continuation, let him try to fix the problem;
+	blank_ null!record;	! flag that a real problem exists;
+	proc_ oneCircuit:buffering.proc[which];
+	call!proc( which, blank, proc );
+	ichan_ onecircuit:enableCode[which];
+	if oneCircuit:forInterrupt[which] = null!record
+	and oneCircuit:doneComing[which] = 0
+	 then return;	! he didn't fix it, leave the interrupt off;
+      end;
+oneCircuit:spaceCount[which]_ -1;	! set for another of these;
+!causeInt( ichan );		! make sure no interrupts ignored;
+enable( ichan );	! and turn them back on;
+end;
+recursive procedure bufferFinished( r!p(oneCircuit) which; 
+					r!p(buffer) r );
+! scheduled once per completed buffer;
+begin	integer proc; 
+if null!record neq r neq oneCircuit:pending[which]
+ then usererr(0,1,"buffers delivered out of sync");
+if r then oneCircuit:pending[which]_ buffer:next[r];
+proc_ oneCircuit:buffering.proc[which];
+call!proc( which, r, proc );
+end;
+internal boolean simple procedure finishTop( r!p(oneCircuit) it );
+! returns true iff anything put into deferred queue;
+start!code	define ic=1, r=2, p='17;
+		label done;
+	skipe	ic,it;
+	 skipn	r,#forInterrupt(ic);	! check to make sure of storage;
+	  jrst	done;
+	aos	#doneComing(ic); ! increment count of dones in pipe;
+	push	p,[4];		! temp.1: "buffer completed" deferral;
+	push	p,ic;		! temp.2: which interrupt caused this;
+	push	p,r;		! temp.3: the buffer that was completed;
+	hrrz	r,#next(r);	! get pointer to the next buffer;
+	movem	r,#forInterrupt(ic);	! and save its address away;
+	hrroi	r,bufferFinished; ! temp.4: procedure to call;
+	push	p,r;
+	movei	r,-3(p);	! "AOBJN pointer" to defer block;
+	push	p,r;		! note: 0,,address is now OK;
+	pushj	p,dfr1in;	! do the deferral;
+	sub	p,[!xwd(4,4)];	! clear out the temps now.;
+	skipa	1,[-1];		! indicate we did do the flush;
+done:	 movei	1,0;
+end;
+simple procedure setIntMap( integer index; r!p(oneCircuit) theRec );
+	! contains the actual code called, does the intmap;
+begin!code	define a=1, ch=3, c=5, r=6, ic=7;
+			! Note: 0,B,CH,FSM Fixed! (MAKFSM determined);
+			! 0 used in case tableAddress=0;
+		label rPort, nextBuffer, defer, updateGo, allDun, retry;
+		label mov.op, jmp.op, doit, realEnd;
+		define readChSkip="auxcal a,ch";
+
+	hrrz	ic,theRec;
+	movei	c,#p.loc(ic);	! get the address of the two words;
+	move	r,mov.op;	! to write the procedure in;
+	hrr	r,ic;		! which is: movei ic,theRec;
+	movem	r,(c);
+	move	r,jmp.op;	! then: jrst doit;
+	movem	r,1(c);		! put it away;
+	push	p,index;	! now build a call to INTMAP;
+	push	p,c;
+	push	p,[0];
+	pushj	p,intmap;	! call it and go home;
+	jrst	realEnd;
+
+mov.op:	movei	ic,0;		! prototypic procedure: this get recptr;
+jmp.op:	jrst	doit;		! then we start the real code;
+
+doit:	push	p,ic;		! save pointer to the record;
+retry:	move	ic,(p);
+	hrrz	r,#forInterrupt(ic);	! check to make sure of storage;
+	jumpe	r,defer;	! no buffers showing;
+	skipl	c,#room(r);	! room for next character?;
+	 jrst	nextBuffer;	! no, try for more room;
+	skipe	a,#auxArg(ic);	! AUXCAL to read a char, if no opcode;
+				! act just like no chars waiting;
+rPort:	 readChSkip;
+	  jrst	updateGo;	! no PTY chars, we've finished;
+	idpb	ch,#bytptr(r);	! store the character we got.;
+	aobjn	c,rPort;	! loop while we have room.;
+	movem	c,#room(r);	! save count for this buffer.;
+				! then get some more room.;
+nextBuffer:	! ran out on current buffer. get more, then try again;
+	push	p,ic;		! finish out out the top buffer;
+	pushj	p,finishTop;
+	jrst	retry;
+
+defer:	! cannot finish now, wait for user level, but force return;
+	aosle	#spaceCount(ic); ! if this is already pending, all done;
+	 jrst	allDun;
+	setzm	#doneComing(ic); ! clear count of dones in pipe;
+	push	p,[3];		! temp.1: number of words in deferral;
+	push	p,ic;		! temp.2: interrupt identity record;
+	hrroi	a,noSpace;	! temp.3: procedure to call;
+	push	p,a;
+	movei	a,-2(p);	! AOBJN pointer for processor (zero OK);
+	push	p,a;
+	pushj	p,dfr1in;	! schedule the deferred interrupt;
+	sub	p,[!xwd(3,3)];	! remove the temps from the stack;
+	jrst	allDun;		! and leave.  cause will occur later;
+
+updateGo: movem	c,#room(r);	! completed reads.  update count and go;
+allDun:	pop	p,ic;
+	popj	p,;
+
+realEnd:
+end;
+internal recursive procedure addBuffer( r!p(oneCircuit) which; 
+					r!p(buffer) r );
+begin	r!p(buffer) last, temp;
+buffer:next[r]_ null!record;
+disable( oneCircuit:enableCode[which] );
+if last_ oneCircuit:forInterrupt[which]
+ then begin
+	while (temp_ buffer:next[last]) and (last_ buffer:next[temp])
+	 do;
+	if temp then last_ temp;
+	buffer:next[last]_ r;
+      end
+ else oneCircuit:forInterrupt[which]_ r;
+
+if oneCircuit:pending[which] = null!record
+ then oneCircuit:pending[which]_ r;
+	
+enable( oneCircuit:enableCode[which] );
+end;
+internal r!p(buffer) recursive procedure new!buffer( 
+					integer chars, bytePointer );
+begin	r!p(buffer) r;
+if chars < 1 or chars land (-1 lsh 18)
+ then usererr(chars,3,"new!buffer: Ridiculous byte count given: ");
+
+if bytePointer land ('37 lsh 18) or bytePointer land (-1 lsh 18) = 0
+ then usererr(bytePointer,3,"new!buffer: bad byte pointer given: ");
+
+r_ new!record(buffer);
+buffer:room[r]_ -chars ash 18;
+buffer:bytePointer[r]_ bytePointer;
+buffer:basePointer[r]_ bytePointer;
+return(r);
+end;
+internal r!p(oneCircuit) recursive procedure new!circuit(
+	integer port		! port to read from;
+	, interruptChannel	! the "character arrived" interrupt;
+	; procedure buffering.proc ! called with circuit and buffer
+				! when buffers completed, called with
+				! circuit and null!record when runs out;
+	);
+begin	r!p(oneCircuit) int;
+	integer toCheat;
+int_ new!record(oneCircuit);
+  start!code	define a=1; protect!acs a;
+	movei	a,interruptChannel;
+	move	a,1(a); 
+	movem	a,toCheat; 
+  end;
+oneCircuit:buffering.proc[int]_ toCheat;
+oneCircuit:enableCode[int]_ newenb(interruptChannel);
+oneCircuit:auxArg[int]_ !xwd(port,!AXI8S);
+oneCircuit:spaceCount[int]_ -1;
+return(int);
+end;
+recursive procedure one.sample( reference r!p(oneCircuit) int;
+					reference r!p(buffer) r );
+if r=null!record
+ then usererr(0,1,"I ran out of buffer space!")
+ else begin	integer size, basePointer; 
+	size_ !rh(buffer:room[r]);
+	basePointer_ buffer:basePointer[r]; 
+	print(crlf & "buffer done (with ", size, " characters: """, 
+		stmake( basePointer, size ), """.");
+	! now make some more room and re-use the buffer;
+	if buffer:room[r] > 0
+	 then begin
+		buffer:bytepointer[r]_ basePointer;
+		buffer:room[r]_ -size ash 18;
+		addBuffer(int,r);
+	      end
+	 ! else short buffer: shutting down;
+      end;
+require processes;
+require 10 polling!interval;
+
+item iproc;
+simple procedure pause!a!minute; return;
+
+simple boolean procedure agrees( string proposition );
+begin	string reply;
+print(proposition, ": ");
+reply_ inchwl;
+return(kequ(reply,"yes"[1 for length(reply)]));
+end;
+
+r!p(oneCircuit) the!int; 
+integer array rings[0:2,0:10];
+integer port, interrupt, enableCode;
+
+intset(iproc,pstack(16));	! deep P-stack just in case;
+port_-1; 
+interrupt_ 7;
+
+the!int_ new!circuit( port, interrupt, one.sample );
+addBuffer( the!int, new!buffer( 5, point(7,rings[0,0],-1) ) );
+addBuffer( the!int, new!buffer( 5, point(7,rings[1,0],-1) ) );
+addBuffer( the!int, new!buffer( 5, point(7,rings[2,0],-1) ) );
+! start it up;
+	setIntMap( tinass(-1,cause!tty!escape,interrupt), the!int );
+	enable( oneCircuit:enableCode[the!int] );
+
+do begin pause!a!minute; poll; end until agrees("Shall I stop");
+poll;
+while finishTop( the!int ) do poll;
+end $
+
+   
