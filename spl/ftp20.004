@@ -1,0 +1,517 @@
+begin	"FTP20"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(WRS)AUXLIB.REQ" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+!get!definitions(ASSERT);
+require 4 version;
+
+simple procedure EraseString( reference string S );
+! 	This MAGIC procedure will overwrite a string with nulls and then set
+	the string pointer to null.  This is not the same as S_0 because this
+	also removes the data from string space and all other variables that
+	may be pointing to the same string.  It is used to erase sensitive
+	data from the core image once it is no longer necessary (like 
+	passwords).  Call it with care!
+;
+if length( S ) then begin!code
+	protect!acs 1,2,3;
+	label	ESLOOP;
+	MOVE	1,-1(P);	! get address of string;
+	SETZ	2,;		! get a null character;
+	HRRZ	3,-1(1);	! get count;
+ESLOOP:	IDPB	2,(1);		! zero out the character;
+	SOJG	3,ESLOOP;	! do for all chars;
+	SETZM	-1(1);		! clear the count;
+end;
+
+item ZapProcedure;
+procedure ZapHandler;
+begin
+    usererr(0,0,"?circuit zapped (oh dear)","X");
+end;
+simple procedure ZapHandlerIni;
+assign(AuxDead_ZapProcedure,ZapHandler);
+require ZapHandlerIni initialization;
+
+simple string procedure GetLine(integer T(0));
+begin	"GetLine"
+    integer CH;
+    string L;
+    if T < 60 
+	then T _ T * 1000
+	else T _ T lor !bit(17);
+    L _ null;
+    do begin 
+    	calli(AuxPort*!bit(8)+!hl('110)+T,calli!HIBER);
+    	auxclv(AuxPort,0,!AXSIC);
+    	if !SKIP! 
+	    then case CH _ AuxIn land '177 of begin
+		[#lf] done;
+		['000]['177] ;
+		else L _ L & CH end
+	    else begin !SKIP! _ false; return(L) end;
+    end until !lh(AuxPort);
+    !SKIP! _ true;
+    return (L);
+end	"GetLine";
+
+procedure SendLine(string S);
+begin
+    integer C;
+    if S[inf for 1] neq #cr then S _ S & #cr;
+    while length(S) do AuxOut(lop(S));
+    do C _ AuxIn land '177 until C = #lf;
+end;
+
+boolean procedure !Csync;
+begin
+    integer C;
+    AuxOut(3);
+    AuxSync("^C"&#lf,15);
+    do begin
+	C _ AuxIn(15) land '177;
+	if not !SKIP! then begin "timeout"
+	    print("?can't sync with Tops-20 exec",crlf);
+	    return(false) end;
+    end until C="@" or C="!" or C="$" or !lh(AuxPort);
+    return(!lh(AuxPort)=0);
+end;
+
+string procedure psync( integer T );
+begin
+    integer C;
+    string S;
+    S := null;
+    do begin
+	C := AuxIn(15) land '177;
+	if not !SKIP! then return( "?out of sync"& crlf );
+	if C=T then done else S := S & C;
+    end until !lh(AuxPort);
+    return( S );
+end;
+
+simple boolean procedure Index (string A,B);
+begin
+    integer I,X,LB;
+    X _ length(A)-(LB_length(B))+1;
+    for I _ 1 upto X do if equ(A[i for LB],B) then return(I);
+    return(0);
+end;
+
+procedure Connect;
+begin
+    integer P,Int; string S;
+
+    print("public net host number: ");
+    S _ ":" & inchwl;
+
+    creaux(S);
+    if not !SKIP! then return;
+    for P_1 upto 32 do auxclv(Auxport,'377,!AXO8);
+    S _ null;
+    Int _ 30;
+    do begin
+	P _ AuxIn(int) land '177; Int _ 30;
+	if !SKIP! then case P of begin
+	    [":"] [" "] begin S _ S & P; Int _ 3 end;
+	    [#cr] ;
+	    [#lf] if length(S) then begin
+		print("> ",S,crlf);
+		S _ null   end;
+	    ["@"] if length(S)=0
+		then done
+		else S _ S & P;
+	    [0]['177] ;
+	    else S _ S & P
+	end
+	else begin
+	    print("?not a Tops-20 system - not connected"&crlf);
+	    AuxZap;
+	    return 
+	end;
+    end until !lh(AuxPort);	    
+    print("[connected]",crlf);
+end;
+
+procedure Login;
+begin
+    integer C;
+    string S;
+    simple procedure Eraser;
+    EraseString( S );
+    cleanup Eraser;
+    if !lh(AuxPort) then begin print("?not connected",crlf); return end;
+    auxclv(Auxport,0,!AXCBI);
+    if not !Csync then return;
+    S _ "LOGIN";
+    print("username: ");
+    S _ S & " " & inchwl;
+    print("password: ");
+    auxcli(-1,'200,!AXCFS);	! echo off;
+    S _ S & " " & inchwl;
+    auxcli(-1,0,!AXCFS);	! echo on;
+    print(crlf,"account: ");
+    S _ S & " " & inchwl;
+    AuxOut(S&#cr);
+    S _ 0;
+    do case C _ AuxIn land '177 of begin
+    	["?"] begin print("?not accepted",crlf); return end;
+	[0]['177] ;
+	["@"] if length(S)
+	    then S _ S & C
+	    else done;
+	[#cr][#lf] if length(S) then begin
+	    if S=" " then print("> ",S,crlf);
+	    S _ null end;
+	else S _ S & C
+    end until !lh(Auxport);
+    SendLine("REFUSE LINKS"); AuxSync("@");
+    SendLine("REFUSE ADVICE"); AuxSync("@");
+    SendLine("REFUSE SYSTEM"); AuxSync("@");
+    SendLine("REFUSE AUTOLOGOUT"); AuxSync("@"); ! Tenex only;
+    SendLine("TERM FORMFEED"); AuxSync("@");
+    SendLine("TERM LOWERCASE"); AuxSync("@");
+    SendLine("TERM NO RAISE"); AuxSync("@");
+    SendLine("TERM NO PAGE"); AuxSync("@");	! TOPS-20 only;
+    print("[accepted]",crlf);
+end;
+
+procedure Enable;
+begin
+    if !lh(AuxPort) then begin print("?not connected",crlf); return end;
+    if not !Csync then return;
+    SendLine("ENA");
+    do case AuxIn land '177 of begin
+	["@"] print("?can't enable",crlf);
+	["!"]["$"] print("[enabled]",crlf);
+	else continue
+    end until true;
+end;
+
+procedure Disable;
+begin
+    if !lh(AuxPort) then begin print("?not connected",crlf); return end;
+    if not !Csync then return;
+    SendLine("DIS");
+    do case AuxIn land '177 of begin
+	["@"] print("[disabled]",crlf);
+	["!"]["$"] print("?can't disable",crlf);
+	else continue
+    end until true;
+end;
+
+procedure Quit;
+begin
+    string S;
+    if not !lh(AuxPort) and !Csync then begin 
+	SendLine("LOGOUT");
+	do begin
+	    S _ GetLine(5);
+	    if length(S) then print("> ",S,crlf);
+	end until not !SKIP!;
+    end;
+    AuxZap;
+end;
+
+procedure Gateway;
+begin
+    integer P,Int; string S,GateWayName,GateWayLogin;
+    simple procedure Eraser;
+    EraseString( GateWayLogin );
+    cleanup Eraser;
+    
+    print("private net gateway [:454]: ");
+    GateWayName_ inchwl; if length(GateWayName)=0 then GateWayName_ ":454";
+    if calli(!xwd('41,'11),calli!GETTAB)>2 then "micro-net"
+	if index(GateWayName,":")=0 then
+	    GateWayName_ GateWayName& ":TYMNET";
+    print("private net user name: ");
+    GateWayLogin_ inchwl;
+    print("private net host number: ");
+    GateWayLogin_ GateWayLogin& ":"& inchwl;
+    auxcli(-1,'200,!AXCFS);	! echo off;
+    print("private net password: ");
+    GateWayLogin_ GateWayLogin& ";"& inchwl;
+    print(crlf);
+    auxcli(-1,'000,!AXCFS);	! echo on;
+
+    for P _ 1 upto 3 do begin
+        creaux(GateWayName&";");
+	if !SKIP! then done;
+	if P=3 
+	    then begin print("?can't connect to gateway"); return end
+	    else print("%trouble connecting to gateway, retrying...");
+	calli(10,calli!SLEEP);
+	print(crlf);
+    end;
+    S _ null;
+    Int _ 30;
+    do begin
+	P _ AuxIn(int) land '177; 
+	if !SKIP! then case P of begin
+	    [":"] [" "] begin S _ S & P; Int _ 2 end;
+	    [#cr] ;
+	    [#lf] if length(S) then begin
+		if index(S,"error") and index(S,"password") then begin
+		    print("?bad password"& crlf);
+		    AuxZap;
+		    return;
+		end;
+		print("> ",S,crlf);
+		S := null;
+		Int := 20;
+	    end;
+	    ["@"] if length(S)=0
+		then done
+		else S _ S & P;
+	    [0]['177] ;
+	    else S _ S & P
+	end
+	else if equ(S,"please log in: ") then begin
+	    if length( GateWayLogin )
+		then SendLine( GateWayLogin )
+		else begin
+		    print("?unable to connect"& crlf);
+		    AuxZap;
+		    return;
+		end;
+	    EraseString( GateWayLogin );
+	    S := null;
+	    Int := 20;
+	end
+	else if index(S,"error") and index(S,"user") then begin
+	    print("?bad user name"& crlf);
+	    AuxZap;
+	    return;
+	end
+	else begin
+	    print("?unable to connect through gateway"& crlf);
+	    AuxZap;
+	    return;
+	end;
+    end until !lh(AuxPort);	    
+    print("[connected]",crlf);
+end;
+
+procedure directory;
+begin
+    integer CNT,C,B,E;
+    string INFILE,OUTFILE,S;
+    if !lh(AuxPort) then begin print("?not connected",crlf); return end;
+    if not !Csync then return;
+    print("file group (Tops-20): ");
+    INFILE _ inchwl;
+    if !SKIP!=#esc then begin
+	INFILE _ INFILE & #esc;
+	print(crlf) end;
+    print("output file (local): ");
+    OUTFILE _ inchwl;
+    if !SKIP!=#esc then begin
+	print("?no default",crlf);
+	return end;
+    AuxOut("DIR "&infile&","&#cr);
+    do case AuxIn land '177 of begin
+	["?"] begin
+	    print("?can't find/read file group",crlf);
+	    auxclv(auxport,0,!AXCBI);
+	    return end;
+	[#lf] done;
+	else
+    end until !lh(auxport);
+    if equ(OUTFILE,"TTY:") or index("TERMINAL",OUTFILE)=1
+	then open(C_getchan,"TTY",0,0,4, 0,0,E)
+	else open(C_getchan,"DSK",0,0,4, 0,0,E);
+    enter(C,OUTFILE,E);
+    if E then begin
+	print("?can't enter output file",crlf);
+	release(C);
+	return end;
+    SendLine("DATE");
+    SendLine("LENGTH");
+    SendLine(null);		! confirm;
+    CNT _ 0;
+    while true do begin
+	S _ GetLine(2);
+	if !SKIP! 
+	    then S _ S & #lf
+	    else if equ(S,"@") then done;
+	cprint(C,S);
+	CNT _ CNT + length(S);
+    end;
+    close(C); release(C);
+    print("[",CNT," characters]",crlf);
+end;
+
+procedure get;
+begin
+    integer CNT,C,B,E;
+    string INFILE,OUTFILE,S,R;
+    if !lh(AuxPort) then begin print("?not connected",crlf); return end;
+    if not !Csync then return;
+    print("input file (Tops-20): ");
+    INFILE _ inchwl;
+    if length(INFILE)=0 and !SKIP!=#esc then begin
+	print("?no default",crlf);
+	return;
+    end;
+    print("output file (local): ");
+    OUTFILE _ inchwl;
+    if !SKIP!=#esc then begin
+	OUTFILE _ INFILE;
+	print(" ",INFILE,crlf);
+    end;
+    SendLine("<WRS>FTP20S");
+    S := psync("*");
+    if length(S) then print( "> ", S );
+    if S="?" then return;
+    SendLine("<"&infile);
+    S := psync("{");
+    if length(S) then print( "> ", S );
+    if S="?" then return;
+    open(C_getchan,"DSK",'14,0,4, 0,0,E);
+    enter(C,OUTFILE,E);
+    if E then begin
+	print("?can't enter output file",crlf);
+	release(C);
+	return;
+    end;
+    CNT := 0;
+    do begin
+	integer W;
+	string S;
+	auxout("{");
+	R := getline(10);
+	while R = "{" do lop(R);
+	R := R[1 to inf-1];
+	if R="|"
+	    then case R[2 to 2] of begin
+		["E"] ;
+		else print("%bad control message: ",R,13&10)
+	    end else begin
+		integer RL;
+		RL := lop(R)-" ";
+		if length(R) neq RL then begin
+		    print("%message too ", if RL>length(R) 
+			then "short" else "long", 
+			" wanted ",RL," got ",length(R),13&10);
+		    sendline("|NAK");
+		    continue;
+		end;
+		print( CNT := CNT + RL, " " );
+		while length(R) do begin
+		    wordout( C, cvsix( R ) );
+		    R := R[7 to inf];
+		end;
+	    end;
+    end until equ(R,"|EOF");
+    close( C );
+    release( C );
+    print( crlf, INFILE, " ==> ", OUTFILE, "  [", CNT, " chars]"&crlf );
+end;
+
+procedure send;
+begin
+    integer CNT,C,B,E;
+    string INFILE,OUTFILE,S;
+    if !lh(AuxPort) then begin print("?not connected",crlf); return end;
+    if not !Csync then return;
+    print("input file (local): ");
+    INFILE _ inchwl;
+    if length(INFILE)=0 and !SKIP!=#esc then begin
+	print("?no default",crlf);
+	return;
+    end;
+    open(C_getchan,"DSK",'14,4,0, 0,0,E);
+    lookup(C,INFILE,E);
+    if E then begin
+	print("?can't lookup input file",crlf);
+	release(C);
+	return;
+    end;
+    print("output file (Tops-20): ");
+    OUTFILE _ inchwl;
+    if !SKIP!=#esc then begin
+	OUTFILE _ INFILE;
+	print(" ",INFILE,crlf);
+    end;
+    SendLine("<WRS>FTP20S");
+    S := psync("*");
+    if length(S) then print( "> ", S );
+    if S="?" then return;
+    SendLine(">"&outfile);
+    S := psync("{");
+    if length(S) then print( "> ", S );
+    if S="?" then return;
+    CNT := 0;
+    do begin
+	integer W;
+	string S,R;
+	S := null;
+	while length(S) < 58 do begin
+	    W := wordin( C );
+	    if E then done else S := S & cvxstr(W);
+	end;
+	if length(S) = 0 then done;	! EOF fell on even record boundary
+	assert(length(S)<64);
+	CNT := CNT + length(S);
+	S := cv6str( length(S) lsh 30 ) & S;
+	do begin
+	    print( CNT, " " );
+	    SendLine( S );
+	    R := psync("{");
+	    if length(R) then begin
+		print( crlf&"> ", R );
+		if R="?" then begin
+		    release( C );
+		    return;
+		end;
+	    end;
+	end until length(R);
+    end until E;
+    print( crlf );
+    SendLine("|EOF");
+    S := psync("*");
+    if length(S) then print( "> ", S );
+    SendLine("Quit");
+    close(C); release(C);
+    print( INFILE, " ==> ", OUTFILE, "  [",CNT," chars sent]",crlf );
+end;
+
+begin	"MAIN"
+    external boolean RPGSW;
+    AuxTrace _ RPGSW;
+    ttyup(true);
+    print("FTP-tops-20 version ",memory['137],crlf);
+    while true do begin "cmdloop"
+	print("*");
+	case inchwl of begin
+	["B"] gateway;
+	["C"] connect;
+	["D"] directory;
+	["E"] enable;
+	["G"] get;
+	["L"] login;
+	["S"] send;
+	["T"] print("[",
+		(if AuxTrace_not AuxTrace then null else "no "),
+		"trace]",crlf);
+	["Q"] begin quit; done end;
+	[0] ;
+	["?"] print("one of:
+  Bubbnet	- connect to a host on a private network
+  Connect	- connect to a host on the public network
+  Login		- login to Tops-20 host
+  Get		- get text file
+  Send		- send text file
+  Directory	- get directory of Tops-20 files
+  Enable	- enable Tops-20 privileges
+  Trace		- toggle trace switch
+  Quit		- quit
+");
+	else print("type ? for help",crlf) end
+    end "cmdloop";
+end "MAIN";
+end "FTP20" $
+
+   
