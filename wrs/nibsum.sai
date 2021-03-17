@@ -1,0 +1,315 @@
+begin	"NIBSUM"
+
+comment
+	NIBSUM - program to checksum NIB files in a way that is portable to
+	Unix (i.e. is not NIB file format dependent, only content dependent).
+;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(SAILIB)REDUFD.REQ" source!file;
+require "ARGS.REQ" source!file;		! argument parsing stuff;
+require "FLIB.REQ" source!file;		! file I/O stuff;
+!get!definitions(ASSERT);		! error checking stuff;
+
+require !xwd('0,'1) version;
+
+comment
+	Utility macros.
+;
+define	!hi(X)	= {((X) lsh -16 land '177777)}
+,	!lo(X)	= {((X) land '177777)}
+,	!24(X)	= {((X) land '77777777)}
+,	!32(X)	= {((X) land '37777777777)}
+;
+
+comment
+	Convert hex constant to decimal at compile time.  Now THIS is
+	a real macro language!
+;
+define	hex(X)	= {(
+	redefine !!hex# = 0;
+	forc !!hex!i _ 1 stepc 1 untilc length("X") doc {
+		redefine !!hex# = !!hex# * 16 + "X"[!!hex!i for 1] - "0";
+		ifcr "X"[!!hex!i for 1] > "9"
+		    thenc redefine !!hex# = !!hex# + "0" - "A" + 10;
+		endc
+		ifcr "X"[!!hex!i for 1] > "Z"
+		    thenc redefine !!hex# = !!hex# + "A" - "a";
+		endc
+	} endc
+	!!hex#
+)};
+
+comment
+	Definitions for NIB/BND file format.  Byte pointer macros
+	index on the integer BLKp which is usually global.  id* define
+	field offsets in the ID record.
+;
+
+define	b!RTYPE	= {point(4,memory[BLKp+0],3)}
+,	 rtID	= 1
+,	 rtMEM	= 2
+,	 rtSYM	= 3
+,	b!BAD	= {point(12,memory[BLKp+0],15)}
+,	b!PAD	= {point(20,memory[BLKp+0],35)}
+,	b!BCNT	= {point(15,memory[BLKp+1],14)}
+,	b!U	= {point(1,memory[BLKp+1],15)}
+,	b!VAD	= {point(20,memory[BLKp+1],35)}
+;
+
+define	idSTART = '1
+,	idDATE	= '2
+,	idTIME	= '3
+,	idUSER	= '4
+,	idFNAME	= '6
+,	idEXT	= '7
+,	idAUTH	= '10
+,	idINDEX	= '12
+,	idEND	= '176
+,	idLINK	= '177
+;
+
+
+
+comment
+	Locations used in ISIS lo memory.  Addresses are fullword addresses,
+	that is the low order two address bits are shifted off.  This
+	facilitates indexing into the array ISIS[].
+;
+
+define	isPBITS	= hex(2D0)%4	comment Presence bits, index by slot;
+,	 Present(S) = {(ISIS[isPBITS+(S)%32] land !bit(4+((S) mod 32)))}
+,	isS0SIZ	= hex(2D8)%4	comment Extent of slot 0 in bytes;
+,	isMSIZE	= hex(2DC)%4	comment Size in bytes of configured memory;
+,	isSORG	= hex(300)%4	comment Physical slot origins;
+;
+define	isBeg	= isPBITS	comment Lowest data to collect from ISIS;
+,	isEnd	= isSORG + 63	comment Highest data to collect from ISIS;
+;
+
+
+comment
+	Locations used in slot's Segment E, CTA table.  Values are fullword
+	offsets from E0000 to facilitate indexing into CTA[].
+;
+
+define	ctCNTRL	= hex(00)%4
+,	ctCTASIZ= hex(04)%4
+,	ctAREA0	= hex(08)%4
+,	ctAREAn	= hex(3C)%4
+,	ctHOSTN	= hex(80)%4	comment hi halfword;
+,	ctNPORTS= hex(82)%4	comment lo halfword;
+,	ctSVERNO= hex(8A)%4	comment lo halfword;
+,	ctPID	= hex(94)%4	comment lo halfword;
+;
+define	ctBeg	= ctCNTRL
+,	ctEnd	= ctPID
+;
+
+
+comment
+	Selected Tymcom-X operating systems symbols for use in I/O.
+;
+
+define !RBPPN='1, !RBNAM='2,
+ !RBEXT='3, !RBPRV='4, !RBSIZ='5, !RBVER='6, !RBFUT='7, !RBEST='10,
+ !RBALC='11, !RBPOS='12, !RBFT1='13, !RBLIC='14, !RBMTA='15, !RBDEV='16,
+ !RBSTS='17, !RBELB='20, !RBXT1='21, !RBQTF='22, !RBQTO='23, !RBMXA='24,
+ !RBUSD='25, !RBAUT='26, !RBUNM='27, !RBTRU='31, !RBXT2='32, !RBALP='33,
+ !RBSNM='34, !RBPJC='35, !RBPID='40;
+
+comment
+	GLOBALS item definitions for command line scanner (ARGPAR).
+;
+
+string item	OUTFILE;
+string item	NIBFILE;
+item		NOSKIP;
+string item	SKIP;
+item		TRACE;
+
+
+comment
+	Miscelaneous globals.
+;
+
+r!p(FILE) 	NIB;			! .NIB file descriptor;
+integer		fnBreak;		! file name scanning break table;
+integer		begSkip, endSkip;	! Range of locations to skip;
+
+comment
+	Low level routine to print an unsigned integer in HEX.
+;
+
+string procedure cvh(integer X, LEN(0));
+begin	"cvh"
+    string S;
+    S := null;
+    do begin
+	S := "0123456789abcdef"[(X land '17)+1 for 1]& S;
+	X := X lsh -4;
+    end until X = 0 and length(S) geq LEN;
+    return(S);
+end	"cvh";
+
+integer procedure hexscan(reference string S);
+begin
+	integer		c, i;
+	i := 0;
+	while c := lop(S) do begin
+		if c < "0" or "9" < c < "A" or "F" < c < "a" or "f" < c then
+			done;
+		if c > "a" then
+			i := i * 16 + c - "a" + 10
+		else if c > "A" then
+			i := i * 16 + c - "A" + 10
+		else
+			i := i * 16 + c - "0";
+	end;
+	return (i);
+end;
+
+comment
+	Return checksum of single byte.
+;
+simple integer procedure cksum(integer addr, data);
+return (if begSkip leq addr leq endSkip
+	then 0
+	else !32((data lsh (addr mod 19)) + (lnot data lsh (addr mod 23))));
+comment
+	Checksum a single MEM type record.
+;
+integer procedure recsum(integer BLKp);
+begin "recsum"
+	integer		a, cs, i, j, n, p, rc;
+
+	cs := 0;
+	n := ldb(b!BCNT);
+	a := ldb(b!PAD);
+	p := point(9, memory[BLKp + 2], -1);
+	if props(TRACE) then print(crlf, cvh(a,6), ":", cvh(a+n-1,6), #ht);
+	while n > 0 do begin
+		i := ildb(p);
+		if i land '400 then begin "repeat"
+			i := i land '377;
+			j := ildb(p) land '377;
+			rc := ildb(p) lsh 9;
+			rc := rc lor ildb(p);
+			assert(rc > 0);
+			while rc geq 0 do begin
+				cs := cs xor cksum(a, i) xor cksum(a + 1, j);
+				a := a + 2;
+				n := n - 2;
+				rc := rc - 1;
+			end;
+			assert(n geq 0);
+		end "repeat" else begin "non-repeat"
+			cs := cs xor cksum(a, i);
+			a := a + 1;
+			n := n - 1;
+		end "non-repeat"
+	end;
+	BLKp := (!rh(p) + 127) land -128;
+	return(cs);
+end;
+comment
+	nibsum() actually does checksum once file is mapped
+;
+integer procedure nibsum(
+	r!p(file)	F;
+	integer		buf );
+begin	"nibsum"
+	integer		bad;
+	integer		BLKp;		! byte pointers reference this;
+	integer		cs;
+
+	cs := 0;
+	bad := 0;
+	do begin "record"
+		BLKp := buf + bad * 128;
+		if ldb(b!RTYPE) neq rtID or ldb(b!BAD) neq bad then begin
+			fError(f, "ID record format error.");
+			return(0);
+		end;
+		for BLKp := buf + bad * 128 + '12 step 2 while memory[BLKp] do
+			if ldb(b!RTYPE) = rtMEM then
+				cs := cs xor recsum(buf + ldb(b!BAD) * 128);
+	end "record" until (bad := memory[buf + bad * 128 + 127]) = 0;
+	return(cs);
+end	"nibsum";
+
+comment
+	handle a file from the directory scanner
+;
+
+integer	nufd;
+
+integer procedure ufdsvc(integer array ufd);
+begin "ufdsvc"
+	string FN;
+	r!p(file) F;
+	integer VP, N;
+	nufd := nufd + 1;
+	FN := "(" & cv6str(ufd[-4]) & cv6str(ufd[-3]) & ")"
+		& cv6str(ufd[0]) & "."
+		& cv6str(ufd[1] land '777777000000);
+	F := fOpen(FN, "r1E");
+	VP := fAlloc(N := (file:LKB[F][!rbSIZ] + '777) lsh -9);
+	if N > 0 then begin
+		if VP < 0 then begin
+			fError(F, "Insufficient memory to map file.");
+			return(false);
+		end;	
+		fMap(F, VP, 1, N);
+		if not file:EOF[F] then print(
+			FN,
+			#ht,
+			cvh(nibsum(f, VP lsh 9), 8),
+			crlf);
+		fFree(VP, N);
+	end;
+	fClose(F);
+	return(false);
+end "ufdsvc";
+
+comment
+	MAIN program
+;
+
+setbreak(fnBreak:=getbreak, ",;"&#LF, " "&#CR, "STINK");
+argparse(OUTFILE, NIBFILE, {NOSKIP,SKIP,TRACE}, ARGS);
+if props(NOSKIP) then begin
+	begSkip := -1;
+	endSkip := -1;
+end
+else if props(SKIP) then begin
+	begSkip := hexscan(datum(SKIP));
+	endSkip := hexscan(datum(SKIP));
+end
+else begin
+	begSkip := hex(e00a4);
+	endSkip := begSkip + 6 - 1;
+end;
+if props(OUTFILE) then
+	setprint(datum(OUTFILE), "F");
+while length(datum(NIBFILE)) do begin
+	string FN;
+	integer B;
+	FN := scan(datum(NIBFILE), fnBreak, B);
+	if FN = "@" then begin "indirect"
+		r!p(file) F;
+		F := fOpen(FN[2 to inf], "r1mb4e");
+		while not file:EOF[F] do
+			datum(NIBFILE) := datum(NIBFILE) & "," &
+				input(file:Chan[F], fnBreak);
+		fClose(F);
+		continue;
+	end "indirect";
+	nufd := 0;
+	redufd(ufdsvc, FN, null);
+	if nufd = 0 then
+		print("?no files matching pattern: ", FN, crlf);
+end;
+
+end	"NIBSUM"
+$
