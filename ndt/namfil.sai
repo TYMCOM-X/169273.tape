@@ -1,0 +1,273 @@
+begin "nameFile"
+require "(sailib)sail.def" source!file;
+!get!module(soundex);
+let andThen=and, orElse=or;
+define elif="ELSE IF";
+define reSchedule={begin print("{ReSched}"); call(0,"SLEEP") end};
+simple string procedure reply(string prompt);
+	begin outstr(prompt); return(inchwl); end;
+
+! file layout: 
+[0] nam=cvsix("names")
+[1] ver=1
+[2] Lock (0=free, else locked)
+[3] modify count (negative while updating = setcm / movnmm)
+		[only changed when lock non-0]
+[4] minBase ,, # of names
+[5:4+N] soundex(name) ,, byte(9) base, length
+...
+base:	value
+	cvasc(str[1 for 5]),
+	cvasc(str[6 for 5]), 
+	...
+;
+
+define	W#name=0, W#version=1, W#Lock=2, W#serial=3, minBase#Count=4, 
+	N#table=5;
+
+simple integer procedure calcFree(integer Base!Count );
+	return( !lh(base!count) - !rh(base!count) - n#table - 1 );
+
+preset!with cvsix("names"), 1, 0,0, !xwd(511,0);
+	own integer array empty[0:511];
+string simple procedure rconstr( reference integer loc; integer len );
+begin!code 	external integer x33;
+movei '14,loc; hrli '14,'010700; 
+push sp,len; push sp,'14; 
+sub p,x33; jrst @3(p);
+end;
+
+simple procedure strstf( string s; integer bptr );
+while length(s) do idpb(lop(s),bptr);
+simple procedure showTable(integer array a);
+begin integer mb,ln,of,i;
+print( crlf, cvxstr(a[W#name]), " v", a[W#version], 
+	", Serial: ", a[W#serial], 
+	(if a[W#lock] then " [Locked] " else " [UnLocked] "),
+	!rh(mb_a[minBase#Count]), " entries from ", !lh(mb), " up.");
+for i_ n#table-1+!rh(mb) step -1 until n#table
+   do print(crlf, cvos(!lh(a[i])), " @", of_ a[i] lsh -9 land '777,
+		"!", ln_ a[i] land '777, " """, rconstr(a[of],ln),
+		""" = ", a[of] );
+print(crlf, " [Serial: ", a[W#serial], 
+	(if a[W#lock] then ":Locked] " else ":UnLocked] ") );
+end;
+boolean simple procedure setQuickLock( integer val; 
+				reference integer lock, seq );
+while true 
+   do begin	boolean result;
+	if val neq seq then return(false);
+	start!code  hrroi 1,-1;  exch 1,lock;  movem 1,result;  end;
+	if result then reschedule else return(true);
+      end;
+
+simple procedure clearQuickLock( reference boolean lock );
+if lock
+ then lock_ false
+ else usererr(0,1,"Unlocking: already unlocked");
+
+boolean procedure setLock( integer val; reference integer lock, seq );
+begin
+if setQuickLock( val, lock, seq ) 
+ then begin
+	if seq=val
+	 then begin start!code setcmm seq; end; return(true); end;
+	clearQuickLock(lock);
+      end;
+return(false);
+end;
+
+simple procedure clearLock( integer val; reference integer lock, seq );
+begin
+if seq=lnot val
+ then seq_ val+1
+ else usererr(seq,3,"Lock error");
+clearQuickLock(lock);
+end;
+simple integer procedure findIndex( safe integer array table;
+					integer key; string name );
+begin	integer index, t;
+	define k#mask= lnot '777000;
+for index_ N#table step 1 while (t_ table[index])
+   do if k#mask land t xor key=0
+	andThen equ(name, rconstr( table[(t lsh -9) land '777], 
+					length(name) ) )
+	then return(index);
+return(-1);
+end;
+internal boolean procedure findIt( integer safe array table;
+				string Name; reference integer val );
+begin	integer ndx, key, modc;
+key_ !xwd( soundx(name), length(name) );
+   do begin
+	while 0 > modc_ table[W#serial] do reSchedule;
+	if 0 < ndx_ findIndex( table, key, name )
+	 then begin
+		val_ table[((table[ndx] lsh -9) land '777)];
+		if modc=table[W#serial] then return(true);
+	     end;
+      end
+ until modc=table[W#serial];
+return(false);
+end;
+boolean procedure addEntry( integer safe array table;
+			integer oldLock, key; string Name; integer val);
+begin	integer ndx, neededSpace, base;
+neededSpace_ 2 + (length(name)+4) % 5;
+if neededSpace > calcFree(table[minBase#Count])
+or not setLock(oldLock, table[W#lock], table[W#serial]) 
+ then return( false );
+if neededSpace > calcFree(table[minBase#Count])
+ then begin 
+	clearLock(oldLock, table[W#lock], table[W#serial]);
+	return( false ); 
+      end;
+ndx_table[minBase#Count]_ table[minBase#Count] + !hl(1-neededSpace) + 1;
+base_ !lh(ndx); 
+ndx_ N#table - 1 + !rh(ndx);
+table[ndx]_ key + base lsh 9;
+strstf( name, point(7,table[base],34) );
+table[base]_ val;
+clearLock(oldLock, table[W#lock], table[W#serial]);
+return(true);
+end;
+internal boolean procedure setIt( integer safe array table;
+				string Name; integer val );
+begin	integer ndx, key, modc;
+key_ !xwd( soundx(name), length(name) );
+   do begin
+	while 0 > modc_ table[W#serial] do reSchedule;
+	if 0 < ndx_ findIndex( table, key, name )
+	 then begin	integer valIndex;
+		valIndex_ ((table[ndx] lsh -9) land '777);
+		if setQuickLock(modc, table[W#lock], table[W#serial]) 
+		 then begin
+			table[valIndex]_ val;
+			clearQuickLock(table[W#lock]);
+			return(true);
+		      end;
+	      end
+	 else if addEntry( table, modc, key, name, val )
+		 then return( true );
+      end
+ until modc=table[W#serial];
+return(false);
+end;
+internal boolean procedure findLike( integer safe array table;
+			string Name; boolean procedure perName );
+begin	integer ndx, key, modc;
+	integer index, t;
+key_ !hl( soundx(name) );
+while 0 > modc_ table[W#serial] do reSchedule;
+for index_ N#table step 1 while (t_ table[index])
+   do if !hl(-1) land t xor key=0
+	 then if perName( name_ rconstr( table[(t lsh -9) land '777],
+					 t land '777 ) )
+			 then done;
+return( modc = table[W#serial] );
+end;
+simple boolean procedure showEm( reference string name );
+	begin print(" ", name ); return(false) end;
+integer brk,token;
+
+string procedure aPage( safe integer array page; string pageId );
+begin	string command;
+	label switch;
+  string procedure rdLine;
+  while true 
+   do begin	string s;
+	if length(s_reply(crlf&">"))=0 and !skip!='5	! ^E;
+	 then if kequ(s_inchwl,"error") then usererr(0,1,"requested")
+		 elif kequ(s,"clear") then arrblt(page[0],empty[0],512)
+		 elif kequ(s,"exit") or kequ(s,"file") 
+		   or kequ(s,"modes") or kequ(s,"mapOpcode")
+		   or kequ(s,"state") or kequ(s,"status")
+		   or kequ(s,"page") then begin command_s;go switch end
+		 elif kequ(s,"help") then print("
+Working on ", pageId, ", ^E commands are: 
+	error, clear, exit, file, page, help, modes, mapOpcode, state" )
+		 else print("???") 
+	 else return(s); 
+      end;
+
+string s;
+
+print(pageId,crlf); command_ null;
+while true
+ do case lop(s_rdLine) of begin
+ ["+"] print( " =", setIt(page, scan(s,token,brk), intscan(s,brk) ));
+ ["="] print( " =", findIt(page, s, brk), " [val=", brk, "]" );
+ ["*"] showTable(page);
+ ["-"] print(" =" & cvs(findLike(page,s,showEm)) );
+ [else] print("
+*=show table, =name looks up, +name=value adds, -name lists near names")
+ end;
+switch:
+return(command);
+end;
+!get!module(mapping);
+integer chan, page; 
+string file, modes, mapC;
+r!p(map1)holder;
+procedure dropPage;
+    if page > 0 then begin getmap(holder,"U",0,0); page_ -1; end;
+simple procedure dropFile;
+    if chan geq 0 then begin dropPage; chniov(chan,0,0); chan_-1; end;
+
+preload!with 0; own integer array aTable[0:511];
+
+if aTable[0]=0 then arrblt(aTable[0],empty[0],512);
+modes_ "RWBM"; mapC_"W";
+setbreak(token_getbreak,"=",null,"IS");
+holder_ map1cr(0,511);
+
+chan_ page_ -1; file_ "<private>";
+while true 
+   do begin	string command;
+	command_ if chan < 0 or page < 1
+		 then aPage( aTable, "<private>" )
+		 else aPage( map1:a[holder], file & ":" & cvs(page) );
+	if kequ(command,"modes")
+	 then begin modes_reply("modes:"); command_ file; end
+	elif kequ(command,"mapOpcode")
+	 then begin mapC_reply("mapping opCode:"); command_ file; end
+	elif kequ(command,"status") or kequ(command,"state")
+	 then print("Mapping files with `",modes,"', pages with `",
+			mapC & "'" )
+	elif kequ(command,"exit") then done;
+	if kequ(command,"file")
+	 then begin
+		dropFile;
+		while chan < 0
+		   do begin
+			print("File: ");
+			if length(file_inchwl)=0
+			or kequ(file,"<private>")
+			or kequ(file,"private")   then done;
+			if 0 > chan_ opfile( file, modes, 16 )
+			 then print("Trouble opening ", file, ":",
+				chan ash-18,",,", !hl(chan)ash-18, crlf)
+		      end;
+		if chan geq 0 then command_ "page";
+	      end;
+	if kequ(command,"page")
+	 then if chan < 0
+		 then print("No new pages in <private>")
+		 else begin
+			dropPage;
+			while page < 1
+			   do begin
+				print("File ", file, ", Page: ");
+				if (page_ cvd(inchwl))<0 then done;
+				if 1>page_ getmap(holder,mapC,chan,page)
+				 then print("Trouble: ", page ash -18,
+					",,", page lsh 18 ash -18, crlf)
+			      end;
+		      end
+     end;
+dropFile;
+
+end "nameFile"
+
+
+   
