@@ -1,0 +1,204 @@
+begin	"FTPTST"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(DARREN)FRMSUB.SAI" source!file;
+
+require "(UORAIL)TRSEND" load!module;
+	external procedure trsend!init;
+	external string procedure send!checksummed( string text );
+
+
+define DEBUG = {true} ;
+
+define UserAct = ifcr DEBUG thenc {""} elsec {"X"} endc;
+
+external procedure Init!Receiver;
+external procedure Init!Sender;
+external procedure Init!Screen;
+external procedure Screen!Out(string S; integer W);
+external procedure T!Fini;
+external procedure T!Rset;
+
+external boolean RPGSW ;
+
+procedure F!VectorStart(
+	integer FD,		! Frame descriptor ;
+		ProgName,	! Actually a word of SIXBIT ;
+		Index 		! Into the start vector ;
+	) ;
+
+begin
+integer array HSB[0:4];		! Frame Halt Status Block ;
+integer F!Err, F!HaltCount ;
+
+HSB[0] := 4 ;			! word 0 is the count ;
+F!Err := FrmOpr( FD, HSB[0], !foHST ) ;
+if not !SKIP! then usererr(FD,3,FRMOP!Err[F!Err],UserAct) ;
+F!HaltCount := HSB[2] ;		! to compare against later ;
+
+! Here we cheat and use the Halt Status Block as the	;
+! argument block for the GET on the program, since it	;
+! just happens to be handy.  So handy, in fact, that	;
+! we needn't even change the block size.		;
+
+HSB[1] := cvsix("DSK") ;
+HSB[2] := calli( !hl(FD) + !hr(!gtPPN), calli!GETTAB) ;
+if not !SKIP! then usererr(0,0,"Target frame GETPPN GETTAB error",UserAct) ;
+HSB[3] := ProgName ;
+HSB[4] := 0 ;
+
+F!Err := FrmOpr( FD, HSB[0], !foGET ) ;
+if not !SKIP! then usererr(FD,3,FRMOP!Err[F!Err],UserAct) ;
+
+! Now wait for the other frame to exit from the GET	;
+
+do begin "GET wait"
+  F!Err := FrmOpr( FD, HSB[0], !foHST ) ;
+  if not !SKIP! then usererr(FD,3,FRMOP!Err[F!Err],UserAct)
+    else calli(1,calli!SLEEP);
+  end "GET wait" 
+  until ( HSB[2] > F!HaltCount ) ;
+
+! Now check to insure that the frame halt was a "Frame	;
+! Set Up" Exit.	;
+
+if ( !lh( HSB[1] ) = Hc!Exi ) and ( !rh( HSB[1] ) = Ht!Jsu )
+  then begin "vector start"
+    print("Frame Set Up"&crlf) ;
+    F!Err := FrmOpr( FD, Index, !foSVA ) ;
+    if not !SKIP! then usererr(FD,3,FRMOP!Err[F!Err],UserAct) ;
+    print("Frame started"&crlf)
+    end "vector start"
+  else begin
+    print( "GET of program ", cv6str(ProgName), " into frame " ) ;
+    print( FD, " failed, "&crlf&"  Halt status ", !lh( HSB[1] ) ) ;
+    print( ", class ", !rh( HSB[1] ), crlf ) ;
+    usererr(0,0,"",UserAct)
+  end
+
+end ;	! end of F!VectorStart procedure ;
+
+boolean procedure noPtyCopy( integer inPort, screen, outPort(0) );
+! copies "inPort" to screen and outPort if non-zero.
+ returns false if at least one char done
+;
+begin "Dump PTY to screen"	integer c;
+auxclr(inPort,C,!axI8S);		! Read from PTY;
+if not !SKIP! then return( true );	! Nothing there at all;
+
+while !SKIP! 
+   do begin
+	if screen then Screen!Out(C,screen);
+	if outPort then auxclv(outPort,C,!axO8);
+	auxclr(inPort,C,!axI8S);	! Read from PTY;
+      end;
+return( false );
+end "Dump PTY to screen";
+simple procedure PortOut( integer port; string data );
+while length( data ) do auxclv(Port, lop(data), !axO8);
+procedure Polling!Loop( integer DataPort );
+  while true do
+  begin "Polling!Loop"
+    integer C;
+    while true do
+      begin "Pipe cmd port to PTY"
+      auxclr(-1,C,!axI8S);		! Read from command port;
+      if !SKIP! then
+	begin
+        C := C land '177 ;
+        if ( C = #ctrl("C") )
+          then begin T!Fini; calli(0,calli!EXIT); end ;
+        if ( C = #ctrl("E") )
+	 then begin T!fini; usererr(0,1,"You rang?"); end;
+	auxclv(DataPort,C,!axO8);	! Output to PTY;
+	Screen!Out(C,2);		! Window 2 for command port echo;
+	end else done;
+      end "Pipe cmd port to PTY" ;
+    if noPtyCopy( DataPort, 1 ) 	! copy across;
+	then calli(1,calli!SLEEP);	! sleep 1 sec if no work;
+  end "Polling!Loop" ;
+simple boolean procedure do!retach( integer frame!descriptor, port );
+    start!code
+	HRRO	2,frame!descriptor; 
+	HRLI	3,'200000;
+	HRR	3,port;
+	MOVEI	2;
+	SETOB 	1,!SKIP!;
+	uuo!RETACH;			! give it the PTY;
+	 SETZB	1,!SKIP!;
+    end;
+procedure commandLoop( integer port );
+begin	boolean encoding;
+encoding_ false;
+screen!out("Command: ",2);
+while true 
+     do begin	integer eol;
+		string s;
+		boolean empty;
+	if length(s := inchsl(empty)) or not empty
+	 then begin 
+		eol_ !skip!; 
+		if      equ(s,"/LOOP") then Polling!Loop(Port)
+		else if equ(s,"/ENCODE") then encoding_ true
+		else if equ(s,"/DECODE") then encoding_ false
+		else if equ(s,"/BUG") 
+			then begin T!fini; usererr(0,1,"do t!rset"); end
+		else if equ(s,"/RETURN") then return
+		else if equ(s,"/T!RSET") then t!rset
+		else if equ(s,"/T!FINI") then t!fini
+		else if equ(s,"?") 
+			then screen!out("
+/BUG, /DECODE, /ENCODE, /LOOP, /RETURN, /T!FINI, or /T!RSET. ", 2)
+		else begin
+			PortOut( Port, if encoding
+					then send!checksummed( s )
+					else s );
+			PortOut( Port, eol );
+		      end;
+		noPtyCopy( Port, 1 );		! copy across;
+		screen!out(if encoding then crlf & "Text: " 
+					else crlf & "Command: ", 2); 
+	      end
+	 else if noPtyCopy( Port, 1 ) 		! copy across;
+		then calli(1,calli!SLEEP);	! sleep 1 s. if no work;
+        end;
+end;
+! Main Program;
+	integer DataPort;
+ 
+if RPGSW
+  then begin "Slave process"
+    DataPort := auxclv(-1,0,!axSLV);	! Slave the command port;
+    if not !SKIP! then usererr(0,0,"?Cannot slave command port",UserAct);
+    do calli(10,calli!SLEEP) until !lh(GetTab(-1,!GTLIN)) neq 0;
+					! Wait for ATTACH;
+    Init!Screen; 
+  end "Slave process"
+  else begin "Master process"
+	    integer P, FD, Ferr ;
+	    integer array FrmArg[0:4] ;
+    P _ calli(0,calli!CREPTY);		! create a PTY;
+    if not !SKIP! then usererr(P,2,"?CREPTY error: ",UserAct);
+    DataPort _ !lh(P);
+    auxcli(DataPort,'214,!axCFS);	! we are in image no echo;
+    auxclv(DataPort,1,!axSOX);		! expand tabs etc for output file;
+    FrmArg[0] := 0; Ferr := FrmOpr(0,FrmArg[0],!foCFM);	! create FRAME;
+    if not !SKIP!
+	then usererr(FD,2,FRMOP!err[Ferr],UserAct)
+	else print("Created frame #", Ferr land '777, crlf);
+    FD _ Ferr Land '777;		! remember child's name;
+    if not do!retach( FD, !rh(P) )	! attach to other end;
+	 then usererr(0,0,"?RETACH error",UserAct);
+    Init!Screen; T!fini;
+    commandLoop( dataPort );
+  end "Master process";
+
+!  Init!Receiver;
+!  Init!Sender;
+
+  Polling!Loop( DataPort );		! "Never" returns;
+T!rset; T!fini;
+
+end "FTPTST" $
+
