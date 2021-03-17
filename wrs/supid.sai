@@ -1,0 +1,310 @@
+begin	"SUPID"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(WRS)ARGS.REQ" source!file;
+require "(WRS)AUXLIB.REQ" source!file;
+require 4096 system!pdl, 4096 string!pdl;
+require 1 version;
+
+define
+    SupRO = {"HOLMBERG"},
+    TimeOut = 30;
+
+integer Token,NonAsciiBreak;
+simple procedure BrkIni;
+begin
+    define AlphaNum = {"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"};
+    setbreak( Token_getbreak,#ht&#cr&#lf&" ",0&#ht&#cr&#lf&" ","TISK" );
+    setbreak( NonAsciiBreak_getbreak,AlphaNum,null,"X" );
+end;
+require BrkIni initialization;
+
+simple string procedure cvas( integer I );
+begin
+    string S;
+    integer X;
+    if X := I lsh -8 land '177
+	then S := X
+	else return( null );
+    if X := I land '177
+	then return( S & X )
+	else return( S );
+end;
+
+simple string procedure cvhs( integer I );
+begin
+    string S;
+    S := null;
+    do begin
+	S := "0123456789ABCDEF"[(I land 15)+1 for 1] & S;
+	I := I lsh -4;
+    end until I=0;
+    if S geq "A" then S := "0"& S;
+    return(S);
+end;
+
+simple integer procedure cvh( string S );
+begin
+    integer I,C;
+    I := 0;
+    while length(S) do case C:=lop(S) of begin
+	[#cr][#lf][" "] ;
+	["0"]["1"]["2"]["3"]["4"]["5"]["6"]["7"]["8"]["9"]
+	    I := (I lsh 4) lor (C - "0");
+	["A"]["B"]["C"]["D"]["E"]["F"]
+	    I := (I lsh 4) lor (C + 10 - "A");
+	[else] print( "%cvh: illegal character """,
+	    C&null,""" in hex string"&crlf )
+    end;
+    return(I);
+end;
+
+procedure ZapService;
+begin
+    print("Aux circuit lost"&crlf);
+end;
+simple procedure ZapIni;
+begin
+    assign( AUXDEAD, ZapService );
+end;
+require ZapIni initialization;
+
+procedure UPSW( integer PSW );
+begin
+    AuxOut( "U"&cvhs(PSW)&#cr );
+    if not AuxSync( "*",TimeOut ) then usererr(0,0,"UPSW: timeout","X");
+end;
+
+integer MACSTS;
+define
+    MACON = 1,
+    MACOFF = 2;
+
+procedure SetMac( integer MAC );
+begin
+    if MAC neq MACSTS then
+	UPSW( cvh( case MAC of ( [MACON] "67F0", [MACOFF] "62F0" ) ) );
+    MACSTS := MAC;
+end;
+
+integer procedure GetW( integer A, MAC(MACOFF) );
+begin
+    string Text,T;
+    integer B,A0,HW;
+    HW := -1;
+    SetMac( MAC );
+    AuxOut( "r "& cvhs(A)& ",4"& #cr );
+    while true do case AuxRead( Text, Timeout ) of begin
+	[aux!zap] usererr(0,0,"GetW: lost circuit","X");
+	[aux!line] begin
+	    A0:=cvh(T:=scan(Text,Token,B));
+	    if length(T) then
+		while length(T:=scan(Text,Token,B)) do begin
+		    if A0 = A 
+			then HW := cvh(T)
+			else if A0 = A+2 
+			    then HW := HW lsh 16 lor cvh(T);
+		    A0 := A0 + 2;
+		end;
+	end;
+	[aux!prompt] if Text = "*"
+	    then done
+	    else usererr(0,0,"GetW: bad prompt "&Text,"X");
+	[aux!timeout] usererr(0,0,"GetW: timeout","X")
+    end;
+    if HW geq 0
+	then return( HW )
+	else usererr(0,0,"GetW: data not seen","X");
+end;
+
+integer procedure GetHW( integer A, MAC(MACOFF) );
+return( GetW( A, MAC ) lsh -16 );
+
+procedure Connect( string SupHost );
+begin
+    integer Host;
+    if not equ(cvs(Host:=cvd(SupHost)),SupHost) then usererr(0,0,
+	"Connect: illegal sup host format """&SupHost&"""","X");
+    if 1 leq Host leq 7 then Host := 120+Host
+    else if 121 leq Host leq 127 then "okay"
+    else usererr(Host,2,"Connect: sup host out of range ","X");
+    if Creaux( 4& SupRO& ":"& cvs(Host) ) < 0 then
+	usererr(0,0,"Connect: login failure","X");
+    if not AuxSync( "*", 10 ) then
+	usererr(0,0,"Connect: no * from DDT","X");
+    MACSTS := 0;	! undefined;
+end;
+
+define
+    ubUNAME	= {( cvas(UB[0])& cvas(UB[1])&
+		cvas(UB[2])& cvas(UB[3]) )},
+    ubLLINK	= {( UB[4] lsh 16 lor UB[5] )},
+    ubUFLAG	= { UB[7] },
+    ubNMAC	= 15,
+    ubMPROT(x)	= {( UB[58+2*(x)] lsh 16 + UB[59+2*(x)] )},
+    ubGETS	= 58 + 2 * ubNMAC,
+    ubLEN	= 508;
+integer array UB[0:ubLEN-1];
+
+ifcr false thenc
+FDDT	EQ	1		:USER RUNNING UNDER DDT
+FLOGIN	EQ	2		:USER IN LOGIN
+FIN	EQ	4		:TTY IN WAIT
+FOUT	EQ	8		:TTY OUT WAIT 
+FDSK1	EQ	10		:WAIT FOR DISK I/O COMPLETION
+FDSK2	EQ	20		:WAIT FOR AVAILABLE DCB FOR DISK I/O
+FTIM	EQ	40		:WAIT TIMEOUT FROM GIVE UP SVC
+FEIGHT	EQ	8		:BIT POSITION IN 1/2 WORD - EIGHT LEVEL MODE
+FFEIGHT	EQ	80		:SAME AS ABOVE IN OTHER FORMAT
+FCRASH	EQ	100		:ILL INST WHILE NOT UNDER DDT
+FPRIV	EQ	200		:PRIVILEGED USER FLAG
+FILLOP	EQ	400		:IF ON CRASH USER ON ILLEGAL INST.
+FSUPS1	EQ	800		:USED TO KEEP SUPERVISOR PERMANENTLY ASLEEP
+FSUPS2	EQ	1000		:SAME AS ABOVE (OPERATOR SUPRESSION)
+FGWAIT	EQ	2000		:INHIBIT OUTPUT WAITING FOR GOBBLER ACK
+FCHANG	EQ	4000		:SLEEP WAITING 1 SEC. OR NULL OUTPUT OR NON-
+				:  NULL INPUT BUFFERS.  ONLY SET BY SVC 5,0A
+				:  WHICH IS NOT USED BY SUPERVISOR.
+endc
+    
+integer KVER,KVERL,HOSTX,SNODEN;
+
+procedure GetKernelVer;
+begin
+    HOSTX := GetHW( cvh("60C"), MACOFF );
+    SNODEN:= GetHW( cvh("60E"), MACOFF );
+    KVERL := GetHW( cvh("620"), MACOFF );
+    KVER  := GetHW( cvh("300C"), MACOFF );
+    if KVER neq KVERL then usererr(0,0,
+	"GetKernelVer: 300C["&cvs(KVER)&" KVERL["&cvs(KVERL),"C");
+    print( "NKER"&#ht&"v ", KVERL, crlf );
+end;
+
+integer sASTIME, sVERSN, sREVISN, SUPVER, SUPMIC, DEBMON;
+
+procedure GetSuperVer;
+begin
+    sASTIME := GetW( cvh("D0004"), MACON );
+    SUPVER  := GetW( cvh("D0008"), MACON );
+    sVERSN  := SUPVER % 10 mod 100;
+    sREVISN := SUPVER mod 10;
+    SUPMIC  := SUPVER % 1000 mod 10;
+    DEBMON  := SUPVER % 10000;
+    print( "SUPER"&#ht&"v ", sVERSN, " r ", sREVISN, crlf );
+    if SUPMIC then print( #ht&"SUPMIC# ",SUPMIC,crlf );
+    if DEBMON then print( #ht&"DEBMON# ",DEBMON,crlf );
+end;
+
+boolean procedure GetUserBlock( integer A, CNT );
+begin
+    string Text,T;
+    integer B,A0;
+    SetMac( MACOFF );
+    AuxOut( "r "& cvhs(A)& ","& cvhs(CNT*2)& #cr );
+    while true do case AuxRead( Text, Timeout ) of begin
+	[aux!zap] usererr(0,0,"GetUserBlock: lost circuit","X");
+	[aux!line] begin
+	    A0 := cvh(T:=scan(Text,Token,B));
+	    if length(T) then
+		while length(T:=scan(Text,Token,B)) do begin
+		    UB[(A0-A)%2] := cvh(T);
+		    A0 := A0 + 2;
+		end;
+	end;
+	[aux!prompt] if Text = "*"
+	    then done
+	    else usererr(0,0,"GetUserBlock: bad prompt "&Text,"X");
+	[aux!timeout] usererr(0,0,"GetUserBlock: timeout","X")
+    end;
+    T := scan( Text:=ubUNAME, NonAsciiBreak, B );
+    return( B=0 and length(T) );
+end;
+
+
+procedure PrintUserBlock;
+begin
+    integer I;
+    print( "  NAME:    ", ubUNAME, crlf,
+	"  LINK:    ", cvhs(ubLLINK), crlf,
+	"  MAC:     ", cvhs(ubMPROT(0)), crlf );
+    for I := 1 upto ubNMAC do
+	print( "           ", cvhs(ubMPROT(i)), crlf );
+end;
+
+define nSlave = 6;
+preload!with "ACCOUNT", "PROBE", "ERLOG", "SYSMSG1", "UN2", "RACCOUNT";
+string array SlaveName[1:nSlave];
+integer array SlaveReloc[1:nSlave];
+integer UBI,SLN;
+integer array UBA[1:256];
+
+recursive procedure CheckUB( integer A );
+begin
+    own integer I;
+    if SLN geq nSlave then return;
+    for I := 1 upto UBI do
+	if A = UBA[i] then return;
+    UBA[ UBI:=UBI+1 ] := A;
+    if GetUserBlock( A, ubGETS ) then begin
+	string NAME;
+	integer LINK;
+	NAME := ubUNAME;
+	LINK := ubLLINK;
+	if equ(NAME,"SPROBE") then NAME := "PROBE";
+	for I := 1 upto nSlave do
+	    if equ(NAME,SlaveName[i]) then begin
+		integer R;
+		R := ubMPROT(0) land cvh("FFF00");
+		if SlaveReloc[i] = 0
+		    then SLN := SLN + 1
+		    else if SlaveReloc[i] neq R
+			then print( "CheckUB: dup UB doesn't match for ",
+			    SlaveName[i], crlf& "   was ", cvhs(SlaveReloc[i]),
+			    " is ", cvhs(R), crlf );
+		SlaveReloc[i] := R;
+	    end;
+	CheckUB( A + ubLEN );
+	CheckUB( A - ubLEN );
+	CheckUB( LINK );
+    end;
+end;
+
+procedure GetRelocations;
+begin
+    string Text;
+    integer UBI, I, B;
+    integer array UB[1:256];
+    UBI := 0;
+    AuxOut( "H" );
+    while true do case AuxRead( Text, TimeOut ) of begin
+	[aux!zap] usererr(0,0,"Who: lost circuit","X");
+	[aux!line] if length( scan( Text, Token, B ) ) then
+	    UB[ UBI := UBI + 1 ] := cvh( Text );
+	[aux!prompt] if Text = "*"
+	    then done
+	    else usererr(0,0,"Who: bad prompt "&Text,"X");
+	[aux!timeout] usererr(0,0,"Who: timeout","X")
+    end;
+    for I := 1 upto UBI do
+	CheckUB( UB[i] );
+end;
+
+procedure PrintSlaveVers;
+begin
+    integer I, ASTIME, VER, REV, VERSN;
+    for I := 1 upto nSlave do begin
+	print( SlaveName[i], #ht& "v ", VER, " r ", REV, crlf );
+    end;	
+end;
+
+begin	"M A I N"
+
+    AuxTrace := kequ(ARGV[1],"-t");
+    Connect( Argv[Argc-1] );
+    GetKernelVer;
+    GetSuperVer;
+    GetRelocations;
+    PrintSlaveVers;
+
+end	"M A I N";
+end $ 
