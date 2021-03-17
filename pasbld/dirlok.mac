@@ -1,0 +1,336 @@
+	subttl	DO%ATT	Return info from extended LOOKUP
+	search	RTSYM
+	$module	DOATT
+	$high
+
+	entry	DO%ATT,DIR%DI
+DO%ATT:	PUSHJ	17,GETCN.##		; get a channel from pascal
+	MOVEM	0,CHSAVE		;   and remember it for later
+	SETZM	0,0(4)			; set OK return now
+	PUSH	TOP,3			; gotta save regs to go to PRFID.
+	PUSH	TOP,2
+	MOVEI	EXP1,0(EXP2)		; filename pointer first par
+	MOVEI	EXP2,GIFNBK		; second is block ptr
+	PUSHJ	17,P.FID.##
+	JRST	DOERRP			; general nonsense
+
+DO.OK:					; restore regs from P.FID.
+	POP	TOP,2
+	POP	TOP,3
+	MOVE	7,GIFNBK
+	MOVEM	7,OPENBK+1		; plunk it down for OPEN
+	MOVEI	7,17			; pick up word for dump mode
+	MOVEM	7,OPENBK		;   so we don't need buffers
+	SETZM	0,OPENBK+2		; zero out buffer pointers
+	MOVE	7,CHSAVE		; get channel number
+	MOVE	10,[OPEN 0,OPENBK]	; get open instruction
+	MOVEM	10,XINSTR		;   put in cell
+	DPB	7,XINSAC		; put channel num in AC field
+	XCT	0,XINSTR		; do the open
+	JRST	1,DO.ERR			; fails
+	JRST	1,.+1
+
+	MOVEI	7,5			; size of arg block
+	MOVEM	7,LOOKBL
+	MOVE	7,GIFNBK+1		; get file name
+	MOVEM	7,LOOKBL+2
+	HLLZ	7,GIFNBK+2		; extension, zeroes
+	MOVEM	7,LOOKBL+3
+	SETZM	7,LOOKBL+4
+	SETZM	7,LOOKBL+5
+	MOVE	7,GIFNBK+3		; ppn
+	MOVEI	6,777
+	AND	6,GIFNBK+2		; number of SFD's specified
+	JUMPE	6,NOSFD			; oh boy
+	ADDI	6,4+GIFNBK		; addr of last SFD in list
+	SETZM	0,0(6)			; wagman didn't clean up his act
+	MOVEI	7,1+GIFNBK		; addr of PATHlike block
+NOSFD:	MOVEM	7,1+LOOKBL		; store ppn spec
+	MOVEM	7,LOOKBL+1
+	MOVE	7,[lookup 0,LOOKBL]
+	MOVEM	7,XINSTR
+	MOVE	7,CHSAVE
+	DPB	7,XINSAC
+	XCT	0,XINSTR
+	JRST	1,DOERR1
+	JRST	1,.+1
+;
+; set up return record
+;
+	MOVE	7,[point 7,2(2)]	; destination ptr
+	MOVE	10,[point 3,LOOKBL+4]	; source ptr for prot. code
+	MOVEI	12,3			; number of digits
+PROLOP:	ILDB	11,10			; pick up three bits
+	ADDI	11,"0"			; make ascii "0".."9"
+	IDPB	11,7			;   and put into dest string
+	SOJG	12,PROLOP		; go back if more
+
+	MOVE	7,[point 7,0(2)]	; destin for file name
+	MOVE	10,[point 6,LOOKBL+2]	; source from lookup block
+	MOVEI	12,^o11			; number to do
+FNLOOP:	ILDB	11,10			; get sixbit char
+	ADDI	11,^o40			; "convert to ascii"
+	IDPB	11,7			; get rid of it
+	SOJG	12,FNLOOP		; back for more
+
+	MOVE	10,LOOKBL+5		; pick up size in words
+	MOVEM	10,3(2)			; and put into record
+	LDB	10,[point 14,LOOKBL+3,35] ;14-bit access date
+	MOVEM	10,5(2)		; put in accessed field
+	LDB	10,[point 2,LOOKBL+3,21] ; 2 high-order cre. date bits
+	LSH	10,^o14			; shift left 12 to make room
+	LDB	11,[point 12,LOOKBL+4,35] ;for low-order 12 bits
+	ADDI	10,0(11)		; add them together
+	HRLZI	10,0(10)		; place in left halfword
+	LDB	11,[point 11,LOOKBL+4,23] ;pick up 11-bit cre time
+	ADD	10,11			; combine the date and time
+	MOVEM	10,4(2)		; and put in record
+	SKIPA	0,0			; skip error instruction
+
+
+;	MOVE	7,[close 0,0]
+;	MOVEM	7,XINSTR
+;	MOVE	7,CHSAVE
+;	DPB	7,XINSAC
+;	XCT	0,XINSTR		; do the close
+;	JRST	1,.+2
+
+DOERR1:	AOS	0,0(4)
+	MOVE	7,[releas 0,0]
+	MOVEM	7,XINSTR
+	MOVE	7,CHSAVE
+	DPB	7,XINSAC
+	XCT	0,XINSTR
+	JRST	1,DO.ERR+1
+
+DOERRP:	POP	17,2
+	POP	17,3
+
+DO.ERR:	SETOM	0,0(4)
+	MOVE	0,CHSAVE
+	PUSHJ	17,FRECN.##
+	POPJ	17,0
+
+DIR%DI:	jrst	DIE.##				; killer jump
+	lit
+
+XINSAC:	point	4,XINSTR,12
+	reloc	0
+GIFNBK:	block	6
+LOOKBL:	block	6
+OPENBK:	block	3
+XINSTR:	0
+CHSAVE:	0
+
+	prgend
+
+;
+	title	DIR%MA	Pattern Matching Facility
+	twoseg
+	reloc 400000
+	subttl	DIR_MATCH Wildcard pattern matcher
+;
+;
+; function DIR_MATCH (TARGET: string[*];
+;		      PATTERN: string[*] ): boolean;
+;
+;   DIR_MATCH returns true if the string in TARGET can be matched with the
+;     pattern in PATTERN.  Asterisks ('*') match any number of consecutive
+;     characters in the target; question marks ('?') match any single
+;     character, or the null string.  No escape is provided for matching
+;     literal question marks or asterisks.
+
+;   The algorithm is recursive, with each call matching a string of
+;     consecutive wild characters or a string of consecutive alphanumerics.
+;     The recursion permits the algorithm to restart after a given replacement
+;     for a wild character fails.
+
+
+	PATCHR=4			; contains current pattern character
+	TARCHR=5			;   and target character
+	PATPTR=6			; byte pointer for pattern
+	TARPTR=7			;   and for target
+	T=10
+	T2=11
+	PATEND=12			; record byte pointer of end of pattern
+	TAREND=13			;   and of target
+	FV=14				; running function value
+	TOP=17				; pascal stack
+
+	OPDEF ADJBP[ IBP 0,0]
+	OPDEF ADJSP [105b8]
+
+;
+; Initialization on call
+;
+	entry	DIR%MA
+DIR%MA:	MOVEM	TOP,STSAVE		; record stack pointer for quick return
+	HRRZ	TAREND,0(2)		; length of target string
+	HRRZ	PATEND,0(3)		; length of pattern string, too
+	MOVE	PATPTR,[point 7,0,34]	; byte pointer skeleton
+	MOVE	TARPTR,PATPTR
+	HRRI	PATPTR,0(3)		; addr + 1 is first character
+	HRRI	TARPTR,0(2)
+
+	ADJBP	PATEND,PATPTR		; adjusted pointer into patend
+	ADJBP	TAREND,TARPTR
+
+	MOVEI	FV,1			; initialize FV to true
+	JSP	T,GETPAT		; get the first pattern char
+	JRST	DIRNPT			;   null pattern matches only null tgt.
+	JSP	T,GETTAR		; get the first target char
+	CAI	0,0			;   don't care if null target
+	PUSHJ	TOP,DOMTCH		; start the search
+DIRERR:	SETZ	FV,0			;   error, return false
+
+DIROUT:	MOVEM	FV,4(TOP)		; record function value
+	POPJ	TOP,0			;   and go home
+
+DIRNPT:	JSP	T,GETTAR		; null pattern -- get target char
+	JRST	DIROUT			;   null target -- instant success
+	JRST	DIRERR			;   non-null -- instant failure
+
+;
+; DOMTCH -- recursive routine to match patterns.  It matches a string of
+;   wildcards or characters in the target string.  If no match is made, the
+;   routine returns without a skip, having restored the byte pointers and
+;   char registers.
+
+
+DOMTCH:	PUSH	TOP,PATPTR		; put byte pointers on stack
+	PUSH	TOP,TARPTR
+	CAIN	PATCHR,"*"		; is asterisk?
+	JRST	DOSTAR			;   yep, hit full wild matcher
+	CAIN	PATCHR,"?"		; is question mark?
+	JRST	DOQUES			;   yep, hit q matcher
+
+; Now we try to match as many alphanumerics as possible, as quick as possible.
+
+DOCHAR:	CAIE	PATCHR,0(TARCHR)	; are they the same?
+	JRST	DOFAIL			;   no, take noskip return
+	JSP	T,GETPAT		; more pattern to go?
+	JRST	DOPEND			;   no, better be end of target, too
+	CAIN	PATCHR,"*"		; is a star?
+	JRST	DOCHGO			;   yes, recurse for rest of pat
+	CAIE	PATCHR,"?"		; how 'bout a questionmark?
+	JRST	DOCHR1			;   no, get next target char
+
+DOCHGO:	JSP	T,GETTAR		; must advance target pointer
+	CAI	0,0			; no-op
+	PUSHJ	TOP,DOMTCH		; do next section of pattern
+	JRST	DOFAIL			; it fails, we fail too
+	0				; never get skip return from inside
+
+DOCHR1:	JSP	T,GETTAR		; more alphabetic pattern, better...
+	JRST	DOFAIL			;   be more target, else we lose
+	JRST	DOCHAR
+
+DOPEND:	JSP	T,GETTAR		; end of pattern -- if end of target...
+	JRST	DOSTOK			;   then instant success
+					;   else fall into DOFAIL
+
+DOFAIL:	POP	TOP,TARPTR		; restore byte pointers
+	POP	TOP,PATPTR
+	LDB	PATCHR,PATPTR		; restore chars
+	LDB	TARCHR,TARPTR
+	POPJ	TOP,0
+
+;
+; DOSTAR -- to do wildcard field containing an asterisk.  Notice that,
+;   for example, "??*?" is perfectly equivalent to "*".  So, the pattern
+;   string is ticked until the first non-wild card (if end of string,
+;   immediate success), and then DOMTCH is called recursively. Each
+;   failure return causes the target to be ticked, with EOS denoting
+;   failure.
+
+
+DOSTAR:	JSP	T,GETPAT		; get next pattern char
+	JRST	DOSTOK			; end of pat, immediate match
+	CAIE	PATCHR,"*"		; skip if star
+	CAIN	PATCHR,"?"		;   or questionmark
+	JRST	DOSTAR
+
+DOSTDO:	CAIN	PATCHR,0(TARCHR)	; scan target until find first char
+	JRST	DOSTD2			; equal, make recursive call
+	JSP	T,GETTAR		; else getnext char
+	JRST	DOFAIL			; none left, but still some pat left
+	JRST	DOSTDO
+
+DOSTD2:	PUSHJ	TOP,DOMTCH		; do it
+	JRST	.+2			;   failure, later
+	0				; never get succ. return from inside
+
+	JSP	T,GETTAR		; else let's eat next target char
+	JRST	DOFAIL			;   better be another, or we lose
+	JRST	DOSTDO			; and try again
+
+DOSTOK:	MOVE	TOP,STSAVE		; complete match, restore stack
+	JRST	DIROUT			;   and take the quick way home
+
+;
+;
+; DOQUES --matches string of question marks.  It places a count of how
+;   many question marks were seen, which is the maximum number of wild
+;   characters to match, on the stack, and then goes ahead with the
+;   recursive call.
+
+
+DOQUES:	MOVEI	T2,0			; assume at least one question mark
+	PUSH	TOP,T2			;   and get a slot on the stack
+
+DOQU1:	CAIE	PATCHR,"?"		; another question mark?
+	JRST	DOQU2			;   no, something else
+	JSP	T,GETPAT		; else get next pattern char
+	JRST	DOQU4			;   end of pattern, just get count
+	AOS	0,0(TOP)		; tick questionmark counter
+	JRST	DOQU1			;    and get another
+
+DOQU2:	CAIE	PATCHR,"*"		; maybe an imbedded asterisk?
+	JRST	DOQU3			;   no, too simple
+	POP	TOP,T2			; just pop stack
+	JRST	DOSTAR			;   and treat as simply "*" field
+
+DOQU3:	CAIE	PATCHR,0(TARCHR)	; do we have current char?
+	JRST	DOQU5			;   no, don't bother with match call
+	PUSHJ	TOP,DOMTCH		; else try for a match
+	JRST	.+2			; fail, try next
+	0				; never get succ. return 
+
+DOQU5:	SOSGE	0,0(TOP)		; any wild fields left?
+	JRST	DOQFL			;   no, must be failure
+	JSP	T,GETTAR		; else get next
+	JRST	DOQFL			;   no more, but more pattern -- fail
+	JRST	DOQU3			; and try again
+
+DOQFL:	POP	TOP,T2			; get rid of our temp
+	JRST	DOFAIL			;   and take failure return
+
+DOQU4:	JSP	T,GETTAR		; get next target char
+	JRST	DOSTOK			; no more, instant success
+	SOSL	0,0(TOP)		; dec count, return if non-negative
+	JRST	DOQU4			;   to get another target char
+	POP	TOP,0			; else failure,pop stack
+	JRST	DOFAIL
+
+;
+; helper routines
+;
+
+GETPAT:	CAMN	PATPTR,PATEND		; end of pattern?
+	JRST	GPNOMO			; yes, no more
+	ILDB	PATCHR,PATPTR		; no, get character, tick pointer
+	JRST	1(T)			; tick return addr and go home
+
+GPNOMO:	JRST	0(T)			; just go home for pattern end
+
+GETTAR:	CAMN	TARPTR,TAREND		; end of target?
+	JRST	GTNOMO			;   yes
+	ILDB	TARCHR,TARPTR
+	JRST	1(T)			; go home with skip return
+
+GTNOMO:	MOVEI	TARCHR,"*"		; load up an unmatchable char
+	JRST	0(T)			; and go home
+	reloc	0
+STSAVE:	0
+	end
+   
