@@ -1,0 +1,930 @@
+begin	"NTDVAL"
+
+require 13&10&"
+    required license: AC
+    required protection: ALL RUN RUN
+" message;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+require !xwd('0,'2) version;	! program version number;
+
+define	TRYLIM = 4;		! number of retrys for CREAUX;
+define	TIMLIM = 120;		! CUD input timeout in seconds;
+redefine calli!FLEXIT = -'142;	! Fail Exit calli;
+define	AllHosts = {("39")};
+
+boolean BUBBNET;		! true if in Bubbnet;
+boolean	CUDTRACE;		! print circuit traffic if true (debug);
+integer	AuxPort;		! port number for circuit to CUD slave;
+boolean	AS,JL;			! license flags;
+integer MYHOST;			! host number of this host;
+string	MYNAME;			! user's name;
+integer	MYGAN,MYUUN;		! user's global account and univ user number;
+string	ARGS;			! arguments from command line;
+external boolean RPGSW;		! called at start+1 - look for TMPCOR;
+
+comment	Illegal characters are:
+    <null> and <rubout>       -- ignored,
+    <cr> and <semi-colon>     -- terminators,
+    <'33-'37> and <'173-'176> -- escapes;
+
+define	IllegalChars = {0&13&";"};
+forc ILLCHR _ '33 stepc 1 untilc '37 doc {
+    redefine IllegalChars = cvms(IllegalChars)&{&ILLCHR};
+} endc
+forc ILLCHR _ '173 stepc 1 untilc '177 doc {
+    redefine IllegalChars = cvms(IllegalChars)&{&ILLCHR};
+} endc
+
+preload!with 
+	"TYMSHARE",
+	"TYMNET",
+	"PASSWORD",
+	"WELCOME";
+string array TRITE[1:4];	! list of trite passwords;
+
+define	PWPAR# = { 1, "?request partially completed" };
+define	PWCIR# = { 2, "?unable to build circuit to CUD - try later" };
+define	PWBSY# = { 3, "?CUD file busy - try later" };
+define	PWCUD# = { 4, "?unexpected CUD error" };
+define	PWINV# = { 5, "?user name not valid: " };
+define	PWPRV# = { 6, "?Account Supervisor license required: " };
+define	PWGAN# = { 7, "?user not in your Global Account: " };
+define	PWTIM# = { 8, "?timeout waiting for CUD reply" };
+define	PWZAP# = { 9, "?CUD circuit zapped" };
+define	PWHND# = { 10,"?CUD handshake failure" };
+define	PWSYN# = { 11,"?lost sync with CUD slave" };
+define	PWLOC# = { 12,"?program not available to local users" };
+define	PWVAL# = { 13,"?validation exception for user: " };
+define	PWNIL# = { 14,"?no user names specified" };
+define	PWTMP# = { 15,"?unable to read DSK:nnnPAS.TMP" };
+define	PWAUX# = { 16,"?program may not be run from aux circuit" };
+define	PWPTY# = { 17,"?program may not be run from PTY" };
+define	PWBAD# = { 18,"?password not correct for user " };
+define	PWNTV# = { 19,"?command not implemented by NETVAL: " };
+define	PWLIC# = { 20,"?insufficient license" };
+define	PWSLF# = { 21,"?not allowed to operate on self" };
+define	PWHNA# = { 22,"?host not accessible: " };
+
+procedure EXIT;
+comment
+	Normal exit from program.
+;
+start!code
+	uuo!EXIT;
+end;
+
+procedure CLEANUP;
+comment
+	Clean things up, zap circuit to slave, etc.
+;
+begin	"CLEANUP"
+    calli( -1, calli!ZAPCIR );	! zap all aux circuits;
+end	"CLEANUP";
+
+procedure FATAL(
+	integer COD;		! code to return;
+	string MSG );		! message to output;
+comment
+	Call upon encountering a fatal error.  Will clean up and stop the
+	frame with appropriate message and return code.  The return code
+	may be read by a parent frame with !FOHST.  Error codes are defined
+	in the table above.  Note that if an error occurs when more than one
+	username is being changed, and at least one username has been 
+	successfully changed, the caller does not know which usernames were
+	actually changed.  To indicate this condition, the error code
+	returned to the caller is set to 1: "?partially completed request",
+	and the original error code indicating the actual error is lost.
+;
+begin	"FATAL"
+    CLEANUP;			! zap circuit, etc;
+    print( MSG, crlf );		! print error message;
+    calli( COD, calli!FLEXIT );	! return error code, and exit;
+    EXIT;			! for pre-FEXIT monitors (or in case of CONT);
+end	"FATAL";
+
+string procedure DEFAULT!PASSWORD;
+begin
+    integer X;
+    string procedure PICK( string S );
+    begin
+	integer Q;
+	Q := ((X land '377777777777) mod length(S)) + 1;
+	X := (X rot 3) xor (X rot 6);
+	return( S[Q for 1] );
+    end;
+    X :=( calli( 0, calli!MSTIME ) rot 11 )lor( calli( 0, calli!DATE ) );
+    return(
+	PICK( "BCDFGHJKLMNPQRSTVWX" )&
+	PICK( "AEIOU" )&
+	PICK( "BCDFGHJKLMNPQRSTVWX" )&
+	PICK( "123456789" )&
+	PICK( "BCDFGHJKLMNPQRSTVWX" )&
+	PICK( "AEIOU" )&
+	PICK( "BCDFGHJKLMNPQRSTVWX" ) );
+end;
+
+procedure CHECK!ORIGIN;
+comment
+	Check origin of terminal - reject AUX and PTY.
+;
+begin
+    integer L;
+    L := calli( !xwd( -1,!GTLOG ), calli!GETTAB );
+	! get supervisor data for command port;
+    if 0 = L land ( LG!ND1 lor LG!ND2 ) then 
+	FATAL( PWPTY# );	! node = 0, must be PTY;
+    if 0 = L land LG!TID then
+	FATAL( PWAUX# );	! TID = 0, must be AUX;
+end;
+
+procedure CREAUX( string LOGIN );
+comment
+	Build an aux circuit to the CUD system.  Retry up to TRYLIM
+	times on error.  Print error message if appropriate.
+;
+begin	"CREAUX"
+    integer I,TRY;
+    integer array X[0:5];
+    LOGIN := LOGIN& ";";
+    for I := 0 upto 5 do
+	X[I] := cvasc(LOGIN[I*5+1 for 5]);
+    for TRY := 1 upto TRYLIM do begin "TRY"
+	AuxPort := I := calli( location(X[0]), calli!CREAUX );
+	if !SKIP! then return;
+	print( "%unable to build circuit to """,LOGIN,""": " );
+	case !lh(I) of begin
+	    [CXSUP#] case !rh(I) of begin
+		[CXSFE#] print( "format error" );
+		[CXSBU#] print( "user not in MUD" );
+		[CXSBM#] print( "bad MUD" );
+		[CXSHU#] begin print( "host unavailable"&crlf ); done end;
+		[CXSDF#] print( "downline request failure" );
+		[CXSTO#] print( "timeout" );
+		[CXSAB#] print( "access barred" );
+		[CXSIS#] print( "error in ISIS" );
+		[CXSLQ#] print( "long queue in supervisor" );
+		else print( "'",cvos(I) )
+	    end;
+	    [CX2AX#] begin print( "AC lic required (cnt)"&crlf ); done end;
+	    [CXLOG#] begin print( "AC lic required (name)"&crlf ); done end;
+	    [CXDCB#] print( "no room in monitor" );
+	    [CXNRR#] print( "sup did not respond (req)" );
+	    [CXNRL#] print( "sup did not respond (login)" );
+	    [CXNCH#] print( "sup did not supply circuit" );
+	    [CXERR#] print( "sup error from request" );
+	    else print( "'",cvos(I) )
+	end;
+	print( crlf );
+	if TRY < TRYLIM then begin
+	    print( "%retrying...please wait...",crlf );
+	    calli( TRY*10, calli!SLEEP );
+	end;
+    end "TRY";    
+    FATAL( PWCIR# );
+end	"CREAUX";
+
+integer procedure CUD!IN;
+comment
+	Read a single 8 bit byte from the CUD slave.  FATAL
+	if no traffic for TIMLIM seconds.
+;
+begin	"CUD!IN"
+    integer C;
+    calli( (AuxPort lsh 27) + !hl('111) + TIMLIM, calli!HIBER );
+    if !SKIP! then begin
+	C := auxclv( AuxPort,0,!AXI8S );
+	if CUDTRACE then print( ">",cvos(C),crlf );
+    	if !SKIP! then return( C );
+	FATAL( PWTIM# );	! timeout;
+    end;
+    FATAL( PWZAP# );		! circuit zapped;
+end	"CUD!IN";
+
+procedure CUD!OUT(
+	integer CHAR );		! character to send;
+comment
+	Send a single 8 bit byte to the CUD slave.
+;
+begin	"CUD!OUT"
+    auxclv( AuxPort, CHAR, !AXO8 );
+    if CUDTRACE then print( "<",cvos(CHAR),crlf );
+end	"CUD!OUT";
+
+integer procedure GET!WORD( 
+	integer BYTE!CNT );	! word size in bytes;
+comment
+	Read BYTE!CNT 8 bit bytes from the CUD slave and return
+	the resulting word.  As per CUD protocol, the most signifigant
+	byte is received first.
+;
+begin
+    integer I,J;
+    I := 0;
+    for J := 1 upto BYTE!CNT do
+	I := (I lsh 8) lor CUD!IN;
+    return( I );
+end;
+
+procedure SEND!WORD(
+	integer BYTE!CNT;	! number of bytes;
+	integer WORD );		! word;
+comment
+	Send BYTE!CNT 8 bit bytes from WORD to CUD slave via circuit.
+	As per CUD protocol, most signifigant bytes are sent first.
+;
+begin
+    integer I;
+    for I := 1-BYTE!CNT upto 0 do
+	CUD!OUT( WORD lsh (I*8) land '377 );
+end;
+
+define CUD = 0;
+
+procedure XUD( integer DHost );
+begin
+    integer I;
+    own integer array PORTS[0:99];
+    if CUDTRACE then print( "=XUD(",DHost,")"&crlf );
+    if AuxPort := PORTS[DHost] then return;
+    if DHost then begin
+	string S;
+	print( "[building circuit to system ", DHost, " LUD]"& crlf );
+	CREAUX("CUD10:"&cvs(DHost));
+	S := #cr&"R FTUPDL"&#cr;
+	while length(S) do CUD!OUT(lop(S));
+    end
+    else begin
+	print( "[building circuit to NETVAL system]"& crlf );
+	CREAUX("NCUD1:1");		! connect with CUD slave;
+	CUD!OUT( #cr );			! satisfy project code prompt;
+    end;
+    while CUD!IN neq 1 do;
+    if CUD!IN neq 2 or CUD!IN neq 3 or CUD!IN neq 4 then
+	FATAL( PWHND#& ", host "& cvs(DHost) );
+    for I := 1 step 1 until 4 do CUD!OUT( I );
+    PORTS[DHost] := AuxPort;		! remember port number;
+end;
+
+integer procedure CIPHER(
+	string PASSWORD );	! password to be ciphered;
+comment
+	Hashes a password passed as its argument into a 32 bit
+	value as per supervisor password hash algorithm.
+;
+begin "CIPHER"
+    integer A,B,I,CH;
+    define mask!32 = '37777777777;
+    A := B := 0;
+    while CH := lop(PASSWORD) do begin "NEXT-CHARACTER"
+	for I := 1 step 1 until 7 do begin "NEXT-PASS"
+	    B := A + B + CH;
+	    A := A + B;
+	    if A land '100 then A := A + CH;
+	    A := ((A lsh 3) land mask!32) + ((A lsh -29) land 7);
+	end "NEXT-PASS";
+    end "NEXT-CHARACTER";
+    A := A xor B;
+    return( A land mask!32 );
+end "CIPHER";
+
+procedure TEST!SYNC;
+begin
+    if CUD!IN neq '40 then
+	FATAL( PWSYN# );
+end;
+
+procedure SEND!UserName( string UNAME );
+begin
+    while length(UNAME) do begin
+	if length(UNAME) > 4
+	    then CUD!OUT( lop(UNAME) )
+	    else CUD!OUT( lop(UNAME)+'200 );
+	CUD!OUT( lop(UNAME) );
+	CUD!OUT( lop(UNAME) );
+	CUD!OUT( lop(UNAME) );
+    end;
+end;
+
+integer procedure HALFin;
+return ( CUD!IN lsh 16 lor CUD!IN lsh 8 lor CUD!IN );
+
+procedure HALFout (integer I);
+begin
+    CUD!OUT( (I lsh -16) land '3 );
+    CUD!OUT( (I lsh -8) land '377 );
+    CUD!OUT( I land '377 );
+end;
+
+procedure WORDout (integer I);
+begin
+    halfout( !lh(I) );
+    halfout( !rh(I) );
+end;
+
+procedure INITout( string S );
+begin
+    while length(S) do CUD!OUT( lop(S) - '40 );
+end;
+
+procedure USERout( string UName );
+begin
+    UName _ (UName & "            ")[1 to 12];
+    while length(UName) do CUD!OUT( lop(UName) - '40 );
+end;
+
+integer !CPARW, !OPTIONS, !DISTRICT;
+
+integer procedure GET!AUN(
+	string UNAME );		! user name;
+comment
+	Lookup the specified user name in the MUD and return its AUN.
+	If the user is not valid, return -1.
+;
+begin
+    integer I,J,GAN,UUN;
+    XUD(CUD);			! use CUD;
+    CUD!OUT( 10 );		! read MUD data command;
+    SEND!UserName( UNAME );	! user name;
+    CUD!OUT( '40 );		! end of command;
+    case I := CUD!IN of begin	! check completion code;
+	[1] begin		! function complete;
+	    GAN := GET!WORD(4) land '777777;	! GAN;
+	    UUN := GET!WORD(4) land '777777;	! UUN;
+	    !CPARW := GET!WORD(2);		! CPARW;
+	    !OPTIONS := GET!WORD(1);		! options;
+	    !DISTRICT := GET!WORD(2);		! district;
+	    if not BUBBNET then GET!WORD(1);	! IRC;
+	    while( '377 neq I := GET!WORD(1) ) do begin "classes"
+		GET!WORD(2);	! class code;
+		for J := 1 upto I do
+		    GET!WORD(2);! group or host code;
+	    end "classes";
+	    GET!WORD(3);	! password change date;
+	end;
+	[2] GAN := UUN := -1;	! not valid;
+	[4][10] FATAL( PWBSY# );
+	[6] FATAL( PWNTV# & "GET_MUD_DATA (10)" );
+	[else] begin
+	    print( "?code '",cvos(I)," from CUD slave",crlf );
+	    FATAL( PWCUD# );
+	end
+    end;
+    TEST!SYNC;
+    return( !xwd( GAN, UUN ) );
+end;
+
+procedure CHANGE!PASSWORD (
+	string UNAME;		! user name;
+	string PASSWORD );	! password;
+begin
+    integer I;
+    XUD(CUD);			! use CUD;
+    CUD!OUT( 30 );		! change password command;
+    SEND!UserName( UNAME );
+    SEND!WORD( 4, CIPHER( PASSWORD ));
+    CUD!OUT( '40 );		! end of command;
+    case I := CUD!IN of begin	! check completion code;
+	[1] begin
+	    print( "[password changed for user ",UNAME,"]",crlf );
+	end;
+	[4][10] FATAL( PWBSY# );
+	[6] FATAL( PWNTV# & "CHANGE_PASSWORD (30)" );
+	[else] begin
+	    print( "?code '",cvos(I)," from CUD slave",crlf );
+	    FATAL( PWCUD# );
+	end
+    end;
+    TEST!SYNC;			! are we in sync?;
+end;
+
+procedure GET!MYDATA;
+comment
+	Check to see that current user is properly validated by
+	comparing his login AUN / username combination with the MUD.
+;
+begin
+    integer LAUN,MAUN,LPRV,LLIC;
+    MYHOST := calli( !xwd( !cnSYS, !gtCNF ), calli!GETTAB );
+    MYNAME := cv6str( calli( !xwd( -1,!GTUNM ), calli!GETTAB ) ) &
+	cv6str( calli( !xwd( -1,!GTUN1 ), calli!GETTAB ) );
+    LAUN := calli( !xwd( -1,!GTAUN ), calli!GETTAB );
+    LPRV := calli( !xwd( -1,!GTPRV ), calli!GETTAB );
+    LLIC := calli( !xwd( -1,!GTLIC ), calli!GETTAB );
+    MAUN := GET!AUN( MYNAME );
+    if MAUN < 0 then
+	FATAL( PWLOC# );	! not available to local users;
+    if MAUN neq LAUN then
+	if BUBBNET then begin
+	    print( "WARNING: user ", MYNAME, " is improperly validated:"& crlf&
+		"   MUD AUN = ", cvos(!lh(MAUN)),",",cvos(!rh(MAUN)), crlf&
+		"   LUD AUN = ", cvos(!lh(LAUN)),",",cvos(!rh(LAUN)), crlf&
+		"Please contact BUBBNET validations to have this corrected."
+		&crlf& "[using AUN from MUD]"& crlf& crlf );
+	    LAUN := MAUN;
+	end
+	else
+	    FATAL( PWVAL# & MYNAME );! validation exception for user ;
+    MYGAN := !lh(LAUN);		! global account number;
+    MYUUN := !rh(LAUN);		! universal user number;
+    AS := LPRV land JP!ASV;	! Account Supervisor license;
+    JL := LLIC land LC!JL;	! Jacct-Login license;
+end;
+
+procedure SEND!REMARK;
+comment
+	Send audit trail information to slave.
+;
+begin
+    integer I;
+    string Remark;
+    Remark := "User: "& MYNAME& " job: "& cvs(calli(0,calli!PJOB));
+    XUD(CUD);			! use CUD;
+    CUD!OUT( 13 );		! remark command;
+    CUD!OUT( length(Remark) );
+    while length(Remark) do CUD!OUT( lop(Remark) );
+    CUD!OUT( '40 );		! end of command;
+    case I := CUD!IN of begin	! check completion code;
+	[1] ;
+	[6] FATAL( PWNTV# & "SET_OPLOG_REMARK (13)" );
+	[else] begin
+	    print( "?code '",cvos(I)," from CUD slave",crlf );
+	    FATAL( PWCUD# );
+	end
+    end;
+    TEST!SYNC;			! are we in sync?;
+end;
+
+integer OKAYbrk,NONSPACEbrk,ILLEGALbrk,TokenBreak;
+procedure OKAYbrkINI;
+begin
+    setbreak( OKAYbrk_getbreak, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", null, "XS" );
+    setbreak( NONSPACEbrk_getbreak, " ", null, "XS" );
+    setbreak( ILLEGALbrk_getbreak, IllegalChars, null, "IS" );
+    setbreak( TokenBreak_getbreak, " ,"&#ht, " "&#ht, "TINSK" );
+end;
+require OKAYbrkINI initialization;
+
+boolean procedure OKAY( 
+    string USER;	! username;
+    string PASSWORD );	! password to check;
+comment
+	Return true if given password meets security restrictions.
+;
+begin
+    boolean OK;			! set if problem detected;
+    OK := true;			! innocent until proven guilty;
+!
+	RULE 1: must not resemble user name
+;
+    begin "RULE1"
+	integer B;
+	string S1,S2;
+	S1 := null;
+	S2 := PASSWORD;
+	do			! S1 = alpha portion of password;
+	    S1 := S1 & scan( S2,OKAYbrk,B )
+	until length( S2 ) = 0;
+	if equ( USER,S1 ) or equ( USER,PASSWORD ) then begin
+	    print( "?password closely resembles user name (",
+		USER, ")"& crlf );
+	    OK := false;
+	end;
+    end "RULE1";
+!
+	RULE 2: must be at least 7 characters
+;
+    begin "RULE2"
+	if length( PASSWORD ) < 7 then begin
+	    print( "?password less than 7 characters"& crlf );
+	    OK := false;
+	end;
+    end "RULE2";
+!
+	RULE 3: must contain embeded non-alphabetic
+;
+    begin "RULE3"
+	integer B;
+	string S1,S2;
+	S2 := PASSWORD;
+	lop( S2 );		! don't count the first character;
+	S1 := scan( S2,OKAYbrk,B );
+	if B=0 or length(S2)=0 then begin
+	    print( "?password lacks an embedded non-alphabetic"& crlf );
+	    OK := false;
+	end;
+    end "RULE3";
+!
+	RULE 4: must not be trite or obvious
+;
+    begin "RULE4"
+	integer I,B;
+	string S1,S2;
+	S2 := PASSWORD;
+	scan( S2,NONSPACEbrk,B );
+	if not B then begin
+	    print( "?password is trivial (blanks)"&crlf );
+	    OK := false;
+	end;
+	S1 := null;
+	S2 := PASSWORD;
+	do
+	    S1 := S1 & scan( S2,OKAYbrk,B )
+	until length( S2 ) = 0;
+	for I := arrinfo( TRITE, 1 ) upto arrinfo( TRITE, 2 ) do
+	    if equ( S1, TRITE[i] ) then begin
+		print( "?password is trite (",S1,")"&crlf );
+		OK := false;
+	    end;
+    end "RULE4";
+!
+	RULE 5: password must not contain illegal characters.
+;
+    begin "RULE5"
+	integer B;
+	string S;
+	S := PASSWORD;
+	scan( S,IllegalBrk,B );
+	if B then begin
+	    print( "?Illegal character in password (",
+		if B < 32 then "^"&(B+64) else """"&B&"""",
+		")"&crlf );
+	    OK := false;
+	end;
+    end "RULE5";
+    return( OK );
+end;
+boolean HDX;
+simple procedure HDXini;
+begin!code
+	SETO	1,;
+	uuo!GETLCH 1;
+	AND	1,[ LC!HDX+LC!LCP ];
+	MOVEM	1,HDX;		! true if TTY is half duplex or local copy;
+end;
+require HDXini initialization;
+
+string procedure ReadPassword;
+begin
+    string S;
+    if HDX then print( crlf&
+	"XXXXXXXXXXXXXXX"&#cr&
+	"WWWWWWWWWWWWWWW"&#cr&
+	"OOOOOOOOOOOOOOO"&#cr&
+	"QMEUXTDHEGSOKGR"&#cr );
+    S := inchwl;
+    while !SKIP! neq #cr do
+	S := S & !SKIP! & inchwl;
+    if equ( S,"?" ) then print( "?" );
+    print( crlf );
+    return( S );
+end;
+
+procedure CHECK!OLD!PASSWORD;
+comment
+	Get old password from user, hash it and check with CUD to make
+	sure it matches.  Prevents unauthorized user from walking up to
+	a terminal and changing the user's password.
+;
+begin
+    integer I;
+    string OldPassword;
+    auxcli( -1,IO!NEC,!AXCFS );		! turn off echo;
+    print( "Enter current password for user ", MyName, ": " );
+    OldPassword := ReadPassword;
+    auxcli( -1,0,!AXCFS );		! turn on echo;
+    XUD(CUD);				! use CUD;
+    CUD!OUT( 31 );			! check password command;
+    SEND!UserName( MyName );
+    SEND!WORD( 4, CIPHER( OldPassword ));
+    CUD!OUT( '40 );			! end of command;
+    case I := CUD!IN of begin		! check completion code;
+	[1] ;
+	[4][10] FATAL( PWBSY# );
+	[6] FATAL( PWNTV# & "CHECK_OLD_PASSWORD (31)" );
+	[18] FATAL( PWBAD# & MyName );
+	[else] begin
+	    print( "?code '",cvos(I)," from CUD slave",crlf );
+	    FATAL( PWCUD# );
+	end
+    end;
+    TEST!SYNC;				! are we in sync?;
+end;
+
+string procedure GET!PASSWORD( string USER, DEFAULT(null) );
+comment
+	Obtain password from terminal, and verify its legal
+;
+begin
+    label AGAIN;
+    string PASSWORD;
+    auxcli( -1,IO!NEC,!AXCFS );		! turn off echo;
+AGAIN:
+    print( "Enter password",
+	if length(DEFAULT) then " ["& DEFAULT& "]: " else ": " );
+    PASSWORD := ReadPassword;
+    if length(PASSWORD) = 0 and length(DEFAULT) neq 0 then begin
+	auxcli( -1,0,!axCFS );
+	return( DEFAULT );
+    end;
+    if equ( PASSWORD, "?" ) then begin
+	print( "Enter new password (it will not echo).
+In order to provide a minimal level of security, the password:
+  [1] must not resemble the user name
+  [2] must be at least 7 characters in length
+  [3] must contain at least 1 embedded number or punctuation character
+  [4] must not be trite or obvious
+"& crlf );
+	goto AGAIN;
+    end;
+    if not OKAY( USER, PASSWORD ) then begin
+	print( "Type a ? for password rules."& crlf&crlf );
+	goto AGAIN;
+    end;
+    print( "Enter it again: " );
+    if not equ( PASSWORD, ReadPassword ) then begin
+	print( "?passwords do not agree"& crlf );
+	goto AGAIN;
+    end;
+    auxcli( -1,0,!AXCFS );	! turn on echo;
+    return( PASSWORD );
+end;
+
+boolean procedure Access( string USER );
+begin
+    integer AUN,GAN;
+    define DENY(X) = {begin cprint( -1+0*X, crlf ); return(false) end };
+    AUN := GET!AUN( USER );
+    GAN := !lh(AUN);
+    if AUN < 0 then DENY( PWINV# & USER );
+    if JL then return(true);
+    if equ( USER, MYNAME ) then DENY( PWSLF# );
+    if AS and GAN = MYGAN then return(true);
+    if !DISTRICT = MYUUN then return(true);
+    return(true);
+end;
+
+procedure ADD!CMD;
+begin
+    string USER, PASSWORD, Hosts, SYS;
+    integer I, GAN, UUN, QUOTA, PRIV;
+    if length(USER:=ARGS) = 0 then begin
+	print( "User name: " );
+	USER := inchwl;
+    end;
+    PRIV := '120177340177;
+    UUN := GET!AUN( USER );
+    if UUN < 0 then begin
+	if JL then begin
+	    print( "New or existing GAN [existing]: " );
+	    if inchwl = "N"
+		then begin
+		    GAN := 0;
+		    PRIV := PRIV lor jp!ASV;
+		end
+		else begin
+		    string ASUN;
+		    label GetASUN;
+GetASUN:	    print( "Name of user in desired GAN [",MYNAME,"]: " );
+		    if length(ASUN:=inchwl)
+			then begin
+			    GAN := !lh(GET!AUN(ASUN));
+			    if GAN = '777777 then begin
+				print( "?user ",ASUN," not found", crlf );
+				goto GetASUN;
+			    end;
+			end
+			else GAN := MYGAN;
+		end;
+	end
+	else GAN := MYGAN;
+	PASSWORD := GET!PASSWORD( USER, DEFAULT!PASSWORD );
+	XUD(CUD);
+	CUD!OUT( 1 );
+	SEND!UserName( USER );
+	SEND!WORD( 4, CIPHER( PASSWORD ));
+	SEND!WORD( 4, GAN );
+	SEND!WORD( 4, UUN := 0 );
+	SEND!WORD( 2, !CPARW := 0 );
+	SEND!WORD( 2, !DISTRICT := MYUUN );
+	if not BUBBNET then SEND!WORD( 1, 0 ); ! IRC;
+	SEND!WORD( 1, 1 );
+	SEND!WORD( 2, 0 );		! class 0;
+	SEND!WORD( 2, '40005 );		! group 5;
+	CUD!OUT( '40 );			! end of command;
+	case I := CUD!IN of begin	! check completion code;
+	    [1] print( "User added to CUD, AUN: ",
+		cvos( GAN := GET!WORD( 4 )), ",",
+		cvos( UUN := GET!WORD( 4 )), "]"& crlf );
+	    [4][10] FATAL( PWBSY# );
+	    [6] FATAL( PWNTV# & "NEW_USER (1)" );
+	    [else] begin
+		print( "?code '",cvos(I)," from CUD slave",crlf );
+		FATAL( PWCUD# );
+	    end
+	end;
+	TEST!SYNC;			! are we in sync?;
+    end
+    else begin
+	GAN := !lh(UUN);
+	UUN := !rh(UUN);
+	print( "[user already in CUD, AUN: ",
+	    cvos( GAN ), ",",
+	    cvos( UUN ), "]"& crlf );
+    end;
+    print( "Disk quota in pages [2500]: " );
+    if (Quota := cvd(inchwl)) = 0 then Quota := 2500;
+    print( "Add to hosts [",AllHosts,"]: " );
+    if length(Hosts := inchwl) = 0 then Hosts := AllHosts;
+    while length(Hosts) do begin
+	string SYS;
+	if length(SYS := scan(Hosts, TokenBreak, !SKIP!)) = 0 then continue;
+	if cvd(SYS) then begin "LUD"
+	    XUD(cvd(SYS));
+	    CUD!OUT( '24 );		! add user;
+	    USERout( USER );
+	    HALFout( GAN );
+	    HALFout( UUN );
+	    CUD!OUT( !DISTRICT );
+	    CUD!OUT( '121 );		! MISC: init, no msg, no pjc;
+	    INITout( "XEXEC       INIT  " );
+	    WORDout( PRIV );	! priv word;
+	    HALFout( Quota*4 );		! quota in blocks;
+	    HALFout( Quota*4 );
+	    case I_CUD!IN of begin
+	    	[1] print("User added to host ",SYS,crlf);
+	    	[2] print("[user already valid on host ",SYS,"]"&crlf);
+	    	['14] FATAL( PWBSY#& " host "& SYS );
+		else FATAL( PWCUD#& " '"& cvos(I) )
+	    end;
+	end "LUD";
+    end;
+end;
+
+procedure DELETE!CMD;
+begin
+    string USER, Hosts, SYS;
+    integer I;
+    if length(USER:=ARGS) = 0 then begin
+	print( "User name: " );
+	USER := inchwl;
+    end;
+    if not Access( USER ) then return;
+    print( "Delete from hosts [",AllHosts,",CUD]: " );
+    if length(Hosts := inchwl) = 0 then Hosts := AllHosts& ",CUD";
+    while length(Hosts) do begin
+	string SYS;
+	if length(SYS := scan(Hosts, TokenBreak, !SKIP!)) = 0 then continue;
+	if kequ(SYS,"CUD")
+	    then begin "CUD"
+		if length(Hosts) then begin
+		    if not kequ(Hosts[inf-3 to inf],",CUD")
+			then Hosts := Hosts& ",CUD";
+		    continue;
+		end;
+		XUD(CUD);
+		CUD!OUT( 3 );		! delete_user;
+		SEND!UserName( USER );
+		CUD!OUT( '40 );		! end of command;
+		case I := CUD!IN of begin	! check completion code;
+		    [1] print( "User deleted from CUD"& crlf );
+		    [2] FATAL( PWINV#& USER );
+		    [4][10] FATAL( PWBSY# );
+		    [else] begin
+			print( "?code '",cvos(I)," from CUD slave",crlf );
+			FATAL( PWCUD# );
+		    end
+		end;
+		TEST!SYNC;			! are we in sync?;
+	    end "CUD"
+	    else if cvd(SYS) then begin "LUD"
+		XUD(cvd(SYS));
+		CUD!OUT( 1 );		! delete user;
+		USERout( USER );
+		case I_CUD!IN of begin
+		    [1] begin
+			for I := 1 upto 6 do CUD!IN;
+			print("User deleted from host ",SYS,crlf);
+		    end;
+		    [3] print("%user not valid on host ",SYS,crlf);
+		    ['14] FATAL( PWBSY#& " host "& SYS );
+		    else FATAL( PWCUD#& " '"& cvos(I) )
+		end;
+	    end "LUD";
+    end;
+end;
+
+procedure PASSWORD!CMD;
+begin
+    string USER, PASSWORD;
+    if length(USER:=ARGS) = 0 then begin
+	print( "User name: " );
+	USER := inchwl;
+    end;
+    if not Access( USER ) then return;
+    PASSWORD := GET!PASSWORD( USER );
+    CHANGE!PASSWORD( USER, PASSWORD );
+end;
+
+procedure FIXAUN!CMD;
+begin
+    integer HOST, I, AUN, MAUN;
+    string USER, S;
+    if (Host:=cvd(ARGS)) = 0 then begin
+	print( "Check against LUD from host [",MyHost,"]: " );
+	HOST := cvd(inchwl);
+	if HOST = 0 then HOST := MYHOST;
+    end;
+    setprint("FIXAUN.RPT","B");
+    print( "Checking MUD against host ",HOST," LUD."& crlf );
+    XUD(HOST);
+    CUD!OUT( 7 );	! LIST ALL USERS IN THE LUD;
+    do begin "ForEachUser"
+	XUD(HOST);
+	USER := null;
+	for I := 1 upto 12 do begin
+	    integer C;
+	    C := CUD!IN + '40;
+	    if C = ('377+'40) then done "ForEachUser";
+	    if C neq " " then USER := USER& C;
+	end;
+	AUN := !xwd( HALFin, HALFin );
+	S := cvos(!lh(AUN))& ","& cvos(!rh(AUN));
+	print(
+	    USER, (#ht&#ht)[length(USER)%8+1 to inf],
+	    S, (#ht&#ht)[length(S)%8+1 to inf]  );
+	MAUN := GET!AUN( USER );
+	if MAUN = -1 then print( "not in mud" )
+	else if AUN = MAUN then print( "okay" )
+	else begin
+	    print( "AUN changed from ", cvos(!lh(MAUN)),",",cvos(!rh(MAUN)) );
+	    XUD(CUD);
+	    CUD!OUT( 23 );	! CHANGE_UUN_AND_GAN;
+	    SEND!UserName( USER );
+	    SEND!WORD( 4, !lh(AUN) );
+	    SEND!WORD( 4, !rh(AUN) );
+	    CUD!OUT( '40 );	! end of command;
+	    case I_CUD!IN of begin
+		[1] ;
+		[2] FATAL( PWINV#& USER );
+		[4][10] FATAL( PWBSY# );
+		[else] begin
+		    print( "?code '",cvos(I)," from CUD slave",crlf );
+		    FATAL( PWCUD# );
+		end
+	    end;
+	    TEST!SYNC;
+	end;
+	print( crlf );
+    end until false;
+    setprint(null,"T");
+end;
+
+procedure TRACE!CMD;
+begin
+    CUDTRACE := not CUDTRACE;
+end;
+
+begin "MAIN"
+
+    ttyup( true );		! convert lower case input to upper;
+    ifcr compiler!switch("B") thenc usererr(0,0,0,"B"); endc ! bail?;
+    BUBBNET := cvstr(calli(!xwd(!CNFG0,!GTCNF),calli!GETTAB)) = "B";
+    if not BUBBNET then usererr(0,0,"?must be run from BUBBNET","X");
+    print (
+	"NTDVAL version ", cvos(memory['137]), crlf&
+	"perform ",
+	if BUBBNET then "BUBBNET" else "TYMNET",
+	"/Tymcom-X validations"& crlf& crlf );
+    CHECK!ORIGIN;		! must not be AUX or PTY;
+    GET!MYDATA;			! get information about our user;
+    if not ( JL or AS ) then FATAL( PWLIC# );
+    if not JL then CHECK!OLD!PASSWORD;
+    SEND!REMARK;		! send username and job number;
+    while true do begin
+	string CMD;
+	print( "NTDVAL> " );
+	ARGS := inchwl;
+	CMD := scan( ARGS, TokenBreak, !SKIP! );
+	if length(CMD) = 0 then continue;
+	if kequ(CMD,"QUIT"[1 to length(CMD)]) then done;
+	define HLPMSG = {One of:}& crlf;
+	if length(CMD) geq 3 then begin
+	    forlc C! _ (ADD,DELETE,FIXAUN,PASSWORD,TRACE) doc {
+		redefine HLPMSG = cvms(HLPMSG)& {  C!}& crlf;
+		if kequ(CMD,"C!"[1 to length(CMD)]) then begin
+		    C!}&{!CMD;
+		    continue;
+		end;
+	    } endc
+	end;
+	print( cvms(HLPMSG), "  QUIT"& crlf );
+    end;
+    CLEANUP;			! shutdown slave, etc;
+    EXIT;			! terminate execution;
+
+end "MAIN";
+end "NTDVAL"
+$
+C †
