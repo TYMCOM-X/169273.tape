@@ -1,0 +1,622 @@
+comment 
+! NODLOD: - Node loader program for 2020
+! Author: - J.M.Stammers May 29, 1980
+! Revised:- J.M.Stammers July 1, 1980 ( include node adjacent load)
+!
+!
+!
+! Revised:- J.W.Rice August 21, 1980  ( remove completion time-out msg)
+! "  "  ":      Comment out 4th line from end of "LOAD" procedure.
+! "  "  ":      Add "outstr("[Process complete.]"&CRLF)"
+!
+! Revised:- D.R.Ernst June 1,1981: add message for acquiring PDP-11
+!	    Eliminate KMC question.
+!	    Changed resetting and loading messages.
+!	    Require confirmation for adjacent question and dr11 #.
+!	    Delay several seconds before declaring 11 active to KMC.
+!	    Changed quit to not set PDP-11 active if load did not 
+!		succeed.
+!	    Added checks for existant pdp-11s and adjusted range of 
+!		valid numbers to type or eliminated asking of question 
+!		if one dr.
+!	    Fixed bug that sent zero length blocks as the last block
+!		of a load. A zero length message will cause the node to
+!		start prematurely.  When the real start message is sent,
+!		the node did not respond and gave the "Can't send word 
+!		to node" error message.
+!	    Added code to send "leave load mode" message to load device
+!		and zap aux cir immediately.
+!	    Added check for oper license.
+!	    Changed "CINT" to remove all characters in circuit after an
+!		interrupt and to ignore line-feeds.
+!	    Added some help info in response to a typed "?".
+!	    Fixed terminal mode setting bug.
+!	    Added "cursor wiggling" to inform user of progress in 
+!		loading. 
+!
+! Purpose:-
+!	   This program is intended to be used to down line
+!	   a node image into a node on a local network to the
+!	   host 2020, running TYMCOM - XX. It goes through a
+!	   question and answer period and then loads the data
+!	   into the specified node.;
+
+begin	"nodlod"
+require processes;
+require 25 polling!interval;
+require "(sys)proces.def" source!file;
+require "(sailib)tymint.def" source!file;
+item intpro;
+simple procedure intini; intset(intpro,0);
+require intini initialization[2];
+item cctblt;
+simple procedure eventini; mkevtt(cctblt);
+require eventini initialization[2];
+define	!	=	"COMMENT",	CRLF	=	"('15&'12)",
+	TURNON	=	-1,		TURNOFF	=	0,
+	USERIOT	=	'25,		DRCLI	=	0,
+	DRSEL	=	1,		DRWIO	=	2,
+	DRRIO	=	3,		DRDSL	=	4,
+	PREFIX	=	'2307,		BLKLEN	=	10,
+	ACK	=	'100307,	NAK	=	'140307,
+	MSN	=	'400,		RESET	=	'177777,
+	START	=	0,		YES	=	0,
+	NO	=	1,		NOERR	=	'750010,
+	BELL	=	'7,		ECHOFF	=	'210,
+	AXI8S	=	'1,		AXO8	=	'3,
+	LROK	=	'100,		LRINN	=	'101,
+	LRNSN	=	'102,		LRNNI	=	'103,
+	LRCSE	=	'104,		LRPOV	=	'105,
+	LRPCE	=	'106,		LRFIN	=	'107,
+	LRTIM	=	'110,		LRRFS	=	'111,
+	LRNHW	=	'112,		AXCFS	=	'1000064,
+	ZAPCIR	=	-'45,		HIBER	=	'72,
+	CR	=	'15,		LF	=	'12,
+	ESC	=	'33,		TAB	=	'11,
+	BS	=	'10,		CTRLU	=	'25,
+	DEL	=	'177,		CTRLC	=	'3,
+	KMCCSR	=	'760540,	AVAIL	=	'4,
+	ACTIV	=	'3,		TIMEOUT	=	'1000005,
+	CREAUX	=	-'44,
+		RDIOB	=0	! "'722 ROT -9";,
+		TIOEB	=0	! "'720 ROT -9";,
+		BSIOB	=0	! "'724 ROT -9";,
+		BCIOB	=0	! "'725 ROT -9";,
+	UBA	=	'3,
+	ECHON	=	'0,		CIOPR	=      -'140,
+	DRDO	=	2,		DEFALT	=	128,
+	DRKMCI	=	5,		GETTAB	=	'41,
+	GTLIC	=	-'20;
+safe integer array intblock[1:2], zapblock[1:2];
+integer	drn,kmc11,dr11c,dskchn,dskeof,port,errflg,brchar,license;
+integer array buffer[1:DEFALT];		! pdp10 words;
+boolean adjacent,selected,connected;
+string	confirm,filnam,logstr,nodnam,auxstr,lognod,rawinp,imgfil;
+external 
+boolean	!SKIP!;
+! A couple of useful procedures;
+procedure userio(integer	mode);	! allow/disallow user level IO;
+begin	"userio" calli(mode,USERIOT);	end	"userio";
+
+
+integer procedure lh(integer word); ! return left halfword;
+start!code  hlrz 1,word; end;
+
+
+integer procedure rh(integer word); ! return right halfword;
+start!code  hrrz 1,word; end;
+
+
+simple boolean procedure cio(integer	fn,dr,arg,ciop);
+  start!code
+	hrlz	3,fn;
+	hrlz	2,dr;
+	hrr	2,arg;
+	hrri	3,2;
+	move	4,ciop;
+	setom	1;
+	calli	3,0(4);
+	  setzm	1;
+  end;
+
+
+simple procedure bclrb(integer	addr,byte);
+  start!code
+	hrlzi	2,UBA;
+	add	2,addr;
+	hrrz	1,byte;
+	BCIOB	1,@2;
+  end;
+
+
+procedure dsldr; ! release the selected dr11c;
+begin	"dsldr"
+if not cio(DRDSL,drn,DRDO,CIOPR) then 
+	begin
+	  outstr(CRLF&"[Can't deselect DR11C]");
+	  return;
+	end;
+if (not errflg) and kmc11 = YES then bclrb(KMCCSR+ACTIV,dr11c);  ! turn on KMC;
+end	"dsldr";
+
+
+procedure quit(string	arg); ! exit procedure, optional diag message;
+begin	"quit"
+errflg _ true;
+outstr(BELL&arg);			! give message;
+if selected then dsldr;			! turn off interrupts;
+if not adjacent then calli(port,ZAPCIR); ! kill the aux circuit;
+userio(TURNOFF);
+auxclv(-1,ECHON, AXCFS);
+call(1,"EXIT");
+end	"quit";
+! some macro assists for user level IO;
+simple boolean procedure teqb(integer	addr,byte);
+  start!code
+       hrlzi	2,UBA;
+       add	2,addr;
+       hrrz	3,byte;
+       setom	1;
+       TIOEB	3,@2;
+	 setzm	1;
+  end;
+
+
+simple procedure bsetb(integer	addr,byte);
+  start!code
+      hrlzi	2,UBA;
+      add	2,addr;
+      hrrz	1,byte;
+      BSIOB	1,@2;
+  end;
+
+
+integer simple procedure breab(integer	addr);
+  start!code
+      hrlzi	2,UBA;
+      add	2,addr;
+      setzm	1;
+      RDIOB	1,@2;
+  end;
+
+
+simple integer procedure locn(reference integer	word);
+  start!code movei	1,word; end;
+string procedure getstr; ! general string input routine with editting;
+begin	"getstr"
+string chr,local;
+local _ NULL;
+while (chr _ inchrw) neq CR and chr neq LF do
+  begin if chr = DEL then 
+	  begin local _ local[1 for INF-1];
+		outstr(BELL&BS&" "&BS);
+	  end
+	else if chr = TAB then
+	  begin outstr(" ");
+		local _ local & chr;
+	  end
+	else if chr = CTRLU then
+	  begin while length(local) > 0 do
+		  begin local _ local[1 for INF-1];
+			outstr(BS&" "&BS);
+		  end;
+		outstr(BELL);
+	  end
+	else if chr = ESC or
+		chr = CTRLC then quit(NULL)
+	else if chr < " " then outstr(BELL)
+	else 
+	  begin if "a" leq chr leq "z" then chr _ chr - '40;
+		outstr(chr);
+		local _ local & chr;
+	  end;
+  end;
+return(local);
+end	"getstr";
+procedure getadj; ! ask whether a host/node adjacent load;
+begin	"getadj"
+string junk;
+while TRUE do
+  begin
+  outstr("Host adjacent load [Y/N]? ");
+  if (junk _ inchrw) = ESC or
+      junk = CTRLC then quit(NULL);
+  if junk = CR or
+     junk = "N" or
+     junk = "n" then
+     begin outstr("No. [Confirm]");
+	   adjacent _ false;
+     end
+  else if junk = "Y" or junk = "y" then
+     begin outstr("Yes. [Confirm]");
+	   adjacent _ true;
+     end
+  else if junk = "?" then
+	begin
+		outstr(CRLF&"Is the node to be loaded directly connected to"
+				&CRLF&"the host you are running this program"
+				&" on?"&CRLF&CRLF);
+		continue;
+	end
+  else begin
+	outstr(CRLF&"[Answer `Y' or `N']"&CRLF);
+	continue;
+       end;
+  if inchrw = CR then done else outstr(CRLF);
+  end;
+outstr(CRLF);
+end "getadj";
+procedure cint; ! character software interrupt routine;
+begin "cint"
+integer ch;
+
+while TRUE do
+begin
+    ch _ auxclv(port,0,AXI8S);
+    if not !SKIP! then return;
+
+    case ch of begin
+	[LF] return; ! OK but ignore;
+	[LROK][LRFIN] cause(cctblt,ANY);
+	[LRINN] quit(CRLF&"[Illegal node name]");
+	[LRNSN] quit(CRLF&"[No such node]");
+	[LRNNI] quit(CRLF&"[Node not idle]");
+	[LRCSE] quit(CRLF&"[Checksum error]");
+	[LRPOV] quit(CRLF&"[Packet overflow]");
+	[LRPCE] quit(CRLF&"[Protocol error]");
+	[LRTIM] quit(CRLF&"[Node timed out]");
+	[LRRFS] quit(CRLF&"[Refused by protocol module]");
+	[LRNHW] quit(CRLF&"[No hardware present]");
+    else
+	quit(CRLF&"[Unknown node error "&cvos(ch)&"]")
+    end;
+end;
+end "cint";
+
+procedure zint; ! circuit zapper software interrupt routine;
+begin "zint"
+if connected then quit(CRLF&"[Lost circuit to node "&lognod&"]");
+end "zint";
+
+item nulljob;
+procedure nulljobproc;
+begin "nulljobproc"
+ while TRUE do 
+  begin calli(TIMEOUT, HIBER);
+	poll;
+  end;
+end "nulljobproc";
+
+simple procedure nulljobini;
+sprout(nulljob,nulljobproc,priority(15)+runme);
+require nulljobini initialization[2];
+procedure getaux; ! create aux cct to load device;
+begin "getaux"
+integer array foo[0:length(logstr)%5];
+integer i;
+outstr(CRLF&"Connecting to node "&lognod&"..");
+for i _ 1 step 5 until length(logstr)
+  do foo[i%5] _ cvasc(logstr[i for 5]);
+port _ calli(location(foo[0]) + (drn lsh 33), CREAUX);
+if !SKIP! then
+  begin connected _ true;
+	intblock[1] _ 2;
+	intblock[2] _ (-1 lsh 18) + location(cint);
+	intmap(tinass(port,1,'10),dfrint,
+	      (-2 lsh 18) + location(intblock[1]));
+	enable(newenb('10));
+	zapblock[1] _ 2;
+	zapblock[2] _ (-1 lsh 18) + location(zint);
+	intmap(tinass(port,7,'11),dfrint,
+	      (-2 lsh 18) + location(zapblock[1]));
+	enable(newenb('11));
+  end
+else
+  begin case lh(port) of begin
+	     [0][7] case rh(port) of begin
+			 [1] quit(CRLF&"[Format error]");
+			 [2] quit(CRLF&"[Tymnet username error]");
+			 [3] quit(CRLF&"[Tymnet mud error]");
+			 [4] quit(CRLF&"[Can't access load device]");
+			 [5] quit(CRLF&"[Tymnet downline request error]");
+			 [6] quit(CRLF&"[Timeout]");
+			 [7] quit(CRLF&"[Access barred]");
+			 [8] quit(CRLF&"[Out of originating ports]");
+			 [9] quit(CRLF&"[Aux circuit queue full]")
+		    end;
+	     [1][2] quit(CRLF&"[Insufficient license - AC not set]");
+	     [3] quit(CRLF&"[No room for DDB]");
+	     [4][5][6] quit(CRLF&"[No response from node "&lognod&"]");
+	     [8] quit(CRLF&"[Node "&lognod&" or intervening node not up]")
+	end;
+  end;
+end "getaux";
+procedure getnod; ! ask for node number to load;
+begin "getnod"
+open(dskchn _ getchan, "DSK", NOERR,5,0,0,0,dskeof);
+if dskeof then quit("[Can't open disk channel]");
+setbreak(1,",",null,"IS");
+while TRUE do
+  begin outstr("Specify node number to load: ");
+	while equ((rawinp _ getstr), NULL) do
+	   outstr(CRLF&"[Enter node number]"&CRLF&
+		  "[Specify node number to load: ");
+	nodnam _ scan(rawinp,1,brchar);
+	if equ(nodnam,"?") then
+	    begin
+		outstr(CRLF&"Enter the node name of the PDP-11"&
+			" you wish to load"&CRLF&CRLF);
+		continue;
+	    end;
+	if brchar = 0 then
+		imgfil _ "(SYS)SV"&nodnam&".IMG"
+	    else
+		begin
+			imgfil _ rawinp;
+			if equ(imgfil,"?") then
+			   begin
+				outstr(CRLF&"Type an alternate file to load"&CRLF);
+				continue;
+			   end;
+		end;
+	lookup(dskchn,imgfil,dskeof);
+	if not dskeof then done
+	else outstr(CRLF&"[Can't lookup "&imgfil&CRLF);
+  end;
+outstr(CRLF);
+end "getnod";
+procedure getdr; ! get dr11c logical number;
+begin "getdr"
+integer drbits,drmax;
+userio(TURNON);
+if kmc11 = YES and !SKIP! then
+    begin
+	drbits _ breab(KMCCSR+AVAIL); ! get KMCCSR bits for available DRs;
+	drmax _ -1;
+	if (drbits land '200) = 0 then
+		drmax _ 3
+	else if (drbits land '20) = 0 then
+		drmax _ 2
+	else if (drbits land '2) = 0 then
+		drmax _ 1
+	else if (drbits land '1) = 0 then
+		drmax _ 0
+	else quit("KMC reports no DR11Cs respond to bus requests!!"&
+		CRLF&"Have the DR11C and KMC hardware checked!!");
+	drn _ drmax;
+    end
+else
+    drmax _ 3;
+userio(TURNOFF);
+
+while drmax neq 0 do
+  begin
+  while TRUE do
+    begin
+	outstr("Specify DR11C [0:"&cvos(drmax)&"]: ");
+	drn _ inchrw;
+	if drn neq CR and drn neq ESC and drn neq CTRLC
+		and not (0 leq (drn - "0") leq drmax) then
+		    if drn = "?" then
+			outstr("?"&CRLF&"Enter the DR11C number of the node"
+				&" directly connected"&CRLF&"to the host"
+				&" computer which is being loaded,"&CRLF
+				&"or the directly connected node from which"
+				&" to build"&CRLF&"a circuit to the neighbor"
+				&" node"&CRLF&CRLF)
+		    else
+			outstr(drn&CRLF&BELL&"[Invalid DR11C]"&CRLF)
+	else done;
+    end;
+  if drn = CR then drn _ "0"
+     else if drn = ESC or drn = CTRLC then quit(NULL);
+  outstr(drn&" [Confirm]");
+  drn _ drn - "0";
+  confirm _ inchrw;
+  outstr(CRLF);
+  if confirm = CR then done;
+  end; 
+end "getdr";
+procedure getlog; ! ask for node to load from;
+begin "getlog"
+integer i,ch;
+
+while TRUE do
+    begin
+	outstr("Specify neighbor node of "&nodnam&": ");
+	if equ((lognod _ getstr), NULL) then
+	    begin
+		outstr(CRLF&"[Enter node number to load from]"&CRLF);
+		continue;
+	    end;
+	if equ(lognod,"?") then
+	    begin
+		outstr(CRLF&"Enter the neighbor of "&nodnam&" which is"
+			&" capable of loading "&nodnam&CRLF
+			&"and is reachable from the host on which this"
+			&" program is running."&CRLF&CRLF);
+		continue;
+	    end;
+	done;
+    end;
+outstr(CRLF);
+logstr _ ":WD1@" & lognod & ";";
+getdr;
+getaux;
+auxstr _ nodnam & "      ";
+for i _ 1 step 1 until 6 do
+  auxclv(port,(ch _ lop(auxstr)), AXO8);
+interrogate(cctblt, wait);
+end "getlog";
+
+procedure getkmc; ! check whether there is a kmc;
+begin	"getkmc"
+if cio(DRKMCI,0,0,CIOPR) then
+	kmc11 _ YES
+    else
+	kmc11 _ NO;
+end	"getkmc";
+procedure seldr; ! latch onto the selected dr11c;
+begin	"seldr"
+integer j,z;
+if kmc11 = NO then 
+  begin if not cio(DRCLI,drn,DRDO,CIOPR) then 
+	  quit(CRLF&"[Can't clear interface]");
+  end
+else
+  begin case drn of
+	  begin [0] dr11c _ '1;
+		[1] dr11c _ '2;
+		[2] dr11c _ '20;
+		[3] dr11c _ '200
+	  end;
+	if not teqb(KMCCSR+AVAIL,dr11c) then 
+	  quit(CRLF&"[DR11C "&cvos(drn)&" does not exist]");
+	z _ 1;
+	while teqb(KMCCSR+ACTIV,dr11c)  and z leq 6 do
+	  begin calli(TIMEOUT,HIBER);
+		z _ z + 1;
+	  end;
+	if z > 6 then
+	    begin 
+		outstr(CRLF&"DR11C "&cvos(drn)&" status shows it is"&
+			" in use by KMC!"&CRLF&
+			"Are you sure the PDP-11 is ready for loading? [Y/N] ");
+			confirm _inchrw;
+		if confirm neq "Y" and confirm neq "y" then quit(BELL);
+		outstr("Yes."&CRLF);
+		bsetb(KMCCSR+ACTIV,dr11c);
+		calli(TIMEOUT,HIBER);		! wait for KMC to see it;
+	    end;
+  end;
+if not cio(DRSEL,drn,DRDO,CIOPR) then quit(CRLF&"[Can't select DR11C]");
+selected _ TRUE;
+end	"seldr";
+! some IO control primitives;
+integer procedure getbuf(integer	pdp10);
+begin	"getbuf"
+arryin(dskchn, buffer[1], pdp10);
+if not dskeof then
+	return(pdp10)
+else
+	return(dskeof land '777777);
+end	"getbuf";
+
+
+procedure send(integer	word);
+begin	"send" 
+if adjacent then
+  begin if not cio(DRWIO,drn,word,CIOPR) then
+	   quit(CRLF&"[Can't send data to node]");
+  end
+else begin
+  auxclv(port,(word land '377),AXO8);
+  auxclv(port,(word lsh (-8)),AXO8);
+  end;
+end	"send";
+
+
+integer procedure recv;
+begin	"recv"
+integer word;
+if not adjacent then return(ACK);
+if not cio(DRRIO,drn,locn(word),CIOPR) then
+	quit(CRLF&"[Timeout on node response!]");
+word _ word land (lnot MSN);
+if word = ACK or word = NAK then return(word);
+outstr(CRLF&"Unknown node response code: "&cvos(word)&CRLF);
+return(NAK);
+end	"recv";
+
+procedure load; ! down line load routine;
+begin	"load"
+integer i,j,k,word,cs;
+if getbuf(DEFALT) neq DEFALT or dskeof then
+  quit("[Node image too short]");
+if adjacent then
+  begin outstr("Resetting "&nodnam&".");
+	send(PREFIX);	! here it comes;
+	outstr(".");
+	send(RESET);	! reset pdp-11 bootstrap;
+	outstr(".");
+	send(0);
+	if recv neq ACK then quit(CRLF&"[Node nak on reset pattern]");
+  end;
+outstr("Loading "&nodnam&"..");
+i _ 1;			! start block;
+while not dskeof do
+  if (j _ getbuf(BLKLEN)) neq 0 then	! j is in pdp10 words;
+    begin cs _ 0;
+	if not adjacent then
+	  send(((j * 2) + 3) * 2); ! Packet size Pdp11 (bytes);
+	send(PREFIX);
+	send(j * 2);		! BLKLEN * 2 Pdp11 words;
+	k _ 1;
+	while k leq j do
+	  begin send(word _ lh(buffer[k]));
+		cs _ cs + word;
+		send(word _ rh(buffer[k]));
+		cs _ cs + word;
+		k _ k + 1;
+	  end;
+	send(cs);	! send checksum;
+	if recv neq ACK then quit(CRLF&"[Node nak on block "&cvs(i)&"]");
+	i _ i + 1;
+	if (i mod 5) = 0 then if (i mod 10) = 0 then outstr(bs)
+						else outstr(" ");
+  end;
+if (i mod 10) > 4 then outstr(bs);
+if not adjacent then send(6);
+outstr(".");
+send(PREFIX);
+outstr(".");
+send(START);
+outstr(".");
+send(0);
+if adjacent then calli(TIMEOUT - 4, HIBER);
+outstr("Booting...");
+if adjacent then calli(TIMEOUT - 4, HIBER);
+if recv neq ACK then quit(CRLF&"[Nak response to startup]");
+if not adjacent then
+	begin	send(-6);
+		interrogate(cctblt,wait);
+		connected _ false; ! say we are no longer connected;
+		calli(port,ZAPCIR); ! kill the aux circuit;
+	end;
+close(dskchn);
+release(dskchn);
+outstr(BELL&"Done!"&CRLF&BELL);
+end	"load";
+! nodcod - main line code;
+
+kmc11_ NO;
+auxclv(-1,ECHOFF,AXCFS);
+selected _ false;
+errflg _ false;
+connected _false;
+outstr(CRLF&"Nodlod - Tymshare V1.6"&CRLF);
+license _ calli(GTLIC,GETTAB);
+if (license land '100000) = 0 or !SKIP! = 0 then quit("[Insufficient license]");
+getnod;
+getadj;
+if adjacent then
+  begin userio(TURNON);
+	if not !SKIP! then
+	   quit("[Insufficient license]");
+	getkmc;
+	getdr;
+	userio(TURNON);		! getdr turns if off;
+	outstr(CRLF&"Connecting to node "&nodnam&"..");
+	seldr;
+  end
+else begin
+	getlog;
+     end;
+outstr(".done!"&CRLF);
+load;
+if selected then dsldr;			! officaly relesae dr and tell KMC;
+userio(TURNOFF);
+auxclv(-1,ECHON, AXCFS);
+call(1,"EXIT");
+end	"nodlod"
+
