@@ -1,0 +1,1326 @@
+Entry;
+begin "DED - File I/O"
+  require "DED.DEF" source!file;
+!! title Tymcom-X File I/O Module ;
+
+ifcr Tops20 thenc
+  require "!!! This is the Tymcom-X File I/O module !!!" message;
+  TryAgainWithTheTops20Version
+endc
+
+
+! *************************************************************************
+*									  *
+*	 This module handles all disk I/O, and isolates all system	  *
+*      dependent file system calls into one file.  The RPG interface	  *
+*			     also lives here.				  *
+*									  *
+*		     Dave W. Smith,  October '81 - ...			  *
+*									  *
+**************************************************************************;
+
+
+! Entry points in other modules that we reference. ;
+
+  external integer
+    C!Debug;
+
+
+!                         From the Buffer Module
+;
+
+  external string
+    B!File;				! name of file ;
+  external simple procedure
+    B!Make( string FileNam, Alias );	! make a new buffer ;
+  external simple procedure
+    B!Read( integer Chan, Words );	! suck in a file ;
+  external simple procedure
+    B!Write( integer Chan );		! spit out a file ;
+  external simple procedure 
+    B!SetP( integer Position );	        ! set the point ;
+  external simple procedure
+    B!Insert( integer C );		! insert a character ;
+  external simple procedure
+    B!Delete( integer Dir );		! delete a chracter ;
+  external simple integer procedure
+    B!GetP;			        ! get the point ;
+  external simple integer procedure
+    B!GetC;			        ! get char at point ;
+  external integer
+    B!Prot;				! buffer protection ;
+  external simple procedure
+    B!Move( integer Dir );		! move the point ;
+  external boolean
+    B!BegP,
+    B!EndP;                             ! position flags ;
+  external boolean
+    B!ModP;				! buffer modified ;
+  external integer
+    B!Lock;
+  external simple boolean procedure
+    B!SeqP;
+  external simple boolean procedure
+    B!NulP;
+  external simple procedure
+    B!DelS;
+  external simple procedure
+    B!DelN;
+
+
+!                         From the Window Module
+;
+
+  external procedure
+    W!Disp( boolean PuntIfKeyHit );
+  external procedure
+    W!Msg( string S );
+  external boolean
+    W!MsgF;
+  external procedure
+    W!NewS;                             ! create new status line ;
+  external procedure
+    W!FixS;
+
+
+!                         From the Command Module
+;
+
+  external boolean
+    C!SPMRegion,                        ! Swap Pooint and Mark on
+                                        ! region-oriented operations (ie
+                                        ! Insert File)
+                                        ;
+    G!RNulls;                           ! Remove nulls from Text file
+                                        ! automatcially if true.
+                                        ;
+  external boolean procedure
+    C!Ask( string Question );
+  external safe integer array
+    C!Tab['0:'177];
+
+
+!                      From the SAIL Runtime System
+;
+
+  external integer
+    RPGSW;                              ! true iff called w/ offset ;
+
+
+!                        From the Redisplay Module
+;
+
+  external procedure
+    T!Bell;
+  external procedure
+    T!Fini;
+  external procedure
+    T!RSet;
+!! title Internal Storage ;
+! Storage internal to this module ;
+
+  internal string
+    F!Search;                           ! The string for which we want to
+                                        ! search upon opening a file for
+                                        ! editing.
+                                        ;
+
+  own integer F!Chan;			! channel of current file ;
+  own integer F!EOF;			! true iff eof reached ;
+  own integer F!EOFSeen;
+  own integer F!InputCount, F!OutputCount;
+  own integer F!Count, F!Break;
+  own integer F!Words;			! size, in words, of file ;
+  internal integer F!Chars;		! chars yet to be read from file ;
+  own integer F!Prot;			! file protection ;
+
+  own integer F!BP;			! byte pointer into F!Buffer ;
+  own safe integer array F!Buffer[ 0 : 127 ];
+
+! stuff scanned from a filename ;
+
+  own string F!Name;			! file name ;
+  own string F!Alias;			! r e g n a d   k c i n ;
+  own boolean F!Lock;			! true iff /read ;
+  own integer F!Page, F!Line, F!Char;	! where to start ;
+  internal boolean F!RPGFlag;		! true iff to exit to RPG ;
+  own string TmpCoreString;		! contents of EDS tmpcore file ;
+!! title Rtn F!Exit ;
+! Do system dependent termination stuff ;
+
+internal procedure F!Exit;
+  begin
+    safe integer array RB[ 0 : 5 ];
+
+    if ( F!RPGFlag ) then
+      begin
+	T!Fini;
+	print(crlf);
+	RB[ 0 ] := cvsix( "SYS" );
+	RB[ 1 ] := cvsix( "RPG" );
+	RB[ 2 ] := RB[ 3 ] := RB[ 4 ] := RB[ 5 ] := 0;
+	calli( XWD( 1, location( RB[ 0 ] )), '35 );
+	Usererr( 0,0,"??? Unable to run RPG - contact SQA","x" );
+      end;
+  end;
+!! title Rtn F!Decompose ;
+! Decompose a Tymcom-X/PEAK FileSpec, which must be of the following form:
+!
+! <FileSpec>	->	<FS>(<Alias>)(<Switches>)
+! <FS>		->	(<UserName>)<FileName> | <FileName>(<PPNSpec>)
+! <UserName>	->	'(' repeat(<V1>, 1-12) ')
+! <FileName>	->	<FilePart> ('.' <ExtPart>)
+! <FilePart>	->	repeat(<V2>, 1-6)
+! <ExtPart>	->	repeat(<V2>, 0-3)
+! <PPNSpec>	->	'[' <GanSpec> ',' <UunSpec> ']'
+! <GanSpec>	->	repeat(<OctNum>, 1-6)
+! <UunSpec>	->	repeat(<OctNum>, 1-6)
+! <Alias>	->	'"' repeat(<V3>, 1-*) '"'
+! <Switches>	->	'/' <Sw> | '%' <Sw>
+! <Sw>		->	repeat(ASCII, 1-*)
+! 
+! <V1>		->	<Alpha> | <DecNum> | '*' | '.' | '/' | '-' | ' '
+! <V2>		->	<Alpha> | <DecNum>
+! <V3>		->	{ASCII - '"'}
+! 
+! <Alpha>	->	'A' - 'Z' | 'a' - 'z' 
+! <DecNum>	->	'0' - '9'
+! <OctNum>	->	'0' - '7'
+! 
+! 
+! (The function repeat(Item, Minimum-Maximum) is replaced by between
+! Minimum and Maximum number of occurences of Item.  The special symbol
+! '*' indicates no limit.)
+!
+! The symbol 'ASCII' indicates the entire ASCII character set.
+!
+! Braces ('{' and '}') enclose set specifications - eg, '{ASCII - '"'}'
+! means all characters except '"'.
+;
+
+
+internal boolean procedure F!Decompose (string InStr; reference string UserName, File, Ext, PPN, Alias, Switches);
+begin "F!Decompose"
+  label
+    S0, S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12, S13, S14, S15,
+    S16, SGood, SBad;
+  integer
+    C;
+  string
+    LUserName, LFile, LExt, LGanStr, LUunStr, LAlias, LSwitches;
+  define
+    sp               = {" "},
+    IsAlphabetic (X) = {("A" <= UpShift(X) <= "Z")},
+    IsNumeric    (X) = {("0" <= X <= "9")},
+    IsOctal      (X) = {("0" <= X <= "7")},
+    IsWhiteSpace (X) = {(X = sp or X = tab)};
+
+
+  LUserName _
+  LFile     _
+  LExt      _
+  LGanStr   _
+  LUunStr   _
+  LAlias    _
+  LSwitches _
+  UserName  _
+  File      _
+  Ext       _
+  PPN       _
+  Alias     _
+  Switches  _ null;
+
+
+  S0:
+      ! Nothing seen - Look for username or filename ;
+
+    C _ lop(InStr);
+    if (IsAlphabetic(C)) then goto S4;
+    if (IsNumeric(C))    then goto S4;
+    if (C = "(") then goto S1;
+    goto SBad;
+
+
+  S1:
+      ! "(" Seen - Look for username ;
+
+    if (not length(InStr)) then goto SBad;
+    C _ lop(InStr);
+    if ((IsAlphabetic(C)) or
+	(IsNumeric(C)) or
+	(C = "*") or (C = ".") or
+	(C = "/") or (C = "-") or
+	(C = sp)) then
+      goto S2;
+    goto SBad;
+
+
+  S2:
+      ! Username character seen - Collect more and look for ")" ;
+
+    appnd(LUserName, ToUpper(C));
+    if (not length(InStr)) then goto SBad;
+    C _ lop(InStr);
+    if ((IsAlphabetic(C)) or
+	(IsNumeric(C)) or
+	(C = "*") or (C = ".") or
+	(C = "/") or (C = "-") or
+	(C = sp)) then
+      goto S2;
+    if (C = ")") then goto S3;
+    goto SBad;
+
+
+  S3:
+      ! ")" seen - Skip whitespace and look for filename ;
+
+    if (not (length(InStr) and length(LUserName))) then goto SBad;
+    C _ lop(InStr);
+    if (IsAlphabetic(C)) then goto S4;
+    if (IsNumeric(C))    then goto S4;
+    if (IsWhiteSpace(C)) then goto S3;
+    goto SBad;
+
+
+  S4:
+      ! Filename character seen - Collect more ;
+
+    appnd(LFile, ToUpper(C));
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (IsAlphabetic(C)) then goto S4;
+    if (IsNumeric(C))    then goto S4;
+    if (C = ".")         then goto S6;
+    if ((C = "/") or (C = "%")) then goto S16;
+    if (C = """")        then goto S14;
+    if (C = "[")         then goto S9;
+    if (IsWhiteSpace(C)) then goto S5;
+    goto SBad;
+
+
+  S5:
+      ! Whitespace seen - gobble up more and look for dot ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (C = ".") then goto S6;
+    if (C = "[") then goto S9;
+    if ((C = "/") or (C = "%")) then goto S16;
+    if (C = """") then goto S14;
+    if (IsWhiteSpace(C)) then goto S5;
+    goto SBad;
+
+
+  S6:
+      ! Dot seen - Look for extension ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (IsAlphabetic(C)) then goto S7;
+    if (IsNumeric(C))    then goto S7;
+    if (C = "[") then goto S9;
+    if ((C = "/") or (C = "%")) then goto S16;
+    if (C = """") then goto S14;
+    if (IsWhiteSpace(C)) then goto S6;
+    goto SBad;
+
+
+  S7:
+      ! Extension character seen - Look for more ;
+
+    appnd(LExt, ToUpper(C));
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (IsAlphabetic(C)) then goto S7;
+    if (IsNumeric(C))    then goto S7;
+    if (C = "[") then goto S9;
+    if ((C = "/") or (C = "%")) then goto S16;
+    if (C = """") then goto S14;
+    if (IsWhiteSpace(C)) then goto S8;
+    goto SBad;
+
+
+  S8:
+      ! Whitespace seen - gobble up more ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (C = "[") then goto S9;
+    if ((C = "/") or (C = "%")) then goto S16;
+    if (C = """") then goto S14;
+    if (IsWhiteSpace(C)) then goto S8;
+    goto SBad;
+
+
+  S9:
+      ! "[" seen - Look for Gan ;
+
+    if (not length(InStr)) then goto SBad;
+    C _ lop(InStr);
+    if (IsOctal(C)) then goto S10;
+    goto SBad;
+
+
+  S10:
+      ! Gan digit seen - Collect more and look for "," ;
+
+    appnd(LGanStr, ToUpper(C));
+    if (not length(InStr)) then goto SBad;
+    C _ lop(InStr);
+    if (IsOctal(C)) then goto S10;
+    if (C = ",") then goto S11;
+    goto SBad;
+
+
+  S11:
+      ! "," seen - Look for Uun ;
+
+    if (not length(InStr)) then goto SBad;
+    C _ lop(InStr);
+    if (IsOctal(C)) then goto S12;
+    goto SBad;
+
+
+  S12:
+      ! Uun digit seen - Collect more ;
+
+    appnd(LUunStr, ToUpper(C));
+    if (not length(InStr)) then goto SBad;
+    C _ lop(InStr);
+    if (IsOctal(C)) then goto S12;
+    if (C = "]")  then goto S13;
+    goto SBad;
+
+
+  S13:
+      ! "]" seen - Look for Alias ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if ((C = "/") or (C = "%")) then goto S16;
+    if (C = """") then goto S14;
+    goto SBad;
+
+
+  S14:
+      ! '"' seen - Gobble up everything until the next occurence ;
+
+    if (not length(InStr)) then goto SBad;
+    appnd(LAlias, ToUpper(C));
+    C _ lop(InStr);
+    if (C = """") then goto S15;
+    goto S14;
+
+
+  S15:
+      ! '"' terminating Alias seen - Look for switches ;
+
+    appnd(LAlias, ToUpper(C));
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (C = "/" or C = "%") then goto S16;
+    goto SBad;
+
+
+  S16:
+      ! "/" or "%" seen - Gobble up the rest of the line ;
+
+    appnd(LSwitches, ToUpper(C));
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    goto S16;
+
+
+  SGood:
+      ! Many Happy Returns ;
+
+    if (length(LUserName)) then
+      UserName _ LUserName[1 for 12]
+    else
+      PPN _ cvos(xwd(cvo(LGanStr[1 for 6]), cvo(LUunStr[1 for 6])));
+
+    File     _ LFile[1 for 6];
+    Ext      _ LExt[1 for 3];
+    Alias    _ LAlias;
+    Switches _ LSwitches;
+
+    return(true);
+
+
+  SBad:
+      ! Oops - something smells funny ;
+
+    UserName _ File _ Ext _ PPN _ Alias _ Switches _ null;
+
+    return(false);
+end "F!Decompose";
+!! title Rtn F!Parse ;
+! Parse and Sanctify a file name ;
+
+internal string procedure F!Parse (string StrIn);
+begin "F!Parse"
+  string
+    UserName,
+    FileName,
+    Ext,
+    SPPN,
+    Alias,
+    Switches;
+  integer
+    PPN;
+  define
+    OurPPN = {(call(xwd(-1, 2), "gettab"))};
+
+
+  if (F!Decompose(StrIn, UserName, FileName, Ext, SPPN,
+      Alias, Switches)) then
+  begin
+    string
+      S;
+
+    PPN _ cvo(SPPN);
+    S   _ null;
+
+    if (length(UserName)) then
+      appnd(S, ("(" & UserName & ")"));
+
+    appnd(S, FileName);
+
+    if (length(Ext)) then
+      appnd(S, ("." & Ext));
+
+    if (PPN and PPN neq OurPPN) then
+      appnd(S, xwdstr(PPN));
+
+    return(S);
+  end
+  else
+    return(null);
+end "F!Parse";
+!! title Rtn F!Lookup ;
+! Routine to open a file for input ;
+
+internal boolean procedure F!Lookup( string FileName );
+  begin "lookup"
+    own boolean Flag;
+    own integer array Info[ 0:5 ];
+
+    F!Chan := GetChan;
+    F!Count := 128;
+    F!EOF := 0;
+
+    open( F!Chan, "DSK", BIT(23)+'17, 0,0, F!Count, F!Break, F!EOF );
+    if ( F!EOF ) then
+      begin
+	W!Msg( "? Can't open DSK:" );  T!Bell;
+	return( false );
+      end;
+
+    lookup( F!Chan, FileName, Flag );
+    FileInfo( Info );
+    if ( Flag ) then
+      begin
+	Flag := Info[ 1 ] land '777777;
+	if ( Flag = 0 ) then
+	  W!Msg( "Nonexistent File"  )
+	else if ( Flag = 1 ) then
+	  W!Msg( "Bad FileSpec" )
+	else if ( Flag = 2 ) then
+	  W!Msg( "File is Protected" )
+	else
+	  W!Msg( "Cannot LOOKUP File, error " & cvos( Flag ) );
+	release( F!Chan );
+	return( false );
+      end;
+
+    F!Prot  := Info[2] lsh -27;		! Protection of file ;
+    F!Words := Info[ 5 ];
+    F!Chars := F!Words * 5;
+
+    F!InputCount := 0;		! haven't read anything, yet ;
+
+    if ( F!Words > MAXFILESIZE ) then
+      begin
+	W!Msg( "? File is too large to edit with "&DED!Alias );
+	T!Bell;
+	release( F!Chan );
+	return( false );
+      end;
+
+    return( true );
+
+  end "lookup";
+!! title Rtn F!Lkup ;
+! Routine to open a disk-resident tmpcore file for input.
+;
+
+boolean procedure F!Lkup (string FileName);
+begin "F!Lkup"
+  own boolean
+    Flag;
+  own integer array
+    Info [0:5];
+
+  F!Chan  _ GetChan;
+  F!Count _ 128;
+  F!EOF   _ 0;
+
+  open(F!Chan, "DSK", BIT(23)+'17, 0,0, F!Count, F!Break, F!EOF);
+
+  if (F!EOF) then
+  begin
+    print("? Can't open DSK:");
+    T!Bell;
+    return(false);
+  end;
+
+  lookup(F!Chan, FileName, Flag);
+
+  if (Flag) then
+  begin
+    release(F!Chan);
+    return(false);
+  end;
+
+  fileinfo(Info);
+  F!Words _ Info[5];
+  F!Chars _ F!Words * 5;
+
+  return(true);
+end "F!Lkup";
+!! title Rtn F!GetC ;
+! Return the next character input from the file open on F!Chan.
+! Return -1 at when no more characters remain to be read or at EOF.
+! The assumption is made that the lookup routine used in conjunction with
+! this one has set the file character count (F!Chars).
+;
+
+internal integer procedure F!GetC;
+begin "F!GetC"
+  own integer
+    Addr,
+    C;
+
+  if (F!EOF or F!Chars <= 0) then
+    return(-1);
+
+  if (F!InputCount = 0) then
+  begin
+    F!BP _ point(7, F!Buffer[0], -1);
+    arryin(F!Chan, F!Buffer[0], 128);
+    F!InputCount _ 128 * 5;
+  end;
+
+  C _ ildb(F!BP);
+  decr(F!InputCount);
+  decr(F!Chars);
+  return(C);
+end "F!GetC";
+!! title Rtn F!Release ;
+! Routine to release the input file ;
+
+internal simple procedure F!Release;
+  begin "release"
+
+    release( F!Chan );
+
+  end "release";
+!! title Rtn F!Enter ;
+! Open a file for output ;
+
+internal boolean procedure F!Enter( string FileName );
+  begin "enter"
+    boolean Flag;
+
+    F!Chan := GetChan;
+    F!Count := 128;
+    F!EOF := 0;
+    open( F!Chan, "DSK", BIT(23)+'17, 0,0, F!Count, F!Break, F!EOF );
+    if ( F!EOF ) then return( false );
+    enter( F!Chan, FileName, Flag );
+    if ( Flag ) then
+      begin
+	release( F!Chan );
+	return( false );
+      end;
+
+    F!OutputCount := 0;
+    return( true );
+
+  end "enter";
+!! title Rtn F!PutC ;
+! Put a character into the output buffer ;
+
+internal procedure F!PutC( integer C );
+  begin "put c"
+    own integer I;
+
+    if ( F!OutputCount = 0 ) then
+      begin
+	own integer Addr;
+	arrclr( F!Buffer );
+	F!BP := point( 7, F!Buffer[ 0 ], -1 );
+      end;
+
+    idpb( C, F!BP );
+
+    F!OutputCount := F!OutputCount + 1;
+
+    if ( F!OutputCount = 128 * 5 ) then
+      begin
+	own integer Addr;
+	arryout( F!Chan, F!Buffer[ 0 ], 128 );
+	F!OutputCount := 0;
+      end;
+
+  end "put c";
+!! title Rtn F!Close ;
+! Routine to flush output and close the file ;
+
+internal procedure F!Close (string FileName);
+  begin "close"
+    integer FlushCount, Flag;
+
+    FlushCount := ( F!OutputCount + 4 ) div 5;
+    if ( FlushCount > 0 ) then
+      begin
+	integer Addr;
+	arryout( F!Chan, F!Buffer[ 0 ], FlushCount );
+      end;
+
+    rename( F!Chan, FileName, B!Prot, (Flag _ 0) );
+
+    if ( Flag ) then
+      usererr( 0, 0, "Cannot apply protection to file (" & FileName & ")" );
+
+    release( F!Chan );
+
+  end "close";
+!! title Rtn F!Read ;
+! Routine to read a file.
+;
+
+internal boolean procedure F!Read(string FName);
+begin "F!Read"
+  integer
+    SavePoint;
+
+  if (not F!Lookup(FName)) then
+    return(false);
+
+    ! Refuse if there is a problem.
+    ;
+
+  SavePoint _ B!GetP;
+
+    ! Remember our position.
+    ;
+
+  if (F!Chars) then
+  begin
+    integer
+      C;
+
+    while ((C _ F!GetC) >= 0) do
+      B!Insert(C);
+
+    ! delete up to 4 nulls from the end of the buffer ;
+
+    F!Chars _ (B!GetP - SavePoint) min 4;
+
+    while (F!Chars) do
+    begin
+      B!Move(BACKWARDS);
+
+      if (B!GetC) then
+      begin
+        B!Move(FORWARDS);
+        done;
+      end
+      else
+        B!Delete(FORWARDS);
+
+      decr(F!Chars);
+    end;
+  end;
+
+  release(F!Chan);
+
+  if (not C!SPMRegion) then
+    B!SetP(SavePoint);
+
+  return(true);
+end "F!Read";
+!! title Rtn F!Load ;
+! Routine to "load" (i.e. destructive read) a file ;
+
+internal boolean procedure F!Load (string FName; integer P, L, C);
+begin "load a file"
+  if (P < 0) then
+    P _ F!Page;
+
+  if (L < 0) then
+    L _ F!Line;
+
+  if (C < 0) then
+    C _ F!Char;
+
+  if (not F!Lookup(FName)) then
+    return();
+
+  B!Prot _ F!Prot;		! save file protection with buffer ;
+
+  B!Read(F!Chan, F!Words);
+  release(F!Chan);
+  W!NewS;
+
+  if (B!SeqP) then
+  begin
+    W!Msg("Removing sequence numbers");
+    W!MsgF _ true;
+    W!Disp(true);
+    B!DelS;
+    W!MsgF _ false;
+  end
+  else if (B!NulP) then
+  begin
+    if (G!RNulls) then
+    begin
+      W!Msg("Removing Nulls");
+      B!DelN;
+    end
+    else
+      W!Msg("Nulls Exist");
+
+    W!Disp(false);
+  end;
+
+  ! position to (P, L, C) ;
+
+  decr(P);
+
+  while (P > 0) do
+  begin "page"
+    if (B!EndP) then
+      done "page";
+
+    if (B!GetC = FF) then
+      decr(P);
+
+    B!Move(FORWARDS);
+  end "page";
+
+  decr(L);
+
+  while (L > 0) do
+  begin "line"
+    if (B!EndP) then
+      done "line";
+
+    if (B!GetC = LF) then
+      decr(L);
+
+    B!Move(FORWARDS);
+  end "line";
+
+  decr(C);
+
+  while (C > 0) do
+  begin "char"
+    if (B!EndP) then
+      done "char";
+
+    decr(C);
+    B!Move(FORWARDS);
+  end "char";
+
+  B!Lock _ F!Lock;		  ! save the lock ;
+  return(true);
+end "load a file";
+!! title Rtn MakeBackupName ;
+! Routine to map a filename into a backup filename ;
+
+simple string procedure MakeBackupName( string FName );
+  begin "backup name"
+    string BName;
+    boolean DotSeen;
+
+    BName := NULL;
+    DotSeen := false;
+
+    if ( FName = "(" ) then
+      begin
+	while ( FName neq ")" ) do
+	  begin
+	    BName := BName & lop( FName );
+	  end;
+	BName := BName & lop( FName );
+      end;
+
+    while ( FName ) do
+      begin
+	if ( ( not DotSeen ) and Fname = "." ) then
+	  begin
+	    BName := BName & ".BAK";
+	    DotSeen := true;
+	    while ( FName ) do lop( FName );
+	  end
+	else
+	  BName := BName & Lop( FName );
+      end;
+    if ( not DotSeen ) then
+      BName := BName & ".BAK";
+
+    return( BName );
+
+  end "backup name";
+!! title Rtn MakeBackup ;
+! Routine to try to make a backup copy of the current file. ;
+
+simple boolean procedure MakeBackup( string FName );
+  begin "make backup"
+    string BackupFileName;
+    integer BChan, EOF, Flag;
+
+    BackupFileName := MakeBackupName( FName );
+
+    ! delete the backup file, if it exists ;
+
+    open( BChan := getchan, "DSK", BIT(23)+'17, 0,0,0,0,EOF );
+    if ( EOF ) then return( false );
+
+    lookup( BChan, BackupFileName, Flag );
+    if ( Flag = 0 ) then
+      begin
+	rename( BChan, 0, NULL, Flag );
+	release( BChan );
+	if ( Flag ) then
+	  begin
+	    W!Msg( "? Couldn't Delete Backup File" );
+	    return( false );
+	  end;
+      end
+    else if ( Flag and ( RH( Flag ) = 0 ) ) then	! no backup file. ;
+      begin
+      end
+    else
+      begin
+	W!Msg( "? Lookup Error " & cvs( RH(Flag) ) & " for BACKUP file" );
+	release( BChan );
+	return( false );
+      end;
+
+
+    ! Here with old backup file deleted.  Try to rename the file to backup ;
+
+    open( BChan := getchan, "DSK", BIT(23)+'17, 0,0,0,0, EOF );
+    if ( EOF ) then return( false );
+
+    lookup( BChan, FName, Flag );
+    if ( Flag = 0 ) then
+      begin
+	rename( BChan, BackupFileName, '0, Flag );
+	release( BChan );
+	if ( Flag ) then
+	  begin
+	    if ( RH( Flag ) = 2 ) then
+	      W!Msg( "? Protection Failure creating backup file" )
+	    else
+	      W!Msg( "? Rename Error " & cvos( RH(Flag) ) &
+		     " creating Backup file" );
+	    T!Bell;
+	    return( false );
+	  end
+	else
+	  return( true );		! all is o.k. ;
+      end
+    else if ( RH( Flag ) = 0 ) then	! can't find file, must be new ;
+      begin
+	release( BChan );
+	return( true );
+      end
+    else
+      begin
+	W!Msg( "? Rename Error " & cvs( RH(Flag) ) );
+	release( BChan );
+	return( false );
+      end;
+
+    return( false );  
+
+  end "make backup";
+!! title Rtn F!Writ ;
+! Routine to write the current file out to DSK ;
+
+internal boolean procedure F!Writ (string FName);
+begin "F!Writ"
+  if (FName = null) then
+    FName _ B!File;
+
+  if (not MakeBackup(FName)) then
+    return(false);
+
+  if (not F!Enter(FName)) then
+    return(false);
+
+  B!Write(F!Chan);
+  F!Close(FName);
+
+  W!FixS;
+  return(true);
+end "F!Writ";
+!! title Rtn F!Scan;
+! Given a string, break it down into a filename, alias, and switches.
+! This routine sets F!Name, F!Alias, F!Lock, F!Page, F!Line, etc.
+;
+
+internal integer procedure F!Scan(string CmdLine);
+begin "F!Scan"
+  string
+    S, UserName, FileName, Ext, SPPN, Switches;
+  integer
+    C, BC, PPN, Error;
+  define
+    OurPPN         = {(call(xwd(-1, 2), "gettab"))},
+    F.OK           = 0,
+    F.BAD.SWITCH   = 1,
+    F.BAD.FILESPEC = 2;
+
+
+  set(G!RNulls);
+
+    ! We remove nulls from the text file by default.
+    ;
+
+  clear(F!RPGFlag);
+
+  F!Lock _ null;
+  F!Page _
+  F!Line _
+  F!Char _ 0;
+
+  if (length(CmdLine) = 0) then
+    return(F.OK);
+
+    ! All is Ok.
+    ;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  ! disect the command line ;
+
+  if (not F!Decompose(CmdLine, UserName, Filename, Ext, SPPN,
+      F!Alias, Switches)) then
+    return(F.BAD.FILESPEC);
+
+  F!Name _ null;
+  PPN    _ cvo(SPPN);
+
+  if (length(UserName)) then
+    appnd(F!Name, ("(" & UserName & ")"));
+
+  appnd(F!Name, FileName);
+
+  if (length(Ext)) then
+    appnd(F!Name, ("." & Ext));
+
+  if (PPN and PPN neq OurPPN) then
+    appnd(F!Name, xwdstr(PPN));
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  C _ lop(Switches);
+
+  F!Search _ null;
+
+    ! We are not searching for anything yet.
+    ;
+
+  forever do
+  begin "get switch"
+    if (not (C = "/" or C = "%")) then done "get switch";
+
+    if (Switches <= " ") then done "get switch";
+    S _ NULL;
+    while (length(Switches)) do
+    begin "switch"
+      if not (C!Tab[ Switches ] land IsAlpha) then done "switch";
+      S _ S & lop(Switches);
+    end "switch";
+
+    if (kequ (S, "Nulls"[1 to length(S)])) then
+      clear(G!RNulls)
+    else if (kequ(S, "READ"[1 to length(S)])) then
+      F!Lock _ -1
+    else if (kequ(S, "RPG"[1 to length(S)])) then
+      F!RPGFlag _ true
+    else if (kequ(S, "P")) then
+    begin
+      F!Page _ intscan(Switches, BC);
+    end
+    else if (kequ(S, "L")) then
+      F!Line _ intscan(Switches, BC)
+    else if (kequ(S, "C")) then
+      F!Char _ intscan(Switches, BC)
+    else if (kequ(S, "S")) then
+    begin
+      integer
+        C,
+        Delim;
+
+      Delim    _ lop(Switches);
+
+      while (length(Switches) and ((C _ lop(Switches)) neq Delim)) do
+      begin
+        appnd(F!Search, C);
+
+        if (C = CR) then
+          appnd(F!Search, LF);
+      end;
+    end
+    else if (length(S)) then
+      return(F.BAD.SWITCH);
+
+    C _ lop(Switches);
+  end "get switch";
+
+  return(F.OK);
+end "F!Scan";
+!! title Rtn ReadTMPFile ;
+! Read a tempcore or .tmp file and return the contents.
+! Return NULL if none.
+;
+
+string procedure ReadTMPFile;
+begin "tmp"
+  string L, TmpFile;
+  integer C, Flag;
+
+  L := tmpin( "EDT", Flag );
+
+  if ( not Flag ) then
+  begin
+    integer array T [0:1];
+
+    T[0] := cvsix( "EDT" );
+    T[1] := 0;
+    calli( xwd(2, location(T[0])), '44 );	! delete EDT tmpcore file ;
+  end;
+
+  L := tmpin( "EDS", Flag );
+
+  if ( Flag ) then
+    begin "disk"
+      TmpFile := cvs( 1000 + call(0,"PJOB"))[2 for 3] & "EDS.TMP";
+      if ( not F!Lkup( TmpFile )) then return( NULL );
+
+      L := NULL;
+      while ( ( C := F!GetC ) >= " " ) do L := L & C;
+      F!Release;
+    end "disk";
+
+  ! o.k. - save the original contents and get rid of the verb ;
+
+  TmpCoreString := L;
+  while ( C!Tab[ L ] land IsAlpha ) do lop( L );
+  while ( C!Tab[ L ] land IsWhite ) do lop( L );
+  while ( L[ inf for 1 ] <= " " ) do L := L[ 1 for inf-1 ];
+
+  return( L );
+
+end "tmp";
+!! title Rtn RescanCommandLine ;
+! Rescan the command line.  Return the line, or NULL if none
+! available.
+;
+
+string procedure RescanCommandLine;
+  begin "rescan"
+    string L, S;
+    integer Flag;
+
+    start!code
+      setob 1,Flag;
+      ttcall '6,1;		! getlch 1 ;
+      tlnn 1,'100000;		! lc.ecs - command lines exists ;
+	setzm Flag;
+    end;
+
+    if ( not Flag ) then return( NULL );
+
+    start!code
+      ttcall '10,;		! rescan ;
+    end;
+
+    L := inchwl;
+
+    ! make sure that we were invoked correctly ;
+
+    S := NULL;
+    TmpCoreString := L;
+    while ( C!Tab[ L ] land IsAlpha ) do S := S & lop( L );
+    while ( C!Tab[ L ] land IsWhite ) do lop( L );
+
+    if ( not kequ( S, DED!Alias[1 for length( S )] )) then
+      TmpCoreString := L := NULL;
+
+    return( L );
+
+  end "rescan";
+!! title Rtn Elsewhere ;
+! Give the luser somehwere else to go ... ;
+
+simple procedure Elsewhere;
+begin
+  define
+    exit = {calli(1, '12)};
+
+  own integer array
+    RnB[0:5];
+
+    ! <<  This should also delete all instantiations of the offending
+	  software ;
+
+  calli(cvsix("*PEAK*"), -'63);
+
+  RnB[0] _ cvsix("DSK");
+  RnB[1] _ cvsix("TECO");
+  RnB[2] _ 0;
+  RnB[3] _ 0;
+  RnB[4] _ xwd(1, 4);
+  RnB[5] _ 0;
+
+  calli(location(RnB[0]), '35);
+  exit;
+end;
+!! title Rtn SanctifyUser ;
+! Verify the user's rights of passage ;
+
+simple procedure SanctifyUser;
+begin
+  integer
+    Fpn,
+    Aun,
+    OurName,
+    PrivWrd;
+
+  define
+    Coees.Gan   = {'7676},
+    Unicon.Gan  = {'35525},
+    Daddy       = {xwd(3, '35556)},
+    Ded         = {xwd(3, '717040)},
+    exit        = {calli(1, '12)},
+    FtSys       = {xwd(1, '315372)},
+    Gan.3       = {3},
+    TymshareBit = {bit(21)},
+    Sys         = {xwd(1, 4)};
+
+  define
+    Bptym       = {xwd('40545, '67440)}         ! British Petroleum
+                                                ! customer for version
+                                                ! 1.2
+                                                ;,
+    Ucslm       = {xwd('11020, '312331)}        ! British Petroleum
+                                                ! customer for version
+                                                ! 1.2
+                                                ;,
+    Phillips    = {xwd('43546, '303644)}        ! Phillips Petroleum
+                                                ! customer for version 1.2
+                                                ;;
+
+
+  PrivWrd _ call(xwd(-1, 6), "gettab");
+  Aun     _ call(xwd(-1, -'23), "gettab");
+
+  if (Aun = Daddy) then
+    return;
+
+  if (not (PrivWrd land TymShareBit) and lh(Aun) neq Coees.Gan and
+      lh(Aun) neq Unicon.Gan and Aun neq Bptym and Aun neq Ucslm and
+      Aun neq Phillips) then
+    exit;
+
+  Fpn _ call(xwd(-1, -'25), "gettab");
+
+  if (Fpn neq Sys and Fpn neq FtSys and Fpn neq Ded
+      and lh(Aun) neq Gan.3) then
+    Elsewhere;
+
+  OurName _ call(xwd(-1, 3), "gettab");
+
+  if (Ourname neq cvsix(DED!Alias)) then
+    Elsewhere;
+end;
+!! title Rtn F!RPG ;
+! Find out what file is meant to be editted.
+;
+
+internal procedure F!RPG;
+begin "rpg interface"
+  string
+    L;
+  integer
+    Flag, Error;
+  define
+    exit           = {calli(1, '12)},
+    F.OK           = 0,
+    F.BAD.SWITCH   = 1,
+    F.BAD.FILESPEC = 2;
+
+
+  if (RPGSW) then
+    L  _ ReadTMPFile
+  else
+  begin
+    L _ RescanCommandLine;
+
+    if (not length(L)) then
+      L _ ReadTMPFile;
+  end;
+
+  SanctifyUser;
+
+  if (length(L) = 0) then
+    return;
+
+  if ((Error _ F!Scan(L)) neq F.OK) then
+  begin
+    T!Bell;
+
+    if (Error = F.BAD.FILESPEC) then
+      print(crlf, L, " [Bad FileSpec]", crlf)
+    else
+      print(crlf, "? Bad command line: ", L, crlf);
+
+    exit;
+  end;
+
+  if (length(TmpCoreString)) then
+    tmpout("EDS", TmpCoreString, Flag);
+
+      ! <<  This should handle the error (no-room-in-core) that could
+	    occur. ;
+
+end "rpg interface";
+!! title Rtn F!Init ;
+! Initialize the file I/O module.  (This assumes that F!RPG has
+! already been invoked, and that F!Name & Co. are set up.
+;
+
+internal procedure F!Init;
+begin "init"
+  if ( length( F!Name )) then
+  begin
+    B!Make( F!Name, F!Alias );
+    if ( F!Load( F!Name, F!Page, F!Line, F!Char ) ) then
+      B!Lock := F!Lock
+    else
+      W!Msg( "New File" );
+  end
+  else
+    B!Make( "NONAME.TXT", NULL );
+
+  B!ModP := false;
+end "init";
+end "DED - File I/O";
+  1i$0ý
