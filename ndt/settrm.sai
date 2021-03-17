@@ -1,0 +1,870 @@
+require 800305 version;
+
+require 128 pnames;
+require 128 new!items;
+
+require "{}()" delimiters;
+define
+  ! = {comment},
+  forever = {while true},
+  never = {while false},
+  nothing = {},
+  upto = {step 1 until},
+  downto = {step -1 until},
+  repeat (foo) = {_(foo)-1 step -1 until 0},
+  assert (be) = {if be then else usererr(0,1,cvps(be)&" failed")},
+  ctrl (c) = {(((c) land '37)&null)},
+  nl = {'15&'12},
+  bit (i) = {(1 lsh (35-(i)))};
+define
+  auxcli (port,e,funct) = {auxclr(port,memory[e],funct)};
+define
+  lh (i) = {((I) lsh -18)},
+  hl (i) = {((I) lsh 18)},
+  rh (i) = {((I) land '777777)},
+  hr (i) = {((I) land '777777)},
+  xwd (i,j) = {(((I) lsh 18) lor ((J) land '777777))};
+external boolean !SKIP!;
+external boolean RPGSW;
+
+!	Parse ("filespec",@Name,@Ext,@PPN)
+
+	Scans the filespec and breaks it into Name, Ext and PPN.
+	If a username is given, it is converted to a PPN.
+;
+
+procedure Parse (
+	string 	File;
+	reference integer 
+		Name,
+		Ext,
+		PPN );
+begin "Parse"
+    Name _ cvfil (File, Ext, PPN);
+    if PPN = 0 then PPN _ calli(0,'24);	! GETPPN;
+    if lh(PPN) = 0 then begin "UserName"
+	integer array LKB[0:3];		! block for extended lookup;
+	integer Chan,Eof;
+	LKB[0] _ arrinfo(LKB,2);	! size of LKB;
+	LKB[1] _ calli('16,'41);	! MFD PPN;
+	LKB[2] _ PPN;			! addr of SIXBIT user name;
+	LKB[3] _ cvsix("UFD");		! extension;
+	open (Chan_getchan, "DSK", '17,0,0, 0,0,Eof);
+	if Eof then return;		! very, very ill;
+	chnior (Chan, LKB[0], 4);	! lookup UFD to get PPN;
+	release (Chan);			! don't need the channel;
+	PPN _ LKB[2];			! save real PPN for user;
+    end "UserName";
+end "Parse";
+
+
+!	ppn _ CVPPN("username")
+
+Convert a directory name to a PPN
+;
+
+integer procedure cvppn (string UNS);
+begin "cvppn"
+	integer array LKB[0:3];		! block for extended lookup;
+	integer array UN[0:3];		! block for user name;
+	integer Chan,Eof;
+	LKB[0] _ arrinfo(LKB,2);	! size of LKB;
+	LKB[1] _ calli('16,'41);	! MFD PPN;
+	LKB[2] _ location(UN[0]);	! addr of SIXBIT user name;
+	LKB[3] _ cvsix("UFD");		! extension;
+	UN[0] _ cvsix(UNS[1 for 6]);	! save user name in sixbit;
+	UN[1] _ cvsix(UNS[7 for 6]);
+	open (Chan_getchan, "DSK", '17,0,0, 0,0,Eof);
+	if Eof then return(0);		! very, very ill;
+	chnior (Chan, LKB[0], 4);	! lookup UFD to get PPN;
+	release (Chan);			! don't need the channel;
+	return (LKB[2]);		! return the PPN;
+end "cvppn";
+
+!	SetAlp sets alternate logout program name in monitor
+
+	SetAlp (File)
+		or
+	SetAlp
+;
+
+simple boolean procedure SetALP (string File(null));
+begin "SetALP"
+    own integer array Foo[0:2];
+    if length(File)
+	then Parse (File, Foo[2], Foo[0], Foo[1])
+	else begin
+	    Foo[2] _ calli('777777000003,'41);	! JBTNAM;
+	    Foo[1] _ calli(-'25,'41);		! JBTFPN;
+	end;
+    Foo[0] _ cvsix("DSK");
+    calli (location(Foo[0]),-'127);	! tell monitor what to run;
+    return (!SKIP!);			! fails if one already set;
+end "SetALP";
+
+!	KJobPending
+
+	This is true if a logout is in progress.  This will allow
+	the same program to be both the INIT and ALP program by
+	examining this bit.
+;
+
+simple boolean procedure KjobPending;
+return (calli(hl(-1),'41)land '100);	! return bit in JBTSTS;
+
+
+!	GetTab (Index,Table)
+
+	Does a gettab for index I into table T.
+;
+
+simple integer procedure GetTab (integer Index,Table);
+start!code
+	SETOM !SKIP!;
+	HRL 1,Index;
+	HRR 1,Table;
+	CALLI 1,'41;
+	  SETZM !SKIP!;
+end;	
+
+!	"username" _ User
+
+	Returns the username the job is logged in to as a string
+	without the "()"
+;
+
+simple string procedure user;
+return(cv6str(gettab(-1,-'22))&cv6str(gettab(-1,-'21)));
+
+!	"list of jobs" _ DetachedJobList
+
+Returns a list of all jobs logged in and deatched.  The PNAMEs of the
+items returned in the list are of the form #:program-name.  The props
+of the item is the frame number, and the datum of the item is the
+program name.  If the program is running, its run state is shown in
+parenthesis after the program name.  Some examples are:
+	{{1:PJ(TI), 2:CHKPNT(TI), 3:FOOBAR}}
+;
+
+
+simple string procedure QUEUE(integer J);
+begin "Q"
+    own integer STS,ST,I;
+    STS _ gettab(J,0);
+    if STS geq 0 then return("^C");
+    ST_STS lsh -21 land '37;
+    I _ gettab(ST/3,'25) lsh (12*(ST mod 3)) land (-1 lsh 24);
+    return(cv6str(I));
+end "Q";
+
+
+list procedure DetachedJobList;
+begin
+    integer JobN,J,MyAun;
+    list S;
+    S _ phi;
+    MyAUN _ gettab(-1,-'23);
+    JobN _ gettab('15,'11) -1;
+    if not !SKIP! then print("?Can't gettab JOBN, assuming ",JobN_1024,nl);
+    for J _ JobN step -1 until 1 do
+	if gettab(J,-'23)=MyAun			! check AUN;
+	    and gettab(J,0) land bit(15)	! check JLOG;
+	    and gettab(J,6) land bit(1) =0	! check NOATT;
+	    and gettab(J,-54) lsh -24 =0	! check for parent;
+	    and gettab(J,-'27) lsh -18 =0	! check LDB;
+	    then begin
+		string Name;
+		string itemvar I;
+		Name _ cv6str(gettab(J,3));	! get NAM;
+		if gettab(J,0) < 0 then 	! get STS;
+		    Name _ Name & "(" & Queue(J) & ")";
+		I _ New (name);
+		props (I) _ J;
+		new!pname (I,cvs(J)&":"&name);
+		put I in S before 1;
+	    end;
+    return(S);
+end;
+
+!	Attach (Job, [Bits])
+
+Attach to specified job.  If bits are specified, use them for
+the attach UUO.  The current job is logged out.  If this works, it
+won't return to the user.  If it doesn't work, it is because the
+job trying to be attached to is illegal or not detached or such.
+;
+
+! Bits are
+	1	Do not force attachee into command mode.
+	2	Do not cause EXIT for current job (forced on).
+;
+
+simple procedure Attach(integer J,Bits(0));
+if gettab(J,-'23)=gettab(-1,-'23)		! check AUN;
+    and gettab(J,0) land bit(15)		! check JLOG;
+    and gettab(J,6) land bit(1) =0		! check NOATT;
+    and gettab(J,-54) lsh -24 =0		! check for parent;
+    and gettab(J,-'27) lsh -18 =0		! check LDB;
+    then begin
+	calli(hl(2 lor bits) lor hr(J),-6);	! ATTACH;
+    	calli(bit(17),-'130);			! LOGOFF;
+    end;
+
+define	AttCmd 	= 0;		! force command mode on attach;
+define	AttUser	= 1;		! do not force command mode on attach;
+define	AttHalt	= 0;		! leave program halted (if it was);
+define	AttCont	= 2;		! continue running program on attach;
+
+!	Setlch (Port,Value,BitNo)
+
+	Changes the specified bit in the SETLCH word.  Other
+	bits remain unchanged.
+;
+
+simple procedure SetLch (integer Port,Value,BitNo);
+begin "SetLch"
+    own integer T,PTR;
+    PTR _ point(1,T,BitNo);
+    start!code
+    	define GETLCH = '051300000000;
+	define SETLCH = '051340000000;
+    	MOVE 1,port;
+    	MOVEM 1,T;
+    	GETLCH T;
+    	MOVE 1,value;
+    	DPB 1,PTR;
+    	SETLCH T;
+    end;
+end "SetLch";
+
+
+!	Functions for user to get information about terminal
+;
+
+simple integer procedure Node;
+begin "node"
+    integer I; 
+    I _ gettab(-1,-'24);
+    return(
+	((I lsh -10)land '7700) lor
+	((I lsh -8)land '77) );
+end "node";
+
+define	Port 		= {(gettab(-1,-'24) land '177)},
+	TIC 		= {((gettab(-1,-'24) lsh -24)land '17)},
+	TIC!AUX 	= {0}, 
+	TIC!A 		= {1}, 
+	TIC!C 		= {2}, 
+	TIC!E 		= {3},
+  	TIC!G 		= {4}, 
+	TIC!B 		= {5}, 
+	TIC!F 		= {6}, 
+	TIC!J 		= {7},
+	TIC!CR 		= {'11}, 
+	TIC!D 		= {'12}, 
+	TIC!RJE 	= {'13},
+  	TIC!2780 	= {'13}, 
+	TIC!1200 	= {'14},
+	States 		= {gettab('17,'11)},
+	STSHUT 		= {'400000}, 
+	SHUT 		= {'400000},
+  	STSUPR 		= {'200000}, 
+	SUPER 		= {'200000}, 
+	SUPER!SHUT 	= {'200000},
+  	RESTRICTED 	= {'100000},
+  	STRLB 		= {'100000}; 
+
+simple string procedure State!Name;
+case States lsh -15 land 7 of begin "state!name"
+    [0] return("answered");
+    [1] return("restricted");
+    [2][3][6][7] return("super-shut");
+    [4] return("shut");
+    [5] return("restricted + shut");
+    else return(cvos(STATES)) 
+end "state!name";
+
+simple string procedure HardWare;
+begin "HardWare"
+    integer FOO;
+    start!code 
+	setz; 
+	blt; 
+	hrrzm FOO; 
+    end;
+    return(case FOO of (		! if KI resolve by BLT;
+	"KI-10",			! BLT is old style BLT;
+	(if gettab('20,'11) land '70000 ! if KL/KS resolve by APR #;
+	    then "KS-10" 		! KS is ['10000:'70000];
+	    else "KL-10")		! KL is [?:''07777];
+	)); 
+end "HardWare";
+
+simple string procedure SoftWare;
+return (  cvastr(gettab('0,'11))
+	& cvastr(gettab('1,'11))
+	& cvastr(gettab('2,'11))
+	& cvastr(gettab('3,'11))
+	& cvastr(gettab('4,'11)));
+
+
+!	Run (program,[start])
+
+	Run another program (overlay).  Program name may contain
+	user name and program name, no device.
+;
+
+procedure Run (
+	string 	File; 
+	integer Start(0) );
+begin "run"
+    integer array RNB[0:5];
+    Parse (File, RNB[1], RNB[2], RNB[4]);
+    RNB[0] _ cvsix("DSK");
+    RNB[3] _ RNB[5] _ 0;
+    calli ((Start lsh 18) + location(RNB[0]), '35);
+end "run";
+
+
+!	set license stuff (ech)
+
+	SetLic (license)
+	license _ MyLic
+;
+
+simple procedure SetLic (integer Lic);
+if calli(-'25,'41)=calli(-'23,'41) then calli(lic,-'10);
+
+simple integer procedure MyLic;
+return( (gettab(-1,-'20) land '777777000000) lor
+	(gettab(-1,-'20) lsh -18) );
+
+
+!	parity hacking
+;
+
+define 	EVEN!PARITY 	= {auxclv(-1,1,'17)},
+	EVEN 		= {auxclv(-1,1,'17)},
+	PARITY		= {auxclv(-1,1,'17)},
+	NO!PARITY 	= {auxclv(-1,0,'17)};
+
+
+!	terminal speed
+;
+
+define 	
+	SetBaud (rate) 	= {begin
+			  auxclv(-1,rate,'15);
+			  auxclv(-1,rate,'16);
+			  end},
+	In!Baud 	= {Auxclv(-1,-1,'15)},
+	Out!Baud 	= {Auxclv(-1,-1,'16)},
+	BAUD!110 	= {0}, 
+	BAUD!150 	= {1}, 
+	BAUD!300 	= {2}, 
+	BAUD!400 	= {3}, 
+	BAUD!600 	= {4}, 
+	BAUD!1200 	= {5}, 
+	BAUD!300!EBCDIC = {6}, 
+	BAUD!150!EBCDIC = {7},
+	CPS!10 		= {0}, 
+	CPS!15 		= {1}, 
+	CPS!30 		= {2}, 
+	CPS!40 		= {3}, 
+	CPS!60 		= {4}, 
+	CPS!120 	= {5}, 
+	CPS!30!EBCDIC 	= {6}, 
+	CPS!15!EBCDIC 	= {7};
+
+
+!	auto LF, duplex and deffered echo mode
+;
+
+define 	Half 		= {auxclv(-1,1,'20)},
+	Full 		= {auxclv(-1,0,'20)},
+	HDX 		= {HALF},
+	Half!Duplex 	= {HALF},
+	FDX 		= {FULL},
+	Full!Duplex 	= {FULL},
+	Auto!LF 	= {setlch(-1,0,16)},
+	No!Auto!LF 	= {setlch(-1,1,16)},
+	LF 		= {AUTO!LF},
+	No!LF 		= {NO!AUTO!LF},
+	Paper!Tape 	= {NO!AUTO!LF},
+	No!Paper!Tape 	= {AUTO!LF},
+	Tape 		= {NO!AUTO!LF},
+	No!Tape 	= {AUTO!LF},
+	Key 		= {AUTO!LF},
+	DEM		= {auxclv(-1,1,'63)},
+	Def		= {DEM},
+	no!DEM		= {auxclv(-1,0,'63)},
+	no!Def		= {no!DEM};
+
+!	width and free CRLF
+;
+
+define 	Width (x) 	= {auxclv(-1,x,'27)},
+	Line!Width (x) 	= {auxclv(-1,x,'27)},
+	CRLF 		= {setlch(-1,0,10)},
+	No!CRLF 	= {setlch(-1,1,10)};
+
+
+!	scope characteristics
+;
+
+define 	Rev!XON 	= {auxclv(-1,1,'55)},
+	No!Rev!XON 	= {auxclv(-1,0,'55)},
+	Stall 		= {Rev!XON},
+	No!Stall 	= {No!Rev!XON},
+	BackSpace	= {auxclv(-1,1,'57)},
+	No!BackSpace	= {auxclv(-1,0,'57)},
+	BS 		= {BackSpace},
+	No!BS 		= {No!BackSpace},
+	Erase		= {auxclv(-1,1,'62)},
+	No!Erase	= {auxclv(-1,0,'62)};
+
+
+!	VT FF HT parameters
+;
+
+define 	Tab 		= {setlch(-1,1,14)},
+	No!Tab		= {setlch(-1,0,14)},
+	HT 		= {Tab},
+	Tabs 		= {Tab},
+	No!HT 		= {No!Tab},
+	No!Tabs		= {No!Tab},
+	Form		= {setlch(-1,1,17)},
+	No!Form		= {setlch(-1,0,17)},
+	FF 		= {Form},
+	Forms 		= {Form},
+	No!FF 		= {No!Form},
+	No!Forms	= {No!Form};
+	
+
+!	lower case
+;
+
+define 	LC 		= {setlch(-1,1,13)},
+	No!LC 		= {setlch(-1,0,13)},
+	Lower 		= {LC},
+	ASCII 		= {LC},
+	Upper 		= {No!LC},
+	Teletype	= {No!LC};
+	
+
+!	FF-fill and HT-fill
+;
+
+define 	FF!Fill (x) 	= {auxclv(-1,x,'30)},
+	HT!Fill (x)	= {auxclv(-1,x,'31)},
+	Form!Feed!Fill (x) = {FF!Fill(x)},
+	Form!Feed!Filler (x) = {FF!Fill(x)},
+	FF!Filler (x)	= {FF!Fill(x)},
+	Tab!Fill (x)	= {HT!Fill(x)},
+	Tab!Filler (x)	= {HT!Fill(x)},
+	HT!Filler (x)	= {HT!Fill(x)};
+	
+
+!	CR and LF delay
+;
+
+define 	SetA (x) 	= {auxclv(-1,x,'21)},
+	SetB (x) 	= {auxclv(-1,x,'22)},
+	SetC (x) 	= {auxclv(-1,x,'23)},
+	CR!Delay	= {auxclv(-1,1,'14)},
+	LF!Delay	= {auxclv(-1,0,'14)},
+	Delay!CR	= {CR!DELAY},
+	Delay!LF	= {LF!DELAY},
+	A!1 		= {0}, 
+	A!2 		= {1}, 
+	A!4 		= {2}, 
+	A!8 		= {3}, 
+	A!16 		= {4}, 
+	A!32 		= {5}, 
+	A!64 		= {6}, 
+	A!128 		= {7}, 
+	B!0 		= {0}, 
+	B!1 		= {1}, 
+	B!2 		= {2}, 
+	B!3 		= {3}, 
+	B!4 		= {4}, 
+	B!5 		= {5}, 
+	B!6 		= {6}, 
+	B!7 		= {7}, 
+	C!0 		= {0}, 
+	C!1 		= {1}, 
+	C!2 		= {2}, 
+	C!3 		= {3}, 
+	C!4 		= {4}, 
+	C!5 		= {5}, 
+	C!7 		= {6}, 
+	C!10 		= {7}, 
+	C!14 		= {8}, 
+	C!19 		= {9}, 
+	C!26 		= {10}, 
+	C!36 		= {11}, 
+	C!50 		= {12}, 
+	C!69 		= {13}, 
+	C!95 		= {14}, 
+	C!131 		= {15};
+
+
+!	Host mode - PDP/TYMEX
+;
+
+define 	PDP 		= {start!code
+			  hrroi 6;
+			  calli '41;
+			  jfcl;
+			  trz '600;
+			  calli -'11;
+			  end},
+	TYMEX 		= {start!code
+			  hrroi 6;
+			  calli '41;
+			    jfcl;
+			  trz '600;
+			  tro '200;
+			  calli -'11;
+			    jfcl;
+			  end},
+	PDP10 		= {PDP},
+	XEXEC 		= {TYMEX},
+	EXEC 		= {TYMEX},
+	TIME (x) 	= {start!code
+			  hrroi 6;
+			  calli '41;
+			    jfcl;
+			  tlz '76000;
+			  tlo x;
+			  calli -'11;
+			    jfcl;
+			  end},
+	TIME!ZONE (x) 	= {TIME(x)},
+	PST 		= {'20000}, 
+	PDT 		= {PST}, 
+	PACIFIC!TIME 	= {PST}, 
+	MST 		= {'22000}, 
+	MDT 		= {MST}, 
+	MOUNTAIN!TIME 	= {MST}, 
+	CST 		= {'24000}, 
+	CDT 		= {CST}, 
+	CENTRAL!TIME 	= {CST}, 
+	EST 		= {'26000}, 
+	EDT 		= {EST}, 
+	EASTERN!TIME 	= {EST};
+
+
+!	delay!in!ms _ Response!Time
+
+	Return time in mS for round trip message through network
+;
+
+simple integer procedure RESPONSE!TIME; 
+begin "RT"
+    integer Start;
+    calli('40000000,'72);
+    Start _ call(0,"MSTIME");
+    calli('40000000,'72);
+    return(call(0,"MSTIME")-Start);
+end "RT";
+
+!	percent!cpu!load _ Load!Average
+
+	Return the % of CPU saturation over the last minute
+;
+
+simple integer procedure LOAD!AVERAGE; 
+return(100-calli('35000012,'41)*100/calli('27000011,'41));
+
+
+!	miscellaneous
+;
+
+define 	EXIT 		= {call(0,"EXIT")};
+
+
+!	routines to set up TMPCOR file for RPG
+
+	SetProc	("processor!name","filespec")
+	AddProc	("processor!name","filespec")
+	SetRPG 	("filespec")
+	SetDDT	("filespec")
+	SetDef  ("processor!name")
+	AddNon	("processor!name","in!ext","out!ext","switch","next")
+	SetNon	("processor!name","in!ext","out!ext","switch","next")
+	SetMail	("filespec")
+	SetDo	("spec","spec","spec"..."spec")
+	AddDo	("spec","spec","spec"..."spec")
+	RPGini	("file")
+	RPGini	
+;
+
+record!class RPGrec (
+	record!pointer(any!class) Link;
+	integer w1,w2,w3,w4,w5,w6,w7,w8,w9 );
+
+integer array		     RPGhdrs[1:8];
+record!pointer(RPGrec) array RPGrecs[1:8];
+record!pointer(RPGrec) RT!;
+
+!	SetDef	("processor!name")
+
+	Setup default processor to be one named
+;
+
+procedure SetDef (string name);
+begin
+    RPGrecs[5] _ RT! _ new!record(RPGrec);
+    RPGhdrs[5] _ xwd(5,1);
+    RPGrec:w1[rt!] _ cvsix(name);
+end;
+
+!	AddProc	("proc!name","filespec")
+	SetProc	("proc!name","filespec")
+
+	Setup the specified alternate processor
+;
+
+procedure AddProc (string proc,spec);
+begin "ADDPROC"
+    RT! _ new!record(RPGrec);
+    RPGrec:link[rt!] _ RPGrecs[2];
+    RPGrecs[2] _ RT!;
+    RPGhdrs[2] _ xwd(2,7+rh(RPGhdrs[2]));
+    RPGrec:w1[rt!] _ cvsix(proc);
+    RPGrec:w2[rt!] _ cvsix("DSK");
+    Parse (Spec, RPGrec:w3[rt!],RPGrec:w4[rt!],RPGrec:w6[rt!]);
+end "ADDPROC";
+
+define SetProc = {
+    RPGrecs[2] _ null!record;
+    AddProc };
+
+!	SetDo ("spec","spec","spec"..."spec")
+	AddDo ("spec","spec","spec"..."spec")
+
+	Setup the specified search list
+;
+
+procedure AddDo (string A1,A2(null),A3(null),A4(null),A5(null),A6(null),A7(null),A8(null),A9(null),A10(null));
+begin "SETDO"
+ procedure Do (string Spec);
+ if length(Spec) then begin
+   integer doptr,ppn;
+   Spec _ scan(Spec,1,!SKIP!);
+   if equ(Spec,"DEFAULT") or equ(Spec,"GFD") then PPN_0
+   else if equ(Spec,"LOG") then PPN_1
+   else PPN_cvppn(Spec);
+   RT! _ new!record(RPGrec);
+   RPGrec:link[rt!] _ RPGrecs[8];
+   RPGrecs[8] _ RT!;
+   RPGhdrs[8] _ xwd(8,3+rh(RPGhdrs[8]));
+   RPGrec:w1[rt!] _ ppn;
+   RPGrec:w2[rt!] _ cvsix(spec[1 for 6]);
+   RPGrec:w3[rt!] _ cvsix(spec[7 for 6]);
+ end;
+ SetBreak(1,null,null,"K");
+ Do(A10);Do(A9);Do(A8);Do(A7);Do(A6);Do(A5);Do(A4);Do(A3);Do(A2);Do(A1);
+end "SETDO";
+
+define	SetDo = {
+    RPGrecs[8] _ null!record;
+    AddDo };
+
+
+!	SetNon	("proc","switch","lukext","nxtproc","outext")
+	SetNon	("proc","switch","lukext","nxtproc","outext")
+
+Define a nonstandard processor
+;
+
+procedure AddNon (
+	string	name;
+	string	inext(null);
+	string	outext(null);
+	string	switch(null);
+	string	next(null) );
+begin "ADDNON"
+    RT! _ new!record(RPGrec);
+    RPGrec:link[rt!] _ RPGrecs[6];
+    RPGrecs[6] _ RT!;
+    RPGhdrs[6] _ xwd(6,8+rh(RPGhdrs[6]));
+    Parse (name, RPGrec:w1[rt!],RPGrec:w2[rt!],RPGrec:w3[rt!]);
+    RPGrec:w4[rt!] _ cvsix("DSK");
+    if length(switch)=0 then switch_RPGrec:w1[rt!];
+    RPGrec:w5[rt!] _ cvsix(switch);
+    if length(inext)=0 then inext_RPGrec:w1[rt!][1 for 3];
+    RPGrec:w6[rt!] _ cvsix(inext);
+    RPGrec:w7[rt!] _ cvsix(next);
+    RPGrec:w8[rt!] _ cvsix(outext);
+end "ADDNON";
+
+define	SetNon = {
+    RPGrecs[6] _ null!record;
+    AddNon };
+
+!	SetDDT	("filespec")
+
+	Setup the default DDT to be as specified
+;
+
+procedure SetDDT (string Spec);
+begin "SETDDT"
+    RT! _ new!record(RPGrec);
+    RPGrec:link[rt!] _ RPGrecs[3];
+    RPGrecs[3] _ RT!;
+    RPGhdrs[3] _ xwd(3,4);
+    RPGrec:w1[rt!] _ cvsix("DSK");
+    Parse (Spec, RPGrec:w2[rt!],RPGrec:w3[rt!],RPGrec:w4[rt!]);
+end "SETDDT";
+
+!	SetRPG	("filespec")
+
+	Setup the default RPG to be as specified
+;
+
+procedure SetRPG (string Spec);
+begin "SETRPG"
+    RT! _ new!record(RPGrec);
+    RPGrec:link[rt!] _ RPGrecs[1];
+    RPGrecs[1] _ RT!;
+    RPGhdrs[1] _ xwd(1,4);
+    RPGrec:w1[rt!] _ cvsix("DSK");
+    Parse (Spec, RPGrec:w2[rt!],RPGrec:w3[rt!],RPGrec:w4[rt!]);
+end "SETRPG";
+
+!	SetMail	("filespec")
+
+	Set the mailbox to the specified file.  The default is
+	to setup mailbox (log-dir)MAIL.BOX
+;
+
+procedure SetMail (string Spec("MAIL.BOX"));
+begin "SETMAIL"
+    RT! _ new!record(RPGrec);
+    RPGrec:link[rt!] _ RPGrecs[7];
+    RPGrecs[7] _ RT!;
+    RPGhdrs[7] _ xwd(7,6+rh(RPGhdrs[7]));
+    RPGrec:w1[rt!] _ 5;
+    Parse (Spec, RPGrec:w3[rt!],RPGrec:w4[rt!],RPGrec:w2[rt!]);
+end "SETMAIL";
+
+
+!	CTest
+
+	Create the RPG temp file
+;
+
+procedure RPGini (string file(null));
+begin "CTEST"
+   integer array desc[0:1];
+   integer array TmpBuf[0:511];
+   integer I,BufPtr,WC;
+   if lenile)=0 then begin "fromCore"
+    BufPtr _ 0;
+    for I _ arrinfo(RPGrecs,1) upto arrinfo(RPGrecs,2) do 
+      if RPGhdrs[i] then begin
+	RT! _ RPGrecs[i];
+	WC _ case i of (0,4,7,4,0,1,8,6,3);
+	TmpBuf[BufPtr]_RPGhdrs[i]; BufPtr_BufPtr+1;
+	while RT! do begin
+	    arrblt ( TmpBuf[BufPtr], RPGrec:w1[rt!], WC );
+	    BufPtr _ BufPtr + WC;
+	    RT! _ RPGrec:link[rt!];
+	end;
+      end;
+   end "fromCore"
+   else begin "fromDisk"
+	integer Ch,Eof;
+	open (Ch_getchan,"DSK",'14,2,0, 0,0,Eof);
+	lookup (ch,file,eof);
+     	if eof then usererr(eof,2,"?file "&file&" not found","C");
+	arryin (Ch,TmpBuf[0],arrinfo(TmpBuf,0));
+	if not eof then usererr(0,0,"?file "&file&" too big","C");
+	BufPtr _ rh(EOF);
+	release (Ch);
+   end "fromDisk";
+   desc[0]_cvsix("RPG");
+   desc[1]_(-bufptr lsh 18)+location(tmpbuf[0])-1;
+   call((3 lsh 18)+location(desc[0]),"tmpcor");
+   if not !SKIP! then begin "dsk"
+      integer Ch,Eof;
+      string  F;
+      ch _ getchan;
+      open(ch,"DSK",'14,0,1, 0,0,EoF);
+      F _ ("000"&cvs(call(0,"PJOB")))[inf-2 to inf]&"RPG.TMP";
+      enter(ch,F,EoF);
+      if EoF then usererr(Eof,2,"can't enter "&F,"C");
+      arryout(Ch,tmpbuf[0],bufptr);
+      release(Ch);
+   end "dsk";
+end "CTEST";
+
+!	special routines for "normal" terminal characteristics;
+
+simple procedure istrou (string S);
+while length(S) do ioneou (lop (S));
+
+simple procedure TabSet ( 
+	string 	!Clr,!Set;
+	integer	!Wid(73) );
+begin
+    integer I;
+    tabs;
+    ioneou ('15);
+    istrou (!Clr);
+    for I _ 2 step 1 until !Wid do begin
+	ioneou ('40);
+	if I mod 8 = 1 then istrou (!Set);
+    end;
+    ioneou ('15);
+end;
+    
+define	Scope = { begin
+	forms;
+	backspace;
+	erase;
+	width(80);
+	rev!xon;
+end };
+
+define	Tym!444 = { begin	! HP-2621A;
+	scope;
+	tabset ('33&"3",'33&"1");
+end };
+
+define	Tym!325 = { begin	! diablo 1620;
+	scope;
+	tabset ('33&"2",'33&"1");
+end };
+
+
+procedure CrashCheck (string Prefix,Systems);
+begin
+    integer Brk,Chan,Eof;
+    integer Sys,Sys1,Sys2;
+    integer ScnBrk;
+    string FN;
+    setbreak(ScnBrk_getbreak,",-:"," ","SINK");
+    open(Chan_getchan,"DSK",1,1,0, 256,Brk,Eof);
+    if Eof then usererr(Eof,2,"can't init DSK: ");
+    while length(Systems) do begin
+	Sys1 _ cvd(scan(Systems,ScnBrk,Brk));
+	case Brk of begin
+	  [":"]
+	  ["-"] Sys2 _ cvd(scan(Systems,ScnBrk,Brk));
+	  else Sys2 _ Sys1
+	end;
+	for Sys _ Sys1 upto Sys2 do begin
+	    FN _ Prefix & "." & cvs(Sys);
+	    lookup(Chan,FN,Eof);
+	    if Eof then print("[",FN," not found]",nl);
+	    while not eof do print(input(Chan,0));
+	    close(Chan);
+	end;
+    end;
+    release(Chan);
+    relBreak(ScnBrk);
+end;
+ U))F3
