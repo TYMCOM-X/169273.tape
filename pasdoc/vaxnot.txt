@@ -1,0 +1,415 @@
+VAXNOT.TXT, last modified 10/24/83, zw
+
+I. Register allocation
+Standard VAX register designations will be maintained:
+
+   R15 = PC    Program counter
+   R14 = SP    Stack pointer
+   R13 = FP    Frame pointer
+   R12 = AP    Argument base
+   R11...R2    Expression and index registers
+   R1....R0    Temps and function return values
+
+Registers R0-R5 are hard-wired for string instructions.  In  order  to
+reduce  conflicts in the use of these registers, "with" base registers
+are  allocated  from  R11  downward  (R12  or  AP  for   parameterless
+routines),  and expression and index registers are allocated below the
+with regs.  Register and stack utilization  in  expression  evaluation
+are addressed in section X.
+
+II. Procedure calls and parameters
+Quick  blocks will not be implemented.  All Pascal routines are called
+via
+
+   CALLS   #n,address
+
+where "n" is the number of words  in  the  stack  parameter  list  and
+associated  temporaries.  This interface is compatible with DEC Pascal
+and in many cases the VAX FORTRAN compiler and system runtime library.
+Parameters  are  pushed onto the stack in reverse order and are passed
+by value or address according to the following criteria:
+
+   (1) integers, reals  (single  or  double  precision),  user-defined
+   scalars,  booleans,  chars,  pointers,  and  procedure  or function
+   variables may be passed by value or by reference.
+   (2) files,  records,  arrays,  strings  and  sets  are  passed   by
+   reference only.
+   (3) formal  procedure and function parameters are represented by an
+   entry point address and the stack frame pointer  of  the  routine's
+   lexical parent (or zero for level 1 routines).
+
+Since double precision reals and procedure and function parameters are
+allocated two longwords  in  the  argument  list,  "n"  in  the  CALLS
+instruction  represents  the  total  number  of longwords in the stack
+parameter list and may thus  be  greater  than  the  actual  parameter
+count.
+
+Generally,  functions  return  values in R0 or R0/R1.  Functions which
+return sets, records, arrays or strings must be passed  as  the  first
+parameter  the  address  of  a  block  for  the  return value.  Within
+functions which return a value in R0/R1 the return value is stored  in
+a  "slot"  at  -16(FP)  or -20(FP) and -16(FP), depending on its size.
+
+This value is moved to registers R0/R1 prior to the function return.
+
+All registers R2-R11 modified by a routine must be  specified  in  its
+register save mask.
+
+III. Environment
+Routines  at  lexical  levels greater than 1 are passed in R0 the base
+address of their parent's stack frame, known as the static link.  This
+is  explicitly  pushed  onto  the  called routine's stack after entry.
+Generally, should a routine P at level n call a routine Q at  level  m
+(1 <= m <= n+1) then
+
+   A. if m = 1 no parent frame pointer is required.
+
+   B. if  m = n+1  then P is the parent of Q and P's own frame pointer
+   must be passed:
+
+        MOVL  FP,R0
+
+   C. otherwise the static chain of  parent  frame  pointers  must  be
+   scanned for the mth entry:
+
+        MOVL  -4(FP),R0      ;back one level
+        MOVL  -(R0),R0       ;repeated n-m times
+
+Storage for locals and temporaries is allocated with
+
+   SUBL2 #stack-size,SP.
+
+Common  entry/return  code  (a la PNTRY./PRTRN.) will not be used.  To
+facilitate debugging the address of a "trace" block is pushed onto the
+stack, following the static link in R0, if appropriate:
+
+TRACE: .WORD    displacement to last stmnt block in procedure
+                or 0 if trace but not debug.
+       .WORD    string length
+       .ASCII   'procedure name'
+PROC:  .WORD    ^M<register-save-mask>
+       PUSHL    R0                ;save static link (if level > 1)
+       PUSHAL   TRACE             ;trace link word
+       SUBL2    #stack-size,SP    ;allocate locals
+
+Thus the stack frame appears as:
+
+           +-----------------------+
+           |                       | <-- SP
+           |      local temps      |               ^
+           |                       |              /|\
+           +-----------------------+               |  Stack grows down
+           |                       |
+           |      local vars       |
+           |                       |
+           +-----------------------+
+   -20(FP) | quadword funct. slot  |   if value returned in R0/R1
+           +-----------------------+
+   -16(FP) | longword funct. slot  |   if value returned in R0
+           +-----------------------+
+   -12(FP) |      AP (current)     |
+           +-----------------------+
+    -8(FP) |      trace link       | <-- AP
+           +-----------------------+
+    -4(FP) |      static link      |   unused if level = 1
+           +-----------------------+
+           |           0           | <-- FP
+           +-----------------------+
+     4(FP) |  PSW & REG save mask  |
+           +-----------------------+
+     8(AP) |          AP           |
+           +-----------------------+
+    12(FP) |          FP           |
+           +-----------------------+
+    16(FP) |          PC           |            higher addreses
+           +-----------------------+                   |
+           |                       |                   |
+           |    saved registers    |                  _|_
+           |                       |                  \|/
+           +-----------------------+                   v
+           |       ARG count       |
+           +-----------------------+
+           |     ARG longwords     |
+           +-----------------------+
+           |                       |
+
+IV. Debugging aids
+In  addition to the runtime trace facility, modules compiled under the
+DEBUG  option  will  include  limited  statement,   page,   and   file
+information  similar  to  that  emitted  by  the  10  compiler for the
+debugger.  A statement block  is  emitted  for  the  first  executable
+statement on each line:
+
+    JSB    STMT.
+    .WORD  displacement to previous stmt or to page link block
+    .BYTE  >= 0 = stmt kind code
+             -1 = page block
+             -2 = file block
+             -3 = page link block
+    .WORD  line number within page
+
+Note  that  if  multiple  procedures  appear on a given page, the word
+displacement to the previous statement block may be inadequate.
+
+A page link block is emitted before the first statement block on  each
+page.  The  page  link  block  serves  only  to eliminate the need for
+longword displacements in statement blocks.
+
+Page link block format:
+
+    L1:  BRB      L2
+         .BYTE    -3
+         .LONG    (displacement from L1 to page block)
+    L2:
+
+Page block format:
+
+    .WORD  displacement to previous page or to file block
+    .BYTE  -1 = page block
+    .LONG  displacement to last stmt block in page
+    .WORD  page number
+    .WORD  subtitle length
+    .ASCII 'section name'
+
+File block format:
+
+    .WORD  displacement to previous file block or zero
+    .BYTE  -2 = file block
+    .WORD  displacement to last page block in file
+    .WORD  file number
+    .WORD  filename length
+    .ASCII 'file name'
+
+The  predefined  external  procedure  SPY  is  called  to  provide   a
+per-statement  traceback.  SPY  is automatically called when a runtime
+error is signaled, provided that at least one module  of  the  program
+was  compiled  with  the  DEBUG  option  (the  DEBUG option causes the
+statement traceback  blocks  to  be  emitted).  The  overhead  of  the
+statement  traceback  is,  on the average, three instructions and some
+static storage:
+
+   MAXDEPTH: .LONG        ;size of table - 1
+   INDEX:    .LONG        ;offset of last entry
+   TABLEADDR:.LONG        ;address of table
+
+   STMT.:    DECL   INDEX ;keep as circular array
+
+             BGEQ   STMT2
+             MOVL   MAXDEPTH,INDEX
+   STMT2:    ADDL3  INDEX,TABLEADDR,R1
+             MOVL   (SP),(R1)
+             ADDL2  #5,(SP) ;skip over stmt block
+             RSB
+
+V. Storage allocation
+Bit fields are not used.  All allocation is in an integral  number  of
+bytes, words, longwords, or quadwords (i. e., a data element requiring
+3 bytes is allocated 4).  With the exception of quadwords  these  data
+alignments  are  enforced for heap as well as stack and local storage;
+quadword alignment is not maintained since the stack is only  longword
+aligned.  Blocks  allocated  by  NEW  should  be an integral number of
+longwords and longword aligned.  The  specified  alignments  apply  to
+unpacked  structures  only;  fields  of packed records are merely byte
+aligned.
+
+  Data type        alignment      size unpacked  size packed
+  boolean          byte           byte           byte
+  integer (1)      long           long           byte/word/long
+  real (2)         long           long/quad      long/quad
+  char             byte           byte           byte
+  pointer          long           long           long
+  file variable    long           long           long
+  enumerated type  byte/word/long byte/word/long byte/word/long
+  set              byte           n bytes        n bytes
+  varying string (3) word         (upb+2) bytes  (upd+2) bytes
+  fixed string     byte           upb bytes      upb bytes
+  proc/func (4)    long           quad           quad
+  record (5)       depends upon the fields
+  array (5)        depends upon the type of the array
+
+Notes:
+
+(1) Integer subranges are minimally represented as  fields  of  packed
+records  or  elements  of  packed  arrays (byte:  -128..127 or 0..255;
+word:  -32768..32767 or 0..65535; otherwise longword).
+
+(2) Single precision floating point data  is  stored  in  a  longword,
+double precision in a quadword.
+
+(3) String lengths are stored in a word.
+
+(4) Procedure and function variables are represented by two longwords:
+the first is the routine's entry address and  the  second  its  parent
+stack frame pointer or zero if level 1.
+
+(5) The  alignment  of a record or array is identical to the strictest
+alignment requirement of any field of the record or any element of the
+array.  Note,  however,  that  the  packing attribute of the record or
+
+array effects the alignment requirements of the fields or elements.
+
+VI. Heap allocation
+NEW and DISPOSE are merely runtime wrappers for  the  system  routines
+LIB$GET_VM  and LIB$FREE_VM, respectively.  NEW requests an additional
+four bytes from LIB$GET_VM in which to store the length word  required
+by  EXTENT  and  DISPOSE.  DISPOSE  simply  passes the length word and
+address to LIB$FREE_VM.  The actual calls are:
+
+   PUSHL #size              ; may be an expression for flex
+   CALLS #1,NEW.            ;address returned in R0
+
+   PUSHL pointer
+   CALLS #1,DISPOSE.
+
+VII. Addressing
+Local variables are addressed as offsets from the  frame  pointer  FP.
+Parameters  are  accessed  offset from AP.  Static storage is directly
+addressible either by relocatable addresses or relative to the program
+counter.  PIC  modules  using  PC  relative  addressing are generated.
+Out-of-scope references require  a  general  register  load  with  the
+indicated   frame  pointer,  as  described  in  section  III.  Pointer
+dereference  also  requires  an  index  register   load.   The   INDEX
+instruction is used for array subscripting.
+
+VIII. Non-local GOTOs
+Out-of-scope  GOTOs  are  performed  through runtime routines.  A GOTO
+into the main program is handled by PAD$UNWINDMAIN:
+
+            MOVAL target-label,R0    ;address of label
+            JMP   PAS$UNWINDMAIN
+
+   PAS$UNWINDMAIN:
+   SEARCH:  CMPL  -4(FP),MAINFRAME   ;saved in a static location
+            BEQL  FOUND
+            MOVL  -(FP),FP            ;back one level
+            BRB   SEARCH
+   FOUND:   MOVL  R0,16(FP)          ;replace return address
+            RET                      ;actual goto
+
+GOTOs into a parent routine transfer through PAS$UNWIND:
+
+            MOVAL target-label,R0    ;address of label
+            MOVL  #n,R1              ;n = # levels to back up
+            JMP   PAS$UNWIND         ;  (n = 1 for immediate parent)
+
+   PAS$UNWIND:
+   SEARCH:  DECL  R1
+            BEQL  DONE
+            MOVL  -(FP),FP           ;back one level
+
+            BRB   SEARCH
+   DONE:    MOVL  R0,16(FP)          ;replace return address
+            RET
+
+The above code is not restoring registers because it is not necessary.
+It  would  be necessary if registers were saved across statements, but
+"with" is the only Pascal statement  which  saves  registers  and  you
+cannot "goto" into a "with".
+
+IX. Code generation strategy
+The  basic  scheme  of the quick pass will be retained:  a linear scan
+over the IF for  "statement-class"  tuples  such  as  assignments  and
+procedure   calls.   Each  such  tuple  invokes  recursive  expression
+evaluation as appropriate.
+
+The primary data structure is the address descriptor ADDR_DESC,  which
+describes  the  location  of an element of data, whether a variable or
+the  result  of  an  expression,  identifying  associated   registers,
+offsets, size, indirection, etc.  The main expression evaluator is:
+
+   Function FETCH (A:EXPR; TARG:  ADDR_DESC):  ADDR_DESC;
+
+FETCH  establishes  addressability  for  the  result  of the parameter
+expression, insuring that the result  can  be  accessed  in  a  single
+instruction.  This may be as simple as returning an address descriptor
+for a local variable or immediate constant, or as complex as  function
+invocation  with  parameter  expression  evaluation.  Two wrappers for
+FETCH are FETCH_FULLWORD, which insures that a byte or word expression
+evaluated  by  FETCH  is  converted to a longword, and ARGUMENT, which
+assures that the result of FETCH_FULLWORD is not indirect.
+
+X. Arithmetic expressions
+All fixed point expressions are  evaluated  in  longwords,  converting
+operands  as  required.  The  result  of  an  arithmetic expression is
+always placed in a register rather than on the  stack.  Generally,  if
+only  one operand is in a register then the result of the operation is
+left in that register.  If both operands are  in  registers  then  the
+result  is  left in the higher unless the operator is not commutative,
+in which case the register of the first operand (e. g.,  the  dividend
+in  division)  receives  the  result.  If  neither  operand occupies a
+register then the highest  index  or  base  (but  not  with)  register
+associated  with  either  operand or as a last resort the highest free
+expression register is chosen for the result.
+
+Examples:
+
+   A. x + y, both real (multiplication similar).
+
+      1. x in register Rx
+
+         a. y in register Ry
+
+            ADDF2 min(Rx,Ry),max(Rx,Ry)
+
+         b. y in memory
+
+            ADDF2 y,Rx
+
+      2. x in memory
+
+         a. y in register Ry
+
+            ADDF2 x,Ry
+
+         b. y in memory
+
+            ADDF3 x,y,Rn
+
+   B. x - y, both integers (division similar).
+
+      1. x in register Rx
+
+         a. y in register Ry
+
+            SUBL2 Ry,Rx
+
+         b. y in memory
+
+            SUBL2 y,Rx
+
+      2. x in memory
+
+         a. y in register Ry
+
+            SUBL3 Ry,x,Ry
+
+         b. y in memory
+
+            SUBL3 y,x,Rn
+
+XI. Math runtime library interface
+The system runtime library MTH$ routines for SIN,  COS,  TAN,  ARCSIN,
+ARCCOS, ARCTAN (one or two arguments), SINH, COSH, LN, LOG, EXP, SQRT,
+and RANDOM take parameters passed  by  reference,  which  may  require
+storing  the  result  of  an  expression  prior  to  the call.  If the
+parameter  count  word  is  ignored  by  these  routines  (as  in  the
+FORTRAN-10  library),  the  parameter value may be pushed on the stack
+and this temporary freed by the CALLS.
+
+As an example, the call for SQRT (exp)
+
+   1. if exp is in register Rx
+
+      MOVF  Rx,-(SP)      ;save in temporary
+      PUSHL SP            ;address of value
+      CALLS #2,MTH$SQRT   ;calculate and clean stack
+
+   2. if exp in memory:
+
+      PUSHAL exp          ; pass direct address
+      CALLS #1,MTH$SQRT
+
+All system OTS$ exponentiation routines accept parameters by value  in
+either   single  or  double  precision,  so  the  stack  temporary  in
+unnecessary.
+   
