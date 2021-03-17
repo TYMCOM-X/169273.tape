@@ -1,0 +1,329 @@
+
+Entry MfdSet, MfdScn, UfdScn;
+
+
+begin "MfdScn - Scan the Disk File System"
+
+  require "(sailib)sail.def"   source!file;
+  require "(sailib)uuosym.def" source!file;
+  require "(sailib)dul.req"    source!file;
+
+
+! MfdSet - A routine to set the file mode (mode, input, output
+!  buffers and count) for each file passed to FileProc when
+!  MFDSCN or UFDSCN is called.  This procedure should be called
+!  just prior to calling  MFDSCN or UFDSCN.
+!
+! MfdScn - A routine to scan selected parts of the file system
+!  and pass the long lookup blocks of selected files to a user
+!  specified procedure.
+!
+! UfdScn - A routine to scan selected files in a single directory
+!  and pass the long lookup blocks to a user specified procedure.
+!
+! See (SAILIB)MFDSCN.DOC for interface details.
+!
+! Dave W. Smith,  September '82.    (FILSCN)
+! Carl A. Baltrunas, December '82/January '83.  (MFDSCN)
+;
+
+! Variables for the MFD/UFD Scanning stuff.
+;
+
+own integer FileInputBuffers,		! count of input buffers ;
+	    FileOutputBuffers,		! count of output buffers ;
+	    FileMode, FileCount;	! mode and count for files ;
+
+integer	MFDChan, MFDEof,		! for scanning the MFD ;
+	UFDChan, UFDEof,		! for scanning UFDs ;
+	FileChan, FileEof,		! for scanning files ;
+	FileBrk;			! more for file scanning ;
+
+integer ThisUFD, ThisAUN;		! UFD being scanned ;
+integer ThisFileName, ThisFileExt;	! file being scanned ;
+
+define LkbLen = '40;
+safe integer array ULKB[ 0 : LkbLen ];	! long lookup block for UFD ;
+safe integer array  LKB[ 0 : LkbLen ];	! long lookup block for files ;
+
+define MFDLen = 100;
+integer MFDCnt, MFDIdx;			! for looking at blk2 ;
+safe integer array MFDBlk1[ 0 : 7 ];	! for the chanio ;
+safe integer array MFDBlk2[ 0 : MFDLen-1 ];
+
+define UFDLen = 100;
+integer UFDCnt, UFDIdx, UFDInc;		! for looking at blk2 ;
+safe integer array UFDBlk1[ 0 : 7 ];	! for the chanio ;
+safe integer array UFDBlk2[ 0 : UFDLen-1 ];
+
+! Channel allocation - dealocation
+;
+
+Internal procedure MFDSet(  Integer Mode( !IODMP ),
+			    Inbufs( 0 ),
+			    Outbufs( 0 ),
+			    Count( 512 )                );
+  begin
+
+    FileInputBuffers := Inbufs;
+    FileOutputBuffers := Outbufs;
+    FileMode := Mode;
+    FileCount := Count;
+
+    If FileChan > 0
+     then Release( FileChan );
+
+    Open( FileChan:= getchan, "DSK", FileMode,
+	  FileInputBuffers, FileOutputBuffers,
+	  FileCount, FileBrk, FileEof := -1 );
+
+  end;
+
+
+procedure SetupChannels;
+  begin
+    open( MFDChan := getchan, "DSK", !IODMP, 0,0,512,0, MFDEof := -1 );
+    open( UFDChan := getchan, "DSK", !IODMP, 0,0,512,0, UFDEof := -1 );
+    FileChan_ 0;
+    MfdSet( !IODMP, 0, 0, 512 );
+  end;
+
+require SetupChannels initialization;
+
+
+! Setup to scan the MFD for [mask].UFD
+;
+
+procedure SetupMFD( integer MFDMask );
+  begin "setup the MFD"
+
+    ! lookup the MFD ;
+
+    lookup( MFDChan, "(UFD)'1000001.UFD", !Skip!_ -1 );
+    if ( !Skip! ) then
+      usererr( 0,0,"? Lookup Failed for MFD, error "&cvos(!rh(!Skip!)), "x" );
+
+    ! set the blocks up for scanning ;
+
+    ArrClr( MFDBlk1 );
+    MFDBlk1[ 0 ] := !XWD( -MFDLen, location( MFDBlk2[ 0 ] ));
+    MFDBlk1[ 1 ] := MFDMask;
+    MFDBlk1[ 2 ] := cvsix( "UFD" );
+
+    MFDCnt := 0;
+
+  end "setup the MFD";
+
+! Return true iff there's more MFD to examine.
+! Iff true, return the AUN of the next UFD.
+;
+
+boolean procedure ReadMFD( reference integer AUN );
+  begin "read MFD"
+
+    while ( true ) do
+      begin "loop until satisfied"
+
+	if ( MFDCnt > 0 ) then
+	  begin
+	    AUN := MFDBlk2[ MFDIdx ];
+	    MFDIdx := MFDIdx + 2;
+	    MFDCnt := MFDCnt - 1;
+	    return( true );
+	  end;
+
+	! The UFD scan block is empty.  Fill it up again. ;
+
+	CHNIOR( MFDChan, MFDBlk1[0], !CHUFD );
+	if ( not !Skip! ) then return( false );
+
+	MFDCnt := MFDBlk1[ 7 ];
+	MFDIdx := 0;
+	
+      end "loop until satisfied";
+
+  end "read MFD";
+
+! Return true iff there's more in this UFD to be examined.
+! Iff true, return the next filename.
+;
+
+boolean procedure ReadUFD( reference integer FileName, FileExt );
+  begin "read UFD"
+
+    while ( true ) do
+      begin "loop until satisfied"
+
+	if ( UFDCnt > 0 ) then
+	  begin
+	    FileName := UFDBlk2[ UFDIdx ];
+	    FileExt :=  UFDBlk2[ UFDIdx + 1 ] land '777777000000;
+	    UFDIdx := UFDIdx + UFDInc;
+	    UFDCnt := UFDCnt - 1;
+	    return( true );
+	  end;
+
+	! The UFD scan block is empty.  Fill it again. ;
+
+	CHNIOR( UFDChan, UFDBlk1[0], !CHUFD );
+	if ( not !Skip! ) then return( false );
+
+	UFDCnt := UFDBlk1[ 7 ];
+	UFDIdx := 0;
+	
+      end "loop until satisfied";
+
+  end "read UFD";
+
+! Lookup  [AUN].UFD and return whether found or not.
+;
+
+boolean procedure LookupUFD( integer AUN );
+  begin "Lookup a UFD"
+
+    ThisAun := AUN;
+
+    ! build the UFD lookup block ;
+
+    arrclr( ULKB );
+    ULKB[ !RBCNT ] := LkbLen;
+    ULKB[ !RBPPN ] := !XWD( 1,1 );
+    ULKB[ !RBNAM ] := AUN;
+    ULKB[ !RBEXT ] := cvsix( "UFD" );
+
+    ! lookup the UFD ;
+
+    CHNIOR( UFDChan, ULKB[ !RBCNT ], !CHLK );
+
+    Return( !Skip! );
+
+  end "Lookup a UFD";
+
+
+! Setup a UFD to be scanned for [name-mask].[ext-mask] [bit-mask]
+;
+
+procedure FileScan( integer NameMask, ExtMask, BitMask;
+		    boolean procedure WantFile;
+		    procedure FileProc );
+
+  begin "setup a UFD scan"
+
+	arrclr( UFDBlk1 );
+	UFDBlk1[ 0 ] := !XWD( -UFDLen, location( UFDBlk2[ 0 ] ));
+	UFDBlk1[ 1 ] := NameMask;
+	UFDBlk1[ 2 ] := ExtMask;
+	UFDBlk1[ 3 ] := If ( BitMask = -1) then 0
+			 else BitMask land '760200000000;
+	UFDCnt := 0;
+
+	UFDInc := 2;
+	If ( BitMask neq -1 ) then
+	  begin
+	    If ( 0 neq ( BitMask land !bit(1) ) ) then
+	      UFDInc := UFDInc + 1;
+	    If ( 0 neq ( BitMask land !bit(2) ) ) then
+	      UFDInc := UFDInc + 1;
+	    If ( 0 neq ( BitMask land !bit(3) ) ) then
+	      UFDInc := UFDInc + 1;
+	    If ( 0 neq ( BitMask land !bit(4) ) ) then
+	      UFDInc := UFDInc + 1;
+	  end;
+
+	while ( ReadUFD( ThisFileName, ThisFileExt ) ) do
+	  begin "every file in UFD"
+
+	    if ( WantFile( ThisFileName, ThisFileExt )) then
+	      begin "process the file"
+
+		If ( BitMask = -1 ) then
+		  begin
+		    LKB[ !RBCNT ] := LkbLen;
+		    LKB[ !RBPPN ] := ThisAun;
+		    LKB[ !RBNAM ] := ThisFileName;
+		    LKB[ !RBEXT ] := ThisFileExt;
+
+		    ! *** For speed *** ;
+		    ! CHNIOR( FileChan, LKB[ !RBCNT ], !CHLK );
+
+		    Start!code "Speedy lookup"	! saves 16 / file ;
+		      Define T1=1;
+			MOVE	T1,FileChan;		! get channel ;
+			HRLI	T1,!CHLK;		! get lookup code ;
+			SETOM	!Skip!;			! mark success ;
+			uuo!CHANIO T1,LKB[ !RBCNT ];	! lookup file ;
+			 SETZM	!Skip!;			! oops! error ;
+		     end "Speedy lookup";
+
+		  end
+		else Start!code "Speedy BLT"	! saves 8 / file ;
+		    Define T1=1, T2=2;
+			MOVE	T1,UFDIdx;		! get Index ;
+			MOVE	T2,UFDInc;		! get Increment ;
+			SUB	T1,T2;			! minus Increment ;
+			ADDI	T1,UFDblk2[0];		! plus Array addr ;
+			HRLZ	T1,T1;			! put into "from" ;
+			HRRI	T1,LKB[ !RBCNT ];	! setup "to" ;
+			ADDI	T2,LKB[ !RBCNT ];	! last "to" loc ;
+			BLT	T1,-1(T2);		! copy data ;
+			SETOM	!Skip!;			! success!! ;
+		  end;
+
+		if ( !Skip! ) then
+		  FileProc( FileChan, FileCount, FileBrk, FileEof, LKB );
+
+	      end "process the file";
+	  end "every file in UFD";
+  end "setup a UFD scan";
+! The top level procedure to scan the file system.
+!
+! The user passes procedures:
+!
+!   boolean procedure WantUFD( reference integer AUN )
+!   procedure UFDProc( reference integer Channel, integer array LookupBlock )
+!   boolean procedure WantFile( reference integer FileName, FileExt )
+!   procedure FileProc( reference integer Channel, Count, BreakVar, EofVar,
+!			integer array LookupBlock )
+;
+
+internal procedure UfdScn( integer UFDaun, FileMask, ExtMask, BitMask;
+			   boolean procedure WantFile;
+			   procedure FileProc );
+  begin "UFD scan"
+
+	If ( BitMask and LookupUFD( UFDaun ) ) then
+	  FileScan( FileMask, ExtMask, BitMask, WantFile, FileProc );
+
+  end "UFD scan";
+
+
+internal procedure MfdScn( integer MFDMask, FileMask, ExtMask, BitMask;
+			   boolean procedure WantUFD;
+			   procedure UFDProc;
+			   boolean procedure WantFile;
+			   procedure FileProc );
+  begin "file scan"
+
+    SetupMFD( MFDMask );
+
+    while ( ReadMFD( ThisUFD ) ) do
+      begin "every UFD"
+
+	if ( WantUFD( ThisUFD ) ) then
+	  begin
+	    If ( LookupUFD( ThisUFD ) ) then
+	      begin
+		UFDProc( UFDChan, ULKB );
+		If ( BitMask ) then
+		  FileScan( FileMask, ExtMask, BitMask, WantFile, FileProc );
+	      end;
+	  end;
+
+      end "every UFD";
+
+
+  end "file scan";
+
+
+end "MfdScn - Scan the Disk File System";
+ 
