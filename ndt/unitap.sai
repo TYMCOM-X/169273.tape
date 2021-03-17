@@ -1,0 +1,592 @@
+begin "unitap"
+    require 12 version;
+require "(sailib)sail.def" source!file;
+!get!module(extend);
+!get!module(strings);
+let routine = procedure;
+define safe="";
+
+COMMENT		Unix interchange for source tapes.
+
+Mag tape format for TYMCOM-X <-> UNIX interchanges
+
+First block:
+	[0,1] tape format version number (3,3)
+	<undefined to eob (block size is 1440)>
+
+per file:
+	[2]	file descriptor version number (2,2)
+	[2]	<undefined>
+	[4]	file length in bytes (an ESTIMATE only)
+	[8]	<undefined>
+	[?]	file name
+	[1]	0 (terminates above)
+	[?]	directory containing file
+	[1]	0 (terminates above)
+	[?]	directory containing directory above
+	[1]	0 (terminates above)
+	...
+	[?] top level containing directory name
+	[1] 0	(terminates above)
+	[1] 0	(terminates entire list of directories)
+	<undefined to eob (block size is 1440 bytes)>
+
+repeat:	[2]	h,l: sequence number of block within file (first is 0,1)
+	[2]	h,l: size of block of data
+	[1436]	block of data
+
+<tape mark>
+
+...
+
+tape end is two consecutive <tape mark> s
+;
+
+boolean really!tape;
+
+routine !arryout( integer ch; reference integer bl; integer size);
+if really!tape then arryout( ch, bl, size) else print("[]");
+
+routine !mtape( integer ch; integer op );
+if really!tape then mtape(ch,op) else print("{" & op, "}");
+define mtape="!mtape", arryout="!arryout";
+
+boolean routine subkeq( string full!name, shorter );
+return( kequ( shorter, full!name[1 for length(shorter)] ) );
+
+
+string routine reply( string prompt, help(null), default(null) );
+while true 
+   do begin	string reply;
+	if length(default)
+	 then print( crlf, prompt, " [", default, "]: ")
+	 else print( crlf, prompt, ": ");
+	if (reply := inchwl) = "?" and length(help)
+	 then begin
+		print( help, crlf );
+		continue;
+	      end;
+	if length(reply) = 0 and length(default)
+	 then return( default );
+	return( reply );
+      end;
+
+
+define tape#bytes#per#word = 4;
+define block#size#bytes = 1440;
+define block#size#words = block#size#bytes % tape#bytes#per#word;
+define data#area#size = block#size#bytes - (2*2);
+				! 2: sequence, 2: length used.;
+
+define tap!version = 3*256 + 3;		! ( = 3,3 );
+define file!descr!version = 2*256 + 2;	! ( = 2,2 );
+define tap!name = {"UNITAP"};		! device to use for tape;
+
+integer	tap!drive	! channel with tape drive on it;
+,	tap!eof		! associated eof variable;
+;
+
+integer array tap!buffer [ 0 : block#size#words - 1 ];
+integer br!no!lines 	! ignore line numbers;
+,	drop!nul 	! scan to and drop an ascii nul;
+,	br!fspec	! to pick out a file name from a set of them.;
+,	br!line		! to read one line from a file list file;
+,	to!lower	! to convert arg string to lower case;
+;
+
+simple procedure setemup;
+begin
+setbreak( br!line := getbreak, #lf & #ff, #cr, "INS" );
+setbreak( br!fspec := getbreak, #sp & #ht & "+,;&", #sp & #ht & "+,;&", 
+				"tins" );
+setbreak( br!no!lines:=getbreak, null, null, "INS" );
+					! for dropping line numbers;
+setbreak( drop!nul:=getbreak, 0, null, "IS" );
+setbreak( to!lower:=getbreak, null, null, "ICS" );
+end;
+require setemup initialization;
+
+record!class dir!name ( string name; r!p(dir!name) parent );
+record!class tap!file (
+	integer	file!number;	! sequential number on tape;
+	string	name;
+	integer	file!length;	! file length in bytes (an ESTIMATE only);
+	r!p(dir!name) home!dir;
+	r!p(tap!file) next!file
+	);
+r!p(tap!file) known#files;
+
+integer routine ask!density( integer available!densities );
+begin	string default;
+	integer i;
+	preload!with "6250", "1600", "800", "556", "200";
+	    own string array dense[13:17];
+default := "1600";
+if 0 = available!densities land !bit(14)
+ then for i := 13 step 1 until 17
+	do if available!densities land !bit(i)
+	    then begin default := dense[i]; done; end;
+
+while true
+  do  begin	string density;
+
+	density := reply( "Density", null, default );
+	for i := 13 step 1 until 17
+	   do if subkeq( dense[i], density ) then return( !bit(i) );
+
+	if density = "?" or subkeq( "Help", density )
+	 then begin
+		print("Type the desired tape density.  Possible are: " );
+		for i := 13 step 1 until 17
+		   do if available!densities land !bit(i)
+		    then print("  ", dense[i] );
+	      end
+	 else print("Illegal density");
+	print( crlf );
+      end;
+end ;
+
+
+procedure create!null!tape;
+begin
+tap!buffer[0] := tap!version lsh (16+4);	! first two bytes;
+arryout( tap!drive, tap!buffer[0], block#size#words );
+mtape(tap!drive,"E");		! write an EOT;
+mtape(tap!drive,"E");		! which is just two EOFs;
+mtape(tap!drive,"W");
+end;
+
+boolean routine check!header;
+begin
+arryin( tap!drive, tap!buffer[0], block#size#words );
+if (tap!buffer[0] lsh -(16+4)) neq tap!version
+ then begin
+	print(crlf & "Tape is NOT in UNITAP format!!" & crlf );
+	return( false );
+      end
+ else return( true );
+end;
+string routine read!buffer( integer expected!sequence );
+! Read in a block from the tape, check the sequence number, and remove 
+  the sequence number from the block.  Return the rest of the block.
+  If the argument "expected!sequence" is negative, no sequence number
+  processing should be done.
+;
+begin	integer len, ptr;
+	string result;
+arryin(tap!drive, tap!buffer[0], block#size#words);
+if tap!eof then return(null);
+result := constr( point( 8, tap!buffer[0], -1 ), block#size#bytes );
+if 0 <= expected!sequence 
+ then begin
+	if expected!sequence land '177777 
+	neq (lop(result) lsh 8 + lop(result))
+	 then usererr( tap!buffer[0] lsh -(16+4), 3, ! cheapo: sequence;
+		 "Woops! I expected to see block " 
+		& cvs( expected!sequence ) 
+		& ", but instead, I see block " );
+      end;
+return( result );
+end;
+
+integer procedure UGETF(integer TapeChannel); begin "UGETF"
+    integer array UG[0:1];
+    UG[0]:=2;
+    chnior(TapeChannel,UG[0],'10);
+    return(UG[1]);
+    end "UGETF";
+
+
+simple boolean procedure INIT!TAPE(string accesses); begin "FTA"
+  define CHOKE(S) = {begin print(crlf, S, crlf); return( false ); end};
+  integer density!bit, tap!descriptor, density!selector, test!bit;
+  string device!name;
+
+  device!name:=cv6str(calli(cvsix(tap!name),'64));
+  if !SKIP! 
+   then print("using device ", tap!name, crlf)
+   else device!name:= reply("Tape unit", 
+			"You know, the tape drive name", "FTA0");
+
+  if length(device!name)=0 then device!name:=tap!name;
+  open( tap!drive := getchan, device!name, '17, 
+	0,0,	0,0, tap!eof:=true);
+  if tap!eof then choke("Unit " & device!name & " not available");
+ 
+  tap!descriptor:=UGETF(tap!drive);	! read the mag tape properties;
+  if tap!descriptor land !bit(12) then choke("Drive is 7 track");
+  if tap!descriptor land !bit(0) 
+	then begin 
+		outstr("Unit is write protected"&crlf);
+		if not subkeq( "Read", accesses )
+		 then choke("But you wanted to " & accesses);
+	      end;
+  if tap!descriptor land !bit(2) then choke("Unit not ready");
+
+  if tap!descriptor land (!bit(13)+!bit(14)+!bit(15)+!bit(16)+!bit(17)) = 0
+   then begin
+	really!tape := false;
+	print("Really not a tape, is it?",crlf);
+	tap!descriptor := tap!descriptor + !bit(13)+!bit(15)+!bit(17);
+      end
+   else really!tape := true;
+
+  while 0 = tap!descriptor land (density!bit := ask!density( tap!descriptor )
+)
+	do print("Drive not capable of selected density" & crlf);
+  
+  density!selector:=4; test!bit:= !bit(12);
+  do begin
+     test!bit:=test!bit lsh -1;
+     if (test!bit land tap!descriptor)
+      then density!selector:=density!selector-1;
+     end
+   until (test!bit land density!bit);
+  print( "Using density ", density!selector, "/3 of ", device!name, ":" & crlf)
+;
+  if density!selector<1 then choke("Can't set density - FUBAR");
+  if density!selector>3 then choke("Can't set density - FUBAR");
+  setsts( tap!drive, density!selector * !bit(28) + '17);
+  mtape( tap!drive, "W" );	! rewind;
+  mtape( tap!drive, "I" );	! set to IBM / industry compatible mode;
+  return( true );
+  end "FTA";
+
+routine setup!tape!file!head( string name, dir; integer size );
+begin	integer bpoint;
+bpoint := point( 8, tap!buffer[0], -1 ); ! just before first byte of buffer;
+idpb( file!descr!version lsh -8, bpoint ); ! write high order byte;
+idpb( file!descr!version, bpoint );	   ! write  low order byte;
+idpb( "~"+0, bpoint );	! undefined;
+idpb( "~"+0, bpoint );	! undefined;
+idpb( size lsh -(8*3), bpoint );	! 4 bytes of file size;
+idpb( size lsh -(8*2), bpoint );	! 4 bytes of file size;
+idpb( size lsh -(8*1), bpoint );	! 4 bytes of file size;
+idpb( size, bpoint );			! 4 bytes of file size;
+bpoint := strstf( bpoint, "~~~~~~~~" );	! 8 undefined bytes;
+bpoint := strstf( bpoint, name );	! file name (name.ext);
+idpb( 0, bpoint );			! terminated;
+bpoint := strstf( bpoint, dir );	! file directory;
+idpb( 0, bpoint );			! terminated;
+idpb( 0, bpoint );			! always one-level directory;
+bpoint := strstf( bpoint, "~~~~~~~~~~" ); ! undefined on out;
+end;
+routine put!in!buffer( string s; integer seq );
+begin	integer bpoint;
+if length(s) > data#area#size
+ then usererr(length(s),3,"Software error, too many bytes for buffer ");
+
+bpoint := point( 8, tap!buffer[0], -1 ); ! just before first byte of buffer;
+idpb( seq lsh -8, bpoint );
+		     ! write high order byte of block sequence number;
+idpb( seq, bpoint ); ! write low order byte of block sequence number;
+idpb( length(s) lsh -8, bpoint ); ! write high order byte of length;
+idpb( length(s), bpoint );	  ! write  low order byte of length;
+strstf( bpoint, s );
+return;
+end;
+
+routine write!file( string first!part; integer channel; reference integer EOF )
+;
+begin
+	integer seqno;
+seqno := 0;
+  do  begin
+	while length(first!part) > data#area#size 
+	   do begin 
+		put!in!buffer( first!part[1 for data#area#size],
+				seqno := seqno + 1 );
+		arryout( tap!drive, tap!buffer[0], block#size#words );
+		first!part := first!part[data#area#size + 1 to inf]; 
+	      end;
+	if length(first!part) > 0
+	 then begin
+		put!in!buffer( first!part, seqno := seqno + 1 );
+		arryout( tap!drive, tap!buffer[0], block#size#words );
+	      end
+      end
+ until length( first!part := input( channel, br!no!lines ) )=0 and EOF;
+					! read some more text;
+
+mtape( tap!drive, "E" );	! write a tape mark;
+mtape( tap!drive, "E" );	! write another tape mark;
+mtape( tap!drive, "B" );	! back up over final mark.;
+end;
+
+boolean procedure write1(integer array fileData); Comment [-4:3];
+begin	string name, directory, full!file!name;
+	integer len;
+	integer chan, count, break, eof;
+	boolean flag;
+	string first!text;
+if fileData[-3]
+ then directory := cvxstr(fileData[-4]) & cv6str(fileData[-3])
+ else directory := cv6str(fileData[-4]);
+
+name := cv6str(fileData[0]) & "." & cv6str(fileData[1]);
+len := fileData[2] * 128 * 5;
+
+if length( directory )
+ then full!file!name := "(" & directory & ")" & name
+ else full!file!name := name;
+
+open( chan := getchan, "DSK", '10000, ! error return on bad file name;
+	4,0,	count := data#area#size, break, eof := true );
+	! try to read a convenient length;
+if eof then usererr(eof,3,"Some error trying to get to the disk=");
+
+lookup( chan, full!file!name, flag );
+if flag
+ then usererr(eof land (-1 lsh -18),3,"Cannot lookup file `" & 
+		full!file!name & "'. reason = " )
+ else begin
+	first!text := input( chan, br!no!lines );
+	if length(first!text) = 0 and eof
+	 then print( "No text at all in `", full!file!name, "'." &crlf)
+	 else begin
+		print(crlf & "Writing file ", full!file!name, ":");
+		setup!tape!file!head( 
+			scan( name, to!lower, !skip! ),
+			scan( directory, to!lower, !skip! ),
+			len );
+		arryout( tap!drive, tap!buffer[0], block#size#words );
+		write!file( first!text, chan, eof );
+	      end;
+      end;
+release(chan);
+return(false);
+end;
+
+forward recursive procedure write!files( string files!line );
+
+boolean recursive procedure write!list(integer array fileData);
+begin	string name;
+	integer chan, count, break, eof;
+	boolean flag;
+
+name := cv6str(fileData[0]) & "." & cv6str(fileData[1]);
+
+if fileData[-4]
+ then name := "(" & (if fileData[-3] then 
+			cvxstr(fileData[-4]) & cv6str(fileData[-3])
+			else cv6str(fileData[-4]))
+		& ")" & name;
+
+open( chan := getchan, "DSK", '10000, ! error return on bad file name;
+	4,0,	count := data#area#size, break, eof := true );
+	! try to read a convenient length;
+if eof then usererr(eof,3,"Some error trying to get to the disk=");
+
+lookup( chan, name, flag );
+if flag
+ then usererr(eof land (-1 lsh -18), 3,
+		"Can't get file list file `" & name & "'. reason = " )
+ else begin
+	print(crlf, "  reading file list from ", name, "...[" );
+	do write!files( input( chan, br!line ) ) until eof;
+	print(crlf, "  ]...", name );
+      end;
+release(chan);
+return(false);
+end;
+
+recursive procedure write!files( string files!line );
+begin	string word, next!word;
+while length( word := scan( files!line, br!fspec, !skip! ) )
+   do if word = "@"
+	 then redUfd( write!list, word[2 to inf], "#*" )
+	 else redUfd( write1, word, "#*B" )
+end;
+procedure add!files;
+begin	string file!group;
+if check!header
+ then while true do begin
+	file!group := reply( "File(s) to write to tape",
+"`Done' when tape output is complete, otherwise text files to output 
+to the tape, wild cards (# and *) are OK. These will be sent in pure 
+Ascii (all printing, crlf, tab, space, and formfeed will get through).
+This will take a comma-separated list of file names.  Any names which
+are directly preceded by an at-sign (@) are read as lists of files to
+be read in.  Syntax (for those into BNF):
+name_part ::= [6 alphanumeric_or_hash ] [*]
+ext_part  ::= [3 alphanumeric_or_hash ] [*]
+filename  ::= [ '(' directory_name ')' ] [ name_part ] [ '.' ext_part ]
+separator ::= ',' | '+' | '&' | ' ' | separator separator
+response  ::= <blank>
+	|	'@' file_name
+	|	file_name
+	|	response separator response
+
+For those not: comma-separated file names with wildcards, 
+		indirect files may be mixed in by '@' notation.
+	eg: *.C,@vax.xfr, vax.xfr
+" );
+	if length(file!group)=0
+	 then print("Please respond.  ")
+	 else if subkeq( "Done", file!group )
+		 then done
+		 else write!files( file!group );
+       end
+ else print("Not in proper format!  Use Create to make new tape."&crlf);
+end;
+define !file!skip!=-2, !end!tape!=-3;
+
+integer routine desired( string file!header; 
+			reference string fixed!reply );
+! Decides whether the named tape file is to be written to disk.
+  This may ask the user whether the named file is desired (automatic
+  replies are stored in fixed!reply).  The function returns
+  either !file!skip! (for don't copy file, proceed to next)
+  or	 !end!tape! (for don't copy file, all done with tape)
+  or	 a channel number to write the tape to.
+;
+begin
+	own integer ch,brk,cnt,eof;
+	string name, dir1, ofile;
+	integer format, size;
+if length(file!header) < 2+2+4+3
+ then usererr( length(file!header),3, "file header too short");
+
+format := lop(file!header) lsh 8 + lop(file!header); ! [2] format ver;
+lop(file!header); lop(file!header);	! [2]	<undefined>;
+size :=	( ( lop(file!header) lsh 8	! [4]	file length in bytes;
+	    + lop(file!header)) lsh 8 		! (an ESTIMATE only);
+	  + lop(file!header)) lsh 8
+	+ lop(file!header);
+file!header := file!header[9 to inf];	! [8]	<undefined>;
+name := scan(file!header,drop!nul,!skip!); ! [?] file name / [1] 0;
+dir1 := scan(file!header,drop!nul,!skip!); ! [?] containing dir / [1] 0;
+if format neq file!descr!version
+ then usererr( format, 3, "Unexpected file descriptor format ");
+
+print( crlf, size, " byte file `", name, "'. " );
+if length(dir1) then print( "from directory `", dir1, "'. " );
+
+do if fixed!reply = "!"
+	 then ofile := fixed!reply[2 to inf]
+	 else ofile := reply("Save as", "
+  `No'	to skip the current file
+  `End'	to stop now, no more tape files desired.
+  file	to write to that file
+  `!No' to skip over the rest of the files (but still list them).
+  `!'	to automatically write each file on the list.
+  <cr>	to write the file as currently named (accept the default)
+",	name )
+ until ofile neq "!";
+if length(ofile) = 0 then ofile := name;
+
+if subkeq( "No", ofile ) then return(!file!skip!);
+if subkeq( "End", ofile ) then return(!end!tape!);
+
+open(ch:=getchan, "DSK",'10000, 0,4, cnt,brk,eof:=false);
+if ch=0 or eof then usererr(0,1,"Ran out of channels to the DSK!!");
+while true
+   do begin	boolean flag;
+	enter(ch, ofile, flag);
+	if not flag then return(ch);
+	close(ch);	! inhibit!create;
+	print(crlf, "Cannot write file ", ofile, " (", eof land '777777,
+	    ") for tape file ", dir1, "/", name, ", try again." & crlf);
+	if subkeq( "No", ofile := reply("Save as",
+		"No to skip it, else file name to write.", name ) )
+	 then begin release(ch); return(!file!skip!); end;
+      end;
+end;
+
+routine scribble( integer chan; string buffer );
+begin	integer valid!length;
+if length(buffer) < 2
+ then usererr( length(buffer),3,"Buffer too short ");
+
+valid!length := (lop(buffer) lsh 8) + lop(buffer);
+
+if valid!length > length(buffer)
+ then usererr( length(buffer),3,"Buffer too short or lngth too long " 
+			& cvs(valid!length) & " on tape, buffer = " );
+
+out( chan, buffer[1 for valid!length] );
+end;
+
+procedure read!files;
+begin "reader"
+
+if check!header
+ then begin	string file!head, reply!storage;
+	if length( file!head := read!buffer(-1) ) = 0
+	 then begin 
+		print(" Empty tape! "); 
+		return; 
+	      end;
+	reply!storage := null;
+	  do  begin "per file"
+			integer chan;
+		chan := desired( file!head, reply!storage );
+		if chan = !end!tape! then done "per file";
+		if chan = !file!skip!
+		 then mtape( tap!drive, "A" )	! get past EOF;
+		 else begin	integer seqno;
+				string buffer;
+			seqno := 0;
+			while length( buffer := read!buffer( 
+						seqno := seqno + 1 ) )
+			   do scribble( chan, buffer );
+			release(chan);
+		      end;
+	      end "per file"
+	  until length( file!head := read!buffer(-1) ) = 0;
+      end
+ else print( crlf, "Tape is in a non-UNITAP format", crlf );
+
+print( crlf, "All done.", crlf );
+mtape( tap!drive, "W" );
+end "reader";
+
+
+boolean routine setup!drive( string operations );
+begin
+print(" setup drive for ", operations, crlf );
+return( init!tape( operations ) );
+end;
+
+string	output!style, record!file;
+boolean create!flag;
+
+
+prinNITAP tape reader, version ", memory['137], crlf );
+record!file := reply("Record transactions on file ",
+    "log file name, `F:<file>' for file-only log, or <cr> for no log.");
+if length( record!file ) 
+ then begin
+	if record!file[2 for 1] = ":"
+	 then setprint( record!file[3 to inf], record!file[1 to 1] )
+	 else setprint( record!file, "B" );
+      end;
+while true
+   do begin
+	output!style := reply("Read, Write, or Create a tape?", 
+		"Type Read or Write [<cr> gets you Write].", "Write");
+	create!flag := subkeq("Create", output!style);
+	if create!flag 
+	or subkeq("Write", output!style) 
+	or subkeq("Read", output!style)
+	 then done;
+	print("Create, Read, or Write only." & crlf);
+      end;
+
+if create!flag or subkeq("Write", output!style) 
+ then output!style := "Write"
+ else if subkeq("Read", output!style) 
+	 then output!style := "Read";
+
+do until setup!drive( output!style );
+
+if create!flag then create!null!tape; 
+
+if subkeq("Write", output!style)
+ then add!files
+ else read!files;
+
+release( tap!drive );
+end "unitap" $ 
+
+  k@4
