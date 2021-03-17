@@ -1,0 +1,558 @@
+entry;
+begin "AuxWin"
+  require "DED.DEF" source!file;
+  ifcr TymcomX thenc
+!! title AuxWin - An Auxiliary Circuit in a Window ;
+! *************************************************************************
+*                                                                         *
+*                                 AuxWin                                  *
+*                                                                         *
+*                Login somewhere via an Auxiliary Circuit                 *
+*           and insert the proceedings into the current buffer            *
+*                   (written by Bill Soley - 12.16.83)                    *
+*                                                                         *
+**************************************************************************;
+!
+!                        Interrupt Administration
+!
+!       o  The interrupt is used to move keyboard data out to the
+!          circuit.  
+!       o  For efficiency, an immediate interrupt is used:
+!
+!                               - BEWARE -
+!                          no SAIL data structures
+!                      may be touched by this routine!
+!
+! -------------------------------------------------------------------------
+
+
+!                         From the Command Module
+;
+
+  external integer
+    C!CreEscChr;                        ! The identity of the CreAux escape
+                                        ! character.
+                                        ;
+
+
+!                         From the Buffer Module
+;
+
+  external simple procedure
+    B!Delete (integer Side);            ! delete character
+                                        ;
+  external simple procedure
+    B!Insert (integer Chr);             ! insert into buffer
+                                        ;
+  external simple procedure
+    B!Move (integer Dir);               ! move in buffer
+                                        ;
+
+
+!                         From the Window Module
+;
+
+  external procedure
+    W!Disp (boolean Punt);              ! redisplay the window
+                                        ;
+  external procedure
+    W!Msg (string MSG);                 ! print a message on the left
+                                        ! side of the message line.
+                                        ;
+  external procedure
+    W!Msg2 (string MSG);                ! print a message on the right
+                                        ! side of the message line.
+                                        ;
+
+
+!                          From SAIL in general
+;
+
+  external integer
+    !skip!;                             ! the flag
+                                        ;
+
+
+! ------------------------------------------------------------------------;
+
+
+!                            Internal Storage
+;
+
+  own boolean
+    ChangingEscChr,                     ! True iff we are changing the
+                                        ! CreAux escape character.
+                                        ;
+    CktZapped,                          ! True iff the aux circuit is
+                                        ! zapped.
+                                        ;
+    EscFlg,                             ! True if an escape operation is to
+                                        ! be performed.
+                                        ;
+    EscSeen;                            ! True if the escape character has
+                                        ! been seen once.
+                                        ;
+  own integer
+    Port,                               ! A local copy of the aux circuit
+                                        ! port number.
+                                        ;
+    WkupChrs,                           ! The characters sent to the aux
+                                        ! circuit input buffer to insure
+                                        ! that a character wait is returned
+                                        ! from when we enter an esc
+                                        ! condition.
+                                        ;
+    WkupChrsPtr;                        ! Pointer to the wakeup chars.
+                                        ;
+
+
+! ------------------------------------------------------------------------;
+!! title Rtn AuxIni ;
+! Initialize misc stuff in the Auxwin Module.
+;
+
+simple procedure AuxIni;
+begin "AuxIni"
+  WkupChrs    _ cvasc(SP & BS);
+  WkupChrsPtr _ point(7, WkupChrs, -1);
+end "AuxIni";
+require AuxIni initialization[0];
+!! title Rtn TTYSvc ;
+!
+!                             CAVEAT HACKER:
+!                                this is a
+!                  SAIL IMMEDIATE INTERRUPT PROCEDURE!!!
+!
+!
+!
+! 
+! Read as many characters as exist from the TTY input buffer (in image
+! mode), and send them to the aux circuit.
+!
+! If the CreAux escape character is seen, then the next character received
+! should be among the following choices, or else the two characters
+! together are rejected (ie, they are ignored):
+!
+!     "Q"          Quit from the aux circuit session, but leave the circuit
+!                  open.
+!
+!     "C"          Change the indentity of the escape character - the next
+!                  character received will be the new value.
+!                  
+!     "Z"          Zap the aux circuit.
+!
+!     <esc char>   Send the escape character through unchanged.
+!
+! Issue a Leave Deferred Echo instruction when done to begin reflecting
+! yellow balls.  The return causes SAIL to DISMIS the interrupt.
+;
+
+simple procedure TTYSvc;
+begin "TTYSvc"
+  start!code
+    define
+     Ac13 = '13,
+     Ac14 = '14,
+     Ac15 = '15;
+    label
+      TTA,
+      TTB,
+      TTC,
+      TTD,
+      TTE,
+      TTF,
+      Loop,
+      Done;
+
+
+    Loop:
+      hrroi     Ac13, !axi8s;           ! Get a char from TTY ;
+      auxcal    Ac13, Ac14;             ! and skip if successful ;
+       jrst     Done;                   ! Nothing there, get out ;
+
+      andi      Ac14, '177;             ! Remove unsightly grime from it ;
+
+      skipn     ChangingEscChr;         ! Are we changing the esc char? ;
+      jrst      TTA;                    ! No - go on ;
+
+      movem     Ac14, C!CreEscChr;      ! Set the new esc char ;
+      setzm     ChangingEscChr;         ! Clear the flag ;
+      jrst      Loop;                   ! and continue ;
+
+    TTA:
+      skipn     EscSeen;                ! Have we seen the esc char? ;
+      jrst      TTE;                    ! No - probably a normal char ;
+
+      setzm     EscSeen;                ! Clear the flag ;
+      move      Ac15, Ac14;             ! Make a copy of the char ;
+      trz       Ac15, '40;              ! Upshift the copy ;
+
+      caie      Ac15, "Q";              ! Is this the Quit command? ;
+      jrst      TTB;                    ! No - look for other commands ;
+
+      setom     EscFlg;                 ! Show that we're quitting ;
+      hrl       Ac13, Port;             ! On the aux circuit ;
+      hrri      Ac13, !axsi;            ! simulate receipt of SP, BS ;
+      auxcal    Ac13, WkupChrsPtr;      ! to insure wakeup on char wait ;
+        jfcl    ;                       ! Do nothing with the error ;
+      jrst      Done;                   ! and get out ;
+
+    TTB:
+      caie      Ac15, "C";              ! Change the esc char command? ;
+      jrst      TTC;                    ! No - look for other commands ;
+
+      setom     ChangingEscChr;         ! Show we're changing esc char ;
+      jrst      Loop;                   ! and continue ;
+
+    TTC:
+      caie      Ac15, "Z";              ! Zap circuit command? ;
+      jrst      TTD;                    ! No - what else is there? ;
+
+      move      Ac13, Port;             ! On the aux circuit ;
+      calli     Ac13, calli!zapcir;     ! send a Zapper ;
+      setom     CktZapped;              ! set the flag ;
+      jrst      Done;                   ! and get out ;
+
+    TTD:
+      camn      Ac14, C!CreEscChr;      ! Is this the esc char? ;
+      jrst      TTF;                    ! Yes - go output it ;
+
+      hrroi     Ac13, !axo8i;           ! Output to the TTY ;
+      auxcal    Ac13, BEL;              ! an immediate Beep ;
+      jrst      Loop;                   ! and continue ;
+
+    TTE:
+      came      Ac14, C!CreEscChr;      ! Is this the esc char? ;
+      jrst      TTF;                    ! No - go output it ;
+
+      setom     EscSeen;                ! Show we've seen the esc char;
+      jrst      Loop;                   ! and continue ;
+
+    TTF:
+      hrl       Ac13, Port;             ! Going to the aux circuit ;
+      hrri      Ac13, !axo8;            ! in image mode ;
+      auxcal    Ac13, Ac14;             ! output the char ;
+      jrst      Loop;                   ! and continue ;
+
+    Done:
+      hrroi     Ac13, !axlde;           ! Let the TTY echo yellow balls ;
+      auxcal    Ac13,;                  
+  end;
+end "TTYSvc";
+!! title Rtn Enable!TTY ;
+! Define an immediate interrupt for a character received from the TTY.
+;
+
+simple procedure Enable!TTY;
+begin "Enable!TTY"
+  intmap(tinass(-1, !iachr, AuxWinChn), TTYSvc, 0);
+  enable(newenb(AuxWinChn));
+  auxclv(-1, 0, !axlde);                ! echo yellow balls;
+end "Enable!TTY";
+!! title Rtn Disable!TTY ;
+! Deassign and disable the interrupt for a character received from TTY.
+;
+
+simple procedure Disable!TTY;
+begin "Disable!TTY"
+  intmap(tinass(-1, !iachr, 0), TTYSvc, 0);
+  disable(newenb(AuxWinChn));
+end "Disable!TTY";
+!! title Rtn MakeLoginString ;
+! Create a fully specified user login string from a fragment thereof
+!
+!       o  The following defaults are handled by this procedure:
+!
+!              <null>           defaults to LIUN:CSYS
+!              nnnn             defaults to nnnn:HSYS
+!                                   (won't work from uNodes)
+!              nnnn:            defaults to nnnn:CSYS
+!              nnnn:ssss                    nnnn:ssss
+!              :ssss            defaults to LIUN:ssss
+!          where
+!
+!              LIUN = logged in user name
+!              CSYS = current system number
+!              HSYS = home system number
+;
+
+
+simple string procedure MakeLoginString (string LoginString);
+begin "MakeLoginString"
+  integer
+    I;
+  string
+    S;
+
+    S           _ LoginString;
+    LoginString _ null;
+
+      ! Keep a copy of the original around.
+      ;
+
+    while (length(S)) do 
+      appnd(LoginString,
+          (
+            if "a" <= (I _ lop(S)) <= "z" then
+              I - '40
+            else
+              I
+          )
+      );
+
+      ! Convert to upper case.
+      ;
+ 
+
+! Handle Defaults in the Login String
+;
+
+    if (length(LoginString) = 0) then
+      LoginString _ ":";
+
+      ! Accept all defaults.
+      ;
+
+    if (LoginString[1 for 1] = ":") then
+      LoginString _
+          cv6str(calli(xwd(-1, !gtunm), calli!GetTab)) &
+          cv6str(calli(xwd(-1, !gtun1), calli!GetTab)) &
+          LoginString;
+
+      ! Supply correct username.
+      ;
+
+    if (LoginString[inf for 1] = ":") then
+      LoginString _
+          LoginString &
+          cvs(calli(xwd(!cnsys, !gtcnf), calli!GetTab));
+
+      ! Supply correct host number.
+      ;
+
+    return(LoginString);
+end "MakeLoginString";
+!! title Rtn CreAux ;
+! Build a circuit to the specified user name/host.
+! Returns the port number if succesful, returns -1 otherwise.
+! !skip! is also set.
+;
+
+internal integer procedure A!CreAux (reference string LoginString);
+begin "CreAux"
+  integer
+    I,
+    Port;
+  integer array
+    X[0:5];
+  string
+    ErrMsg;
+
+
+    LoginString _ MakeLoginString(LoginString);
+
+      ! Fill in all defaults in the login string.
+      ;
+
+    W!Msg("Login: " & LoginString & " [Working]");
+    W!Disp(true);
+
+      ! Keep the User Informed.
+      ;
+
+
+! Pack the String into an Array and Call the Monitor to Build the Circuit
+;
+
+    for I _ 0 step 1 until 5 do
+      X[I] _ cvasc(LoginString[1+5*I to 5+5*I]);
+
+    Port _
+    I    _ calli(location(X[0]), calli!CreAux);
+
+
+! If the Monitor Call Skipped, Return the Port Number to Our Caller
+;
+
+    if (!skip!) then
+    begin
+      W!Msg("Login: " & LoginString & " [Ok]");
+      return(I);
+    end;
+
+
+! Otherwise, we got an error, print the message
+;
+
+    case (lh(I)) of
+    begin
+      [cxsup#]
+        case (rh(I)) of
+        begin
+          [cxsfe#]
+            ErrMsg _ "?format error";
+          [cxsbu#]
+            ErrMsg _ "?not in MUD";
+          [cxsbm#]
+            ErrMsg _ "?bad MUD";
+          [cxshu#]
+            ErrMsg _ "?host unavailable";
+          [cxsdf#]
+            ErrMsg _ "?download/dialout failure";
+          [cxsto#]
+            ErrMsg _ "?timeout";
+          [cxsab#]
+            ErrMsg _ "?access barred";
+          [cxsis#]
+            ErrMsg _ "?error in ISIS";
+          [cxslq#]
+            ErrMsg _ "?long queue in supervisor";
+          else
+            ErrMsg _ "?supervisor error: '" & cvos(rh(I))
+        end;
+
+    [cx2ax#]
+      ErrMsg _ "?too many circuits";
+    [cxlog#]
+      ErrMsg _ "?not your username";
+    [cxdcb#]
+      ErrMsg _ "?no room in monitor";
+    [cxnrr#]
+      ErrMsg _ "?sup ignored original req";
+    [cxnrl#]
+      ErrMsg _ "?sup ignored login message";
+    [cxnch#]
+      ErrMsg _ "?sup supplied no circuit";
+    [cxerr#]
+      ErrMsg _ "?sup error on original request";
+    else
+      ErrMsg _ "?unknown error: '" & cvos(lh(I))
+  end;
+
+  W!Msg("Login: " & LoginString & " [failed]");
+  W!Msg2("[" & ErrMsg & "]");
+  clear(!skip!);
+  return(-1);
+end "CreAux";
+!! title Rtn OutC ;
+! Insert characters into the buffer.  (^H is interpreted, nulls are
+! ignored, and all other characters are inserted verbatim.
+;
+
+simple procedure OutC (integer C);
+begin "OutC"
+  case (C land !mask(7)) of
+  begin
+    [NUL]
+      ;
+    [BS]
+      begin
+        B!Move(BACKWARDS);
+        B!Delete(FORWARDS);
+      end;
+    else
+      B!Insert(C)
+  end;
+end "OutC";
+!! title Rtn TakeCareOfChars ;
+! Take care of inserting characters received on the aux circuit into the
+! buffer.
+;
+
+simple procedure TakeCareOfChars;
+begin "TakeCareOfChars"
+  start!code
+    define
+      Ac13 = '13,
+      Ac14 = '14,
+      P    = '17;
+    label
+      Loop,
+      Done,
+      Zapped;
+
+      hrl       Ac13, Port;             ! Taking from the aux circuit ;
+      hrri      Ac13, !axI8C;           ! Get a char - wait if necessary ;
+      auxcal    Ac13, Ac14;             ! Put it in Ac14 ;
+        jrst    Zapped;                 ! Circuit is hosed - go away ;
+
+      push      P, Ac14;                ! Output the char ;
+      pushj     P, OutC;                ! using OutC ;
+
+    Loop:
+      hrl       Ac13, Port;             ! Taking from the aux circuit ;
+      hrri      Ac13, !axI8S;           ! Get a char ;
+      auxcal    Ac13, Ac14;             ! Put it in Ac14 ;
+        jrst    Done;                   ! None exists - go away ;
+
+      push      P, Ac14;                ! Output the char ;
+      pushj     P, OutC;                ! using OutC ;
+      jrst      Loop;                   ! Go get another char ;
+
+    Zapped:
+      setom     CktZapped;              ! Flag loss of the circuit ;
+
+    Done:
+  end;
+end "TakeCareOfChars";
+!! title Rtn A!AuxWindow ;
+!                               A!AuxWindow
+!
+!       assumes echo is off on command port
+!       takes over terminal for duration of circuit
+!       uses SAIL immediate interrupts - beware!
+;
+
+internal procedure A!AuxWindow (reference integer AuxPort);
+begin "A!AuxWindow"
+  Port _ AuxPort;
+
+    ! A local copy for local uses.
+    ;
+
+  if (Port >= 0) then
+  begin "OK"
+    clear(ChangingEscChr);
+    clear(EscFlg);
+    clear(EscSeen);
+    clear(CktZapped);
+
+    Enable!TTY;                       ! enable interrupts;
+
+    do
+    begin
+      W!Disp(true);                   ! Redisplay before getting chars ;
+      TakeCareOfChars;                ! Input and insert characters ;
+    end
+    until (EscFlg or CktZapped);
+
+    Disable!TTY;                      ! disable interrupts;
+
+    if (CktZapped) then
+      AuxPort _ Port _ -1;
+
+      ! <<  Otherwise: is there anything we should do to the aux circuit
+      !     to handle backpressure, funny colored balls, etc?
+      ;
+
+    W!Disp(true);
+  end "OK";
+end "A!AuxWindow";
+!! title Rtn A!Fini ;
+! Close down shop before exitting for good.
+;
+
+internal simple procedure A!Fini;
+begin "A!Fini"
+  if (Port >= 0) then
+    calli(Port, calli!ZapCir);
+
+    ! Zap the circuit if it remains open.
+    ;
+end "A!Fini";
+end "AuxWin";
+endc
+
+
+! *************************  End of AuxWin.Sai  **************************;
+    
