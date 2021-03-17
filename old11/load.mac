@@ -1,0 +1,475 @@
+	.TITLE	LOAD	Down line loader routines
+	.SBTTL	LOAD   - NEXILIS/JRG/BRN
+
+	XLPAR				;DON'T LIST PARAMETER FILES
+
+	CODE
+
+;Define load response codes
+
+.LROK =!100		;OK
+.LRINN=!101		;Illegal node name
+.LRNSN=!102		;No such node
+.LRNNI=!103		;Node not idle
+;.LRCSE=!104		;Checksum error
+;.LRPOV=!105		;Packet overflow
+.LRPCE=!106		;Protocol error
+.LRFIN=!107		;Finished load
+.LRTIM=!110		;1 minute time out
+.LRRFS=!111		;Refused by protocol module
+.LRNHW=!112		;No hardware present
+
+;
+; SDWDFG bit definitions
+;
+$END=!1		;End of transmition
+$SKIP=!2	;Skip the poke entry for now
+$BYT2=!4	;Byte 2 of the count is waiting
+
+	.SBTTL	LOAD   - Initialization subroutines
+	.SBTTL	LOAD   - WDDDBI - Initialize DDB
+
+;Subroutine to initialize the DDB
+;	C(R4) = Address of DDB
+;	CALL	WDDDBI
+
+WDDDBI::RETURN
+
+	.SBTTL	LOAD   - WDSDBI - Initialize SDB
+;Subroutine to initialize the SDB
+;	C(R4) = Address of DDB
+;	C(SD) = Address of SDB
+;	CALL	WDSDBI
+
+WDSDBI::MOV	#SDWDCZ#,R1		;NUMBER OF WORDS TO CLEAR
+	MOV	#SDWDFC#,R2		;Offset to start
+	ADD	SD,R2			;Make address
+WDSDB2:	CLR	(R2)+
+	SOB	R1,WDSDB2
+	MOVB	#1,SDWDSA#(SD)		;Initialize state
+	BIS	#$S1AVL,SDSTS1#(SD)	;Make it available
+RTN001:	RETURN				;Thats all!
+	.PAGE
+	.SBTTL	LOAD   - Subroutines called by packet service
+	.SBTTL	LOAD   - WDRSUM - Resume entry
+
+;Subroutine called to restart transmission to packet service after it has
+;  been stopped (This subroutine should never be called!)
+;	C(SD) = Address of SDB
+;	CALL	LDRSUM
+
+WDRSUM::RETURN				;Just return since we don't do enough
+					;  output to worry about being stopped!
+
+	.SBTTL	LOAD   - WDPOKE - Poke entry
+;Subroutine called when data is tranfered to idle load device from packet
+;  service
+;	C(R1) = Address of packet
+;	C(R4) = Address of DDB
+;	C(SD) = Address of SDB
+;	CALL	WDPOKE
+
+WDPOKE::MOVB	PKTYPE(R1),R0		;Get packet type
+LDPOK2:	ASL	R0			;Times 2
+	JMP	@PKTDSP(R0)		;Dispatch on packet type
+
+;Packet type dispatch table
+
+PKTDSP:	.WORD	LDDATA		;.PTDAT =  0 - DATA
+	.WORD	LDCONC		;.PTCON =  1 - CONNECT
+	.WORD	LDILPK		;.PTACK =  2 - CONNECT ACK
+	.WORD	LDILPK		;.PTNAK =  3 - CONNECT NAK
+	.WORD	LDFUNC		;.PTFUN =  4 - FUNCTION
+	.WORD	LDFUNC		;.PTINT =  5 - INTERRUPT
+	.WORD	LDFUNC		;.PTEAT =  6 - EAT
+	.WORD	LDDISC		;.PTDIS =  7 - DISCONNECT
+	.WORD	LDDISC		;.PTKIL = 10 - KILL CONNECTION
+	.WORD	LDDISA		;.PTDAK = 11 - DISCONNECT ACK
+	.WORD	IGNPKT		;.PTRCR = 12 - Reconnect request
+
+;Here for Function type packet
+
+LDFUNC:	CMPB	#.FNREQ,PKDATA(R1)	;Is this a Request function?
+	BNE	IGNPKT			;No-ignore it!
+	MOVB	#.FNRSP,PKDATA(R1)	;Yes-change to Response
+	CALL	PKTRTN#			;And send it back
+	BR	LDDATA			;Continue
+
+;Here for illegal packet type
+
+LDILPK:	RSTOP	IPT			;[ILLEGAL PACKET TYPE]
+
+;
+; Here for Disconnect ack
+;
+
+LDDISA:	CALL	JNKPKT#			;Get rid of this packet
+	CJMP	FRESOC#			;Give back this socket
+	.PAGE
+;Here for connect packet
+
+LDCONC:	MOV	#377*400,R2		;We don't care about the profile, etc.
+	CALL	ACCEPT#			;Accept the connection
+	BCS	RTN001			;If not enough priv.!
+	MAKPKT	.PLSTP#			;Get a free packet
+	BCS	1$			;Can't tell him
+	INCB	SDPCNT#(SD)		;Count the packet
+	MOV	R1,R2			;Make our pointer
+	ADD	#PKCNT,R2		;
+	MOV	#TYPMES,R3		;Get the pointer for the type message
+	MOV	#TYPSIZ,R0		;Get the number to do
+2$:	MOV	(R3)+,(R2)+		;Copy into the packet
+	SOB	R0,2$			;Around till done
+	CALL	SNDPKT#			;Send it on its way
+1$:	CALL	WDSDBI			;Initialize SDB
+	BR	LDDAT2			;Go see if any data now
+
+;Here for packets which are ignored
+
+IGNPKT:	CALL	JNKPKT#			;Give up the packet
+	BR	LDDATA			;Go see if more packets
+
+;Here for disconnect packet
+
+LDDISC:	CALL	FINDIS#			;Finish disconnecting
+	MOV	SDWDLK#(SD),R4		;Get address of ddb
+	BEQ	2$			;If none
+	MOV	#6,R0			;Terminate loading
+	CALL	@DDLKLD#(R4)		;Tell the protocol routine
+2$:	CLR	SDWDLK#(SD)		;Clear link to link
+	CALL	WDSDBI			;Initialize the SDB
+	RETURN				;Finished
+
+;Here for data character
+
+LDDATA:	TSTB	SDWDSA#(SD)		;Should we fetch it now?
+	BNE	LDDAT2			;If in initial state go on
+	MOV	SDWDLK#(SD),R4		;Get the DDB for the link
+	MOV	#10,R0			;Poke for link service routine
+	CJMP	@DDLKLD#(R4)		;Go wake link
+
+LDDAT2:	CALL	GETBYT			;Yes-get next byte
+	BEQ	RTN001			;If nothing more there
+	BCS	LDPOK2			;If control packet
+	TBBE	200,R0,LDDAT3		;WE ONLY TAKE 7 BIT CHARS
+	MOVB	#1,SDWDSA#(SD)		;Initialize the state
+	BR	LDDAT2			;Try again
+
+LDDAT3:	MOVB	SDWDSA#(SD),R2		;Data-get state
+	ASL	R2			;Times 2
+	JMP	@STADSP-2(R2)		;Dispatch on the state
+
+;State dispatch table
+
+STADSP:	.WORD	NODNM1			; 1 - First character of node name
+	.WORD	NODNM2			; 2 - Second character of node name
+	.WORD	NODNM3			; 3 - Third character of node name
+	.WORD	NODNM4			; 4 - Fourth character of node name
+	.WORD	NODNM5			; 5 - Fifth character of node name
+	.WORD	NODNM6			; 6 - Sixth character of node name
+
+;Here for first character of node name
+
+NODNM1:	CALL	GETRDX			;Get radix-50 value
+	MUL	#50*50,R3		;In right place
+	BR	NODNXA			;Continue
+
+;Here for second character of node name
+
+NODNM2:	CALL	GETRDX			;Get radix-50 value
+	MUL	#50,R3
+	BR	NODNXA			;Continue
+
+;Here for third character of node name
+
+NODNM3:	CALL	GETRDX
+NODNXA:	ADD	R3,SDWDN1#(SD)
+	BR	NODNMX
+
+;Here for fourth character of node name
+
+NODNM4:	CALL	GETRDX
+	MUL	#50*50,R3
+	BR	NODNXB			;Continue
+
+;Here for fifth character of node name
+
+NODNM5:	CALL	GETRDX
+	MUL	#50,R3
+NODNXB:	ADD	R3,SDWDN2#(SD)		;Merge into SDB
+NODNMX:	INCB	SDWDSA#(SD)		;Increment state
+	BR	LDDAT2			;Continue if more data now
+
+;Here for sixth character of node name
+
+NODNM6:	CALL	GETRDX
+	ADD	R3,SDWDN2#(SD)
+	MOV	#L0$#,R4		;Point to first link ddb
+LDDAT5:	CMP	DDLKN1#(R4),SDWDN1#(SD)	;This one?
+	BNE	LDDAT6			;NO
+	CMP	DDLKN2#(R4),SDWDN2#(SD)	;Maybe
+	BEQ	LDDAT7			;YES
+LDDAT6:	MOV	DDLKNX#(R4),R4		;No-step to next link DDB
+	BNE	LDDAT5			;Go on if more
+	MOV	#.LRNSN,R0		;No more-say "no such node"
+LDBADN:	CALL	PUTBYX			;Send back to other end
+	CALL	WDSDBI			;Initialize SDB
+;	MOV	#.PTDIS,R0		;Followed by disconnect packet
+;	CALL	CTLPKX#			;MAKE ONE NO MATTER WHAT
+;	MOV	#.ERDER,R0		;Indicate device level error
+;	CJMP	CTLSTE#			;Send it and leave
+	RETURN
+
+;Here with match on node name
+
+LDDAT7:	MOV	R4,SDWDLK#(SD)		;Save ddb address for later
+	TBBE	$D0HST,DDSTS0#(R4),10$	;Skip if not a host
+	MOV	#.LRNSN,R0		;No such node (cannot load a host)
+	BR	LDBADN			;Abort load
+
+10$:	TBBN	$D1DWN,DDSTS1#(R4),LDDAT8;Is this link down now?
+	MOV	#.LRNNI,R0		;No-say "node not idle"
+	BR	LDBADN
+
+;Here if link to node to load is idle now
+
+LDDAT8:	TBBE	$D1UNV,DDSTS1#(R4),10$ ;Skip if hardware present
+	MOV	#.LRNHW,R0		;Tell loader no hardware
+	BR	LDBADN			;Abandon load
+
+10$:	CLRB	SDWDSA#(SD)		;Clear the state
+	BIS	#$SKIP,SDWDFG#(SD)	;We are done in poke
+	PUSH	SD			;Save SDB address
+	PUSH	R1
+	MOV	#60.,SDWDTO#(SD)	;Set up time out timer
+	MOV	#4,R0			;Enter load mode
+	MOV	DDLKLD#(R4),R2		;Get the address of the device service
+					;routine
+	BEQ	20$			;No service routine
+	CALL	(R2)			;Start load sequence
+	BCC	30$			;If no problems
+	POP	R1
+	POP	SD
+20$:	MOV	#.LRRFS,R0		;He refuses!
+	BR	LDBADN			;We will abandon this now.
+
+30$:	POP	R1
+	POP	SD			;Restore SDB address
+	MOV	#.LROK,R0		;SAY "OK"
+PUTBYX:	CALL	PUTBYT#			;Store byte into packet
+	  NOP
+	MOV	#LF,R0			;
+	CALL	PUTBYT#			;
+	  NOP
+	CJMP	SNDDPK#			;Force the packet out and return
+
+;Subroutine to get radix-50 value and check for end of name
+;	C(R0) = Ascii character
+;	CALL	GETRDX
+;	C(R0) = RADIX-50 VALUE
+
+GETRDX:	BIC	#^C177,R0		;Just seven bits worth
+	CMP	#'A,R0			;Letter?
+	BGT	GETRD4			;NO
+	CMP	#'Z,R0
+	BLT	BADNAM			;No-error
+	BIC	#^C77,R0		;Yes-change to radix-50 value
+	BR	GETRD6			;Return
+
+;Here if not letter
+
+GETRD4:	CMP	#'0,R0			;Is it a number?
+	BGT	BADNAM			;No-error
+	CMP	#'9,R0
+	BLT	BADNAM			;No-error
+	SUB	#22,R0			;Yes-convert to radix-50
+GETRD6:	MOV	R0,R3			;Get into right ac
+	RETURN				;All done
+
+;Here if illegal name
+
+BADNAM:	CMPB	#' ,R0			;A blank?
+	BNE	1$			;If not its bad
+	CLR	R3			;Our return for blank
+	RETURN
+
+1$:	TST	(SP)+			;Clean the stack up
+	MOV	#.LRINN,R0		;Send back the error code
+	BR	LDBADN
+	.PAGE
+	.SBTTL	LOAD   - NXTLOD - Main level load entry
+
+;Subroutine to fetch next packet to send to node being loaded
+;	C(R4) = Address of DDB of link being used
+;	CALL	NXTLOD
+;	C(R0) = RETURN INDEX:
+;		 0 = Nothing available
+;		 2 = Data packet ready, C(R1) = Address of packet
+;		 4 = Switch to load mode
+;		 6 = Terminate load
+
+NXTLOD::PUSH	R4			;Save DDB address
+	MOV	#W0$1#,SD		;Yes-get address of our SDB
+	CMP	SDWDLK#(SD),R4		;Are we loading over this link?
+	BNE	NXTPRE			;No-stop this nonsense!
+NXTLD0:	CALL	GETBYT#			;Get data byte
+	BEQ	NXTRT0			;If nothing there
+	BCS	NXTCTL			;If control packet
+	TBBN	$BYT2,SDWDFG#(SD),NXTCNT;If set we have second byte to chuck
+	TSTB	SDWDBC#(SD)		;Are we in the middle of a packet?
+	BEQ	NXTLD1			;NO
+	TST	SDWDPP#(SD)		;Yes-has the packet been allocated?
+	BEQ	NXTLD3			;No-go do that now
+	BR	NXTLD4			;Yes
+
+NXTCNT:	BIC	#$BYT2,SDWDFG#(SD)	;Clear the second byte flag
+	BR	NXTLD0			;Get the next byte
+
+;Here if nothing available now
+
+NXTRT0:	CLR	R0			;Say nothing available now
+NXTRTN:	POP	R4			;Restore link DDB address
+	RETURN
+
+;Here to start new packet
+
+NXTLD1:	BIS	#$BYT2,SDWDFG#(SD)	;Dump the next byte
+	TSTB	R0			;What have we got?
+	BPL	NXTLD2			;If positive, a normal count
+	CMPB	#-4,R0			;Switch to load mode?
+	BEQ	NXTSLM			;YES
+	CMPB	#-6,R0			;Terminate load mode?
+	BEQ	NXTFIN			;Yes finish up
+NXTPRE:	MOV	#.LRPCE,R0		;No-say "protocol error"
+	CALL	LDBADN			;Send back message and disconnect
+NXTEND:	MOV	#6,R0			;Stop everything!
+	MOV	#60.,SDWDTO#(SD)	;Make the disconnect timer start
+	BR	NXTRTN			;Tell driver to terminate
+
+;Here with byte count to start data block
+
+NXTLD2:	CMP	#PKCMAX,R0		;Too big?
+	BLT	NXTPRE			;Yes-fail
+	MOVB	R0,SDWDBC#(SD)		;Ok-store count
+	BR	NXTLD0			;Dump second byte
+
+NXTLD3:	MAKPKT	.PLSTP#			;Get a packet
+	BCS	NXTRT0			;If no packet is available
+	MOV	R1,SDWDPP#(SD)		;Store address of packet
+	MOV	R1,SDWDDP#(SD)		;Store data pointer
+	ADD	#PKDATA,SDWDDP#(SD)	;POINT TO DATA AREA
+	MOVB	SDWDBC#(SD),PKCNT(R1)	;Store count in packet
+NXTLD4:	MOVB	R0,@SDWDDP#(SD)		;Store data in packet
+	INC	SDWDDP#(SD)		;Bump pointer
+	DECB	SDWDBC#(SD)		;Reduce count
+	BNE	NXTLD0			;Continue if packet now full
+	MOV	SDWDPP#(SD),R1		;Full-get address of packet
+	CLR	SDWDPP#(SD)		;Clear our pointer
+	CLR	SDWDDP#(SD)		;
+	MOV	SDWDLK#(SD),R4
+	MOV	#60.,SDWDTO#(SD)	;Reset the timer
+	MOV	#2,R0			;Get return code
+	BR	NXTRTN			;Return with packet to send
+
+;Here if should switch to load mode
+
+NXTSLM:	MOV	#4,R0			;Get return index
+	BR	NXTRTN			;And return
+
+NXTFIN:	MOV	#.LRFIN,R0		;Get the finished code
+	CALL	PUTBYX			;Send the result code back to loader
+;	MOV	#.PTDIS,R0		;Want a disconnect
+;	CALL	CTLPKX#			;Make a control packet
+;	MOV	#.ERREQ,R0		;He requested this
+;	CALL	CTLSTE#			;Send it on it's way
+	BR	NXTEND			;Finished
+;Here if control packet
+
+NXTCTL:	ASL	R0			;Packet type times 2
+	JMP	@NXTDSP(R0)		;Dispatch on the packet type
+
+;Packet type dispatch table
+
+NXTDSP:	.WORD	LDILPK		;.PTDAT =  0 - DATA
+	.WORD	LDILPK		;.PTCON =  1 - CONNECT
+	.WORD	LDILPK		;.PTACK =  2 - CONNECT ACK
+	.WORD	LDILPK		;.PTNAK =  3 - CONNECT NAK
+	.WORD	NXTFUN		;.PTFUN =  4 - FUNCTION
+	.WORD	NXTFUN		;.PTINT =  5 - INTERRUPT
+	.WORD	NXTFUN		;.PTEAT =  6 - EAT
+	.WORD	NXTDIS		;.PTDIS =  7 - DISCONNECT
+	.WORD	NXTDIS		;.PTKIL = 10 - KILL CONNECTION
+	.WORD	LDILPK		;.PTDAK = 11 - DISCONNECT ACK
+	.WORD	NXTIGN		;.PTRCR = 12 - Reconnect request
+
+;Here for Function type packet
+
+NXTFUN:	CMPB	#.FNREQ,PKDATA(R1)	;Is this a Request function
+	BNE	NXTIGN			;No-ignore it
+	MOVB	#.FNRSP,PKDATA(R1)	;Yes-change to a Response function
+	CALL	PKTRTN#			;Send it back
+	BR	NXTLD0			;Continue
+
+;Here to ignore packet
+
+NXTIGN:	CALL	JNKCPK#			;Give up the packet
+	BR	NXTLD0			;Continue
+
+;Here for disconnect packet
+
+NXTDIS:	CALL	FINDIS#			;Finish disconnecting
+	CALL	WDSDBI			;Initialize the SDB
+	BR	NXTEND			;Say to stop loading
+	.PAGE
+	.SBTTL	LOAD   - MOVLOD	- Send packet back to sender
+;Subroutine to send packet back to other end from node being loaded
+;	C(R1) = Address of packet
+;	C(R4) = Address of DDB for link being used
+;	CALL	MOVLOD
+
+MOVLOD::PUSH	R4			;Save DDB address
+	MOV	#W0$1#,SD		;Get address of our SDB
+	CLRB	PKTYPE(R1)		;Make sure its a data packet
+	MOVB	#1,PKCNT(R1)		;Containing 1 byte
+	INCB	SDPCNT#(SD)		;Increase our packet count
+	CALL	SNDPKT#			;Send the packet
+	BR	NXTRTN			;Restore DDB address and return
+	.PAGE
+	.SBTTL	LOAD   - WDSEC - Once a second routine
+
+;Here once a second to see if our 1 minute timer has gone off
+
+	ONCSEC	WDSEC
+
+WDSEC:	MOV	#W0$1,SD		;Set up SD
+	MOV	SDWDLK#(SD),R4		;Get the DDB pointer
+	BEQ	RTN004			;If zero, quit now
+	TST	SDWDTO#(SD)		;Zero ? if so skip this
+	BEQ	RTN004
+	BPL	10$			;Check for normal count down
+	INC	SDWDTO#(SD)
+	BNE	RTN004
+	CALL	WDSDBI			;Init the SDB
+	MOV	#.PTKIL,R0		;Set up for a kill
+	CALL	CTLPKX#			;Build a control packet
+	MOV	#.ERDER,R0		;Device level error
+	CJMP	CTLSTE#			;Send the packet out
+10$:	DEC	SDWDTO#(SD)
+	BNE	RTN004
+	MOV	#6,R0			;Terminate load mode
+	CALL	@DDLKLD#(R4)		;Call driver
+	MOV	#-5,SDWDTO#(SD)		;Kill circuit in 5 seconds 
+	MOV	#.LRTIM,R0		;Report timeout
+	CJMP	PUTBYX			;Send back to other end
+
+RTN004:	RETURN
+	.PAGE
+	.SBTTL	LOAD - Data area for load device
+	PURE
+
+TYPMES:	.BYTE	3,.PTFUN,0,0		;Header
+	.BYTE	.FNRDP,.TPWID,132.	;Data
+TYPSIZ=!<.-TYPMES+1>/2
+	.EVEN
+	.END
+   
