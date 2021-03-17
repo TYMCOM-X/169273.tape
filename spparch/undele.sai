@@ -1,0 +1,592 @@
+begin "undelete"
+
+require "(SAILIB)SAIL.DEF" source!file;
+define VER={1};
+require VER version;
+define left(word)={word land '777777000000};
+define LC.ECS={!bit(2)};
+define !strngloop={
+    Fini_length(CM);
+    For i_1 upto Fini do
+	if (x_lop(CM)) = (y_lop(!s)) then continue
+	else begin
+	 helpmsg;
+	 return;	! if in interact mode, return to main pgm;
+	end;
+    end };
+!	This program works in conjunction with Dirit to undelete
+	deleted files.  When Dirit is passed the /3 switch and a
+	file is deleted, the file is renamed to ######.tmp.  That is,
+	it is soft deleted.  Soft deleted files may be reclaimed
+	up to the point when they are expunged by either Gfd, Logout,
+	or the Undel "purge" command.  This program can be called
+	directly or a command string may be passed to it with the
+	monitor Undel command.
+;
+!get!module(extend);
+record!class filset(INTEGER filnme,filext,filownr;
+		    RECORD!POINTER(ANY!CLASS) next);
+record!pointer(any!class) UFR,header,temphdr,endptr;
+integer PPN,EOF,Errcode,Inichan,Brkcr,
+	Tabspdel,Tabspbk,Tabextbk,Tabspdotdel,Tabflush,Tabsw,Tabcomfl,
+	Tabnonspbk,Ownrppn;
+string Cmd,Cmd2,Line,Ownrnme,COMLINE,EXPNAME,EXPEXT;
+boolean ALREADYINIT,CMDSW,Cmdflgsw,!everyfile,otherdelfils;
+
+require "(SAILIB)cvppn.req" source!file;
+
+simple procedure Endprog;
+begin
+    call(0,"reset");
+    call(0,"exit");
+end;    
+
+simple procedure Errxit(integer Value,Code; string Msg);
+begin
+    print (Msg);
+    if Code=1 then print (Value);
+    print (crlf);
+    Endprog;
+end;
+
+
+simple procedure Dskopenerr;
+    if Eof then Errxit(Eof,1,"?Error opening DSK: ");
+
+simple procedure Diritinierr;
+    Errxit(!rh(Errcode),1,"?Dirit.ini file selection error ");
+
+simple boolean procedure Endisini;
+begin
+    open(Inichan_getchan,"DSK",0,1,1,'776*5,Brkcr,Eof);
+    Dskopenerr;
+    lookup(Inichan,"Dirit.ini",errcode);
+    if Errcode then
+        if !rh(Errcode) then
+            Diritinierr
+        else return(false)
+    else return(true);
+end;
+
+simple boolean procedure Slash3;
+begin
+    boolean Found;
+    Cmd_"";
+    Found_false;
+    do begin
+            Cmd_Cmd&input(Inichan,Tabsw);
+            if not Eof then begin
+                input(Inichan,Tabnonspbk);
+                if Brkcr="3" then Found_true
+                else Cmd_Cmd&"/"&Brkcr;
+            end;
+        end
+    until Eof;
+    if Cmd[inf-1 to inf] neq crlf then        Errxit(0,0,"?Dirit.ini not terminated by crlf");
+    return(Found);
+end;
+
+simple procedure Supdirini;
+begin
+    enter(Inichan,"Dirit.ini",Errcode);
+    if Errcode then Diritinierr;
+    useto(Inichan,1);
+    out(Inichan,Cmd);
+    close(Inichan);
+end;
+
+procedure UFDINI;
+begin
+    own integer CHAN;
+    if not ALREADYINIT then begin "UFDINIT"
+        ALREADYINIT_true;
+        PPN _ call(0,"GETPPN");
+        CHAN _ getchan;
+        open(CHAN,"DSK",0,0,0, 0,0,EOF);
+        Dskopenerr;
+        begin "LOOKUP"
+        integer array X[0:3];
+        X[0] _ 3;
+        X[1] _ !hl(1)+!hr(1);
+        X[2] _ PPN;
+        X[3] _ cvsix("UFD");
+        chnior(CHAN,X[0],4);
+        end "LOOKUP";
+        if not !SKIP! then Errxit(PPN,1,"?can't lookup UFD: ");
+    end "UFDINIT";
+    UFR _ INIUFR("*","TMP",CHAN,'52);
+end;
+
+simple boolean procedure WildMatch (string Name, Ename);
+begin
+   if not equ (Ename, "*") then begin
+      if length (Ename) < length (Name) then return (false);
+      while length (Ename) do begin
+         integer En;
+         if lop (Name) neq (En_lop (Ename))  and En neq "#" then
+	       return (false);
+      end;
+   end;
+   return (true);
+end;
+
+simple string procedure STTIME (integer TIME);
+begin
+    string X;
+    integer A,B;
+    getformat(A,B);
+    setformat(2,0);
+    X _ cvs(TIME%3600);
+    setformat(-2,0);
+    X _ X & ":" & cvs(TIME%60 mod 60) & ":" & cvs(TIME mod 60);
+    setformat(A,B);
+    return(X);
+end;
+
+simple integer procedure Getlch;
+begin
+    integer I;
+    start!code
+        setom I;
+        ttcall 6,I;
+    end;
+    return (I);
+end;
+
+procedure Getownr;
+begin
+	integer parenflush;
+	setbreak (parenflush_getbreak," )","() ","IS");
+	ownrnme_scan(COMLINE,parenflush,brkcr);
+	ownrppn_cvppn(ownrnme);
+end;
+
+procedure Prnerr (integer errwrd);
+begin
+		    case !rh(errwrd) of begin
+		    [0] print ("     ","**ILLEGAL FILE NAME!**",crlf);
+		    [2] print ("     ","**PROTECTION FAILURE!**",crlf);
+		    [4] print ("     ","**ALREADY EXISTING FILE!**",crlf);
+		    [5] print ("     ","**ILLEGAL UUO SEQUENCE!**",crlf)
+		    end;
+end; 
+  
+Procedure helpmsg;
+Begin
+        string SW;
+        if CMDSW then SW_"/" else SW_"";
+        print ("
+One of the following...
+   ",SW,"list <files> - list specified deleted files
+   ",SW,"recover <files> - recover specified deleted files
+   ",SW,"purge <files> - expunge specified deleted files
+   ",SW,"select <files> - select action on a per file basis
+   ",SW,"fast<switch><files> - display only the file name(s)
+   ",SW,"enable - deleted files not expunged until logout or gfd
+   ",SW,"disable - files will be expunged when deleted",crlf,
+            if not CMDSW then "   quit - end program"&crlf&crlf else
+                "   /begin - enter undelete program
+If no command is given, ""/recover"" is assumed"&crlf);
+If CMDSW then Endprog;
+Cmdflgsw_true;		! return to main pgm if in interactive mode ;
+End;
+
+
+! Procedure stringchk will verify that the user has entered a valid   ;
+! substring as a command swithch to UNDELETE                          ;
+
+Procedure strngchk (string !LET,CM);
+Begin
+  integer i,Fini;
+  string x,y,!s;
+   If (!LET = "R") and (length(CM) leq 6) then begin
+	!s_"ECOVER";
+	!strngloop
+   Else if (!LET="L") And (Length(CM) Leq 3) then begin
+	!s_"IST";
+	!strngloop
+   Else if (!LET="P") and (length(CM) leq 4) then begin
+	!s_"URGE";
+	!strngloop
+   Else if (!LET="S") and (length(CM) leq 5) then begin
+	!s_"ELECT";
+	!strngloop
+   Else if (!LET="E") and (length(CM) leq 5) then begin 
+	!s_"NABLE";
+	!strngloop
+   Else if (!LET="D") and (length(CM) leq 6) then begin
+	!s_"ISABLE";
+	!strngloop
+   Else if (!LET="B") and (length(CM) leq 4) then begin
+	!s_"EGIN";
+	!strngloop
+   Else if (!LET = "F") and (length(CM) leq 3) then begin
+	!s_"AST";
+	!strngloop
+   Else if !LET = "?" then helpmsg
+   Else if !Let = "Q" and not CMDSW then endprog
+   Else helpmsg;
+End;
+
+
+! Procedure Getrecent will examine the user's directory in order to ;
+! find the most current or recent version of a file when there is   ;
+! more than one file that fits the user specified description       ;
+
+Procedure Getrecent (reference record!pointer(any!class) filptr,endptr;
+	integer array U,X; integer CHAN);
+begin
+   integer mostrecent;
+   boolean filfnd;
+   integer array T[0:'40],UTEMP[0:4];
+   filfnd_false;
+   otherdelfils_false;
+   arrblt(UTEMP[0],U[0],4);
+   mostrecent_U[3];
+
+! Continue searching through the user's directory in order to find ;
+! any more deleted files that match the given specifications       ;
+   do begin "GETLOOP" 
+	if not NXTUFR(U,filptr) then done;  ! no more files;
+	T[0]_arrinfo(T,2);
+	T[1]_PPN;
+	T[2]_U[0];
+	T[3]_U[1];
+	chnior(CHAN,T[0],4);
+	if not !SKIP! then continue;
+	if (not !everyfile) and (T[6] neq ownrppn) then continue;
+	if (T[6] = 0) or (t[7] = 0) or not (wildmatch(cv6str(T[7]),
+	   EXPNAME) and wildmatch(cv6str(left(T['13])),EXPEXT)) then
+	   continue;
+      filfnd_false;
+      temphdr_header;
+
+! Check through the linked list to find whether we already examined a ;
+! file with this specification. If we have, then ignore it            ;
+        Do begin "CHKLOOP2"   
+	 if equ(cv6str(T[7]),cv6str(filset:filnme[temphdr])) and
+	    equ(cv6str(left(T['13])),cv6str(filset:filext[temphdr])) and
+	    filset:filownr[temphdr] = T[6] then filfnd_true
+	   else if filset:next[temphdr] = NULL!RECORD then done "CHKLOOP2"
+	   else temphdr_filset:next[temphdr];
+	end "CHKLOOP2" until filfnd; 
+
+	if filfnd then continue; ! we looked at this filename before, cont;
+      If (X[7] neq T[7]) or (X['13] neq T['13]) or (X[6] neq T[6]) then
+	otherdelfils_true; ! Wildcards were used and we'll have to    ;
+			   ! come back to look at these               ;
+      If U[3] < mostrecent then continue; ! An old file, we don't want it ;
+      arrblt(X[0],T[0],'41); ! at this point, a more recenet file of the;
+		       ! same name has been found;
+      mostrecent_U[3];
+      arrblt(UTEMP[0],U[0],4);   ! save contents of U;
+   end "GETLOOP" until 0; ! loop terminates by done;
+
+   arrblt(U[0],UTEMP[0],4); ! restore U ;
+
+  	! Insert this filename into the list of already examined files;
+   temphdr_NEW!RECORD(filset);   ! get a new, blank record            ;
+   filset:filnme[temphdr] _ X[7];! put in the name                    ;
+   filset:filext[temphdr] _ left(X['13]);! put in the extension       ;
+   filset:filownr[temphdr] _ X[6]; ! put in the file owner's name     ;
+   filset:next[endptr] _ temphdr;  ! link the record up to the list   ;
+
+   chnior(CHAN,x[0],4);    ! open a channel to this file;
+end;   
+
+
+procedure modechk(reference string STRNGLN; reference boolean quick,
+		  baddspec);
+   Begin
+   string Frstlet,Tempcmd;
+	if (not CMDSW) and (not length(CMD)) then begin
+	   print("'/' cannot be entered as the first character after",
+	   " a '*' prompt. Try again.",crlf);
+	   Baddspec_true;
+	end;
+	scan(STRNGLN,TABSW,BRKCR); ! eliminate the '/' ;
+	scan(STRNGLN,TABSPDEL,BRKCR); ! eliminate any leading blanks;
+	Cmd2_scan(STRNGLN,TABSPBK,BRKCR); ! put 2nd switch into Cmd2;
+	Tempcmd_Cmd2;
+	Frstlet_lop(Tempcmd);
+	Strngchk(Frstlet,Tempcmd); ! See if Cmd2 was valid;
+	If Frstlet = "F" then Quick_true
+	Else begin ! /fast wasn't the 2nd switch, was it the 1st?;
+	   Tempcmd_CMD; 
+	   Frstlet_lop(Tempcmd);
+	   Strngchk(Frstlet,Tempcmd); ! if it's valid, see if it's /fast;
+	   If Frstlet = "F" then begin
+		Quick_true; ! If /fast wasn't 1st switch then ignore;
+		CMD_CMD2; ! the second switch;
+	   end;
+	end;
+end;  
+
+
+
+ifcr compiler!switch("B") thenc usererr(0,0,0,"B"); endc;
+
+begin "MAIN" ! main program;
+boolean NOFILS,Fast,badspec;
+integer CHAN;
+string Tempcmd,Frstlet;
+Fast_false;
+CHAN _ getchan;
+open(CHAN,"DSK",0,0,0, 0,0,EOF);
+Dskopenerr;
+ttyup(true);
+setbreak (TABCOMFL_getbreak," ,/","","IR");
+setbreak (TABSW_getbreak,"/"," ","I");
+breakset (TABNONSPBK_getbreak," ","X");
+setbreak (TABSPDEL_getbreak," ","","XR");
+setbreak (TABSPBK_getbreak," ,/","","IR");
+setbreak (TABEXTBK_getbreak," .,","","IR");
+setbreak (TABSPDOTDEL_getbreak," .","","XR");
+breakset (TABFLUSH_getbreak,",","I");
+CMDSW_LC.ECS land Getlch;
+if CMDSW then begin
+    backup;
+    scan(LINE_inchwl,TABSPDEL,BRKCR);
+    scan(LINE,TABCOMFL,BRKCR);
+    COMLINE_scan(LINE,TABSW,BRKCR);
+    if not length(LINE) and BRKCR neq "/" then
+        CMD_"RECOVER"
+    else begin
+        scan(LINE,TABSPDEL,BRKCR);
+        CMD_scan(LINE,TABSPBK,BRKCR);
+	If Brkcr = "/" then modechk(LINE,fast,Badspec); ! get other switch;
+        COMLINE_COMLINE&LINE;
+    end;
+
+    Tempcmd_CMD;
+    Frstlet_lop(tempcmd);
+    If Frstlet = "B" then strngchk(Frstlet,Tempcmd);
+    case CMD of begin
+        ["BEGIN"] CMDSW_false;
+        [null] CMD_"/";
+    else end;
+end;
+if not CMDSW then print (crlf,"   File Undeleter - Version ",VER,crlf,crlf);
+do begin "CMDLOOP"
+    boolean INTERACTIVE,Found;
+    integer BRK,Nopgfil,Recpgs,Filsiz;
+    !everyfile_false;
+    Cmdflgsw_false;
+    Found_false;
+    NOFILS_true;
+    Recpgs_Filsiz_Nopgfil_0;
+    if not CMDSW then begin
+	Fast_false;
+	Badspec_false;
+        print ("*");
+        scan(COMLINE_inchwl,TABSPDEL,BRKCR);
+        CMD_scan(COMLINE,TABSPBK,BRKCR);
+	If Brkcr = "/" then modechk(COMLINE,fast,Badspec);
+	If Badspec then continue;
+    end;
+    INTERACTIVE_false;
+    BRK_0;
+    Tempcmd_CMD;		! Check for a valid substring of CMD ;
+    Frstlet_lop(Tempcmd);    		
+    strngchk(Frstlet,Tempcmd);	! Call procedure that does actual checking;
+    if not length(COMLINE) then
+	!everyfile_true;	! /p or /r will now affect every deleted;
+				! file in user's directory;
+    if Cmdflgsw then continue;
+    if Frstlet = "F" then begin
+	Fast_true;
+	CMD_"RECOVER";
+	Frstlet_"R";
+    end;
+
+    case CMD of begin
+        ["LIST"] BRK_#cr;
+        ["RECOVER"] 
+		begin
+		      header_NEW!RECORD(filset); ! start a new linked list;
+		      BRK_#dc2;
+		    end;
+        ["PURGE"] BRK_#EOT;
+        ["SELECT"] INTERACTIVE_true;
+        ["ENABLE"]
+            begin
+                if not Endisini then Cmd_"/3"&crlf
+                else if not Slash3 then begin
+                        Cmd_Cmd[1 to inf-2]&"/3"&crlf;
+                        if length(Cmd) geq '776*5 then
+                            usererr(0,0,"?Dirit.ini too big");
+                    end else
+                        continue "CMDLOOP";
+                Supdirini;
+                continue "CMDLOOP";
+            end;
+        ["DISABLE"]
+            if not Endisini then continue "CMDLOOP" else
+                begin
+                    if Slash3 then
+                        if equ(Cmd,crlf) then begin
+                            rename(Inichan,0,0,Errcode);
+                            if Errcode then Diritinierr;
+                        end
+                        else Supdirini;
+		    print ("CAUTION! DANGER! Files will be expunged",
+			   " immediately after deletion!",crlf);
+                    continue "CMDLOOP";
+                end;
+        ["QUIT"] done "CMDLOOP";
+	["BEGIN"]
+	    begin
+	     print ("?You're already in interactive mode. Type ? for help",
+		    crlf);
+	     continue "CMDLOOP";
+	    end;
+        [null] continue "CMDLOOP"
+    end;	! end of case stmt ;
+    if not BRK=#cr then print (crlf);
+    do begin "LISTLOOP"
+        ufdini;
+        scan(COMLINE,TABSPDEL,BRKCR);
+	if brkcr = "(" then getownr
+	    else ownrppn_PPN;
+        EXPNAME_scan(COMLINE,TABEXTBK,BRKCR);
+        scan(COMLINE,TABSPDOTDEL,BRKCR);
+        EXPEXT_scan(COMLINE,TABSPBK,BRKCR);
+	if equ(EXPNAME,"ALL") then EXPNAME_"";
+        scan(COMLINE,TABFLUSH,BRKCR);
+        if not (length(EXPNAME) or length(EXPEXT)) then EXPEXT_"*";
+        if not length(EXPNAME) then EXPNAME_"*";
+        do begin "main loop"
+            define LBS = '40;
+            integer array U[0:3],X[0:LBS];
+            if not NXTUFR(U,UFR) then done;
+            X[0] _ arrinfo(X,2);
+            X[1] _ PPN;
+            X[2] _ U[0];
+            X[3] _ U[1];
+            chnior(CHAN,X[0],4);
+            if not !SKIP! then continue;
+	    if not !everyfile then
+		if x[6] neq ownrppn then continue;
+            if (X[6]=0) or (X[7]=0) or
+                not (wildmatch(cv6str(X[7]),EXPNAME) and
+                wildmatch(cv6str(left(X['13])),EXPEXT)) then continue;
+            NOFILS_false;
+	    FOUND_true;
+
+	    if frstlet = "R" then begin ! check linked list to see if this;
+					! filename was examined before;
+		boolean filfnd;
+		filfnd_false;
+		temphdr_header;
+		do begin "LISTCHKLOOP"
+		   if equ(cv6str(filset:filnme[temphdr]),cv6str(X[7])) and
+		    equ(cv6str(filset:filext[temphdr]),cv6str(left(X['13])))
+		    and filset:filownr[temphdr] = X[6] then filfnd_true
+		   else if filset:next[temphdr] = 0 then begin
+			endptr_temphdr;
+			done;
+			end
+		   else temphdr_filset:next[temphdr];
+		end "LISTCHKLOOP" until filfnd;
+		if not filfnd then getrecent(UFR,endptr,U,X,CHAN)
+		else continue "main loop";   		   
+		end;   
+            X[1] _ X[6];    ! restore PPN;
+            X[2] _ X[7];    ! restore NAME;
+            X[3] _ X['13];  ! restore EXT;
+            X[6]_X[7]_X['13]_0;
+	    X['14]_X['14] land lnot !bit(8); ! clear tmp bit in RBLIC;
+            do begin "prompt"
+                integer TEMP;
+                string NewFile, UNM;
+                NEWFILE_null;
+		if Fast then Filsiz_(U[2]+3)%4;
+                print(
+                    if not INTERACTIVE and (BRK=#cr) then crlf else "",
+                    if X[1] neq PPN then
+                        (UNM_lokdul(X[1]))&
+                        "            "[1 for 15-length(UNM)]
+                    else "",
+                    cvxstr(X[2]),
+                    if Temp_length(cv6str(left(X[3]))) then "." else " ",
+                    cv6str(left(X[3])));
+		    If not fast then print("   "[1 for (3-Temp)],
+                    "; ",
+                    "   "[1 for 3-length(cvs(Filsiz_(U[2]+3)%4))],
+                    Filsiz,
+                    " page",
+                    if Filsiz=1 then "; " else "s;",
+                    " created ",
+                    " "[1 for 9-length(UNM_STDATE(!lh(U[3]),'31))]&UNM,
+                    " ",
+                    STTIME(!rh(U[3])));
+                if INTERACTIVE then begin "interact"
+                    print (if X[1] neq PPN then crlf&"  " else ""," = ");
+                    NewFile _ inchwl;
+                    BRK _ !SKIP!;
+                    if NewFile = "?" then begin
+                        print("
+    One of the following...
+      <^R> - recover and keep old name
+      <cr> - skip this file, no recovery
+      <^D> - expunge this file
+      <name><^R> - recover file and rename to new name
+      <name><cr> - recover file and rename to new name
+
+");                     continue "prompt";
+                    end;
+                end "interact";
+                if (BRK=#dc2) and (length(NewFile)=0) then begin
+                    chnior(CHAN,X[0],'11);
+                    if !SKIP! then begin
+                        print(" [okay]",crlf);
+			if otherdelfils then ufdini; ! there are other ;
+				! deleted files to be recovered;
+                        continue "main loop";
+                    end else begin
+                        print(crlf," Your request failed because of: ");
+		        prnerr(x[3]);
+                        if INTERACTIVE then continue "prompt"
+                            else begin 
+				 if otherdelfils then ufdini;
+				 continue "main loop";
+			    end;
+                        end;
+                end;
+                if length(NewFile)=0 and BRK neq #eot then continue "main loop";
+                X[2] _ cvfil (NewFile,TEMP,X[1]);
+                X[3ft(TEMP)+!rh(X[3]);
+                chnior(CHAN,X[0],'11);
+                if !SKIP! then begin
+                    if BRK neq #eot then print(" [okay]",crlf)
+                    else begin
+                            print(" [expunged]",crlf);
+                            Recpgs_Recpgs+Filsiz;
+                            Nopgfil_Nopgfil+1;
+                        end;
+		    if otherdelfils then ufdini;
+                    continue "main loop";
+                end else begin
+                    if BRK neq #dc2 and BRK neq #eot then
+                         print("               ");
+                    print(crlf, " Your request failed because of: ");
+		    prnerr(x[3]);
+		    if otherdelfils then ufdini;
+                    continue "main loop";
+                end;
+                usererr(0,0,"?impossible condition","X");
+            end "prompt" until 0; ! loop terminates by CONTINUE;
+        end "main loop" until 0; ! loop terminates by DONE;
+    end "LISTLOOP" until not length(COMLINE) and BRKCR neq ",";
+    if NOFILS then
+	print ("?There are no deleted files matching request",crlf);
+    if FOUND then
+        print (crlf,if not INTERACTIVE and BRK=#cr
+            and not CMDSW then crlf else "");
+    if Nopgfil>1 then
+        print ("Total pages recovered = ",Recpgs,crlf,
+            if not Cmdsw then crlf else "");
+end "CMDLOOP" until CMDSW; ! loop terminates by DONE or CMDSW true;
+Endprog;
+end "MAIN";
+end $ $oOø
