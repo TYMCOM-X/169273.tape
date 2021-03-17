@@ -1,0 +1,2218 @@
+	search	RTSYM
+	search	IOSYM
+	sall
+	$MODULE	IOBOO
+
+	entry	BOOL.W
+	extern	BOOL.X
+
+; BOOL.W -- write a boolean.  Just load up string, hit the X format
+;   string code.
+
+BOOL.W:	MOVEM	R1,3(TOP)	; save return addr in INITRA
+	MOVEI	R1,1		; get our one ARG
+	ADDB	R1,0(TOP)
+	SKIPE	R1,@-1(R1)	; get our boolean value
+	MOVEI	R1,1		; insure either zero or one
+	MOVE	R0,BOOLPT(R1)	; load appropriate byte pointer
+	MOVEM	R0,4(TOP)	; put into DDESC
+	MOVE	R0,BOOLNG(R1)	; get length
+	MOVEM	R0,5(TOP)	;   and store in 1+DDESC
+	MOVE	R1,0(TOP)	; reload return addr
+	JRST	BOOL.X		;   and get out of here
+
+BOOLPT:	point	7,FALSE		; ILDB gets first char
+	point	7,TRUE
+
+BOOLNG:	exp	5		; length of "false"
+	exp	4		;   and "true"
+
+FALSE:	ascii	/FALSE/
+TRUE:	asciz	/TRUE/
+	$END	IOBOO
+	prgend
+	search	RTSYM
+	search	IOSYM
+	sall
+	$MODULE	IONTR
+
+	entry	INT.R
+	extern	INT.C,INT.C1
+
+	$TEMP	TDESC,2		; target descriptor
+	$TEMP	INITRA,1	; save init cortn. RA
+	$TEMP	DDESC,2		; datum descriptor
+	$TEMP	SAVPRO,2	; saving producer's registers
+	$TEMP	FWBITS,1	; AC field of field width ARG
+	$TEMP	FARG2,1		; second format arg if any
+	$TEMP	BDSPTR,1	; pointer to subrange bds if any
+	$TEMP	JUNK,6		; padding for decimal conversion
+	$TEMP	STRSAV,1	; temp for string variable read
+	$TEMP	FWIDTH,1	; field width, or zero
+	$TEMP	REGSAV,^o15	; register save area
+
+; INT.R -- integer consumer coroutine (read).  We munch chars until
+;   we see something which isn't a blank, then try to get an integer
+;   out of it.  Notice that digits 8 and 9 work just like any other
+;   nonnumeric char during an octal read (for example).  If a field
+;   width is specified, (conceptually) read a string with the same
+;   field width and then scan.
+
+INT.R:	MOVEM	R1,INITRA	; save caller's RA
+	JSP	R1,INT.C	; explode arg list
+	JSP	R1,@INITRA	; go home, come back ready to go
+
+	LDERR	CO1,DIGERR	; assume we'll never see a good digit
+	MOVEM	CO1,$IOERR(PDA)
+	MOVE	CO1,FWIDTH	; pick up specified field width if any
+	MOVEI	R0,2		; to test bit
+	TDNN	R0,FWBITS	; was field width specified for real?
+	HRLOI	CO1,377777	;   no, load largest integer
+
+ICG1NX:	SOJL	CO1,ICGEOF	; must check for zero fw
+	RESUME	OK		; get a character
+	JRST	ICGEOF		; better check it out
+	CAIE	R1," "		; the only thing we're allowed to skip
+	JRST	ICGOT1		;   better check it out
+	SOJGE	CO1,ICG1NX+1	; back if more to skip
+
+ICGEOF:	MOVEI	R0,2		; check to see if a field width was specified
+	TDNN	R0,FWBITS	; if none, we can skip EOLN etc.
+	JRST	ICG1NX+1	; skip count of field width to go
+
+ICZERO:	SETZ	DWD1,0		; pretend we read a zero
+	JRST	ICNOMO		; no more to be had
+
+ICGOT1:	JFCL	17,.+1		; clear the flags
+	SETZ	DWD1,0		; initialize read-in integer
+	SETZM	0,INITRA	; assume sign is positive
+	MOVE	DWD2,FWBITS	; get bits from format
+	LSH	DWD2,-2		; shift right leaving only base
+	MOVE	DWD2,BASES(DWD2)	; load appropriate base from table
+	SETZM	0,STRSAV	; initialize error code cell
+	CAIN	R1,"+"		; a good char, no change
+	JRST	ICGNXT		;   get number after it
+	CAIE	R1,"-"		; is it a minus?
+	JRST	ICLOOP		; no, everything from now on must be digit
+	AOS	0,INITRA	; set sign of scanned number negative
+	JRST	ICGNXT		;   and get first digit
+
+ICLOOP:	CAIN	R1,","		; comma always terminates read successfully
+	JRST	ICOMMA+1
+	JSP	CO2,INT.C1	; call our helper
+	JRST	ICUNCH		; not a digit -- read is done
+	CAIL	R0,0(DWD2)	; better be within the base
+	JRST	ICDERR		;   else record a digit error
+	SETZM	0,$IOERR(PDA)	; can't get error for no digits any more
+	IMULI	DWD1,0(DWD2)	; shift sum over one digit
+	JOV	ICOERR		; conversion overflow
+	SUB	DWD1,R0		; tack on digit (goes negative)
+	JOV	ICOERR		; another conversion error
+
+ICGNXT:	RESUME	OK		; get next char
+	JRST	ICNOMO		; there's no mo
+	SOJGE	CO1,ICLOOP	; count it, process only if within field
+	JRST	ICNOMO		; we know the field's exhausted now
+
+ICDONE:	MOVEI	R0,2		; must check to see if FW specified
+	TDNN	R0,FWBITS	;   meaning skip chars at end of read
+	JRST	ICNOMO		; no
+ICDLOO:	RESUME	OK
+	JRST	ICNOMO		; end of line always terminates
+	CAIN	R1,","		; if it's a comma
+	JRST	ICOMMA		;   then hit it
+	SOJL 	CO1,ICNOMO	; 
+	CAIE	R1," "
+	JRST	ICDERR
+	JRST	ICDLOO
+
+ICNOMO:	SKIPN	0,INITRA	; was there a minus sign?
+	MOVN	DWD1,DWD1	;   no, load positive
+	JOV	IC35		; in case the MOVN had -2**35
+	SKIPN	CO2,BDSPTR	; get subrange pointer if any
+	JRST	ICOUT		;   none, just store and split
+	CAMGE	DWD1,0(CO2)	; check lower bound
+	JRST	IC35		;   too low
+	CAMLE	DWD1,1(CO2)	; now upper bound
+	JRST	IC35		;   too high
+ICOUT:	MOVE	CO2,DDESC	; get addr of integer variable cell
+	MOVEM	DWD1,0(CO2)	;   and store scanned integer
+	RESUME	NOTOK		; force the detach
+
+ICUNCH:	CAIN	R1," "
+	JRST	ICDONE
+	jrst	icdone		; [dws] dammit! do it the way it's documented
+
+ICDERR: LDERR	R0,DIGERR	; load error code
+	MOVEM	R0,$IOERR(PDA)	; store it
+
+ICERDN:	MOVEI	R0,2
+	TDNN	R0,FWBITS
+	JRST	ICERNF
+ICERFR:	RESUME	OK
+	RESUME	NOTOK
+	CAIN	R1,","
+	JRST	IERCMA
+	SOJGE	CO1,ICERFR
+	RESUME	NOTOK
+ICERNF:	RESUME	OK
+	RESUME	NOTOK
+	CAIN	R1," "
+	RESUME	NOTOK
+	CAIE	R1,","
+	JRST	ICERNF
+IERCMA:	SOJL	CO1,.+2
+	RESUME	OK
+	RESUME	NOTOK
+	RESUME	NOTOK
+
+ICOERR: LDERR	R0,OVFERR	; set code
+	MOVEM	R0,$IOERR(PDA)
+	JRST	ICERDN
+
+ICOMMA:	SOJL	CO1,ICNOMO	; can only discard if within field width
+	RESUME	OK
+	JRST	ICNOMO		; in both cases, we're done
+	JRST	ICNOMO		;   don't want to scan any more
+
+IC35:	SETZM	0,DDESC		; read 2 ** 35 -- inhibit store
+	LDERR	R0,OVFERR	; killer
+	MOVEM	R0,$IOERR(PDA)
+	JRST	ICOUT
+
+BASES:				; bases indexed by ac bits
+	exp	^o12		;   decimal
+	exp	^o20		;   hexadecimal
+	exp	^o10		;   octal
+	exp	0		;   internal error -- force to be zero
+	$END	IONTR
+	prgend
+	search	RTSYM
+	search	IOSYM
+	sall
+	$MODULE	IONTW
+
+	entry	INT.W
+	extern	INT.C,INT.C1
+
+	$TEMP	TDESC,2		; target descriptor
+	$TEMP	INITRA,1	; save init cortn. RA
+	$TEMP	DDESC,2		; datum descriptor
+	$TEMP	SAVPRO,2	; save producer's registers
+	$TEMP	FWBITS,1	; AC field of field width ARG
+	$TEMP	FARG2,1		; second format arg if any
+	$TEMP	BDSPTR,1	; points to subrange limits, if any
+	$TEMP	JUNK,6		; padding for decimal conversion
+	$TEMP	STRSAV,1	; temp for string variable read
+	$TEMP	FWIDTH,1	; field width, or zero
+	$TEMP	REGSAV,^o15	; register save area
+	$STATIC	DUMMY,1		; must agree with IOCHAR's layout
+	$STATIC	SAVSTK,1	; for saving stack pointer off r14
+
+; INT.W -- integer producer coroutine (write).  Writes out an integer
+;   in decimal, hex, or octal, with field width violated on decimal and
+;   enforced otherwise (lo order written out).  Octal and hex are never
+;   signed.  The decimal busting of digits is done negated so the largest
+;   negative integer can be written out.  First a helper routine.
+
+BLOUT:	HRREI	DWD1,0(PR1)	; number of blanks to write
+BLOLO:	SOJL	DWD1,0(DWD2)	; split if done
+	MOVEI	R1," "		; the blank
+	RESUME	OK
+	JRST	IPDONE
+	JRST	BLOLO
+
+IBLOUT:	HRREI	DWD1,0(PR1)	; load number of chars to write
+IBLOLO:	SOJL	DWD1,0(DWD2)	; if nothing to do, go home
+	MOVEI	R1,0(PR2)	; the pad character
+	RESUME	OK		; here it is
+	JRST	IPDONE		; spoiled
+	JRST	IBLOLO
+
+INT.W:	MOVEM	R1,INITRA	; save our return addr
+	JSP	R1,INT.C	; explode the args
+	MOVE	R1,DDESC	; load addr of integer datum
+	MOVE	R1,0(R1)	;   and datum
+	MOVEM	R1,DDESC	; store it
+	JSP	R1,@INITRA	;   and split
+
+	MOVE	PR1,FWIDTH	; get FW, or zero if none
+	MOVE	PR2,FWBITS	; get option bits
+	TRNE	PR2,14		; if hex or octal
+	JRST	INTOH		;   then hit different routine
+	MOVEM	TOP,SAVSTK	; save the stack pointer
+	SETZ	R0,0		; assume positive
+	SKIPGE	DWD1,DDESC	; get integer, is it negative?
+	AOSA	0,R0		;   yes, set R0 to one and skip negate
+
+IPOSTV:	MOVN	DWD1,DWD1	; make negative for loop
+IPDOIT:	MOVEI	R1,"0"		; smallest char to write
+	IDIVI	DWD1,^o12	; divide by the base
+	SUB	R1,DWD2		; remainder gives char to write
+	PUSH	TOP,R1		; stack them to write out in order
+	JUMPE	DWD1,IPDOUT	; if quotient zero, we're done
+	SOJA	PR1,IPDOIT	;   else dec field width and do again
+
+IPDOUT:	SOJ	PR1,0		; extra decrement needed
+	JUMPE	R0,IPDPOS	; jump if original number positive
+	PUSH	TOP,[exp "-"]	;   else stack the minus sign
+IPDOGM:	SUBI	PR1,1		;   and dec length
+IPDOGT:	TRNN	PR2,1		; is this a left justified write?
+	JSP	DWD2,BLOUT	;   no, put out blanks now
+	HRRZ	DWD1,SAVSTK	; get old stack pointer
+	MOVE	DWD1,.FWIDT(DWD1)	;   to get stored field width
+	SUB	DWD1,PR1	;   to get number of chars stacked
+
+IPDLOO:	POP	TOP,R1		; get the char
+	RESUME	OK		; put it out
+	JRST	IPDONE		;   no go
+	SOJG	DWD1,IPDLOO	; back if more
+
+	TRNE	PR2,1		; was this left justified?
+	JSP	DWD2,BLOUT	;   yes, write blanks out now
+IPDONE:	MOVE	TOP,SAVSTK	; restore stack pointer
+	RESUME	NOTOK		; force the detach
+
+IPDPOS:	TRNE	PR2,2		; was a length specified?
+	JRST	IPDOGT		;   yes, no leading blank required
+	PUSH	TOP,[exp " "]	; else push a blank for sign
+	JRST	IPDOGM		; fix length and continue
+
+; INTOH -- write integer in octal or hexadecimal.  Use register NAME
+;   for holding a byte pointer to the number in register DWD2.  If the
+;   whole number won't fit in field width, do just the lo order digits.
+
+INTOH:	MOVEI	NAME,DWD2	; byte pointer points to DWD2
+	TRNE	PR2,4		; split between hex and octal
+	JRST	INTHEX
+	HRLI	NAME,440300	; pointer for byte size of 3 bits
+	MOVEI	R1,^o14		; max number of octal digits
+	MOVEI	PR2,"7"		; the leading sign char
+	JRST	INTOHC
+
+INTHEX:	HRLI	NAME,440400	; 4 bit byte
+	MOVEI	R1,^o11
+	MOVEI	PR2,"F"		; the leading sign char
+INTOHC:	SKIPL	0,DDESC		; if number is nonnegative
+	MOVEI	PR2,"0"		;   then lead with a zero
+	CAIL	PR1,0(R1)	; will whole number fit?
+	JRST	IHCJUS		;   yes, calculate justification
+	SUBI	R1,0(PR1)	; no, get number to remove
+	ADJBP	R1,NAME		; advance pointer to skip them
+	MOVE	NAME,R1		; recopy pointer to NAME
+	SETO	PR1,0		; make sure no blanks are written
+	JRST	IHCDO		; start char loop
+
+IHCJUS:	SUBI	PR1,0(R1)	; subtract full number width
+	JSP	DWD2,IBLOUT	;   yes, write out the digits
+
+IHCDO:	MOVE	DWD2,DDESC	; load integer to write
+IHCLOO:	ILDB	R1,NAME		; get the byte
+	ife DWD2&1,
+	< TRNE	NAME,1 >	; even reg, skip if EA of BP is even now
+	ifn DWD2&1,
+	< TRNN	NAME,1 >	; odd reg, see if odd now
+	RESUME	NOTOK		; we're done
+	ADDI	R1,"0"		; convert to digit
+	CAILE	R1,"9"		; is it an alphabetic hex digit?
+	ADDI	R1,"A"-"9"-1	;   yes, convert
+	RESUME	OK		; here you go
+	DETACH
+	JRST	IHCLOO		; more digits to do
+	$END	IONTW
+	prgend
+	search	RTSYM
+	search	IOSYM
+	sall
+	$MODULE	IONTC
+
+	entry	INT.C,INT.C1
+
+	$TEMP	TDESC,2		; target descriptor
+	$TEMP	INITRA,1	; save init cortn. RA
+	$TEMP	DDESC,2		; datum descriptor
+	$TEMP	SAVPRO,2	; save producer's registers
+	$TEMP	FWBITS,1	; AC field of field width ARG
+	$TEMP	FARG2,1		; second format arg if any
+	$TEMP	BDSPTR,1	; pointer to subrange bounds if any
+	$TEMP	JUNK,6		; padding for decimal conversion
+	$TEMP	STRSAV,1	; temp for string variable read
+	$TEMP	FWIDTH,1	; field width, or zero
+	$TEMP	REGSAV,^o15	; register save area
+
+; INT.C -- helper for INTCON and INTPRO to explode their argument lists.
+
+INT.C:	MOVEM	R1,FARG2	; save our return address
+	SETOM	$INRT(PDA)	; ignore over/underflows during conversion
+	MOVEI	R1,1		; get one argument word
+	ADDB	R1,0(TOP)
+	MOVEI	R0,@-1(R1)	; get address of integer variable
+	MOVEM	R0,DDESC	;   and store
+	SETZM	0,BDSPTR	; assume no bounds
+	MOVE	R0,-1(R1)	; whole ARG for datum descr
+	TLNN	R0,^o400	; is bounds bit set?
+	JRST	INC1		; nope
+	MOVEI	R1,1		; yes, increment past bounds ARG
+	ADDB	R1,0(TOP)
+	MOVEI	R0,@-1(R1)	; get the bounds pointer
+	MOVEM	R0,BDSPTR	;   and store it
+
+INC1:	SETZM	0,FWBITS	; assume no field width for now
+	SETZM	0,FWIDTH
+	HRLZI	R0,777000	; look for zero opcode field
+	TDNE	R0,0(R1)	; is current RA word and ARG word?
+	JRST	@FARG2		;   no, take stored return addr home
+	LDB	R0,ACBIT.	; load format word's AC field
+	MOVEM	R0,FWBITS	;   and store it
+	AOS	0,0(TOP)	; tick over ARG word
+	MOVEI	R0,@0(R1)	; load field width
+	MOVEM	R0,FWIDTH	;   and store it
+	JRST	@FARG2		; go home
+
+
+; INT.C1 -- helper for INTCON to evaluate a digit in R1. Takes skip return
+;   if char is good, with its value (0-17b) in R0, noskip if not digit.
+
+INT.C1:	MOVEI	R0,0(R1)	; must transfer char to R0 to evaluate
+	CAILE	R0,"9"		; if more than 9
+	JRST	ICDGT2		;   then try again
+	CAIL	R0,"0"		; if zero or better
+	JRST	ICDGOK		;   then we have numeric
+ICDGT2:	CAILE	R0,"F"		; same thing for "A"--"F"
+	JRST	ICDGT3
+	CAIL	R0,"A"
+	JRST	ICGOTL		; we have uppercase alphabetic
+ICDGT3:	CAILE	R0,"f"		; same thing for "a"--"f"
+	JRST	0(CO2)		; give up -- take noskip return
+	CAIGE	R0,"a"		; if not within range
+	JRST	0(CO2)		;   then give up
+	SUBI	R0,40		; convert to uppercase
+ICGOTL:	SUBI	R0,67		; convert 101... to 12...
+	JRST	1(CO2)		; nonskip return
+ICDGOK:	SUBI	R0,"0"		; convert digit to 0..9
+	JRST	1(CO2)
+
+ACBIT.:	point	4,@0(TOP),12
+	$END	IONTC
+	prgend
+	search	RTSYM
+	search	IOSYM
+	sall
+	$MODULE	IORLR
+
+	entry	REAL.R,SRL.R
+	extern	REA.C1,REA.C2,REA.C3,TENE.,TENF.,TENP.,ENDRN.
+
+	$TEMP	TDESC,2		; target descriptor
+	$TEMP	INITRA,1	; save init cortn. RA
+	$TEMP	DDESC,2		; datum descriptor
+	$TEMP	SAVPRO,2	; save producer's registers
+	$TEMP	FWBITS,1	; AC field of field width ARG
+	$TEMP	FARG2,1		; second format arg if any
+	$TEMP	BDSPTR,1	; pointer to subrange bounds if any
+	$TEMP	JUNK,6		; padding for decimal conversion
+	$TEMP	STRSAV,1	; temp for string variable read
+	$TEMP	FWIDTH,1	; field width, or zero
+	$TEMP	REGSAV,^o15	; register save area
+
+; REAL.R and SRL.R -- real number consumers (read).  Use same code as
+;   for producers to explode arg list, perform read in double precision,
+;   and assign as appropriate.
+
+REAL.R:	MOVEM	R1,INITRA	; save ours
+	JSP	R1,REA.C1	; explode args
+	JSP	R1,@INITRA	; return to our caller
+	JSP	R1,RLCONS	; do the conversion
+	SKIPN	R1,BDSPTR	; any subrange bounds?
+	JRST	DRLOK		; no, easy
+	CAMGE	DWD1,0(R1)	; compare high order lowbd
+	JRST	BDERR		;   flunk
+;	CAMN	DWD1,0(R1)	; if not equal, then it's ok
+;	CAML	DWD2,1(R1)	; else check low order lowbd
+	JRST	CKHI		;   cool, try upper bound
+BDERR:	LDERR	R1,OVFERR	; shoot him
+	MOVEM	R1,$IOERR(PDA)
+	JRST	RLCOUT
+CKHI:	CAMLE	DWD1,1(R1)	; same thing high order highbd
+	JRST	BDERR		; oops
+;	CAMN	DWD1,2(R1)
+;	CAMG	DWD2,3(R1)
+;	JRST	DRLOK		; cool, go ahead and store
+;	JRST	BDERR
+
+DRLOK:	MOVE	R1,DDESC	; get addr of double real var
+	DMOVEM	DWD1,0(R1)	;   install
+	JRST	RLCOUT
+
+SRL.R:	MOVEM	R1,INITRA	; same sequence as above
+	JSP	R1,REA.C1
+	JSP	R1,@INITRA
+	JSP	R1,RLCONS
+	TLNE	DWD2,200000	; is lo order worth rounding up?
+	ADDI	DWD1,1		;   yep.
+	SKIPN	R1,BDSPTR	; any subrange bounds specified?
+	JRST	SRLOK		;   no, forget it
+	CAMGE	DWD1,0(R1)	; how about lower bd?
+	JRST	BDERR		;   oops
+	CAMLE	DWD1,1(R1)	; how about high?
+	JRST	BDERR		;   no go
+SRLOK:	MOVE	R1,DDESC	; addr of single real var
+	MOVEM	DWD1,0(R1)	; store single word result
+RLCOUT:	MOVE	PR1,SAVPRO	; restore producer's two registers
+	MOVE	PR2,1+SAVPRO
+	MOVE	R1,FWBITS	; restore last character seen
+	RESUME	NOTOK		;   and tell producer to cool it
+
+; RLCONS -- the real consumer (double precision real reads).  Looks a
+;   bit like integer read code, except the operations for each digit
+;   are mucho different.  We only use field width on input -- a "well
+;   formed real constant" is essentially a numeric (decimal) quantity,
+;   with optional sign, decimal point, "E" or "e" and optionally signed
+;   numeric exponent.  Everything is optional!
+
+RLCONS:	MOVEM	R1,INITRA	; our return addr (no detaching)
+	SETZB	DWD1,DWD2	; initialize fraction to zero
+	LDERR	CO1,DIGERR	; assume no valid real seen yet
+	MOVEM	CO1,$IOERR(PDA)
+	MOVEI	CO1,1		; init decimal exp positive (no point seen)
+	MOVE	CO2,FARG2	; get field width
+	MOVEI	R0,2		; find out if it's meaningful
+	TDNN	R0,FWBITS
+	HRLOI	CO2,377777	;   no, use largest integer (o boy!)
+
+RCG1NX:	SOJL	CO2,RCGEOF	; already out of chars??
+	RESUME	OK		; get one
+	JRST	RCGEOF
+	CAIE	R1," "		; the only thing we can skip
+	JRST	RCGOT1		; oh boy, here we go
+	SOJGE	CO2,RCG1NX+1	;   else go back
+
+RCGEOF:	MOVEI	R0,2		; find out if we stop at end of line
+	TDNN	R0,FWBITS	; was a field width specified?
+	JRST	RCG1NX		;   no, keep on reading past it!
+RCZERO:	SETZB	DWD1,DWD2	; get proper floating point zero
+	JRST	@INITRA		;   and return
+
+RCGOT1:	JFCL	17,.+1		; clear the flags
+	SETZM	0,JUNK		; init. -- zero digits spilled over
+	SETZM	0,5+JUNK	;	-- fraction is positive
+	SETZM	0,4+JUNK	;       -- exponent is positive (zero)
+	SETZM	0,STRSAV	;	-- no errors have occured
+	MOVEI	CO1,1		; positive #, no digits seen past dec. pt.
+	MOVEM	CO1,1+JUNK
+	SETZ	CO1,0		; accum. for explicit exponent
+	CAIN	R1,"+"		; a plus sign?
+	JRST	RCGNXT		; yep, just fall into number loop
+	CAIE	R1,"-"		; a minus sign?
+	JRST	RCLOOP		;   no, treat like any other digit
+	AOS	0,5+JUNK	;   yes, remember we saw it
+	JRST	RCGNXT		;     and get next
+
+RCLOOP:	CAIN	R1,","		; is a comma?
+	JRST	RCOMMA+1	;   yes, always terminates our quest
+	CAIL	R1,"0"		; is numeric?
+	CAILE	R1,"9"
+	JRST	RCNDGT		;   no, go figure
+	SKIPG	0,1+JUNK	; if positive, no point seen yet
+	SOS	0,1+JUNK	;   else remember it
+RCLOO2:	CAML	DWD1,[31463146314]	; will multiply overflow
+	JRST	RCSPIL		;   yes, a spilled digit 
+	DMOVEM	DWD1+2,2+JUNK	; save regs after DWD2 for DMUL
+	DMUL	DWD1,DWTEN	; multiply by double word ten
+	DMOVE	DWD1,DWD1+2	; take low order of product as high
+	MOVEI	DWD1+3,-"0"(R1)	; load normalized digit
+	SETZ	DWD1+2,0	; double word, clear high order
+	DADD	DWD1,DWD1+2	; slap it in
+	DMOVE	DWD1+2,2+JUNK	;   restore borrowed registers
+
+RCGNXT:	SETZM	0,$IOERR(PDA)	; can't go wrong now
+	RESUME	OK		; take the char no matter what
+	JRST	RCNOMO
+	SOJGE	CO2,RCLOOP	; go back if more field width available
+	JRST	RCNOMO		;   no
+
+RCSPIL:	AOS	0,JUNK
+	JRST	RCGNXT
+
+RCNDGT:	CAIE	R1,"."		; not a digit -- is it a decimal point?
+	JRST	RCNDG2		;   no, guess again
+	SKIPG	0,1+JUNK	; dec. point already seen?
+	JRST	RCDERR		;   yes, don't take another
+	SOS	0,1+JUNK	; set it up
+	JRST	RCGNXT		;   and keep going
+
+RCNDG2:	CAIE	R1,"E"		; check for exponent delimiters
+	CAIN	R1,"e"
+	JRST	.+2		; yes
+	JRST	RCUNCH		;  know what it is -- forget about it
+	SOJL	CO2,RCNOMO	; go if no more to see
+	RESUME	OK		;   else check first char for sign
+	JRST	RCNOMO
+	CAIN	R1,"+"		; well?
+	JRST	RCELOO		;   yes, treat as any other exp. digit
+	CAIE	R1,"-"		; is a minus?
+	JRST	RCECHK		;   no, figure it out
+	AOS	0,4+JUNK	; remember we saw a minus
+
+RCELOO:	RESUME	OK
+	JRST	RCNOMO
+	SOJL	CO2,RCNOMO	; field width exhausted
+RCECHK:	CAIN	R1,","		; comma always terminates read
+	JRST	RCOMMA
+	CAIL	R1,"0"		; did we score a digit?
+	CAILE	R1,"9"
+	JRST	RCUNCH		;   no
+	IMULI	CO1,^o12	; expand accumulator
+	ADDI	CO1,-"0"(R1)	;   and slap in adjusted character
+	JRST	RCELOO
+
+RCOMMA:	SOJL	CO2,RCNOMO	; eat comma if room to do so
+	RESUME	OK
+	JRST	RCNOMO		; nothing can follow
+	JRST	RCNOMO
+
+RCDONE:	MOVEI	R0,2		; find out if any trailing FW to eat
+	TDNN	R0,FWBITS
+	JRST	RCNOMO		; no
+RCDLOO:	RESUME	OK		; go get it
+	JRST	RCNOMO		; end of line/file/string always short-x
+	CAIN	R1,","		; only a comma can stop us now
+	JRST	RCOMMA
+	SOJL 	CO2,RCNOMO	; 
+	CAIE	R1," "
+	JRST	RCDERR
+	JRST	RCDLOO
+
+RCNOMO:	SKIPE	0,4+JUNK	; is exponent negative?
+	MOVN	CO1,CO1		;   yes, toggle it
+	MOVEM	PR1,SAVPRO	; borrow a pair of producer's registers
+	MOVEM	PR2,1+SAVPRO
+	MOVEM	R1,FWBITS	; save delimiter char for DETACH
+	ADD	CO1,JUNK	; digits spilled reduce decimal exponent
+	SKIPG	0,1+JUNK	; skip if no digits after point (adjust)
+	ADD	CO1,1+JUNK	;   subtract # after point (negative)
+	MOVE	R0,DWD1		; left normalize double word DWD1&2
+	JFFO	R0,RCBINA	; it succeeded!
+	MOVE	R0,DWD2		; try second word
+	JFFO	R0,.+2
+	JRST	RCZERO		;   must be double word zero
+	ADDI	R1,^d35		; second word -- count 36 bits to shift
+RCBINA:	ASHC	DWD1,-1(R1)	; left normalize to bit 1 (not zero)
+	MOVNI	PR1,-233-54(R1)	; cons up the binary exponent
+	HRRE	PR1,PR1		; if negative, make SURE it's negative
+	MOVE	R0,CO1		; load decimal exponent
+	MOVEI	R1,NSCALE	; largest scaling first
+	CAIL	R0,^d45		; see if decimal exponent is
+	JRST	RCEXPF		;   totally unreasonable.
+	CAMG	R0,[exp -^d45]	;   in either direction, natch.
+	JRST	RCEXPF
+
+	JUMPL	R0,RCSMAL	; negative decimal exp -- too small
+RCSCAL:	JUMPN	R0,RCBIG	; still not zero -- try again...
+	CAIL	PR1,0		; what kind of binary exponent have we?
+	CAILE	PR1,377
+	JRST	RCEXPF		; out of range
+	DADD	DWD1,DW377	; round up the number (we lose 8 bits)
+	JUMPL	DWD1,RCSROV	; ye gads, we overranged the fraction!
+	ASHC	DWD1,-^o10	; make room for the exponent
+	LSH	PR1,^d27	; properly shifted etc.
+	OR	DWD1,PR1
+	SKIPE	0,5+JUNK	; was original number negated?
+	DMOVN	DWD1,DWD1	;   yes, flip it
+	JRST	@INITRA		; go home now
+
+RCBIG:	CAML	R0,TENP.(R1)	; is current scaling factor too big?
+	JRST	RCBSCA		;   no, go ahead and do it
+	SOJG	R1,RCBIG	; yes, try next smaller one
+	JRST	RCSCAL		; last one -- must be done
+RCBSCA:	ADD	PR1,TENE.(R1)	; increase the binary exponent
+	SUB	R0,TENP.(R1)	;   while decreasing the decimal exponent
+	JSP	NAME,REA.C3	; fix fraction by multiplying
+	JRST	RCBIG		;   and see if still too big
+
+RCSMAL:	MOVN	R0,R0		; make dec. exp. positive -- easier
+RCSMA1:	CAML	R0,TENP.(R1)	; is this scaling too big?
+	JRST	RCSSCA		;   no, it's fine
+	SOJG	R1,RCSMA1	;   yes, try next if there is one
+	JRST	RCSCAL		;     that was last -- must be done
+RCSSCA:	SUB	R0,TENP.(R1)	; adjust decimal exponent up (flipped sign)
+	SUB	PR1,TENE.(R1)	;   and binary exponent down
+	JSP	NAME,REA.C2	; fix fraction
+	JRST	RCSMA1		;   and do it
+
+RCSROV:	HRLZI	DWD1,200000	; we blew it -- load proper fraction
+	SETZ	DWD2,0		;   double word, natch
+	AOJA	PR1,RCBIG	; make exponent something and test again
+
+RCEXPF:	HRLOI	DWD1,377777	; load largest floatingpoint number
+	SETO	DWD2,0		;   again, doubleword
+	JRST	@INITRA		;   and return
+
+RCUNCH:	CAIN	R1," "
+	JRST	RCDONE
+
+RCDERR:	LDERR	R1,DIGERR
+	MOVEM	R1,$IOERR(PDA)
+
+RCERDN:	MOVEI	R0,2
+	TDNN	R0,FWBITS
+	JRST	RCERNF
+RCERFR:	RESUME	OK
+	RESUME	NOTOK
+	CAIN	R1,","
+	JRST	RERCMA
+	SOJGE	CO2,RCERFR
+	RESUME	NOTOK
+RCERNF:	RESUME	OK
+	RESUME	NOTOK
+	CAIN	R1," "
+	RESUME	NOTOK
+	CAIE	R1,","
+	JRST	RCERNF
+RERCMA:	SOJL	CO2,.+2
+	RESUME	OK
+	RESUME	NOTOK
+	RESUME	NOTOK
+
+RCOERR:	LDERR	R1,OVFERR
+	MOVEM	R1,$IOERR(PDA)
+	JRST	RCERDN
+
+DWTEN:	exp	0,^o12		; double word integer decimal ten
+DW377:	exp	0,^o377		; rounds up input
+
+	$END	IORLR
+	prgend
+	search	RTSYM
+	search	IOSYM
+	sall
+	$MODULE	IORLW
+
+	entry	REAL.W,SRL.W
+	extern	REA.C1,REA.C2,REA.C3,TENE.,TENF.,TENP.,ENDRN.
+
+	$TEMP	TDESC,2		; target descriptor
+	$TEMP	INITRA,1	; save init cortn. RA
+	$TEMP	DDESC,2		; datum descriptor
+	$TEMP	SAVPRO,2	; save producer's registers
+	$TEMP	FWBITS,1	; AC field of field width ARG
+	$TEMP	FARG2,1		; second format arg if any
+	$TEMP	BDSPTR,1	; pointer to subrange bounds, if any
+	$TEMP	JUNK,6		; padding for decimal conversion
+	$TEMP	STRSAV,1	; temp for string variable read
+	$TEMP	FWIDTH,1	; field width, or zero
+	$TEMP	REGSAV,^o15	; register save area
+
+; REAL.W and SRL.W -- real output producer coroutines.  Fake up a single
+;   real to look like a double real, with a zeroed low order word.  The
+;   sign will straighten itself out.  
+
+REAL.W:	MOVEM	R1,INITRA	; save our return addr
+	JSP	R1,REA.C1	; explode real arg list
+	MOVE	R1,DDESC	; address of real variable to write
+	DMOVE	R0,0(R1)	; get the number
+	DMOVEM	R0,DDESC	;   and store it
+	JSP	R1,@INITRA	; return with everything started up
+	JRST	DODRLP		;   and go to the real producer
+
+SRL.W:	MOVEM	R1,INITRA	; a lot like the above sequence
+	JSP	R1,REA.C1
+	MOVE	R1,DDESC	; address of single real number
+	MOVE	R0,0(R1)	; like so
+	SETZ	R1,0		; assume it might be zero
+;	JUMPE	R0,FOO		; skip if number is floating zero
+;	HRLOI	R1,^o177777	; lo order set to round up
+FOO:	DMOVEM	R0,DDESC	;   and store
+	JSP	R1,@INITRA
+	JRST	DODRLP
+
+
+; DODRLP -- the real output conversion routine.  By repeatedly "scaling"
+;   the double word binary real number by 10, 10000, or 1.0e+13, we
+;   will get a real number between 1/2 * 2 ** 1  (decimal 1.0) and
+;   5/8 * 2 ** 4  (decimal 10.0), and some number of scalings that were
+;   required to get us there.  This conveniently converts into a
+;   standard scientific notation number  a * 10 ** n, where 
+;   1.0 <= a < 10, and n is somewhere between -39 and 39.
+
+DODRLP:	DMOVE	DWD1,DDESC	; get the double real number
+	TLNE	DWD1,400000	; is it negative?
+	DMOVN	DWD1,DWD1	;   yes, flip sign
+	LDB	PR1,[point 8,DWD1,8]	; pick out exponent from reg
+	ASHC	DWD1,^o10	; shift out the exponent, "normalize"
+	MOVEI	R1,NSCALE	; start at largest scaling factor
+	SETZ	R0,0		; init decimal exponent to zero
+	JUMPN	DWD1,RPGO	; not zero, go ahead
+	JUMPE	DWD2,RPOK	; zero, don't bother scaling
+
+RPGO:	SUBI	PR1,200		; unbias exponent
+RPTEST:	JUMPLE	PR1,RPLOW	; bin. exp <= 0  -- number too small
+	CAILE	PR1,4
+	JRST	RPHIGH		; bin. exp > 4  -- number too large
+	CAIE	PR1,4
+	JRST	RPOK		; 0 < bin. exp. < 4 -- number is OK
+	CAMGE	DWD1,[240000,,0]
+	JRST	RPOK		; BE = 4, fract < 5/8 -- number is OK
+
+RPHIGH:	SUB	PR1,TENE.(R1)	; too big -- scale down.  Fix BE
+	JUMPE	PR1,RPHCHK	;   went to zero -- may be too much
+	JUMPL	PR1,RPHTOS	;   went negative -- definitely too much
+RPHGH1:	ADD	R0,TENP.(R1)	; OK -- we just divided by 10**n --
+	JSP	NAME,REA.C2	;   adjust decimal exp, divide fraction,
+	JRST	RPTEST		;   and try to scale again
+
+RPHTOS:	ADD	PR1,TENE.(R1)	; undo binary scaling
+	SOJG	R1,RPHIGH	; reduce scaling factor and try again
+	AOJA	R1,RPTEST	; last factor -- try again??????
+
+RPHCHK:	MOVEI	PR2,0(R1)	; we're close -- must check scaling factor
+	LSH	PR2,1		; double word table index
+	CAMLE	DWD1,TENF.(PR2)	; if divide will require adjustment
+	JRST	RPHGH1		;   then do it -- BE will be 1 after
+	CAMN	DWD1,TENF.(PR2)	; if we skipped greater, forget it
+	CAMGE	DWD2,TENF.+1(PR2)	; else test lo order too
+	JRST	RPHTOS		; forget it -- BE would've been zero
+	JRST	RPHGH1		; lo order made divide require adj.
+
+RPLOW:	ADD	PR1,TENE.(R1)	; binary number too small -- add to BE
+	CAILE	PR1,4		; did we overdo it?
+	JRST	RPLOWD		;   yes, undo it
+	SUB	R0,TENP.(R1)	; was good -- adjust decimal exponent
+	JSP	NAME,REA.C3	; multiply fraction by power of ten
+	JRST	RPTEST		;   and back up to top
+
+RPLOWD:	SUB	PR1,TENE.(R1)	; undo it -- reset binary exponent
+	SOJG	R1,RPLOW	; do next scaling factor if possible
+	AOJA	R1,RPTEST	; back to top if no scaling factors?????
+
+RPOK:	MOVEM	R0,1+DDESC	; save decimal exponent for later
+	SETZ	R0,0		; compose rounding factor -- high order zero
+	MOVE	R1,ENDRN.(PR1)	;   and bits for those shifted out
+	DADD	DWD1,R0		;   to get rid of binary exponent -- round up
+	ASHC	DWD1,-5(PR1)	;     and shift to "normalize" at bit 5,6
+	MOVE	R0,FWBITS	; check for explicit format
+	TRNE	R0,^o4		; was "E" format?
+	JRST	RPEOUT		;   yep
+	TRNE	R0,^o10		; was "F" format?
+	JRST	RPFOUT		;   yep
+;
+; To define G (default) format, choose the "natural" one of "F" and "E".
+;   Try for sufficient precision with the fewest number of characters.
+;      ***         0  <=  (exp + 4)  <  (prec + 8)        ***
+;   is true if F format is more economical (and wins ties).
+;
+	MOVE	R0,1+DDESC	; get the exponent
+	ADDI	R0,4		; exp + 4
+	JUMPL	R0,RPEOUT	;   less than (-4) -- automatic "E"
+	SUBI	R0,^o10		; get exp - 4
+	CAML	R0,FWIDTH	; if greater or equal to precision
+	JRST	RPEOUT		;   then "E" wins here also
+	MOVE	R0,FWIDTH	; we're using "F" -- compute frac. FW
+	SUB	R0,1+DDESC	;   as precision - exponent
+	SOJGE	R0,.+2		;   - 1
+	SETZ	R0,0		;     but never leave it negative
+	MOVEM	R0,FWIDTH	; pony up precision
+	JRST	RPFOUT		;   and hit "F" processor
+
+; RPEOUT -- write out real in "E" format.  First compute the left-over
+;   field width, justify if needed, call helper to write mantissa with
+;   one decimal place before decimal point, then explicitly write
+;   "E", "+" or "-", and two digits worth of decimal exponent.
+
+RPEOUT:	SETZ	PR1,0		; assume no precision given
+	TRNN	R0,^o10		; how about it?
+	JRST	RPENEX		;   not explicit, compute to fill
+RPEEX:	MOVE	PR1,FARG2	; get given field width
+	SUB	PR1,FWIDTH	; minus digits needed
+	SUBI	PR1,6		; minus overhead positions
+	JRST	RPEOK
+RPENEX:	MOVE	R1,FARG2	; get total field width
+	SUBI	R1,6		; minus six for overhead
+	MOVEM	R1,FWIDTH	; store as faked precision
+RPEOK:	SKIPL	0,DDESC		; is there a blank to put?
+	ADDI	PR1,1		; yes, do it with leading blanks
+
+RPELLB:	MOVEI	R1," "		; reload our blank
+	SOJL	PR1,RPEDGT	; kick out if done
+	RESUME	OK		; return the blank
+	DETACH
+	SOS	0,FARG2		; count it
+	JRST	RPELLB
+
+RPEDGT:	SETZ	PR2,0		; number of places to shift from "n.nnn"
+	MOVEI	PR1,2		; minimum precision
+	CAMLE	PR1,FWIDTH	; enforce it
+	MOVEM	PR1,FWIDTH
+	MOVE	R1,FWIDTH	; get precision
+	LSH	R1,1		;   index into doubleword table
+	CAIGE	R1,RNDMAX	;   if not too large
+	DADD	DWD1,ROUND(R1)	;     then round up by factor
+	CAMGE	DWD1,[120000,,0]	; check for overflow to 10.0
+	JRST	.+3		; no sweat
+	HRLZI	DWD1,10000	; else hoke up to 1.0 (only 1 digit needed)
+	AOS	0,1+DDESC	;   and increment exponent to reflect it
+	SOS	0,FWIDTH	; frac. field width = prec - 1
+	JSP	R1,RPMANT	; write out mantissa
+
+	MOVEI	R1,"E"		; the exponent delimiter
+	RESUME	OK		; do it
+	DETACH
+	SOS	0,FARG2		; count it
+	MOVEI	R1,"+"		; determine sign char of exponent
+	SKIPGE	0,1+DDESC
+	MOVEI	R1,"-"		; it were negative
+	RESUME	OK		; here you go
+	DETACH
+	SOS	0,FARG2		; count it
+
+	MOVM	DWD1,1+DDESC	; load up exponent
+	IDIVI	DWD1,^o12	; bust into two digits
+	MOVEI	R1,"0"(DWD1)	; grab the first
+	RESUME	OK		; write it
+	DETACH
+	SOS	0,FARG2		; count it
+	MOVEI	R1,"0"(DWD2)	;   and the second
+	RESUME	OK
+	DETACH
+	SOS	0,FARG2		; count it
+
+	MOVE	PR1,FARG2	; reload old field width (updated)
+	SUBI	PR2,3		; update for exponent
+	MOVEI	R1,1		; check for left justification
+	TDNE	R1,FWBITS
+RPEDET:	RESUME	NOTOK		; we're done -- force the detach
+RPETLB:	MOVEI	R1," "		; write those trailing blanks
+	SOJL	PR1,RPEDET	;   if there should be any
+	RESUME	OK
+	DETACH
+	JRST	RPETLB
+
+; RPFOUT -- write out real number in "F" format.  First we must decide if
+;   the number will fit into a "F" format, given the specified field width
+;   (if none, it always fits).  Then do the leading/trailing blanks, and
+;   write out the number with the helper.
+
+RPFOUT:	MOVE	PR1,FWIDTH	; get desired fractional field width
+	SKIPGE	PR2,1+DDESC	; get decimal exponent
+	SETZ	PR2,0		;   neg. exp., nothing extra left of D.P.
+	ADDI	PR1,2(PR2)	; one for dec. pt., one for leading digit
+	SKIPGE	0,DDESC		; was original number negative?
+	ADDI	PR1,1		;   yes, count sign as digit too
+	SKIPE	0,FARG2		; was a field width specified?
+	CAMG	PR1,FARG2	;   yes, see if calculated length will fit
+	JRST	RPFOK		; yep
+	MOVEI	PR1,6		;   else write out "E" format with 6 sigs
+	MOVEM	PR1,FWIDTH
+	SETZ	PR1,0		; init for E format
+	JRST	RPEEX		; fake up explicit E
+
+RPFOK:	MOVE	PR2,FWIDTH	; get fractional field width
+	ADDI	PR2,1		;   plus one
+	ADD	PR2,1+DDESC	; exponent, for loss/gain of precision
+	LSH	PR2,1		; use to index doubleword table
+	CAIGE	PR2,RNDMAX	;   if not too large
+	DADD	DWD1,ROUND(PR2)	; round
+	CAMGE	DWD1,[120000,,0]	; check for overflow
+	JRST	.+3		; no
+	HRLZI	DWD1,10000
+	AOS	0,1+DDESC
+	MOVEI	R1,1		; how are we justifying the number?
+	TDNE	R1,FWBITS
+	JRST	RPFOK2		; left just. -- no leaders
+
+	SKIPG	R1,FARG2	; get original field width
+	JRST	RPFOK2		; zero -- no justification
+	SUBM	R1,PR1		; PR1 gets number of blanks to write
+RPFLLB:	MOVEI	R1," "		; get the blank
+	SOJL	PR1,RPFOK2	; kick out if no digits to write
+	RESUME	OK
+	DETACH
+	JRST	RPFLLB
+
+RPFOK2:	MOVE	PR2,1+DDESC	; load up the exponent (may be neg.)
+	JSP	R1,RPMANT	; write out the mantissa if significant
+	MOVEI	R1,1		; again, check justification
+	TDNN	R1,FWBITS	; don't skip if right just (blanks already out)
+RPFDET:	RESUME	NOTOK		; force detach
+RPFTLB:	MOVEI	R1," "		; the pad char
+	SOSGE	0,FARG2		; if no more blanks to put
+	RESUME	NOTOK		;   then force the detach
+	RESUME	OK
+	DETACH
+	JRST	RPFTLB		; back up
+
+; RPMANT -- write (produce) mantissa.  Take the decimal fraction in DWD1&2,
+;   write it out with FWIDTH fractional digits, with a scaling of (PR2)
+;   decimal places.  PR2 represents the right shifting of the decimal
+;   point within a field of "n.nnn" ; interpret it as the number of
+;   significant "n"'s to the left of the point.
+
+RPMANT:	MOVEM	R1,1+JUNK	; save our return addr
+	MOVEI	R1,"-"		; in case we have to write out a sign
+	SKIPGE	0,DDESC		; do we?
+	JRST	RPMINS		;   yes, go do it
+	SKIPE	0,FARG2		; no minus -- was a field width specified?
+	JRST	RPMLDD		;   yes, no leading blank needed
+	MOVEI	R1," "		;   do the leading blank
+RPMINS:	RESUME	OK
+	DETACH
+	SOS	0,FARG2		; count it as one written out
+
+RPMLDD:	MOVEI	R1,"0"		; if no real leading digits, use zero
+	JUMPL	PR2,RPMLD2	; if shift negative then write zero
+RPMLDL:	JSP	PR1,RPMDGT	;   else get the first digit
+RPMLD2:	RESUME	OK
+	DETACH
+	SOS	0,FARG2		; count it
+	SOJGE	PR2,RPMLDL	; do again if more leading digits
+
+	MOVEI	R1,"."		; write out the decimal point
+	RESUME	OK
+	DETACH
+	SOS	0,FARG2
+
+	ADDI	PR2,1		; correct for extra digit
+	SKIPG	0,FWIDTH	; are there any fractional digits?
+	JRST	@1+JUNK		;   no
+RPMTRL:	MOVEI	R1,"0"		; preload Zero
+	AOJL	PR2,RPMTR2	; skip call if not significant yet
+	JSP	PR1,RPMDGT
+RPMTR2:	RESUME	OK		; here
+	DETACH
+	SOS	0,FARG2		; count it
+	SOSLE	0,FWIDTH	; if more fractionals left
+	JRST	RPMTRL		;   then write them
+	JRST	@1+JUNK		;   else split
+
+RPMDGT:	LDB	R1,[point 6,DWD1,5]	; bust off a digit
+	ADDI	R1,"0"		; make it a number
+	TLZ	DWD1,770000	; clear the bits we just busted off
+	DMOVEM	DWD1+2,2+JUNK	; save low order registers
+	DMUL	DWD1,DWTEN	; ready for next time
+	DMOVE	DWD1,DWD1+2	; we want only the low order 2 words
+	DMOVE	DWD1+2,2+JUNK	; restore borrowed registers
+	JRST	0(PR1)		;   go back
+
+; rounding tables
+;
+
+ROUND:				; the rounding table, sig. digits here
+; To generate this table, start with the first rounding factor, which
+;   is our internal representation of 5.0  (with a zero exponent).  Then
+;   double divide this number by 10 decimal -- the quotient is the next
+;   table entry.  If the remainder is >= 5, give it a "plus 1".  Repeat
+;   division with new table entry (ignoring remainder) until goes to zero.
+
+	exp	050000000000,000000000000	;0
+	exp	004000000000,000000000000	;1
+	exp	000314631463,063146314631+1	;2
+	exp	000024365605,036560507534	;3
+	exp	000002030446,351361523757+1	;4
+	exp	000000150667,027261610313	;5
+	exp	000000012370,265421615507+1	;6
+	exp	000000001030,336750132755+1	;7
+	exp	000000000065,257712325712+1	;8
+	exp	000000000005,136307342141	;9
+	exp	000000000000,211340575011+1	;10
+	exp	000000000000,015574677547	;11
+	exp	000000000000,001277537760+1	;12
+	exp	000000000000,000106274630	;13
+	exp	000000000000,000007022702	;14
+	exp	000000000000,000000550223	;15
+	exp	000000000000,000000044016+1	;16
+	exp	000000000000,000000003464+1	;17
+	exp	000000000000,000000000270	;18
+	exp	000000000000,000000000022	;19
+	exp	000000000000,000000000001+1	;20
+RNDMAX=.-ROUND
+
+DWTEN:	exp	0,^o12		; double word integer ten decimal
+	$LIT
+	$END	IORLW
+	prgend
+	search	RTSYM
+	search	IOSYM
+	sall
+	$MODULE	IORLC
+
+	entry	REA.C1,REA.C2,REA.C3,TENE.,TENF.,TENP.,ENDRN.
+
+	$TEMP	TDESC,2		; target descriptor
+	$TEMP	INITRA,1	; save init cortn. RA
+	$TEMP	DDESC,2		; datum descriptor
+	$TEMP	SAVPRO,2	; save producer's registers
+	$TEMP	FWBITS,1	; AC field of field width ARG
+	$TEMP	FARG2,1		; second format arg if any
+	$TEMP	BDSPTR,1	; pointer to subrange bds if any
+	$TEMP	JUNK,6		; padding for decimal conversion
+	$TEMP	STRSAV,1	; temp for string variable read
+	$TEMP	FWIDTH,1	; field width, or zero
+	$TEMP	REGSAV,^o15	; register save area
+
+; REA.C1 -- explode real argument list.
+
+REA.C1:	MOVEM	R1,1+DDESC	; save our RA
+	SETOM	$INRT(PDA)	; ignore over/underflows during conversion
+	MOVEI	R1,2		; get our 2 args
+	ADDB	R1,0(TOP)
+	MOVEI	R0,@-2(R1)	; addr of real number
+	MOVEM	R0,DDESC
+	SETZM	0,BDSPTR	; assume no bounds
+	MOVE	R0,-2(R1)	; whole ARG for datum descriptor
+	TLNN	R0,^o400	; is bounds bit set?
+	JRST	REAC12		; no
+	MOVEI	R0,@-1(R1)	; grab EA of next ARG
+	MOVEM	R0,BDSPTR	;   and store
+	ADDI	R1,1		; fake up to skip over it
+	AOS	0,0(TOP)
+REAC12:	SETZM	0,FWBITS	; clear out optional args
+	SETZM	0,FWIDTH
+	SETZM	0,FARG2
+	MOVEI	R0,@-1(R1)	; load first format arg
+	MOVEM	R0,FWIDTH
+	MOVE	R0,-1(R1)	; load entire ARG word
+	LSH	R0,-^o27	; shift AC field to rightmost
+	ANDI	R0,17		; mask rest out
+	MOVEM	R0,FWBITS
+	HRLZI	R0,777000	; test for zero opcode
+	TDNE	R0,0(R1)	;   presence of optional arg
+	JRST	@1+DDESC	; nope
+	AOS	0,0(TOP)	; one more word
+	MOVEI	R0,@0(R1)	; load second EA
+	MOVEM	R0,FARG2
+	JRST	@1+DDESC
+
+; REA.C2 and REA.C3 -- arithmetic helpers for real producer.  Performs
+;   simulated double floating multiply and divide on fractional part
+;   only, keeping the number 'normalized'.
+
+REA.C2:	DMOVEM	DWD1+2,2+JUNK	; save extra registers needed
+	MOVEI	PR2,0(R1)	; load current scale index (1..3)
+	LSH	PR2,1		;   X 2 to get index into dblword table
+	SETZB	DWD1+2,DWD1+3	; clear lo order registers of dividend
+	CAMGE	DWD1,TENF.(PR2)	; will divide work - high order check
+	JRST	DIV10G		; hi order dividend smaller -- will work
+	CAMN	DWD1,TENF.(PR2)	; skip if hi order smaller -- won't work
+	CAML	DWD2,TENF.+1(PR2) ; hi order equal -- skip if lo order smaller
+	JRST	DIV10A		; won't work -- adjust number
+
+DIV10G:	DDIV	DWD1,TENF.(PR2)	; do it
+	LSHC	DWD1+2,1	; double the doubleword remainder
+	JUMPL	DWD1+2,D10RND	; if shifted into bit 0, round up
+	CAMLE	DWD1+2,TENF.(PR2)	; else compare to divisor
+	JRST	D10RND		; bigger -- must round up
+	CAMN	DWD1+2,TENF.(PR2)	; if smaller, we're ok
+	CAMG	DWD1+3,TENF.+1(PR2)	; if equal check lo order
+	JRST	D10OUT		; smaller -- we're ok
+
+D10RND:	DADD	DWD1,DWONE	; add a double length "1"
+D10OUT:	DMOVE	DWD1+2,2+JUNK	; restore saved registers
+	JRST	0(NAME)		;   and split
+
+DIV10A:	ASHC	DWD1,-1		; divide fraction by 2
+	AOJA	PR1,DIV10G	; increase binary exponent and go
+
+
+REA.C3:	DMOVEM	DWD1+2,2+JUNK	; save extra registers needed
+	MOVEI	PR2,0(R1)	; compute double word table index
+	LSH	PR2,1		;   from scaling index
+	DMUL	DWD1,TENF.(PR2)	; do it
+	DMOVE	DWD1+2,2+JUNK	; restore borrowed registers
+	TLNE	DWD1,200000	; is it "normalized"?
+	JRST	0(NAME)		;   yes, bit is set, go home
+	ASHC	DWD1,1		; multiply fraction by two
+	SOJA	PR1,0(NAME)	;   decrement binary exponent and split
+
+; Real number conversion tables
+;
+
+NSCALE=3			; three factors -- 10, 10000, and 1e13
+
+TENP.=.-1			; the decimal exponents
+	exp	1,4,^d13
+
+TENE.=.-1			; the binary exponents for the numbers
+	exp	4,^d14,^d44
+
+TENF.=.-2			; the double word fractions
+		; these are our internal forms for above factors
+	exp	240000000000,0
+	exp	234200000000,0
+	exp	221411634520,0
+ENDRN.=.-1
+	exp	^o17,7,3,1	; for rounding up decimal fraction
+
+DWONE:	exp	0,1		; double word integer one
+
+	$END	IORLC
+	prgend
+	search	RTSYM
+	search	IOSYM
+	sall
+	$MODULE	IOSTR
+
+	entry	XSTR.R,XSTR.W,FSTR.R,FSTR.W
+	entry	BOOL.X,CSTR.W,STRV.R,STRV.W
+	entry	CSTR.R
+
+	$TEMP	TDESC,2		; target descriptor
+	$TEMP	INITRA,1	; save init cortn. RA
+	$TEMP	DDESC,2		; datum descriptor
+	$TEMP	SAVPRO,2	; save producer's registers
+	$TEMP	FWBITS,1	; AC field of field width ARG
+	$TEMP	FARG2,1		; second format arg if any
+	$TEMP	BDSPTR,1	; pointer to subrange bounds if any
+	$TEMP	JUNK,6		; padding for decimal conversion
+	$TEMP	STRSAV,1	; temp for string variable read
+	$TEMP	FWIDTH,1	; field width, or zero
+	$TEMP	REGSAV,^o15	; register save area
+
+; XSTR.W -- X format producer (for writes).  The length to write is
+;   controlled by the field width.  If width <= length, truncate if
+;   necessary.  If width >= length, pad out either before or after
+;   string write, for right or left justification respectively.
+
+XSTR.W:	MOVEM	R1,INITRA	; explode arg list -- save RA,
+	MOVEI	R1,2		;   and get the two datum descriptor words
+	ADDB	R1,0(TOP)	; standard trick
+	MOVEI	R0,@-2(R1)	; pick up addr of byte pointer
+	MOVE	R0,@R0		;   and the pointer (indirect bit not set!)
+FSPCOM:	MOVEM	R0,DDESC	; store it
+	MOVEI	R0,@-1(R1)	; get length of string
+CSPCOM:	MOVEM	R0,1+DDESC	;   and store it
+BOOL.X:	SETZM	0,FWBITS	; assume no format specified
+	HRLZI	R0,777000	; get op code mask
+	TDNE	R0,0(R1)	; is there a format descriptor?
+	JRST	XPNFMT		;   no
+	LDB	R0,ACBIT.	; load ac field (random things)
+	MOVEM	R0,FWBITS	;   and store it
+	AOS	0,0(TOP)	; correct return addr
+	TRNN	R0,2		; is field width non-minimal?
+	JRST	XPNFMT		;   no, remember minimal
+	MOVEI	R1,@0(R1)	; R1 already correct, get field width
+	MOVEM	R1,FWIDTH	;   store it
+	JRST	XPSTRT		; hit common code if non-zero FW
+
+XPNFMT:	SETOM	0,FWIDTH	; zero it out -- minimal field width
+XPSTRT:	JSP	R1,@INITRA	; return -- now regs are saved, etc.
+	MOVE	PR1,1+DDESC	; load string length
+	SKIPGE	PR2,FWIDTH	; get field width
+	JRST	XPLOOP		; minimal -- no sweat
+	SUBI	PR2,0(PR1)	; get residue of FW over length
+	JUMPLE	PR2,XPTRNC	; no overflow -- trunc it
+	MOVEI	R1,1		; determine justification mode
+	TDNE	R1,FWBITS
+	JRST	XPLOOP		; left just -- write blanks after
+
+XPBPAD:	MOVEI	R1," "		; pad before with blanks
+	RESUME	OK
+	DETACH			; forget it if no acceptance
+	SOJG	PR2,XPBPAD	; go back if more to write
+
+XPTRNC:	ADD	PR1,PR2		; correct output width (FW or str len)
+	SETZ	PR2,0		; no trailing blanks
+
+XPLOOP:	SOJL	PR1,XPAPAD	; if no more, hit trailing blank writer
+	ILDB	R1,DDESC	; get the char
+	RESUME	OK		; there you go
+	DETACH			;   picky
+	JRST	XPLOOP		; get next
+
+XPAPAD:	SOJL	PR2,XPDONE	; write trailers if any
+	MOVEI	R1," "		; padding character
+	RESUME	OK		; do it
+	DETACH			; no
+	JRST	XPAPAD		; try it again
+
+XPDONE:	RESUME	NOTOK		; force the detach
+
+; FSTR.W, CSTR.W, and STRV.W -- other string write coroutines.  All we
+;   do here is fake up the X format and jump into the X format code.
+;   STRV.W is not implemented, but would be really easy to do.  Just
+;   make a byte pointer and store it, load up the length in R1 and
+;   jump to CSPCOM.
+
+FSTR.W:	MOVEM	R1,INITRA	; must duplicate XSTR.W entry sequence
+	MOVEI	R1,2
+	ADDB	R1,0(TOP)
+	MOVEI	R0,@-2(R1)	; addr of fixed length string
+	HRLI	R0,440700	; convert to zero byte pointer
+	JRST	FSPCOM		; hit common code
+
+CSTR.W:	MOVEM	R1,INITRA
+	MOVEI	R1,1
+	ADDB	R1,0(TOP)
+	MOVEI	R0,@-1(R1)	; address of character
+	HRLI	R0,070700	; hoke up ILDB-able byte pointer
+	MOVEM	R0,DDESC	;   and store it
+	MOVEI	R0,1		; grab "string length"
+	JRST	CSPCOM		; hit common code
+
+STRV.W:	JSP	R1,0(R1)	; just a coreturn via R1
+	MOVEI	R1,INTERR	; bad news
+	JRST	IOERR.##	; go barf.
+
+; XSTR.R, FSTR.R, and STRV.R -- string consumer coroutines.
+;   These guys are used in string read operations for X and F format
+;   strings and string variables respectively.  Code is shared with
+;   the string producer coroutines for exploding the arguments to save
+;   space.  Simply stated, the read algorithm is:
+;
+;   while not (eoln or eopage) and FW not exceeded and MAX not exceeded do
+;     put an input stream character into the read item;
+;   while (FW not exceeded) and not (eoln or eopage) do
+;     discard an input character   (* must read that many *) ;
+;   if not string variable then    (* pad with blanks *)
+;     while MAX not exceeded do stuff a blank
+;   else set length of string variable;
+
+XSTR.R:	MOVEM	R1,FARG2	; save our caller's RA
+	JSP	R1,XSTR.W	; hit producer's init routine
+	JSP	R1,XCSTRT	; hit the string read common code
+	JRST	XCPAD		; "stuff a blank"
+
+FSTR.R:	MOVEM	R1,FARG2	; again, same thing
+	JSP	R1,FSTR.W
+	JSP	R1,XCSTRT
+
+XCPAD:	MOVEI	R0," "		; the pad character
+	SOJL	CO1,XPDONE	; CO1 returned from XCSTRT, remaining
+XCPLOO:	IDPB	R0,DDESC	;   positions to be filled
+	SOJGE	CO1,XCPLOO
+	RESUME	NOTOK
+
+STRV.R:	MOVEM	R1,FARG2	; same thing except no common code
+	MOVEI	R1,SVROK	; fake return addr
+	MOVEM	R1,INITRA	;   like so
+	MOVEI	R1,2		; explode args
+	ADDB	R1,0(TOP)
+	MOVEI	R0,@-2(R1)	; addr of string variable
+	HRRZM	R0,STRSAV	; remember it
+	ADDI	R0,1		; addr of first char word
+	HRLI	R0,440700	; compose byte pointer
+	MOVEM	R0,DDESC	;   and store it
+	MOVEI	R0,@-1(R1)	; get declared length
+	JRST	CSPCOM		;   and hit common code
+
+SVROK:	JSP	R1,XCSTRT	; hit the common code
+	MOVE	CO1,STRSAV	; load addr of string variable
+	MOVEM	CO2,0(CO1)	; store returned length
+	RESUME	NOTOK		; force detach
+
+CSTR.R:	MOVEM	R1,FARG2
+	JSP	R1,CSTR.W
+	JSP	R1,XCSTRT
+	JRST	XCPAD
+
+; XCSTRT -- common code for string reads.  Implements the algorithm on
+;   the previous page via JSP R1, returns CO2 with the number of chars
+;   stored (for strings) and CO1 with the number of chars remaining
+;   until the max is exceeded (for other things).
+
+XCSTRT:	EXCH	R1,FARG2	; get original RA, store from last page
+	JSP	R1,0(R1)	; resume caller, now regs are saved, etc.
+
+	SETZ	CO2,0		; initialize current length
+	SKIPL	CO1,FWIDTH	; pick up field width if non-zero
+	CAMLE	CO1,1+DDESC	;   smaller of FW and MAX
+	MOVE	CO1,1+DDESC
+	RESUME	OK		; ask for first char
+	JRST	XCEOLN		;   already at end, read null string
+
+XCLOOP:	SOJL	CO1,XCNCNT	; jump if count underflow
+	IDPB	R1,DDESC	; store the char
+	ADDI	CO2,1		; tick the character count
+	RESUME	OK		; get a char
+	JRST	XCEOLN		;   no more??
+	JRST	XCLOOP		; back up to top.
+
+; CO2 does not get modified after this!!!
+
+XCNCNT:	SKIPGE	CO1,FWIDTH	; reload FW if any
+	JRST	XCEOLN		;   no, we're done
+	SUBI	CO1,0(CO2)	; subtract number already read
+	SOJL	CO1,XCEOLN	; unfolded loop, kick out if none to do
+
+XCGLOO:	RESUME	OK		; get a char
+	JRST	XCEOLN		; no, sorry
+	SOJGE	CO1,XCGLOO	; back if more to do
+
+XCEOLN:	MOVE	CO1,1+DDESC	; original maximum
+	SUBI	CO1,0(CO2)	;   minus number read == number pos'ns left
+	JRST	@FARG2		; go home
+
+ACBIT.:	point	4,@0(top),12
+
+	$END	IOSTR
+	prgend
+	search	RTSYM
+	search	OPDEFS
+	search	IOSYM
+	sall
+	$module	IOCHAR
+
+;
+; entry points and external requirements
+;
+
+	entry	GETCH.,GETCR.	; get for text files
+	entry	PUTCH.,PUTCR.	; put for text files
+	entry	RD.LNN,RD.LNR	; readln
+	entry	WR.LNN,WR.LNR	; writeln
+	entry	WR.SVN,WR.SVR	; putstring to string var
+	entry	RD.SSN,RD.SSR	; getstring from X substring
+	entry	WR.SSN,WR.SSR	; putstring to X substring
+	entry	RD.FSN,WR.FSN	; get/putstring to/from fixed string
+	entry	WR.DNN,WR.DNR	; done with putstring
+	entry	RD.FDR,RD.FDN	; read
+	entry	WR.FDR,WR.FDN	; write
+	entry	PUTPG.		; page
+	entry	BREAK.		; break for both text and non-text
+
+	extern	IOERR.		; common error table routine
+	extern	INT.R,INT.W,REAL.R,REAL.W,SRL.R,SRL.W
+	extern	XSTR.R,XSTR.W,FSTR.R,FSTR.W,CSTR.R,CSTR.W
+	extern	STRV.R,STRV.W,BOOL.W,.JBFF
+
+;
+; data declarations
+;
+
+	$STATIC	SAVFBL,1	; save file opnd for remember calls
+	$STATIC	SAVSTK,1	; save stack pointer where we can get it
+	$STATIC	SVSTRG,1	; to save string target descriptor words
+	$STATIC	FORERR,1	; format error cell
+	$STATIC	OPENBK,3	; for OPEN uuo to work ok
+	$STATIC	OPENIN,1	; cell for instruction
+	$TEMP	TDESC,2		; target descriptor
+	$TEMP	INITRA,1	; save init cortn. RA
+	$TEMP	DDESC,2		; datum descriptor
+	$TEMP	SAVPRO,2	; save producer's registers
+	$TEMP	FWBITS,1	; AC field of field width ARG
+	$TEMP	FARG2,1		; second format arg if any
+	$TEMP	BDSPTR,1	; pointer to subrange limits if any
+	$TEMP	JUNK,6		; padding for decimal conversion
+	$TEMP	STRSAV,1	; temp for string variable read
+	$TEMP	FWIDTH,1	; field width, or zero
+	$TEMP	REGSAV,^o15	; register save area
+
+; GETCH. -- get a character into the file buffer.  There are two
+;   versions, GETCH., with a single ARG pointing to the file block,
+;   and GETCR., using the file block remembered from the previous
+;   operation.  If we can get the char cheap, do it, else hit the
+;   full coroutine sequence.
+
+GETCH.:	MOVEI	R1,1		; get our single arg
+	ADDB	R1,0(TOP)
+	MOVEI	R0,@-1(R1)	; gotta be R0 so we can index R1
+	MOVE	R1,$IOCHA(PDA)	;   into the data area
+	MOVEM	R0,.SAVFB(R1)
+	MOVE	R1,R0		; put file block addr in R1
+	JRST	TRYGCH		;   and try to sneak a char
+
+GETCR.:	MOVE	R1,$IOCHA(PDA)	; load data area pointer
+	MOVE	R1,.SAVFB(R1)	;   and old file block addr
+
+TRYGCH:	SKIPN	0,EOFWRD(R1)	; if eosomething
+	SKIPG	0,BUFCNT(R1)	;   or we're at end of buff or doing tab
+	JRST	NOGO		;   then forget it
+	MOVE	R0,BUFPTR(R1)	; get the byte pointer
+	ILDB	R0,R0		;   get the char
+	SKIPN	0,ERRORS(R1)	; check for deferred errors
+	CAIGE	R0," "		; if it's a control char
+	JRST	NOGO		;   then forget it
+	$MASK			;   else we're taking it -- mask
+	MOVEM	R0,@COMPTR(R1)	; store the char
+	SOS	0,BUFCNT(R1)	; reduce the count
+	IBP	0,BUFPTR(R1)	; increment the pointer
+	AOS	0,CURSOR(R1)	; increment the cursor
+	$UNMASK			; we're done
+	POPJ	TOP,0		;   split
+
+NOGO:	$MASK			; hit the whole normal sequence
+	$SAVE	REGSAV,EXP1,PSA
+	MOVE	PSA,$IOCHA(PDA)	; load up pointer
+	MOVE	FBL,SAVFBL	;   and remembered file block addr
+
+GETCH:				; the common code
+	SKIPLE	R1,ERRORS(FBL)	; any outstanding errors?
+	JRST	ERROR		; yes
+	JSP	COREG,FDPRO	; start up the char getter
+	CAI	0,0		; don't care about EOL/EOP/EOF
+	RESUME	OK		; ok, get next char
+	CAI	0,0		; still don't care, let FDPRO die
+	MOVEM	R1,@COMPTR(FBL)	; store component char ourselves
+				;   and fall into exit code
+
+GETOUT:	$RESTOR	REGSAV,EXP1,PSA		; the exit sequence
+	SETZM	$INRT(PDA)	; resume overflow checking in case suppressed
+	$UNMASK
+	POPJ	TOP,0
+
+; FDPRO -- file or device producer coroutine.  FDPRO assumes that
+;   FBL contains the address of the file block from which to produce
+;   characters.  The file component is not updated until the detach
+;   signal is received from the consumer.
+
+FDPRO:	MOVE	R0,EOFWRD(FBL)	; load the end of file word
+	TLNE	R0,EOFBIT	; is it eof?
+	JRST	DOEOF		;   yes, let caller diagnose
+
+	SETZM	0,ERRORS(FBL)	; init all error cells
+	SETZM	0,$IOERR(PDA)
+	SETZM	0,$EXTST(PDA)
+	MOVE	R1,@COMPTR(FBL)	; get current component char
+	TLNE	R0,EOLBIT+EOPBIT	; if either end of line or page
+	JRST	DOEOLN		;   then do nonskip return etc.
+	RESUME	OK		; go back with good char
+	DETACH			; ok, heck with it
+	SETZM	0,EOFWRD(FBL)	; clear all of eof, eoln, and eopage
+	SKIPL	0,BUFCNT(FBL)	; is tab bit set?
+	JRST	FDPNXT		; no, do it for real
+
+FDTAB:	MOVEI	R1," "		; we will return blanks
+	MOVE	PR1,CURSOR(FBL)	; get cursor value
+	ANDI	PR1,7		; get to next stop ((mod 8) +1 )
+	SUBI	PR1,^o10	; 8 minus that
+
+FDTABL:	AOS	0,CURSOR(FBL)	; must increment that cursor
+	AOJGE	PR1,FDTABD	; is this is last space for canon.?
+	RESUME	OK		; no, return space
+	JRST	FDPOT1		; return normally
+	JRST	FDTABL		; do another blank
+
+FDTABD:	HRRZS	0,BUFCNT(FBL)	; clear tab indicator now
+	RESUME	OK
+	JRST	FDPOT1		; done, take normal return
+
+FDPNXT:	SOSGE	0,BUFCNT(FBL)	; anything left in buffer?
+	JSP	PR1,GITTIT	;   no, get something
+
+FDPCHR:	ILDB	R1,BUFPTR(FBL)	; get the character
+	SETZ	R0,0		; clear EOP flag if we hit EOLN
+	CAIL	R1," "		; is it a control character?
+	JRST	FDPLNR		; no, treat normally
+	JUMPE	R1,FDPNXT	; we always chuck NUL
+	CAIE	R1,12		; see if it's a endofline char -- LF,
+	CAIN	R1,7		; BEL,
+	JRST	ISEOLN
+	CAIE	R1,32		; ^Z,
+	CAIN	R1,33		; and ESC
+	JRST	ISEOLN
+	CAIN	R1,14		; FF?
+	JRST	FDPPAG		; yep
+
+	HRLZI	R0,ASCIIB	; find out if we're taking controls
+	TDNE	R0,STATUS(FBL)
+	JRST	DORESU		; yes, give it to consumer
+	CAIN	R1,11		; HTab?
+	JRST	DOTAB		; yep
+	JRST	FDPNXT
+
+FDPLNR:	MOVEI	R0,1		; check for SOS-type line numbered file
+	TDNN	R0,@BUFPTR(FBL)	; is bit 35 set?
+	JRST	DORESU		; no, forget it
+	MOVE	R1,@BUFPTR(FBL)	; pick up 5 char line number
+	TRZ	R1,1		; clear bit 35
+	MOVEM	R1,LINENR(FBL)	;   and put into line number word
+	MOVE	R0,BUFCNT(FBL)	; update count
+	SUBI	R0,5		; by knocking off five chars
+	JUMPGE	R0,FDPLPG	; update count if anything left
+	$DOUUO	XCT,0,IOINST(FBL),FDPGT1,FDPEOF
+	;	execute the get buff, go on if ok, EOF if skip
+FDPGT1:	IBP	0,BUFPTR(FBL)	; increment to go past tab
+	SOS	0,BUFCNT(FBL)	;   dec the count, too
+	JRST	FDPNXT		;   and get next normal char
+
+FDPLPG:	MOVEM	R0,BUFCNT(FBL)	; update buffer count
+	AOS	0,BUFPTR(FBL)	; advance byte pointer 5 chars
+	JRST	FDPNXT		; return next normal char
+
+FDPPAG:	HRLZI	R0,EOPBIT	; end of page, set both that
+ISEOLN:	TLO	R0,EOLBIT	;   and eol (if not eop, R1=0)
+	ORM	R0,EOFWRD(FBL) 	; set 'em
+DOEOLN:	HRLZI	R0,ASCIIB	; do we blank out EOL char?
+	TDNN	R0,STATUS(FBL)	;   depends on ASCII bit
+	MOVEI	R1," "		; return blank
+	RESUME	NOTOK		; return it
+	JRST	FDPOT2		;   we're done
+EOLCHK:	SOSL	0,BUFCNT(FBL)	; anything left?
+	JRST	EOLSOM		;   yes, make sure it's not null
+	JSP	PR1,GITTIT	;   no, get something
+	SETZM	0,EOFWRD(FBL)	; clear EOL, EOP, and EOF
+	SETZM	0,CURSOR(FBL)	; new line
+	JRST	FDPCHR		;   try again
+
+EOLSOM:	ILDB	R1,BUFPTR(FBL)	; so we got something, eh?
+	JUMPE	R1,EOLCHK	;   not really
+	SETZM	0,EOFWRD(FBL)	; fix up and check it out
+	SETZM	0,CURSOR(FBL)
+	JRST	FDPCHR+1	; skip their ILDB
+
+DORESU:	AOS	0,CURSOR(FBL)	; we got a char -- tick cursor
+	RESUME	OK
+	JRST	FDPOT2		; we're done
+	JRST	FDPNXT		;   else get next char
+
+DOTAB:	HRLZI	R0,400000	; set high order bit in word
+	ORM	R0,BUFCNT(FBL)	;   in count to indicate tab
+	JRST	FDTAB		; and start returning blanks
+
+FDPEOF:	HRRZI	R0,ISTTYI	; must find out if this is TTY
+	TDNN	R0,STATUS(FBL)
+	JRST	FDSEOF		;   no
+	SETZM	0,EOFWRD(FBL)	; whatever happens, no longer at eoln
+	MOVE	PSA,$IOCHA(PDA)	; just make sure our static pointer is ok
+	SETZM	0,OPENBK	; set up OPEN block
+	HRLZI	R1,'TTY'
+	MOVEM	R1,1+OPENBK	; zero status bits, TTY device
+	MOVEI	R1,RINGHD(FBL)
+	MOVEM	R1,2+OPENBK
+	MOVE	PR1,CHNUM(FBL)	; set up instruction
+	LSH	PR1,^o27
+	HRRI	PR1,OPENBK
+	TLO	PR1,(open)	; make OPEN instruction
+	MOVEM	PR1,OPENIN	; store it
+	$DOUUO	XCT,0,OPENIN,FDSEOF,FDPBUF
+
+	; ON SUCCESSFUL REOPEN, REINITIALIZE BUFFER
+FDPBUF:	MOVE	PR1,CHNUM(FBL)
+	LSH	PR1,^O27
+	TLO	PR1,(INBUF)
+	ADDI	PR1,1			; ONE BUFFER INBUF INSTRUCTION IN PR1
+	MOVEI	R0,BUFFHD(FBL)	; where we want the buffers
+	EXCH	R0,.JBFF
+	$DOUUO	XCT,0,PR1,FDPRES
+FDPRES:	MOVEM	R0,.JBFF
+	JRST	FDPNXT
+
+FDSEOF:	HRLZI	R0,EOFBIT+EOLBIT	; must set EOF in file block
+	HRRI	R0,EOFCNT	; put max countdown in right half
+	ORM	R0,EOFWRD(FBL)	;   like so
+	HRRZ	R0,EXTRA2(FBL)	; get status bits from buffer header
+	MOVEM	R0,$EXTST(PDA)	;   and call it extended status
+	JRST	DOEOF		; start EOF countdown
+
+FDPOT1:	MOVEI	R1," "		; get a blank to install
+FDPOT2:	MOVEM	R1,@COMPTR(FBL)	; install char in component
+	SKIPE	R1,$IOERR(PDA)	; was a formatting error detected?
+	MOVEM	R1,ERRORS(FBL)	;   yes, put it into file block too.
+	DETACH			; split
+
+DOEOF:	HRRZ	PR1,EOFWRD(FBL)	; pick up EOF counter
+DOEOFL:	HRRM	PR1,EOFWRD(FBL)	; update it each time
+	RESUME	NOTOK		; tell caller it's eosomething
+	JRST	FDPOT1		;   OK, all right already!
+	SOJGE	PR1,DOEOFL	;   else back up and count it
+
+GETERR:	LDERR	R1,EOFERR	; proper error code
+GETER2:	HRLZI	R0,ETRAP	; must see if file is trapping
+	TDNN	R0,STATUS(FBL)	; are it?
+	JRST	ERROR		;   no, blow up now
+	MOVEM	R1,ERRORS(FBL)	; else record fatal error
+	MOVEM	R1,$IOERR(PDA)	;   in both file and global cell
+	DETACH			; and split
+
+GITTIT:	SETZM	0,BUFCNT(FBL)	; make sure file block is ok
+	$UNMASK
+	$DOUUO	XCT,0,IOINST(FBL),GT1,GT2
+
+GT1:	$MASK			; success
+	JRST	0(PR1)
+
+GT2:	$MASK			; eof
+	JRST	FDPEOF
+
+; PUTCH. -- put out the current buffer character.  Again, there are
+;  two flavors, with PUTCR. using the most recently used file var.
+;  Try to just stuff a normal character without looking very hard
+;  at it, but watch out if EOLN is true.
+
+PUTCH.:	MOVEI	R1,1		; one arg
+	ADDB	R1,0(TOP)
+	MOVEI	R0,@-1(R1)	; first put it in R0
+	MOVE	R1,$IOCHA(PDA)	;   so that R1 can index the PSA
+	MOVEM	R0,.SAVFB(R1)	;   to store the addr of file
+	MOVE	R1,R0		; load file block addr in R1
+	JRST	TRYPCH
+
+PUTCR.:	MOVE	R1,$IOCHA(PDA)	; just load the remembered addr
+	MOVE	R1,.SAVFB(R1)	;   and now the file block addr
+
+TRYPCH:	MOVE	R0,EOFWRD(R1)	; get the whole word
+	TLNN	R0,EOLBIT+EOPBIT	; both better be clear
+	TLNN	R0,EOFBIT	; but EOF better be high
+	JRST	PNOGO		;   then go thru the normal seq
+	SKIPN	0,ERRORS(R1)	; must check for deferred errors
+	SKIPG	0,BUFCNT(R1)	;   and for buffer being full
+	JRST	PNOGO
+	$MASK			; ok, let's stuff it
+	MOVE	R0,@COMPTR(R1)	; get the component char
+	IDPB	R0,BUFPTR(R1)	; increment and stuff
+	SOS	0,BUFCNT(R1)	; dec the count
+	AOS	0,CURSOR(R1)	; inc the cursor
+	$UNMASK			;   and we're done
+	POPJ	TOP,0		; like so
+
+PNOGO:	$MASK			; oh well, take full entry
+	$SAVE	REGSAV,EXP1,PSA
+	MOVE	PSA,$IOCHA(PDA)
+	MOVE	FBL,SAVFBL	; just pick up old one
+
+PUTCH:
+	SKIPLE	R1,ERRORS(FBL)	; is there an outstanding error?
+	JRST	ERROR		; yep
+
+	JSP	COREG,FDCON	; initialize consumer on file block
+	JRST	PUTERR		; no good
+	MOVE	R1,@COMPTR(FBL)	; load up current component char
+	RESUME	OK		; put it out
+	JRST	PUTERR		; still no good
+	JRST	GETOUT		; hit exit code
+
+PUTERR:	MOVEI	R1,REWERR	; load bit for "rewrite required"
+	JRST	GETER2		; common code for errors
+
+; ERROR -- code for errors.
+
+ERROR:	POP	TOP,R0		; get the return addr, R1 has code
+	JRST	IOERR.		; hit the error routine
+
+
+CHINIT:	SETZM	0,SAVSTK	; zero everything out
+	SETZM	0,SAVFBL
+	SETZM	0,SVSTRG
+	SETZM	0,1+SVSTRG
+	SETZM	0,FORERR
+	POPJ	TOP,0
+
+; FDCON -- file or device consumer coroutine.  We have to worry about
+;   line terminators, so EOLN of an output file is high if there is
+;   a deferred line terminator. The only thing strange about this is
+;   that EOLN is false after a PAGE operation (it's actually ok if you
+;   think about the definition of line terminators on the -10).
+
+FDCON:				; optional test for text file
+;	HRLZI	R0,TEXTFI
+;	TDNE	R0,STATUS(FBL)
+;	RESUME	NOTOK
+
+	HRLZI	R0,EOFBIT	; must make sure EOF is true
+	TDNN	R0,EOFWRD(FBL)
+	RESUME	NOTOK		; no, error
+	RESUME	OK		;   else we're ready, signal producer
+	DETACH			; producer done   (?)
+
+	SETZM	0,ERRORS(FBL)	; must clear all error cells
+	SETZM	0,$IOERR(PDA)
+	SETZM	0,$EXTST(PDA)
+	HRLZI	R0,EOLBIT	; must check if deferred end of line
+	TDNE	R0,EOFWRD(FBL)
+	JRST	FDC1ST		; oh boy, first char on line!
+
+FDCLOO:	MOVEI	CO1,FDCLOO+1	; load up return addr from bufferload put
+	SOSGE	0,BUFCNT(FBL)	; have we filled one?
+	JRST	FDCPUT		;   yes, put it out
+	IDPB	R1,BUFPTR(FBL)	; install character in buffer
+
+FDCGO:	AOS	0,CURSOR(FBL)	; common return code -- tick cursor,
+	RESUME	OK		;   and get next char to put
+	DETACH			; nothing to do -- ok
+	JRST	FDCLOO		;   else back up to top
+
+FDCPUT:	$DOUUO	XCT,0,IOINST(FBL),0(CO1),FDCDIE
+	; put out the buffer, register return if ok, else die
+
+FDC1ST:	ANDCAM	R0,EOFWRD(FBL)	; as long as it's loaded, clear EOLN now
+	HRLZI	R0,CONTRB	; first char on new line
+	TDNN	R0,STATUS(FBL)	; was the file opened with CONTROL?
+	JRST	FDCDON		; no, terminate old line with LF
+	CAIN	R1,"+"		; overstrike?
+	JRST	FDCGO		;   yes, do nothing, ignore current
+	SETZM	0,CURSOR(FBL)	; definitely real end of line, zero cursor
+	CAIN	R1," "		; check current char -- blank?
+	JRST	FDCLFD		;   yes, LF and discard blank
+	CAIN	R1,"1"		; page skip (1) ?
+	JRST	FDCFFD		;   yes, FF and discard char
+	CAIN	R1,"0"		; double space (0) ?
+	JRST	FDC2LF		;   yes, LF LF and discard char
+				;     else fall into normal termination
+
+FDCDON:	MOVEI	CO1,FDCDON+1	; in case we fill buffer this time
+	MOVEI	R0,12		; get a line feed
+	SETZM	0,CURSOR(FBL)	; make sure that cursor is zero
+	SOSGE	0,BUFCNT(FBL)	; did we overflow?
+	JRST	FDCPUT		;   yes, write out buffer
+	IDPB	R0,BUFPTR(FBL)	; put the LF
+	JRST	FDCLOO		;   and put out the R1 char
+
+FDC2LF:	MOVEI	CO1,FDC2LP	; just like the other case
+FDC2LP:	MOVEI	R0,12
+	SOSGE	0,BUFCNT(FBL)	; did we make it?
+	JRST	FDCPUT		;   no, sorry
+	IDPB	R0,BUFPTR(FBL)	; put the character
+
+FDCLFD:	MOVEI	R0,12		; load up line feed
+	MOVEI	CO1,FDCLFD+2	; same sequence
+	SOSGE	0,BUFCNT(FBL)	; are we full?
+	JRST	FDCPUT		;   yes, put it out
+	IDPB	R0,BUFPTR(FBL)	; install EOL char
+	JRST	FDCGO+1		; resume producer, but with cursor 0
+
+FDCFFD:	MOVEI	R0,14		; a form feed instead
+	JRST	FDCLFD+1
+
+FDCDIE:	HRRZ	R1,EXTRA2(FBL)	; get error bits from buffer header
+	MOVEM	R1,$EXTST(PDA)	;   call it extended status.
+	LDERR	R1,OUTERR	; output file space exhausted
+	JRST	GETER2		; go die
+
+; PUTPG. -- page.  Write a page mark to the file specified by the ARG
+;   word.  If EOLN is high for the file, then the LF was supressed, so
+;   just put the FF and split, leaving EOLN low.  If not EOLN, we must
+;   put a CR before the FF.
+
+PUTPG.:	MOVEI	R1,1		; trick to load ARG word addr
+	ADDB	R1,0(TOP)	;   and tick return addr
+	MOVEI	R1,@-1(R1)	; get the file block addr
+	$MASK
+	$SAVE	REGSAV,EXP1,PSA
+
+	MOVEI	FBL,0(R1)	; load it up
+	SKIPLE	R1,ERRORS(FBL)	; errors outstanding?
+	JRST	ERROR		; yep
+	MOVEI	DETREG,GETOUT	; exit addr
+
+	JSP	COREG,FDCON	; are you ready?
+	JRST	PUTERR		; guess not
+
+	HRLZI	R0,EOLBIT	; are we at EOL right now?
+	TDNE	R0,EOFWRD(FBL)
+	JRST	PGDOFF		;   yes, just do the FF
+	MOVEI	R1,15		; else get a CR
+	RESUME	OK		; hand it down
+	JRST	PUTERR		;   'scuuuuuuuse me!
+PGDOFF:	MOVEI	R1,14		; now the form feed
+	HRLZI	R0,EOLBIT	; gotta clear EOLN
+	ANDCAM	R0,EOFWRD(FBL)	;   so deferred LF isn't written
+	RESUME	OK		; do it
+	JRST	PUTERR		; oh, foo
+	RESUME	NOTOK		; force detach, we're done
+
+; BREAK. -- break for a file.  So simple it's sick.
+
+BREAK.:	$MASK
+	$SAVE	REGSAV,EXP1,PSA
+	MOVEI	R1,1		; get our arg
+	ADDB	R1,0(TOP)
+	MOVEI	FBL,@-1(R1)
+	SKIPLE	R1,ERRORS(FBL)	; any errors?
+	JRST	ERROR		;   yes
+	MOVEI	R1,TEXTFI	; must see if it's a tenio file
+	TDNE	R1,STATUS(FBL)	;   i.e. not a text file
+	JRST	BRKTEN
+	HRLZI	R1,EOLBIT	; if eoln, we pony up a CR write
+	TDNN	R1,EOFWRD(FBL)	; is it EOL?
+	JRST	BREAKO		;   no, just output the stuff
+	ANDCAM	R1,EOFWRD(FBL)	; clear EOLN so FDCON won't put anything
+	JSP	COREG,FDCON	; initiallize consumer
+	JRST	BREAKE		;   must not be open
+	MOVEI	R1,12		; we put a line feed (sneakily)
+	RESUME	OK
+	JRST	BREAKE		; something's up
+	MOVEI	DETREG,BREAKO	; make it detach
+	SETZM	0,CURSOR(FBL)	; sneaky, but it is end of line now.
+	RESUME	NOTOK		; force detach
+
+BREAKO:	$DOUUO	XCT,0,IOINST(FBL),GETOUT,BREAKT
+	; force output to system, GETOUT if ok, else error
+
+BREAKT:	HRRZ	R1,EXTRA2(FBL)	; get status bits from buffer
+	MOVEM	R1,$EXTST(PDA)	;   and call it extended status
+
+BREAKE:	LDERR	R1,REWERR
+	JRST	GETER2
+
+BRKTEN:	SETZ	R1,0		; tell tenio not to update rib etc.
+	FLUSHF	R1,CHNUM(FBL)	;   do it
+	JRST	BREAKE		; error
+	JRST	GETOUT		; ok, we're done
+
+; RD.LNR and RD.LNN -- done with input line.  After loading the file block
+;   addr, call the file producer coroutine until EOLN is true.
+
+RD.LNR:	MOVE	R1,$IOCHA(PDA)	; must load the PSA register
+	MOVE	R1,.SAVFB(R1)	;   to load the old file block addr
+	JRST	RDLINM
+
+
+RD.LNN:	MOVEI	R1,1		; to pick up addr of arg word
+	ADDB	R1,0(TOP)	;   and tick return addr at once
+	MOVEI	R1,@-1(R1)	; go thru arg word for block addr
+
+RDLINM:	$MASK
+	$SAVE	REGSAV,EXP1,PSA	; store 'em
+
+	MOVEI	FBL,0(R1)	; load file block into right register
+	SKIPLE	R1,ERRORS(FBL)	; errors on preceding operations?
+	JRST	ERROR		;   yep
+	MOVEI	DETREG,GETOUT	; the final return addr
+	MOVE	PSA,$IOCHA(PDA)	; load data area pointer
+	MOVEM	FBL,SAVFBL	;   and store for next operation
+
+	MOVEI	COREG,FDPRO-1	; just load up coroutine addr
+
+RDLOOP:	RESUME	OK		; see if it skips
+	JRST	RDEOLN		;   it did, we must be there
+	JRST	RDLOOP		;     up to top
+
+RDEOLN:	RESUME	OK		; get next char
+	RESUME	NOTOK		; force detach
+	RESUME	NOTOK		; force detach
+
+; WR.LNR and WR.LNN -- writeln.  Load up the file block addr, write out
+;   a CR to the file consumer coroutine, and set EOLN true.
+
+WR.LNR:	MOVE	R1,$IOCHA(PDA)	; load up data pointer
+	MOVE	R1,.SAVFB(R1)	; old file block add
+	JRST	WRLINM		;   do it
+
+
+WR.LNN:	MOVEI	R1,1		; get arg word and tick return addr
+	ADDB	R1,0(TOP)	;   like so
+	MOVEI	R1,@-1(R1)	; thru arg word to get file block
+
+WRLINM:	$MASK
+	$SAVE	REGSAV,EXP1,PSA
+	MOVEI	FBL,0(R1)	; put file block addr in right register
+	SKIPLE	R1,ERRORS(FBL)	; errors last time?
+	JRST	ERROR		;   yeth
+	MOVEI	DETREG,GETOUT	; the return addr
+	MOVE	PSA,$IOCHA(PDA)	; load data area pointer
+	MOVEM	FBL,SAVFBL	;   to save remembered file block
+
+	JSP	COREG,FDCON	; initialize consumer
+	JRST	PUTERR		;   not in the mood
+	MOVEI	R1,15		; load up the CR
+;	RESUME	OK		; do it
+;	JRST	PUTERR		;   sorry
+;	MOVEI	R1,12		; now a LF
+	RESUME	OK		; ok?
+	JRST	PUTERR		;   no
+	HRLZI	R0,EOLBIT	; get that bit
+	ORM	R0,EOFWRD(FBL)	;   and set it
+	RESUME	NOTOK		; force the store and detach
+
+; RD.FDR and RD.FDN -- read.  The principal routine for all formatted
+;   reads.  Explode the file variable descriptor, initialize the file
+;   producer coroutine, and then branch to the appropriate consumer
+;   coroutine for the datum type.
+
+RD.FDR:	MOVE	R1,$IOCHA(PDA)	; load up data area pointer
+	MOVE	R1,.SAVFB(R1)	; get old block addr
+	JRST	RDSOME		;   go read something
+
+
+RD.FDN:	MOVEI	R1,1		; get ARG word addr and tick
+	ADDB	R1,0(TOP)	;   return address
+	MOVEI	R1,@-1(R1)	; thru ARG word to get FB addr
+
+RDSOME:	MOVEM	R1,TDESC	; save file block addr
+	LDB	R1,ACBIT.	; get type of datum
+	JSP	R1,@CONSUM(R1)	; initialize consumer, explode args
+	MOVEM	R1,INITRA	; save coroutine RA in block
+	$MASK			; all right!
+	$SAVE	REGSAV,EXP1,PSA
+	MOVE	PSA,$IOCHA(PDA)	; load up data area pointer
+	MOVE	FBL,TDESC	; get saved file block pointer
+	SKIPLE	R1,ERRORS(FBL)	; deferred errors?
+	JRST	ERROR		; yes
+	MOVEI	COREG,FDPRO-1	; set up producer but don't call yet
+	MOVEM	FBL,SAVFBL	; save it for next time
+	MOVEI	DETREG,GETOUT	; formatted exit
+	JRST	@INITRA		; back to consumer coroutine via saved RA
+
+CONSUM:				; the consumer coroutine transfer vector
+	xwd	0,INT.R		; integer
+	xwd	0,SRL.R		; single real
+	xwd	0,REAL.R	; double real
+	xwd	0,XSTR.R	; X format string
+	xwd	0,FSTR.R	; F format string
+	xwd	0,CSTR.R	; C format string
+	xwd	0,STRV.R	; string variable
+
+; WR.FDR and WR.FDN -- write.  The principal routine for formatted
+;   writes to files or devices.  Get the file block address, initialize
+;   the file consumer coroutine, then branch to the proper datum prod-
+;   ucer coroutine.
+
+WR.FDR:	MOVE	R1,$IOCHA(PDA)	; load data area pointer
+	MOVE	R1,.SAVFB(R1)	;   explicitly index to get old one
+	JRST	WRSOME		; hit common code
+
+
+WR.FDN:	MOVEI	R1,1		; standard trick
+	ADDB	R1,0(TOP)
+	MOVEI	R1,@-1(R1)	;   to get first arg word EA
+
+WRSOME:	MOVEM	R1,TDESC	; remember target
+	LDB	R1,ACBIT.	; load datum type
+	JSP	R1,@PRODUC(R1)	; hit producer coroutine
+	MOVEM	R1,INITRA	; save return addr
+	$MASK
+	$SAVE	REGSAV,EXP1,PSA
+	MOVE	FBL,TDESC	; load file block address
+	MOVE	PSA,$IOCHA(PDA)	;   and data area pointer
+	SKIPLE	R1,ERRORS(FBL)	; anything deferred?
+	JRST	ERROR		;   yes, do it now
+	MOVEI	DETREG,GETOUT	; formatted exit routine
+	MOVEM	FBL,SAVFBL	; remember for next time
+	JSP	COREG,FDCON	; initialize file consumer
+	JRST	PUTERR		; not interested
+	JRST	@INITRA		; go to it
+
+PRODUC:				; producer coroutine table
+	xwd	0,INT.W		; integer producer
+	xwd	0,SRL.W		; single real
+	xwd	0,REAL.W	; double real
+	xwd	0,XSTR.W	; X format string
+	xwd	0,FSTR.W	; F format string
+	xwd	0,CSTR.W	; C format string
+	xwd	0,STRV.W	; string variable
+	xwd	0,BOOL.W	; boolean
+
+; WR.SVR and WR.SVN -- string variable as target of PUTSTRING.  The
+;   characters produced by the item are concatenated onto the target
+;   string variable.  The countdown cell provided on the call is decre-
+;   mented along with the update of the length.
+
+WR.SVR:	MOVE	R1,$IOCHA(PDA)	; load up static area pointer
+	MOVE	R1,.SVSTR(R1)	; saved addr of argument block
+	JRST	SVCOMM
+
+WR.SVN:	MOVEI	R1,1		; get arg the usual way
+	ADDB	R1,0(TOP)
+	MOVEI	R1,@-1(R1)	; get addr of two-word cell
+
+SVCOMM:	MOVEI	R0,SVRTRG	; load addr of consumer coroutine
+	MOVEM	R0,JUNK		;   to hit after common init code
+
+STRCOM:	MOVEM	R1,TDESC	; remember addr of block
+	LDB	R1,ACBIT.	; get datum descriptor type
+	JSP	R1,@PRODUC(R1)	; initialize producer
+	SETZM	0,$IOERR(PDA)	; init global error cell
+	MOVEM	R1,INITRA	; remember its return addr
+	$MASK
+	$SAVE	REGSAV,EXP1,PSA
+	MOVE	PSA,$IOCHA(PDA)	; load up data area pointer
+	MOVE	CO1,TDESC	; reload arg block
+	MOVEM	CO1,SVSTRG	; remember for next operation
+	DMOVE	CO1,0(CO1)	; load actual arguments
+	MOVEI	DETREG,GETOUT	; normal termination code
+	JSP	COREG,@JUNK	; hit stored target consumer
+	JRST	PSTERR		;   huh?
+	JRST	@INITRA		; resume producer
+
+PSTERR:	LDERR	R1,PSTROV	; putstring overflow
+	MOVEM	R1,$IOERR(PDA)
+	JRST	GETOUT
+
+; SVRTRG -- string target consumer coroutine.  Go ahead and take the
+;   characters, but don't update the length word of the string until
+;   we have them all, and we know that there will be no overflow.
+
+SVRTRG:	MOVEI	R1,1(CO1)	; get addr of first char of string
+	HRLI	R1,440700	; hoke up byte pointer to first
+	MOVE	CO1,0(CO1)	; pick up current length of string
+	ADJBP	CO1,R1		; load up correct byte pointer
+;	JUMPLE	CO2,SVROVF	; if non-positive max, don't bother
+
+SVRTLO:	RESUME	OK		; get a char
+	JRST	SVRTOK		; must be end -- go update
+	SOJL	CO2,SSTTDN	; only install if we have room
+	IDPB	R1,CO1		; install char into target
+	JRST	SVRTLO		; go back
+
+SVRTOK:	MOVE	DWD1,SVSTRG	; load addr of parameter block
+	MOVE	DWD2,0(DWD1)	;   and address of string variable
+	EXCH	CO2,1(DWD1)	; exch new countdown val with old
+	SUB	CO2,1(DWD1)	; get number of chars installed
+	ADDM	CO2,0(DWD2)	; update string length
+	DETACH			; voila!
+
+; WR.SSR and WR.SSN -- substring as PUTSTRING target.  Almost the
+;   same as WR.SVR etc., except that there's no length word to
+;   update, and conversion errors cause the field to be blanked out.
+
+WR.SSR:	MOVE	R1,$IOCHA(PDA)	; get to our data area
+	MOVE	R1,.SVSTR(R1)	; load addr of parameter block
+	JRST	SSCOMM		; common substring code
+
+WR.SSN:	MOVEI	R1,1		; explode one stack ARG
+	ADDB	R1,0(TOP)
+	MOVEI	R1,@-1(R1)	; addr of parameter block
+
+SSCOMM:	MOVEI	R0,SSTTLO	; substring target coroutine
+	MOVEM	R0,JUNK		; save it
+	JRST	STRCOM		;   and hit common intialize code
+
+SSTTLO:	RESUME	OK		; get a char
+	JRST	SSTTOK		; no more -- we're done
+	SOJL	CO2,SSTOVF	; jump if no more room
+	IDPB	R1,CO1		; install char
+	JRST	SSTTLO		; more to do
+
+SSTOVF:	MOVE	CO1,SVSTRG	; error -- reload block addr
+	DMOVE	CO1,0(CO1)	; reload entire block
+	MOVEI	R1," "		; get padding character (blank)
+SSTBLO:	SOJL	CO2,SSTTDN	; if no more to blank, kick out
+	IDPB	R1,CO1		; install blank
+	JRST	SSTBLO		; back up to top
+
+SSTTOK:	MOVE	R1,SVSTRG	; load addr of parameter block
+	DMOVEM	CO1,0(R1)	; store new pars
+	DETACH			;   and split, producer already OK
+
+SSTTDN:	LDERR	R0,PSTROV	; proper error code
+	MOVEM	R0,$IOERR(PDA)
+	MOVE	R1,SVSTRG	; zero stored length
+	SETZM	0,1(R1)		;   to inhibit subsequent items
+	RESUME	NOTOK		; force clean-up of producer
+	DETACH			;   and split
+
+; WR.FSN -- new fixed string as target of PUTSTRING.  Convert the addr
+;   argument into a byte pointer and hit the substring code.
+
+WR.FSN:	MOVEI	R1,1		; normal arg sequence
+	ADDB	R1,0(TOP)
+	MOVEI	R1,@-1(R1)	; load addr of block
+	HRRI	R0,440700	; left half of byte pointer
+	HRLM	R0,0(R1)	; slip it in
+	JRST	SSCOMM		;   and hit common substring code
+
+
+
+
+; WR.DNR and WR.DNN -- done with PUTSTRING for fixed length (sub)string.
+;   Called to pad out a fixed length string or substring after a few
+;   PUTSTRING calls.
+
+WR.DNR:	MOVE	R1,$IOCHA(PDA)	; load data area addr
+	MOVE	R1,.SVSTR(R1)	; get addr of two-word block
+	JRST	DNCOMM		; do it
+
+WR.DNN:	MOVEI	R1,1		; one-word arg
+	ADDB	R1,0(TOP)
+	MOVEI	R1,@-1(R1)
+
+DNCOMM:	$MASK
+	$SAVE	REGSAV,EXP1,PSA
+	MOVE	PSA,$IOCHA(PDA)	; really load it this time
+	MOVEM	R1,SVSTRG	; save ARG block (why???)
+	DMOVE	CO1,0(R1)	; load both pointer and length to go
+	MOVEI	DWD1," "	; the padding char
+	SOJL	CO2,DNCDON	; unfold the loop
+
+DNCLOO:	IDPB	DWD1,CO1	; drop the char
+	SOJGE	CO2,DNCLOO
+
+DNCDON:	DMOVEM	CO1,0(R1)	; update the args (why???)
+	JRST	GETOUT		; so long
+
+; RD.SSR and RD.SSN -- getstring from an X format string descriptor
+;   (also used for string variables).  Follows same setup as WR.SSN.
+
+RD.SSR:	MOVE	R1,$IOCHA(PDA)	; get data area address
+	MOVE	R1,.SVSTR(R1)	; get old arg block address
+	JRST	SSRCOM		; hit common code
+
+RD.SSN:	MOVEI	R1,1		; get one ARG word
+	ADDB	R1,0(TOP)
+	MOVEI	R1,@-1(R1)	; get block addr
+
+SSRCOM:	MOVEM	R1,TDESC	; remember block addr
+	LDB	R1,ACBIT.	; get datum type
+	JSP	R1,@CONSUM(R1)	; initialize reader
+	MOVEM	R1,INITRA	; remember its return addr
+	$MASK
+	$SAVE	REGSAV,EXP1,PSA
+	SETZM	0,$IOERR(PDA)	; clear global error cell
+	MOVE	PSA,$IOCHA(PDA)	; load data area pointer
+	MOVE	PR2,TDESC	; load arg block addr
+	MOVEM	PR2,SVSTRG	; remember for next operation
+	MOVE	PR1,0(PR2)	; load block (registers not contig.)
+	MOVE	PR2,1(PR2)
+	MOVEI	DETREG,GETOUT	; detach code
+	MOVEI	COREG,SSPTRG-1	; where to get first char
+	JRST	@INITRA		; back to consumer
+
+
+; RD.FSN -- fixed string getstring.  Hoke up a byte pointer and pretend
+;   it's a substring call.
+
+RD.FSN:	MOVEI	R1,1		; get first ARG word
+	ADDB	R1,0(TOP)
+	MOVEI	R1,@-1(R1)	; get fixed string addr
+	HRRI	R0,440700	; turn into byte pointer
+	HRLM	R0,0(R1)
+	JRST	SSRCOM
+
+; SSPTRG -- getstring coroutine (producer).  Fake an end of line cond.
+;   at the end of the string, and store end of string conditions to
+;   inhibit future attempts of the same getstring.
+
+SSPTRG:	JUMPE	PR2,SSPTNO	; zero length -- loser
+SSPTLO:	ILDB	R1,PR1		; get char
+	RESUME	OK		; here you go
+	JRST	SSPDON		; conversion succeeds
+	SOJG	PR2,SSPTLO	; back if more chars
+
+SSPTNO:	RESUME	NOTOK		; tell consumer to quit it (end of line)
+	JRST	SSPTOK		;   good, it agrees with me
+	LDERR	R0,GSTROV	; getstring overflow
+	MOVEM	R0,$IOERR(PDA)
+
+SSPTOK:	MOVE	R1,SVSTRG	; load addr of arg block
+	MOVEM	PR1,0(R1)	; store those args
+	MOVEM	PR2,1(R1)
+	DETACH			;   and split
+
+SSPDON:	MOVNI	R1,1		; back up byte pointer a char
+	ADJBP	R1,PR1		;   so next ILDB will get current char
+	MOVE	PR1,R1		; put into proper register
+	JRST	SSPTOK		; hit sequence
+
+;
+
+	$LIT
+ACBIT.:	point	3,@0(TOP),12	; AC bits of ARG word at R.A.
+
+	$END	IOCHAR,CHINIT
+	prgend
+	search	RTSYM
+	search	IOSYM
+	$module	TWAIT
+
+	entry	TWAIT.
+	extern	BREAK.,FMTCH.
+
+	$LOCAL	REGSAV,^o14
+
+; TWAIT. -- flush tty output if any.  Search the file chain to see if it's
+;   there.  If so, do a break.  If not, screw it.
+
+TWAIT.:	$FRAME
+	$SAVE	REGSAV,EXP1,PSA
+	SKIPN	PSA,$IOICM(PDA)		; see if support module loaded
+	JRST	DONE			;   no, forget it now
+	MOVEI	PR2,ISTTYO		; load up search bits
+	JSP	CO1,FMTCH.##		; go for it
+	JRST	DONE			;   not open, we're done
+	PUSHJ	TOP,BREAK.##		; ok, do the break
+	  ARG	0,0(FBL)		;   on ttyout
+
+DONE:	$RESTOR	REGSAV,EXP1,PSA		; get out
+	$UNFRAME
+	POPJ	TOP,0
+	end
+  @-m
