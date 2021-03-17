@@ -1,0 +1,536 @@
+title ksfefs Set up KS10 front-end file system
+
+;This hack written by Daniel S. Blom
+
+;This program runs under Tymcomp-X and creates the Front-End
+; file system used by the console processor.  The format of
+; the system is the same as that described in the TOPS-10 help file
+; SMFILE.TXT, except that the bootstrap program
+; is guarenteed to be written starting at FPFEFS+1; if it isn't,
+; the preboots program (BOTLOD) must be changed.
+
+;Accumulator names
+zz==0
+define loser(x)<
+irp x,<x=zz
+zz==zz+1>>
+loser <f,a,b,c,d,e,t,t1,pt,pt1,pt2,ch,fs,l,p>
+
+opdef adjsp [105000000000]
+opdef call [pushj p,]
+opdef ret [popj p,]
+
+;Disk parameters.
+uniprm:	exp ^D148,36		;Rm03
+	exp ^D380,24		;Rp06
+lbplc:	0			;Logical blocks per logical cylinder
+bpt:	0			;Logical blocks per track
+;Note: if the following two paramters do not agree with those in REFSTR,
+; total havoc may result when the 8080 starts overwriting parts of the SAT.
+;The preboots program (BOTLOD) expects FPFEFS to be 10.
+fpfefs==10			;Start of front end file system
+lefefs==100			;Length of front end file system
+
+pag:	block 1000
+fedir:	block 1000
+pdl:	-30,,.
+	block 30
+
+dcblk:	block 30
+uniidx:	0
+
+nunits==4		;Assume 4. units on system.
+
+;Software I/O channels: channel 0 is used for file input;
+; channel 1 for absolute disk writes.
+
+start:	reset
+	move p,pdl
+	call initia		;Initialize core, disk channels.
+	movsi a,-nunits		;For each unit do
+unilp:	movem a,uniidx
+	call iniuni		;Setup for new unit.
+	 jrst unilp0		;Not accessible.
+	move a,[pag,,pag+1]	;Setup page 0 pointers for 8080.
+	setzm -1(a)
+	blt a,pag+777
+	move a,[sixbit/HOM/]
+	movem a,pag+200
+	movei a,fpfefs*4
+;;;	hrli a,100000		;TOPS-20 does this for some reason.
+	movem a,pag+200+101
+	call lbtda
+	movem a,pag+200+103
+	movei a,lefefs*4
+	movem a,pag+200+102
+	movei pt,pag
+	movei pt1,0
+	call wapag		;Set up pointers for the 8080
+	move a,[fedir,,fedir+1]	;Zero out directory
+	setzm -1(a)
+	blt a,fedir+777
+	movei pt1,fpfefs+1
+	call copy		;Copy the files.
+	move a,pt1
+	call lptda
+	movem a,fedir+0		;Disk address of first free page
+	subi pt1,fpfefs
+	hrlzm pt1,fedir+1	;First free page
+	movei a,lefefs
+	subi a,(pt1)
+	hrrm a,fedir+1		;Length
+	movei pt,fedir		;Write out the directory
+	movei pt1,fpfefs
+	call wapag
+unilp0:	move a,uniidx
+	aobjn a,unilp
+	outstr [asciz/
+Done.
+/]
+quit:	reset
+	exit
+
+;Copy files to the front end file area.
+copy:	movsi l,-ptl
+copy1:	hrrz a,protab(l)	;Read the file name and open the file
+	skipge pt,protab+2(l)
+	 jrst copy3
+	call getfil
+	call chklen		;Check that the length is reasonable.
+	 jrst copy1
+	hrrom pt,protab+2(l)
+copy2:	hrrz pt,protab+2(l)
+	hlrz pt2,protab(l)
+	call copfil		;Copy file, set directory pointer
+	add l,[2,,2]
+	aobjn l,copy1
+	ret
+copy3:	call opnfil
+	 jrst 4,.		;Oops
+	jrst copy2
+;Check length of file whose handle is in Pt, warn user if needed.
+; Single return if he decided he wants to use another file.
+chklen:	hlrz b,protab+1(l)
+	camn a,b
+	 jrst cpopj1
+	outstr [asciz/That file is /]
+	call prtpag
+	outstr [asciz/ long; we expected it to have /]
+	hlrz a,protab+1(l)
+	call prtpag
+	outstr [asciz/./]
+	hrrz a,protab+1(l)
+	skipe a
+	 outstr (a)
+	movei c,fpfefs+lefefs
+	subi c,(pt1)
+	camge c,7(pt)
+	 outstr [asciz/
+In addition, the file is too large to fit!/]
+	outstr [asciz/
+Continue anyway (Y or N)? /]
+	inchrw a
+	caie a,"y"
+	 cain a,"Y"
+	  jrst cpopj1
+	outstr [asciz/
+Ok, try again, then.
+/]
+	ret
+
+prtpag:	cain a,1
+	 jrst prtpa1
+	call decprt
+	outstr [asciz/ pages/]
+	ret
+prtpa1:	outstr [asciz/1 page/]
+	ret
+
+;Print number in A in radix 10.
+decprt:	idivi a,12
+	jumpe a,decpr1
+	hrlm b,(p)
+	call decprt
+	hlrz b,(p)
+decpr1:	addi b,"0"
+	outchr b
+	ret
+
+;This table controls which files are to be copied to the front end file
+; area.  For each file there is a three word entry which contains:
+; Word 0: Lh:Offset of the fe file sysem directory pointer to this file
+;	  Rh:Address of an ASCIZ string to use to prompt the user for
+;	     the file name.
+; Word 1: Lh:The expected length, in pages, of the file.
+;	  Rh:Address of an ASCIZ string to print if the expected length
+;	     doesn't match the actual length, or 0 if none.
+; Word 2: Lh:-1 if specification read.
+;	  Rh:Address of file handle.
+;Note that the bootstrap program must be first since pages are allocated
+; sequentially starting at FPFEFS+1.
+protab:	14,,[asciz/
+Name of file containing bootstrap program: /]
+	2,,[asciz/
+The pre-boots program (BOTLOD) expects the bootstrap program
+be exactly 2 pages long./]
+	0
+	2,,[asciz/
+Name of file containing microcode: /]
+	14,,0
+	0
+	4,,[asciz/
+Name of file containing pre-boot program: /]
+	1,,[asciz/
+The front-end expects the pre-boot program to be exactly 1 page long./]
+	0
+ptl==.-protab
+;Initialize some things.
+initia:	movei a,377777		;This is virtual memory, turkey.
+	core a,
+	 jfcl
+	movei fs,40000
+	movsi l,-ptl
+inilp:	setzm protab+2(l)
+	add l,[2,,2]
+	aobjn l,inilp
+	ret
+
+;Copy a file into the front end file area.
+;Call Pt/ File handle
+;     PT1/ First absolute page of destination.
+;     PT2/ Offset of directory entry for this file.
+;On return the file will have been copied and the directory entry
+; updated appropriately.
+copfil:	movei a,(pt1)		;Set 8080 disk address of this file
+	call lptda
+	movem a,fedir(pt2)
+	movei a,-fpfefs(pt1)
+	hrlzm a,fedir+1(pt2)	;Set logical page number of this file
+	hrrz a,7(pt)
+	hrrm a,fedir+1(pt2)	;Set the length of the file in pages
+	movns a
+	hrlzs a
+	movei pt,pag
+coplp:	call rfpag
+	call wapag
+	aoj pt1,
+	aobjn a,coplp
+	ret
+
+;Read page number A of open file into PAG.
+rfpag:	movei t,(a)
+	lsh t,2
+	useti 1(t)
+	input [	-1000,,pag-1
+		0]
+	ret
+
+;Write core page starting at PT into absolute page PT1 of
+; currently selected unit.
+wapag:	jumpe pt1,wapag0	;First make sure request is within the
+	cail pt1,fpfefs		; FE file area or page 0.
+	 cail pt1,fpfefs+lefefs
+	  jrst waperr
+wapag0:	movei t,(pt1)
+	lsh t,2
+	useto 1,(t)
+	movei b,-1(pt)
+	hrli b,-1000
+	setz c,
+	output 1,b
+	ret
+waperr:	outstr [asciz/
+Sorry, illegal attempt to write into disk page /]
+	hrrz a,pt1
+	call decprt
+	outstr [asciz/.  We give up.
+The front-end file area has not been completely initialized.
+/]
+	jrst quit
+
+;Open channel, set unit type for unit # in Rh(A).
+;Skip if unit could be opened.  Single return otherwise.
+iniuni:	move d,[sixbit/DSKB/]
+	movei b,(a)
+	lsh b,3
+	iori b,(a)
+	trz b,7070
+	iori b,2020
+	trnn b,1700
+	 lsh b,6
+	andi b,7777
+	ior d,b
+	movei c,17
+	setz e,
+	open 1,c
+         jrst inierr
+	movem d,dcblk
+	move a,[22,,dcblk]
+	dskchr a,
+         jrst inierr
+	ldb a,[point 2,a,31]	;Unit type code
+	lsh a,1
+	dmove a,uniprm(a)
+	movem a,lbplc
+	movem b,bpt
+	jrst cpopj1
+
+inierr: outstr [asciz/
+Drive DSKB/]
+        hrrz c,uniidx
+        addi c,60
+        outchr c
+        outstr [asciz/ NOT written
+/]
+        ret
+
+;Convert logical page into 8080 style disk address, which is DC,,DA.
+;Call A/ Logical page number.  Return with A/ 8080 Disk address.
+lptda:	lsh a,2
+lbtda:	idiv a,lbplc
+	idiv b,bpt
+	dpb b,[100400,,c]
+	hrl a,c
+	movss a
+	ret
+
+;Parse a Tymcomp-X file specification and open the file.
+; Returns with PT pointing to the file name.  Prints an error message
+; and quits if can't find the file.
+; block suitable for use by LOOKUP.
+getfil:	push p,a
+getfi0:	move a,(p)
+	call parfn		;Parse the filename.
+	 jrst getfi0
+	call opnfil		;Open the file.
+	 jrst getfi0
+	adjsp p,-1
+	ret
+;Parse a Tymcomp-X file specification.
+parfn:	outstr (a)
+	hrli a,(fs)
+	hrri a,1(fs)
+	setzm -1(a)
+	blt a,7(fs)
+	call getch
+pn4:	call scan
+	caie a,t.opar
+	 jrst pn2
+	call scan
+	caie a,t.id
+	 jrst synerr
+	dmovem b,5(fs)
+	hrrzi a,5(fs)
+	hrrzm a,3(fs)
+	call scan
+	caie a,t.cpar
+	 jrst synerr
+	call scan
+pn2:	caie a,t.id
+	 jrst synerr
+	movem b,0(fs)
+	call scan
+	caie a,t.dot
+	 jrst pn3
+	call scan
+	caie a,t.id
+	 jrst synerr
+	hllzm b,1(fs)
+	call scan
+pn3:	caie a,t.eol
+	 jrst synerr
+	movei pt,(fs)
+	addi fs,10
+	jrst cpopj1
+synerr:	outstr [asciz/
+Sorry, I can't parse that file specification.  Try again.
+/]
+	ret
+
+scnign:	call getch
+scan:	jrst @scntbl(ch)
+
+c.let==400000
+t.id==0
+t.dot==1
+t.semi==2
+t.opar==3
+t.cpar==4
+t.eol==5
+scntbl:	repeat 11-0+1,<scnign>
+	scneol
+	repeat "'"-13+1,<scnign>
+	scnop
+	scncp
+	repeat 4,<scnign>
+	scndot
+	scnign
+	repeat "9"-"0"+1,<c.let,,scnid>
+	scnign
+	scnsem
+	repeat 5,<scnign>
+	repeat "z"-"a"+1,<c.let,,scnid>
+	repeat 6,<scnign>
+	repeat "z"-"a"+1,<c.let,,scnid>
+	repeat 5,<scnign>
+
+scnid:	move pt,[440600,,b]
+	setzb b,c
+scnid3:	trze ch,100
+	 troa ch,40
+	  trz ch,40
+	came pt,[000600,,c]
+	 idpb ch,pt
+	call getch
+	hll ch,scntbl(ch)
+	jumpl ch,scnid3
+	movei a,t.id
+	ret
+scnop:	skipa a,[t.opar]
+scncp:	movei a,t.cpar
+	jrst getch
+scndot:	skipa a,[t.dot]
+scnsem:	movei a,t.semi
+	jrst getch
+scneol:	movei a,t.eol
+	ret
+getch:	inchwl ch
+	ret
+
+;Open a file.  PT/ Address of file handle.
+;If the LOOKUP on the file fails, return +1 after printing an error message.
+; Otherwise skip and return the number of pages in the file in A and LENGTH.
+opnfil:	open [	17
+		sixbit/dsk/
+		0]
+	 jrst 4,.
+	hllzs 1(pt)
+	push p,3(pt)
+	lookup (pt)
+	 jrst opnerr
+	hlre a,3(pt)		;set up size
+	jumpge a,opnfi1
+	movns a
+	soj a,
+	trze a,777		;Round up to pages
+	 addi a,1000
+	lsh a,-9
+	skipa
+opnfi1:	 lsh a,2		;Convert from blocks to pages
+	movem a,7(pt)
+	pop p,3(pt)
+cpopj1:	aos (p)
+cpopj:	ret
+opnerr:	pop p,3(pt)
+	outstr [asciz/
+Sorry, can't find /]
+	call prthdl
+	outstr [asciz/.  Try again.
+/]
+	ret
+
+;Print file handle in PT.
+prthdl:	skipn a,3(pt)
+	 jrst prthd1
+	outchr ["("]
+	movei b,14
+	call sixprt
+	outchr [")"]
+prthd1:	movei a,(pt)
+	movei b,6
+	call sixprt
+	hllzs 1(pt)
+	skipn 1(pt)
+	 ret
+	outchr ["."]
+	movei b,3
+	movei a,1(pt)
+	call sixprt
+	ret
+
+;Print up to B sixbit characters pointed at by A.
+sixprt:	tlo a,440600
+sixpr1:	ildb c,a
+	jumpe c,cpopj
+	addi c,40
+	outchr c
+	sojg b,sixpr1
+	ret
+
+
+end start
+
+pnfil		;Open the file.
+	 jrst getfi0
+	adjsp p,-1
+	ret
+;Parse a Tymcomp-X file specification.
+parfn:	outstr (a)
+	hrli a,(fs)
+	hrri a,1(fs)
+	setzm -1(a)
+	blt a,6(fs)
+	call getch
+pn4:	call scan
+	caie a,t.opar
+	 jrst pn2
+	call scan
+	caie a,t.id
+	 jrst synerr
+	dmovem b,5(fs)
+	hrrzi a,5(fs)
+	hrrzm a,3(fs)
+	call scan
+	caie a,t.cpar
+	 jrst synerr
+	call scan
+pn2:	caie a,t.id
+	 jrst synerr
+	movem b,0(fs)
+	call scan
+	caie a,t.dot
+	 jrst pn3
+	call scan
+	caie a,t.id
+	 jrst synerr
+	hllzm b,1(fs)
+	call scan
+pn3:	caie a,t.eol
+	 jrst synerr
+	movei pt,(fs)
+	addi fs,7
+	jrst cpopj1
+synerr:	outstr [asciz/
+Sorry, I can't parse that file specification.  Try again.
+/]
+	ret
+
+scnign:	call getch
+scan:	jrst @scntbl(ch)
+
+c.let==400000
+t.id==0
+t.dot==1
+t.semi==2
+t.opar==3
+t.cpar==4
+t.eol==5
+scntbl:	repeat 11-0+1,<scnign>
+	scneol
+	repeat "'"-13+1,<scnign>
+	scnop
+	scncp
+	repeat 4,<scnign>
+	scndot
+	scnign
+	repeat "9"-"0"+1,<c.let,,scnid>
+	scnign
+	scnsem
+	repeat 5,<scnign>
+	repeat "z"-"a"+1,<c.let,,scnid>
+	repeat 6,<scnign>
+	repeat "z"-"a"+1,<c.let,,scnid>
+	repeat 5,<scnign>
+
+scni
+ 
