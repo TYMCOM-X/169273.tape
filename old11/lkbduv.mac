@@ -1,0 +1,617 @@
+	.TITLE	LKBDUV.MAC - Interrupt module for DUV-11
+	.SBTTL	Introduction
+	XLPAR			;Don't list parameter file
+	CODE
+;
+;	Version 1.0
+;
+;	This module processes the interrupts from the DUV-11
+; interface and passes the characters to LNKBPS the link type B
+; protocol service. it also accumulates the CRC-16 for input and
+; output (DDICRC,DDOCRC).
+;
+;	Bruce R. Nevins  20-September-1978
+;	Last edit: 21-oct-79
+	.PAGE
+	.SBTTL	LKBINI - Initialize service
+
+;	C(R4) = Address of DDB to initialize
+;	CALL	LKBINI
+
+LKBINI::MOV	#DDLBCZ#,R1		;NUMBER OF WORDS TO CLEAR
+	MOV	#DDLBFC#,R2		;Where to start
+	ADD	R4,R2			;Make into address
+LKBIN2:	CLR	(R2)+
+	SOB	R1,LKBIN2
+
+; Reset all CB pointers
+
+	MOV	DDCIMB#(R4),DDCIMI#(R4)
+	MOV	DDCIMB#(R4),DDCIMO#(R4)
+	MOV	DDCMOB#(R4),DDCMOI#(R4)
+	MOV	DDCMOB#(R4),DDCMOO#(R4)
+	TST	@DDLBRS#(R4)		;Is there hardware present
+	NXMJMP	NOLINK#			;If not do common exit
+	BIS	#$ISTRT,DDFLAG#(R4)	;Set for initial start
+	MOVB	#TIMVAL,DDTIMR#(R4)	;Start the rep timer
+	MOVB	#THRSH,DDREPT#(R4)	;Start down timer
+	MOV	DDCMOB#(R4),R2		;Get the start of the buffer
+	MOV	#STRTYP,(R2)+		;Start message
+	CLR	(R2)+
+	MOV	R2,DDCMOI#(R4)		;Set up the in pointer
+	MOV	#$D1DWN,DDSTS1#(R4)	;Link is down
+	MOVB	#SNDCNT,DDSCNT#(R4)	;Our send ahead count
+	CLRB	DDLBLS#(R4)		;Clear the load state
+	MOVB	#1,DDLBSN#(R4)		;Clear our counter
+	CALL	LKBRST			;Set up the hardware
+LKBINS::RETURN
+	.PAGE
+	.SBTTL	LKBRST - Link reset routine
+
+;	C(R4) = Address of the DDB
+;	CALL	LKBRST#
+
+LKBRST::MOV	#$REST,@DDLBTS#(R4)	;Reset the interface
+	MOVB	#LCOUNT,DDLBSS#(R4)	;Set for long synch
+	NOP
+	MOV	#$INSYN+$BYT8+SYN,@DDLBPR#(R4)	;Set up for 8 bit internal sync
+	MOV	#$DTR+$RQSND+$SHSYN+$RXENB+$STRIP,@DDLBRS#(R4) ;
+	MOV	#$SEND+$TXENB,@DDLBTS#(R4)
+	MOV	#SYN,@DDLBTB#(R4)	;SEND SYNCHS
+	BIS	#$OIP,DDFLAG#(R4)	;When we reset the device it will
+					; interrupt us
+	RETURN
+	.PAGE
+	.SBTTL	LKBISV - Link B Input Service
+
+
+;	CALL	LKBISV
+;The link b input service
+;	C(R4) - The DDB pointer for the DUV-11
+;	The old R4 is on the stack
+
+LKBISV::PUSH	R0			;Save the users R0
+	MOV	@DDLBRB#(R4),R0		;Get the character from the interface
+	BPL	1$
+	JMP	ERROR
+
+1$:	PUSH	R1
+	PUSH	R2
+	PUSH	R3
+	BIC	#$STRIP,@DDLBRS#(R4)	; Clear strip synch for input
+	TBBN	$LOAD,DDFLAG#(R4),2$	;Just do protocol service stuff
+	JMP	LKBPST
+
+2$:	MOVB	DDLBLS#(R4),R2		;Get load state
+	ASL	R2
+	JMP	@LDISP(R2)		;Get the state
+
+	PURE
+LDISP:	.WORD	LKBTY1
+	.WORD	LKBTY2
+	.WORD	LKBCK1
+	.WORD	LKBCK2
+
+	CODE
+LKBTY1:	MOVB	R0,DDLBT1#(R4)	;
+	INCB	DDLBLS#(R4)
+	BR	LEXIT
+
+LKBTY2:	MOVB	R0,DDLBT1#+1(R4)
+	INCB	DDLBLS#(R4)
+	BR	LEXIT
+
+LKBCK1:	MOVB	R0,DDLBC1#(R4)
+	INCB	DDLBLS#(R4)
+LEXIT:	POP	R3
+	POP	R2
+	POP	R1
+	POP	R0
+	POP	R4
+	RTI
+
+
+LKBCK2:	MOVB	R0,DDLBC1#+1(R4)
+	CLRB	DDLBLS#(R4)		;CLEAR THE LOAD STATE
+	CMP	DDLBT1#(R4),DDLBC1#(R4)	; Check the check sum
+	BNE	ENQOT
+	MOV	DDLBT1#(R4),R0		;GET THE RESPONSE
+	BIC	#10400,R0		;MASK OFF THE SEQ AND THE ENQ
+					; BIT
+	CMP	#140307,R0		;A NAK?
+	BEQ	LKBAGN			;RE TRANSMIT IT
+	CMP	#100307,R0		;A ACK?
+	BNE	ENQOT			;DO AN ENQUIRE
+	TBBE	$SEQ,DDFLAG#(R4),LKBCK3
+
+;HERE IF SET
+
+;	CMP	#140307,R0		;A NAK?
+;	BEQ	LKBAGN			;RE TRANSMIT IT
+;	CMP	#100307,R0		;A ACK?
+;	BNE	ENQOT			;DO AN ENQUIRE
+	TBBE	400,DDLBT1#(R4),LKBAGN	;IF WRONG FLAVOR SEND AGAIN
+	BIC	#$SEQ,DDFLAG#(R4)	;TOGGLE SEQ NO
+LKBCMN:	MOV	DDLBPO#(R4),R1		;Get the packet acked
+	CMP	R1,#255.		;In a reasonable range?
+	BLO	SPCLCK			;DO SPECIAL CHECK
+	MOV	PKDATA+2(R1),R0
+	FREPKT				;Give it up
+LKBCM0:	MOV	DDCIMI#(R4),R2		;Pick up the in pointer
+	MOV	R2,R3			;Save a copy of the pointer
+	ADD	#IMSIZ,R2		;Make a pointer to the end of the frame
+	CMP	R2,DDCIME#(R4)		;Check for the end of the ring
+	BNE	10$			;Not at the end
+	MOV	DDCIMB#(R4),R2		;Point back to the top
+10$:	CMP	DDCIMO#(R4),R2		;Is the ring full?
+	BNE	20$			;No
+	RSTOP	MRF			;[MRF - Main Ring Full]
+
+20$:	MOV	#LODTYP,(R3)+		;Tell main we need more load data
+	CLR	(R3)			;Next word in the ring not used
+	MOV	R2,DDCIMI#(R4)		;We are done
+	CMP	#-1,R0
+	BNE	30$			;Not a reset
+	BIC	#$SEQ,DDFLAG#(R4)	;Clear sequence bit on reset
+30$:	CLR	DDLBPO#(R4)		;Make room for the next
+	MOVB	#LODSYN,DDLBSS#(R4)	;Give us some margin
+LKBCM1:	BIC	#$ELOAD+$WAKE2+$ENQWT+$ENQIR,DDFLAG#(R4)	;Don't bother us
+	BR	LKBZAP
+
+LKBCK3:;	CMP	#140307,R0		;A NAK?
+;	BEQ	LKBAGN
+;	CMP	#100307,R0		;AN ACK?
+;	BNE	ENQOT			;GARBAGE?
+	TBBN	400,DDLBT1#(R4),LKBAGN
+	BIS	#$SEQ,DDFLAG#(R4)
+	BR	LKBCMN
+
+SPCLCK:	CMP	#1,R1			;A RESTART MESSAGE?
+	BNE	SPCLC2
+SPCLC1:	CLR	DDLBPO#(R4)
+	BIC	#$SEQ+$WAKE2+$ELOAD+$ENQWT+$ENQIR,DDFLAG#(R4)
+SPCLC2:	BR	LKBCM0			;Do common exit
+
+;Here if we got a nak from the bootstrap
+
+LKBAGN:	MOVB	#1,DDSNAK#(R4)		;Set nak so we will do output
+	MOVB	#50,DDLBSS#(R4)	;Margin for retry
+	BR	LKBCM1
+
+
+ENQOT:	MOVB	#50,DDLBSS#(R4)		;Give us a chance to synch with him
+	BIS	#$ENQIR+$ENQWT,DDFLAG#(R4)
+	BIC	#$ELOAD,DDFLAG#(R4)
+	MOVB	#1,DDSNAK#(R4)
+	BR	LKBZAP
+
+LKBPST:	MOV	DDICRC#(R4),R2		;Get old partial CRC-16
+	MOV	R0,R3			;The character to add
+	XOR	R2,R3			;XOR old CRC and data character
+	BIC	#177400,R3		;Clear the high byte
+	ASL	R3			;Make a word index
+	MOV	CRCBYT#(R3),R3		;Modifier word
+	CLRB	R2			;Clear low byte old CRC
+	SWAB	R2			;High to low
+	XOR	R3,R2			;XOR modifier and old CRC
+	MOV	R2,DDICRC#(R4)		;Save partial CRC
+	BNE	1$			;Skip if not zero
+	BIS	#$RCRCZ,R0		;Set zero crc bit
+1$:	CALL	LNKBPS#			;Call link protocol
+
+	TBBE	$RSYNC,DDFLAG#(R4),LKBIS1	;If no need for synch leave
+LKBZAP:	BIC	#$SHSYN,@DDLBRS#(R4)	;Clear the synch
+	BIS	#$SHSYN+$STRIP,@DDLBRS#(R4)	;Search for synch
+	BIC	#$RSYNC+$EOM,DDFLAG#(R4)	;CLEAR THE SYNCH FLAG
+	CLR	DDICRC#(R4)		;Clear the crc accumulator
+	CLRB	DDSTAT#(R4)		;Clear the protocol state
+	BR	EXIT
+
+LKBIS1:	TBBE	$EOM,DDFLAG#(R4),EXIT	;If end of message then clean up
+	CLR	DDICRC#(R4)		;Clear crc accumulator
+	CLRB	DDSTAT#(R4)		;Clear input state
+	BIS	#$STRIP,@DDLBRS#(R4)	;Set strip synch just in case
+	BIC	#$EOM,DDFLAG#(R4)	;Clear our flag
+EXIT:	POP	R3
+	POP	R2
+	POP	R1
+EXIT1:	POP	R0
+	TSTB	DDSNAK#(R4)
+	BNE	ERROR1
+	POP	R4
+	RTI
+
+ERROR:	TBBN	$ISTRT+$ASTRT,DDFLAG#(R4),EXIT1 ;If either is set skip error
+	MOVB	#9.,DDSNAK#(R4)		;Set receiver overrun
+	INC	DDERRO#(R4)		;Count the receive overrun
+	POP	R0
+	CLRB	DDSTAT#(R4)		;Clear the protocol state
+	BIC	#$SHSYN,@DDLBRS#(R4)	;Clear search synch
+	BIS	#$SHSYN+$STRIP,@DDLBRS#(R4) ;And set it
+ERROR1:	TBBN	$OIP,DDFLAG#(R4),ERREXT	;If going then leave
+	BR	LKBOSV			;Branch into output
+
+ERREXT:	POP	R4
+	RTI
+	.PAGE
+	.SBTTL	LKBOSV - Link B output service
+
+LKBOSV::PUSH	R0
+	PUSH	R1
+	PUSH	R2
+	PUSH	R3
+	BIC	#$IRMA,DDFLAG#(R4)	;Clear lost interrupt flag
+	TST	@DDLBTS#(R4)		;Check for under run
+	BPL	10$			;Nope
+	TBBE	$OIP,DDFLAG#(R4),10$	;If not active don't count under run
+	INC	DDERTU#(R4)		;Count the under run
+10$:	MOVB	DDOST#(R4),R3		;Get the output state
+	ASL	R3			;Make into word index
+	JMP	@DISPAT(R3)		;Jump off the dispatch table
+
+	PURE
+
+DISPAT:	STHDR				;Start of header
+	HDOUT				;Header output
+	CRC1				;Header CRC character #1
+	CRC2				;"		"     #2
+	DATOUT				;Data output
+	CRC1				;Data CRC character #1
+	CRC2				;"		"   #2
+	.PAGE
+	.SBTTL	STHDR - Start of header output
+
+	CODE
+
+STHDR:	BIS	#$OIP,DDFLAG#(R4)	;Mark output active
+	TSTB	DDLBSS#(R4)		;Check the synch count
+	BEQ	STHOK			;If zero node to do
+	MOV	#SYN,@DDLBTB#(R4)	;Send an SYN
+	DECB	DDLBSS#(R4)		;One down
+	JMP	HDEND			;Exit
+
+STHOK:	TBBE	$LOAD,DDFLAG#(R4),STHOKN ;If not load mode go on
+	TBBE	$ELOAD,DDFLAG#(R4),1$
+	JMP	ACKQT
+
+1$:	CLRB	DDSNAK#(R4)
+	TBBE	$ENQIR,DDFLAG#(R4),NOPE	;Check for enq requested
+	MOV	DDLBPO#(R4),R0		;Get the pointer to next packet
+	CMP	#1,R0			;Check for special cases
+	BEQ	2$			;Load start message
+	CMP	#2,R0
+	BEQ	3$			;Load end message
+	CMP	#-1,2(R0)
+	BNE	3$
+2$:	BIC	#$ENQIR,DDFLAG#(R4)
+	BR	NOPE
+
+3$:	MOV	#6,DDCNTO#(R4)
+	MOV	#ENQMS,DDPKTO#(R4)
+	MOVB	#4,DDOST#(R4)
+	JMP	DATOUT
+
+NOPE:	MOV	DDLBPO#(R4),R0		;Get the packet to send
+	BNE	2$
+	JMP	ACKQT
+2$:	CMP	#1,R0			;A start load mode message?
+	BEQ	STLDM			;Yes! go do it
+	CMP	#2,R0			;An end load mode message?
+	BEQ	ENDLDM			;Yes, say bye bye
+	MOV	R0,DDPKTO#(R4)		;Save the packet pointer
+	MOVB	PKCNT(R0),DDCNTO#(R4)	;And the count
+	ADD	#PKDATA,DDPKTO#(R4) 	;Plus the header
+	MOV	#4,DDOST#(R4)		;Data output state
+	MOVB	#6,DDLBSS#(R4)		;Give boot time to think
+	JMP	DATOUT			;Go send it
+
+STLDM:	MOV	#6,DDCNTO#(R4)
+	MOV	#RSTMS,DDPKTO#(R4)
+	MOVB	#4,DDOST#(R4)
+	MOVB	#50,DDLBSS#(R4)		;Give the boot time to reset
+	JMP	DATOUT
+
+ENDLDM:	BIC	#$WAKE2+$ENQIR+$LOAD+$ELOAD+$SEQ,DDFLAG#(R4) ;Make
+					; all happy
+	CLR	DDLBPO#(R4)		;Clear message
+	JMP	ACKQT			;Dismiss it all
+
+STHOKN:	CLR	DDOCRC#(R4)		;Clear old CRC
+	TSTB	DDSNAK#(R4)		;Is a NAK pending?
+	BNE	NAKOT			;If so do a NAK output
+	TSTB	DDSREP#(R4)		;Any reps pending?
+	BEQ	STHOK1			;No
+	JMP	REPOT
+
+
+; Here to check for messages from the main program level
+; The messages are two words.
+; The first is the message type
+; The second is the packet address of the packet to send
+; If the message has no packets then the field is zero
+
+STHOK1:	CMP	DDCMOI#(R4),DDCMOO#(R4) ;A message pending?
+	BEQ	STHDR1			;Check for data
+	MOV	DDCMOO#(R4),R2		;Get the pointer
+	MOV	(R2)+,R0		;Get the type
+	MOV	(R2),R3			;And the packet address if one is there
+	CLR	(R2)			;Just in case we attempt to use this
+	MOV	DDCMOO#(R4),R2		;Reset the circular buffer pointers
+	ADD	#MOSIZ,R2
+	CMP	R2,DDCMOE#(R4)
+	BNE	5$
+	MOV	DDCMOB#(R4),R2
+5$:	MOV	R2,DDCMOO#(R4)
+	ASL	R0			;Make into a word index
+	JMP	@DISPT2(R0)		;Do the routine service
+
+	PURE
+DISPT2:	.WORD	DIEB
+	.WORD	ACKOT
+	.WORD	DIEB
+	.WORD	DIEB
+	.WORD	DIEB
+	.WORD	DIEB
+	.WORD	STRTMS			;The start messsge routine
+	.WORD	STCKMS			;The start ack routine
+
+	CODE
+STHDR1:	MOV	DDLBOH#(R4),R1		;Get the packet pointer
+	BNE	10$			;
+	JMP	ACKCK			;No data check for an ack
+
+10$:	MOV	R1,DDPKTO#(R4)		;The packet to use
+	MOV	(R1),DDLBOH#(R4)	;Point to the next
+	ADD	#2,DDPKTO#(R4)		;Point past the link word
+	MOVB	PKCNT(R1),DDCNTO#(R4)	;The character count
+	TBBE	$ASTRT+$ISTRT,DDFLAG#(R4),1$ ; Go on if ok
+	BR	ACKQT			;Bye
+
+1$:	ADD	#<PKDATA-2>,DDCNTO#(R4)	;Plus the header size
+	MOV	DDSTHO#(R4),R0		;The start of the header
+	MOV	R0,DDCTHO#(R4)		;The current header pointer
+	MOVB	#SOH,(R0)+		;DDCMP start of header(data)
+	MOVB	DDCNTO#(R4),(R0)+	;And the character count
+;	TST	DDLBOH#(R4)		;Check if more data
+;	BEQ	STHDR2			;if not, set quick synch flag
+;	CLRB	(R0)+			;More waiting clear Quick synch
+;	BR	STHDR3			;
+STHDR2:	MOVB	#$QSYNC,(R0)+		;Set the quick synch flag
+	MOVB	#QCOUNT,DDLBSS#(R4)	;Set the synch count
+STHDR3:	MOVB	DDRESP#(R4),(R0)+	;Tell him whats ACK'ed
+	MOVB	PKSEQ(R1),(R0)+		;The message number
+	MOVB	#1,(R0)+		;And the station number
+	CLRB	DDSACK#(R4)		;Clear the ACK flag
+	INCB	DDOST#(R4)		;Next state
+	MOVB	#TIMVAL,DDTIMR#(R4)	;Start rep timer
+	BIS	#$OIP,DDFLAG#(R4)	;
+	JMP	HDSTRT			;Start the header out.
+	.PAGE
+	.SBTTL	DIEB - Invalid interrupt level state
+
+DIEB:	RSTOP	IIS			;[Invalid Interrupt State]
+
+	.SBTTL	NAKOT	- Nak out
+
+NAKOT:	MOV	DDSTHO#(R4),R0		;Start of header
+	MOV	R0,DDCTHO#(R4)		;Set up the current pointer
+	MOVB	#ENQ,(R0)+		;Enquire message
+	MOVB	#NAKTYP,(R0)+		;NAK
+	MOVB	DDSNAK#(R4),(R0)	;The NAK reason
+;	TST	DDLBOH#(R4)		;Check if more data
+;	BEQ	NAKOT1			;If so set quick synch flag
+;	INC	R0			;Point to the next
+;	BR	NAKOT2
+NAKOT1:	BISB	#$QSYNC,(R0)+		;Set the quick synch flag
+	MOVB	#QCOUNT,DDLBSS#(R4)	;Set up the synch count
+NAKOT2:	MOVB	DDRESP#(R4),(R0)+	;Send the ACK off
+	CLRB	(R0)+			;Filler field
+	MOVB	#1,(R0)			;Our station number
+	CLRB	DDSACK#(R4)		;Clear the ack flag
+	CLRB	DDSNAK#(R4)		;Clear the NAK flag
+	INCB	DDOST#(R4)		;Next state
+	MOVB	#TIMVAL,DDTIMR#(R4)	;Start the rep timer
+	JMP	HDSTRT			;Go do it.
+	.PAGE
+	.SBTTL	ACKCK	- The ack check and output
+
+ACKCK:	TSTB	DDSACK#(R4)		;Need to send an ACK?
+	BNE	ACKOT
+ACKQT:	TBBN	$IDL,DDFLAG#(R4),10$	;If set we are now going idle
+	BIS	#$IDL,DDFLAG#(R4)	;We are going idle
+	MOVB	#SYN,@DDLBTB#(R4)	;Send synchs
+	BR	ACKOUT
+
+10$:	BIC	#$IDL!$OIP,DDFLAG#(R4)	;Clear output in progress and idle
+	BR	ACKOUT			;Exit
+
+ACKOT:	MOV	DDSTHO#(R4),R0	;Get the start of the header
+	MOV	R0,DDCTHO#(R4)	;The current header pointer
+	MOVB	#ENQ,(R0)+		;Enquire
+	MOVB	#ACKTYP,(R0)+		;An ACK
+;	TST	DDLBOH#(R4)		;Check if more data
+;	BEQ	ACKCK1			;If so then set quick synch
+;	CLRB	(R0)+			;No flags
+;	BR	ACKCK2
+ACKCK1:	MOVB	#$QSYNC,(R0)+		;Set the quick synch flag
+	MOVB	#QCOUNT,DDLBSS#(R4)	;Set up the synch count
+ACKCK2:	MOVB	DDRESP#(R4),(R0)+	;That which we ACK
+	CLRB	(R0)+			;Filler field
+	MOVB	#1,(R0)			;Our station number
+	CLRB	DDSACK#(R4)		;Clear the ack flag
+	INCB	DDOST#(R4)		;The next state
+	BR	HDSTRT
+
+ACKOUT:	CLRB	DDOST#(R4)	;Set to start header
+	POP	R3
+	POP	R2
+	POP	R1
+	POP	R0
+	POP	R4
+	RTI
+	.PAGE
+	.SBTTL	REPOT	- Respone output service
+
+REPOT:	MOV	DDSTHO#(R4),R0		;Get the start of the header
+	MOV	R0,DDCTHO#(R4)		;Set up the current header pointer
+	MOVB	#ENQ,(R0)+		;ENQUIRE
+	MOVB	#REPTYP,(R0)+		;Rep
+;	TST	DDLBOH#(R4)		;Check if more data
+;	BEQ	REPO1
+;	CLRB	(R0)+
+;	BR	REPO2
+
+REPO1:	MOVB	#$QSYNC,(R0)+		;Tell him no messages
+	MOVB	#QCOUNT,DDLBSS#(R4)	;Send the standard synchs
+REPO2:	CLRB	(R0)+			;Filler field
+	MOVB	DDLBSN#(R4),(R0)	;Send the number of our last message
+	DECB	(R0)+			;Adjust the rep number
+	MOVB	#1,(R0)			;Station no.
+;	CLRB	DDSACK#(R4)		;We have told him now
+	INCB	DDOST#(R4)		;Next state
+	MOVB	#TIMVAL,DDTIMR#(R4)	;Start the rep timer
+	CLRB	DDSREP#(R4)		;We have sent it
+	BR	HDSTRT
+	.PAGE
+	.SBTTL	STRTMS	- Start message
+
+STRTMS:	MOV	DDSTHO#(R4),R0	;Get start of header
+	MOV	R0,DDCTHO#(R4)		;Set up current pointer
+	MOVB	#ENQ,(R0)+
+	MOVB	#STRTYP,(R0)+
+	MOVB	#$SELEC+$QSYNC,(R0)+
+	CLRB	(R0)+
+	CLRB	(R0)+
+	MOVB	#1,(R0)
+	INCB	DDOST#(R4)
+	MOVB	#QCOUNT,DDLBSS#(R4)	;The synch count
+	BIS	#$ISTRT,DDFLAG#(R4)	;We are waiting for a stack
+	BIC	#$ASTRT,DDFLAG#(R4)	;Clear the ASTART flag
+	MOVB	#TIMVAL,DDTIMR#(R4)	;Start the rep timer
+	MOV	DDCMOB#(R4),DDCMOI#(R4)	;Clear output ring
+	MOV	DDCMOB#(R4),DDCMOO#(R4)	;
+	BR	HDSTRT
+	.PAGE
+	.SBTTL	STCKMS	- Start acknowledge message
+
+STCKMS:	MOV	DDSTHO#(R4),R0		;Get start of header
+	MOV	R0,DDCTHO#(R4)		;Set up current pointer
+	MOVB	#ENQ,(R0)+
+	MOVB	#STCKTY,(R0)+
+	MOVB	#$SELEC+$QSYNC,(R0)+
+	CLRB	(R0)+
+	CLRB	(R0)+
+	MOVB	#1,(R0)
+	INCB	DDOST#(R4)
+	MOVB	#QCOUNT,DDLBSS#(R4)	;The synch count
+	BIS	#$ASTRT,DDFLAG#(R4)	;We are waiting for an ack
+	BIC	#$ISTRT,DDFLAG#(R4)	;Clear the ISTRT FLAG
+	MOVB	#TIMVAL,DDTIMR#(R4)	;Start the rep timer
+	MOV	DDCMOB#(R4),DDCMOI#(R4)	;Clear output ring
+	MOV	DDCMOB#(R4),DDCMOO#(R4)	;
+;	BR	HDSTRT
+HDSTRT:	MOVB	#SYN,@DDLBTB#(R4)	;START OFF ON THE RIGHT FOOT
+	BR	HDEND
+	.PAGE
+	.SBTTL	HDOUT	- Header out
+
+HDOUT:	MOVB	@DDCTHO#(R4),R0		;The character to output
+	MOVB	R0,@DDLBTB#(R4)		;Place in device register
+	INC	DDCTHO#(R4)		;Point to the next character
+	MOV	DDOCRC#(R4),R2		;Get the old patial CRC
+	XOR	R2,R0
+	BIC	#177400,R0		;Remove upper byte
+	ASL	R0			;Make into word index
+	MOV	CRCBYT#(R0),R0		;
+	CLRB	R2
+	SWAB	R2
+	XOR	R0,R2
+	MOV	R2,DDOCRC#(R4)		;Save the new partial
+	CMP	DDCTHO#(R4),DDEDHO#(R4)	;Done yet?
+	BNE	HDEND			;If not return
+	INCB	DDOST#(R4)		;Next state
+HDEND:	POP	R3
+	POP	R2
+	POP	R1
+	POP	R0
+	POP	R4
+	RTI
+	.PAGE
+	.SBTTL	CRC1	- CRC-16 character 1
+
+CRC1:	MOVB	DDOCRC#(R4),@DDLBTB#(R4)	;Place the low order char in
+						; Device register
+	INCB	DDOST#(R4)
+	POP	R3
+	POP	R2
+	POP	R1
+	POP	R0
+	POP	R4
+	RTI
+	.PAGE
+	.SBTTL	CRC2	- CRC character 2
+
+CRC2:	BIC	#$IDL,DDFLAG#(R4)	;Make sure we clear the idle flag
+	SWAB	DDOCRC#(R4)		;Swap the bytes of the CRC
+	MOVB	DDOCRC#(R4),@DDLBTB#(R4) ;Send the rest of the CRC
+	CMPB	#SOH,@DDSTHO#(R4)	;Are we sending data?
+	BEQ	HDDAT			;If so do next state
+	CLRB	DDOST#(R4)		;Clear the state to header start
+	BR	HDEXT
+HDDAT:	CMPB	#ST.DC2,DDOST#(R4)	;Output data crc2
+	BNE	1$
+	CLRB	DDOST#(R4)		;Clear output state
+	BR	HDEXT
+
+1$:	INCB	DDOST#(R4)		;Next state
+	CLR	DDOCRC#(R4)		;Clear the CRC for the data
+HDEXT:	POP	R3
+	POP	R2
+	POP	R1
+	POP	R0
+	POP	R4
+	RTI
+	.PAGE
+	.SBTTL	DATOUT	- Data output
+
+DATOUT:	MOVB	@DDPKTO#(R4),R0		;Get the character to output
+	MOVB	R0,@DDLBTB#(R4)		;Place in device register
+	INC	DDPKTO#(R4)		;Point to the next character
+	MOV	DDOCRC#(R4),R2		;Get the old crc value
+	XOR	R2,R0
+	BIC	#177400,R0
+	ASL	R0
+	MOV	CRCBYT#(R0),R0
+	CLRB	R2
+	SWAB	R2
+	XOR	R0,R2
+	MOV	R2,DDOCRC#(R4)
+	DEC	DDCNTO#(R4)		;Drop the character count
+	BNE	DATEND			;If not zero go on
+	INCB	DDOST#(R4)		;Next state
+	TBBE	$LOAD,DDFLAG#(R4),1$	;Load state?
+	BIS	#$ELOAD,DDFLAG#(R4)	;Set end of load
+	CLRB	DDOST#(R4)		;Don't send CRC for load mode
+1$:	CLRB	@DDSTHO#(R4)		;Zap the characer from header
+					; So the CRC routine will clear state
+DATEND:	POP	R3
+	POP	R2
+	POP	R1
+	POP	R0
+	POP	R4
+	RTI
+	.PAGE
+	.SBTTL	Data area
+
+	PURE
+
+ENQMS:	.WORD	2307
+	.WORD	-2
+	.WORD	0
+
+RSTMS:	.WORD	2307
+	.WORD	-1
+	.WORD	0
+
+	.END
+   
