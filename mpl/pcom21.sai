@@ -1,0 +1,1197 @@
+begin	"PCOM"
+
+require ('1 lsh 18) lor '21 version;
+
+require "
+PCOM - interim PERP exec language [with parameters]
+
+Assembly instructions:
+    Load @PCOM.CMD
+
+Source files:
+    PCOM.SAI	- Main Program
+    UUOSYM.SAI	- UUO definitions
+    HCALLI.MAC	- CALLI subroutine
+
+License required: WC RC SY" message;
+
+require "(SAILIB)SAIL.DEF" source!file;
+!Get!Definitions(TYMINT);
+
+require "UUOSYM.SAI" source!file;
+
+require 25 polling!interval;
+require processes;
+require 1000 new!items,  pnames;
+!	Variable definitions for outer block;
+
+Define Batch = {"SPAWN"};	! monitor command for /DETACH;
+Define Tty   = {"APPLY"};	! monitor command for /NODETACH;
+Define Default!Ext = {".CTL"};	! default file extension;
+
+external boolean RPGSW;		! true if run at start address plus one;
+boolean Normal;			! true if normal ccl entry;
+boolean Ext!Found;		! true if "." found in filename;
+boolean File!Error;		! true if illegal filename;
+boolean CCLSW; 			! true if command found on cmd line;
+boolean IACSW;			! true if interactive (being prompted);
+boolean DETACH!;		! true if this frame IS detached;
+boolean MakeLog;		! true if making a log file;
+boolean DoDel;			! true if deleting log file;
+boolean DoERRORLOG;		! true if log file kept for errors;
+boolean DoLOG;			! true if making a log file;
+boolean DoMAIL;			! true if sending mail at finish;
+boolean DoParam;		! true if we are substituting parameters;
+
+integer	swDETACH;		! status holder of /DETACH switch;
+integer swHELP;			! status holder of /HELP switch;
+integer swLOG;			! status holder of /LOG switch;
+integer swERRORLOG;		! status holder of /ERRORLOG switch;
+integer swMAIL;			! status holder of /MAIL switch;
+integer swNEWS;			! status holder of /NEWS switch;
+
+integer LineNo;			! input/output line number.;
+integer	BRK,EOF,OChan,S!Chan;	! I/O variables;
+string	IChan;			! stack of nested input files;
+string	CmdFile,LogFile;	! I/O file names;
+string	CmdName;		! Temporary CmdFile holder;
+integer Sleep!Time;		! How long to sleep while waiting;
+
+string Delim!list;		! Delimiter list;
+string Par!Str;			! Parameter escape character (settable);
+list Par!!List,Par!!Set;	! Lists of ordered & named parameters;
+list itemvar Par!List;		! List of Ordered parameters;
+set  itemvar Par!Set;		! Set of Named parameters;
+
+integer B!Lin;			! break table for reading a line;
+integer B!Wrd;			! break table for grabbing a text word;
+integer B!Nam;			! break table for reading a filename;
+integer B!Usr;			! break table for end of username;
+integer B!Ppn;			! break table for reading ppn's;
+integer B!Wht;			! break table for skipping whitespace;
+integer B!Brk;			! break table for finding break chars;
+integer B!Quote;		! break table for finding a quote;
+integer B!Sub;			! break table for building parameters;
+integer B!Par;			! break table for reading parameters;
+integer B!Cmd;			! break table for reading a command;
+integer B!Up;			! break table for uppercaseing text;
+integer Dummy;			! dummy variable so we don't lose Brk;
+Define Uppercase(x) = {Scan(x, B!Up, Dummy)};
+Define White(x) = {Scan(x, B!Wht, Brk)};
+
+!	Initialization routines;
+
+simple procedure LicenseCheck;
+begin
+    integer L;
+    L _ calli(!xwd(-1,!GTLIC),calli!GETTAB);
+    if (L land LC!WC = 0)
+    or (L land LC!RC = 0)
+    or (L land LC!SY = 0)
+    then usererr(0,0,"?license required: WC RC SY","X");
+end;
+require LicenseCheck initialization;
+
+procedure ParIni;
+begin "parameter initialization"
+    DoParam _ False;			! Insure no substitution;
+    Delim!list _ Par!Str _ "\";		! Default parameter escape;
+    Par!!List _ NIL;			! Empty channel/file list;
+    Par!!Set  _ PHI;			! Empty parameter set;
+end;
+require ParIni initialization;
+
+procedure BrkIni;			! depends on ParIni;
+begin
+    Define ##Cmd = {";=_/ "&#ht};
+    Define ##Wht = {" "&#ht&#cr};
+    Define ##Brk = {" !@#$%^&*()_+-=~`[]|\:;'<>,.?/" & '42 & '173 & '175};
+    Define ##Sub = {"<>"",/=_ " & '11 & '177};
+    Define #Upper = {"ABCDEFGHIJKLMNOPQRSTUVWXYZ"};
+    Define #Lower = {"abcdefghijklmnopqrstuvwxyz"};
+    Define #Alpha = {#Upper & #Lower};
+    Define #Digit = {"0123456789"};
+    Define #Chars = {#Alpha & #Digit};
+    Define #Par   = {#Alpha & "-_"};
+
+    setbreak(B!Lin_Getbreak,#lf,         null, "SINF");	! line;
+    setbreak(B!Wrd_Getbreak,#Alpha,      crlf, "RXNF");	! word or token;
+    setbreak(B!Nam_Getbreak,#Chars,      crlf, "RXNF");	! name or token;
+    setbreak(B!Usr_Getbreak, ")",        null, "SINK");	! end of username;
+    setbreak(B!Ppn_Getbreak,"01234567,", null, "SXNK");	! only allow these;
+    setbreak(B!Wht_Getbreak,#lf & ##Wht, crlf, "RXNK");	! white space;
+    setbreak(B!Brk_Getbreak,#lf & ##Brk, #cr,  "RINK");	! all break chars;
+    setbreak(B!Quote_Getbreak, Par!str,  null, "SINF");	! parameter on line;
+    setbreak(B!Par_Getbreak, #Par,       null, "RXNK");	! parameter variable;
+    setbreak(B!Sub_Getbreak, ##Sub,      #cr,  "SINF");	! substitutions;
+    setbreak(B!Cmd_Getbreak,#lf & ##Cmd, #cr,  "SINK");	! command;
+    setbreak(B!Up _Getbreak, null,       null, "SINK"); ! make uppercase;
+end;
+require BrkIni initialization;
+
+procedure Initialize!switches;
+begin
+    swDETACH _ swMAIL _ swHELP _ swNEWS _  swLOG _ swERRORLOG _ -1;
+end;
+require Initialize!switches initialization;
+
+
+string procedure TOK (reference string S);
+begin
+    string S1;
+    White( S );			! clear whitespace;
+    S1 _ scan(S, B!Brk, BRK);	! get the next word;
+    if length(S1) = 0		! null?;
+	then if length(S) = 0	!   null source also?;
+	    then return (null)	!    yes - return null;
+	    else S1 _ lop(S);	!    no  - get a character;
+    White( S );			! clear whitespace;
+    return(S1);			! return the token;
+end;
+
+
+string procedure EXIT;		! string so it can be "printed" [ugh];
+calli(0,(if detach! then calli!LOGOFF else calli!EXIT));
+
+
+simple string procedure GetFil( Reference string Str;
+				Reference Boolean Dot, Err);
+begin "read a file name"
+    String Usr, Fil, Ext, Ppn;
+    Dot _ Err _ False;					! Initially false;
+    Usr _ Fil _ Ext _ Ppn _ Null;			! Initially empty;
+    Fil _ Scan(Str, B!Nam, Brk);			! Read name?;
+    If Brk = "(" then begin
+	Lop(Str);					! eat "(";
+	Usr _ "(" & Scan(Str, B!Usr, Brk) & ")";	! get username;
+	If Brk neq ")" then err _ True;			! everything ok?;
+	Fil _ Scan(Str, B!Nam, Brk);			! then filename;
+    end;
+    If Brk = "." then begin
+	Lop(Str);					! eat ".";
+	Dot _ True;					! declare extension;
+	Ext _ "." & Scan(Str, B!Nam, Brk);		! and read it;
+    end;
+    If Brk = "[" then begin
+	Lop(Str);					! eat "[";
+	Ppn _ "[" & Scan(Str, B!Ppn, Brk) & "]";	! get PPN;
+	Lop(Str);					! eat "]";
+	If Brk neq "]" then err _ True;			! closed ok?;
+	If Length(Usr) then err _ True;			! (user) & [ppn] ?;
+    end;
+    White( Str );					! clear whitespace;
+    Return ( Usr & Fil & Ext & Ppn );			! All done;
+end "read a file name";
+
+simple string procedure Get!Parameter(Reference string Par!Lst);
+begin "get a parameter"
+    String S, Old!Brk;
+    Integer InQuote, Save!Brk;
+
+    White( Par!Lst );					! Clear whitespace;
+    S _ Scan(Par!Lst, B!Sub, Brk);			! Get Token;
+    If Brk = '177 or Brk = '42 or BRK = "<" then begin "in quote"
+	InQuote _ True;    Save!Brk _ Brk;		! For matching pair;
+	If Length(S) then begin				! not allowed yet;
+	    Print("?error in parameter substitution: (",S,") discarded",crlf);
+	    S _ null;
+	end;
+	Old!Brk _ null;					! Start anew;
+	While InQuote do begin				! Match quotes! ;
+	    S _ S & Old!Brk & Scan(Par!Lst, B!Sub, Brk);! Ignore other breaks;
+	    If Brk = '42 and Save!Brk = '42 or		! Check for pairs;
+	       Brk = '177 and Save!Brk = '177 or	!       ...;
+	       Brk = ">" and Save!Brk = "<" then begin	!    of each type;
+		    InQuote _ False;			! Set we are done;
+		    White( Par!Lst );			! Clear Whitespace;
+		    Scan(Par!Lst, B!Sub, Brk);		! Eat to next break*;
+		end
+		else Old!Brk _ If Brk = 0 then Null else Null & Brk;
+	    If length(Par!Lst) = 0 then Done;		! If missing quote?;
+	end;
+    end;
+!
+  * --	It would be nice at this point to allow some kind of combination
+	or other parameter tricks.  However... not so decided...  (YET)
+;
+    If Brk = "/" then Par!Lst _ "/" & Par!Lst;		! Hack! restore "/";
+    If Brk = " " or Brk = '11 then White( Par!Lst );	! Clear whitespace;
+    Return(If Length( S ) then S else null);		! Return something;
+end "get a parameter";
+
+Procedure New!Parameter(Integer Chan; String Name, Initial!Value, New!Value);
+begin
+    String Itemvar SI;    Boolean Not!Defined;
+    Name _ Uppercase(Name);				! Guess what this is;
+    SI _ Cvsi( Chan&Name, Not!Defined);			! See if PNAME exists;
+    If Not!Defined then begin				! No, then;
+	New!Pname(SI _ New(Initial!Value), Chan&Name);	!   define it;
+	Par!Set _ Lop(Par!!Set);			! Get current set;
+	Put SI in Datum( Par!Set );			! Put new item in set;
+	Put Par!Set in Par!!Set before 1;		! Put set away;
+    end;
+    If length(New!Value) then datum(SI) _ New!Value;	! If we have a value?;
+!    Print("Set: ",chan,name," = {",datum( SI ),"}",crlf);
+end;
+
+
+simple procedure Set!Parameter(Reference string Par!Lst);
+begin "build substitution table"
+    String Par!,Name;    String Itemvar SI;    Integer Par!Index;
+
+    Par!Set  _ New(Phi);				! Empty set;
+    Put Par!Set  in Par!!Set  before 1;			! First item in list;
+    Par!List _ New(Nil);				! Empty list;
+    While Length(Par!Lst) and Brk neq "/" do begin "reading parameters"
+	Name _ null;					! Clear name;
+	Par! _ Get!Parameter( Par!Lst );		! Read a parameter;
+	If Brk = "=" or Brk = "_" then begin "named parameters"
+	    Name _ Scan( Par!, B!Par, Brk );		!   Set name;
+	    If Length(Par!) then begin			!   Error if non-null;
+		Print("?Illegal character """,Brk&Null,	!     print message;
+			""" in parameter",crlf);	!     ....;
+		Name _ null;				!     clear name;
+	    end;
+	    Par! _ Get!Parameter( Par!Lst );		!   Set parameter;
+	end "named parameters";
+! Print("List: {",Name,"}={",Par!,"}",Length(name),":",Length(par!),crlf);
+	If Length( Name ) then begin			! Named parameter;
+	    DoParam _ True;				! Set flag true;
+	    New!Parameter(S!Chan, Name, Null, Par! )	! Create parameter;
+	  end
+	  else begin					! Ordered parameter;
+	    DoParam _ True;				! Set flag true;
+	    SI _ New( Par! );				!   create item;
+	    Put SI in Datum(Par!List) after INF;	! Put into list;
+	end;
+    end "reading parameters";
+    Put Par!List in Par!!List before 1;			! First item in list;
+end "build substitution table";
+
+Procedure Forget!substitutions;
+begin
+    String Itemvar SI;
+    If Length( Par!!List ) then begin "zap list by 1"
+	Par!List _ Lop( Par!!List );
+	While Length( Datum(Par!List) ) do begin "ordered"
+	    SI _ Lop( Datum(Par!List) );
+	    Delete( SI );
+	end "ordered";
+	Delete( Par!List );
+    end "zap list by 1";
+    If Length( Par!!Set ) then begin "zap set by 1"
+	Par!Set _ Lop( Par!!Set );
+	While Length( Datum(Par!Set) ) do begin "named"
+	    SI _ Lop( Datum(Par!set) );
+	    Del!Pname( SI );
+	    Delete( SI );
+	end "named";
+	Delete( Par!Set );
+    end "zap set by 1";
+end;
+
+
+string procedure Make!List(String Text!, L!Quote, R!Quote);
+begin "make parameter list"
+    String S;    String Itemvar SI;    Boolean X;    Integer C;
+
+    S _ null;					! Initial string values;
+    Par!List _ Cop( Par!!List );		! Current ordered list;
+    While Length( Datum(Par!List) ) do begin "ordered"
+	SI _ Lop( Datum(Par!List) );		! Ordered list to string;
+	S  _ S &","& L!Quote & Datum( SI ) & R!Quote;
+    end "ordered";
+    Par!Set  _ Cop( Par!!Set );			! Current set;
+    While Length( Datum(Par!Set) ) do begin "named"
+	SI _ Lop( Datum(Par!Set) );		! Named list to string;
+	S _ S &","& Cvis( SI, X )[2 for inf] &"="& !     , pname[2 to n] = ;
+	    L!Quote & Datum( SI ) & R!Quote;	!     quote string quote;
+    end "named";
+    Lop(S);					! Strip off first ",";
+
+    Return (Text! & S);				! Return string;
+end "make parameter list";
+
+String procedure Mumble(Integer Chan; String Key);
+begin
+    String Itemvar SI;    Boolean Not!Defined;
+
+    SI _ Cvsi(Chan&Key, Not!Defined);			! user keyword? ;
+    If Not!Defined then SI _ Cvsi( 0&Key, Not!Defined); ! system keyword? ;
+    Return( If Not!Defined then null else Datum(SI) );	! null if undefined;
+end;
+
+String procedure parametize(Value String S);
+begin "parameter substitution"
+    String L, Key;    Integer Par!Chr;
+
+    L _ Null;					! Newline;
+    While Length(S) do begin
+      L _ L & Scan(S, B!Quote, Brk);		! Scan for a parameter;
+      If Brk = Par!Str then begin "got one"	! well? else must be null;
+	Par!Chr _ Lop(S);			! Get next char;
+	If Par!Chr = Par!Str			! Do we have '' ?;
+	  then L _ L & Par!chr			!  Yes, make a ' ;
+	  else begin				!  No. ;
+	    Key _ Par!Chr & Scan(S,B!Par,Brk);	!   Read keyword;
+	    If Brk = Par!Str then Par!Chr _ Lop(S); ! strip trailing ' ;
+	    Key _ Uppercase(Key);		! make sure this works;
+	    L _ L & Mumble(S!Chan, Key);	!   Perform substitution;
+	  end;
+      end "got one";				! Done parameter;
+    end;					! Done Line;
+    Return (L);					! So, Return it;
+End;
+	
+
+simple procedure HELP(String Inout);
+begin "give user help"
+If Kequ(Inout,"IN") then print("
+command syntax is:
+
+    [logfile =] commandfile [parameters] [/switches] ]
+
+where
+    logfile		is the name of the output file (see note)
+    commandfile		is the name of the input file 
+    parameters		is an optional parameter list (may be omitted)
+    switches		is zero or more of the following switches:
+	/DETACH		run the job detached (default)
+	/ERRORLOG	create a log file, but delete it if no errors
+	/LOG		create a log file (default)
+	/MAIL		send mail to notify when complete (default)
+	/HELP		prints this message (same as ?)
+	/NEWS		prints latest enhancements
+
+note: If the first line of the file begins with "":"", it is assumed to
+      be the logfile name.  If the job is run /NODETACH then switches
+      /NOLOG and /NOMAIL are assumed, but may be overridden on the PCOM
+      command line.
+
+")
+else if Kequ(Inout,"OUT") then print("
+Command syntax is:
+
+    logfile
+
+where logfile is the log file to be used to record terminal output
+from the PCOM job.  The default log file is jjjPCO.LOG where jjj is
+the PCOM job number.
+
+")
+else if Kequ(Inout,"SWITCHES"[1 for length(inout)]) then print("
+DETACH, ERRORLOG, HELP, LOG, MAIL, NEWS
+");
+end "give user help";
+
+simple procedure NEWS;
+print("
+PCOM ""news"" has been incorporated into the standard system
+documentation files.  Please refer to PCOM.DOC for further details.
+");
+
+simple integer procedure checksw(String Nam, Txt);
+Return( If Kequ( Nam, Txt[1 for length(Nam)] )	! Compare Nam & Txt;
+	then 1					! A match here is true;
+	else if Kequ(Nam,("NO"&Txt)[1 for length(Nam)] )
+	    then 0				! A match here is false;
+	    else -1 );				!   else no match - default;
+
+simple string procedure print!switch(String Nam; Integer Flag);
+Return( If Flag < 0 then "" else
+	If Flag = 0 then "/NO"&Nam else "/"&Nam );
+
+
+boolean procedure legal!switch(Reference string S; String Inout);
+begin
+    string SW;    integer V;
+    if Brk = "/" then begin "switch search"
+	Brk _ Lop(S);
+	SW  _ scan(S, B!Wrd, BRK);
+	if -1 < V _ checksw(SW,"DETACH") then swDETACH _ V
+	else if -1 < V _ checksw(SW,"MAIL") then swMAIL _ V
+	else if -1 < V _ checksw(SW,"LOG") then swLOG _ V
+	else if -1 < V _ checksw(SW,"ERRORLOG") then swERRORLOG _ V
+	else if -1 < V _ checksw(SW,"HELP") then swHELP _ V
+	else if -1 < V _ checksw(SW,"NEWS") then swNEWS _ V
+	else begin "switch error"
+	    print("?unrecognized or duplicate switch: ""/",SW,"""",crlf);
+	    Return (False);
+	end "switch error";
+    end "switch search";
+    If swHELP > 0 then HELP(Inout);
+    If swNEWS > 0 then NEWS;
+    Return ( If swHELP > 0 or swNEWS > 0 then False else True );
+end;
+integer procedure Visit!Maternity!Ward;
+begin "birth procedure"
+    Integer loop!count, frame!index;
+
+    loop!count _ 0;			! set clock running;
+    Do begin "pregnancy"		!  we only get so many months;
+	begin!code
+	    protect!acs 1;
+	    SETOM !skip!;		! skip return;
+	    HRLI 1,!foCFM;
+	    uuo!FRMOP 1,[0];		! attempt to bear a child;
+	      SETZM !skip!;		! miscarriage?;
+	    MOVEM 1,frame!index;	! put the child in a closet;
+	end;
+	if not !skip! then begin "intercourse"
+	    loop!count _ loop!count+1;	! count number of nights;
+	    if loop!count land '101 then ! but only tell about some;
+		print(If loop!count > 1	! Dont't tell about first time;
+		    then "attempting retry."&crlf else "",
+		  case !rh(frame!index) of (
+		    [0] "?not enough disk space",
+		    [1] "?frame capacity exceeded",
+		    [else] "?create frame error: "&Cvos(!rh(frame!index))
+		      ),
+		    If !rh(frame!index) < 2
+			then " - please wait..." else EXIT);
+	    calli(!Xwd(1,2), calli!hiber);	! always sleep;
+	end "intercourse";
+    end "pregnancy" until !skip! neq 0;
+    If loop!count > 0 then
+	print(crlf,"Problem corrected.  Continuing job.",crlf);
+    Return(frame!index);	! Don't forget this;
+end "birth procedure";
+
+!	FRONT!END
+Obtain a command line, check it for errors, and return it in global
+variables.  The CMDFile and LOGFile are both opened and made ready.
+If job is to be detached, take necessary action (does not return).  Due 
+to problems dealing with error recovery, it is impossible to check the 
+LOGFile for writability if /DET is specified and no LOGFile is given.
+This is okay based on the assumption that jjjPCO.LOG[0,0] will always be 
+writable by frame jjj.
+The command line may be obtained in one of three ways:
+	1. from the command line (xxx logfile_cmdfile param/switch)
+	2. interactively by prompting the user for the information
+	3. by RPG where it is obtained from a jjjPCO.TMP file
+;	
+
+procedure FRONT!END;
+begin
+    string S;			! a handy string;
+    label INPUT.PROMPT;		! goto here for purpose of reprompting;
+    label OUTPUT.PROMPT;	! goto here for purpose of reprompting;
+
+!	cope with being detached
+;
+    Detach! _ !lh(calli(!xwd(-1,!gtLIN),calli!GETTAB))=0;
+	! set detach flag if we are detached;
+    if Detach! then 
+	calli(JP!NAT lor calli(!xwd(-1,!GTPRV),cGETTAB),calli!SETPRV);
+	! set NO ATTACH so we don't bother user when logging in;
+
+!	check for RPG type call - look for jjjPCO.TMP
+;
+    if RPGSW then begin "RPG"	! was our start address +1?;
+	integer C,B,E; string F; integer array T[0:1];
+	S _ TMPIN( "PCO", E );	comment SAIL function;
+	if E then begin
+	    F _ cvs(1000+calli(0,calli!PJOB))[2 to 4]&"PCO.TMP";
+	    open(C_getchan,"DSK",1,4,0,256,B,E);
+	    lookup(C,F,E);
+	    if E then print("?cant read ",F," error code '",E, EXIT);
+	    S _ null;		! make sure no ill side-effects;
+	    Do S _ S & input(C,0) until E;
+	    rename(C,null,0,E);
+	    release(C);
+	end
+	else begin
+	    T[0] _ Cvsix("PCO");
+	    T[1] _ 0;
+	    calli(!Xwd(!TCRDF,T[0]), calli!TMPCOR);	! Delete it;
+	end;
+    end "RPG";
+
+!	next try for CCL type call:
+	  o  look for semicolon in command line
+	  o  see if first token is the magic BATCH or TTY command
+;
+    Normal _ True;			! Initial default is to detach;
+    if not RPGSW then begin
+	String IT;
+	backup;				! back up monitor TTY read pointer;
+	S _ inchsl(EOF);		! read monitor command line;
+	If length(S) then begin
+	    It _ Scan(S, B!Nam, Brk);	! Get first token on line;
+	    If Kequ(It,BATCH[1 for length(It)]) then CCLSW _ True
+		else if Kequ(It,TTY[1 for length(It)]) then begin
+		    CCLSW _ True;
+		    Normal _ False;	! Terminal desired!;
+		end;
+	end;
+	while length(S) and not CCLSW do
+	    CCLSW _ ( ";" = Tok(S) );	! look for a semicolon;
+    end;
+    IACSW _ not (CCLSW or RPGSW);	! set interactive flag appropriately;
+    if IACSW then begin "prompt"
+	If Kequ(cv6str(calli(!xwd(-1,!gtnam),calli!GETTAB)),"PCOM")
+	    then print("PCOM version ",Cvos(!lh(Memory['137])),".",
+			Cvos(!rh(Memory['137]))  )
+	    else begin "security code"
+		Calli(cvsix("PCOM"),calli!PUTLSA);
+		Calli(cvsix("PCOM"),calli!SETNAM);
+	    end "security code";
+	print(crlf,"(Type ? for HELP)",crlf);
+    end "prompt";
+
+    INPUT.PROMPT: if IACSW then begin "prompt"
+	Forget!Substitutions;
+	print("Command file: ");
+	S _ inchwl;
+    end "prompt";
+
+    Initialize!Switches;		! Set swXXX variables to default;
+
+    if S = "?" then begin		! give help and re-prompt?;
+	HELP("IN");			!   Type help message;
+	If IACSW
+	   then go to INPUT.PROMPT	!   If interactive then ask again;
+	   else EXIT;			!      else go away;
+    end;
+    White( S );				! clear out whitespace (if any);
+    CmdFile _ GetFil(S, Ext!found, File!error);
+    If File!Error then begin
+	Print("?Error in filename """,CmdFile,"""",crlf);
+	If IACSW then go to INPUT.PROMPT else EXIT;
+    end;
+    If Brk = "=" or Brk = "_" then Brk _ Lop(S);
+    LogFile _ null;			! default file name;
+    case BRK of begin
+	["="]["_"] begin		! maybe get LOG file name too;
+	    White( S );			! clear out whitespace;
+	    LogFile _ CmdFile;		! set LogFile;
+	    CmdFile _ GetFil(S, Ext!found, File!error);
+	    If File!Error then begin
+		Print("?Error in filename """,CmdFile,"""",crlf);
+		If IACSW then go to INPUT.PROMPT else EXIT;
+	    end;
+	end;
+	else
+    end;
+
+!	Handle parameters here.
+	Note: Do this even if no parameters.  This will
+	      setup the necessary empty set and lists.
+;
+    Set!Parameter(S);			! look for "/" or EOL;
+
+!	Read off any switches and react to them
+;
+    while length(S) do
+	if not legal!switch(S,"IN") then
+	    if IACSW then go to INPUT.PROMPT else EXIT;
+
+!	Initial non-command-line "DEFAULTS" (from switches)
+;
+    If swDETACH < 0 then swDETACH _ If Normal then 1 else 0;	! /Det?;
+    DoErrorlog _ If swERRORLOG > 0 then True else False;	! Err?;
+    DoLog  _ If swLOG < 0 then If Length(LogFile) then True	! Log?;
+    						  else detach!				! Log?;
+			  else If swLOG > 0 then True
+					    else False;
+    MakeLog _ DoLog;						! logfile;
+    DoMail _ If swMAIL < 0 then detach!				! Mail;
+			   else If swMAIL > 0 then True
+					      else False;
+
+!	setup input file
+;
+    lookup(IChan,CmdName_CmdFile,EOF_-1);	! input file;
+    if EOF and not Ext!Found then
+	lookup(IChan,CmdName_CmdFile&Default!Ext,EOF);	! alternate?;
+    if EOF then begin
+	lookup(Ichan,CmdName_CmdFile,EOF_-1);	! Get right error code, etc;
+	print ("?input file """,CmdFile,""" ",case !rh(EOF) of (
+	    [0] "not found",
+	    [1] "invalid user",
+	    [2] "protection failure",
+	    [else] "LOOKUP error '"&cvos(!rh(EOF)) ),crlf);
+	if IACSW then go to INPUT.PROMPT else EXIT;
+    end;
+    CmdFile _ CmdName;				! Keep the name straight;
+
+!	Read first line of command file to see if ":LOGFILENAME"
+;
+    S _ input(IChan,B!Cmd);
+    if lop(S) = ":" 		! see if 1st line of file is LogFile name;
+	then if length(LogFile)	! see if we already have a LogFile set;
+	    then	 	! set already, ignore one in cmd file;
+	    else LogFile _ S	! use 1st line of cmd file if no LogFile;
+	else useti(IChan,1);	! reread 1st line if no ":";
+
+!	setup LOG file
+;
+    if MakeLog then begin "get log file"
+	OUTPUT.PROMPT:
+	if length(LogFile)=0 then begin "no log file yet"
+	    if IACSW then do begin "prompt"
+		print("Log file: ");
+		LogFile _ inchwl;
+		if LogFile = "?" then HELP("OUT");
+	    end "prompt" until LogFile neq "?";
+	    If length(LogFile) = 0
+		then LogFile_cvs(1000+calli(0,calli!PJOB))[2 to 4]&"PCO.LOG"
+		else;			! let child PCOM default it;
+	end "no log file yet";
+
+	if MakeLog then begin "create log file"
+	    enter(OChan,LogFile,EOF);
+	    if EOF then begin "do error cleanup"
+		print("?output file """,LogFile,""" ",case !rh(EOF) of (
+		    [0] "illegal name",
+		    [1] "invalid user",
+		    [2] "protection failure",
+		    [3] "being modified",
+		    ['14] "exceeds quota or disk full",
+		    [else] "ENTER error '"&cvos(!rh(EOF)) ),crlf);
+		LogFile _ null;
+		if IACSW then go to OUTPUT.PROMPT else EXIT;
+	    end "do error cleanup";
+	end "create log file";
+    end "get log file";
+
+!	"detach" if necessary
+;
+    if  swDETACH > 0 then begin "DETACH"
+        own integer C,B,E;		! stuff for writing .TMP file;
+	own integer FDX;		! FD of child;
+	own integer F.err;		! .fo-ERR;
+	own integer JX;			! job number of child for msgs only;
+        own integer array RB[0:3];
+	FDX _ Visit!Maternity!Ward;	! create a child frame;
+	JX _ FDX land '7777;		! shouldn't there be a uuo for this?;
+        RB[0] _ !xwd(1,arrinfo(RB,2));	! our name so can run ourself;
+        RB[1] _ cvsix("DSK");
+        RB[2] _ calli(!xwd(-1,!gtFPN),calli!GETTAB);
+        RB[3] _ calli(!xwd(-1,!gtNAM),calli!GETTAB);
+        If MakeLog then			! then this is open, so close it;
+	    release(OChan,'40);		! don't create (supercede) outputfile;
+        release(IChan);			! just close it for good form;
+        open(C_getchan,"DSK",0,0,4,0,0,E);
+        enter(C,cvs(1000+JX)[2 to 4]&"PCO.TMP",E);
+        cprint(C,if swLOG neq 0 then LogFile&"_" else "", ! Log file?;
+	    CmdFile, " ", Make!List( null,'177,'177 ),	! file par...par;
+	    "/NODETACH",				! for child frame;
+	    Print!switch("LOG",swLOG),			! Log file?;
+	    Print!switch("MAIL",swMAIL),		! Mail?;
+	    Print!switch("ERRORLOG",swERRORLOG)		! Errorlogging?;
+	);
+        close(C); release(C);
+        print("[",cv6str(RB[3])," in frame ",JX,"]");
+        begin!code
+	    protect!acs 1;
+	    MOVE 1,FDX;
+	    HRLI 1,!foRUN;	! run PCOM in child at RPG entry point;
+	    SETOM !skip!;
+	    uuo!FRMOP 1,access(RB[0]);
+	      SETZM !skip!;
+        end;
+        if not !skip! then
+	    print(crlf,"?cant run ",cv6str(RB[3])," in inferior");
+        begin!code
+	    protect!acs 1;	! Use JX (abs handle) instead of FDX (family);
+	    MOVE 1,JX;		!   here so disown doesn't ever fail;
+	    HRLI 1,!foGFT;	! disown child now that were done;
+	    SETOM !skip!;
+	    uuo!FRMOP 1,[0];	
+	      SETZM !skip!;
+	    Movem 1,F.err;
+        end;
+        if not !skip! then print(crlf,"%cant disown inferior (",
+				cvos(JX),") [",cvos(F.err),"]" );
+        EXIT;
+    end "DETACH";
+
+end "FRONT!END";
+
+
+item	INTPRO;			! deffered interrupt process;
+integer array M[0:35,0:4];	! interrupt data area;
+! note:	M[c,0] is count of locations used for DF1INT call (4);
+!	M[c,1] is addr of M[c,4] for ref arg to XINT;
+!	M[c,2] is addr of service routine for proc arg to XINT;
+!	M[c,3] is pointer to XINT for DF1INT;
+!	M[c,4] is -1 for ok to queue, >=0 for pending (already queued);
+
+procedure XINT (reference integer MC4; procedure MC2);
+begin	! called by INTPRO as result of queued request from QINT;
+    MC4 _ -1;			! set flag saying ok to quque;
+    MC2;			! call int service procedure;
+end;
+
+simple procedure QINT;
+begin	! called at immediate level to queue a request for service;
+    integer C;
+    C _ memory['10];		! get interrupt channel number;
+    if M[C,4] _ M[C,4] + 1 
+	then ! don't queue it more than once;
+	else DFR1IN (!xwd(-4,location(M[C,0])));
+end;
+
+forward procedure TIM;
+forward procedure CHR;
+forward procedure ZAP;
+forward procedure ORG;
+forward procedure NTQ;
+
+simple procedure INTINI(integer Port);
+begin	! called by main prog to setup interrupts once port is known;
+    simple procedure DEFMAP (integer INDEX; procedure PROC);
+    begin
+	own integer C;
+	C _ INDEX land '77;	! extract channel number;
+	M[C,0] _ 4;		! 2 word arg to DF1INT;
+	now!safe M;
+	M[C,1] _ location(M[C,4]);! pending flag;
+	begin!code		! setup handler procedure;
+		protect!acs 1;
+		MOVE	1,-1(P);
+		MOVEM	1,access(M[C,2]);
+	end;
+	M[C,3] _ !xwd(-1,location(XINT));
+	M[C,4] _ -1;		! DF1INT needs to be called;
+	now!unsafe M;
+	intmap (INDEX,QINT,0);
+	enable (newenb(C));
+    end;
+    intset (INTPRO,0);
+    defmap (intass(!IATIM,10),TIM);
+    Auxclv (Port,#LF,!AXS8B);			! #lf is break;
+    defmap (tinass(Port,!IABRK,11),CHR);	! [{{}}] .IACHR;
+    defmap (tinass(Port,!IAZAP,12),ZAP);
+    defmap (tinass(Port,!IAORG,13),ORG);
+    defmap (intass(!IANTQ,14),NTQ);
+    defmap (tinass(-1,!IAESC,14),NTQ);
+end;
+
+simple procedure IntZap;
+begin
+    disable (newenb(10));
+    disable (newenb(11));
+    disable (newenb(12));
+    disable (newenb(13));
+    disable (newenb(14));
+end;
+
+integer PORT;
+integer FD;
+
+simple procedure SPROUT;
+begin
+    integer P;
+    P _ calli(0,calli!CREPTY);	! create a PTY;
+    if not !SKIP! then usererr(P,2,"?CREPTY error: ","X");
+    PORT _ !lh(P);
+    auxcli(PORT,'214,!axCFS);	! we are in image no echo;
+    auxclv(PORT,1,!axSOX);	! expand tabs etc for output file;
+    FD _ Visit!Maternity!Ward;	! create a child frame;
+    start!code
+	HRRO	1,FD;
+	HRLI	2,'200000;
+	HRR	2,P;
+	MOVEI	1;
+	SETOM 	!SKIP!;
+	uuo!RETACH;		! give it the PTY;
+	 SETZM	!SKIP!;
+    end;
+    if not !SKIP! then usererr(0,0,"?RETACH error","X");
+end;
+
+simple procedure OutPtr (integer PORT; string S);
+while length(S) do auxclv(PORT,lop(S),!axO8);
+! begin!code	! could use this but it won't do image mode;
+!	MOVEI	1,!AXOPC;	! output SAIL string;
+!	HRL	1,PORT;
+!	AUXCAL	1,-1(SP);	! output through pointer;
+! end ;
+
+string S,Disposition;
+Define Complete = {"completed"};		! Use a defined string;
+
+simple procedure ABORT(reference integer WHY);
+begin
+    IChan _ null;	! okay at immediate int level? ;
+    EOF _ WHY _ true;
+end;
+
+boolean TIM!;
+procedure TIM;
+abort(TIM!);		! terminate commands file and wake up SYNC;
+
+procedure CHR;
+begin	! called when a character is received from the port;
+    integer C;
+    while true do begin
+	auxclr(Port,C,!AXI8S);		! get character if any more;
+	if !SKIP! 
+	    then begin
+		if DoLog then wordout(OChan,C);	! Log it?;
+		if not Detach! then outchr(C);
+	    end
+	    else done;
+    end;
+    auxclv(Port,0,!AXLDE);		! indicate ready for input;
+end;
+
+boolean ZAP!;
+procedure ZAP;
+begin
+    IntZap;
+    abort(ZAP!);	! stop processing;
+end;
+
+boolean ORG!;
+procedure ORG;
+ORG! _ true; 		! wake up SYNC;
+
+boolean NTQ!;
+procedure NTQ;
+abort(NTQ!);
+
+procedure SYNC;
+begin	! synchronize with slave;
+    ORG! _ false;
+    auxclv(PORT,0,!axSYB);	! send yellow ball;
+    do 
+	calli(Sleep!Time,calli!HIBER)
+    until ORG! or TIM! or ZAP! or NTQ!;
+    ! orange ball interrupt procedure sets ORG!;
+end;
+
+integer array VarVal ["A":"Z"];
+string array VarStr ["A":"Z"];
+
+procedure ASSIGN (string CMD);
+begin "ASSIGN COMMAND"
+    integer V;
+    V _ TOK(CMD);	! get variable name;
+    TOK(CMD); 		! eat "=";
+    if "A" leq V leq "Z" 
+	then VarVal[V] _ cvd(TOK(CMD));
+end "ASSIGN COMMAND";
+
+procedure COM (string CMD);
+begin "COM COMMAND"
+    String Name;
+
+    Name _ GetFil(CMD, Ext!Found, File!Error);	! read off filename;
+    If File!Error then begin			! If error...;
+	Print("?COM Filename error """,Name,"""",crlf);
+      end
+      else begin
+	S!Chan _ Getchan;			! declare new channel;
+	IChan _ S!Chan & IChan;			! add channel to list;
+	Delim!list _ Par!Str & Delim!list;	! add delimiter to list;
+	Set!Parameter(CMD);			! setup parameters;
+	open(IChan,"DSK",1,4,0,1024,BRK,EOF);	! open the file;
+	lookup(IChan, Name, EOF_-1);		!   "   "   "  ;
+	If EOF and not Ext!Found then		! if not there, then;
+	  lookup(IChan, Name&Default!Ext, EOF);	!  try other extension;
+    end;
+end;
+
+procedure ESCAPE;
+begin!code
+    label HALTW,HALTX,CLRW,CLRX;
+	MOVS 1,FD;
+	TLZ 1,'770000;
+	HRRI 1,!gtSTS;
+	uuo!GETTAB 1,;		! get JBTSTS;
+	 JFCL;
+	JUMPG 1,CLRX;		! don't hassle if halted;
+	MOVE 1,FD;
+	TRZ 1,'770000;		! do absolute so license will help;
+	HRLI 1,!foHLT;
+	uuo!FRMOP 1,;		! return to monitor;
+	 JRST CLRX;		! assume already halted (oh well);
+HALTW:	MOVEI 1,1;
+	uuo!SLEEP 1,;
+	MOVS 1,FD;
+	TLZ 1,'770000;
+	HRRI 1,!gtSTS;
+	uuo!GETTAB 1,;		! get JBTSTS;
+	 SETZ 1,;
+	JUMPL 1,HALTW;		! sleep until child halts;
+HALTX:	MOVE 1,FD;
+	TRZ 1,'770000;
+	HRLI 1,!foCLR;
+	uuo!FRMOP 1,;		! clear frame;
+	 JFCL;
+CLRW:	MOVEI 1,1;
+	uuo!SLEEP 1,;
+	MOVS 1,FD;
+	TLZ 1,'770000;
+	HRRI 1,!gtSTS;
+	uuo!GETTAB 1,;		! get JBTSTS;
+	 SETZ 1,;
+	JUMPL 1,CLRW;		! sleep until child halts;
+	MOVE 1,FD;
+	uuo!SETOTF 1,;
+	 JRST CLRX;
+	MOVSI 1,'206001;	! 1 page at 0 R/W in other frame;
+	uuo!VCREAT 1,;
+	 JRST CLRX;
+	MOVE 1,FD;
+	HRLI 1,!foWVA;
+	SETZ 2,;		! address;
+	HRROI 3,!GTPRV;		
+	uuo!GETTAB 3,;		! data = JBTPRV for us;
+	 JRST CLRX;
+	uuo!FRMOP 1,2;		! write in AC0;
+	 JRST CLRX;
+	MOVEI 2,1;		! address;
+	MOVE 3,[uuo!SETPRV];	! data;
+	uuo!FRMOP 1,2;
+	 JRST CLRX;
+	MOVEI 2,1;		! address;
+	MOVE 3,[uuo!EXIT];	! data;
+	uuo!FRMOP 1,2;
+	 JRST CLRX;
+	HRLI 1,!foSAA;
+	MOVE 2,['400000000001];	! start address;
+	uuo!FRMOP 1,2;
+	 JFCL;
+CLRX:
+	PUSHJ P,SYNC;		! stay in sync with slave;
+end;
+
+procedure GOTO (string CMD);
+if IChan > 0 then begin
+    string S;
+    S _ "::"& TOK(CMD);
+    useti(IChan,1); LineNo _ 0;
+    do begin
+	LineNo _ LineNo +1;
+	if Kequ( S,parametize( input(IChan,B!Cmd) ) ) then return;
+    end until EOF;
+end else print("?GOTO not allowed from terminal",crlf);
+
+simple procedure LOGCHECK(reference string CMD);
+begin "log check"
+    String s;
+    simple procedure switcheck;
+    If Kequ(S,"RESUME") then DoLog _ True
+	else If Kequ(S,"SUSPEND") then DoLog _ False
+	else If Kequ(S,"ERROR") then DoErrorlog _ True
+	else print("?illegal LOG command """,S,"""",crlf);
+
+    If length( S _ TOK(CMD) ) then switcheck else DoLog _ True;
+    While Length(S_TOK(CMD) ) do switcheck;
+end "log check";
+
+simple procedure QUIT;
+EOF _ true;
+
+boolean STOP!;		! tell world why we stoped;
+simple procedure STOP;
+STOP! _ EOF _ true;
+
+procedure TIME (string CMD);
+calli(!xwd(1,60*cvd(TOK(CMD))),calli!SETTIM);
+
+simple procedure Checker(reference string CMD; reference boolean Par);
+begin "parameter check"
+    String s;
+
+    simple procedure on!off(reference boolean Par);
+    begin
+	If Kequ(S,"ON") then Par _ True
+	    else If Kequ(S,"OFF") then Par _ False
+	    else Print("?illegal keyword """,S,""" in command at line ",
+			LineNo, Crlf);
+    end;
+
+    If length( S _ TOK(CMD) ) then on!off(Par) else Par _ True;
+    While Length(S_TOK(CMD) ) do on!off(Par);
+end "parameter check";
+
+procedure LET(string CMD);
+begin "LET COMMAND"
+    string Key;
+
+    While Length(CMD) do begin "scanning parameters"
+	White( CMD );					! Clear whitespace;
+	Key _ Scan( CMD, B!Par, Brk);			! Get name;
+	If Brk = " " or Brk = '11 then White( Cmd );	! Eat whitestuff;
+	If Brk = "=" or Brk = "_" then begin
+	    Lop( CMD );					! Eat = & assign;
+	    New!Parameter(S!Chan, Key, Null, Get!Parameter(CMD) );
+	  end
+	  else Print("?Illegal LET command format on line ",LineNo,crlf);
+    end "scanning parameters";
+end "LET COMMAND";
+
+procedure PARAMETERS(String CMD);
+begin "PARAMETERS COMMAND"
+    string Key, Par!Default, Par!Value;    String Itemvar SI;
+
+    DoParam _ True;					! Means Go!Substitute;
+    Par!List _ Lop( Par!!List );			! Get ordered list;
+    While Length(CMD) do begin "scanning parameter names"
+	Key _ Get!Parameter(CMD);			! Name;
+	Par!Default _ If Brk = "=" or Brk = "_"		! Parameter or null;
+	    then Get!Parameter(CMD) else Null;
+	If Length( Datum(Par!List) ) then begin		! If any in list;
+	    SI _ Lop( Datum(Par!List) );		! Get Item;
+	    Par!Value _ Datum( SI );			! Get string value;
+	    Delete( SI );				! No longer needed;
+	end
+	else Par!Value _ Null;				! Get null value;
+	New!Parameter(S!Chan, Key, Par!Default, Par!Value );
+    end "scanning parameter names";
+    Put Par!List in Par!!List before 1;			! Restore list;
+end "PARAMETERS COMMAND";
+
+procedure Set!Delimiter(String S);
+begin integer B;
+    White( S );					! first nonwhite character;
+    If Brk = 0 then Brk _ "\";			! default back to "\";
+    Par!Str _ Brk;				! setup string;
+    setbreak(B!Quote, Par!Str, null, "SINF");	! change table;
+end;
+
+
+recursive procedure SET(string CMD);
+begin "SET COMMAND"
+    string Key;
+    Key _ Tok(CMD);
+    if equ(Key,"LOG") then LOGCHECK(CMD)
+    else if equ(Key,"MAIL") then Checker(CMD, DoMail)
+    else if equ(Key,"PARAMETERS") then Checker(CMD, DoParam)
+    else if equ(Key,"DELIMITER") then Set!Delimiter(CMD)
+    else if equ(Key,"TIME") then TIME(CMD)
+    else Print("?Illegal SET command """,Key,""" at line ",LineNo,crlf);
+
+end "SET COMMAND";
+
+
+recursive procedure COMMAND (string CMD);
+begin	"COMMAND"
+    string KW;
+    if CMD = ":" then lop(CMD);
+    KW _ TOK(CMD);
+    if KW = ":" then ! ignore label here;
+    else if BRK = "=" then ASSIGN(KW&CMD)
+    else if equ(KW,"AFTER") then 
+    else if equ(KW,"COM") then COM (CMD)
+    else if equ(KW,"DEFINE") then 
+    else if equ(KW,"ESCAPE") then ESCAPE
+    else if equ(KW,"FIND") then
+    else if equ(KW,"GO") or equ(KW,"GOTO") then GOTO(CMD)
+    else if equ(KW,"IF") then
+    else if equ(KW,"LET") then LET(CMD)
+    else if equ(KW,"LOG") then LOGCHECK(CMD)
+    else if equ(KW,"LOOK") then
+    else if equ(KW,"MAIL") then Checker(CMD, DoMail)
+    else if equ(KW,"PAUSE") then
+    else if equ(KW,"PARAMETERS") then PARAMETERS(CMD)
+    else if equ(KW,"QUIT") then QUIT
+    else if equ(KW,"RESTART") then 
+    else if equ(KW,"SET") then SET(CMD)
+    else if equ(KW,"STOP") then STOP
+    else if equ(KW,"TIME") then TIME (CMD)
+    else if equ(KW,"UNLESS") then 
+    else if equ(KW,"WAIT") then
+    else ;
+end	"COMMAND";
+
+!	M A I N   program
+;
+string MyName;
+MyName _ cv6str(calli(!xwd(-1,!GTUNM),calli!GETTAB)) &
+    cv6str(calli(!xwd(-1,!GTUN1),calli!GETTAB));
+
+open(IChan_S!Chan_getchan,"DSK",0,4,0, 256,BRK,EOF);
+open(OChan_getchan,"DSK",0,0,4, 0,0,EOF);
+FRONT!END;			! parse command, open files, etc.;
+Sleep!Time _ (If Detach!	! set hibernation period;
+    then !Xwd(2,5)		! up to 5 minutes if detached;
+    else !Xwd(1,3) );		! else 3 seconds at the terminal;
+SPROUT;				! create child frame and PTY to it;
+calli(!xwd(2,60),calli!SETTIM);	! set (default) timeout to 1 hour;
+IntIni (Port);			! enable interrupts;
+while length(IChan) do begin "main loop"
+  while not EOF do begin "one file"
+    string S;
+    S _ input(IChan,B!Lin);	! input line from file;
+    if EOF then done;
+    If DoParam then
+	S _ parametize(S);	! parameter-ize the line;
+    LineNo _ LineNo +1;		! count it;
+    if S = ":"			! check for begin with colon;
+	then Command(S)		!	process PCOM command;
+	else begin		!	send command to slave job;
+	    OutPtr(Port,S);
+	    SYNC end;
+  end;
+  Forget!Substitutions;		! clear current substitutions;
+  release(lop(IChan));		! pop the channel stack;
+  S!Chan _ IChan[1 for 1];	! set new channel for substitutions;
+  Lop(Delim!list);		! lop off the last delimiter;
+  If Par!Str neq Delim!list then
+     Set!Delimiter(Delim!list);	! reset delimiters;
+  EOF _ false;			! clear end of file;
+end;
+
+!	determine disposition and clean up
+;
+DISPOSITION _ Complete;
+if TIM! then DISPOSITION _ "aborted: timeout at line "& cvs(LineNo);
+if NTQ! then DISPOSITION _ "aborted: halted by operator at line "& cvs(LineNo);
+if ZAP! then DISPOSITION _ "abended: lost circuit to slave at line "& cvs(LineNo);
+if STOP! then DISPOSITION _ "aborted: :STOP at line "& cvs(LineNo);
+if ZAP! then begin		! start a new frame;
+    ZAP! _ false;
+    SPROUT;
+    IntIni (PORT) end;
+ESCAPE;				! force command level;
+
+
+!	send mail if indicated - inform user of disposition
+;
+DoDel _ Kequ(Disposition,Complete) and
+	(swERRORLOG > 0 or
+	    (DoErrorlog and (swERRORLOG neq 0) and (swLOG leq 0) ) );
+ORG! _ TIM! _ NTQ! _ False;
+If MakeLog then DoLog _ True;	! Force into logfile if there;
+if swMAIL > 0 or (DoMail and (swMAIL neq 0)) then begin	! send mail ?;
+    Sync; OutPtr(Port,"SEND "&MyName&#cr);
+    Sync; OutPtr(Port, cv6str(calli(!xwd(-1,!GTNAM),calli!GETTAB))&
+	" command processed: "&
+	(If MakeLog and (not DoDel)
+	    then LogFile&" = " else "")&		! Log file?;
+	CmdFile&					! Command file?;
+	(If detach! then "/DETACH" else "/NODETACH")&	! Detached?;
+	Print!switch("LOG",swLOG)&			! Log;
+	Print!switch("ERRORLOG",swERRORLOG)&		! Errorlog;
+	Print!switch("MAIL",swMAIL)&			! Mail;
+	#cr);
+    Sync; OutPtr(Port,"Job "&CmdFile&" "&disposition&"."&#cr);
+    If MakeLog and (not DoDel)				! If a log file;
+	then begin					!  and not deleteing;
+	    Sync;					!  tell user;
+	    OutPtr(Port, "Output recorded in file "&LogFile&"."&#cr);
+	end;
+    Sync; OutPtr(Port, #ctrl("D") );
+end;
+Sync; OutPtr(Port,"LOGOUT"&#cr);
+while not ZAP! 				! wait for zapper;
+    do calli(Sleep!Time,calli!HIBER);	! for however long it takes;
+
+if MakeLog and DoDel			! Under the right conditions;
+    then rename(OChan,null,0,EOF);	!   we will delete the log-file;
+if MakeLog then release(OChan);		! If we had the channel - release it;
+
+print(crlf,"[Job ",CmdFile," ",disposition,"]",crlf,
+    if MakeLog and (not DoDel)
+	then  "[Output recorded in file "&LogFile&"]"	!  tell user;
+	else "");
+EXIT;				! log out if necessary;
+
+end 	"PCOM" $
+H`k
