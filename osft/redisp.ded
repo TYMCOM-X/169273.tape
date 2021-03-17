@@ -1,0 +1,1535 @@
+Entry;
+begin "Redisplay for a Cannonical CRT"
+require "Ded.Def" source!file;
+!! title Redisplay for a Canonical CRT ;
+! *************************************************************************
+*                                                                         *
+*                               Redisp.Sai                                *
+*                                                                         *
+***************************************************************************
+
+        Peak Terminal Abstraction and Redisplay Module.
+
+**************************************************************************;
+
+
+external boolean
+  C!Debug;
+
+external procedure
+  W!BAdd (string S);
+!! title Internal Storage ;
+! The following information "lives" in this module, and is shared
+! between the terminal abstraction and the redisplay.
+;
+
+internal boolean
+  T!IntP;                              ! Flag indicating that the Terminal
+                                        ! has been initialized.
+                                        ;
+
+
+! Name and enumerated type of the terminal. ;
+
+internal string
+  T!Name;
+
+integer
+  T!Enum;
+
+
+! We make certain information about the terminal available to the world. ;
+
+internal integer
+  T!Lines,		! # lines on screen for this terminal ;
+  T!MaxS,		! # lines max to try scrolling  ;
+  T!Width;		! # characters on a line ;
+
+integer
+  T!Row,		! Last row we left the cursor on ;
+  T!Col;		! Last column we left the cursor on ;
+
+
+! For the insert/delete character/line operations, it is assumed that
+! the terminal can do deletes if it can do inserts. ;
+
+internal boolean
+  T!ICP,		! The terminal can do insert char ops ;
+  T!ILP,		! The terminal can do insert line ops ;
+  T!ELP;		! The terminal can erase to end-of-line ;
+
+integer
+  T!CPC,		! The cost of doing cursor positioning ;
+  T!ELC,		! The cost of erasing lines ;
+  T!ICC,		! The cost of inserting characters ;
+  T!ILC;		! The cost of inserting lines ;
+
+
+! Other information hidden in this module ;
+
+ifcr TymcomX thenc
+  own integer
+    T!LCH,			! terminal line characteristics ;
+    T!XON;			! terminal XON setting ;
+endc
+
+ifcr Tops20 thenc
+  own integer
+    SaveRTIW,			! character interrupt word ;
+    SaveRFMOD;			! terminal mode word ;
+endc
+
+
+! Characters are buffered to make i/o a bit more efficient. ;
+
+define
+  TERMBUFFERSIZE = 125;
+
+integer array
+  T!Buffer[0:(TERMBUFFERSIZE / 5) + 1];
+
+integer
+  T!Buf!BP,
+  T!Buf!Cnt;
+!! title Terminal Definitions ;
+! The following set of macros set up the terminal definition tables.
+! Take care not to move semicolons around if changing things.
+!  (Thanks here to Ken Dawson) ;
+
+define
+  !!Cnt   = 0,
+  !!Term  = {preload!with },
+  !!Alias = {preload!with },
+  !!Enum  = {preload!with },
+  !!Lines = {preload!with },
+  !!MaxS  = {preload!with },
+  !!Width = {preload!with },
+  !!CPC   = {preload!with },
+  !!ELP   = {preload!with },
+  !!ELC   = {preload!with },
+  !!ILP   = {preload!with },
+  !!ICP   = {preload!with };
+
+define
+  TTY(Term, Alias, Enum, Lines, MaxS, Width, CPC, ELP, ELC, ILP, ICP) =
+  {
+
+    redefine Term!Idx!}&{Alias = Enum;
+
+    redefine
+      !!Cnt   = !!Cnt + 1,
+      !!Term  = cvms(!!Term)  & {Term, },
+      !!Alias = cvms(!!Alias) & {"} & cvps(Alias) & {", },
+      !!Enum  = cvms(!!Enum ) & {Enum, },
+      !!Lines = cvms(!!Lines) & {Lines, },
+      !!MaxS  = cvms(!!MaxS ) & {MaxS, },
+      !!Width = cvms(!!Width) & {Width, },
+      !!CPC   = cvms(!!CPC  ) & {CPC, },
+      !!ELP   = cvms(!!ELP  ) & {ELP, },
+      !!ELC   = cvms(!!ELC  ) & {ELC, },
+      !!ILP   = cvms(!!ILP  ) & {ILP, },
+      !!ICP   = cvms(!!ICP  ) & {ICP, };
+  };
+
+define
+  TTX(Term, Alias, Enum, Lines, MaxS, Width, CPC, ELP, ELC, ILP, ICP) =
+  {
+
+    redefine Term!Idx!}&{Alias = Enum;
+
+    redefine
+      !!Cnt   = !!Cnt + 1,
+      !!Term  = cvms(!!Term ) & {Term;  string  array T!!Term  [1:!!Cnt];},
+      !!Alias = cvms(!!Alias) & {"} & cvps(Alias) & {";
+                                        string  array T!!Alias [1:!!Cnt];},
+      !!Enum  = cvms(!!Enum ) & {Enum;  integer array T!!Enum  [1:!!Cnt];},
+      !!Lines = cvms(!!Lines) & {Lines; integer array T!!Lines [1:!!Cnt];},
+      !!MaxS  = cvms(!!MaxS ) & {MaxS;  integer array T!!MaxS  [1:!!Cnt];},
+      !!Width = cvms(!!Width) & {Width; integer array T!!Width [1:!!Cnt];},
+      !!CPC   = cvms(!!CPC  ) & {CPC;   integer array T!!CPC   [1:!!Cnt];},
+      !!ELP   = cvms(!!ELP  ) & {ELP;   integer array T!!ELP   [1:!!Cnt];},
+      !!ELC   = cvms(!!ELC  ) & {ELC;   integer array T!!ELC   [1:!!Cnt];},
+      !!ILP   = cvms(!!ILP  ) & {ILP;   integer array T!!ILP   [1:!!Cnt];},
+      !!ICP   = cvms(!!ICP  ) & {ICP;   integer array T!!ICP   [1:!!Cnt];};
+
+    !!Term
+    !!Alias
+    !!Enum
+    !!Lines
+    !!MaxS
+    !!Width
+    !!CPC
+    !!ELP
+    !!ELC
+    !!ILP
+    !!ICP
+  };
+!! title Build Terminal Tables ;
+! Now build the terminal tables.  If you change anything here be careful
+! about not placing semicolons after the macro invocations.  Also, the
+! last macro, and ONLY the last macro, MUST be a TTX().
+!
+!   Terminal Type Specification Acceptable as Input
+!   |          Displayed Terminal Type Alias
+!   |          |        Enumerated Terminal Type Class (may not be used)
+!   |          |        |  Lines Per Screen
+!   |          |        |  |   Maximum Scoll Region
+!   |          |        |  |   |   Screen Width
+!   |          |        |  |   |   |   Cost of Positioning Cursor
+!   |          |        |  |   |   |   |  Can we Erase Lines?
+!   |          |        |  |   |   |   |  |  Cost of Erasing Lines
+!   |          |        |  |   |   |   |  |  |  Can We Insert Lines?
+!   |          |        |  |   |   |   |  |  |  |  Cost of Inserting
+!   |          |        |  |   |   |   |  |  |  |  |  Characters
+!   |          |        |  |   |   |   |  |  |  |  ;
+TTY("H19",     H19,     1, 24, 24, 80, 4, 1, 2, 1, 0)
+TTY("Z19",     H19,     1, 24, 24, 80, 4, 1, 2, 1, 0)
+TTY("VT52",    VT52,    1, 24, 24, 80, 4, 1, 2, 1, 0)
+TTY("*15*",    VT52,    1, 24, 24, 80, 4, 1, 2, 1, 0)
+TTY("*17*",    VT52,    1, 24, 24, 80, 4, 1, 2, 1, 0)
+
+TTY("TYM444",  Tym444,  2, 24, 24, 80, 8, 1, 2, 1, 0)
+TTY("444",     Tym444,  2, 24, 24, 80, 8, 1, 2, 1, 0)
+TTY("HP2621",  Tym444,  2, 24, 24, 80, 8, 1, 2, 1, 0)
+TTY("*5*",     Tym444,  2, 24, 24, 80, 8, 1, 2, 1, 0)
+TTY("*33*",    Tym444,  2, 24, 24, 80, 8, 1, 2, 1, 0)
+
+TTY("TYM425",  Tym425,  3, 24,  5, 80, 4, 1, 2, 1, 1)
+TTY("425",     Tym425,  3, 24,  5, 80, 4, 1, 2, 1, 1)
+TTY("ADM31",   Tym425,  3, 24,  5, 80, 4, 1, 2, 1, 1)
+TTY("ADM31A",  Tym425,  3, 24,  5, 80, 4, 1, 2, 1, 1)
+TTY("*4*",     Tym425,  3, 24,  5, 80, 4, 1, 2, 1, 1)
+
+TTY("TYM420",  Tym420,  3, 24,  5, 80, 4, 1, 2, 0, 0)
+TTY("420",     Tym420,  3, 24,  5, 80, 4, 1, 2, 0, 0)
+TTY("ADM1",    Tym420,  3, 24,  5, 80, 4, 1, 2, 0, 0)
+TTY("ADM1A",   Tym420,  3, 24,  5, 80, 4, 1, 2, 0, 0)
+
+TTY("ADDS",    ADDS,    4, 24, 24, 80, 4, 1, 2, 0, 0)
+
+TTY("VT100",   VT100,   5, 24, 24, 80, 8, 1, 3, 0, 0)
+TTY("*20*",    VT100,   5, 24, 24, 80, 8, 1, 3, 0, 0)
+TTY("VT102",   VT102,   6, 24, 10, 80, 8, 1, 3, 1, 1)
+TTY("*37*",    VT102,   6, 24, 10, 80, 8, 1, 3, 1, 1)
+
+TTY("Tym430",  Tym430,  7, 24,  0, 80, 4, 0, 0, 0, 0)
+TTY("430",     Tym430,  7, 24,  0, 80, 4, 0, 0, 0, 0)
+TTY("ADM3A",   Tym430,  7, 24,  0, 80, 4, 0, 0, 0, 0)
+
+TTY("SCANSET", Scanset, 8, 24,  0, 80, 4, 1, 2, 0, 0)
+
+TTY("940",     Ti940,   9, 24,  5, 80, 4, 1, 2, 1, 0)
+TTX("Ti940",   Ti940,   9, 24,  5, 80, 4, 1, 2, 1, 0)
+!! title Rtn DelStr ;
+! Return some number of DELs.
+;
+
+simple string procedure DelStr (integer Cnt);
+begin "DelStr"
+  own string
+    DelString;
+
+  while (length(DelString) < Cnt) do
+    DelString _ DelString & DEL & DelString;
+
+  return(DelString[1 for Cnt]);
+end "DelStr";
+!! title Rtn TermIdx ;
+! Determine the magic index if the supplied terminal type.  If none
+! matches, return -1.
+;
+
+simple integer procedure TermIdx (string Term);
+begin "TermIdx"
+  integer
+    I;
+
+  for I _ 1 step 1 until !!Cnt do
+    if (kequ(Term, T!!Term[I][1 for 6])) then
+      return(I);
+
+  return(-1);
+end "TermIdx";
+!! title Rtn T!GetTermType ;
+! Get the user's terminal type, and set up some information about the
+! terminal, such as its screen size, capabalities, ... ;
+
+forward internal integer procedure T!GetC;
+
+internal simple procedure T!GetTermType (boolean AskTheMonitor(true));
+begin "T!GetTermType"
+  string
+    Term;
+  integer
+    I;
+
+
+  if (AskTheMonitor) then
+  begin
+    I _ -1;
+
+    ifcr TymcomX thenc
+      Term _ cv6str(auxclv(-1, I, '100));       ! get tty type ;
+
+      if (equ(Term, "______")) then
+        Term _ null;				! not implemented ;
+    endc
+
+    ifcr Tops20 thenc
+      start!code
+        movei     1, -1;
+        gttyp;
+        movem     2, I;
+      end;
+
+      Term _ "*" & cvos(I) & "*";
+    endc
+  end
+  else
+    Term _ null;
+
+  while (true) do
+  begin "ask for terminal type"
+    if (Term = null) then
+    begin
+      print("Terminal Type? ");
+
+      ifcr TymcomX thenc
+        if (T!IntP) then
+        begin
+          integer
+            C;
+
+          while ((C _ T!GetC) neq CR and C neq ESC) do
+          begin
+            appnd(Term, C);
+            auxclv(-1, C, '003);        ! .axo8 (image output)
+                                        ;
+          end;
+        end
+        else
+          Term _ inchwl;
+      endc
+
+      ifcr Tops20 thenc
+	Term _ InTTY;
+      endc
+    end;
+
+    if ((I _ TermIdx(Term)) > 0) then
+    begin
+      T!Enum  _ T!!Enum[I];
+      T!Name  _ T!!Alias[I];
+      T!Lines _ T!!Lines[I];
+      T!MaxS  _ T!!MaxS[I];
+      T!Width _ T!!Width[I];
+      T!CPC   _ T!!CPC[I];
+      T!ELP   _ T!!ELP[I];
+      T!ELC   _ T!!ELC[I];
+      T!ILP   _ T!!ILP[I];
+      T!ICP   _ T!!ICP[I];
+      return;
+    end;
+
+    if (equ(Term, "?") or kequ(Term, "help")) then
+    begin
+      print(crlf & "Supported terminals are:" & crlf);
+
+      for I _ 1 upto !!Cnt do
+	if (not kequ(T!!Alias[I], Term)) then
+	begin
+	  print("  ", T!!Alias[I], crlf);
+	  Term _ T!!Alias[I];
+	end;
+
+      print(crlf);
+    end
+    else
+    begin
+      print(crlf & "Unknown terminal type: ", Term, crlf);
+      print("Type ? for a list of supported types." & crlf&crlf);
+    end;
+
+    Term _ NULL;
+  end "ask for terminal type";
+end "T!GetTermType";
+!! title Rtn T!Init ;
+! Initialize the module.  This involves saving the current state of
+! the monitor with respect to the terminal, turning off the echo ... ;
+
+internal procedure T!Init;
+begin
+  define
+    AskTheMonitor = {true};
+
+  T!GetTermType(AskTheMonitor);
+
+  ifc TymcomX thenc
+    begin!code
+      seto	1, ;
+      ttcall	6, 1;		! getlch 1;
+      movem	1, T!LCH;	! save them ;
+      tlo	1, '220;	! set some magic bits ;
+      ttcall	7, 1;		! setlch 1;
+      hrroi	1, '64;
+      auxcal	1, '714;	! set no-echo, break on all bits ;
+      setzm	T!XON;		! want the xon bit off ;
+      hrroi	1, '55;
+      auxcal	1, T!XON;	! turn it off, save old value ;
+      jfcl;
+    end;
+  endc
+
+  ifcr Tops20 thenc
+    start!code
+      movei	1, -5;
+      rtiw;
+      movem	2, SaveRTIW;
+      tlz	2, '040004;		! turn off ^C, ^O interrupts ;
+      trz	2, '100000;		! turn off ^T interrupt ;
+      hrrzi	1, -5;
+      stiw;
+      hrrzi	1, -1;
+      rfmod;
+      movem	2, SaveRFMOD;
+      hrrzi	1, -1;
+      trz	2, '300;		! 8 bit image i/o ;
+      sfmod;
+    end;
+  endc
+
+  T!Buf!BP  _ point(7, T!Buffer[0], -1);
+  T!Buf!Cnt _ 0;
+
+  set(T!IntP);
+end;
+!! title Rtn T!FlshIBuf ;
+! On Tops-20 (as of V5.0), there is a bug in the transition from image
+! mode I/O to "normal", monitor-supervised I/O.  Basically, if the last
+! character input in image mode was a CR, the monitor feels compelled to
+! insert a LF into the terminal input buffer, regardless of whether the
+! character has already been read.
+!
+! At the monitor level, upon exiting Peak, this is manifested as a repeat
+! of the prompt.  At MAGNUM level, a LF causes the last command issued to
+! be repeated (and naturally, this repeats the edit command).
+!
+! We therefore force another character (a space) into the terminal input
+! buffer, and read it immediately.
+;
+
+ifcr Tops20 thenc
+  internal simple procedure T!FlshIBuf;
+  begin "T!FlshIBuf"
+    start!code
+      hrrzi     1, -1;
+      hrrzi     2, '40;
+      sti;
+      hrrzi     1, -1;
+      bin;
+    end;
+  end "T!FlshIBuf";
+endc
+!! title Rtn T!Fini ;
+! Reset the terminal (or at least the line characteristics) to roughly
+!  how we found it.  Position the cursor to the bottom of screen. ;
+
+forward internal simple procedure T!CPos(integer Row, Col);
+forward internal simple procedure T!Flush;
+
+internal procedure T!Fini;
+begin
+  T!Cpos(T!Lines, 1);
+  T!Flush;
+
+  ifcr TymcomX thenc
+    begin!code
+      hrli	1, '41;		! wait for output to complete ;
+      hrri	1, 5;		! wait 5 seconds before timeout ;
+      calli	1, '72;		! hiber will send yellow ball ;
+       jfcl;			! ignore timeout (so we lose...) ;
+      move	1, T!LCH;	! restore original line characteristics ;
+      ttcall	7, 1;		! setlch 1;
+      hrroi	1, '64;		! turn off bits in file status word ;
+      auxcal	1, 0;		! clear the bits ;
+       jfcl;
+      hrroi	1, '55;
+      auxcal	1, T!XON;	! restore xon setting ;
+       jfcl;
+    end;
+  endc
+
+  ifcr Tops20 thenc
+    start!code
+      movei	1, - 5;
+      move	2, SaveRTIW;
+      stiw;
+      hrrzi	1, -1;
+      move	2, SaveRFMOD;
+      sfmod;
+    end;
+  endc
+end;
+!! title Rtn T!RSet ;
+! Oops, re-init the terminal ;
+
+internal procedure T!RSet;
+begin "reset the terminal"
+  ifcr TymcomX thenc
+    begin!code
+      seto	1, ;
+      ttcall	6, 1;			! getlch 1;
+      tlo	1, '220;		! set some magic bits ;
+      ttcall	7, 1;			! setlch 1;
+      hrroi	1, '64;
+      auxcal	1, '714;		! set no-echo, break on all bits ;
+      setz	2, ;
+      hrroi	1, '55;
+      auxcal	1, 2;
+      jfcl;
+    end;
+  endc
+
+  ifcr Tops20 thenc
+    start!code
+      movei	1, -5;
+      move	2, SaveRTIW;
+      tlz	2, '040004;		! turn off ^C, ^O interrupts ;
+      trz	2, '100000;		! turn off ^T interrupt ;
+      stiw;
+      hrrzi	1, -1;
+      move	2, SaveRFMOD;
+      trz	2, '300;		! 8 bit image i/o ;
+      sfmod;
+    end;
+  endc
+end "reset the terminal";
+!! title Rtn T!ChrP ;
+! Routine to tell if typeahead is present ;
+
+internal boolean procedure T!ChrP;
+begin "T!ChrP"
+  own integer
+    CharThere;
+
+  ifcr TymcomX thenc
+    start!code
+      hrroi	1, '10;		! 1/  -1,,10 ;
+      auxcal	1, ;		! skip if input ;
+       tdca	1, 1;		!  zero t1 and skip ;
+      seto	1, ;		! set 1 to -1 ;
+      movem	1, CharThere;	! store the result ;
+    end;
+  endc
+
+  ifcr Tops20 thenc
+    start!code
+      setzm	CharThere;
+      hrrzi	1, -1;
+      sibe;				! skip if buffer empty ;
+      movem	2, CharThere;		!  not empty, save count ;
+    end;
+  endc
+
+  return(CharThere);
+end "T!ChrP";
+!! title Rtn T!GetC ;
+! Routine to get a 7 bit image character from the terminal. ;
+
+internal integer procedure T!GetC;
+begin "T!GetC"
+  integer
+    C;
+
+  ifcr TymcomX thenc
+    start!code
+      label
+	getc,
+	waitc,
+	gotc;
+
+      getc:
+	hrroi	1, 1;		! -1,,1 (.axi8s) ;
+	auxcal	1, 2;		! input image character and skip ;
+	  jrst	waitc;		! no character, block for one ;
+	jrst	gotc;		! have a character, go home ;
+
+      waitc:
+	hrroi	1, 0;		! -1,,0 (.axi8c) ;
+	auxcal	1, 2;		! block until input ;
+	  jfcl;
+
+      gotc:
+	andi	2, '177;	! and to 7 bits ;
+	movem	2, C;		! Save the character ;
+    end;
+  endc
+
+  ifcr Tops20 thenc
+    start!code
+	hrrzi 1, -1;		! read from the console ;
+	bin;			! get a byte ;
+	andi 2, '177;		! mask to 7 bits ;
+	movem 2, C;		! save ;
+    end;
+  endc
+
+  return(C);
+end "T!GetC";
+!! title Rtn T!Flush ;
+! Routine to flush the terminal buffer ;
+
+internal simple procedure T!Flush;
+begin "T!Flush"
+  idpb(0, T!Buf!BP);
+
+  ifcr TymcomX thenc
+    auxclr(-1, T!Buffer[0], '52);	! pseudo outstr ;
+  endc
+
+  ifcr Tops20 thenc
+    start!code
+      hrroi     2,access(T!Buffer[0]);
+      setz      3,;
+      hrrzi     1,-1;			! write to our console ;
+      sout;				! dump the string ;
+    end;
+  endc
+
+  T!Buf!BP  _ point(7, T!Buffer[0], -1);
+  T!Buf!Cnt _ 0;
+end "T!Flush";
+!! title Rtn T!SBuf ;
+! Send a string of stuff to the terminal, regardless of size.
+;
+
+simple procedure T!SBuf (string Str);
+begin "T!SBuf"
+  if ((length(Str) + T!Buf!Cnt) < TERMBUFFERSIZE) then
+  begin
+    ! The string and the current contents of the buffer both fit in the
+    ! buffer.
+    ;
+
+    while (length(Str)) do
+    begin
+      integer
+        Char;
+
+      idpb(Char _ lop(Str), T!Buf!BP);
+      incr(T!Buf!Cnt);
+    end;
+  end
+  else 
+  begin
+    ! String and buffer won't both fit in the buffer.
+    ;
+
+    define
+      T1 = 1,
+      T2 = 2,
+      T3 = 3,
+      Sp = '16;
+
+      T!Flush;
+
+        ! Output the buffer.
+        ;
+
+    ifcr TymcomX thenc
+      begin
+        own integer array
+          ArgBlk [0:1];                 ! Argument block we give to
+                                        ! auxclr. 
+                                        ;
+        start!code
+          hrrz          T1, -1(Sp);
+          movem         T1, ArgBlk[0];
+          move          T1, (Sp);
+          movem         T1, ArgBlk[1];
+        end;
+
+        auxclr(-1, ArgBlk[0], '67);
+
+          ! Output the string, regardless of length.
+          ;
+      end;
+    endc
+
+    ifcr Tops20 thenc
+      start!code
+        hrrzi   T1, -1;                 ! Our console designator ;
+        move    T2, (Sp);               ! Byte pointer ;
+        hrrz    T3, -1(Sp);             ! -Byte Count ;
+        movns   T3;
+        sout;                           ! Output the string ;
+      end;
+    endc
+  end;
+end "T!SBuf";
+!! title Rtn T!Buf ;
+! Routine to buffer a character for output ;
+
+internal simple procedure T!Buf(integer Char);
+begin "T!Buf"
+  if (T!Buf!Cnt = (TERMBUFFERSIZE - 1)) then
+    T!Flush;
+
+  idpb(Char, T!Buf!BP);
+  incr(!Cnt);
+end "T!Buf";
+!! title Rtn T!OutC ;
+! Routine to output a 7 bit character to the terminal ;
+
+internal simple procedure T!OutC(integer Char);
+begin "T!OutC"
+  if (Char < " ") then
+  begin
+    if (Char = CR) then
+      T!Col _ 1
+    else if (Char = LF) then
+      incr(T!Row)
+    else if (Char = BS) then
+      decr(T!Col);
+  end
+  else
+  begin
+    incr(T!Col);
+
+    if (T!Col > T!Width) then		! we just got lost ;
+      T!Col _ -999;
+  end;
+
+  T!Buf(Char);
+end "T!OutC";
+!! title Rtn T!Bell ;
+! Routine to beep the bell
+;
+
+internal simple procedure T!Bell;
+begin "T!Bell"
+
+  ifcr TymcomX thenc
+    auxclv(-1, '7, '3);
+  endc
+
+  ifcr Tops20 thenc
+    start!code
+      hrrzi 1, -1;		! aim at our console ;
+      hrrzi 2, '7;		! with a bell ;
+      bout;			! launch it ;
+    end;
+  endc
+end "T!Bell";
+!! title Rtn T!ES ;
+! Routine to erase the screen for a T!Enum terminal.
+;
+
+internal simple procedure T!ES;
+begin "T!ES"
+  integer
+    pad;
+
+  T!Row _ 1;		! update state variables ;
+  T!Col _ 1;
+
+  case (T!Enum) of
+  begin
+    [Term!Idx!H19]
+    [Term!Idx!Scanset]
+    [Term!Idx!VT52]
+
+        T!SBuf(ESC & "H" & ESC & "J");
+
+    [Term!Idx!TYM444]
+
+        T!SBuf(ESC & "&a0r0C" & ESC & "J");
+
+    [Term!Idx!Tym425]
+    [Term!Idx!Tym420]
+
+        T!SBuf(('36) & ESC & "Y" & ESC & ":");
+
+    [Term!Idx!Adds]
+
+	T!Buf(FF);
+
+    [Term!Idx!VT100]
+    [Term!Idx!VT102]
+
+        T!SBuf(ESC & "[H" & ESC & "[2J" & DelStr(16));
+
+    [Term!Idx!Tym430]
+
+      T!Buf('32);
+
+    [Term!Idx!Ti940]
+
+      T!SBuf(ESC & "p")
+  end;
+end "T!ES";
+!! title Rtn T!EL ;
+! Routine to erase to end of line. ;
+
+internal simple procedure T!EL;
+begin "T!EL"
+  case (T!Enum) of
+  begin
+    [Term!Idx!H19]
+    [Term!Idx!Tym444]
+    [Term!Idx!Adds]
+
+        T!SBuf(ESC & "K");
+
+    [Term!Idx!Tym425]
+    [Term!Idx!Tym420]
+
+        T!SBuf(ESC & "T");
+
+    [Term!Idx!VT100]
+    [Term!Idx!VT102]
+
+        T!SBuf(ESC & "[K" & DEL);
+
+    [Term!Idx!Scanset]
+
+      T!SBuf(ESC & "K");
+
+    [Term!Idx!Ti940]
+
+        T!SBuf(ESC & "I")
+  end;
+end "T!EL";
+!! title Rtn T!CPos ;
+! Routine to position the cursor. ;
+
+internal simple procedure T!CPos(integer Row, Col);
+begin "T!CPos"
+  own integer
+    Temp1,
+    Temp2;
+
+  case (T!Enum) of
+  begin
+    [Term!Idx!Adds]
+    [Term!Idx!H19]
+    [Term!Idx!Scanset]
+    [Term!Idx!Ti940]
+    [Term!Idx!VT52]
+
+        T!SBuf(ESC & "Y" & (Row + '37) & (Col + '37));
+
+    [Term!Idx!Tym444]
+      begin
+        T!SBuf(ESC & "&a");
+
+	if (true) then
+	begin
+	  Temp1 _ Row - 1;
+	  Temp2 _ Temp1 div 10;
+
+	  if (Temp2 > 0) then
+	    T!Buf(Temp2 + "0");
+
+	  Temp2 _ Temp1 mod 10;
+          T!SBuf((Temp2 + "0") & "y");
+	end;
+
+	if (true) then		! if (Col neq T!Col) then ;
+	begin
+	  Temp1 _ Col - 1;
+	  Temp2 _ Temp1 div 10;
+
+	  if (Temp2 > 0) then
+	    T!Buf(Temp2 + "0");
+
+	  Temp2 _ Temp1 mod 10;
+	  T!Buf(Temp2 + "0");
+	end;
+
+	T!Buf("C");
+      end;
+
+    [Term!Idx!Tym425]
+    [Term!Idx!Tym420]
+    [Term!Idx!Tym430]
+
+        T!SBuf(ESC & "=" & (Row + '37) & (Col + '37));
+
+    [Term!Idx!VT100]		! vt100 ;
+    [Term!Idx!VT102]		! vt102 - rainbow 100, pro 350 ;
+      begin
+        T!SBuf(ESC & "[");
+	Temp1 _ Row;
+	Temp2 _ Temp1 div 10;
+
+	if (Temp2 > 0) then
+	  T!Buf(Temp2 + "0");
+
+	Temp2 _ Temp1 mod 10;
+        T!SBuf((Temp2 + "0") & ";");
+	Temp1 _ Col;
+	Temp2 _ Temp1 div 10;
+
+	if (Temp2 > 0) then
+	  T!Buf(Temp2 + "0");
+
+	Temp2 _ Temp1 mod 10;
+        T!SBuf((Temp2 + "0") & "H");
+      end
+  end;
+
+  T!Row _ Row;
+  T!Col _ Col;
+end "T!CPos";
+!! title Rtn T!IC ;
+! Insert N spaces at the cursor ;
+
+internal simple procedure T!IC(integer N);
+begin "T!IC"
+  case (T!Enum) of
+  begin
+    [Term!Idx!H19]
+      begin
+      end;
+
+    [Term!Idx!Tym444]
+      begin
+        T!SBuf(ESC & "Q");
+
+	while (N) do
+	begin
+	  T!Buf(" ");
+	  decr(N);
+	end;
+
+        T!SBuf(ESC & "R");
+      end;
+
+    [Term!Idx!Tym425]
+    [Term!Idx!Tym420]
+
+      while (N) do
+      begin
+        T!SBuf(ESC & "Q");
+	decr(N);
+      end;
+
+    [Term!Idx!VT102]
+      begin
+        T!SBuf(ESC & "[4h");
+
+	while (N) do
+	begin
+	  T!Buf(" ");
+	  decr(N);
+	end;
+
+        T!SBuf(ESC & "[4l");
+      end
+  end;
+end "T!IC";
+!! title Rtn T!DC ;
+! Delete N characters at the cursor ;
+
+internal simple procedure T!DC(integer N);
+  begin "delete spaces"
+
+    case T!Enum of
+      begin
+
+	[Term!Idx!H19]
+          begin
+          end;
+
+	[Term!Idx!Tym444]
+	    while (N) do
+	      begin
+                T!SBuf(ESC & "P");
+		decr(N);
+	      end;
+
+	[Term!Idx!Tym425]
+	[Term!Idx!Tym420]
+	    while (N) do
+	      begin
+                T!SBuf(ESC & "W");
+		decr(N);
+	      end;
+
+        [Term!Idx!VT102]
+	    begin
+              T!SBuf(ESC & "[");
+
+	      if (N div 10) then
+		T!Buf( (N div 10) + "0");
+
+              T!SBuf(((N mod 10) + "0") & "P");
+	    end
+      end;
+
+  end "delete spaces";
+!! title Rtn T!IL ;
+! Routine to insert a blank line at the cursor. ;
+
+internal simple procedure T!IL;
+begin "T!IL"
+  case (T!Enum) of
+  begin
+    [Term!Idx!Tym444]
+    [Term!Idx!H19]
+
+        T!SBuf(ESC & "L");
+
+    [Term!Idx!Tym425]
+    [Term!Idx!Tym420]
+
+        T!SBuf(ESC & "E");
+
+    [Term!Idx!VT102]
+
+        ! <<  This would benefit by a repeat count.
+        ;
+
+        T!SBuf(ESC & "[L" & DelStr(16)); 
+
+    [Term!Idx!Ti940]
+
+        T!SBuf(ESC & "N")
+  end;
+end "T!IL";
+!! title Rtn T!DL ;
+! Routine to delete the line at the cursor. ;
+
+internal simple procedure T!DL;
+begin "T!DL"
+  case (T!Enum) of
+  begin
+    [Term!Idx!Tym444]
+    [Term!Idx!H19]
+
+        T!SBuf(ESC & "M");
+
+    [Term!Idx!Tym425]
+    [Term!Idx!Tym420]
+
+        T!SBuf(ESC & "R");
+
+    [Term!Idx!VT102]
+
+        T!SBuf(ESC & "[M" & DelStr(16));
+
+    [Term!Idx!Ti940]
+
+        T!SBuf(ESC & "O")
+  end;
+end "T!DL";
+!! title The Redisplay Proper ;
+! ************************  R E D I S P L A Y  *************************
+! *                                                                    *
+! *  Herein is an implementation of the D.W.S. Redisplay algorithm,    *
+! *  which incorporates some of the ideas from the FINE redisplay,     *
+! *  the UNIX EMACS redisplay, and from James Gosling's talk on re-    *
+! *  displays at the 1981 ACM SIGPLAN conference on Text Manipulation, *
+! *  but tries to be less CPU intensive, as people here in the "real   *
+! *  world" get charged for the cycles they use.  So it goes.          *
+! *                                                                    *
+! *  Dave W. Smith,  September '81                                     *
+! *                                                                    *
+! **********************************************************************
+!
+! The Redisplay works roughly as follows:
+!
+! 1.  Slide the old hash vector along the new hash vector to find an
+!     adjustment where the number of matches is a maximum.  (This will
+!     be 0 is nothing has scrolled, -n if text is to be scrolled down,
+!     +n if text is to be scrolled up).
+!
+! 2.  Adjust the physical screen vertically, using insert/delete line
+!     operations if available.
+!
+! 3.  For each line do:
+!
+!     A.  Scan new and old lines to find the character position, if any,
+!         where the lines begin to differ.  If the lines don't differ,
+!         then proceed to the next line.
+!
+!     B.  Slide the remaining section of the old line along the remaining
+!         section of the new line, looking an for an adjustment which
+!         maximizes character matches.
+!
+!     C.  Adjust the line horizontally, using insert/delete character if
+!         available.
+!
+!     D.  Proceeding from the point of initial difference, fix characters
+!         as needed.
+!
+!     Various heuristics are applyed here and there to minimize the number
+!     of characters which must be sent to fix the screen.
+! ;
+!! title Internal Data Structures ;
+! *********************  Internal data structures *********************** ;
+
+! The Redisplay's image of the screen is kept as a packed array of
+! integers (with 5 characters packed into a word), which is accessed by
+! pointing a byte pointer into it. ;
+
+  safe integer array R!Buf[1 : 25, 1 : 27];
+
+! Each line of text on the screen has an associated hash value which is
+! used as an efficient way of telling when lines should be moved up or
+! down on the screen by comparing it against the hash vector for the
+! desired screen image. ;
+
+  safe integer array R!Hash[1 : 25];
+  safe integer array W!Hash[1 : 25];
+
+! We want to keep the hash for a blank line around. ;
+
+  integer BlankHash;
+
+! Weights for hashes ;
+
+  internal integer R!WB, R!WNB,		! weights for blank, non-blank ;
+		   R!WX;		! threshold for scrolling ;
+
+! we also want to keep track of the cursor ;
+
+  internal integer R!Row, R!Col;
+!! title Rtn R!Init ;
+! (Re)Initialize the Redisplay by clearing the physical screen, setting
+! the cursor pointers to home, filling the internal screen with <CR>s,
+! and reinitializing the hash vector. ;
+
+internal procedure R!Init;
+  begin "init"
+    integer I;
+
+    R!WB _ 0;
+    R!WNB _ 1;
+    R!WX _ 1;
+
+    T!ES;				! clear the screen ;
+
+    for R!Row _ 1 upto 25 do
+      for R!Col _ 1 upto 27 do
+        R!Buf[R!Row, R!Col] _ cvasc("     ");
+
+    for R!Row _ 1 upto 25 do R!Hash[R!Row] _ BlankHash;
+
+  end "init";
+!! title Rtn R!SetCursor ;
+! routine to get the cursor to (R!Row, R!Col) by whatever devious and
+!  nefarious means we see fit. ;
+
+simple procedure R!SetCursor(integer array Buffer);
+  begin "move cursor"
+    own integer Dist, BP;
+
+    ! If we're moving up, punt.  Few terminals can handle this. ;
+    ! Also, if we're lost, punt. ;
+
+    if ((R!Row < T!Row) or (T!Col < 0)) then
+      begin
+	T!CPos(R!Row, R!Col);
+	return;
+      end;
+
+    ! if we want the cursor to move down, see if we can't get there
+    ! using line feeds, then let the 'same row' code do the rest ;
+
+    if (R!Row > T!Row) then
+      begin
+	Dist _ (R!Row - T!Row) + abs(R!Col - T!Col);
+	if (Dist > T!CPC) then
+	  begin
+	    T!CPos(R!Row, R!Col);
+	    return;
+	  end;
+	Dist _ R!Row - T!Row;		! get us to the correct row ;
+	while (Dist) do
+	  begin
+	    T!OutC(LF);
+	    Dist _ Dist - 1;
+	  end;
+      end;
+
+    ! Here we handle cursor movement within a row.  Checks are made to
+    ! see if it may be cheaper to use backspaces or character rewrites
+    ! to get us where we want to go. ;
+
+    if (T!Col = R!Col) then		! the trivial case ;
+      return
+    else if (R!Col < T!Col) then	! do the backspace check ;
+      begin
+	Dist _ T!Col - R!Col;
+	if (Dist < T!CPC) then	! cheaper to backspace? ;
+	  while (Dist) do		 ! yes - use backspaces ;
+	    begin
+	      T!OutC(BS);
+	      Dist _ Dist - 1;
+	    end
+	else
+	  T!CPos(R!Row, R!Col);	 ! no - punt ;
+      end
+    else  ! R!Col > T!Col ;
+      begin
+	Dist _ R!Col - T!Col;
+	if (Dist < T!CPC) then	! cheaper to rewrite characters? ;
+	  begin
+	    BP _ point(7, Buffer[R!Row, 1], -1);	 ! yes, do it ;
+	    Dist _ T!Col;
+	    while (Dist) do
+	      begin
+		ibp(BP);
+		Dist _ Dist - 1;
+	      end;
+	    Dist _ R!Col - T!Col;
+	    while (Dist) do
+	      begin
+		T!OutC(ldb(BP));
+		ibp(BP);
+		Dist _ Dist - 1;
+	      end;
+	  end
+	else
+	  T!CPos(R!Row, R!Col);	 ! no - punt ;
+      end;
+
+  end "move cursor";
+!! title Rtn R!Disp ;
+! **********************  The ReDisplay proper  ********************** ;
+
+! It is extremely dangerous to even consider touching this.  Think twice,
+! then decide not to.  If a particular type of terminal is having problems,
+! you are better off looking in the terminal abstraction.
+;
+
+internal simple procedure R!Disp (integer array Buffer; boolean PuntIfKeyHit; integer FinalRow, FinalColumn);
+begin "redisplay"
+  own integer
+    Old!BP,
+    Old!C,
+    New!BP,
+    New!C,
+    Cursor!BP,
+    Line,
+    FirstLineChanged,
+    LineAdjustment,
+    LinesChanged,
+    Sweep,
+    SweepSize,
+    SweepCnt,
+    ScanHi,
+    ScanLow,
+    ThisAdj,
+    ThisAdjCnt,
+    BestAdj,
+    ThisWeight,
+    BestWeight,
+    NewIdx,
+    OldIdx,
+    ChangeP,
+    BufferLength,
+    BufferWidth;
+
+  if (PuntIfKeyHit and T!ChrP) then
+    return;
+
+  BufferLength _ arrinfo(Buffer, 2);
+  BufferWidth  _ arrinfo(Buffer, 4);
+
+  BlankHash _ 0;
+
+  for Line _ 1 upto BufferWidth do
+    BlankHash _ (BlankHash rot 3) xor cvasc("     ");
+
+  for Line _ 1 upto BufferLength do
+  begin "hash"
+    own integer
+      Hash,
+      Chunk;
+
+    Hash _ 0;
+
+    for Chunk _ 1 upto BufferWidth do
+      Hash _ (Hash rot 3) xor Buffer[Line, Chunk];
+
+    W!Hash[Line] _ Hash;
+  end "hash";
+
+  if (T!ILP) then
+  begin "vertical adjustment"
+    label
+      EndOfVerticalAdjustment;
+
+    ! Find first, and number of, lines changed. ;
+
+    FirstLineChanged _ 0;
+    LinesChanged     _ 0;
+
+    for Line _ (T!Lines - 2) downto 1 do
+      if (R!Hash[Line] neq W!Hash[Line]) then
+      begin
+	FirstLineChanged _ Line;
+	incr(LinesChanged);
+      end;
+
+    if (LinesChanged and
+	(Buffer[FirstLineChanged,1] = R!Buf[FirstLineChanged,1])) then
+    begin
+      incr(FirstLineChanged);
+      decr(LinesChanged);
+    end;
+
+    if (LinesChanged <= 2) then
+      goto EndOfVerticalAdjustment;
+
+    ! Find the best adjustment factor by comparing the hash vectors ;
+
+    SweepSize  _ (T!Lines - 1) - FirstLineChanged;
+    BestAdj    _ 0;
+    BestWeight _ 0;
+    ScanHi     _ (SweepSize - 1);
+    ScanLow    _ - ScanHi;
+
+    for ThisAdj _ ScanHi downto ScanLow do
+    begin "comb"
+      NewIdx _ FirstLineChanged;
+
+      if (ThisAdj > 0) then
+	incr(NewIdx, ThisAdj);
+
+      OldIdx _ FirstLineChanged;
+
+      if (ThisAdj < 0) then
+	decr(OldIdx, ThisAdj);
+
+      SweepCnt   _ SweepSize - abs(ThisAdj);
+      ThisWeight _ 0;
+
+      for Sweep _ 1 upto SweepCnt do
+      begin "sweep"
+	if (R!Hash[OldIdx] = W!Hash[NewIdx]) then
+	  if (R!Hash[OldIdx] = BlankHash) then
+	    incr(ThisWeight, R!WB)
+	  else
+	    incr(ThisWeight, R!WNB);
+
+	incr(OldIdx);
+	incr(NewIdx);
+      end "sweep";
+
+      if (ThisWeight > BestWeight) then
+      begin
+	BestWeight _ ThisWeight;
+	BestAdj    _ ThisAdj;
+      end;
+    end "comb";
+
+    ! Is the best weight good enough? ;
+
+    if (BestWeight < R!WX) then
+      goto EndOfVerticalAdjustment;
+
+    ! Don't exceed T!MaxS ;
+
+    if (abs(BestAdj) > T!MaxS) then
+      goto EndOfVerticalAdjustment;
+
+    ! Adjust the screen with insert/delete line ops ;
+
+    if (BestAdj < 0) then
+    begin
+      T!CPos(FirstLineChanged, 1);
+
+      for Line _ -1 downto BestAdj do
+	T!DL;
+
+      T!CPos(T!Lines - 1 + BestAdj, 1);
+
+      for Line _ -1 downto BestAdj do
+	T!IL;
+
+      for R!Row _ FirstLineChanged upto (T!Lines - 2) do
+      begin
+	Line _ R!Row - BestAdj;
+
+	if (Line < (T!Lines - 1)) then
+	begin
+	  for R!Col _ 1 upto BufferWidth do
+	    R!Buf[R!Row, R!Col] _ R!Buf[Line, R!Col];
+
+	  R!Hash[R!Row] _ R!Hash[Line];
+	end
+	else
+	begin
+	  for R!Col _ 1 upto BufferWidth do
+	    R!Buf[R!Row, R!Col] _ cvasc("     ");
+
+	  R!Hash[R!Row] _ BlankHash;
+	end;
+      end;
+    end
+    else if (BestAdj > 0) then
+    begin
+      T!CPos(T!Lines - 1 - BestAdj , 1);
+
+      for Line _ 1 upto BestAdj do
+	T!DL;
+
+      T!CPos(FirstLineChanged, 1);
+
+      for Line _ 1 upto BestAdj do
+	T!IL;
+
+      for R!Row _ (T!Lines - 2) downto FirstLineChanged do
+      begin
+	Line _ R!Row - BestAdj;
+
+	if (Line < FirstLineChanged) then
+	begin
+	  for R!Col _ 1 upto BufferWidth do
+	    R!Buf[R!Row, R!Col] _ cvasc("     ");
+
+	  R!Hash[R!Row] _ BlankHash;
+	end
+	else
+	begin
+	  for R!Col _ 1 upto BufferWidth do
+	    R!Buf[R!Row, R!Col] _ R!Buf[Line, R!Col];
+
+	  R!Hash[R!Row] _ R!Hash[Line];
+	end;
+      end;
+    end;
+
+    T!Flush;
+
+    EndOfVerticalAdjustment:
+  end "vertical adjustment";
+
+
+  ! Now do fixups on a line by line basis ;
+
+  for R!Row _ 1 upto (T!Lines min (BufferLength * 5)) do
+  begin "each row"
+    own integer
+      NewLength,
+      OldLength,
+      I,
+      Temp!New!BP,
+      Temp!Old!BP;
+    label
+      EndOfLine;
+
+    if (PuntIfKeyHit and T!ChrP) then
+    begin
+      T!Flush;
+      return;
+    end;
+
+    OldIDX _ location(R!Buf[R!Row, 1]);
+    NewIDX _ location(Buffer[R!Row, 1]);
+
+    start!code
+      label
+	loop;
+
+      setzm	ChangeP;	! no changes seen yet ;
+      move	1, BufferWidth;
+      move	2, OldIDX;	! point to old words ;
+      move	3, NewIDX;	! point to new words ;
+
+      loop:
+      move	4, (2);		! pick up old value ;
+      came	4, (3);		! compare with new value ;
+       setom	ChangeP;	! a change! ;
+      addi	2, 1;
+      addi	3, 1;
+      sojg	1, loop;
+    end;
+
+    if (not ChangeP) then
+      goto EndOfLine;
+
+    New!BP _ point(7, Buffer[R!Row, 1], 6);
+    Old!BP _ point(7, R!Buf[R!Row, 1], 6);
+
+    Temp!New!BP _ New!BP;
+    Temp!Old!BP _ Old!BP;
+    NewLength   _ OldLength _ 0;
+
+    for I _ 1 upto (T!Width min (BufferWidth * 5)) do
+    begin
+      if (ldb(Temp!New!BP) neq " ") then NewLength _ I;
+      if (ldb(Temp!Old!BP) neq " ") then OldLength _ I;
+      ibp(Temp!New!BP);
+      ibp(Temp!Old!BP);
+    end;
+
+
+    ! look for the first difference between the two lines ;
+    ! compute the adjustment factor ;
+    ! adjust the line with insert/delete character ;
+
+    ! now fix the rest of the line ;
+
+    Cursor!BP _ 0;
+    R!Col     _ 1;
+
+    while (R!Col <= (T!Width min (BufferWidth * 5))) do
+    begin "fix a line"
+      Old!C _ ldb(Old!BP);
+      New!C _ ldb(New!BP);
+
+      if ((R!Col > NewLength) and (Old!C neq " " ) and T!ELP) then
+      begin
+	if (R!Col <= OldLength) then
+	begin
+	  R!SetCursor(Buffer);
+	  T!El;
+	end;
+
+	done "fix a line";
+      end
+      else if (New!C neq Old!C) then
+      begin
+	R!SetCursor(Buffer);
+	T!OutC(New!C);
+	Cursor!BP _ New!BP;
+	ibp(Cursor!BP);
+      end;
+
+      ibp(Old!BP);
+      ibp(New!BP);
+      incr(R!Col);
+    end "fix a line" ;
+
+    ! here do do end of line bookkeeping ;
+
+    EndOfLine:
+
+    for R!Col _ 1 upto BufferWidth do
+      R!Buf[R!Row, R!Col] _ Buffer[R!Row, R!Col];
+
+    R!Hash[R!Row] _ W!Hash[R!Row];
+  end "each row" ;
+
+
+  ! Now put the cursor to rest ;
+
+  if (FinalRow and FinalColumn) then
+  begin
+    R!Row _ FinalRow;
+    R!Col _ FinalColumn;
+    R!SetCursor(Buffer);
+  end;
+
+  T!Flush;
+end "redisplay";
+end "Redisplay for a Cannonical CRT";
+
+
+! **************************  End Redisp.Sai  ****************************;
+  xSAE¢
