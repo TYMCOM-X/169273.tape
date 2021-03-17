@@ -1,0 +1,582 @@
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+
+------------------------------------------------------------------------
+
+COMPONENTS:
+                  Finish Packet
+                  Assign Header
+                  Put Packet With Header
+                  Calculate Chksum
+                  Send Packet
+                  Put Packet into Outgoing Window
+                  Get ACK
+                  Put Micro Abort Message
+                  Send RFR
+                  Get Incoming Packet
+                  Activate Timer
+                  Check For Timeout
+                  Timer Interrupt Routine
+                  Get Good Chksummed Packet
+                  Validate Chksum
+                  Send ACK/NAK
+                  Determine Packet Type
+                  Put Packet in Incoming Window
+                  Respond To Flow Control Packet
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   This layer puts the PTC (Packet Type Character) and the PID (Packet
+IDentifyer) on the packet (packet header), calculates and puts the
+checksum on the end of the packet, and figures out whether or not the
+packet can be sent to the micro.
+
+   When packets are received, this layer checks the checksum, ACKs good
+packets, and moves them into the incoming window for further processing
+by the Valid Packet layer.
+
+   This layer also starts and stops the timer to prevent the program from
+hanging when an ACK gets lost or garbled.
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Get Incoming Packet
+PROCEDURE ID:     BI.get.incoming.packet
+PROCEDURE TYPE:   untyped
+
+------------------------------------------------------------------------
+
+INPUT:            PTC.type
+
+GLOBALS:          have.in.sequence.packet
+                  incoming.packet
+                  incoming.packet.size
+                  timeout.type
+                  number.of.seconds
+
+OUTPUT:           PTC.char
+                  abort.type
+
+------------------------------------------------------------------------
+
+CALLED BY:        Get Incoming Application Record     ! Valid Packet Layer
+
+CALLS:            Activate Timer
+                  Get Good Chksummed Packet
+                  Determine PTC
+                  Put Packet into Incoming Window
+                  Respond to Flow Control Packet
+                  Abort Transfer                    ! Sustem Utility
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   This procedure delivers an in-sequence, good-checksummed packet to
+the Valid Packet layer.
+
+------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------
+
+PROCEDURE NAME:   Get Incoming Packet
+PROCEDURE ID:     BI.get.incoming.packet
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+while there is no in-sequence packet in the incoming window do
+! have.in.sequence.packet is false
+   if timeout.type = shut.off then  ! otherwise timer is already running
+      set timeout.type to waiting.for.data/cmd
+      execute BI.activate.timer using number.of.seconds
+   execute BI.get.good.chksummed.packet  ! returning incoming.packet,
+                                                     incoming.packet.size
+   set PTC.char to first.byte of incoming.packet
+   execute BI.determine.PTC using PTC.char
+                            returning PTC.type
+   if PTC.type is flow control then  ! ACK, NAK, RFR
+      execute BI.respond.to.flow.control.packet ! using incoming.packet
+   else
+      if PTC.type is d/c then
+         execute BI.put.packet.in.incoming.window ! using incoming.packet,
+                                                    incoming.packet.size
+         ! have.in.sequence.packet is set to true
+      else     ! bad PTC
+         execute SU.abort.transfer using PTC.error
+
+set have.in.sequence.packet to false
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Activate Timer
+PROCEDURE ID:     BI.activate.timer
+PROCEDURE TYPE:   untyped
+
+------------------------------------------------------------------------
+
+INPUT:            PARAMETERS: number.of.seconds (value)
+
+GLOBALS:          timeout
+
+OUTPUT:
+
+------------------------------------------------------------------------
+
+CALLED BY:        Validate Chksum
+                  Get Incoming Packet
+                  Get Good Chksummed Packet
+                  Send Packet
+                  Check For Timeout
+
+CALLS:            monitor UUO CALLI
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   This procedure uses a monitor UUO to start the timer using
+number.of.seconds as the argument.  If number.of.seconds is zero, the
+timer is shut.
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+define timer.interrupt.channel as 10
+set timeout to false
+calli (number.of.seconds * 1000, -'37)
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Check For Timeout
+PROCEDURE ID:     BI.check.for.timeout
+PROCEDURE TYPE:   untyped
+
+------------------------------------------------------------------------
+
+INPUT:
+
+GLOBALS: incoming.timeout.counter
+         max.incoming.timeouts
+         outgoing.timeout.counter
+         max.outgoing.timeouts
+         current.incoming.PID
+         timeout.type
+         timeout
+         number.of.seconds
+
+OUTPUT:           abort.type
+
+------------------------------------------------------------------------
+
+CALLED BY:        Get Decoded Packet   ! Transport Layer
+
+CALLS:            Activate Timer
+                  Send ACK/NAK
+                  Send RFR
+                  Abort Transfer       ! System Utility
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   If the timer has fired, recover from what was probably lost and
+restart the timer.  The timeout counters are reset whenever a packet is
+received.  Max.timeouts are exceeded only if there's no activity for
+2 minutes.  This release does not abort if there are lots of retries
+on a noisy line.
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+if timeout then
+   case timeout.type of
+      waiting.for.data/cmd  :
+         execute BI.send.ACK using current.incoming.PID
+         increment incoming.timeout.counter
+         if incoming.timeout.counter > max.incoming.timeouts then
+            execute SU.abort.transfer using max.incoming.timeouts.error
+      waiting.for.ACK   :
+         execute BI.send.RFR
+         increment outgoing.timeout.counter
+         if outgoing.timeout.counter > max.outgoing.timeouts then
+            execute SU.abort.transfer using max.outgoing.timeouts.error
+
+execute BI.activate.timer using number.of.seconds
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Timer Interrupt Routine
+PROCEDURE ID:     BI.timer.interrupt
+PROCEDURE TYPE:   untyped
+
+------------------------------------------------------------------------
+
+INPUT:
+
+GLOBALS: timeout
+
+OUTPUT:
+
+------------------------------------------------------------------------
+
+CALLED BY:        system monitor when number.of.seconds is reached
+
+CALLS:
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   This is the routine the monitor invokes when the number.of.seconds
+passes without the timer being shut or restarted.  It sets the global
+boolean timeout to true.
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+set timeout to true
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Get Good Chksummed Packet
+PROCEDURE ID:     BI.get.good.chksummed.pkt
+PROCEDURE TYPE:   untyped
+
+------------------------------------------------------------------------
+
+INPUT:
+
+GLOBALS: current.incoming.PID
+         number.of.seconds
+         incoming.packet
+         incoming.packet.size
+         direction.of.transfer
+
+OUTPUT:
+
+------------------------------------------------------------------------
+
+CALLED BY:        Get Incoming Packet
+
+CALLS:            Get Decoded Packet   ! Transport Layer
+                  Validate Chksum
+                  Send ACK/NAK
+                  Activate Timer
+                  Send RFR
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   This procedure loops until a packet that passes the checksum test
+is received.  If an invalid checksum is received, error recovery is
+instituted:  for TOHOST transfers, the ACK or NAK is resent, for
+TOPC transfers, an RFR is sent.
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+do until good.chksum
+   execute TR.get.decoded.packet ! returning incoming.packet,
+                                             incoming.packet.size
+   ! reset timer and counters whenever a packet comes in
+   set incoming.timeout.counter, outgoing.timeout.counter to zero
+   set timeout.type to shut.off
+   execute BI.activate.timer using 0
+
+   execute BI.validate.chksum ! using incoming.packet, incoming.packet.size
+                              returning boolean value
+   if false is returned then
+      case direction.of.transfer of
+         TOHOST   :
+            execute BI.send.ACK using current.incoming.PID
+         TOPC  :
+            execute BI.send.RFR
+      execute BI.activate.timer using number.of.seconds
+   else  ! good chksum
+      decrement incoming.packet.size by 2    ! removes chksum bytes
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Validate Chksum
+PROCEDURE ID:     BI.validate chksum
+PROCEDURE TYPE:   boolean
+
+------------------------------------------------------------------------
+
+INPUT:            checksum
+
+GLOBALS: timeout
+         incoming.packet
+         incoming.packet.size
+         timeout.type
+
+OUTPUT:           boolean value
+                  decoded.packet
+                  packet.size.in.bytes
+
+------------------------------------------------------------------------
+
+CALLED BY:        Get Good Chksummed Packet
+
+CALLS:            Calculate Chksum
+                  Activate Timer
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   Recalculate checksum on decoded.packet to determine whether the
+current checksum equals the one on the packet.  If the checksums
+match, set the procedure value to true and shut off the timer.
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+set decoded.packet to incoming.packet
+set packet.size.in.bytes to incoming.packet.size
+remove last two bytes from decoded.packet into old.checksum
+execute BI.calculate.checksum using decoded.packet, packet.size.in.bytes
+                              returning new.checksum
+if new.checksum equals old.checksum then
+   set BI.validate.chksum to true
+else
+   set BI.validate.chksum to false
+   discard decoded.packet
+
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Send ACK
+PROCEDURE ID:     BI.send.ACK
+PROCEDURE TYPE:   untyped
+
+------------------------------------------------------------------------
+
+INPUT:            checksum
+
+GLOBALS: last.PID.ACKed
+         top.of.PID.range
+         bottom.of.PID.range
+         current.incoming.PID
+
+OUTPUT:           ACK.packet  (flow.control.packet)
+                  cksummed.ACK.packet
+                  packet.size.in.bytes
+
+------------------------------------------------------------------------
+
+CALLED BY:        Get Good Chksummed Packet
+                  Put Packet in Incoming Window
+                  Put Flow Control Packet
+
+CALLS:            Calculate Checksum
+                  Encode and Send      ! Transport Layer
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   Create and send an ACK on the packet just received.  NAKs are not
+sent since there's no guarantee the last ACK was received and using
+a window size of one means the next PID isn't in the micro's outgoing
+window yet.
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+PROCEDURE NAME:   Send ACK/NAK
+PROCEDURE ID:     BI.send.ACK
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+   create ACK.packet : ACK PTC + current.incoming.PID +
+               if current.incoming.PID + 1 <= top.of.PID.range then
+                  current.incoming.PID + 1
+               else
+                  bottom.of.PID.range
+               set packet.size.in.bytes to 3
+               set last.PID.ACKed to current.incoming.PID
+
+execute BI.calculate.chksum using flow.control.packet, packet.size.in.bytes
+                            returning checksum
+
+append checksum onto flow.control.packet forming flow.control.chksummed.packet
+increment packet.size.in.bytes by 2
+execute TR.encode.and.send using flow.control.chksummed.packet,
+                                 packet.size.in.bytes
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Determine Packet Type
+PROCEDURE ID:     BI.determine.PTC
+PROCEDURE TYPE:   untyped
+
+------------------------------------------------------------------------
+
+INPUT:            PARAMETERS:  PTC.char   (value)
+
+OUTPUT:           PARAMETERS:  packet.type   (reference)
+
+------------------------------------------------------------------------
+
+CALLED BY:        Get Incoming Packet
+
+CALLS:
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   Determines the type of the packet from the PTC character.
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+case PTC.char of
+   "x"   :  set PTC.type to ACK.type
+   "y"   :  set PTC.type to NAK.type
+   "z"   :  set PTC.type to RFR.type
+   "w"   :  set PTC.type to d/c.type
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Put Packet in Incoming Window
+PROCEDURE ID:     BI.put.packet.in.incoming.window
+PROCEDURE TYPE:   untyped
+
+------------------------------------------------------------------------
+
+INPUT:
+
+GLOBALS:          have.in.sequence.packet
+                  incoming.packet
+                  incoming.packet.size
+                  current.incoming.PID
+
+OUTPUT:
+
+------------------------------------------------------------------------
+
+CALLED BY:        Get Incoming Packet
+
+CALLS:            Send ACK/NAK
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   Since this release of the program only supports window size of one
+it is certain that packets will be received in sequence.  If multiple
+outstanding packet mode is implemented in the future, this procedure must
+determine whether the packet just received is in sequence.  This procedure
+does determine whether the packet just received is a duplicate.
+
+   Strip off the PID byte, place packet into incoming window, update
+the current.incoming.PID, and send an ACK.
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+remove PID.byte from incoming.packet
+decrement incoming.packet.size
+if ((current.incoming.PID = top.of.PID.range) AND
+   (PID.byte = bottom.of.PID.range)) OR
+   (PID.byte = current.incoming.PID + 1) then
+   set current.incoming.PID to PID.byte
+   execute BI.send.ACK ! using current.incoming.PID
+   set have.in.sequence.packet flag to true
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+LAYER:            BINARY
+PROCEDURE NAME:   Respond To Flow Control Packet
+PROCEDURE ID:     BI.respond.to.flow.control.packet
+PROCEDURE TYPE:   untyped
+
+------------------------------------------------------------------------
+
+INPUT:
+
+GLOBALS: current.incoming.PID
+         greatest.outgoing.PID
+         current.outgoing.packet
+         outgoing.packet.size
+         incoming.packet
+
+OUTPUT:
+
+------------------------------------------------------------------------
+
+CALLED BY:        Get Incoming Packet
+
+CALLS:            Send ACK/NAK
+                  Encode and Send   ! Transport Layer
+
+------------------------------------------------------------------------
+
+DESCRIPTION:
+
+   An ACK from the micro on the initial command packet sent will be
+handled by this procedure.  The command packet is cleared from the
+outgoing window.  If a NAK is received, the packet is resent.  If an
+RFR is received, another ACK or NAK is sent.
+
+------------------------------------------------------------------------
+
+PSEUDOCODE:
+
+case PTC.type of
+   ACK.type :  set greatest.outgoing.PID to second PIDncoming.packet
+                  (third byte of incoming.packet)
+   NAK.type :  execute TR.encode.and.send using current.outgoing packet,
+                                                outgoing.packet.size
+   RFR.type :  execute BI.send.ACK using current.incoming.PID
+
+------------------------------------------------------------------------
+
+  i@O|
