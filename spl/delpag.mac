@@ -1,0 +1,367 @@
+TITLE	DELPAG - Program to free all the good pages of a bad file.
+SUBTTL	By Joe Smith, 18-Nov-86
+
+COMMENT ~	(MPL)DELPAG
+
+  This program deletes pages from a file, one at a time, leaving only bad
+pages.  It does so by reading the file one page at a time using SIMIO to find
+the ones with hard read errors or hard write errors.  To be considered a good
+page, it must pass 5 tests:
+
+        1) Reading existing data
+        2) Writing first test pattern
+        3) Reading and compare with first test pattern
+        4) Writing second test pattern
+        5) Reading and compare with second test pattern
+
+If the page is good, it is deleted from the file and made available to the
+system.  Bad pages are kept locked in the file.  At the end of the file, if any
+bad pages were found, then the file is marked with RP.NFS so TITO won't try to
+access it.  If all the pages passed all five tests, the entire files is deleted.
+
+This program can also be used to perform a "data-security erase" on files with
+with confidential data.  Verification of deletion is required for files with
+no error bits set.  If the user responds "Yes", all data pages will be
+overwritten with test patterns before the page is deleted and made available
+to the system.
+
+~  ;End of COMMENT
+
+	SEARCH UUOTYM		;TYMCOM-X definitions
+
+;Accumulator names
+	F=0
+	T4=1+<T3=1+<T2=1+<T1=1>>>
+	P=17
+
+;I/O channels
+	FIL==7
+
+	OPDEF	PJRST	[JUMPA 17,]
+SUBTTL	Main program loop
+
+START:	RESET
+	MOVEI	F,0		;Clear flag bits
+	MOVE	P,[IOWD PDLEN,PDL]
+	PUSHJ	P,SCAN		;Get name of file to process
+	SKIPN	FILBLK+.RBNAM	;Stop if no file specified
+	 JRST	QUIT1
+	PUSHJ	P,FIND		;Lookup file
+	  JRST	START		;Try again
+	PUSHJ	P,VERIFY	;Output file status, get confirmation
+	  JRST	QUIT1		;User decided not to destroy file
+	PUSHJ	P,UPDATE	;Set update mode
+	  JRST	QUIT1		;Insufficient license
+	SETZM	FREED		;No pages freed yet
+	SETZM	BADPAG		;No bad pages found yet
+	SETZM	CURPAG		;Start with page 1 of file
+
+LOOP:	AOS	T1,CURPAG	;Next page number
+	CAMLE	T1,MAXPAG	;Done them all?
+	 JRST	DONE		;Yes
+	LSH	T1,2		;4 blocks per page
+	SUBI	T1,3		;Block 1 is first block of file
+	MOVEM	T1,CURBLK
+	PUSHJ	P,READ1		;Do first read
+	  JRST	LOOP
+	PUSHJ	P,WRITE1	;Do write and compare
+	  JRST	LOOP
+	PUSHJ	P,WRITE2	;Do 2nd write and compare
+	  JRST	LOOP
+	PUSHJ	P,FREPAG	;Release page to the system
+	JRST	LOOP
+
+DONE:	MOVEI	T1,RP.NFS	;No "failsafe" bit
+	HLRZ	T2,FILBLK+.RBEXT
+;*;	CAIN	T2,'BAD'	;Extension '.BAD' ?
+;*;	 IORI	T1,RP.NDL	;Yes, set "no delete" bit
+	SKIPE	BADPAG		;If any bad pages were found
+	 IORM	T1,FILBLK+.RBSTS; make sure TITO does not touch it
+	SKIPN	BADPAG		;If no bad pages,
+	 SETZM	FILBLK+.RBNAM	; delete it
+	RENAME	FIL,FILBLK	;Set bits or delete file and close channel
+	  OUTSTR [ASCIZ /[RENAME failed, try again after setting license.]
+/]
+	OUTSTR	[ASCIZ	/Total of /]
+	MOVE	T1,FREED
+	PUSHJ	P,OUTDEC
+	OUTSTR	[ASCIZ	/ pages freed
+File /]
+	SKIPN	FILBLK+.RBNAM
+	 JRST	[OUTSTR	[ASCIZ	/deleted
+/]
+		JRST	QUIT1]
+	PUSHJ	P,FILNM
+	OUTSTR	[ASCIZ	/ now marked as:/]
+	PUSHJ	P,FILSTS
+	JRST	QUIT1
+
+QUIT:	PUSHJ	P,FILNAM	;Output file name and CRLF
+QUIT1:	RESET			;RELEAS	FIL,
+	EXIT	1,
+	JRST	START		;Can continue
+SUBTTL	Test for successful read and write operations
+
+;Check if page can be read
+
+READ1:	USETI	FIL,@CURBLK	;Set to read current page
+	IN	FIL,RDCMD	;Read it (may take a while if retries needed)
+	  JRST	CPOPJ1		;Read OK, try writing
+	GETSTS	FIL,T1		;Error, get status bits
+	TRNE	T1,IO.DER!IO.DTE;Device error or data error?
+	 JRST	MARKRD		;Found a bad page, mark it
+	TRNE	T1,IO.EOF	;Hit end of file?
+	 JRST	CPOPJ1		;Yes, last page had less than 512 words
+BADIO:	JSP	T1,MARKIT
+	 ASCIZ	/Unexpected I-O error on page /
+
+;Check if page can be written, write 2 test patterns
+
+WRITE1:	SKIPA	T1,[252525252525]
+WRITE2:	 MOVE	T1,[525252525252]
+	MOVEM	T1,WTBUF	;Store test pattern
+	MOVE	T1,[WTBUF,,WTBUF+1]
+	BLT	T1,WTBUF+777	;Repeat thru 4-block buffer
+	USETO	FIL,@CURBLK	;Write back to same page
+	OUT	FIL,WTCMD
+	  JRST	READ2		;Ok
+MARKWT:	JSP	T1,MARKIT
+	 ASCIZ /Cannot write to page /
+
+;Check if test pattern can be read
+
+READ2:	USETI	FIL,@CURBLK	;Back up to page just written
+	IN	FIL,RDCMD
+	  JRST	COMPAR
+	JRST	MARKRD		;Read error
+
+;Compare read in data with test pattern
+
+COMPAR:	MOVSI	T4,-1000	;All 512 words on the page
+COMP1:	MOVE	T3,RDBUF(T4)
+	CAMN	T3,WTBUF(T4)	;Check for match
+	 AOBJN	T4,COMP1	;OK
+	JUMPL	T4,MARKCM	;Compare error if AOBJN did not run out
+CPOPJ1:	AOS	(P)		;This compare succeded
+CPOPJ:	POPJ	P,		;Do 2nd write test
+
+;Page failed test, leave it assigned to the file
+
+MARKRD:	SETSTS	FIL,.IODMP	;Clear status so can read rest of file
+	JSP	T1,MARKIT
+	 ASCIZ /Cannot read from page /
+
+MARKCM:	JSP	T1,MARKIT
+	 ASCIZ /Compare test failed on page /
+
+MARKIT:	OUTSTR	(T1)
+	MOVE	T1,CURPAG
+	MOVEM	T1,BADPAG
+	PUSHJ	P,OUTDEC	;Type decimal number
+	OUTSTR	[ASCIZ /, this page is not being released.
+/]
+	POPJ	P,		;Keep this page, try next one
+
+;This page is good, free it up
+
+FREPAG:	MOVE	T1,[.CHDFP,,FIL]
+	CHANIO	T1,CURPAG	;Delete good page from the file
+	  JRST	NODEL		;Not expected to fail
+	AOS	T1,FREED	;Count another page freed up
+	TRNE	T1,177		;Multiple of 128?
+	 POPJ	P,		;Do next page
+	OUTSTR	[ASCIZ	/Processed up thru page /]
+	PUSHJ	P,OUTDEC
+	OUTSTR	CRLF
+	POPJ	P,		;Do next page
+
+NODEL:	JSP	T1,MARKIT
+	 ASCIZ	/Could not delete page /
+
+SUBTTL	Utility routines
+
+;Sixbit output routine
+
+OUTSIX:	SETZ	T2,
+	ROTC	T1,6
+	OUTCHI	" "(T2)
+	JUMPN	T1,OUTSIX
+	POPJ	P,
+
+;Decimal output routine
+
+OUTDEC:	IDIVI	T1,^D10
+	HRLM	T2,(P)
+	SKIPE	T1
+	 PUSHJ	P,OUTDEC
+	HLRZ	T1,(P)
+	OUTCHI	"0"(T1)
+	POPJ	P,
+CRLF:	ASCIZ	/
+/
+SUBTTL	File name routines
+
+;File scanning routine
+
+SCAN:	SETZM	FILBLK+.RBPPN	;Current directory only
+	OUTSTR	[ASCIZ	/Name of file to delete: /]
+	PUSHJ	P,GETSIX	;File name
+	MOVEM	T1,FILBLK+.RBNAM
+	MOVEI	T1,0		;No default extension
+	CAIN	T3,"."
+	 PUSHJ	P,GETSIX	;Extension
+	MOVEM	T1,FILBLK+.RBEXT
+EOL:	CAIN	T3,12		;End of line?
+	 POPJ	P,
+	INCHWL	T3		;Eat garbage
+	JRST	EOL
+
+;Input SIXBIT token
+
+GETSIX:	SETZ	T1,		;Accumulate name in T1
+	MOVE	T2,[POINT 6,T1]
+GET6:	INCHWL	T3		;Get next char
+	CAIN	T3,15		;If CR,
+	 JRST	GET6		; get LF
+	CAIL	T3,140		;If lowercase
+	 SUBI	T3,40		; make upper
+	CAIL	T3,"0"
+	CAILE	T3,"Z"
+	 POPJ	P,		;Not alphameric
+	CAILE	T3,"9"
+	CAIL	T3,"A"
+	 SKIPA			;OK
+	  POPJ	P,
+	SUBI	T3,40		;Convert to SIXBIT
+	TLNE	T2,770000	;Run out of byte pointer?
+	 IDPB	T3,T2		;No, store char
+	JRST	GET6
+
+;Output file name
+
+FILNAM:	PUSHJ	P,FILNM
+	OUTSTR	CRLF
+	POPJ	P,
+
+FILNM:	SKIPN	T1,FILBLK+.RBNAM
+	 OUTSTR	[ASCIZ	/(deleted)/]
+	JUMPE	T1,CPOPJ	;No name if deleted
+	PUSHJ	P,OUTSIX	;Name of file
+	OUTCHI	"."
+	HLLZ	T1,FILBLK+.RBEXT
+	PUSHJ	P,OUTSIX	;Extension
+	POPJ	P,
+;Lookup file, determine its size
+
+FIND:	OPEN	FIL,OPNBLK	;DSK in dump mode
+	  POPJ  P,
+	LOOKUP	FIL,FILBLK	;Find the file
+	  JRST	[OUTSTR [ASCIZ /?Cannot find file /]
+		PJRST	FILNAM]
+	MOVE	T1,FILBLK+.RBSIZ
+	MOVEM	T1,FILSIZ	;Size in words
+	ADDI	T1,777
+	LSH	T1,-^D9
+	MOVEM	T1,MAXPAG	;Size in pages
+	JRST	CPOPJ1
+
+;Put file in single-access update mode to do random I/O
+
+UPDATE:	HLLZS	FILBLK+.RBEXT	;Clear out date bits to cause
+	SETZM	FILBLK+.RBPRV	; creation date to be set to today
+	ENTER	FIL,FILBLK	;Switch to update mode
+	  JRST	[OUTSTR [ASCIZ /?Cannot update file /]
+		PJRST	FILNAM]
+	JRST	CPOPJ1
+
+;Verify that file should be destroyed
+
+VERIFY:	PUSHJ	P,FILNM		;Output name, no crlf
+	OUTSTR	[ASCIZ	/ (/]
+	MOVE	T1,MAXPAG
+	PUSHJ	P,OUTDEC
+	OUTSTR	[ASCIZ	/ pages)/]
+	MOVE	T1,FILBLK+.RBSTS
+	TRNE	T1,RP$BAD	;Any bits set?
+	 JRST	ISBAD		;Yes, type them out
+	OUTSTR	[ASCIZ	/ does not have any error bits set.
+Do you want to destroy it anyway? /]
+	INCHWL	T3
+	CAIE	T3,"Y"
+	CAIN	T3,"y"
+	 JRST	[AOS	(P)	;Skip return
+		 PJRST	EOL]	;Eat CR
+	OUTSTR	[ASCIZ	/Not deleted
+/]
+	PJRST	EOL		;Look for LF
+
+ISBAD:	PUSHJ	P,FILSTS	;Output the bits
+	MOVE	T1,FILBLK+.RBSTS
+	TRNN	T1,RP.NDL	;Undeletable file?
+	 JRST	CPOPJ1		;No, proceed
+	OUTSTR	[ASCIZ /?Cannot process files with RP.NDL set
+/]
+	POPJ	P,
+
+;Output file status bits
+
+FILSTS:	MOVSI	T1,-LBITS	;Length of table
+FILS1:	HLRZ	T2,BITS(T1)	;Bit to test
+	HRRZ	T3,BITS(T1)	;Description
+	TDNE	T2,FILBLK+.RBSTS
+	 OUTSTR	(T3)		;Bit is set
+	AOBJN	T1,FILS1
+	OUTSTR	CRLF
+	POPJ	P,		;Error return
+
+
+	DEFINE X(COD,BIT,DESCR),<RP.'COD==1B'BIT
+	XWD	RP.'COD,[ASCIZ /   DESCR/]>
+
+BITS:				;Table of bits and their names
+X (NDL,19,No delete)
+X (NFS,21,No FAILSA)		;TITO ignores these files
+X (DRB,25,Dead RIB)
+X (FCE,27,Checksum error)	;TOPS-10 RIB error
+X (HWE,28,Hard write error)
+X (HRE,29,Hard read error)
+X (BFS,32,Bad restore)		;Data error on backup tape
+X (BDA,35,DSKCLN found bad)	;Multiply used cluster
+LBITS==.-BITS
+	RP$BAD==RP.BDR!RP.HWE!RP.HRE!RP.BFS!RP.BDA
+SUBTTL	Data area
+
+;Command lists
+
+RDCMD:	IOWD	1000,RDBUF
+	0
+
+WTCMD:	IOWD	1000,WTBUF
+	0
+
+;Buffers
+
+RDBUF:	BLOCK	1000
+WTBUF:	BLOCK	1000
+
+	PDLEN==20
+PDL:	BLOCK	PDLEN
+
+;Variables
+
+FILSIZ:	0			;File size in words
+CURBLK:	0			;Current block number of USETI/USETO
+CURPAG:	0			;Current page number
+MAXPAG:	0			;Maximum page number
+FREED:	0			;Total pages freed
+BADPAG:	0			;Number of bad page
+
+OPNBLK:	EXP	.IODMP		;Dump mode
+	SIXBIT	/DSKB/		;Device
+	XWD	0,0		;No buffers
+
+FILBLK:	EXP	.RBSNM		;Highest interesting word
+	BLOCK	.RBSNM		;Lookup block
+
+LITS:	END	START
+    
