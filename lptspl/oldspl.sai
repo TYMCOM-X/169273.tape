@@ -1,0 +1,295 @@
+begin "Auxspl"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "(SAILIB)DUL.REQ" source!file;
+require "AUXLIB.REQ" source!file;
+require "AUXBLK.REQ" source!file;
+require "FRMOPS.REQ" source!file;
+
+require crlf&"License: SY RF JL"&crlf message;
+
+string filename, Author, Login!name;
+integer myppn, myjob, flag, eof, count, data!output, work!done;
+integer inbrk, ufdchn, dskchn, Aux;
+own safe integer array filelookup[ !RBCNT : !RBUNM+2 ];
+
+preset!with cvsix("SYS"),cvsix("LOGOUT"),0,0,0,0;
+Integer array runblock[0:5];
+
+
+Define	Debug=False;
+
+Define	Top={AuxOut('15&'14)}, Spaces = {"        "};
+
+Define	Go!Away={ifc debug thenc Calli( 0, Calli!EXIT )
+	    elsec if myppn = '3000003
+	    then Calli( location(runblock[0]), Calli!RUN )
+	    else Calli( 0, calli!EXIT ) endc};
+
+preset!with
+  "Wednesday","Thursday","Friday","Saturday","Sunday","Monday","Tuesday";
+string array Weekdays[ 1:7 ];
+
+preset!with
+  "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec";
+string array ShortMonths[ 1:12 ];
+
+preset!with
+  "January","February","March","April","May","June",
+  "July","August","September","October","November" ,"December";
+string array LongMonths[ 1:12 ];
+
+string procedure trailer( integer N );	! assumes positive N ;
+  begin
+    if ( ( N div 10 ) = 1 ) then return( "th" )
+    else if (( N mod 10 ) = 1 ) then return( "st" )
+    else if (( N mod 10 ) = 2 ) then return( "nd" )
+    else if (( N mod 10 ) = 3 ) then return( "rd" )
+    else return( "th" );
+  end;
+string DateTime, WeekDay, DayMonthYear, TimeOfDay, DetailLine;
+
+procedure DateTimeStuff;
+  begin
+    integer JDate, UDT, Hours, Minutes, Zone, RollOver;
+    integer TodaysDate, Day, Month, Year, DayOfWeek;
+    string Time, Header;
+
+    start!code
+      calli 0,'14;	! get UDT ;
+       movem UDT;	! save it ;
+      hrri 0,'11;	! 0,,11 ;
+      hrli 0,'11;	! 11,,11 ;
+      calli 0,'41;	! gettab julian date ;
+       movei 0,47;	! assume error ;
+      movem 0,JDate;	! save the julian date ;
+      calli 0,'22;	! get jiffies past midnite ;
+      idivi 0,3600;	! convert to minutes ;
+      idivi 0,60;	! convert to hours ;
+      movem Hours;	! save hours ;
+      movem 1,Minutes;	! save minutes;
+      hrroi 6;		! make gettab pointer to priv word ;
+      calli 0,'41;	! gettab our priv word ;
+       setzm 0;		! assume no privs on error ;
+      rot '10;		! right justify bits 3-7 ;
+      andi '37;		! mask to 5 bits ;
+      movem Zone;	! save as our time zone code ;
+    end;
+
+    if (( Hours + ( 16 - Zone)) >= 24 ) then RollOver _ -1
+    else Rollover _ 0;
+
+    TodaysDate _ UDT;
+    Day	_ ( UDT mod 31 ) + 1;
+    UDT _ UDT div 31;
+    Month _ ( UDT mod 12 ) + 1;
+    Year _ ( UDT div 12 ) + 64;
+
+    DayMonthYear := cvs( Day ) &
+		  "-" & ShortMonths[ Month ] & "-" & cvs( Year );
+
+    DayOfWeek	_ (( JDate + Rollover ) mod 7 ) + 1;
+    WeekDay := WeekDays[ DayOfWeek ];
+
+    TimeOfDay := cvs( Minutes );
+    if ( Minutes < 10 ) then TimeOfDay := "0" & TimeOfDay;
+    TimeOfDay := cvs( Hours ) & ":" & TimeOfDay;
+
+    Header := ", printed " &
+	     Weekdays[ DayOfWeek ] & ", " &
+	     LongMonths[ Month ] & " " &
+	     cvs( Day ) & Trailer( Day ) & ", " &
+	     "19" & cvs( Year ) & " at " & TimeOfDay & " **";
+
+    DateTime := Header;
+  end;
+
+
+Boolean Procedure WantFile( Reference integer File, Ext );
+Return( True );
+
+Procedure Each!file( Reference integer dskchn, Brk, Eof; integer array LKB );
+Begin "Each File"
+    Own Integer Decext, MoreText, Lines, Break, LastBrk, Eot, Waiting;
+    Own String Extension, Ours, TextLine;
+    Define S.Width = 132, S.Height = 60;
+
+    String procedure get!line;
+    begin
+	If not MoreText				! if buffer empty;
+	 then begin				!  then get more;
+	    Ours_ input( dskchn, inbrk );	!   read part of a line;
+	    While not Eof and			!   while not at Eof;
+	      Brk neq #LF and Brk neq #FF	!   and not a line-break;
+	     do Ours_ Ours &
+		      input( dskchn, inbrk );	!   add to line + more input;
+	 end
+	 else Ours_ Ours[S.Width+1 to INF];	!  else clip buffer;
+	MoreText_ Length( Ours ) > S.Width;	! if too many characters;
+	Break_ If MoreText then #LF else Brk;	! set break and;
+	Eot_ Eof and (not MoreText);		!  Eot flags appropriately;
+	Return( Ours[1 to S.Width]		! Return a line;
+		& (If Length( Ours ) or		!  ...if non-blank;
+		      Brk neq #FF		!      or not a FF;
+		    then Crlf else "") );	!  ...add a CRLF;
+    end;
+
+    Simple Procedure HeaderPage;
+    Begin "Header Page"
+	AuxOut( DateTime );
+	AuxBlk( Author, 1,1, 0, 1,132, 3,0 );
+	AuxBlk( cv6str(LKB[!RBNAM]) & "." & 
+		cv6str(LKB[!RBEXT] land '777777000000), 1,1, 0, 1,132, 3,3 );
+	AuxOut( DateTime );
+	AuxBlk( WeekDay, 1,1, 0, 1,132, 3,3 );
+	AuxOut( DateTime );
+	AuxBlk( DayMonthYear, 1,1, 0, 1,132, 3,3 );
+	AuxOut( DateTime );
+	Top;
+    End "Header Page";
+
+    Eot_ data!output_ false;
+    Extension _ cv6str( LKB[!RBEXT] land '777777000000 );
+
+    Author _ CvUser( LKB[!RBAUT] );
+    DateTimeStuff;
+    DateTime := "** (" & Author & ")" &
+		cv6str( LKB[!RBNAM] ) & "." & Extension &
+		DateTime & #CR;
+
+    if ( length( Author ) leq 10 )
+     then Author_ "(" & Author & ")";
+
+    Waiting_ 1;				! reset to initial period ;
+    while (( Aux_ CreAux( ":LP1@554" ) ) < 0 )
+     do begin
+	If Waiting < 3600
+	 then Waiting_ (Waiting + Waiting) Max 3600;
+	Calli( !Xwd( '201, Waiting ), calli!HIBER );
+     end;
+
+    if Aux geq 0
+     then begin
+
+	Top; HeaderPage; HeaderPage;	! print headers - twice ;
+
+	do begin "reading and writing"
+
+	TextLine_ Get!line;		! get a line from the file;
+	If not Eot or length(TextLine)	! ? End of Text or null line;
+	 then begin "Counting breaks"
+	    AuxOut( TextLine );		! print a line of data;
+	    If break = #LF		! for normal "or" overflow;
+	     then Lines_ Lines + 1;	!  then increment lines;
+	    If break = #FF or		! if form-feed;
+	       Lines geq S.Height	!  or page overflow;
+	     then begin "do FF"		!  then do page-advance;
+		Break_ #FF;		! change break char;
+		Lines_ 0;		! reset line counter;
+		If LastBrk neq #FF or	! if FF not after FF;
+		   length(TextLine)	!  or text on line;
+		 then AuxOut( #FF );	!  then advance the frame;
+	     end "do FF";
+	    LastBrk_ break		! copy breaks;
+	 end "Counting breaks"
+
+	 end "reading and writing" until Eot;
+
+	If break neq #FF then AuxOut( #FF );
+
+	data!output_ work!done_ true;	! set flags for data sent ;
+	AuxZap;				! zap the circuit ;
+     end;
+
+    if data!output
+     then begin
+	if decext_ abs( cvd(extension) )
+	 then LKB[!RBEXT]_ Cvsix(cvs(decext-1)[1 for 3]) lor !rh(LKB[!RBEXT])
+	 else LKB[!RBNAM]_ 0;
+	Chnior( dskchn, LKB[!RBCNT], !chREN );
+     end;
+     close(dskchn);
+
+end "Each File";
+
+Simple Boolean Procedure PrinterJob;
+Begin "PrinterJob"
+    integer Job,Jobs,Me;
+
+    Me _ Call(0,"PJOB");
+    Jobs _ Calli(!Xwd('15,'11), calli!GETTAB ) -1;
+    if not !SKIP! then Jobs_1024;
+
+    for Job _ Jobs step -1 until 1 do
+	if not Job = Me
+	    and Calli( !xwd(Job,!gtaun), calli!gettab ) = '3000003
+	    and Calli( !xwd(Job,0), calli!gettab) land !bit(15)	! JLOG ;
+	    and equ( "AUXSPL", cv6str( calli(!Xwd(Job,3), calli!gettab) ) )
+	    and Calli( !xwd(Job,0), calli!gettab ) < 0		! Running ;
+	then return(Job);
+    return(False);
+
+end "PrinterJob";
+
+Procedure Create!Printer!Fork;
+begin "setframe"
+    Integer Frame, Framerror;
+    String FrameName;
+
+    FrameName _ "LPQ";
+    If not EQU(FrameName,Login!Name) then
+    Begin
+	Frame _ CreFrm(FrameName);
+	If not !SKIP! then usererr(0,0,"[Cannot login to "&FrameName&"]","X");
+	Framerror _ RunFrm (Frame,"LPTSPL","AUXSPL",0);
+	If not Framerror and !SKIP! then
+	    Print("[AuxSpl started in frame ", Frame land '777, "]")
+	else begin
+	    Print("Run error for (LPTSPL)AUXSPL, Status: ",Cvos(Framerror));
+	    Framerror _ RunFrm(Frame,"SYS","LOGOUT",0);
+	    If not Framerror and !SKIP! then
+		Print("Frame ",Frame land '777," Logged out")
+	    else
+		Print("Run error for (SYS)LOGOUT, Status: ",Cvos(Framerror),
+			Crlf,"Cannot log frame ",frame land '777," off.");
+	end;
+    End;
+end "setframe";
+
+myppn  _ call(0,"GETPPN");		! Get my logged-in ppn;
+login!name _ cv6str(calli(!gtunm,calli!gettab)) &
+		cv6str(calli(!gtun1,calli!gettab));
+
+if myjob_PrinterJob then
+    begin
+	print(Crlf,"[%AUXSPL already allocated in frame ",myjob,"]",Crlf);
+	Go!Away;
+    end;
+
+open(ufdchn_getchan,"DSK",'17, 0,0, 0,0,Eof_true);	! handle error;
+if Eof then begin
+    usererr(0,0,"Serious Problem -- DSK not available","C");
+    Go!Away;
+end;
+setbreak(inbrk_getbreak,#LF&#FF,null,"FINS");
+
+if myppn = '3000003
+ then while true
+     do begin
+
+	work!done _ false;
+
+	UfdScn( myppn, cvsix("*"), cvsix("*"), -1, WantFile, Each!File ); 
+
+	If not work!done
+	 then Calli('201000010, '72);	! then sleep for a bit;
+
+     end
+ else Create!printer!fork;
+
+Go!Away;
+
+end "Auxspl";
+  
