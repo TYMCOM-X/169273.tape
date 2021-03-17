@@ -1,0 +1,787 @@
+    SUBTTL	TELEX.602 - HANDLES INTERFACE WITH TELEX TERMINALS
+: ******************************************************************
+: **                  PROPRIETARY INFORMATION                     **
+: **                                                              **
+: **  This  source code listing constitutes the proprietary pro-  **
+: **  perty of TYMNET, Incorporated. The recipient, by receiving  **
+: **  this program listing, agrees that neither this listing nor  **
+: **  the   information  disclosed herein nor any  part  thereof  **
+: **  shall be  reproduced or transferred to other documents  or  **
+: **  used  or  disclosed to others for manufacturing or for any  **
+: **  other purpose except as specifically authorized in writing  **
+: **  by  TYMNET, Incorporated.                                   **
+: ******************************************************************
+: **                   MODULE IDENTIFICATION                      **
+: **                                                              **
+: **  File Name          :  TELEX.602      last change: 09/26/86  **
+: **                                                              **
+: **  File Description   :  Various Telex processors perform the  **
+: **			    interaction of receiving or transmitt-**
+: **			    ing data and signals between Telex    **
+: **			    terminals and network. Data are passed**
+: **			    back and forth under different mode   **
+: **			    such as IIX, transparency, translation**
+: **                                                              **
+: **  File Abstract      :  Telex terminals use 5-bit as data cha-**
+: **			    racter which we call BAUDOT and it is **
+: **			    not like ASCII using 7-bit as data    **
+: **			    character. Therefore this module is to**
+: **			    support the interface between Telex   **
+: **			    terminals and the network.            **
+: **                                                              **
+: ******************************************************************
+: **                    CHANGE LOG                                **
+: **                                                              **
+: **  Ver   Date    By   PIR/NSR  Changes (most recent at top)    **
+: ** ----- -------- ---  -------- ------------------------------- **
+: ** 06.02 10/14/86 DLG		  Fixed operand out of range error**
+: **				  at XBTLX1			  **
+: ** 06.02 09/26/86 LH   NSR 958  Fixed crash type 03 by changing **
+: **				  IIXCAL(not under X3ON) to IIXCAP**
+: ** 06.00 05/30/86 LH            Change transparent TELEX (TID33)**
+: **				  to work with new IIX module.    **
+: ** 05.00 03/13/86 LH   n/a	  Make TID34 & TID35 (virtual TLX)**
+: **				  have port-addressable ability.  **
+: ** 04.03 02/24/86 LH   NSR 0228 Add new option to replace untra-**
+: **				  nslateable char. to ? mark and  **
+: **				  specific char. expanded into    **
+: **				  text string.    		  **
+: ** 04.03 02/24/86 LH   PIR 1869 Check if ports are ASCII type   **
+: **				  for SPEEDLINK part 2 (TID38)).  **
+: ** 04.03 01/28/86 sdw  n/a      Moved TINIT, BTINIT and TTINIT  **
+: **                              to INITIZ.403                   **
+: ** 04.02 01/07/86 LH   PIR 1869 New initial routine TTINT,trans-**
+: **				  mitter XTTLX, receiver VTTLX are**
+: **				  added for SPEEDLINK Telex.      **
+: **  ''      ''    ''            Add proprietary banner.	  **
+: ** 04.02 12/30/85 LH   NSR 0469 Correct ASCII/BAUDOT translation**
+: ** 04.02 12/09/85 LH   NSR 0251 Change initial line state from  **
+: **				  mark to space for virtual telex **
+: **				  (TID34).			  **
+: **                                                              **
+: ******************************************************************
+
+	SUBTTL	(TELEX) IIX MESSAGE TYPES
+
+	IF	TELEX
+
+	GL	XTELX,VTELX,TLXBRK,T.INIT,TINIT,A.BRK
+	GL	A.CLRO,RBRATE,SBRATE
+
+	SEG	A.CODE
+	MO	.,TELEX
+
+	LO	DATA
+
+
+:	The IIX global message types are set up below.  Each
+:	message type is given a label corresponding to the
+:	message number.  The message numbers are represented
+:	less the offset.  The global messages are (8080!n).
+:	8080 being the offset.
+
+
+SDCGLB	EQ	0			:select dialect command
+SDRGLB	EQ	1			:select dialect response
+GSHGLB	EQ	2			:gateway reached smart host
+GDHGLB	EQ	3			:gateway reached dumb host
+NLSGLB	EQ	4			:normal logon status
+RSIGLB	EQ	5			:resynchronize interface exchange
+PIVGLB	EQ	6			:product id and version
+RPVGLB	EQ	7			:request product id and version
+MAXGLB	EQ	RPVGLB			:maximm number of global msgs defined
+
+
+:	The IIX telex dialect messages are set up below.  Each
+:	message type is given a label corresponding to its
+:	number less the offset.  Dialect messages are (C080!n).
+:	C080 is the offset.
+:
+:	The TELEX dialect messages indicate the state of the line
+:	between the terminal and the consat.  The forward path is
+:	from the terminal to the consat. The backward path is from the 
+:	consat to the terminal.  The state is indicated by the two
+:	rightmost bits in the message.  The rightmost is the backward path
+:	and next to rightmost is forward path (state FB).  If the bit is set
+:	the designated path is in marking state (idle line state).  If the
+:	bit is not set the path is in spacing state (free line state).
+:	
+:	Whenever the CONSAT sends a Telex dialect message it is indicating
+:	the current state of the forward and backward path.
+:
+:	All Telex dialect messages received from the Telex gateway
+:	indicate what the gateway perceives the state of the forward
+:	path to be and what it wants the state of the backward path
+:	to be. When a dialect message is received, the backward path
+:	is set as indicated in the message and the current state is
+:	sent to the gateway.  
+
+
+TLXD00	EQ	0			:force bakward path to space and
+					:return current status
+TLXD01	EQ	1			:MARK - force backward path to mark
+					:and return current status
+TLXD02	EQ	2			:SPACE - fore backward path to space
+					:and return current status
+TLXD03	EQ	3			:MARK - force backward path to mark
+					:and return current status
+MAXTDL	EQ	TLXD03			:maximum number of message defined
+
+
+	SUBTTL	(TELEX) IIX GLOBAL MESSAGE PROCESSOR
+
+:	Called from IIX message preprocessor to process IIX global
+:	message types.
+:	RBC	IIX global message type
+:	RLINK	return to polling loop
+
+TLXGLB	CHI	RBC,MAXGLB		:is this a valid message
+	JG	PRBTLX			:if not, report to Probe
+	LHL	R5,GLBMSG,RBC,RBC	:get service routine
+	J	BASE,R5,,		:go do it
+
+GLBMSG	HC	EA(SLTDTX)		:select dialect command
+	HC	EA(SLTRTX)		:selected dialect response
+	HC	EA(SMTGTX)		:gateway reached smart host
+	HC	EA(DUMGTX)		:gateway reached dumb host
+	HC	EA(LGSTTX)		:normal logon status
+	HC	EA(RSYNTX)		:resynchronize interface exchange
+	HC	EA(PRODTX)		:product id and version
+	HC	EA(REQPTX)		:request product id and status
+
+PRBTLX	LHI	R0,15			:set Probe report value for TID33
+	STB	R0,PROBVL		:save value
+	JAL	RCH,PROBMG		:send msg to Probe
+	JR	RLINK			:exit
+
+:	SLTDTX - select dialect.  Reads dialect list sent by
+:	gateway, if dialect matches writes to port table - unless
+:	one already selected.  Sets in dialect select mode.
+
+SLTDTX	RBT	RP,ASCIIX		:not ASCII IIX dialect capable
+	RBT	RP,GATIIX		:not TYMNET gateway IIX dialect capable
+	RBT	RP,PADIIX		:not X.29 IIX dialect capable
+	RBT	RP,SMDIIX		:not S-mode IIX dialect capable
+	RBT	RP,GETIIX		:no TIIX be found yet
+	SBT	RP,TLXIIX		:TID33 - transparent TLX IIX capable
+	TS	.IIXMD,RPI		:set in dialect select mode
+	JAL	R4,SELDLT		:go to select dialect value
+	J	XSIG.T			:if signal, do signal processing
+	JR	RLINK			:dialect value selected, then exit
+
+:	SLTRTX - dialect selected response. If any 8081, just read
+:	2 bytes and take no action.
+
+SLTRTX	JAL	R6,GET2BD		:read 2 bytes and take no action
+	J	XSIG.T			:process signals
+	JR	RLINK
+
+:	SMTGTX - smart host reached.  As expected, take no action.
+:
+SMTGTX	SBT	RP,IIXCAP		:set the other end IIX capable*6.02 LH
+	JR	RLINK			:and return
+
+:	DUMGTX - dumb host reached.  ZAP circuit.
+
+DUMGTX	RBT	RP,IIXCAP		:Reset the other end IIX capable*6.02LH
+	J	ZAPPER			:go ZAP circuit
+
+
+:	LGSTTX - normal logon status.  gets status byte and returns.
+:	takes no action.
+
+LGSTTX	JAL	R6,GET1BD		:get status byte
+	J	XSIG.T			:signal, normal return
+	JR	RLINK			:data, skip return
+
+
+:	RSYNTX - resynchronize interface.  Just return for now.
+
+RSYNTX	JR	RLINK			:return
+
+:	PRODTX - product id and version.  read product id and version
+:	number, but take no action.
+
+PRODTX	JAL	R4,PRODCT		:get product ID and version
+	J	XSIG.T			:if signal, do signal processing
+	JR	RLINK			:and return
+
+:	REQPTX - request product id and version number.  Send product
+:	id and version number back to requesting interface.
+
+REQPTX	JAL	R4,REQPRD		:request product ID and version
+	JR	RLINK			:and return
+
+
+	SUBTTL	(TELEX) IIX TELEX DIALECT MESSAGE PROCESSOR
+
+
+:	Called from IIX message preprocessor to process IIX Telex
+:	dialect messages.
+:	RBC	Telex dialect message type
+:	RLINK	return to polling loop
+
+TLXDLT	L	R3,.IIXVL,RPI		:has Telex dialect been selected
+	CI	R3,8091
+	JN	PRBTLX			:report to Probe if not
+	XHI	RBC,4000			:strip off dialect message indicator
+	CHI	RBC,MAXTDL		:is it a valid message
+	JG	PRBTLX			:report to Probe if not valid 
+	LHL	R5,TXDMSG,RBC,RBC	:get processing routine
+	J	BASE,R5,,		:go do it
+
+TXDMSG	HC	EA(FRCSP0)		:force backward path to space
+	HC	EA(CMPMK1)		:compare for mark & force
+	HC	EA(CMPSP2)		:compare for space & force
+	HC	EA(CMPMK3)		:compare for mark & force
+
+:	FRCSP0 - for dialect message 00 forces backward path to
+:	spacing and respond with current state of line.
+
+FRCSP0	SBT	RP,EMTBRK		:force back path to space
+	JAL	R8,SBRATE		:for isis consat ignore it, for solo consat set obrate for break
+	JAL	RBF,A.BRK		:put two breaks into async output ring
+	JAL	RBF,A.BRK
+	RBT	RP,MRKING		:not marking in both directions
+	TBT	RP,FWDPTH		:what is forward state
+	JNFS	FRCS01
+	JAL	R9,DLCT00		:if space, send 00
+	JR	RLINK			:and return
+FRCS01	JAL	R9,DLCT02		:if mark, send 10
+	JR	RLINK			:and return
+
+:	CMPMK1 - forces bakward path to marks and responds with
+:	current state of line.
+
+CMPMK1	RBT	RP,EMTBRK		:fwd is space, so force back to mark
+	JAL	R8,RBRATE		:for isis consat ignore it,for solo consat reset obrate
+	TBT	RP,FWDPTH		:what is state of forward path
+	JNFS	CMPM11			:report current state
+	JAL	R9,DLCT01		:send state 01
+	JR	RLINK			:and return
+CMPM11	JAL	R9,DLCT03		:back is mark, send state 11
+	SBT	RP,MRKING		:maring in both directions
+	JR	RLINK			:and return
+
+:	CMPSP2 - forces backward path to space and sends state.
+
+CMPSP2	SBT	RP,EMTBRK		:fwd is mark, force back to space
+	JAL	R8,SBRATE		:for isis consat ignore it,for solo consat set obrate
+	JAL	RBF,A.BRK		:put two breaks int async output ring
+	JAL	RBF,A.BRK
+	RBT	RP,MRKING		:not marking in both directions
+	TBT	RP,FWDPTH		:what is stae of forward path
+	JEFS	CMPS21			:report current state
+	JAL	R9,DLCT02		:send state 10
+	JR	RLINK			:and return
+CMPS21	JAL	R9,DLCT00		:back is space, send state 00
+	JR	RLINK			:and return
+
+:	CMPMK3 - forces backward path to mark and sends state.
+
+CMPMK3	RBT	RP,EMTBRK		:fwd is mark, so force back to mark
+	JAL	R8,RBRATE		:for isis consat ignore it,for solo consat reset obrate
+	TBT	RP,FWDPTH		:what is state of forward path
+	JEFS	CMPM31			:report current state
+	JAL	R9,DLCT03		:send state 11
+	SBT	RP,MRKING		:marking in both directions
+	JR	RLINK			:and return
+CMPM31	JAL	R9,DLCT01		:back is mark, send state 01
+	JR	RLINK			:and return
+
+	SUBTTL	(TELEX) IIX TELEX DIALECT UTILITIES
+
+:	DLCT00 - Telex dialect message 00 (state 00) sent to
+:	Telex gateway.
+:	R9	LINK REGISTR
+:	RBP	BUFFER POINTER
+
+DLCT00	L	RBP,.FTBUF,RPI		:get buffer to net
+	JAL	R6,SNDSIX		:send SIIX message
+	LHI	RBC,80C0		:send C080 message
+	JAL	RCH,PUTCHR
+	EXBR	RBC,RBC			
+	JAL	RCH,PUTCHR
+	JAL	R6,SNDTIX		:send TIIX message
+	JR	R9
+
+:	DLCT01 - Telex dialect message 01 (state 01) sent to
+:	Telex gateway.
+:	R9	LINK REGISTR
+:	RBP	BUFFER POINTER
+
+DLCT01	L	RBP,.FTBUF,RPI		:get buffer to net
+	JAL	R6,SNDSIX		:send SIIX message
+	LHI	RBC,81C0		:send C081 message
+	JAL	RCH,PUTCHR
+	EXBR	RBC,RBC
+	JAL	RCH,PUTCHR
+	JAL	R6,SNDTIX		:send TIIX message
+	JR	R9
+
+:	DLCT02 - Telex dialect message 02 (state 10) sent to
+:	Telex gateway.
+:	R9	LINK REGISTR
+:	RBP	BUFFER POINTER
+
+DLCT02	L	RBP,.FTBUF,RPI		:get buffer to net
+	JAL	R6,SNDSIX		:send SIIX message
+	LHI	RBC,82C0		:send C082 message
+	JAL	RCH,PUTCHR
+	EXBR	RBC,RBC
+	JAL	RCH,PUTCHR
+	JAL	R6,SNDTIX		:send TIIX message
+	JR	R9
+
+:	DLCT03 - Telex dialect message 03 (state 11) sent to
+:	Telex gateway.
+:	R9	LINK REGISTR
+:	RBP	BUFFER POINTER
+
+DLCT03	L	RBP,.FTBUF,RPI		:get buffer to net
+	JAL	R6,SNDSIX		:send SIIX message
+	LHI	RBC,83C0		:send C083 message
+	JAL	RCH,PUTCHR
+	EXBR	RBC,RBC
+	JAL	RCH,PUTCHR
+	JAL	R6,SNDTIX		:send TIIX message
+	JR	R9
+	SUBTTL	(TELEX) TELEX TRANSMITTER
+
+:	HALF DUPLEX TELEX BAUDOT TRANSMITTER (TRANSPARENT)
+:	==== ====== ===== ====== =========== =============
+
+XTELX	JAL	RCH,GETCHR		:get character
+	J	XSIG.T			:normal return...its a signal
+	TBT	RP,MRKING		:are we marking in both directions
+	JER	RLINK			:if not, toss data
+	OHI	RBC,0E0			:set 3 most significant bits 
+	JAL	RCH,APUTCH		:xmit character
+	JR	RLINK			:and return
+
+:	XSIG.T:	signal processor for Telex
+:	called from telex baudot transmitter (transparent) to
+:	process control signals
+:	RLINK	return to polling loop
+:	R5	signal to examine
+
+	LO	CONSAT
+XSIG.T	SIGBGN(ETMSIG,LTMSIG,EADSIG,LADSIG,SEXSIG-QQMSIG)
+	SIGEXC(ZAPSIG,TLXZAP)		:zapper
+	SIGEXC(SIXSIG,TLXSIX)		:SIIX signal
+	SIGEXC(TIXSIG,TLXTIX)		:TIIX signal
+	SIGEND
+	FO	CONSAT
+
+
+:	Handle zapper for telex xmitter
+TLXZAP	J	ZAPPER			:for now just zap
+
+
+:	Preprocessor for IIX messages, strips off offset (8080)
+:	and determines whether global or dialect message
+
+TLXSIX	JAL	R6,GET2BD		:get IIX message	
+	J	XSIG.T			:signals, do signal processing
+	XI	RBC,8080		:strip off offset
+	THI	RBC,4000		:is it dialect message
+	JN	TLXDLT			:if so, go process dialect message
+	J	TLXGLB			:else, it is global message
+
+:	Process TIIX signal.  See if in dialect select mode and if so
+:	send response, else just reurn.
+
+TLXTIX	SBT	RP,GETIIX		:get TIIX now
+	LH	R0,.IIXMD,RPI		:are we in dialect select mode
+	JGER	RLINK			:if not, just return
+	L	RBP,.FTBUF,RPI		:get buffer - to network
+	JAL	R6,SNDSIX		:send SIIX msg
+	JAL	R6,SNDDSC		:send dialect selected msg
+	JAL	R6,SNDTIX		:send TIIX msg
+	LIS	R0,0			:set not in dialect select mode 
+	STH	R0,.IIXMD,RPI
+	JR	RLINK			:and return
+
+	SUBTTL	(TELEX) TELEX RECEIVER
+
+:	HALF DUPLEX TELEX BAUDOT RECEIVER (TRANSPARENT)
+:	==== ====== ===== ====== ======== =============
+
+VTELX	JAL	RCH,AGETCH		:get byte of data
+	J	VSIG.T			:signal...go process
+	L	R0,.IIXVL,RPI		:toss data till dialect selected
+	CI	R0,8091
+	JNR	RLINK
+	TBT	RP,MRKING		:are we marking in both directions
+	JER	RLINK			:if not, toss data
+	OHI	RBC,0E0			:set 3 high order bits high
+	L	RBP,.FTBUF,RPI		:get buffer pointer
+	JAL	RCH,PUTCHR		:send character to network
+	JR	RLINK			:and return
+
+
+:	VSIG.T - called from telex baudot transmitter to handle break 
+:	state and send appropriate IIX dialect messages.  Any other signals
+:	are effectively tossed.
+
+	 LO SIGNAL
+VSIG.T	CHI	R5,BBSIG		:is it BREAK Begin
+	JEFS	VBRKBG
+	CHI	R5,BESIG		:is it BREAK End
+	 FO SIGNAL
+	JE	VBRKED
+	JR	RLINK			:else, return
+	
+:	Process BREAK Begin.  
+VBRKBG	RBT	RP,FWDPTH		:forward path is now spaceing
+	RBT	RP,MRKING		:and not marking in both directions
+	JAL	R9,RWEIIX		:is IIX set up
+	TBT	RP,EMTBRK		:what is state of backward path
+	JNFS	VBRKB1
+	JAL	R9,DLCT01		:send state 01 to gateway
+	JR	RLINK
+VBRKB1	JAL	R9,DLCT00		:send state 00 to gateway
+	JR	RLINK
+
+
+:	Process BREAK End
+VBRKED	SBT	RP,FWDPTH		:forward path is now marking
+	TBT	RP,EMTBRK		:what is state of backward path
+	JNFS	VBRKD1
+	SBT	RP,MRKING		:marking in both directions
+	JAL	R9,RWEIIX		:is IIX set up
+	JAL	R9,DLCT03		:send state 11 to gateway
+	JR	RLINK
+VBRKD1	JAL	R9,RWEIIX		:is IIX set up
+	JAL	R9,DLCT02		:send state 10 to gateway
+	JR	RLINK
+	
+	
+:	RWEIIX - are we IIX, has dialect been selected and response
+:	been sent.  If not ignore change in signalling.
+:	R9	link register
+
+RWEIIX	L	R0,.IIXVL,RPI		:has dialect been selected
+	CI	R0,8080			:if not just return
+	JER	RLINK			
+	LHL	R0,.IIXMD,RPI		:has dialect selected msg been sent
+	JLR	RLINK			:if no just return
+	JR	R9			:go back and send IIX msg
+
+
+:	TELEX PORT ESTABLISHMENT
+:	===== ==== =============
+
+:	T.INIT - Port estamblishment routine called from AIDPVC.
+:	Sets up port to be IIX smart.
+
+T.INIT	STH	R5,TIIEST
+	LIS	R5,0			:zero IIX dialect and mode in port table
+	STH	R5,.IIXMD,RPI
+	SBT	RP,FWDPTH		:set forward path in marking state
+	RBT	RP,EMTBRK		:set backward path in marking
+	SBT	RP,MRKING		:init to marking in both directions
+	JAL	R6,A.CLRO		:clear async output
+	LA	R5,T.STAT		:get address of extended logon handler
+	ST	R5,.LSTAT,RPI		:put in port table
+	LI	R5,0C000		:IIX smart and extended logon status
+	OH	R5,TIIEST		:get indicater from PSTATE for Tymnet II
+	J	ESTPRT			:go establish port
+
+:	TELEX EXTENDED LOGON STATUS HANDLER
+:	===== ======== ===== ====== =======
+
+:	T.STAT - checks for extended logon status infformation and
+:	takes any required action.
+
+T.STAT	CLHI	R9,8			:is there an extended message
+	JLR	R8			:if not, return
+	CLHI	R9,13			:is msg out of range
+	JGFS	T.STA1			:abort and check it out
+	NOP				:do nothing for now
+	JR	RLINK			:and return
+
+C.STAT	EQ	87			:illegal status code
+
+:	illegal status code, abort and check it out
+T.STA1	ABORT(R9,C.STAT)
+	SUBTTL	(TELEX) BUILD TELEX CIRCUITS AT INTITIALIZATION
+
+
+	 FO	DATA
+	EM	:TELEX
+	EI	:TELEX
+:
+:
+ 	SUBTTL	(TELEX) VIRTUAL TELEX SERVICE
+	IF	BTELEX
+	GL	XBTLX,VBTLX,BTINT
+
+	SEG	A.CODE
+	MO	.,BTELEX
+
+	LO	DATA
+
+POWRU	EQ	1^11			:WRU option for PVC parameter
+
+	SUBTTL	(TELEX) VIRTUAL-TELEX TRANSMITTER
+
+:	VIRTUAL TELEX BAUDOT TRANSMITTER (NON-TRANSPARENT)
+:	======= ===== ====== =========== =================
+:	** 4.03 LH
+:	Add ability to have untranslateable characters sent as a
+:	BAUDOT question markinstead of discarding them.
+:	Add ability to expand specific characters to text strings.
+
+XBTLX	JAL	RCH,GETCHR		:get character
+	J	XBSIG.T			:normal return...its a signal
+	TBT	RP,MRKING		:are we marking in both directions
+	JER	RLINK			:if not, toss data
+	TBT	RP,BQSP			:replace untranslateable chars with ?
+	JE	XHBA0			:no, convert ASCII to BAUDOT
+	NHI	RBC,7F			:yes, then remove MSB first
+	LB	R9,A.BDOT,RBC		:get BAUDOT chars
+	CLHI	R9,20			:check if expandable chars
+	JG	XHBA1			:no, jump to convert ASCII to BAUDOT
+	LR	R6,RLINK		:save return-address (to POLLING)
+	LHL	R5,EXPTBL,R9,R9		:get pointer for expandable char. table
+XBTLX1	LB	RBC,BASE,R5,		:get a character
+	JER	R6			:end of expansion, then back to POLLING
+	JAL	RLINK,XHBA0		:convert ASCII to BAUDOT
+	AIS	R5,1			:increase one count
+	JBS	XBTLX1			:get next char in text string
+
+
+:	XBSIG.T: signal processor for vitual Telex
+:	called from virtual telex baudot transmitter (non-transparent)
+:	to process control signals
+:	RLINK	return to polling loop
+:	R5	signal to examine
+
+	LO	CONSAT
+XBSIG.T	SIGBGN(ETMSIG,LTMSIG,EADSIG,LADSIG,SEXSIG-QQMSIG)
+	SIGEXC(SECSIG,SECHO)		:Set echo-control
+	SIGEXC(QECSIG,QECHO)		:Query echo-control
+	SIGEXC(ZAPSIG,BTXZAP)
+	SIGEND
+	FO	CONSAT
+
+:	Handle zapper for virtual telex transmitter
+BTXZAP	RBT	RP,FWDPTH		:return to space for forward path
+	RBT	RP,MRKING		:space both directions
+	SBT	RP,EMTBRK		:emit breaks
+	RBT	RP,VB.ACP		:port not active for now
+	RBT	RP,RECWRU		:clear receive wru
+	RBT	RP,WRUT1		:clear WRU timmer
+	RBT	RP,WRUT0
+	J	ZAPPER			:for now just Zap
+
+
+EXPTBL	HS	0
+	HC	EA(EXPNBR)		:pointer to string - number
+	HC	EA(EXPDLR)		:pointer to string - dollar
+	HC	EA(EXPPCN)		:pointer to string - percentage
+	HC	EA(EXPAND)		:pointer to string - ampersand
+
+EXPNBR	AC	/NBR"00/		:character # expanded into NBR
+EXPDLR	AC	/DLR"00/		:character $ expanded into DLR
+EXPPCN	AC	/O"2FO"00/		:character % expanded into O/O
+EXPAND	AC	/AND"00/		:character & expanded into AND
+
+
+
+	SUBTTL	(TELEX) VIRTUAL TELEX RECEIVER
+
+:	VIRTUAL TELEX BAUDOT RECEIVER (NON-TRANSPARENT)
+:	======== ==== ====== ======== =================
+
+VBTLX	JAL	RCH,AGETCH		:get byte of data
+	J	VBSIG.T			:signal...go process
+	TBT	RP,MRKING		:are we marking in both directions
+	JER	RLINK			:if not, toss data
+	NHI	RBC,1F			:mask it down
+	CHI	RBC,02			:if line feed
+	JER	RLINK			: then discard
+	CHI	RBC,1B			:is figure shift ?
+	JNFS	VBTLX1			:no
+	SBT	RP,BICF			:yes,set up figure shift flag
+	JR	RLINK
+VBTLX1	CHI	RBC,1F			:is letter shift ?
+	JNFS	VBTLX2			:no
+	RBT	RP,BICF			:yes,set up letter shift flag
+	JR	RLINK
+VBTLX2	L	R7,.PVCX,RPI		:get PVC paramater
+	TI	R7,POWRU		:are we expecting WRU
+	JN	VBTLX4			:if not, just jump to conversion
+	TBT	RP,BICF			:check shift flag
+	JEFS	VBTLX3			:figure case
+	CHI	RBC,09			:is WRU ? (WRU in letters case)
+	JE	SDANS1			:yes, send answer back messages
+VBTLX3	TBT	RP,RECWRU		:have we received WRU before ?
+	JER	RLINK			:if not, toss data
+	TBT	RP,VB.ACP		:virtual telex port active ?
+	JER	RLINK			:if not, toss data
+	J	VHBA0			:exit to baudot ascii conversion
+VBTLX4	TBT	RP,VB.ACP		:virtual telex port active ?
+	JE	AIDTLX			:if not, perform aid
+	J	VHBA0			:exit to baudot ascii conversion
+
+:	VBSIG.T - called from virtual telex transmitter to handle
+:	break state.  Any other signals are effective toss.
+
+	LO SIGNAL
+VBSIG.T	CHI	R5,BBSIG		:is it break begin ?
+	JEFS	VBBKBG
+	CHI	R5,BESIG		:is it break end ?
+	FO SIGNAL
+	JE	VBBKBE
+	JR	RLINK			:else, return
+
+:	process BREAK begin
+VBBKBG	ST	RLINK,TLXTM2		:store return address
+	JAL	RLINK,CIRDIS,,		:circuit disconnect and send out japper
+	RBT	RP,FWDPTH		:forward path is spacing
+	RBT	RP,MRKING		:and not marking in both directions
+	SBT	RP,EMTBRK		:set emitting breaks
+	RBT	RP,BICF			:clear shift flag
+	RBT	RP,VB.ACP		:virtual telex port not active
+	RBT	RP,WRUT1		:clear WRU timmer
+	RBT	RP,WRUT0
+	RBT	RP,RECWRU		:clear receiving WRU
+	L	RLINK,TLXTM2		:get return address
+	JR	RLINK			:return
+
+:	process BREAK end
+VBBKBE	RBT	RP,EMTBRK		:cancel emitting breaks
+	SBT	RP,FWDPTH		:forward path is marking
+	SBT	RP,MRKING		:and marking in both directions
+	L	R7,.PVCX,RPI		:set PVC parameter
+	TI	R7,POWRU		:are we expecting WRU ?
+	JN	AIDTLX			:if not, perform AID
+	SBT	RP,WRUT1		:set waiting WRU timmer
+	JR	RLINK			:return
+
+:	send answer back messages
+SDANS1	SBT	RP,RECWRU		:already received WRU
+	RBT	RP,WRUT1		:cancel WRU timmer
+	RBT	RP,WRUT0
+	LHL	R9,ANSP,RP,RP		:set answer back table pointer
+SDANS2	LB	RBC,ANSTBL,R9		:get answer back character
+	JEFS	VBESTP			:finish sending answer back
+	L	RBP,.TTBUF,RPI		:set to terminal buffer
+	JAL	RCH,PUTCHR		:send it
+	AIS	R9,1			:increment answer back pointer
+	JBS	SDANS2			:continue
+VBESTP	TBT	RP,VB.ACP		:port active?
+	JNR	RLINK			:if yes, just exit
+
+:	routine jump to AIDPVC
+AIDTLX	SBT	RP,NEWLOG		:...new logon
+	J	AIDPVC
+
+	 FO	DATA
+	EM	:BTELEX
+	EI	:BTELEX
+
+	SUBTTL	(TELEX) SPEEDLINK TRANSPARENT TELEX SERVICE
+	IF	TTELEX
+	GL	TTINT,XTTLX,VTTLX
+
+	SEG	A.CODE
+	MO	.,TTELEX
+
+	LO	DATA
+:	routine checks array of transparent telex ports 
+
+:	TELEX BAUDOT TRANSMITTER (TRANSPARENT)
+:	===== ====== =========== =============
+:	** 4.02 LH
+
+XTTLX	JAL	RCH,GETCHR		:get character
+	J	XTSIG.T			:normal return...its a signal
+	TBT	RP,MRKING		:are we marking in both directions
+	JER	RLINK			:if not, toss data
+	TBT	RP,ASCII		:ASCII device ?
+	JEFS	XTTLX1			:no, skip
+	NHI	RBC,7F			:yes, remove MSB
+	JFS	XTTLX2			:skip to send chars to device
+XTTLX1	OHI	RBC,0E0			:else, set hi bits
+XTTLX2	JAL	RCH,APUTCH		:send chars to device
+	JR	RLINK			:exit
+
+:	XTSIG.T: signal processor for transparent telex
+:	called from telex baudot transmitter (transparent)
+:	to process control signals
+:	RLINK	return to polling loop
+:	R5	signal to examine
+
+	LO	CONSAT
+XTSIG.T	SIGBGN(ETMSIG,LTMSIG,EADSIG,LADSIG,SEXSIG-QQMSIG)
+	SIGEXC(SECSIG,SECHO)		:Set echo-control
+	SIGEXC(QECSIG,QECHO)		:Query echo-control
+	SIGEXC(ZAPSIG,BTTZAP)		:zap signal
+	SIGEND
+	FO	CONSAT
+
+:	Handle zapper for telex transmitter
+BTTZAP	RBT	RP,MRKING		:inhibit data passing
+	SBT	RP,EMTBRK		:emit breaks (SPACING)
+	J	ZAPPER			:for now just zap
+
+
+	SUBTTL	(TELEX) TRANSPARENT TELEX RECEIVER
+
+:	VIRTUAL TELEX BAUDOT RECEIVER (TRANSPARENT)
+:	======== ==== ====== ======== =============
+:	** 4.02 LH
+
+VTTLX	JAL	RCH,AGETCH		:get byte of data from device
+	J	VTSIG.T			:signal...go process
+	TBT	RP,MRKING		:are we marking in both directions
+	JER	RLINK			:if not, toss data
+	TBT	RP,ASCII		:ASCII device?
+	JEFS	VTTLX1			:no, skip
+	NHI	RBC,7F			:yes, remove MSB
+	JFS	VTTLX2			:skip to send it to Oring
+VTTLX1	OHI	RBC,0E0			:else, set high bits for ISIS
+VTTLX2	L	RBP,.FTBUF,RPI		:ge byte of dat from buffer
+	JAL	RCH,PUTCHR		:send it to Oring
+	JR	RLINK
+
+:	VTSIG.T - called from virtual telex transmitter to handle
+:	break state.  Any other signals are effective toss.
+
+	LO SIGNAL
+VTSIG.T	CHI	R5,BBSIG		:is it break begin ? (space ?)
+	JEFS	VTBKBG
+	CHI	R5,BESIG		:is it break end ? (mark ?)
+	JE	VTBKBE
+	JR	RLINK			:else, return
+	FO SIGNAL
+
+:	process BREAK begin
+VTBKBG	ST	RLINK,TLXTMP		:store return address
+	JAL	RLINK,CIRDIS,,		:circuit disconnect and zapper
+	HS				:on space from device
+	IF	NPAPRT
+	TBT	RP,AD.PRT		:addressable port ?
+	JEFS	VTBK1			:no, skip
+	RBT	RP,LIMBO		:yes, not in limbo (login) state
+	EI	:NPAPRT
+VTBK1	RBT	RP,FWDPTH		:spacing forward path now
+	RBT	RP,FWDPT0		:previous forward path as spacing
+	RBT	RP,MRKING		:not marking in both directions
+	SBT	RP,EMTBRK		:emitting breaks (space) to device
+	RBT	RP,TT.ACP		:virtual telex port not active
+	L	RLINK,TLXTMP		:get return address
+	JR	RLINK			:return
+
+:	process BREAK end
+VTBKBE	SBT	RP,FWDPTH		:forward path is marking now
+	RBT	RP,FWDPT0		:clear previous state
+	JR	RLINK			:** 4.02 LH for transparent TELEX
+
+	 FO	DATA
+	EM	:TTELEX
+	EI	:TTELEX
+ jr j
