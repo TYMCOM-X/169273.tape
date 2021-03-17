@@ -1,0 +1,1150 @@
+begin "RDMail"
+
+  require "(sailib)sail.def" source!file;
+  require "(MAILDEV)nbslib.req" source!file;
+
+simple integer procedure inc(reference integer vbl); 
+	start!code aos 1,vbl; end;
+
+define routine = "simple procedure";
+
+  define OURNAME = {"RdMail"};
+
+  define DEBUG = {false};
+  define DEBUG2 = {false};
+
+!	RRRR   DDDD   M   M   AAA   III   L
+!	R   R  D   D  MM MM  A   A   I    L
+!	RRRR   D   D  M M M  AAAAA   I    L
+!	R  R   D   D  M   M  A   A   I    L
+!	R   R  DDDD   M   M  A   A  III   LLLLL
+!
+!
+! Dave W. Smith,  June, 1982 ;
+
+  require 3 version;	! tried to speed up the setup /SDD 24-Jan-83;
+  require 2 version;	! added REDISTRIBUTE command /WRS 23-Jan-83;
+!
+!	V1.01	(23-Oct-82, kmd)
+!
+!	MAILBOX and RDMAIL.INI were being read from (and MAILBOX written
+!	to) the gfd'd directory ("the PPN" in the parlance). They are
+!	now referenced in the logged-in directory ("the AUN") instead.
+;
+! Information about messages in a given mailbox is kept in a set
+! of parallel arrays.  This isn't the ideal way to do things, but
+! it gets us up and going quickly. ;
+
+  define MSGMAX = 512;
+
+  integer MsgCnt;
+
+  integer array Msg!Bits[ 1 : MSGMAX ];
+  integer array Msg!Start[ 1 : MSGMAX ];
+  integer array Msg!Length[ 1 : MSGMAX ];
+  integer array Msg!PostedDate[ 1 : MSGMAX ];
+  string array Msg!From[ 1 : MSGMAX ];
+  string array Msg!To[ 1 : MSGMAX ];
+  string array Msg!Subject[ 1 : MSGMAX ];
+  string array Msg!Summary[ 1 : MSGMAX ];
+
+
+! Bits in MSG!Bits ;
+
+  define
+	Bit!UnRead	= '400000000000,
+	Bit!NewMail	= '200000000000,
+	Bit!Selected	= '100000000000,
+	Bit!Deleted	= '040000000000;
+! Information that we maintain about the date ;
+
+integer Day, Month, Year, DayOfWeek;
+
+preload!with
+ "Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday";
+string array WeekDayStr[ 1 : 7 ];
+
+preload!with
+ "January","February","March","April","May","June",
+ "July","August","September","October","November","December";
+string array MonthStr[ 1 : 12 ];
+
+preload!with
+ 31,28,31,30,31,30,31,31,30,31,30,31;
+integer array DaysPerMonth[ 1 : 12 ];
+
+routine Init!Date;
+  begin
+    integer T, Zone;
+    own integer array cnv[0:2];
+
+    T := call(0,"DATE" );
+    Day := ( T mod 31 ) + 1;
+    T := T div 31;
+    Month := ( T mod 12 ) + 1;
+    T := T div 12;
+    Year := 1964 + T;
+
+    ! the following magic yields the day of the week ;
+
+    zone := ( call('777777000006,"GETTAB") lsh -28 ) land '37;
+    cnv[0] := call('11000011,"GETTAB");
+    cnv[1] := call('10000011,"GETTAB");
+    cnv[2] := '400020400000 + Zone;
+    calli( location(cnv[0]), -'55 );
+    DayOfWeek := (( cnv[0] + 2 ) mod 7) + 1;
+
+  end;
+
+require Init!Date initialization;
+! Misc. ;
+
+  string CmdLine;
+  string Sender;
+
+  string LogFile;
+
+  integer Chan, EOF;
+  string MailBoxName, AunStr, IniFileName;  boolean ChangeFlag;
+  integer MailBoxSize, StartOfNewMail, WordsOfNewMail;
+
+  integer array Buffer[ 0 : 511 ];
+  integer WordPointer;
+  integer PageNumber;
+
+  integer array OutBuf[ 0 : 511 ];
+  integer X!Chan, X!Err, OutBufPnt;
+
+  integer CmdChan, CmdEOF, CmdBC, CmdBT;
+! Initialization stuff ;
+
+routine Init;
+  begin
+    define
+      !xwdstr (X) = {("[" & cvos(!lh(X)) & "," & cvos(!rh(X)) & "]")};
+
+    open( Chan := getchan, "DSK",'17,0,0,512,0,EOF );
+
+    setbreak( CmdBT := getbreak, '12, '15, "INS" );
+    open( CmdChan := getchan, "DSK", '0,1,0,512,CmdBC,CmdEOF );
+
+    AunStr := !xwdstr(call(-'23, "GETTAB"));
+    MailBoxName := MAILBOX & AunStr;
+    IniFileName := OURNAME & ".INI" & AunStr;
+
+    lookup( CmdChan, IniFileName, CmdEOF );
+
+    LogFile := NULL;
+
+  end;
+
+require Init initialization;
+! routine to get the next command line ;
+
+string routine GetLine( string Prompt );
+    if ( CmdEOF ) then
+      begin
+	print( Prompt );
+	return( inchwl );
+      end
+    else
+      begin
+	    string S;
+	S := input( CmdChan, CmdBT );
+	if ( CmdEOF ) then release( CmdChan );
+	return( S );
+      end;
+! Position us so that the next read will pick up word N ;
+
+routine PositionTo( integer N );
+  begin
+    integer P, W;
+
+    if ( MailBoxSize = 0 ) then return;
+
+    WordPointer := N;
+
+    P := (N ash -9) + 1;
+
+    if ( P neq PageNumber ) then
+      begin
+	PageNumber := P;
+	start!code
+	  move 1,Chan;
+	  hrli 1,'31;
+	  chanio 1,P;		! point to desired page ;
+	end;
+	arryin( Chan, Buffer[0], 512 );
+      end;
+
+  end;
+! Get the next word from the mailbox file ;
+
+integer routine GetWord;
+  begin "get a word"
+    own integer W, P, Word;
+
+    P := ( WordPointer ash -9 ) + 1;
+    if ( P neq PageNumber ) then
+      begin
+	PageNumber := P;
+	arryin( Chan, Buffer[0], 512 );
+      end;
+    W := WordPointer land '777;
+
+    Word := Buffer[ W ];
+    inc( WordPointer );
+
+    if ( DEBUG ) then
+      print( "GetWord -> '",
+	      ("00000000000"&cvos(Word))[inf-11 to inf], crlf );
+
+    return( Word );
+
+  end "get a word";
+! Sweep the mailbox ;
+
+procedure OpenMailBox( string FileSpec );
+  begin
+    integer Flag, Count, T, I;
+    integer array FInfo[ 0:5 ];
+    NBS!pointer N;
+
+    MsgCnt := 0;
+
+    lookup( Chan, FileSpec, Flag );
+    if ( Flag ) then
+      begin
+	print( "[No Old Mail]", crlf );
+	MailBoxSize := -1;
+	return;
+      end;
+
+    FileInfo( FInfo );
+    MailBoxSize := FInfo[ 5 ];
+    StartOfNewMail := MailBoxSize - WordsOfNewMail - 1;
+    WordPointer := 0;
+    PageNumber := -1;		! force first page in ;
+    ChangeFlag := false;
+
+! continued ... ;
+! continued ... ;
+
+    PositionTo( 0 );
+
+    print( "Loading... " );
+
+    while ( WordPointer < MailBoxSize ) do
+      begin "each packet"
+
+	InitBuffer;
+	print( inc( MsgCnt ), " " );
+
+	Msg!Start[ MsgCnt ] := WordPointer;
+	Msg!Bits[ MsgCnt ] := 0;
+	if ( WordPointer >= StartOfNewMail ) then
+	  Msg!Bits[ MsgCnt ] := Bit!NewMail;
+
+	T := GetWord;
+	if ( !rh( T ) neq '777777 ) then
+	  usererr( 0,0,"? Mail File is damaged!", "x" );
+	if ( T < 0 ) then
+	  Msg!Bits[ MsgCnt ] := Msg!Bits[ MsgCnt ] lor Bit!UnRead;
+
+	Count := GetWord;
+	if ( DEBUG ) then print( "count=",Count,crlf );
+	for I := 1 upto Count do
+	  begin
+	    T := GetWord;
+	    SinkWord( T );
+	  end;
+	if ( DEBUG ) then print( "end-of-packet", crlf );
+
+	N := new!record( NBS!Rec );
+	NBSUnpack( SourceByte, N );
+
+	Msg!PostedDate[ MsgCnt ] := cvd( NBS!Rec:PostedDate[N] );
+	Msg!To[ MsgCnt ] := NBS!Rec:To[N];
+	Msg!From[ MsgCnt ] := NBS!Rec:From[N];
+	Msg!Subject[ MsgCnt ] := NBS!Rec:Subject[N];
+	Msg!Summary[ MsgCnt ] := Summary( N );
+
+      end "each packet";
+
+    print( "."& crlf& "[", MsgCnt, " messages]"& crlf );
+
+  end;
+! routine to put a byte into the output buffer ;
+
+routine PutByte( integer B );
+  begin
+
+    if ( OutBufPnt = 512 ) then
+      begin
+	arryout( X!Chan, OutBuf[0], 512 );
+	arrclr( OutBuf );
+	OutBufPnt := 0;
+      end;
+
+    OutBuf[ OutBufPnt ] := B;
+    inc( OutBufPnt );
+
+  end;
+
+
+! Flush the buffer ;
+
+routine FlushBytes;
+    if ( OutBufPnt > 0 ) then
+      begin
+	arryout( X!Chan, OutBuf[0], OutBufPnt );
+      end;
+! ReWrite the mailbox - omitting deleted packets ;
+
+procedure ReWriteMailBox;
+  begin
+    integer I, C, W, Flag, OldIdx;
+
+    open( X!Chan:=getchan,"DSK",'17,0,0,512,0,X!Err );
+    enter( X!Chan, MailBoxName, Flag );
+    if ( Flag ) then
+      begin
+	print( "? Can't rewrite mailbox - error ",!rh(Flag), crlf );
+	return;
+      end;
+
+    arrclr( OutBuf );
+    OutBufPnt := 0;
+    PageNumber := -1;
+    PositionTo( 0 );
+
+    print( "Writing... " );
+
+    for OldIdx := 1 upto MsgCnt do
+      begin "each packet"
+
+	W := GetWord;
+	if ( !rh( W ) neq '777777 ) then
+	  usererr( 0,0,"? Mail file damage","x" );
+
+	C := GetWord;
+
+	if ( Msg!Bits[ OldIdx ] land Bit!Deleted ) then
+	  begin "delete"
+	    if ( DEBUG ) then
+	      print( "[Expunging message ",OldIdx,"]", crlf );
+	    for I := 1 upto C do GetWord;
+	  end "delete"
+	else
+	  begin "rewrite"
+	    PutByte( ( Msg!Bits[OldIdx] land Bit!UnRead ) + '777777 );
+
+	    PutByte( C );
+
+	    for I := 1 upto C do PutByte( GetWord );
+
+	  end "rewrite";
+
+      end "each packet";
+
+    FlushBytes;
+
+    close( X!Chan ); release( X!Chan );
+    close( Chan );
+
+    print( "Done", crlf );
+
+  end;
+! Read in packet and return NBS pointer;
+
+NBS!Pointer procedure Msg!NBS( integer N );
+  begin
+    NBS!pointer NBS;
+    integer T, Count, I;
+
+    PositionTo( Msg!Start[N] );
+
+    InitBuffer;
+
+    T := GetWord;
+    if ( !rh( T ) neq '777777 ) then
+      usererr( 0,0,"? Mail File is damaged!", "x" );
+
+    Count := GetWord;
+    if ( DEBUG ) then print( "count=",Count,crlf );
+    for I := 1 upto Count do
+      begin
+	T := GetWord;
+	if ( DEBUG ) then print( "'", cvos( T ), crlf );
+	SinkWord( T );
+      end;
+    if ( DEBUG ) then print( "end-of-packet", crlf );
+
+    NBS := new!record( NBS!Rec );
+    NBSUnpack( SourceByte, NBS );
+    return( NBS );
+    
+  end;
+! Read in and type out packet #N ;
+
+define TypePacket( integer!N ) = "NBSPrint( Msg!NBS( integer!N ) )";
+! Clear selection bits ;
+
+routine UnSelectAll;
+  begin
+    integer I;
+    for I := 1 upto MsgCnt do
+      Msg!Bits[I] := Msg!Bits[I] land lnot Bit!Selected;
+  end;
+
+! Select All messages ;
+
+routine SelectAll;
+  begin
+    integer I;
+    for I := 1 upto MsgCnt do
+      Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+  end;
+
+
+! Select "New" messages ;
+
+routine SelectNew;
+  begin
+    integer I;
+    for I := 1 upto MsgCnt do
+      if ( Msg!Bits[I] land Bit!NewMail ) then
+	Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+  end;
+
+
+! Select "old" messages ;
+
+routine SelectOld;
+  begin
+    integer I;
+    for I := 1 upto MsgCnt do
+      if ( not ( Msg!Bits[I] land Bit!NewMail )) then
+	Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+  end;
+
+! Select "unread" messages ;
+
+routine SelectUnRead;
+  begin
+    integer I;
+    for I := 1 upto MsgCnt do
+      if ( Msg!Bits[I] land Bit!UnRead ) then
+	Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+  end;
+
+! Select "read" messages ;
+
+routine SelectRead;
+  begin
+    integer I;
+    for I := 1 upto MsgCnt do
+      if ( not ( Msg!Bits[I] land Bit!UnRead )) then
+	Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+  end;
+! Routine to eat whitespace from the command line ;
+integer passWhite, passAlpha, passPrinting, 
+	oneToken, printing!comma;
+	
+simple procedure setup!break!tables;
+  begin	string nonPrinting, alpha;
+	integer ch;
+    nonPrinting := '177;
+    for ch := 0 step 1 until '40 do nonPrinting := nonPrinting & ch;
+    alpha := null;
+    for ch := "a"+0 step 1 until "z"+0, "A"+0 step 1 until "Z"+0 
+	do alpha := alpha & ch;
+
+    setbreak( passWhite := getbreak, #sp & #ht, null, "XR" );
+    setbreak( passAlpha := getbreak, alpha, null, "XR" );
+    setbreak( oneToken := getbreak, alpha, #sp & #ht, "XTR" );
+    setbreak(printing!comma := getbreak, nonPrinting & ",", null, "IR");
+  end;
+require setup!break!tables initialization;
+
+define EatWhitespace = "scan( CmdLine, passWhite, !skip! )";
+! procedure EatWhitespace;
+! begin
+!   while ( CmdLine = " " ) do lop( CmdLine );
+! end;
+
+
+! Routine to scan a number from the command line ;
+
+define ScanNumber = "intscan( CmdLine, !skip! )";
+! integer procedure ScanNumber;
+! begin
+!   integer N;
+!   N := 0;
+!   while (( CmdLine >= "0" ) and ( CmdLine <= "9" )) do
+!     N := ( N * 10 ) + lop( CmdLine ) - "0";
+!   return( N );
+! end;
+
+
+! Routine to scan a token from the command line ;
+
+define ScanToken = "scan(CmdLine, passAlpha, !skip!)";
+! string procedure ScanToken;
+! begin
+!   string T;
+!   T := NULL;
+!   while ((( CmdLine >= "a" ) and ( CmdLine <= "z" )) or
+!	   (( CmdLine >= "A" ) and ( CmdLine <= "Z" ))) do
+!     T := T & lop( CmdLine );
+!   return( T );
+! end;
+
+
+! Scan a string from the command line ;
+
+define ScanString = "scan( CmdLine, printing!comma, !skip! )";
+! string procedure ScanString;
+! begin
+!   string T;
+!   T := NULL;
+!   while (( CmdLine > " " ) and ( CmdLine neq "," )) do
+!     T := T & lop( CmdLine );
+!   return( T );
+! end;
+! Parse a FileSpec ;		! ** hack ** ;
+
+boolean routine ParseFileSpec;
+  begin
+!   string S;
+!   boolean DotSeen;
+ 
+    EatWhiteSpace;
+!
+!   S := NULL;
+!   DotSeen := false;
+!
+!   while ( CmdLine > " " ) do S := S & lop( CmdLine );	! ** hack ** ;
+!
+!   LogFile := S;
+LogFile := scan(CmdLine, printing!comma, !skip!);
+
+    return( true );
+  end;
+
+
+! set a default extension ;
+
+routine DefaultExtension( string E );
+  begin
+    string s;
+
+    s := LogFile;
+    while length(s) do if lop(s)="." then return;
+
+    LogFile := LogFile & "." & E;
+
+  end;
+! Parse a message field ;
+!
+! ** hack ** ;
+
+boolean routine ParseField( string F );
+  begin
+    String T; integer I;
+
+    T := ScanString;
+
+    if ( not MsgCnt ) then return( true );
+
+    if length( F ) = 0 then F := "<Empty>";
+
+    if ( kequ( F, "From"[1 for length(F)])) then
+      begin
+	for I := 1 upto MsgCnt do
+	  begin
+	    ! ** hack ** ;
+	    if ( kequ( T, Msg!From[I][1 to length(T)])) then
+	      Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+	  end;
+      end
+    else if ( kequ( F, "To"[1 for length(F)])) then
+      begin
+	for I := 1 upto MsgCnt do
+	  begin
+	    ! ** hack ** ;
+	    if ( kequ( T, Msg!To[I][1 to length(T)])) then
+	      Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+	  end;
+      end
+    else if ( kequ( F, "Subject"[1 for length(F)])) then
+      begin
+	for I := 1 upto MsgCnt do
+	  begin
+	    ! ** hack ** ;
+	    if ( kequ( T, Msg!Subject[I][1 to length(T)])) then
+	      Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+	  end;
+      end
+!    else if ( kequ( F, "Cc"[1 for length(F)])) then
+!      begin
+!	for I := 1 upto MsgCnt do
+!	  begin
+!	    ! ** hack ** ;
+!	    if ( kequ( T, Msg!Cc[I][1 to length(T)])) then
+!	      Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+!	  end;
+!      end ** ;
+    else
+      begin
+	print( "? Bad field - ",F,":", crlf );
+	return( false );
+      end;
+
+    return( true );
+  end;
+! Routine to calculate what the date was N days ago ;
+
+integer routine BackDate( integer N );
+  begin
+    integer Y, M, D;
+
+    N := abs( N );    
+    D := Day;
+    M := Month;
+    Y := Year;
+
+    while ( N ) do
+      begin "backward in time"
+	if ( D > N ) then
+	  begin
+	    D := D - N;
+	    N := 0;
+	  end
+	else
+	  begin
+	    N := N - D;
+	    M := M - 1;
+	    if ( M = 0 ) then
+	      begin
+		Y := Y - 1;
+		M := 12;
+	      end;
+	    D := DaysPerMonth[M];
+	    if ((M=2) and not (Y mod 4)) then inc( D );  ! leapyear ;
+	  end;
+      end "backward in time";
+
+    return( Y * 10000 + M * 100 + D );
+
+  end;
+! Parse a Date ;
+
+integer routine ParseDate;
+  begin "parse a date"
+    integer I, N1, N2, N3;
+    string T;
+
+    EatWhitespace;
+
+    if ( length( T := ScanToken )) then
+      begin "some token"
+
+	if ( length( T ) < 3 ) then
+	  begin
+	    print( "? Bad token in <date> - ", T, crlf );
+	    return( 0 );
+	  end;
+
+	if ( kequ( T, "Today"[1 to length(T)])) then
+	  return( Year * 10000 + Month * 100 + Day );
+
+	if ( kequ( T, "Yesterday"[1 to length(T)])) then
+	  return( BackDate( 1 ) );
+
+	for I := 1 upto 7 do
+	  if ( kequ( T, WeekdayStr[I][1 to length(T)])) then
+	    begin
+	      if ( I >= DayOfWeek ) then
+		return( BackDate( 7 - (I - DayOfWeek) ))
+	      else
+		return( BackDate( DayOfWeek - I ));
+	    end;
+
+	for I := 1 upto 12 do
+	  if ( kequ( T, MonthStr[I][1 to length(T)])) then
+	    begin
+	      if ( I > Month ) then
+		return( (Year-1)*10000 + I*100 + 1 )
+	      else
+		return( Year*10000 + I*100 + 1 );
+	    end;
+
+	print( "? Bad token in <date> - ", T, crlf );
+	return( 0 );
+	
+      end "some token"
+
+! continued ... ;
+! continued ... ;
+
+    else if ( CmdLine = "-" ) then
+      begin
+	lop( CmdLine );
+	if ( not ((CmdLine >= "0") and (CmdLine <="9"))) then
+	  begin
+	    print( "? Expected <const> in <date>", crlf );
+	    return( 0 );
+	  end;
+	N1 := ScanNumber;
+	return( BackDate( N1 ));
+      end
+    else
+      begin
+	if ( not ((CmdLine >= "0") and (CmdLine <="9"))) then
+	  begin
+	    print( "? Expected <const> in <date>", crlf );
+	    return( 0 );
+	  end;
+	print( "? <number> code not implemented", crlf );
+	return( 0 );
+      end;
+
+  end "parse a date";
+! procedure to select records 'after' a given date ;
+
+boolean routine SelectAfter;
+  begin
+    integer I, T;
+
+    if ( not ( T := ParseDate )) then return( false );
+
+    if ( DEBUG ) then print ( "[select after ",T,"]", crlf );
+
+    for I := 1 upto MsgCnt do
+      if ( Msg!PostedDate[I] >= T ) then
+	Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+
+    return( true );
+  end;
+
+
+! procedure to select records 'before' a given date ;
+
+boolean routine SelectBefore;
+  begin
+    integer I, T;
+
+    if ( not ( T := ParseDate )) then return( false );
+    print( "[select before ", T, "]", crlf );
+
+    for I := 1 upto MsgCnt do
+      if ( Msg!PostedDate[I] < T ) then
+	Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+
+    return( true );
+  end;
+! Routine to handle an individual criterion ;
+
+boolean routine ParseCriterion;
+  begin "parse a criterion"
+
+    integer N1, N2, I;
+    string T;
+
+    if ("0" <= CmdLine <= "9" ) then
+      begin
+	N1 := ScanNumber;
+	if ( CmdLine = "-" ) then
+	  begin "range"
+	    lop( CmdLine );
+	    N2 := ScanNumber;
+	    if (( N1 = 0 ) or ( N2 > MsgCnt ) or ( N1 >= N2 )) then
+	      begin
+		print( "? Bad numeric range", crlf );
+		return( false );
+	      end;
+	    for I := N1 upto N2 do
+	      Msg!Bits[I] := Msg!Bits[I] lor Bit!Selected;
+	  end "range"
+	else
+	  begin
+	    if (( N1 = 0 ) or ( N1 > MsgCnt )) then
+	      begin
+		print( "? Bad message number", crlf );
+		return( false );
+	      end;
+	    Msg!Bits[N1] := Msg!Bits[N1] lor Bit!Selected;
+	  end;
+      end
+    else if ( length( T := ScanToken )) then
+      begin
+	if ( CmdLine = ":" ) then
+	  begin
+	    lop( CmdLine );
+	    if ( not ParseField( T )) then return( false );
+	  end
+	else
+	  begin
+	    if ( kequ( T, "New"[1 to length(T)])) then SelectNew
+	    else if ( kequ( T, "Old"[1 to length(T)])) then SelectOld
+	    else if ( kequ( T, "Read"[1 ngth(T)])) then SelectRead
+	    else if ( kequ( T, "UnRead"[1 to length(T)])) then SelectUnRead
+	    else if ( kequ( T, "All" )) then SelectAll
+	    else if ( kequ( T, "After"[1 to length(T)])) then SelectAfter
+	    else if ( kequ( T, "Before"[1 to length(T)])) then SelectBefore
+	    else if ( kequ( T, "To" )) then
+	      begin
+		return( ParseFileSpec );
+	      end
+	    else
+	      begin
+		print( "? Bad keyword - ",T, crlf );
+		return( false );
+	      end;
+	  end;
+      end
+    else
+      begin
+	print( "? Bad character [", CmdLine[1 for 1],"]", crlf );
+	return( false );
+      end;
+
+    return( true );
+
+  end "parse a criterion";
+! Top level of our ad-hoc recruftive descent parser ;
+
+boolean routine ParseSelectionCriteria;
+  begin "parse"
+
+    UnSelectAll;
+
+    while ( true ) do
+      begin "parse a criterion"
+
+	if ( length( CmdLine ) = 0 ) then done "parse a criterion";
+
+	if ( not ParseCriterion ) then return( false );
+
+	if ( CmdLine = "," ) then lop( CmdLine );
+
+	EatWhiteSpace;
+
+      end "parse a criterion";
+
+    return( true );
+
+  end "parse";
+! Cpy the specified packets to another file ;
+
+routine CopyPackets;
+  begin
+    integer I;
+
+    if ( not MsgCnt ) then return;
+
+    if ( length( CmdLine )) then
+    if ( not ParseSelectionCriteria ) then return;
+
+    if ( not LogFile ) then
+      begin
+	print( "% No file specified", crlf );
+	return;
+      end;
+
+    DefaultExtension( "MAI" );
+
+    for I := 1 upto MsgCnt do
+      if (( Msg!Bits[I] land Bit!Selected ) and not
+	  ( Msg!Bits[I] land Bit!Deleted )) then
+	begin
+	  print( "% Can't yet copy #",I," to ",LogFile, crlf );
+	  ! archive ;
+	end;
+
+  end;
+! Delete specified packets ;
+
+routine DeletePackets;
+  begin
+    integer I;
+
+    if ( not MsgCnt ) then return;
+
+    if ( length( CmdLine )) then
+     if ( not ParseSelectionCriteria ) then return;
+
+    if ( LogFile ) then
+      print( "% Can't delete to a log file", crlf );
+
+    for I := 1 upto MsgCnt do
+      if (( Msg!Bits[I] land Bit!Selected ) and not
+	  ( Msg!Bits[I] land Bit!Deleted )) then
+	begin
+	  print( "Deleting ", I, crlf );
+	  Msg!Bits[I] := Msg!Bits[I] lor Bit!Deleted;
+	  ChangeFlag := true;
+	end;
+
+  end;
+! ListSummaries - list the specified summaries ;
+
+routine ListPackets;
+  begin
+    integer I;
+
+    if ( not MsgCnt ) then return;
+
+    if ( length( CmdLine )) then
+      if ( not ParseSelectionCriteria ) then return;
+
+    if ( LogFile ) then
+      begin
+	DefaultExtension( "LOG" );
+	setprint( LogFile, "F" );
+      end;
+
+    for I := 1 upto MsgCnt do
+      if (( Msg!Bits[I] land Bit!Selected ) and not
+	  ( Msg!Bits[I] land Bit!Deleted )) then
+	print( I, ". ", Msg!Summary[I], crlf );
+
+    setprint( NULL,"T" );
+
+  end;
+! Redistribute messages;
+
+procedure RedistributePackets;
+  begin
+    integer I;
+    NBS!Pointer NBS;
+    Name!Pointer DST;
+    if ( not MsgCnt ) then return;
+    if ( length( CmdLine )) then
+      if ( not ParseSelectionCriteria ) then return;
+    while length( logfile ) = 0 do begin
+	print( "Redistribute To: " );
+	logfile := inchwl;
+    end;
+    DST := CVNList( LogFile );
+    ExpandNames( DST );
+    print( "Redistributed: " );
+    for I := 1 upto MsgCnt do
+	if (( Msg!Bits[I] land Bit!Selected ) and not
+	    ( Msg!Bits[I] land Bit!Deleted )) then begin
+		print( I, " " );
+		NBS := Msg!NBS( I );
+		if( not kequ( NBS!Rec:From[nbs], Sender )) then
+		    NBS!Rec:Sender[nbs] := Sender;
+		NBSxmit( DST, NBS );
+	    end;
+    print( crlf );
+  end;
+! NextPacket - type the next selected packet ;
+
+procedure NextPacket;
+  begin
+    integer I, Bits;
+
+    if ( not MsgCnt ) then return;
+
+    if ( length( CmdLine )) then
+      if ( not ParseSelectionCriteria ) then return;
+
+    if ( LogFile ) then
+      print( "% Can't next to a log file", crlf );
+
+    for I := 1 upto MsgCnt do
+      if (( Msg!Bits[I] land Bit!Selected ) and not
+	  ( Msg!Bits[I] land Bit!Deleted )) then
+	begin
+	  print( "- ", I, " -", crlf );
+	  TypePacket( I );
+	  if ( Msg!Bits[I] land Bit!UnRead ) then ChangeFlag := true;
+	  Msg!Bits[I] := Msg!Bits[I] land lnot Bit!UnRead;
+	  Msg!Bits[I] := Msg!Bits[I] land lnot Bit!Selected;
+	  return;
+	end;
+
+    print( "[No more]", crlf );
+
+  end;
+! Purge - rewrite the mailbox, omitting all deleted packets ;
+
+routine PurgePackets;
+  begin
+
+    if ( not MsgCnt ) then return;
+
+    if ( length( CmdLine )) then
+      if ( not ParseSelectionCriteria ) then return;
+
+    if ( LogFile ) then
+      print( "% Can't purge to a log file", crlf );
+
+    ReWriteMailBox;
+    OpenMailBox( MailBoxName );
+
+  end;
+! Select - new selection criteria ;
+
+routine SelectPackets;
+  begin
+
+    UnSelectAll;
+
+    if ( length( CmdLine )) then ParseSelectionCriteria;
+
+    if ( LogFile ) then
+      print( "% Can't select to a log file", crlf );
+
+  end;
+! Type - list a packet ;
+
+procedure TypePackets;
+  begin
+    integer I;
+
+    if ( not MsgCnt ) then return;
+
+    if ( length( CmdLine )) then
+      if ( not ParseSelectionCriteria ) then return;
+
+    if ( LogFile ) then
+      begin
+	DefaultExtension( "LOG" );
+	setprint( LogFile, "F" );
+      end;
+
+    for I := 1 upto MsgCnt do
+      if (( Msg!Bits[I] land Bit!Selected ) and not
+	  ( Msg!Bits[I] land Bit!Deleted )) then
+	begin
+	  print( "- ", I, " -", crlf );
+	  TypePacket( I );
+	  if ( Msg!Bits[I] land Bit!UnRead ) then ChangeFlag := true;
+	  Msg!Bits[I] := Msg!Bits[I] land lnot Bit!UnRead;
+	end;
+
+    setprint( NULL, "T" );
+
+  end;
+! Undelete packets ;
+
+routine UndeletePackets;
+  begin
+    integer I;
+
+    if ( not MsgCnt ) then return;
+
+    if ( length( CmdLine )) then
+      if ( not ParseSelectionCriteria ) then return;
+
+    if ( LogFile ) then
+      print( "% Can't undelete to a log file", crlf );
+
+    for I := 1 upto MsgCnt do
+      if (( Msg!Bits[I] land Bit!Selected ) and
+	  ( Msg!Bits[I] land Bit!Deleted )) then
+	begin
+	  print( "Undeleting ", I, crlf );
+	  Msg!Bits[I] := Msg!Bits[I] land lnot Bit!Deleted;
+	end;
+  end;
+! Give help ;
+
+routine GiveHelp;
+  begin
+    print( "
+<command>   ::= COPY <criteria> TO <filespec>
+            ::= DELETE <criteria> | UNDELETE <criteria> | PURGE <criteria>
+            ::= LIST <criteria> | LIST <criteria> TO <filespec>
+            ::= TYPE <criteria> | TYPE <criteria> TO <filespec>
+	    ::= REDISTRIBUTE <criteria> | REDISTRIBUTE <criteria> TO <name>
+            ::= SELECT <criteria> | NEXT <criteria>
+            ::= QUIT
+<criteria>  ::= null | [ <criterion> ]*
+<criterion> ::= ALL | NEW | OLD | UNREAD | READ
+            ::= <message-number> | <message-number> '-' <message-number>
+            ::= AFTER <date> | BEFORE <date>
+            ::= FROM: <token> | TO: <token> | SUBJECT: <token>
+<date>      ::= MONDAY | ... | SUNDAY
+	    ::= JANUARY | ... | DECEMBER
+            ::= TODAY | YESTERDAY
+            ::= '-' <number>
+
+");
+  end;
+! The command loop lives here ;
+
+routine CommandLoop;
+  begin
+    string Cmd;
+
+    while ( true ) do
+      begin "command loop"
+
+        LogFile := NULL;
+
+	CmdLine := GetLine( "*" );
+
+	if ( not CmdLine ) then continue "command loop";
+
+	Cmd := ScanToken;
+	EatWhitespace;
+
+	if ( CmdLine = "?" ) then
+	  GiveHelp
+	else if ( kequ( Cmd, "Copy"[ 1 to length( Cmd )])) then
+	  CopyPackets
+	else if ( kequ( Cmd, "Delete"[ 1 to length( Cmd )])) then
+	  DeletePackets
+	else if ( kequ( Cmd, "Help"[ 1 to length( Cmd )])) then
+	  GiveHelp
+	else if ( kequ( Cmd, "List"[ 1 to length( Cmd )] )) then
+	  ListPackets
+	else if ( kequ( Cmd, "Next"[ 1 to length( Cmd )] )) then
+	  NextPacket
+	else if ( kequ( Cmd, "Purge"[ 1 to length( Cmd )] )) then
+	  PurgePackets
+	else if ( kequ( Cmd, "Quit"[ 1 to length( Cmd )] )) then
+	  done "command loop"
+	else if ( kequ( Cmd, "Redistribute"[1 to length( Cmd )] )) then
+	  RedistributePackets
+	else if ( kequ( Cmd, "Select"[ 1 to length( Cmd )] )) then
+	  SelectPackets
+	else if ( kequ( Cmd, "Type"[ 1 to length( Cmd )] )) then
+	  TypePackets
+	else if ( kequ( Cmd, "Undelete"[1 to length( Cmd )])) then
+	  UndeletePackets
+	else
+	  print( "Eh?  Type ? for help", crlf );
+
+      end "command loop";
+
+  end;
+! Top-level ;
+
+  WordsOfNewMail := NBSRecieve(MailBoxName);
+
+  Sender := cv6str( call( -'22, "GETTAB" )) &
+	cv6str( call( -'21, "GETTAB" )) &
+	":" & cvs( call( '33000011, "GETTAB" ));
+  if (WordsOfNewMail) then
+    print("[New Mail]", crlf);
+  InitAliasList;
+  OpenMailBox(MailBoxName);
+  StartOfNewMail := '377777777777;
+
+  CommandLoop;
+
+  if (ChangeFlag and (MailBoxSize > 0)) then ReWriteMailbox;
+
+  release(Chan);
+  release(CmdChan);
+  release(X!Chan);
+  call(0,"EXIT");
+
+end "RDMail";
+   io
