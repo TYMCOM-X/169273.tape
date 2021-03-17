@@ -1,0 +1,564 @@
+entry;
+begin "binary"
+
+   require "copypc.def" source!file;
+   require "copypc.ext" source!file;
+
+   external procedure TR.send.reset;
+
+   external procedure TR.get.decoded.packet;
+
+   external procedure TR.encode.and.send(integer array chksummed.packet;
+                                               integer number.of.bytes);
+
+   external procedure SU.get.unexpected.response;
+
+   external procedure SU.abort.transfer(integer abort.type);
+internal integer procedure BI.calculate.checksum
+                                    (integer array packet.to.checksum;
+                                     integer packet.size);
+
+   begin "calculate checksum"
+
+   integer sum,
+           i,
+           ptr,
+           pkt.byte;
+
+
+   sum := 0;
+   ptr := point(8,packet.to.checksum[0],-1);
+   for i := 1 step 1 until packet.size do
+      begin
+      pkt.byte := ildb(ptr);
+      sum := sum lsh 1;
+      if sum GEQ two14th then
+         begin
+         sum := (sum lor 1);
+         sum := sum land (two14th -1);
+         end;
+      sum := sum + pkt.byte;
+      if sum GEQ two14th then
+         begin
+         sum := sum + 1;
+         sum := sum land (two14th - 1);
+         end;
+      end;
+
+
+      return(sum);
+
+      end "calculate checksum";
+! incoming binary layer procedures;
+
+
+procedure BI.send.RFR;
+
+   begin "send RFR"
+
+   own integer array RFR.packet[0:2];
+   integer ptr,
+           RFR.size,
+           checksum;
+
+   arrclr(RFR.packet,0);
+   ptr := point(8,RFR.packet[0],-1);
+   ! assign RFR PTC (z);
+   idpb('172,ptr);
+   RFR.size := 1;
+   checksum := BI.calculate.checksum(RFR.packet,
+                                     RFR.size);
+   ptr := point(16,RFR.packet[0],7);
+   idpb(checksum,ptr);
+   RFR.size := 3;
+   TR.encode.and.send(RFR.packet,
+                      RFR.size);
+
+   end "send RFR";
+internal procedure BI.activate.timer(integer number.of.seconds);
+
+begin "activate"
+
+timeout := false;
+calli (number.of.seconds * 1000, calli.timer);
+
+end "activate";
+internal simple procedure BI.timer.interrupt;
+
+begin "interrupt"
+
+timeout := true;
+
+end "interrupt";
+procedure BI.send.ACK(integer PID);
+
+begin "send ACK"
+
+integer array ACK.packet[0:1];
+integer packet.size,
+        ack.char,
+        a.checksum,
+        l.checksum,
+        ACK.ptr;
+
+last.PID.ACKed := PID;
+ack.char := '170;             ! 'x';
+! create ACK;
+ACK.ptr := point(8,ACK.packet[0],-1);
+idpb(ack.char,ACK.ptr);
+
+
+idpb(PID,ACK.ptr);
+if PID + 1 LEQ top.of.PID.range then
+   PID := PID + 1
+else
+   PID := bottom.of.PID.range;
+idpb(PID,ACK.ptr);
+
+packet.size := 3;
+a.checksum := BI.calculate.checksum(ACK.packet,
+                                    packet.size);
+
+! save low-order byte of checksum;
+l.checksum := a.checksum LAND mask(8);
+! pick up next byte of checksum;
+a.checksum := a.checksum lsh -8;
+idpb(a.checksum,ACK.ptr);
+idpb(l.checksum,ACK.ptr);
+
+packet.size := packet.size + 2;
+
+TR.encode.and.send(ACK.packet,
+                   packet.size);
+
+end "send ACK";
+procedure BI.determine.packet.type(integer PTC.char;
+                                   reference integer PTC.type);
+
+begin "determine"
+
+PTC.type := 99;
+
+case PTC.char of
+   begin
+   ['170] PTC.type := ACK.type;
+   ['171] PTC.type := NAK.type;
+   ['172] PTC.type := RFR.type;
+   ['167] PTC.type := d.c.type
+   end;
+
+end "determine";
+internal procedure BI.check.for.timeout;
+
+begin "check"
+
+if timeout then
+   begin
+! debug ;
+print ("timeout.type: ", timeout.type, " incoming.counter: ", incoming.timeout.counter, " outgoing.timeout.counter: ", outgoing.timeout.counter, crlf);
+   case timeout.type of
+      begin
+      [shut.off] ! no-op; ;
+      [waiting.for.ACK]
+         begin
+!         BI.send.RFR;
+         outgoing.timeout.counter := outgoing.timeout.counter + 1;
+         if outgoing.timeout.counter > max.outgoing.timeouts then
+            SU.abort.transfer(max.outgoing.timeouts.error);
+         end;
+      [waiting.for.data.cmd]
+         begin
+         BI.send.ACK(last.PID.ACKed);
+         incoming.timeout.counter := incoming.timeout.counter + 1;
+         if incoming.timeout.counter > max.incoming.timeouts then
+            SU.abort.transfer(max.incoming.timeouts.error);
+         end
+      end;
+
+   BI.activate.timer(number.of.seconds);
+   end;
+
+end "check";
+procedure BI.put.packet.in.incoming.window;
+
+begin "put in window"
+
+integer PID.byte;
+
+PID.byte := ildb(incoming.packet.ptr);
+
+! print(crlf,"PID on incoming packet:  ",PID.byte,crlf);
+! print("current incoming PID:  ",current.incoming.PID,crlf);
+
+
+
+incoming.packet.size := incoming.packet.size - 1;
+
+! be sure this is the packet you're expecting;
+if PID.byte = current.incoming.PID then
+   begin
+   BI.send.ACK(current.incoming.PID);
+   if PID.byte = top.of.PID.range then
+      current.incoming.PID := bottom.of.PID.range
+   else
+      current.incoming.PID := PID.byte + 1;
+   have.in.sequence.packet := true;
+   end;
+
+end "put in window";
+procedure BI.get.good.chksummed.pkt;
+
+begin "get good"
+
+integer the.chksum;
+boolean good.chksum;
+
+
+! internal to BI.get.good.chksummed.pkt;
+
+boolean procedure BI.validate.chksum;
+
+begin "validate"
+
+integer chksum.ptr,
+        chksum.spot,
+        o.checksum,
+        old.checksum;
+
+! grab checksum on packet;
+chksum.spot := (incoming.packet.size - 2) div 4;    ! index into packet;
+chksum.ptr :=
+   point(8,incoming.packet[chksum.spot],
+        (((incoming.packet.size - 2) mod 4) * 8) -1);
+old.checksum := ildb(chksum.ptr);
+! ! PRINT("FIRST CHECKSUM BYTE: ", old.checksum, crlf);
+
+old.checksum := old.checksum lsh 8;
+
+
+o.checksum := ildb(chksum.ptr);
+! print ("SECOND CHECKSUM BYTE: ", o.checksum, crlf);
+
+o.checksum := o.checksum + old.checksum;
+
+
+old.checksum := BI.calculate.checksum(incoming.packet,
+                                      incoming.packet.size - 2);
+! print ("Our checksum: ", old.checksum, crlf);
+
+if old.checksum = o.checksum then
+   return(true)
+else
+   return(false);
+
+end "validate";
+! code for BI.get.good.chksummed.pkt;
+
+good.chksum := false;
+do
+   begin
+   TR.get.decoded.packet;
+
+   ! reset timer and counters whenever a packet comes in;
+   incoming.timeout.counter := 0;
+   outgoing.timeout.counter := 0;
+   timeout.type := shut.off;
+   BI.activate.timer(0);
+
+   if BI.validate.chksum then
+      begin
+! print ("VALIDATED CHECKSUM!!!", CRLF);
+
+      incoming.packet.size := incoming.packet.size - 2;
+      good.chksum := true;
+      end
+   else
+      begin
+! PRINT ("CAN'T VALIDATE CHECKSUM!!!", CRLF);
+
+      if equ(direction.of.transfer,"TOHOST") then
+         BI.send.ACK(last.PID.ACKed)
+      else        ! TOPC;
+         if in.startup.mode then
+            begin
+!             print("I am sending an ACK",crlf);
+            BI.send.ACK(top.of.PID.range);
+            end
+         else
+            begin
+!             print("I am sending an RFR",crlf);
+!            BI.send.RFR;
+            end;
+
+      BI.activate.timer(number.of.seconds);
+      end;
+   end
+until good.chksum;
+
+end "get good";
+internal procedure BI.get.incoming.packet;
+
+begin "get incoming"
+
+integer PTC.char,
+        PTC.type;
+
+! internal to BI.get.incoming.packet;
+
+procedure BI.respond.to.flow.control.packet;
+
+begin "respond"
+
+integer ACK.PID,
+        NAK.PID,
+        a.ptr;
+
+case PTC.type of
+   begin
+   [ACK.type]
+      begin
+      a.ptr := point(8,incoming.packet[0],7);  ! pick up 2nd byte;
+      ACK.PID := ildb(a.ptr);
+      if ACK.PID = current.outgoing.PID then
+         greatest.outgoing.PID := ACK.PID + 1      ! window size is 1;
+      else
+         TR.encode.and.send(current.outgoing.packet,
+                            current.outgoing.packet.size);
+      end;
+   [NAK.type]
+      begin
+      a.ptr := point(8,incoming.packet[0],7);
+      NAK.PID := ildb(a.ptr);
+      if NAK.PID = current.outgoing.PID then
+         TR.encode.and.send(current.outgoing.packet,
+                            current.outgoing.packet.size)
+      else
+!         BI.send.RFR;
+      end;
+   [RFR.type]
+      BI.send.ACK(last.PID.ACKed)
+   end;     ! case;
+
+end "respond";
+! code for BI.get.incoming.packet;
+
+while not have.in.sequence.packet do
+   begin
+   if timeout.type = shut.off then
+      begin
+      timeout.type := waiting.for.data.cmd;
+      BI.activate.timer(number.of.seconds);
+      end;
+
+   BI.get.good.chksummed.pkt;    ! returns incoming.packet & size;
+
+   ! strip off PTC byte;
+   incoming.packet.ptr := point(8,incoming.packet[0],-1);
+   PTC.char := ildb(incoming.packet.ptr);
+   incoming.packet.size := incoming.packet.size - 1;
+
+   BI.determine.packet.type(PTC.char,
+                            PTC.type);
+
+   if (PTC.type > 3) OR (PTC.type < 0) then
+      SU.abort.transfer(PTC.error);
+
+   case PTC.type of
+      begin
+      [ACK.type] [NAK.type] [RFR.type]
+         BI.respond.to.flow.control.packet;
+      [d.c.type]
+         BI.put.packet.in.incoming.window
+      end;     ! case;
+   end;                    ! while;
+
+have.in.sequence.packet := false;
+
+end "get incoming";
+
+
+
+
+! end "incoming binary" ;
+! outgoing binary procedures;
+
+
+
+internal procedure BI.finish.pkt;
+
+   begin "finish packet"
+
+   integer PTC.type;
+
+
+
+
+   simple procedure BI.assign.header;
+
+      begin "assign header"
+
+      outgoing.packet.ptr := point(8,outgoing.packet[0],-1);
+      ! insert data/cmd PTC as first byte;
+      idpb('167,outgoing.packet.ptr);
+      current.outgoing.PID := current.outgoing.PID + 1;
+      if current.outgoing.PID > top.of.PID.range then
+         current.outgoing.PID := bottom.of.PID.range;
+      ! insert PID as second byte;
+      idpb(current.outgoing.PID,outgoing.packet.ptr);
+      outgoing.packet.size := outgoing.packet.size + 2;
+
+      end "assign header";
+simple procedure BI.put.pkt.with.header;
+
+   begin "put pkt with hdr"
+
+   integer checksum1,
+           checksum2;
+
+
+
+   simple procedure BI.send.packet;
+
+      begin "send packet"
+
+      integer PID1;
+      boolean packet.sent;
+
+
+      simple procedure BI.put.pkt.in.out.window;
+
+         begin "put pkt in out window"
+
+         arrtran(last.outgoing.packet,current.outgoing.packet);
+         last.outgoing.packet.size := current.outgoing.packet.size;
+         arrtran(current.outgoing.packet,outgoing.packet);
+         current.outgoing.packet.size := outgoing.packet.size;
+
+         end "put pkt in out window";
+simple procedure BI.get.ACK(integer PTC.type);
+
+   begin "get ACK"
+
+   integer PTC.char;
+
+
+
+   simple procedure BI.put.micro.abort.msg;
+
+      begin "put abort msg"
+
+      BI.put.packet.in.incoming.window;
+      SU.get.unexpected.response;
+
+      end "put abort msg";
+
+
+
+   ! get ACK code;
+
+   BI.get.good.chksummed.pkt;
+   incoming.packet.ptr := point(8,incoming.packet[0],-1);
+   PTC.char := ildb(incoming.packet.ptr);
+   BI.determine.packet.type(PTC.char,
+                    PTC.type);
+   if PTC.type = d.c.type then
+      BI.put.micro.abort.msg;
+
+   end "get ACK";
+! send packet code;
+
+BI.put.pkt.in.out.window;
+packet.sent := false;
+
+do
+   begin
+   if (current.outgoing.PID LEQ greatest.outgoing.PID) OR
+      (current.outgoing.PID = top.of.PID.range AND
+       greatest.outgoing.PID = bottom.of.PID.range) then
+      begin
+      TR.encode.and.send(current.outgoing.packet,
+                         current.outgoing.packet.size);
+      timeout.type := waiting.for.ACK;
+      BI.activate.timer(number.of.seconds);
+      packet.sent := true;
+      if in.closeup.mode then
+         begin
+         timeout.type := shut.off;
+         BI.activate.timer(0);
+         end;
+      end
+   else
+      begin
+      BI.get.ACK(PTC.type);
+      incoming.packet.ptr := point(8,incoming.packet[0],7);
+      PID1 := ildb(incoming.packet.ptr);
+      if PTC.type = ACK.type then
+         begin
+         incoming.packet.size := 0;    ! for VPL, don't confuse an ACK
+                                         with a data/cmd packet ;
+         if ((current.outgoing.PID = bottom.of.PID.range) AND
+            (PID1 = top.of.PID.range)) OR
+            (current.outgoing.PID = PID1 + 1) then
+            begin
+            greatest.outgoing.PID := greatest.outgoing.PID + 1;
+            if greatest.outgoing.PID > top.of.PID.range then
+               greatest.outgoing.PID := bottom.of.PID.range;
+            end
+         else
+            TR.encode.and.send(last.outgoing.packet,
+                               last.outgoing.packet.size);
+         end
+      else
+         if ((current.outgoing.PID = bottom.of.PID.range) AND
+            (PID1 = top.of.PID.range)) OR
+            (current.outgoing.PID = PID1 + 1) then
+            TR.encode.and.send(last.outgoing.packet,
+                               last.outgoing.packet.size)
+         else
+!            BI.send.RFR;
+      end;
+   end
+
+until packet.sent;
+
+end "send packet";
+! put pkt with hdr code;
+
+checksum2 := BI.calculate.checksum(outgoing.packet,
+                                   outgoing.packet.size);
+checksum1 := checksum2 lsh -8;
+checksum2 := checksum2 lsh 28;
+checksum2 := checksum2 lsh -28;
+
+print(crlf,"cheskum1 = ",checksum1,"   cheskum2 = ",checksum2,crlf);
+
+
+! position pointer at end of packet to append checksum;
+outgoing.packet.ptr := point(8,
+                       outgoing.packet[outgoing.packet.size div 4],
+                       ((outgoing.packet.size mod 4) * 8) - 1);
+idpb(checksum1,outgoing.packet.ptr);
+idpb(checksum2,outgoing.packet.ptr);
+outgoing.packet.size := outgoing.packet.size + 2;
+
+
+BI.send.packet;
+
+end "put pkt with hdr";
+   ! finish packet code;
+
+   if need.reset then
+      begin
+      TR.send.reset;
+      need.reset := false;
+      end;
+
+   BI.assign.header;
+   BI.put.pkt.with.header;
+
+   end "finish packet";
+
+
+
+end "binary";
+   
