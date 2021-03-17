@@ -1,0 +1,315 @@
+*	SNODDT -- A Program to Aid in Debugging SNOBOL Programs
+*	-------------------------------------------------------
+*
+*	Initialization and Definitions
+*	------------------------------
+*
+*	Revision History:
+*
+*	1	Fix a problem with $E, so it handles errors ok.
+*	2	Fix TMSG  so that it will return instead
+*		of going to SNODDT when finishing a trap from a $X or $E.
+
+	SETEXIT(.exterr	);		&ERRLIMIT = 1000000
+	fullname = 'SNOBOL';	name = 'SNO';	&VERSION = 2
+
+	OUTPUT(.ddtout,'TTY:');		in.file	= 'TTY:'
+	INPUT(.ddtchr,in.file,'C');	INPUT(.ddtin,in.file,'T')
+	OUTPUT(.ddttty,'TTY:','T')
+
+	DEFINE('SNODDT()',.snoddt);	OPSYN(.snoddt,.SNODDT)
+	DEFINE('scan()');		DEFINE('getnam()')
+	DEFINE('getint()');		DEFINE('getexp()')
+	DEFINE('cv.str(cv.str)');	DEFINE('image(image)dt')
+	DEFINE('spsh(s)');		DEFINE('spop(s)')
+
+	DATA('stk(hed)');		DATA('nod(lst,val)')
+	ddtstk	= stk();		filstk	= stk()
+
+	crlf	= ASCII(15) ASCII(12);	tab	= ASCII(11)
+
+	altpat	= POS(0) (SPAN(crlf) ! null) RTAB(1) . line ASCII(33)
+	brkpat	= BREAK(crlf ';"' "'") (ANY('"' "'") $ q BREAK(*q)
++   LEN(1) *brkpat ! null)
+	scnpat	= POS(0) (*brkpat . scan (';' ! crlf) ! (LEN(1)
++   &REM) . scan) &REM . line
+	nampat	= POS(0) (SPAN(' ' tab) ! null) ('.' ! null)
+	intpat	= POS(0) (SPAN(' ' tab) ! null) (ANY('0123456789') &REM) . x
+	lstpat = ((BREAK('=_') '=' ! '_') ! '') ((BREAK(',+') ',' ! '+') ! '') REM . file
+
+	X.tbl	= TABLE(7)
+	X.tbl['F'] = F.tbl = TABLE(7);	X.tbl['S'] = S.tbl = TABLE(7)
+	X.tbl['C'] = TABLE(7);		X.tbl['R'] = TABLE(7)
+	X.tbl['T'] = T.tbl = TABLE(7);	X.tbl['B'] = B.tbl = TABLE(7)
+
+	DATA('blok(cnt,exp,tag)');	DATA('process(typ,fcn,act,lvl)')
+	Fprocess = process('F',.F.trap,1,1000)
+	Sprocess = process('S',.S.trap,1,-1000)
+	Tprocess = process('S',.T.trap,1,-900)
+	Bprocess = process(,.B.trap,1,1000)
+
+	DEFINE('S.trap(name,S.trap)');	DEFINE('F.trap(name,F.trap)')
+	DEFINE('T.trap(name,T.trap)');	DEFINE('CR.trap(name,c)')
+	DEFINE('B.trap(name,c)');	DEFINE('O.trap()');
+	C.msg = 'return from ';	R.msg = 'return from ';	DEFINE('D.trap(name,msg)')
+	CONNECT('ddt',process(,.D.trap,1,1))	:(last)
+-newpage
+*	Main Debugging Function
+*	-----------------------
+
+* SNODDT() -- get debugging expressions and evaluate them.
+*
+snoddt
+cmdret	z.flag	= r.flag = line	=
+	ddttty	= '>>'
+loop1	line1	= ddtin					:F(rewind)
+	line	= line line1
+	line	? altpat				:F(loop1)
+cmd	c	= REPLACE(ddtchr,'abcdefghijklmnopqrstuvwxyz',
++   'ABCDEFGHIJKLMNOPQRSTUVWXYZ')			:F(error)
+	ddtout	= LNE(c,'0')				:S(disp)
+	z.flag	= EQ(z.flag) 1				:S(cmd)F(error)
+disp	LABEL(c '.cmd')					:S($(c '.cmd'))
+error	ddtout	= ASCII(7) '??'				:(cmdret)
+
+rewind	REWIND(in.file) ENDFILE(in.file)
+	in.file	= spop(filstk)				:S(in.file)
+	in.file	= 'TTY:'
+in.file	INPUT(.ddtin,in.file,'T') INPUT(.ddtchr,in.file,'C')	:(cmdret)
+
+* exp$X -- execute an expression and display the result.
+*
+X.cmd	r.flag	= EQ(r.flag) 1		:F(error)
+	spsh(ddtstk)	= scan()				:F(cmdret)
+	ddtout	= image(EVAL(spop(ddtstk)))			:S(cmdret)
+	ddtout	= '%Failed'				:(cmdret)
+
+* exp$E -- execute an expression.
+*
+E.cmd	r.flag	= EQ(r.flag) 1		:F(error)
+	spsh(ddtstk)	= x				:F(cmdret)
+	ddtout	= \EVAL(spop(ddtstk)) '%Failed'			:(cmdret)
+
+* string$K -- compile SNOBOL4 code.
+*
+K.cmd	ddtout	= \CODE(line) '%Compilation failed'	:(cmdret)
+
+* label;offset$G -- go to a specified statement and begin execution.
+*
+G.cmd	x	= getnam()				:F(RETURN)
+	c	= getint()				:F(error)
+	ddtout	= \LABEL(x,c) '%Stmt not defined'	:F<WHERE(x,c)>
++							 S(cmdret)
+
+* name;cnt;exp;tag$F -- commence fetch monitoring on a variable.
+* name;cnt;exp;tag$S -- commence store monitoring on a variable.
+*
+F.cmd;S.cmd
+	x	= getnam()				:F(error)
+	NE(z.flag) DISASSOCIATE(x,$(c 'process'))	:S(cmdret)
+	X.tbl[c][x] = blok(getint(),getexp(),cv.str(x))	:F(error)
+	tag(X.tbl[c][x]) = scan()
+	DISASSOCIATE(x,$(c 'process'))
+	ASSOCIATE(x,$(c 'process'))			:(cmdret)
+
+* name;cnt;exp;tag$C -- commence call monitoring of a function.
+* name;cnt;exp;tag$R -- commence return monitoring of a function.
+*
+C.cmd;R.cmd
+	x	= getnam()				:F(error)
+	EQ(z.flag)					:S(CRcmd1)
+	STOPTR(x,c)					:(cmdret)
+CRcmd1	X.tbl[c][x] = blok(getint(),getexp(),cv.str(x))	:F(error)
+	tag(X.tbl[c][x]) = scan()
+	TRACE(x,c,c,.CR.trap)				:(cmdret)
+
+* name;type;tag$T -- declare a type for a variable.
+*
+T.cmd	x	= getnam()				:F(error)
+	NE(z.flag) DISASSOCIATE(x,Tprocess)		:S(cmdret)
+	T.tbl[x] = blok(0,getnam(),cv.str(x))		:F(error)
+	tag(T.tbl[x]) = scan()
+	DISASSOCIATE(x,Tprocess)
+	ASSOCIATE(x,Tprocess)				:(cmdret)
+
+* label;offset;cnt;exp;tag$B -- set a breakpoint.
+*
+B.cmd	x	= getnam()				:F(error)
+	c	= getint()				:F(error)
+	ddtout	= \LABEL(x,c) '%Stmt not defined'	:S(cmdret)
+	NE(z.flag) REMOVEBP(x,c,Bprocess)		:S(cmdret)
+	line1	= x
+	line1	= GT(c) x '+' c
+	line1	= LT(c) x c
+	B.tbl[x = WHERE(x,c)] = blok(getint(),getexp(),line1)
++							:F(error)
+	tag(B.tbl[x]) = scan()
+	REMOVEBP(x,,Bprocess) INSERTBP(x,,Bprocess)	:(cmdret)
+
+* n$P -- proceed from breakpoint or monitoring trap.
+*
+P.cmd	cnt(spop(ddtstk)) = getint()			:S(RETURN)F(error)
+
+* file$Y -- take commands from a file.
+*
+Y.cmd	x	= scan()				:F(error)
+	ddtout	= \FILE(x) '%File(s) not found'		:S(cmdret)
+	spsh(filstk) = in.file
+	in.file	= x					:(in.file)
+
+* f1;f2;f3;...;fn$D -- dump a structure.
+*
+D.cmd	line1	= scan()				:F(error)
+Dcmd1	x	= scan()				:F(Dcmd2)
+	line1	= ?(x ? intpat) line1 '<' x '>'		:S(Dcmd1)
+	line1	= x '(' line1 ')'			:(Dcmd1)
+Dcmd2	x	= EVAL(line1)				:F(error)
+	ddtout	= ?CONVERT(x,.STRING) cv.str(x)		:S(cmdret)
+	FUNCTION(.DUMPS) DUMPS(x,tab)			:S(cmdret)
+	DUMP(x)						:(cmdret)
+
+* $H -- type SNODDT help file.
+*
+H.cmd	FILE('HLP:SNODDT.HLP') INPUT(.x,'HLP:SNODDT.HLP')	:S(2)
+	ddtout	= \(FILE('SNO:SNODDT.HLP') INPUT(.x,'SNO:SNODDT.HLP'))
++   '%No help file'					:S(cmdret)
+	ddtout	= x					:S()
+	DETACH(.x)
+	ENDFILE('HLP:SNODDT.HLP') ENDFILE('SNO:SNODDT.HLP')
+	REWIND('HLP:SNODDT.HLP') REWIND('SNO:SNODDT.HLP'):(cmdret)
+
+
+* file$z -- exit from SNODDT
+*
+
+Z.cmd	x = CONVERT(scan(),.STRING)			:F(zcmd1)
+	EXIT(-1,,x)					:F(error)S(cmdret)
+zcmd1	CODE('end	:(END)' crlf 'END')		:F(END)S(end)
+
+* cnt;end;file$l -- list from cnt to end of file
+*
+
+L.cmd	file =;	cnt = getint()			:S(2)
+	cnt = 0
+	end = getint()
+	EQ(end)					:F(2)
+	end = cnt
+	file = CONVERT(scan(),.STRING)		:S(lcmd2)
+	&COMMAND ? lstpat
+	file = file \(file ? '.') '.SNO'	;* change 'sno' to default ext.
+lcmd1	EQ(cnt)				:S(lcmd2)
+	cnt = cnt - last.line;	end = end - last.line
+	LE(cnt) LE(end)		:S(error)
+lcmd2	ddtout = \FILE(file) '%File not found'	:S(cmdret)
+	INPUT(.src,file);	cnt1 =
+lcmd3	line = src				:F(lcmd4)
+	LE(cnt)					:S(lcmd0)
+	cnt1 = cnt1 + 1
+	GE(cnt1,cnt) LE(cnt1,end)		:F(lcmd3)
+lcmd0	ddttty = line crlf			:(lcmd3)
+lcmd4	ENDFILE(file);	REWIND(file)		:(cmdret)
+
+
+* $i -- restart to intial debugging
+*
+
+I.cmd	OUTPUT(.tmp,LPAD(&JOBNO,3,'0') name '.TMP')	:F(error)
+	x = scan()					:F(2)
+	tmp = x						:F(error)S(icmd1)
+	tmp = &COMMAND					:F(error)
+icmd1	RUN(fullname,1)
+	RUN('SYS:' fullname,1)				:F(error)
+
+-newpage
+
+* Here on execution-time errors.  Issue message and enter snoddt
+*
+exterr	ddtout = '?' &ERRNAME ' in stmt ' &LASTNO ', level '
++	&FNCLEVEL
+	ddtout = &ERRMSG
+	SETEXIT(.exterr)				:F(err1)
+	err = "'" cv.str(&ERRPARM) "'"
+	ddtout	= EQ(&ERRTYPE,9001) err ' is not defined'
+	ddtout	= EQ(&ERRTYPE,8002) err ' is not a label'
+	ddtout	= EQ(&ERRTYPE,9003) err ' is not an entry point'
+	ddtout	= LE(&ERRTYPE,1999) err
++   ' is of an illegal datatype'
+err1	spsh(ddtstk) = blok()
+	snoddt()					:(CONTINUE)
+
+* Here on a breakpoint, datatype, fetch, store, call or return trap.
+*
+D.trap	x	= blok()				:(tmsg)
+
+B.trap	msg	= c ', break at ' tag(x = B.tbl[name])	:(trap)
+
+T.trap	msg	= &LASTNO ', attempt to assign ' DATATYPE(T.trap) ' to '
++   tag(x = T.tbl[name])
+	IDENT(.$DATATYPE(T.trap),exp(x))		:S(RETURN)F(tmsg)
+
+F.trap	msg	= &LASTNO ', ' tag(x = F.tbl[name]) ' fetched, value = '
++   image(F.trap)					:(trap)
+
+S.trap	msg	= &LASTNO ', ' tag(x = S.tbl[name]) ' assigned '
++   image(S.trap)					:(trap)
+
+CR.trap	msg	= &LASTNO ', ' $(c '.msg') tag(x = X.tbl[c][name])
+
+trap	cnt(x)	= NE(cnt(x)) cnt(x) - 1			:S(RETURN)
+	EVAL(exp(x))					:F(RETURN)
+tmsg	ddtout	= DUPL('! ',&FNCLEVEL - 1) 'Stmt ' msg
+	EQ(r.flag)			:S(snoddt)F(RETURN)
+-newpage
+*	Scanner and Misc. Functions
+*	---------------------------
+
+* scan() -- the command scanner.  Returns next token from input line.
+* Fails if the line is empty.
+*
+scan	DIFFER(line)					:F(FRETURN)
+	line	? scnpat				:(RETURN)
+
+* getnam() -- return a name.  Fails if scan() fails or not a name.
+*
+getnam	getnam	= scan()				:F(FRETURN)
+	getnam	? nampat = '.'				:F(FRETURN)
+	getnam	= EVAL(getnam)				:S(RETURN)F(FRETURN)
+
+* getint() -- return an integer.  If scan() fails, return null.
+*
+getint	getint	= scan()				:F(RETURN)
+	getint	= CONVERT(getint,.INTEGER)		:S(RETURN)F(FRETURN)
+
+* getexp() -- return an expression.  If scan() fails, return null.
+*
+getexp	getexp	= scan()				:F(RETURN)
+	LEQ(getexp)					:S(RETURN)
+	getexp	= CONVERT(getexp,.EXPRESSION)		:S(RETURN)F(FRETURN)
+
+* spsh(s) -- push onto stack s.
+*
+spsh	hed(s)	= nod(hed(s))
+	spsh	= .val(hed(s))				:(NRETURN)
+
+* spop(s) -- pop stack s and return value.  Fails if stack is empty.
+*
+spop	spop	= DIFFER(hed(s)) val(hed(s))		:F(FRETURN)
+	hed(s)	= lst(hed(s))				:(RETURN)
+
+* cv.str(cv.str) -- convert argument to string for printing.  If
+* convert fails return <datatype>.
+*
+cv.str	cv.str	= CONVERT(cv.str,.STRING)		:S(RETURN)
+	cv.str	= '<' DATATYPE(cv.str) '>'		:(RETURN)
+
+* image(image) -- construct printable image of an object.
+*
+image	dt	= DATATYPE(image)
+	image	= LEQ(dt,'STRING') "'" image "'"	:S(RETURN)
+	image	= CONVERT(image,.STRING)		:S(RETURN)
+	image	= LNE(dt,'ARRAY') LNE(dt,'TABLE') dt	:S(RETURN)
+	image	= dt '(' PROTOTYPE(image) ')'		:(RETURN)
+
+last	last.line = &STNO + 1	;* last line in SNODDT
+snoddt.end	ddttty = '[Entering SNODDT]' crlf;	snoddt()
+   
