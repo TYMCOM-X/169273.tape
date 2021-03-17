@@ -1,0 +1,473 @@
+begin "disread"
+require 2 version;
+require "(SAILIB)SAIL.DEF" source!file;
+!get!module(randio);
+let routine=procedure, andThen = and;
+define #spaces(n)={("                              "[1 for n])};
+
+require "cvhex.dcl" source!file;
+	
+integer lineBreak, commaBreak, inkToken; 
+simple procedure setupB;
+begin
+setbreak(lineBreak_ getbreak, #lf & #ff, #lf & #ff & #cr, "INST");
+setbreak(commaBreak_getbreak, ",", null, "IS");
+setbreak( inkToken_ getbreak, #sp & #ht, #sp & #ht, "IAT");
+end;
+require setupB initialization;
+record!class seg(integer segment, offbeg, offend; 
+		integer array bits; string array contents;
+		r!p(seg) next );
+r!p(seg) main;
+
+
+r!p(seg) procedure makeDis( integer low, top, segment(-1) );
+begin	integer array block[low:top];
+	string array text[low:top];
+	r!p(seg) r;
+r_new!record(seg);
+seg:segment[r]_ segment;
+seg:offbeg[r]_ low;
+seg:offend[r]_ top;
+arrclr(block);	! start with nice clean storage;
+arrclr(text);	! start with nice clean storage; 
+memory[location(block)] swap memory[location(seg:bits[r])];
+	! put BLOCK into the record, remove whatever is in BITS;
+memory[location(text)] swap memory[location(seg:contents[r])];
+	! put TEXT into the record, remove whatever is in CONTENTS;
+return(r);
+end;
+
+procedure oneByte( r!p(seg) r; integer offset, setBits, clearBits );
+if seg:offbeg[r] leq offset leq seg:offend[r] 
+ then seg:bits[r][offset]_ (seg:bits[r][offset] lor setBits) 
+				land lnot clearBits;
+
+
+procedure manyBytes( r!p(seg) r; 
+			integer offset, count, setBits, clearBits );
+begin	integer loc;
+if offset < seg:offbeg[r]
+ then begin
+	count_ count + offset - seg:offbeg[r]; 
+	offset_ seg:offbeg[r];
+      end;
+count_ count min (seg:offend[r] + 1 - offset);
+loc_ location( seg:bits[r][offset] );
+if count > 0
+ then start!code define ptr=1, on=2, off=3; protect!acs ptr, on, off;
+		label loopBoth, loopOn, loopOff, return;
+	movn	ptr,count;
+	movsi	ptr,(ptr);
+	hrr	ptr,loc;
+	move	on,setBits;
+	move	off,clearBits;
+	jumpe	on,loopOff;
+	jumpn	off,loopBoth;
+  loopOn:
+	iorm	on,(ptr);
+	aobjn	ptr,loopOn;
+	jrst	return;
+
+  loopBoth:
+	iorm	on,(ptr);
+	andcam	off,(ptr);
+	aobjn	ptr,loopBoth;
+	jrst	return;
+
+  loopOff:
+	andcam	off,(ptr);
+	aobjn	ptr,loopOff;
+  return:
+  end;
+end;
+integer routine nextLike( reference integer first; 
+				integer count, someOn, allOff );
+start!code define A=1,ptr=2,need=3,hate=4; protect!acs a,ptr,need,hate;
+		label loop,unfound;
+	movn	ptr,count;
+	movsi	ptr,(ptr);
+	movei	ptr,access(first);	! aobjn ptr for the data;
+	move	need,someOn;
+	move	hate,allOff;
+loop:	tdnn	need,(ptr);	! is the bit on;
+	 aobjn	ptr,loop;	! no, keep looking;
+	tdne	hate,(ptr);	! does it have the ones we dont want?;
+	 aobjn	ptr,loop;	! yes, keep looking;
+	jumpge	ptr,unFound;	! did we stop because we ran out?;
+	hlre	A,ptr;		! no, get distance to end;
+	add	A,count;	! and convert to distance from start;
+	caia;
+unFound: hrroi	A,-1;
+end;
+
+integer routine getPointer( r!p(seg) r; integer offset )
+return( if r andThen seg:offbeg[r] leq offset leq seg:offEnd[r]
+	 then bbpp( 36, seg:bits[r][offset], 35 )
+	 else 0 );
+
+integer routine nextLabel( r!p(seg) r; integer offset );
+return( if getPointer( r, offset )
+	 then nextLike( seg:bits[r][offset], seg:offend[r]+1-offset,
+			needs#Label, 0 )
+	 else -1 );
+
+integer routine nextNewCode( r!p(seg) r; integer offset );
+return( nextLike( seg:bits[r][offset], seg:offend[r]+1-offset,
+		needs#Label, #seen lor suppressed# ) );
+
+integer routine nextStop( r!p(seg) r; integer offset );
+return( nextLike( seg:bits[r][offset], seg:offend[r]+1-offset, 
+		#seen lor suppressed#, 0 ) );
+
+! end-of-package exports:
+	r!p(seg) <- makeDis( low, top, segment(-1) )
+	notCode( r!p(seg) r: offset, count(1) )
+	manySeen( r!p(seg) r: offset, 0 )
+	markSeen( r!p(seg) r: offset )
+	markNewBlock( r!p(seg) r: offset )
+	markTransfer( r!p(seg) r: offset: 
+			 boolean isCall, interSegment(false) )
+	success <- declaresObject( r!p(seg) r: offset, "accessType" )
+	offset_or_-1 <- nextLabel( r!p(seg) r: offset )
+	offset_or_-1 <- nextNewCode( r!p(seg) r: offset )
+	offset_or_-1 <- nextStop( r!p(seg) r: offset )
+;
+string routine inkWords( string text );
+begin	integer brk;
+	string res;
+res_ scan( Text, inkToken, brk );
+if brk < 1 then return(res);
+while brk do res_ res & scan( Text, inkToken, brk );
+if res[inf for 1] neq #sp
+ then begin 
+	print(crlf, "???: `", res, "' terminates funny");
+	return(res);
+      end;
+return( res[1 for inf-1] )
+end;
+boolean watch!unary;
+integer SymbolFile;
+string unknownStyle;
+string knownStyle;
+boolean endCode, prefix;
+
+routine declareSymbol( integer offset; 
+			string segment("?"), type(null), name(null) ); 
+if SymbolFile > -2
+ then cprint( SymbolFile, type, " ", name, " is ", 
+			segment, ":", cvhexs(offset), "h" & crlf );
+
+string routine labName( string aLabel ); return("Label`" & aLabel & "'");
+string routine proName( string aLabel ); 
+	return("Proc`" & aLabel & "'");
+
+routine clear!unknown; setprint(null,knownStyle);
+routine set!unknown; setprint(null,unknownStyle);
+
+string routine byteName( string aLabel ); 
+	return("Byte`" & aLabel & "'");
+string routine wordName( string aLabel ); 
+	return("Word`" & aLabel & "'");
+string routine dwordName( string aLabel );
+	return("DWord`" & aLabel & "'");
+routine spout2( string op, arg1, arg2 );
+if equ(op,"MOV")      then print("`", arg1, "' <- `", arg2, "'")
+else if equ(op,"XCHG")then print("`", arg1, "' <-> `", arg2, "'")
+
+else if equ(op,"CMP") then print("`", arg1, "' <?> `", arg2, "'")
+else if equ(op,"ADD") then print("`", arg1, "' +<- `", arg2, "'")
+else if equ(op,"ADC") then print("`", arg1, "' +#<- `", arg2, "'")
+else if equ(op,"SUB") then print("`", arg1, "' -<- `", arg2, "'")
+else if equ(op,"SBB") then print("`", arg1, "' -#<- `", arg2, "'")
+else if equ(op,"MUL") then print("`", arg1, "' *<- `", arg2, "'")
+else if equ(op,"DIV") then print("`", arg1, "' /<- `", arg2, "'")
+
+else if equ(op,"TEST")then print("`", arg1, "' test `", arg2, "'")
+else if equ(op,"OR")  then print("`", arg1, "' lor<- `", arg2, "'")
+else if equ(op,"XOR") then print("`", arg1, "' xor<- `", arg2, "'")
+else if equ(op,"AND") then print("`", arg1, "' land<- `", arg2, "'")
+
+else if equ(op,"ROL") then print("`", arg1, "' l-rot<- `", arg2, "'")
+else if equ(op,"ROR") then print("`", arg1, "' r-rot<- `", arg2, "'")
+else if equ(op,"RCL") then print("`", arg1, "' l-rot#<- `", arg2, "'")
+else if equ(op,"RCR") then print("`", arg1, "' r-rot#<- `", arg2, "'")
+else if equ(op,"SHL") then print("`", arg1, "' l-shift<- `", arg2, "'")
+else if equ(op,"SHR") then print("`", arg1, "' r-shift<- `", arg2, "'")
+else if equ(op,"SAR") then print("`", arg1, "' r-ashift<- `", arg2, "'")
+
+else if equ(op,"LEA") or equ(op,"LES") 
+     or equ(op,"LDA") or equ(op,"LDS") 
+		      then print( op, " ", arg1, ", `", arg2, "'")
+
+else if equ(op,"CALL") and not equ(arg1,"L")
+			then print("Call `", arg1, "',`", arg2, "'")
+else if endCode_ equ(op,"JMP") and equ(arg1,"L") 
+			then print("Far Jump `", LabName(arg2), "'")
+else if endCode_ equ(op,"RET") and equ(arg1,"L")
+			then print("Far RET `", arg2, "'")
+ else begin
+	set!unknown;
+	print( "`", op, "'(`", arg1, "',`", arg2, "')" );
+      end;
+
+routine spout1( string op, arg1 );
+if equ(op,"DB")			then print( "Db `", arg1, "'" )
+else if prefix_ equ(op,"SEG")	then print( "Segment ", arg1, ":" )
+else if equ(op,"POP")		then print( "`", arg1, "' <- STACK" )
+else if equ(op,"PUSH")		then print( "STACK <- `", arg1, "'" )
+
+else if equ(op,"OUTB")		then print( "Output Byte `", arg1, "'" )
+else if equ(op,"INB")		then print( "Input Byte `", arg1, "'" )
+else if equ(op,"INW")		then print( "Input Word `", arg1, "'" )
+else if equ(op,"OUTW")		then print( "Output Word `", arg1, "'" )
+
+else if equ(op,"INC")		then print( "`", arg1, "' +<- 1" )
+else if equ(op,"DEC")		then print( "`", arg1, "' -<- 1" )
+else if equ(op,"NEG")		then print( "`", arg1, "' -<- self" )
+else if equ(op,"NOT")		then print( "`", arg1, "' lnot<- self" )
+else if equ(op,"SHL") or equ(op,"SHR")
+     or equ(op,"SAL") or equ(op,"SAR")
+     or	equ(op,"ROL") or equ(op,"ROR")
+     or	equ(op,"RCL") or equ(op,"RCR")
+				then spout2(op,arg1,"1")
+else if equ(op,"INT")		then print( "Interrupt `", arg1, "'" )
+else if equ(op,"LOOP")		then print( "Loop to ", labName(arg1) )
+else if equ(op,"LOOPZ")		then print( "Loop while 0 to ", labName(arg1) )
+else if equ(op,"LOOPNZ")	then print( "Loop until 0 to ", labName(arg1) )
+else if equ(op,"CALL")		then print( "Call ", proName(arg1) )
+else if endCode_ equ(op,"JMP")	then print( "Jump to ", labName(arg1) )
+else if endCode_ equ(op,"RET")
+	then if equ(arg1,"L")	then print( "Far Ret" )
+				else print( "Ret `", arg1, "'" )
+else if endCode_ equ(op,"IRET")	then print( "I-Ret `", arg1, "'" )
+else if op="J" and 1<length(op)<4
+				then print( "Jump if `", op[2 to inf], 
+					"' to ", labName(arg1) )
+else if equ(op,"JCXZ")		then print( "Jump if `cxz' to ", 
+					labName(arg1) )
+ else begin
+	set!unknown;
+	print( "`", op, "'(`", arg1, "')" );
+      end;
+
+routine spout0( string op ); 
+if equ(op,"NOP")		then print( "Nop" )
+else if equ(op,"POPF")		then print( "Flags <- Stack" )
+else if equ(op,"PUSHF")		then print( "Stack <- Flags" )
+else if equ(op,"SAHF")		then print( "Flags <- AH" )
+else if equ(op,"LAHF")		then print( "AH <- Flags" )
+else if prefix_ equ(op,"LOCK")	then print( " Lock " )
+else if prefix_ equ(op,"REPZ")	then print( " Repz " )
+else if prefix_ equ(op,"REPNZ")	then print( " Repnz " )
+else if endCode_ equ(op,"IRET")	then print( "I-Return" )
+else if endCode_ equ(op,"RET")	then print( "Return" )
+else if equ(op,"MOVB") or equ(op,"MOVW") 
+     or equ(op,"CMPB") or equ(op,"CMPW") 
+     or equ(op,"LODB") or equ(op,"LODW") 
+     or equ(op,"STOB") or equ(op,"STOW") 
+     or equ(op,"STI")  or equ(op,"CLI") 
+     or equ(op,"STC")  or equ(op,"CLC") or equ(op,"CMC") 
+     or equ(op,"STD")  or equ(op,"CLD") 
+     or equ(op,"SCAB") or equ(op,"SCAW")
+     or equ(op,"CBW")  or equ(op,"CWD")
+     or equ(op,"AAA")  or equ(op,"AAS")
+     or equ(op,"XLAT") or equ(op,"DAS")
+				then print( op )
+ else begin
+	if watch!unary then set!unknown;
+	print("`", op, "'"); 
+      end;
+boolean procedure CodeLine(string line;
+		reference integer segment, offset;
+		reference string codeBytes, opCode, arg1, arg2 );
+begin	integer brk;
+	string Text, DataMode;
+if length(line) < 27
+or line[24 for 1] neq #sp
+or (length(line) > 32 and line[32 for 1] neq #sp)
+ then return(false);
+segment_ cvHex(line);		if !skip! neq ":" then return(false);
+offset_ cvHex(line[6 for 4]);	if !skip! neq -1 then return(false); 
+opCode_ inkWords( line[25 to 32] );
+codeBytes_ inkWords( line[10 to 24] );
+
+arg2_ line[33 to inf];
+arg1_ scan(arg2,commaBreak,brk);
+if brk="," and length(arg1)=1 and (arg1="B" or arg1="W")
+ then Begin
+	DataMode_ (if arg1 = "B" then " {Byte}" else " {Word}");
+	arg1_ scan(arg2,commaBreak,brk);
+      end
+ else DataMode_ null;
+
+if EndCode
+ then print( "<<Label ", cvHexs(segment), ":", cvHexs(offset), 
+		">>" & crlf & #ht );
+EndCode_ prefix_ false;
+
+if length(arg2) then spout2( opCode, arg1, arg2 )
+else if length(arg1) then spout1( opCode, arg1 )
+else spout0( opCode );
+
+if not prefix
+ then begin
+	print( DataMode, #ht &";", cvHexs(segment), ":", 
+		cvHexs(offset), (if endCode then crlf & crlf 
+				 else crlf & #ht) );
+	clear!unknown;
+      end;
+return( segment geq 0 and offset geq 0 );
+end;
+routine recordOtherPC( r!p(seg) main; string op, arg1, arg2 );
+begin	integer destination;
+if length(arg1)=0 then usererr(0,1, op & " with no args?");
+if equ(op,"CALL")
+ then if length(arg2)=0
+	 then begin
+		destination_ cvHex(arg1);
+		if !skip! = -1 and length(arg1)
+		 then markTransfer( main, destination, true, false )
+		 else if arg1="[" 
+		  then return		! indirect pointer;
+		  else usererr(0,1,"What kind of code is CALL " & arg1);
+	      end
+	 else begin	integer seg;
+		seg_ cvHex(arg1);
+		if !skip! = -1 then destination_ cvHex(arg2);
+		if !skip! = -1	! read both to end of their strings;
+		 then markTransfer( main, destination, true, true )
+		 else usererr(0,1,"Oops: CALL `"&arg1&"',`"&arg2&"'.");
+	      end
+else if equ(op, "JMP")
+ then begin	! ** wrong, but I am tired **;
+	if length(arg2) 
+	 then begin
+		destination_ cvHex(arg2);
+		if !skip! = -1	! entire text is hex;
+		 then markTransfer( main, destination, false, true );
+	      end
+	 else begin
+		destination_ cvHex(arg1);
+		if !skip! = -1	! entire text is hex;
+		 then markTransfer( main, destination, false, false );
+	      end
+      end
+else if length(arg2) 
+ then usererr(0,1, "Conditional transfer with two args?: `"
+			& op & "' `" & arg1 & "',`" & arg2 & "'  ")
+ else begin
+	destination_ cvHex(arg1);
+	if !skip! = -1		! entire text is hex;
+	 then markTransfer( main, destination, false, false );
+	 else usererr(0,1," bad argument: " & op & " `" & arg1 & "'");
+      end
+end;
+! for each cell: [ boolean merge_with_next, string code ];
+integer dis,disbrk,discnt,diseof;
+string line;
+
+define readLine(chan)={input(chan,lineBreak)};
+boolean flag;
+string fName;
+
+open( dis_getchan, "DSK",'10000, 4,0, disCnt_100,disBrk,diseof_false );
+  do  begin
+	print(".DIS file name: "); fName_ inchwl;
+	lookup( dis, fName & ".DIS", flag );
+	if flag then lookup( dis, fName, flag );
+      end
+ until not flag;
+
+SymbolFile_ -2;
+
+  do  begin
+	print("Do you want to hear about unknown single opcodes?: ");
+	fName_ inchwl;
+	watch!unary_ kequ(fName, "Yes"[1 for 1 max length(fName)]);
+      end
+ until watch!unary or kequ(fName,"No"[1 for length(fName)]);
+
+print("Output dis-assembly to: "); fName_ inchwl;
+if length(fName)
+ then begin unknownStyle_ "B"; knownStyle_ "F"; end
+ else begin
+	print("Output unknown operations to: "); fName_ inchwl;
+	if length(fName)
+	 then begin unknownStyle_ "B"; knownStyle_ "S"; end
+	 else begin unknownStyle_ "T"; knownStyle_ "N"; end
+      end;
+setprint( fName, knownStyle );
+
+begin "Pass1"
+! read labels;
+! call:	r!p(seg) <- makeDis( low, top, segment(-1) );
+! call:	success <- declaresObject( r!p(seg) r: offset, "accessType" )
+!	as many times as he has labels
+;
+	r!p(seg) main;		! stays thru two actually;
+	integer start, activeStart;
+	boolean passive;
+
+main_ makeDis( cvHex("0000"), cvHex("0FFF") );
+if not declaresObject( main, cvHex("100"), "CODE" )
+ then usererr(0,1,"Oops, cannot recognize `CODE'");
+
+do line_ readLine(dis) until disEof or kequ(line[1 for 2],"-u");
+	! That jumps to the first Code;
+
+start_ nextNewCode( main, 0 );
+
+endCode_ true; prefix_ false; passive_ true;
+  do  begin	string line, bytes, op, arg1, arg2;
+		integer segment, offset, pos;
+	pos_ rchptr(dis); line_ readLine(dis); 
+	if CodeLine(line, segment, offset, bytes, op, arg1, arg2)
+	 then begin "log code"	own integer nextLoc;
+				own integer firstActive;
+		print(crlf, (if passive then "{Pass" else "{Act"),
+			",+= ", cvhexs(nextLabel(main,nextLoc)), "}" &#ht);
+		if offset neq nextLoc
+		 then begin string mode; 
+			mode_ getprint; setprint("","C");
+			print(crlf, "<< Jump from ", cvHexs(nextLoc), 
+				"h to ", cvHexs(offset), "h>>", crlf);
+			setprint("",mode);
+			markNewBlock( main, offset );
+		      end;
+		nextLoc_ offset + (length(bytes) ash -1);
+		if endCode then markNewBlock( main, nextLoc );
+		if passive and start leq nextLoc
+		 then begin
+			passive_ prefix_ false;
+			ActiveStart_ nextLoc;
+			start_ nextStop( main, nextLoc );
+		      end
+		else if not passive
+		 then begin
+			if op="J" or equ(op,"CALL")
+			 then recordOtherPC( main, op, arg1, arg2 );
+			if not prefix and (nextLoc geq start or endCode)
+			 then begin	integer sw;
+				manySeen( main, activeStart, 
+						nextLoc - activeStart );
+				activeStart_ nextLoc;
+				sw_ nextNewCode(main, offset);
+				if sw > nextLoc or sw < 0
+				 then begin passive_ true;start_ sw end;
+			      end
+		      end
+	      end "log code"
+	else if kequ(line[1 for 2],"-u") then 
+	else print(crlf, "Unknown: `", line, "'.");
+      end
+ until disEof;
+! loop and get more addresses;
+end "Pass1";
+! analyzeCode;
+! OutPutCode;
+release(dis);
+if SymbolFile > -1 then release(SymbolFile);
+end "disread"
+
+   
