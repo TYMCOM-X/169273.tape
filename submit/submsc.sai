@@ -1,0 +1,789 @@
+
+entry
+
+	CvName, CvPPN,  InfNam, InfJob, OpLine,
+	BrkChr, ToBlnk, NDigit, SkJunk, NxtWrd, ToCB,   SKCB,   EB,
+	ToDot,  Blanks, LnBrk,  UpCase, FndKey, LopWrd, LopTo,
+	HowMany,ValNum, ValOrd, AUS,    Prompt, Upper,  IntRead,
+	ValDateStr, CryForHelp, Vik,    ValidTimeStr,   ValidDaOfWk,
+	ValidMOY,   ValidKey,   ValModifier,    ValNmOrd
+;
+Begin "Miscellaneous Submit Routines"
+
+require "(SAILIB)SAIL.DEF"   source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+
+require "(EXECX)JQUEUE.DEF"  source!file;
+require "(EXECX)JQUE.REQ"    source!file;
+require "(EXECX)XEXFIL.REQ"  source!file;
+
+require "SUBMIT.DEF"         source!file;
+
+external integer JobLic;
+
+Define	Alphs = {"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"}
+,	Digits = {"0123456789"}
+;
+
+
+internal integer		! the following integers are breaks;
+	BrkChr			! holds break character     ;
+,	ToBlnk			! sp cr lf  , omit sp,  INS ;
+,	Blanks			! null      , omit sp,  INS ;
+,	NDigit			! digits    , omit nul, XS  ;
+,	SkJunk			! a-z0-9/:<>, omit nul, IR  ;
+,	NxtWrd			! a-z0-9/:<>, omit nul, XS  ;
+,	EB			! =	    , omit nul, INS ;
+,	ToDot			! .         , omit nul, INS ;
+,	SKCB			! , sp      , omit nul, IR  ;
+,	ToCB			! , sp      , omit nul, XR  ;
+,	LnBrk			! a-z0-9    , omit nul, XS  ;
+,	UpCase			! nul       , omit nul, XSK ;
+;
+external string GS!Err;
+external string array WkDay[ 0:NumWkDay - 1 ];
+external string array Mos[ 0:NumMnths - 1 ];
+external string array Keys[ 0:NumKeys - 1 ];
+external string array GoodKey[ 0:NumKeys - 1 ];
+external string array Modifiers[ 0:NumMods - 1 ];
+
+
+simple procedure SetBreaks;
+begin
+    setbreak( LnBrk_  getbreak, Alphs&Digits,         null, "XS"  );
+    setbreak( NDigit_ getbreak, Digits,               null, "XS"  );
+    setbreak( SkJunk_ getbreak, Alphs&Digits&"/-:<>", null, "IR"  );
+    setbreak( NxtWrd_ getbreak, Alphs&Digits&"/-:<>", null, "XS"  );
+    setbreak( SKCB_   getbreak, ","&" ",              null, "IR"  );
+    setbreak( ToCB_   getbreak, ","&" ",              null, "XR"  );
+    setbreak( EB_     getbreak, "=" ,		      null, "INS" );
+    setbreak( ToDot_  getbreak, ".",                  null, "INS" );
+    setbreak( ToBlnk_ getbreak, " "&crlf,             " ",  "INS" );
+    setbreak( Blanks_ getbreak, null,                 " ",  "INS" );
+    setbreak( UpCase_ getbreak, null,                 null, "XSK" );
+end;
+require SetBreaks initialization;
+
+
+internal simple procedure OpLine(
+		String       OptionName;	! Option name to print;
+		Integer      Setting;		! Around which setting;
+		 				!   to place brackets.;
+		String Array Names;		! Which OPTION array;
+		Integer      Privs(0) );	! Privileges needed;
+! ----------------------------------------------------------------------;
+!									;
+!		Produces one line of OPTIONS HELP menu.			;
+!		Brackets are placed around the current setting.		;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "OpLine"
+	integer ArrPosition,	! Index while printing possibilities for option;
+		Low, 		! Array lower bound. ;
+		High;		! Array upper bound. ;
+
+  if ( Privs land PRV$INV )		! Is this an invisible option? ;
+   then return;				!  Yes, just return. ;
+
+  if ( Privs land PRV$QM )		! Does the user need QM for this? ;
+   then if not( JobLic land LC!!QM )	!  Yes, does the user have QM? ;
+	 then return;			!    No, so don't tell user. ;
+
+  Low_  arrInfo( Names,1 );		! Get the array bounds. ;
+  High_ arrInfo( Names,2 );
+
+  print( crlf& "      " );		! Start a new line. ;
+  print( OptionName &"         " );	! Option name against left side. ;
+
+  for ArrPosition_ Low upto High do	! Print possibilities horizontally ;
+    BEGIN "list parameters"		!   to the right of the option name. ;
+
+    if ArrPosition neq Low then 	! Place commas between parameters but ;
+      print( "," );			!    not at beginning. ;
+
+    if ArrPosition = Setting then	! This param is the current setting. ;
+      print( " [", Names[ ArrPosition ], "]" )	! So surround it with "[]". ;
+    else					! else ;
+      Print( " ", Names[ ArrPosition ] );	!   just print it. ;
+
+    END "list parameters";
+END "OpLine";
+
+
+internal simple string procedure CvNAME( integer AUN );
+! ----------------------------------------------------------------------;
+!									;
+!	CvName		Routine to get the username for a specific	;
+!			AUN by looking up the UFD.  Uses the .chNXT	;
+!			feature to get a channel and releases it to	;
+!			preserve outside file/channel integrity.	;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    integer NotEof, Chan;
+    Preload!with '17, cvSIX( "DSK   " ), 0;
+    Own safe integer array Dev[ 0 : 2 ];
+    Own safe integer array Look[ 0 : !RBUNM+1 ];
+
+    Look[ !RBCNT ]_ !RBUNM+1;		! PPN -> User;
+    Look[ !RBPPN ]_ !Xwd( 1,1 );	! (UFD)  ;
+    Look[ !RBNAM ]_ AUN;		! [user] ;
+    Look[ !RBEXT ]_ cvSIX("UFD   ");	! .UFD   ;
+
+    Chan_ VMCHan;			! channel to use ;
+    Chnior( Chan, Dev[ 0 ], !chOPN );	! open DSK ;
+    If ( NotEof_ !skip! )
+     then begin
+	Chnior( Chan, Look[!RBCNT], !chLK );
+	NotEof_ !skip!;
+	Chnior( Chan, memory[0], !chREL );
+     end;
+
+    If ( NotEof )
+     then return( Cv6str(Look[!RBUNM])&Cv6str(Look[!RBUNM+1]) )
+     else return( Cvos(!lh(aun))&","&Cvos(!rh(aun)) );
+end;
+
+
+internal simple integer procedure CvPPN( string Name );
+! ----------------------------------------------------------------------;
+!									;
+!	CvPPN		Routine to get the AUN for a specific username	;
+!			by looking up the UFD.  Uses the .chNXT feature	;
+!			to get a channel and releases it to preserve	;
+!			outside file/channel integrity.			;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    integer NotEof, Chan;
+    Own safe integer array Nam[ 0 : 1 ];
+    Preload!with '17, cvSIX( "DSK   " ), 0;
+    Own safe integer array Dev[ 0 : 2 ];
+    Own safe integer array Look[ 0 : !RBUNM+1 ];
+
+    Nam[ 0 ]_ cvsix( Name[1 for 6] );	! name 1-6 ;
+    Nam[ 1 ]_ cvsix( Name[7 for 6] );
+    Look[ !RBCNT ]_ !RBEXT+1;
+    Look[ !RBPPN ]_ location(Nam[0]);
+    Look[ !RBNAM ]_ Look[ !RBEXT ]_ cvsix("*");
+
+    Chan_ VMCHan;			! channel to use ;
+    Chnior( Chan, Dev[ 0 ], !chOPN );	! open DSK ;
+    If ( NotEof_ !skip! )
+     then begin
+	Chnior( Chan, Look[!RBCNT], !chLK );
+	Chnior( Chan, memory[0], !chREL );
+     end;
+
+    return( Look[ !RBPPN ] )
+
+end;
+
+
+internal simple string procedure InfNam( Integer Name );
+! ----------------------------------------------------------------------;
+!									;
+!	InfNam		Routine to return  DEV:(USER)NAME.EXT  as a	;
+!			string given the memeory address of a block.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Info File"
+
+    return(   Cv6str( memory[ Name + F!Device ] ) & ":" &
+	      "("& Cv6str( memory[ Name + F!User ] ) &
+	      Cv6str( memory[ Name + F!User+1 ] ) & ")" &
+	      Cv6str( memory[ Name + F!Name ] ) &
+	      (if ( memory[ Name + F!Ext] )
+	       then "."&cv6str( memory[ Name + F!Ext ] )[1 for 3]
+	       else "")
+	   );
+end "Info File";
+
+
+
+internal simple string procedure InfJob( Integer Name );
+! ----------------------------------------------------------------------;
+!									;
+!	InfJob		Routine to return the job information as a	;
+!			string given the memeory address of a block.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Info Job"
+
+    return(
+
+	"Req #" & cvs( LAPReq( Name ) ) & " " &
+
+	(if LAPLog( Name )
+	 then InfNam( Name + E!LogFile ) & "="
+	 else "") &
+
+	(if ( LAPRunF( Name ) )
+	 then " Running "
+	 else "") &
+
+	InfNam( Name + E!CmdFile )
+
+    );
+
+end "Info Job";
+
+
+internal simple integer procedure FndKey( String Key; String Array CMD.Names );
+! ----------------------------------------------------------------------;
+!									;
+!	index_ FndKey( String, Array )					;
+!		Return the index in the array of a match for string.	;
+!		If no match, return lower bound - 1.  If ambiguous,	;
+!		return lower bound - 2.					;
+!									;
+! ----------------------------------------------------------------------;
+begin "Find Key"
+    Own Integer Low, High, CMD.Index, Cmd;
+
+    Low_  ArrInfo( CMD.Names, 1 );	! initialize low index   ;
+    High_ ArrInfo( CMD.Names, 2 );	! initialize high index  ;
+
+    CMD.Index_ Low - 1;			! setup default: invalid ;
+
+    For Cmd_ Low step 1 until High	! for each keyword;
+     do if kequ( Key, CMD.Names[ Cmd ] )
+	 then Return( Cmd );		!  -- exact match --;
+
+    For Cmd_ Low step 1 until High	! for each keyword;
+     do if kequ( Key, CMD.Names[ Cmd ][1 for length(Key)] )
+	 then if CMD.Index < Low	!  -check ambiguity-;
+		then CMD.Index_ Cmd	!  Ok, set instance ;
+		else return( Low - 2 );	!  No, set error    ;
+
+    Return ( CMD.Index );		! return result;
+
+end "Find Key";
+
+
+internal simple string procedure LopWrd( reference string S );
+! returns everything up to the first blank space;
+  return( scan( S,ToBlnk,BrkChr ) ); 
+
+
+internal simple string procedure LopTo( reference string OrigS; String Target ); 
+! returns everything until "Target";
+begin
+    string SS,Str;
+
+    SS_ Str_ null;
+    while Not kequ( SS,Target ) do
+    begin
+      Str_ Str & SS & " "; 	! add on what we,ve got;
+      SS_ LopWrd( OrigS );	! get next word from "OrigS";
+      if length( OrigS ) = 0 then ! if break word is last word in OrigS then;
+	return( null );		!   don't bother returning anything;
+    end;
+    return( Str ); 		! return all up to, but not including "Target";
+end;
+
+
+internal simple integer procedure HowMany( string S,Target ); 
+! returns number of times "Target" appears in string S;
+BEGIN
+  integer count;
+
+  count_ 0;
+  while ( length( S ) ) do 	! check the whole string;
+  BEGIN
+    if kequ( LopWrd( S ),Target ) then	! is it same as "Target";
+      count_ count + 1;		! if so, increment counter;
+  END;
+  return( count );
+
+END; ! HowMany;
+
+
+internal simple boolean procedure ValNum( string S );
+! true if whole of "S" consists of an integer;
+BEGIN
+    integer NonDigit;
+
+  if kequ( S,null ) then
+    return( false );
+  S_ scan( S,NDigit,NonDigit );
+  if NonDigit then 
+    return( false )
+  else
+    return( true );
+
+END;
+
+
+internal simple boolean procedure ValOrd( reference string S );
+! validates words such as "FIRST" or "FOURTH";
+! if a correct abbreviation is typed, the full word will be substituted;
+BEGIN
+  preload!with
+  "FIRST","SECOND","THIRD","FOURTH","FIFTH",
+  "SIXTH","SEVENTH","EIGHTH","NINTH","TENTH";
+  own safe string array ChkOrds[ 0:NumOrds - 1 ];
+  integer i;
+
+  if length( S ) < 3 then 
+    return( false );
+
+  for i_ 0 upto NumOrds - 1 do		! check array for match;
+    if kequ( S,ChkOrds[ i ][ 1 for length( S ) ] ) then
+    BEGIN
+      S_ cvs( i + 1 );			! replace ord with integer equiv;
+      return( true );
+    END;
+
+  return( false );			! no match;
+
+END;
+
+
+
+internal simple integer procedure IntRead( string msg );
+! prompts with msg for integer TTY input.;
+begin
+	integer i;
+	string s;
+  print( msg );			! type the prompt ;
+  s_inchwl;			! get the response ;
+  i_ intscan( s,BrkChr );	! get the first integer in the response ;
+  return( i );			! return the integer ;
+end;
+
+
+internal simple string procedure upper( string rawstring );
+! converts rawstring to uppercase only.;
+begin
+	integer char;
+	string UpStr;
+  UpStr_ null;
+  while length( rawstring ) do	!  loop once for each char in rawstring ;
+    begin
+      char_ lop( rawstring );	! get char at beginning of rawstring ;
+      UpStr_ UpStr & ( if "a" LEQ char LEQ "z" then ! if char is lower ;
+  			char - '40	! change to upper ;
+  		    else
+  			char );		! already upper so leave alone ;
+    end;
+  return( UpStr );
+end;
+
+
+internal simple procedure AUS( string str(null) );
+BEGIN
+  ClsQue;
+  if length( Str )
+   then print( Str );
+  call( 0, "EXIT" );
+END;
+
+internal simple string procedure prompt( string PromptLine, default(null) );
+! prompts with PromptLine and returns user response.;
+BEGIN "prompt"
+	string reply;
+  print( crlf, PromptLine );
+  reply_ inchwl;
+  if !skip! = #SUB
+   then AUS;
+  if length( reply ) = 0 then
+    return( default )
+  else
+    return( reply );
+END "prompt";
+
+internal simple boolean procedure CryForHelp( string word );
+! ----------------------------------------------------------------------;
+!									;
+! 		Returns true if "word" seems to be a help request. 	;
+!									;
+! ----------------------------------------------------------------------;
+return(  ( word = "?" ) or kequ( word,"HELP"[1 for length(word) min 4] ) );
+
+
+
+internal simple integer procedure ViK( 	string array Arr;
+				reference string Target );
+! ----------------------------------------------------------------------;
+!									;
+!	index_ Vik( Array, String )					;
+!		Routine to check for a string match in array and to	;
+!		return the index if found, otherwise return -1.  If	;
+!		the string is ambigious, set GS!ERR to say so.		;
+!									;
+! ----------------------------------------------------------------------;
+				
+BEGIN "find it"
+    integer index, bound;
+
+    if ( length( Target ) = 0 )
+     then return( -1 );
+
+    if ( ( index_ FndKey( Target, Arr ) ) < ( bound_ arrinfo( Arr, 1 ) ) )
+     then begin "ambiguity"
+	if ( (index + 1) < bound )
+	 then GS!ERR_ "?ambiguous """& Target &""", type HELP for help.";
+	return( -1 );
+     end "ambiguity";
+
+    Target_ Arr[ index ];
+    return( index );
+
+END "find it";
+
+
+internal simple boolean procedure ValidTimeStr( reference string S );
+! ----------------------------------------------------------------------------;
+!									      ;
+! 		Return true if a contiguous string of chars is of the	      ;
+! 		  form HH:MM:SS						      ;
+!									      ;
+! ----------------------------------------------------------------------------;
+
+BEGIN "valid time"
+	string HH,MM,SS,Copy;
+	integer NonDigit;
+  Copy_ S;					! save a copy;
+  HH_ scan( S,NDigit,NonDigit );
+  if NonDigit = ":" then			! was break a ":" ?;
+    BEGIN "colon found"
+    if not( 0 leq cvd( HH ) leq 23 ) then 	! if yes,check hour in range;
+      BEGIN "gross hour" 			! hour out of range 0-23;
+      GS!ERR_ "?Hour (" & HH & ") - out of range.";
+      return( false );
+      END "gross hour" 				! hour out of range 0-23;
+    else 
+      BEGIN "check minutes"
+      MM_ scan( S,LnBrk,NonDigit );       	! get next number/letter;
+      if NonDigit = ":" then 			! true if break was ":";
+        BEGIN "second colon"
+        if not( 0 leq cvd( MM ) leq 59 ) then   ! does minute make sense;
+          BEGIN "gross minute"		! minute was not in range 0-59 so 86;
+	  GS!ERR_ "?Minute (" & MM & ") - must be from 0 to 59";
+	  return( false );
+	  END "gross minute"		! minute was not in range 0-59 so 86;
+	else 
+	  BEGIN "examine seconds"
+	  SS_ S; 			! now include the second part;
+          if not( 0 leq cvd( SS ) leq 59 ) then  ! does minute make sense;
+            BEGIN "gross second" 	! minute was not in range 0-59 so 86;
+            GS!ERR_ "?Second (" & SS & ") - must be from 0 to 59";
+	    return( false );
+	    END "gross second" 		! minute was not in range 0-59 so 86;
+	  else 
+	    BEGIN "within range"
+	    S_ Copy;  ! restore ;
+	    return( true );
+	    END "within range"
+	  END "examine seconds"
+        END "second colon"
+      else
+        BEGIN "NoMore colon"
+	if NonDigit = 0 then
+	  BEGIN  "thats all"
+	  S_ Copy;
+	  return( true ); ! string such as HH:MM ;
+	  END "thats all"
+	else 
+	  BEGIN "oh oh"
+ 	  GS!ERR_ "?UNRECOGNIZABLE WORD: " & Copy & " " ;
+	  return( false );
+	  END "oh oh"
+        END "NoMore colon"
+      END "check minutes"
+    END "colon found"
+  else 
+    BEGIN "integer only"
+    S_ Copy; 		! restore original;
+    return( false );
+    END "integer only"
+
+END "valid time";
+
+
+internal simple boolean procedure ValDateStr( reference string S );
+! ----------------------------------------------------------------------------;
+!									      ;
+! 		Return true if a contiguous string of chars is of the	      ;
+! 		  form MM/DD/YY.					      ;
+!									      ;
+! ----------------------------------------------------------------------------;
+
+BEGIN "valid date string"
+
+  preset!with 31,29,31,30,31,30,31,31,30,31,30,31;
+  own safe integer array MonthLength[1:12];
+  string MM,DD,YY,Copy;
+
+  Copy_ S;				! save a copy;
+
+  MM_ scan( S,LnBrk,BrkChr );		! scan until non-letter/number;
+  if BrkChr = "/" then			! was break a "/" ?;
+    BEGIN "slash found"
+    if not( 1 leq cvd( MM ) leq 12 ) then ! if yes,check month in range;
+      BEGIN "month no good" 			! month out of range 1-12;
+      GS!ERR_ "?Month (" & MM & ") - out of range.";
+      return( false );
+      END "month no good"
+    else
+      BEGIN "legal month"
+      DD_ scan( S,LnBrk,BrkChr );       ! get next number/letter;
+      if BrkChr = "/" then 		! true if break was another "/";
+        BEGIN "second slash"
+        if not( 1 leq cvd( DD ) leq MonthLength[cvd(MM)] ) then  ! valid day?;
+          BEGIN "bad day" 		! day was not in range 1-31 so 86;
+          GS!ERR_ "?Day (" & DD & ") - must be in range 1 to "
+		    & Cvs(MonthLength[cvd(MM)]);
+          return( false );
+          END "bad day"
+        else
+          BEGIN "do year"
+          YY_ S; 			! now include the year part;
+          ! now change to form as "JANUARY 12, 85;
+          S_ mos[cvd(MM)-1] & " " & DD & " " & YY;
+          return( true );
+          END "do year"
+        END "second slash"
+      else
+        BEGIN "something omitted"
+        S_ Copy;
+        return( false );
+        END "something omitted"
+      END "legal month"
+    END "slash found"
+  else
+    BEGIN "no slash"		! no slash found so, see if dash ;
+    if BrkChr = "-" then
+      BEGIN "first hyphen"
+      DD_ MM;				! read "DD" of DD-MMM-YY ;
+      MM_ scan( S,LnBrk,BrkChr );       ! get next number/letter;
+      if BrkChr = "-" then 		! true if break was another dash;
+        BEGIN "second hyphen"
+	if ( 0 leq y( MM, mos ) ) then	! if yes,check month in range;
+	  BEGIN "OK month"
+	  MM_ cvs( FndKey( MM, mos )+1 );
+	  END "OK month"
+	else
+	  BEGIN "bogus month"			! month out of range 1-12;
+	  GS!ERR_ "?Unknown month name: " & MM;
+	  return( false );
+	  END "bogus month";
+        if not( 1 leq cvd( DD ) leq MonthLength[cvd(MM)] ) then  ! does day make sense;
+          BEGIN "crazy day"		! day was not in range 1-31 so 86;
+          GS!ERR_ "?Day (" & DD & ") - must be in range 1 to "
+		  & cvs( MonthLength[ cvd(MM) ] );
+          return( false );
+          END "crazy day"
+        else
+          BEGIN  "OK return"
+          YY_ S; 			! now include the year part;
+          ! now change to form as "JANUARY 12, 85;
+          S_ mos[cvd(MM)-1] & " " & DD & " " & YY;
+          return( true );
+          END "OK return"
+        END "second hyphen"
+      END "first hyphen"
+    else
+      BEGIN
+      S_ Copy; 		! restore original;
+      return( false );
+      END
+    END "no slash"
+
+END "valid date string";
+
+
+internal simple boolean procedure ValidDaOfWk( string S );
+! ----------------------------------------------------------------------;
+!									;
+! 		True if S is a day-of-the-week, ex: "MONDAY".		;
+!									;
+! ----------------------------------------------------------------------;
+return( not( FndKey( S, WkDay ) < arrinfo( WkDay, 1 ) ) );
+
+
+
+internal simple boolean procedure ValidMOY( string S );
+! ----------------------------------------------------------------------;
+!									;
+! 		Validates words such as "AUGUST", or "MAY".		;
+!									;
+! ----------------------------------------------------------------------;
+return( not( FndKey( S, Mos ) < arrinfo( Mos, 1 ) ) );
+
+
+
+internal simple boolean procedure ValidKey( reference  string S );
+! ----------------------------------------------------------------------;
+!									;
+! 		Validates words such as "EVERY" or "AND"		;
+! 		If a correct abbreviation is typed, the full word	;
+!		  will be substituted.					;
+!									;
+! ----------------------------------------------------------------------;
+BEGIN "ValidKey"
+    integer i; 
+
+    if ( length( S ) < 3 )
+     then return( false );
+
+    if ( ( i_ FndKey( S, Keys ) ) < arrinfo( Keys, 1 ) )
+     then return( false );
+
+    S_ GoodKey[ i ]; 			! replace with match from array;
+    return( true );
+
+END "ValidKey";
+
+
+
+internal simple boolean procedure ValModifier( string S );
+! ----------------------------------------------------------------------------;
+!									      ;
+! 		Validates words such as "AFTER" or "EXCEPT".		      ;
+!									      ;
+! ----------------------------------------------------------------------------;
+return( not( FndKey( S, Modifiers ) < arrinfo( Modifiers, 1 ) ) );
+
+
+
+internal simple boolean procedure ValNmOrd( reference string S );
+! ----------------------------------------------------------------------------;
+!									      ;
+! 		Validates words such as "3RD" or "1ST".			      ;
+! 		If a correct abbreviation is typed, the full word	      ;
+!		  will be substituted.					      ;
+!									      ;
+! ----------------------------------------------------------------------------;
+BEGIN "valid ordinal"
+  integer c,i,BrkChr;
+  string temp;
+
+  temp_ S; 				! save original string;
+  for i_ 1 upto length( S ) do
+    BEGIN "check each char"
+    c_ lop( S );			! get first char;
+    if "0" leq c leq "9" then		! is it a number;
+      BEGIN "first char was integer"
+      continue			! if yes then loop again for next char;
+      END "first char was integer"
+    else				! non-number found;
+      BEGIN "not integer"
+      if i < 2 then 			! better not be in first position;
+        BEGIN "cant be ordinal"
+        S_ temp;			! if so then restore and return;
+        return( false );
+        END "cant be ordinal"
+      else				! else replace non-number;
+        BEGIN "ordinal so far"
+        S_ c & S;
+        done;			! out of for loop;
+        END "ordinal so far"
+      END "not integer"
+    END "check each char";
+  ! now check non-number part for the right two letters;
+  if kequ( S[ 1 for 2 ] ,"RD" ) or
+    kequ( S[ 1 for 2 ] ,"ST" ) or
+    kequ( S[ 1 for 2 ] ,"TH" ) or
+    kequ( S[ 1 for 2 ] ,"ND" ) then
+    BEGIN "checks out"
+    S_ cvs( intscan( temp,BrkChr ) ); ! it's valid but just return number;
+    if cvd( S ) > 31 then
+      S_ "31";			
+    return( true )
+    END "checks out"
+  else
+  S_ temp;				! invalid so restore;
+  return( false );			! and return false;
+
+END  "valid ordinal";
+
+
+internal simple procedure LJust( string S; integer FieldWidth );
+! ----------------------------------------------------------------------------;
+!									      ;
+!		Prints S left justified in a field of FieldWidth spaces.      ;
+!									      ;
+! ----------------------------------------------------------------------------;
+BEGIN
+	integer len;
+  redefine spaces = { "                                        " };
+
+  len_ length( s );
+  if len > FieldWidth then
+    print( S[ 1 to FieldWidth ] )	! Truncate the string to FieldWidth. ;
+  else
+    print( S );
+  print( spaces[1 to FieldWidth - len ]  );
+END;
+
+internal simple integer procedure TodaysIntrnDat;
+! ----------------------------------------------------------------------------;
+!									      ;
+! 		Returns today's displacement in days from jan 1, 1964.	      ;
+!									      ;
+! ----------------------------------------------------------------------------;
+BEGIN "Todays internal date"
+  own safe integer array Date[0:2];
+
+  Date[0]_ calli( 0, calli!DATE );	! Date: DEC format ;
+  Date[1]_ 0;				! Time: none given ;
+  Date[2]_ '400000;			! New:  0-DEC ,, 400000-TYM ;
+  calli( location(Date[0]), calli!DATUUO );
+  return( Date[0] );			! converted date, TYM format ;
+
+END "Todays internal date";
+
+
+internal simple integer procedure Today;
+! ----------------------------------------------------------------------------;
+!									      ;
+! 		Returns today's WkDay : 0 - 1 ( Saturday - Friday ).	      ;
+!									      ;
+! ----------------------------------------------------------------------------;
+BEGIN "todays day"
+
+  return( (TodaysIntrnDat + 4 ) mod 7 );	! Jan 1st was a WED = 0 ;
+
+END "todays day";
+
+
+internal simple boolean procedure EqSign( reference string LogF, ComF );
+! ----------------------------------------------------------------------------;
+!									      ;
+! 		Examine LogF, remove all spaces, see if it contains 	      ;
+! 		  an "=".  If if does then return everything in 	      ;
+! 		  front of "=" in LogF, and everything beyond "=" in ComF.    ;
+!									      ;
+! ----------------------------------------------------------------------------;
+BEGIN "EqSign"
+	integer brk;
+	string  sav,		! save original LogF string for restore. ;
+		Before;
+  sav_ LogF;					! Make backup. ;
+  LogF_ Scan( LogF, Blanks, brk );		! Remove spaces. ;
+  Before_ scan( LogF, EB, brk );		! Get all upto '=' or cr. ;
+  if brk = 61 then				! Found a '='. ;
+    BEGIN
+    ComF_ LogF;					! Comf gets all after '='.;
+    LogF_ Before;				! Logf gets all before '='.;
+    return( true );
+    END
+  else
+    BEGIN					! No '=' so, ;
+    LogF_ sav;					!   restore. ;
+    return( false );
+    END;
+
+END "EqSign";
+
+internal simple string procedure GetUserName;
+! returns logged in user name. ;
+Return( cv6str(calli(-'22,'41)) & cv6str(calli(-'21,'41)) );
+
+
+End "Miscellaneous Submit Routines";
+.
+
+  [ m[
