@@ -1,0 +1,445 @@
+entry
+	CVFNAM
+;
+begin "CVFLIB"
+
+require "MYSAIL.DEF" source!file;
+
+comment
+
+Revision History
+================
+
+    5	15-Sep-84	Carl
+	Convert to use an array rather than separate variables for
+	the return information.  Call is ( String, Flags, Fields )
+
+    4	30-Mar-84	Carl
+	Added Version number scanning to allow file-spec:ver for FDM
+	to distinguish between various entries with the same name.
+
+    3	20-Mar-84	Carl
+	Added flag DOTSEEN to determine if the user specified a dot.
+	This is needed to distinguish between "FILE" and "FILE." in
+	checking for wildcards.	 Needed in FDM for comparing a missing
+	extension against an explicit null or wild extension.
+
+    2	 9-Mar-84	Carl
+	Added flag INDIRECT to determine if the user specified an
+	indirect file in place of a single file.  Installed in the
+	re-write of FDM since @FILE needs to work for compatibility.
+
+    1	 8-Sep-83	Carl
+	Added protection scanning of <nnn> accepted by PIP and various
+	versions of RPG and such.  Installed in program VMXXX and VMAP
+	which copy files using !chMFP and !chVMP instead of using the
+	old style SIMIO stuff.
+
+    0	21-Aug-83	Carl
+	Created CvFNAM to parse/scan a file specification for TYMCOM-X
+	because of the "known" inadequacies of SAIL's internal CvFIL
+	function (which doesn't like "."s in usernames)!
+
+================
+end History;
+
+
+
+Define
+    CvF.Flag	= 0			! Return flags ;
+,   CvF.F	= CvF.Flag + 1		! Filename ;
+,   CvF.E	= CvF.F    + 1		! Extension ;
+,   CvF.P	= CvF.E    + 1		! PPN ;
+,   CvF.FM	= CvF.P    + 1		! Filename Mask ;
+,   CvF.EM	= CvF.FM   + 1		! Extension Mask ;
+,   CvF.PM	= CvF.EM   + 1		! PPN Mask ;
+,   CvF.Prot	= CvF.PM   + 1		! Protection ;
+,   CvF.Ver	= CvF.Prot + 1		! Version ;
+
+,   CvF.Count	= CvF.Ver-CvF.Flag+1	! All variables ;
+
+,   CvF.VOk	= { !bit(0) }		! Version Ok for file ;
+,   CvF.IOk	= { !bit(1) }		! At-Sign Ok for @file ;
+
+,   CvF.Dot	= { !bit(0) }		! Dot seen before extension ;
+,   CvF.Ind	= { !bit(1) }		! At-Sign seen for @file ;
+;
+
+Own Integer IdentBrk, UserBrk, OctBrk, WhiteBrk, NameBrk;
+Own Integer QMarkBrk, CommaBrk, NumBrk;
+Own Boolean File, Ext, User, Protection, Version;
+
+
+Simple Procedure CvFBreak;
+begin
+    Define UC = {"ABCDEFGHIJKLMNOPQRSTUVWXYZ"};
+    Define LC = {"abcdefghijklmnopqrstuvwxyz"};
+    Define DC = {"0123456789"}, OC = {"01234567,?*"};
+    Define ID = {UC & LC & DC & "#?*"};
+    Define UN = {UC & LC & DC & "./- *"};
+    Define QM = {"?*#"};
+    Define SP = {'11&'40};
+    Define CT = {1&2&4&5&6&14&15&16&17&18&19&20&21&22&23&24&25&28&29&30&31};
+    Define PC = {CT & "()[],.=_<> !""$%^&-+:;@|\~`'"};
+
+    setbreak( IdentBrk_ getbreak, ID,  Null, "XNRK" );	! Identifiers   ;
+    setbreak( UserBrk_  getbreak, UN,  Null, "XNRK" );	! Pass username ;
+    setbreak( OctBrk_   getbreak, OC,  Null, "XNRK" );	! Pass octal #s ;
+    setbreak( NumBrk_   getbreak, DC,  Null, "XNRK" );  ! Pass numbers  ;
+    setbreak( WhiteBrk_ getbreak, SP,  Null, "XNRK" );	! Pass w-spaces ;
+    setbreak( NameBrk_  getbreak, PC,  Null, "INRK" );	! Punctuations  ;
+    setbreak( QMarkBrk_ getbreak, QM,  Null, "INSK" );	! Pick out ???s ;
+    setbreak( CommaBrk_ Getbreak, ",", Null, "INSK" );	! Pick commas   ;
+end;
+require CvFBreak initialization;
+
+
+Simple Integer Procedure CvFMask( String S; Reference Integer M );
+begin
+    String S1, S2;
+    Integer Brk;
+    Boolean Fill;
+
+    Define SPC = { "      "[1 for Length(S1)] };
+    Define MSK = { "______"[1 for Length(S2)] };
+
+    M_ Brk_ 0;				! Initially clear ;
+    Fill_ False;			! Initially false ;
+    S2_ Null;				! Initially empty ;
+
+    S1_ Scan( S, QMarkBrk, Brk );	! Copy string (or part of it) ;
+
+    While ( Length( S ) or ( Brk neq 0 ) )
+     do begin "munch it"
+	If ( Brk = "?" or Brk = "#" )	! If was a question-mark ;
+	 then S2_ "#"			!  then substitute hatch ;
+	 else If ( Brk = "*" )		!  else check for a star ;
+	       then begin
+		  If (not Fill)		! If this is the first star ;
+		   then S2_ "######";	!  then substitute a filler ;
+		  Fill_ True;		!  and always set fill flag ;
+	       end;
+
+	M_ M lor CvSix( SPC & MSK );	! Setup mask and munch some ;
+	S1_ S1 & S2 & Scan( S, QMarkBrk, Brk );
+     end "munch it";
+
+    Return( CvSix( S1[1 for 6] ) );	! Give back the first 6 chars ;
+end;
+
+
+Integer Procedure CvPPN( String UserName );
+begin
+    Integer Array Look[ 0:5 ];
+    Integer Ch,Eof;
+    Define !chLK = 4;
+
+    Open( Ch_Getchan, "DSK", '17, 0,0, 0,0, Eof_-1 );
+    If ( Eof )
+     then Return( -1 );
+
+    Look[0]_ 3;
+    Look[1]_ location( Look[4] );
+    Look[2]_ Look[3]_ CvSix( "*" );
+    Look[4]_ CvSix( UserName[1 for 6] );
+    Look[5]_ CvSix( UserName[7 for 6] );
+    Chnior( Ch, Look[0], !chLK );
+
+    If ( !lh( Look[1] ) )
+     then Return( Look[1] )
+     else Return( -1 );
+
+end;
+
+
+Simple Integer Procedure CvPWild( String S; Reference Integer Msk );
+begin
+    Integer Val, Chr, Left;
+
+    Val_ Msk_ 0;
+    Left_ 18;
+
+    While Length( S ) and ( Left > 0 )	! Scan through the string ;
+     do begin "munch it"		!  one at a time up to 6  ;
+
+	Chr_ Lop( S );
+
+	If ( Chr geq "0"  and  Chr leq "7" )
+	 then begin "a digit"
+	    Val_ (Val lsh 3) + (Chr land 7);
+	    Msk_ (Msk lsh 3);
+	 end "a digit"
+	 else If ( Chr = "?" )
+	       then begin "a wild char"
+		  Val_ (Val lsh 3) + 7;
+		  Msk_ (Msk lsh 3) lor 7;
+	       end "a wild char"
+	       else If ( Chr = "*" )
+		     then begin "a wild mask"
+			Val_ (Val lsh Left) lor (-1 lsh (Left-36));
+			Msk_ (Msk lsh Left) lor (-1 lsh (Left-36));
+			Return( Val );
+		     end "a wild mask";
+
+	Left_ Left - 3;
+
+     end "munch it";
+
+    Return( Val );
+
+end;
+
+
+Simple Integer Procedure CvPMask( String S; Reference Integer M );
+begin
+    Integer Brk, Gan, GanMsk, Uun, UunMsk, Aun;
+    String S1;
+    Define !GTAUN = -'23, calli!GETTAB = '41;
+
+    Aun_ calli( !Xwd(-1,!GTAUN), calli!GETTAB );
+
+    S1_ Scan( S, CommaBrk, Brk );	! Split ppn into 2 parts ;
+
+    Gan_ CvPWild( S1, GanMsk );		! Setup the GAN ;
+    If ( Gan = 0 )			! If 0 then use aun half ;
+     then Gan_ !lh( Aun );
+
+    Uun_ CvPWild( S,  UunMsk );		! Setup the UUN ;
+    If ( Uun = 0 )			! If 0 then use aun half ;
+     then Uun_ !rh( Aun );
+
+    M_ !Xwd( GanMsk, UunMsk );		! Re-establish the mask ;
+    Return( !Xwd( Gan, Uun ) );		! Re-construct the ppn  ;
+end;
+
+
+Simple Integer Procedure RdProt( String S );
+begin
+    Integer Val;
+
+    If ( Length( S ) neq 3 )		! We must have 3 octal digits ;
+     then Return( -1 );			!  or it is an error ;
+
+    Val_  0;				! Initialize to zero ;
+    While ( Length( S ) )		! Scan through the string ;
+     do If ( "0" leq S leq "7" )
+	 then Val_ (Val lsh 3) + (Lop(S) land '7)
+	 else Return( -1 );
+
+    Return( Val );			! Remit our octal number ;
+
+end;
+
+
+Internal Simple Boolean Procedure CvFnam(
+	Reference String  S;		! Input string ;
+	Reference Integer Flags;	! Flags ;
+	Integer Array Field		! Fields to be returned ;
+    );
+
+begin "parse routine"
+
+    Integer Brk;
+    String  Str;
+
+    ArrClr( Field );			! Clear all fields first ;
+
+    Field[ CvF.Ver ]_
+	 If ( Flags land CvF.VOk )	! Set version based on ;
+	  then -1			!  it's legality. ;
+	  else  0;
+
+    If ( Length(S) = 0 )		! If we have an empty filespec  ;
+     then Return( True );		!  then allow it as legal [0,0] ;
+
+    File_ Ext_ User_ Protection_ Version_ False;
+
+    Str_ Scan( S, WhiteBrk, Brk );	! Clear leading whitespace ;
+
+    If ( Brk = "@" )			! Check for indirect file ;
+     then begin "may be indirect"
+
+	Brk_ Lop( S );			! Eat character and Set flag ;
+	Field[ CvF.Flag ]_ Field[ CvF.Flag ] lor CvF.Ind;
+
+	If ( Length( S ) )		! Anything left? ;
+	 then begin "legal construct"
+
+	    Brk_ S[1 for 1];		! Copy new break ;
+	    If (Brk = " " or Brk = '11)	! Check for whitespace ;
+	     then Return( False );	!  Ooops! Too bad. ;
+
+	 end "legal construct"
+	 else Return( False );		! "@" without a spec, sigh. ;
+
+     end "may be indirect";
+
+    While ( Length( S ) )
+     do begin "main parse loop"
+
+	Str_ Scan( S, NameBrk, Brk );	! Attempt to read item ;
+
+	If ( (Brk = "(") or (Brk = "[") )
+	 then begin "open username"
+
+	    If ( User )
+	     then Return( False );	! Illegal if more than once ;
+
+	    If ( Length( Str ) )	! Was there a name? ;
+	     then begin "store string"	!  Yes, so take care of it ;
+
+		If ( File )		! Is this the first time? ;
+		 then Return( False );	!  No, this is an error ;
+
+		Field[ CvF.F ]_ CvFMask( Str, Field[ CvF.FM ] );
+
+		File_ True;		! Kilroy was here ;
+
+	     end "store string";
+
+	    Brk_ Lop( S );		! Eat "(" or "[" here ;
+
+	    If ( Brk = "(" )		! Username vs PPN ;
+	     then begin "username"	!  Yes, so eat username ;
+
+		Str_ Scan( S, UserBrk, Brk );
+
+		If ( Brk neq ")" )	! If not at the end ;
+		 then Return( False );	!  Something is wrong - Abort ;
+
+					!  else Convert to a PPN ;
+		Field[ CvF.P ]_ CvPPN( Str );
+
+	     end "username"
+	     else begin "ppn"		! PPN vs Username ;
+
+		Str_ Scan( S, OctBrk, Brk );
+
+		If ( Brk neq "]" )	! If it doesn't end here ;
+		 then Return( False );	!  Something is wrong ;
+
+		Field[ CvF.P ]_ CvPMask( Str, Field[ CvF.PM ] );
+
+	     end "ppn";
+
+	    Brk_ Lop( S );		! Eat ")" or "]" here ;
+	    User_ True;			! Plant flag in ground ;
+
+	 end "open username"
+	 else If ( Brk = "." )		! However, if it was a dot ;
+	 then begin "extension"		!  then we do the extension ;
+
+	    If ( Ext )			! Was there one before? ;
+	     then Return( False );	!  Yes, something is wrong ;
+
+	    If ( Length( Str ) )	! Was anything typed? ;
+	     then begin "store string"	!  Yes, see what we got ;
+
+		If ( File )		! Did we already have a NAME? ;
+		 then Return( False );	!  Yes, then this is an error ;
+
+		File_ True;		! No, set flag and Setup filename ;
+		Field[ CvF.F ]_ CvFMask( Str, Field[ CvF.FM ] );
+					
+	     end "store string";
+
+	    Ext_ True;			! Set flag since "." seen ;
+	    Field[ CvF.Flag ]_ Field[ CvF.Flag ] lor CvF.Dot;
+
+	    Brk_ Lop( S );		! Eat the "." and read EXT ;
+	    Str_ Scan( S, IdentBrk, Brk );
+
+	    If ( Length( Str ) )	! Is there anything following? ;
+	     then begin			!  Yes, setup extension ;
+
+		Field[ CvF.E ]_ CvFMask( Str[1 for 3], Field[ CvF.EM ] )
+				 land (-1 lsh 18);
+		Field[ CvF.EM ]_ Field[ CvF.EM ] land (-1 lsh 18);
+
+	     end;
+
+	 end "extension"
+	 else If ( Brk = "<" )
+	 then begin "protection"
+
+	    If ( Protection )		! Was one specified already? ;
+	     then Return( False );	!  Yes, this is illegal ;
+
+	    If ( Length( Str ) )	! Was there a name? ;
+	     then begin "store string"
+
+		If ( File )		! Was there another time? ;
+		 then Return( False );	!  Yes, then this is an error ;
+
+		Field[ CvF.F ]_ CvFMask(Str,Field[ CvF.FM ]);
+		File_ True;		! Kilroy was here ;
+
+	     end "store string";
+
+	    Brk_ Lop( S );		! Eat "<" here ;
+
+	    Str_ Scan(S, OctBrk, Brk);	! Read protection code ;
+
+	    If ( Brk neq ">" ) or	! Verify ">" and code read ;
+	       ( 0 > (Field[ CvF.Prot ]_ RdProt( Str )) )
+	     then Return( False );	!  and return if either is bad ;
+
+	    Brk_ Lop( S );		! Eat ">" here ;
+	    Protection_ True;		! Set flag and finish ;
+
+	 end "protection"
+	 else If ( Brk = ";" )
+	 then begin "version number"
+
+	    If ( not( Field[ CvF.Flag ] land CvF.VOk ) or ( Version ) )
+	     then Return( False );	!  Yes, this is illegal ;
+
+	    If ( Length( Str ) )	! Was there a name? ;
+	     then begin "store string"
+
+		If ( File )		! Was there another time? ;
+		 then Return( False );	!  Yes, then this is an error ;
+
+		Field[ CvF.F ]_ CvFMask(Str,Field[ CvF.FM ]);
+		File_ True;		! Kilroy was here ;
+
+	     end "store string";
+
+	    Brk_ Lop( S );		! Eat semi-colon here ;
+
+	    Str_ Scan(S, NumBrk, Brk);	! Read version code ;
+
+	    If ( Length( Str ) )	! If there, convert to decimal ;
+	     then Field[ CvF.Ver ]_ CvD( Str )
+	     else Return( False );	!  else it's illegal ;
+
+	    Version_ True;		! Kilroy was here too ;
+	    Done;			! All is done.  (S) will give ;
+					!  the next Brk or null ;
+
+	 end "version number"
+	 else begin "we may be done"	! End of S or unknown Brk ;
+
+	    If ( Length( Str ) )	! Did we read anything? ;
+	     then begin "fill in name"	!  Yes, let's see what it is ;
+
+		If ( File )		! Do we already have a name ;
+		 then Return( False )	!  Yes, illegal!  else scan it ;
+		 else Field[ CvF.F ]_ CvFMask( Str, Field[ CvF.FM ] );
+
+	     end "fill in name";
+
+	    Done;			! All is done.  (S) will give ;
+					!  the next Brk or null ;
+
+	 end "we may be done";
+
+     end "main parse loop";
+
+    Return( True );
+
+end "parse routine";
+
+
+end "CVFLIB";
+  
