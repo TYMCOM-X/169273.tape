@@ -1,0 +1,915 @@
+        TITLE FILES
+;
+;	Revision History !!!
+;
+;  112	Fix loop in MORFIL: in CPROMP -- cleanups. /CAB 17-Sep-81.
+;	SPOFIL:  spurious code in GETGD, unnecessary. {Sigh!}
+;
+;  106	General 'obviously bad' code cleanups.  /CAB 4-Sep-81 vis. 
+;	SPOFIL:  In INPMAP, PUSH PUSH PUSH x POP POP POP "should"
+;		 always "reverse" the order!!! [Sigh!]
+;
+
+;
+;       ACCUMULATOR DEFINITIONS
+;
+        FLAG=15
+        R0==0
+        R1==1
+        R2==2
+        R3==3
+        R4==4
+        R5==5
+        R6==6
+        R7==7
+        R11==11
+        R12==12
+        R13==13
+        R14==14
+        R15==15
+        R16==16
+        P==17
+        BUFADR==10
+;
+;       TYPES OF REQUESTS
+;
+%REQPEN==0              ;REQUEST PENDING
+%REQHLD==1              ;REQUEST PUT ON HOLD
+%TRAREQ==2              ;TRANSFER REQUEST
+%REQPRI==3              ;IN PROCESS OF BEING PRINTED
+%TAPXFR==4              ;REQ. XFERED TO TAPE
+%TAPCOM==5              ;REQ. XFER TO TAPE AND COMPLETED
+%COMREQ==6              ;REQ. COMPLETED BY NORMAL MEANS
+%COMDEL==7              ;REQ. COMPLETED, FILES PURGED
+%CANREQ==10     	;REQ. HAS BEEN CANCELED
+REQMSK==770000  	; MASK FOR REQUEST NUMBER
+;
+;       FILE CHANNEL ASSIGNMENTS
+;
+        FDCHL==1
+        GDCHL==2
+        FILCHL==3
+        NGDCHL==4
+        NFDCHL==5
+        MAPF==6
+
+;       EXTERNAL SYMBOLS
+        EXTERNAL DISABL,RENABL,REPORT,SEEREP,DELBLK
+        EXTERNAL SPLGAN,GDBUFF,FILESP,FULLCH,FULMSK,HCOPYS,PAGESP
+
+; the following are used only when debugging the accounting module
+ifdef actdeb < EXTERNAL REMPNT,TOTCHR,ACTREC >
+
+;
+;       ENTRY POINTS
+;
+        ENTRY MONUPD,DAIUPD,DELOLD,FLUFD1,DELFD,SETTOT
+        ENTRY STAGET,SAVREG,RESREG,INPMAP,NEXTGD,READFD,RDNEXT
+        ENTRY OPNMAP,GETMAP,SETMAP,FINBNO,FNDTYP,GETINF,RELMAP,FINWHE
+        ENTRY SETINF,GETGDI,UPDGD
+        ENTRY GETGD,GETFD,PUTGD,PUTFD,OPNFD,FNDFD,SIXNUM
+        ENTRY FIXFDP,RDLFD,RELFD,RELGD
+;
+;       OPNMAP OPENS [SPLPPN]SPOOL.MAP
+;       USES R11,R12,R13,R14
+;       SKIP RETURN IF SUCESSFUL
+;
+OPNMAP: SETZ    R13,
+        INIT    MAPF,17         ; DUMP MODE
+        SIXBIT  /DSK/
+        XWD     0,0
+        JRST    ERROR1
+        SETZB   R12,R14         	; 0 TO REGS
+        MOVE    R11,[SIXBIT /SPOOL/]
+        MOVE    R12,[SIXBIT /MAP/]
+        MOVE    R14,SPLGAN      	; PPN OF SPOOL
+        LOOKUP  MAPF,R11        	; OH WHERE OH WHERE IS THE FILE
+        JRST    ERROR2
+        SKIPL   OPNOUT                  ; OUTPUT?
+        POPJ    P,
+OPNMAE: MOVEI   R16,OPNMAE      	; ERROR RETURN FOR ENTER
+        SETZ    R13,            	; I SEE IT
+        MOVE    R12,[SIXBIT /MAP/]      ; FIX IT UP
+        MOVE    R14,SPLGAN
+        ENTER   MAPF,R11                ; GO FIX IT UP
+        JRST    REST1
+        POPJ    P,
+RET1:   AOS     (P)
+        POPJ    P,
+;
+;       INPMAP DOES GETMAP AND REL MAP IF FOR INPUT
+;
+INPMAP: PUSH    P,R0		;[106] re-order Acs to push/pop
+        PUSH    P,R11		;[106] in the same order. /CAB
+        PUSH    P,R12
+        PUSH    P,R13
+        PUSH    P,R14
+        PUSHJ   P,GETMAP
+        SKIPN   OPNOUT          ; -1=> OUTPUT OPEN 0=> INPUT OPEN
+        PUSHJ   P,RELMAP
+        POP     P,R14
+        POP     P,R13
+        POP     P,R12
+        POP     P,R11
+        POP     P,R0
+        POPJ    P,
+;
+;       NEXTGD GETS INFO ABOUT THE NEXT GD POINTED TO BY NEXTRE
+;
+NEXTGD: MOVE    R1,NEXTRE
+        PUSHJ   P,GETINF
+        PUSHJ   P,SETCUR
+        POPJ    P,              ; NO MORE LEFT
+        JRST 	RET1
+;
+;       GETMAP GETS THE MAP FROM THE FILE
+;
+GETMAP: PUSHJ   P,OPNMAP        ; OPEN THE MAP
+        INPUT   MAPF,MAPLST     ; READ MAP
+        JRST    .+2             ; LOOKS GOOD
+        JRST    ERROR3          ; NOW WHAT?
+SETTOT: MOVE    R0,MAP
+        MOVEM   R0,TOTREQ       ; LAST REQUEST ENTERED AT THIS TIME
+        ADDI    R0,20
+        MOVEM   NEXTRE          ; SETUP NXT REQ TO START AT END OF MAP
+        POPJ    P,
+RELMAP: RELEASE MAPF,
+        POPJ    P,
+;
+;       SETMAP SETS THE MAP
+;
+SETMAP: SETOM	OPNOUT                  ; OPEN FOR OUTPUT
+        PUSHJ   P,OPNMAP
+        OUTPUT  MAPF,MAPLST             ; DUMP IT 
+        POPJ    P,
+        JRST    ERROR2
+;
+;       FINBNO THIS ROUTINES FINDS THE REQUEST SENT IN R0
+;              IT ALSO CALLS GETINF GIVING STATUS OF THE REQUEST
+;
+FINBNO: MOVE    R1,NEXTRE
+        PUSHJ   P,GETINF        	; LOOK AT NEXTRE
+        PUSHJ   P,SETCUR                ; SET CURBLK, NEXTRE
+        POPJ    P,                      ; WE RAN OUT OF ROOM
+        CAMN    R0,CURREQ       	; R0 HAS WHAT WE LOOKING FOR
+        JRST    RET1
+        JRST    FINBNO
+;
+;       FINWHE FINDS OUT FROM MAP(R1) IF REQ IS CENTER OR REM OR BOTH
+;              R0=1 => WANT CENTER
+;              R0=2 => WANT REM
+;              R0=3 => WANT BOTH
+;
+FINWHE: MOVE    R1,NEXTRE
+        PUSHJ   P,GETINF
+        PUSHJ   P,SETCUR        	; SET CURBLK,NEXTRE
+        POPJ    P,              	; NO MORE
+        MOVE    R2,CURWHE
+        TDNN    R2,R0
+        JRST    FINWHE
+        JRST    RET1
+;
+;       FNDTYP FINDS THE TYPE OF FORM THAT IS PASSED IN R0
+;
+FNDTYP: MOVE    R1,NEXTRE
+FTYP0:  PUSHJ   P,GETINF
+        PUSHJ   P,SETCUR		; SET CURBLK,NEXTRE
+        POPJ    P,			; SORRY NO MORE
+        HRL     R1,CURTYP
+        HRR     R1,CURFOR
+        CAMN    R0,R1			; ARE THEY EQUAL?
+        JRST    RET1
+        JRST    FNDTYP
+;
+;       GETINF GETS THE WORD FROM MAP(R1) AND FINDS
+;              CURTYP,CURPAG,CURSTA,CURREQ,CURBLK,CURFOR
+;
+GETINF: SETZ    R2,
+        MOVE    R3,MAP(R1)
+        LSHC    R2,^D12
+        MOVEM   R2,CURPAG
+        SETZ    R2,
+        LSHC    R2,3
+        MOVEM   R2,CURTYP
+        SETZ    R2,
+        LSHC    R2,3
+        MOVEM   R2,CURFOR
+        SETZ    R2,
+        LSHC    R2,6
+        MOVEM   R2,CURSTA
+        SETZ    R2,
+        LSHC    R2,2
+        MOVEM   R2,CURWHE
+        SETZ    R2,
+        LSHC    R2,^D10
+        MOVEM   R2,CURREQ
+        MOVE    R3,R1
+        SUBI    R3,20
+        MOVEM   R2,CURBLK
+        POPJ    P,
+;
+;       SETINF SETS MAP(R1)
+;
+SETINF: SETZ    R2,
+        MOVE    R2,CURREQ
+        LSHC    R2,^D-10
+        MOVE    R2,CURWHE
+        LSHC    R2,-2
+        MOVE    R2,CURSTA
+        LSHC    R2,^D-6
+        MOVE    R2,CURFOR
+        LSHC    R2,^D-3
+        MOVE    R2,CURTYP
+        LSHC    R2,^D-3
+        MOVE    R2,CURPAG
+        LSHC    R2,^D-12
+        MOVEM   R3,20+MAP(R1)
+        POPJ    P,
+;
+;       GETGDI GETS ALL WORDS NECESSARY TO SET UP MAP FROM GDBUFF
+;
+GETGDI: SETZ    R2,
+        MOVE    R3,GDBUFF		; get the request no.
+        LSHC    R2,6
+        MOVEM   R2,CURSTA
+        MOVE    R0,GDBUFF		; get the request no. again
+        PUSHJ   P,SIXNUM                ; CONVERT R0 TO NUMBER
+        MOVEM   R1,CURREQ
+        MOVE    R0,GDBUFF+3		; get the printer loc.
+        ANDI    R0,3                    ; ONLY 2 BITS
+        MOVEM   R0,CURWHE
+        HLRZ    R3,GDBUFF+4		; get the no. of pages
+        MOVEM   R3,CURPAG
+        MOVE    R3,GDBUFF+5		; get word with paper type/form
+        SETZ    R2,
+        LSHC    R2,3
+        MOVEM   R2,CURTYP
+        SETZ    R2,
+        LSHC    R2,3
+        MOVEM   R2,CURFOR
+; the next line of code may not be needed.  However, in case some
+; routine that calls GetGdi expects BufAdr to be set up, we leave
+; it where it would have been if we had used it instead of reading
+; directly from GdBuff as we did above.
+	movei	BufAdr,GdBuff+5
+        POPJ    P,
+;
+;       GETGD GETS GD POINTED AT BY CURBLK
+;
+GETGD:  SKIPN   GDOPN		;[112] Already open?
+         PUSHJ  P,OPNGD		;[112] No--Open it
+	USETI   GDCHL,@CURBLK	;[112] Point at current block.
+        INPUT   GDCHL,GDPTR	; GET IT
+	  CAIA			;[112]  OK
+        JRST    ERROR6
+GOTGD:  PUSHJ   P,GETGDI	; LETS GET THE INFO ABOUT GD
+        HLRZ    R0,GDBUFF+1	;get word containing no. of files
+        LSH     R0,-^D8         ;GET FILES SPOOLED
+        MOVEM   R0,FILESP       ;SAVE THEM
+        MOVE    R0,GDBUFF+3	;get word containing switches
+        SETZM   FULLCH          ;ZERO FULL CASE DESIRE
+        TRNE    R0,FULMSK       ;SEE IF WANTS IT
+        SETOM   FULLCH          ;FLAG AS YES
+        ANDI    R0,77000        ;TEMP 4/21
+        LSH     R0,-^D9         ;TEMP 4/21
+        MOVEM   R0,R2           ;TEMP 4/21
+        HLRZ    R0,GDBUFF+4	;get no. of pages spooled
+        MOVEM   R0,PAGESP       ;SAVE THEM
+        HLRZ    R0,GDBUFF+21	;get max. no. of copies
+        LSH     R0,-^D9         ;RIGHT JUSTIFY IT
+        ANDI    R0,77           ;MAX IS 63 ANYWAY
+        MOVEM   R0,HCOPYS       ;KEEP FOR LATER
+        SKIPN   HCOPYS          ;TEMP 4/21
+        MOVEM   R2,HCOPYS       ;TEMP 4/21
+        SETZ    R0,             ;ZERO FLAG
+        AOS     ,BLKPTR         ;ADD 1 TO BLK. POS. POINTER
+        MOVEI   BUFADR,GDBUFF	;restore bufadr just to make sure
+        POPJ    P,
+;
+;       GETFD GETS BLOCK POINTED TO BY CURFD
+;             READS TO BUFFER POINTED TO IN R0
+;
+GETFD:  USETI   FDCHL,@CURFD    ; SET IT
+        SETZ    R1,
+        INPUT   FDCHL,R0        ; READ IT TO BUFFER POINTED TO IN R0
+        JRST    .+2
+        JRST    ERROR9
+        STATZ   FDCHL,20000     ; EOF?
+        JRST    ERRO13
+        POPJ    P,
+RELFD:  RELEASE FDCHL,          ; SMALL ROUTINE TO RELEASE FD
+        SETZM   FDOPN
+        POPJ    P,
+;
+;       PUTGD PUTS CURRENT GD BACK TO FILE
+;
+PUTGD:  USETO   GDCHL,@CURBLK
+        OUTPUT  GDCHL,GDPTR
+        JRST    .+2
+        JRST    ERRO10
+        POPJ    P,
+RELGD:  RELEASE GDCHL,
+        SETZM   GDOPN
+        POPJ    P,
+;
+;       PUTFD   PUTS FDBLOCK BACK TO FD
+;
+PUTFD:  SETSTS  FDCHL,17                ;CLEAR ALL ERROR BITS
+        USETO   FDCHL,@CURFD
+        OUTPUT  FDCHL,FDPTR
+        JRST    .+2
+        JRST    ERRO11
+        RELEASE FDCHL,
+        POPJ    P,
+;
+;       OPENGD OPENS GDFIL IN DUMP MODE
+;
+OPNGD:  SKIPE   GDOPN			; FILE OPEN?
+        POPJ    P,
+        SETZ    R13,
+        INIT    GDCHL,17		; DUMP MODE
+        SIXBIT  /DSK/
+        XWD     0,0
+        JRST    ERROR4
+        SETZB   R12,R14         	; 0 TO REGS
+        MOVE    R11,[SIXBIT /SPOOL/]
+        MOVE    R12,[SIXBIT /GDF/]
+        MOVE    R14,SPLGAN      	; PPN OF SPOOL
+        LOOKUP  GDCHL,R11        	; OH WHERE OH WHERE IS THE FILE
+        JRST    ERROR5          	; TSK TSK WE DON'T KNOW
+        SKIPL   OPNOUT                  ; OPN FOR OUTPUT?
+        JRST    OPNGD1                  ; NO
+OPGDE:  MOVEI   R16,OPGDE        	; TSK TSK WE DON'T KNOW
+        SETZ    R13,            	; I SEE IT
+        MOVE    R14,SPLGAN      	; FIX GAN UP
+        MOVE    R12,[SIXBIT /GDF/]      ; FIX IT UP
+        ENTER   GDCHL,R11               ; GO FIX IT UP
+        JRST    REST1                   ; NOW WHAT IS GOING ON?
+OPNGD1: PUSHJ   P,WHELAS                ; EVEN BLOCK (BETTER BE)
+        MOVEM   R0,LASGD
+        MOVEM   R1,NWDLGD               ; NUM WDS IN LAST BLOCK
+        SETOM   GDOPN                   ; FILE IS NOW OPEN
+        POPJ    P,
+;
+;       OPNFD   OPEN FD FILE 
+;               R0 WILL CONTAIN LAST BLOCK NUMBER OF FD ON RETURN
+;               R1 WILL CONTAIN NUMBER OF WORDS IN LAST BLOCK ON RETURN
+;
+OPNFD:  SKIPE   FDOPN
+        POPJ    P,
+        SETZ    R13,
+        INIT    FDCHL,17         	; DUMP MODE
+        SIXBIT  /DSK/
+        XWD     0,0
+        JRST    ERROR7
+        SETZB   R12,R14         	; 0 TO REGS
+        MOVE    R11,[SIXBIT /SPOOL/]
+        MOVE    R12,[SIXBIT /FDF/]
+        MOVE    R14,SPLGAN      	; PPN OF SPOOL
+        LOOKUP  FDCHL,R11		; OH WHERE OH WHERE IS THE FILE
+        JRST    ERROR8
+        SKIPL   OPNOUT			; OPEN FOR OUTPUT?
+        JRST    OPNFD1
+OPNFDE: MOVEI   R16,OPNFDE
+        SETZ    R13,            	; I SEE IT
+        MOVE    R14,SPLGAN      	; GET GAN BACK
+        MOVE    R12,[SIXBIT /FDF/]      ; FIX IT UP
+        ENTER   FDCHL,R11                ; GO FIX IT UP
+        JRST    REST1
+OPNFD1: PUSHJ   P,WHELAS                ; SEE IF BLOCK BOUNDARY
+OPNFDR: MOVEM   R0,LASFD
+        MOVEM   R1,NWDLFD               ; NUMBER WORDS IN LAST FD
+        SETOM   FDOPN           	; FILE IS OPEN
+        POPJ    P,
+;
+;       FNDFD FINDS A FD EQUAL TO CURREQ
+;
+FNDFD:  ILDB    R0,FDPTR		; GET BATCHNO
+        PUSHJ   P,SIXNUM                ; CHANGE SIXBIT TO NUMBER
+        CAMN    R1,CURREQ
+        JRST    FNDFD2                  ; FOUND IT
+        PUSHJ   P,RDNEXT
+        JRST    FNDFD
+FNDFD1: HALT
+FNDFD2: HRRZ	R1,FDPTR
+        HLRZ    R2,0(R1)        	; WE NEED COPYS
+        LSH     R2,^D-12        	; GET IT
+        MOVEM   R2,NCOPFD       	; SAVE IT (NO. OF COPIES OF FD)
+        POPJ    P,              	; RETURN
+;
+;       SIXNUM CONVERTS SIXBIT BR NO TO NUMBER
+;
+SIXNUM: ANDI    R0,575757               ; GET INTEGERS
+        MOVE    R1,[POINT 6,0,^D17]   	; SETUP POINTER
+        MOVNI   R4,3
+        SETZB   R2,R3
+SIX0:   IMULI   R3,^D10
+        ILDB    R2,R1
+        ADD     R3,R2
+        AOJL    R4,SIX0
+        MOVE    R1,R3
+        POPJ    P,
+;
+;       FIXFDP  FIXES UP FDLIST FOR THE OUTPUT(S)
+;               ON CALL NOFIFD MUST HAVE NO. OF FILES TO BE WRITEN OUT
+;
+FIXFDP: MOVE    R5,NOFIFD               ; GET NUMBER OF FILES
+        IMULI   R5,FDSIZE
+        MOVE    R2,R5
+        ADD     R2,NWDLFD               ; ADD WDS IN OLD TO NEW WDS
+        MOVNS   R2                      ; MAKE NEG
+        HRLZS   R2                      ; PUT IT IN THE L.H.
+        HRRI    R2,BUFLFD-1             ; FINISH UP IO WORD
+FIXFDR: MOVEM   R2,FDPTR
+        SETZM   FDPTR+1
+        MOVEI   R2,BUFLFD               ; LETS SEE WHERE TO BLT TO
+        ADD     R2,NWDLFD               ; NUM OF WDS IN OLD BLOCK
+        HRLI    R2,BUFFFD               ; FROM BUFFFD
+        MOVEI   R3,BUFLFD-1             ; FIND LAST WORD TO MOVE TO
+        ADD     R3,NWDLFD               ; OLD NUMBER OF WDS
+        ADD     R3,R5                   ; NEW NUMBER OF WDS
+        BLT     R2,@R3			; SEND IT BABY
+        POPJ    P,
+;
+;       RDLFD READS THE LAST FD FROM THE FILE INTO BUFLFD
+;
+RDLFD:  MOVE    R2,LASFD                ; GET BLK OF LAST FD
+        MOVEM   R2,CURFD                ; GET SET TO READ
+        MOVE    R0,[IOWD 200,BUFLFD]    ; SET UP R0 TO POINT TO BUFLFD
+        PUSHJ   P,GETFD			; GET IT
+        POPJ    P,			; GOT IT
+;
+;       WEHLAS  FINDS OUT IF FILE OPENED IN R11-R14 
+;               ENDS ON A BLOCK BOUNDARY
+;               ON RETURN: R0=NUMBER OF LAST BLOCK
+;               ON RETURN: R1=NUMBER OF WDS IN  LAST BLOCK
+;
+WHELAS: HLRE    R0,R14                  ; LETS GET WORDS
+        SETZ    R1,
+        JUMPL   R0,WHE1                 ; EVEN BLOCK
+        JRST    WHER    		; LETS RETURN
+WHE1:   MOVNS   R0,R0                   ; LETS MAKE WORDS POSITIVE
+        IDIVI   R0,200                  ; LETS MAKE BLOCKS
+WHER:   ADDI    R0,1
+        POPJ    P,
+;
+;       UPDGD   UPDATES THE GD SPECIFIED BY CURBLK
+;               IT ALSO UPDATES THE MAP
+;
+UPDGD:  PUSHJ   P,DISABL                ; NO ESCAPES ALLOWED
+        PUSHJ   P,RELGD
+        SETOM   OPNOUT                  ; OPEN GD FILE FOR OUTPUT
+        PUSHJ   P,OPNGD
+        PUSHJ   P,GETMAP
+        SKIPL   CURBLK          	; CURBLK < 0 => APPEND TO END
+        JRST    UPD1            	; CURBLK > 0 => WHERE TO WRITE
+        AOS     MAP
+        MOVE    R2,MAP
+        MOVEM   R2,CURBLK
+UPD1:   PUSHJ   P,PUTGD         	; PUT OUT THE GD
+        PUSHJ   P,GETGDI        	; GET INFOR FROM GD FOR MAP WORD
+        MOVE    R1,CURBLK
+        PUSHJ   P,SETINF        	; SET MAP(CURBLK)+20
+        PUSHJ   P,SETMAP        	; PUT OUT MAP
+        PUSHJ   P,RELGD         	; REL GD
+        PUSHJ   P,RELMAP        	; REL MAP
+        PUSHJ   P,RENABL                ; ALLOW ESCAPES AGAIN
+        POPJ    P,
+;
+;       STAGET  GETS GD OF NEXT VALID GD FOR STA
+;
+STAGET: MOVE    R0,FLAG
+        PUSHJ   P,FINWHE                ; FIND OUT WHERE REQUEST IS
+        JRST    STAG2
+        MOVE    R1,CURSTA		; GET STATUS OF CURRENT BATCH REQ
+        SKIPE   REPORT              	; REPORT?
+        JRST    STAG1                   ; YES
+        CAILE   R1,4			; ONLY PEND PROC HOLD OR TRAN
+        JRST    STAGET
+STAG1:  PUSHJ   P,GETGD
+        JRST    RET1
+STAG2:  PUSHJ   P,RELGD
+        POPJ    P,
+;
+;       SAVREG SAVES REGISTERS 5-16
+;
+SAVREG: HRLZI   R1,R2
+        HRRI    R1,SAV2
+        BLT     R1,SAV16
+        POPJ    P,
+;
+;       RESREG RESTORES REGISTERS
+;
+RESREG: HRLZI   R1,SAV2
+        HRRI    R1,R2
+        BLT     R1,R16
+        POPJ    P,
+;
+;       SETCUR  SETS CURBLK AND NEXTRE
+;               R1 CONTAINS NEXTRE+1
+;
+SETCUR: MOVE	R1,NEXTRE
+        SUBI    R1,20
+        SKIPG   R1
+        POPJ    P,
+        SOS     NEXTRE
+        MOVEM   R1,CURBLK
+        JRST    RET1
+;
+;       ERROR MESSAGES
+;
+REERR1:
+REERR2:
+REERR3:
+REERR4:
+        HALT
+ERROR1: MOVEI   R0,ERM1			; CAN'T GET CHAN FOR MAP FILE
+ERRRET: PUSHJ   P,OUTLIN##
+        JRST    SEEREP##
+ERROR2: MOVEI   R0,ERM2			; CANNOT FIND MAP FILE
+        JRST    ERRRET
+ERROR3: MOVEI   R0,ERM3
+        JRST    ERRRET
+ERROR4: MOVEI   R0,ERM4
+        JRST    ERRRET
+ERROR5: MOVEI   R0,ERM5
+        JRST    ERRRET
+ERROR6: MOVEI   R0,ERM6
+        JRST    ERRRET
+ERROR7: MOVEI   R0,ERM7
+        JRST    ERRRET
+ERROR8: MOVEI   R0,ERM8
+        JRST    ERRRET
+ERROR9: MOVEI   R0,ERM9
+        JRST    ERRRET
+ERRO10: MOVEI   R0,ERM10
+        JRST    ERRRET
+ERRO11: MOVEI   R0,ERM11
+        JRST    ERRRET
+ERRO12: MOVEI   R0,ERM12
+        JRST    ERRRET
+ERRO13: MOVEI   R0,ERM13
+        JRST    ERRRET
+;
+;       REST1   SLEEPS 10 SECS AND RETURNS THROUGH AC16
+;
+REST1:  MOVEI   R0,12
+        SLEEP   R0,
+        JRST    @R16
+;
+;       READFD READS THE FD(S) INTO CORE FOR CURRENT GD
+;
+READFD: SKIPE   FDOPN           	; IS FD OPEN?
+        JRST    READF0          	; YES IT IS
+        PUSHJ   P,OPNFD         	; OPEN IT
+        SETZM   CURFD           ; SET CURFD TO 0 (WE DIDN'T READ IT)
+READF0: HLRZ    R7,GDBUFF+1
+        LSH     R7,^D-8         	; NUMBER OF FILES
+        MOVE    R0,GDBUFF+34    	; GET PTR TO BLOCK OF FD
+   CAMN    R0,CURFD
+        JRST    READF1          	; ALREADY IN CORE
+        MOVEM   R0,CURFD                ; GET READY
+RDFN:   MOVE    R0,[IOWD 200,BUFLFD]    ; MAX OF THREE BUFFERS
+        PUSHJ   P,GETFD         	; GET THE FD
+READF1: MOVE    R0,[POINT 36,BUFLFD]
+        MOVEM   FDPTR
+        POPJ    P,
+;
+;       RDNEXT BYPASSES CURRENT FD AND CHECKS TO SEE IF END REACHED
+;
+RDNEXT: MOVE    R0,FDPTR        	; LETS SEE IF DONE
+        ADDI    R0,FDSIZE-1
+        MOVEM   R0,FDPTR
+        HRRZ    R1,FDPTR
+        CAIGE   R1,BUFLFD+200-1
+        POPJ    P,              	; FOUND ONE--SO  RETURN 
+        AOS     CURFD           	; ELSE GET NEXT BLOCK
+        PUSHJ   P,RDFN
+        POPJ P,
+
+ifdef actdeb <
+; some routines to assist in debugging the accounting module.
+; these are called in the daily update routine to charge all
+; recently completed requests.  To insure that this doesn't
+; happen accidentally, the code also depends on debug switch.
+;
+ifdef debug <
+savtst: block	20			; storage to save the ac's
+acttst:	movem	16,savtst+16		; save 16
+	move	16,rempnt		; fetch the current rempnt
+	movem	16,savtst+17		; and save it
+	movei	16,savtst		; we'll blt beginning here
+	blt	16,savtst+15		; save the other ac's
+	setzm	,rempnt			; make it for center
+	pushj	p,actrec		; charge it
+	movei	16,^D100000
+	movem	16,totchr		; fake this for testing
+	setom	,rempnt			; make it remote this time
+	pushj	p,actrec		; and charge it
+	move	16,savtst+17		; restore real rempnt
+	movem	16,rempnt
+	hrlzi	16,savtst		; set up to restore ac's
+	blt	16,16			; and do it
+	popj	p,			; all done
+> >
+;
+;       DAIUPD IS RESPONSIBLE FOR THE DAILY UPDATE
+;
+DAIUPD: 
+        SETOM   OPNOUT
+        PUSHJ   P,GETMAP
+        PUSHJ   P,OPNGD
+        PUSHJ   P,OPNFD
+        PUSHJ   P,DISABL                ; NO ESCAPES BUDDY
+        INIT    FILCHL,10
+        SIXBIT  /DSK/
+        XWD     0,0
+        JRST    ERROR1
+DAI1:   PUSHJ   P,NEXTGD        	; GET NEXT GD TO PROCESS
+        JRST    DAI3            	; EOF
+        MOVE    R0,CURSTA
+        CAIG    R0,%COMREQ
+        CAIGE   R0,%TAPCOM
+        JRST    DAI1            ; NOT DONE YET 0-4, 7, 10 SO DO NOT DEL
+        PUSHJ   P,GETGD         	; BETTER LOOK AT THE GD
+ifdef actdeb <  ifdef debug <
+	pushj	p, acttst	; charge the request
+> >
+        PUSHJ   P,CHKDAY        	; CHECK TO SEE IF WE DELETE
+        JRST    DAI1            	; BETTER NOT DEL
+        HLRZ    R0,GDBUFF       	; SET GD STAT TO FILES DEL
+        ANDI	R0,7777
+        IORI    R0,70000
+        HRLM    R0,GDBUFF       	; PUT IT BACK
+        PUSHJ   P,GETGDI        	; SET UP MAP TO BE CORRECT
+        MOVE    R1,CURBLK       	; CUR BLK OF GD+20 = MAP POS
+        PUSHJ   P,SETINF        	; SET MAP(R1)
+        PUSHJ   P,READFD        	; READ FD SO WE CAN DEL
+DAI2:   PUSHJ   P,FNDFD         	; SEE IF IT THIS BATCH REQ NUM
+        PUSHJ   P,DELFD         	; DELETE FILES ASSOCIATED WITH IT
+        PUSHJ   P,RDNEXT        	; GO TO NEXT FD
+        SOJG    7,DAI2            	; DO IT
+        PUSHJ   P,PUTGD         	; BETTER PUT OUT THE GD NOW
+        JRST    DAI1            	; EOF OR NO MORE--PROC NXT GD
+DAI3:
+        DATE    R0,
+        MOVEM   R0,MAP+2
+        PUSHJ   P,SETMAP
+        PUSHJ   P,RELFD
+        PUSHJ   P,RELGD
+        PUSHJ   P,RELMAP
+        PUSHJ   P,RENABLE
+        POPJ    P,
+;
+;       CHKDAY CHECKS GD TO SEE IF REQUEST COMPLETED 2 DAYS AGO
+;		call it ONLY for completed requests!
+;		it will fix up a missing completion date
+;
+CHKDAY:
+        DATE    R1,             	; GET TODAY'S DATE TO R1
+        PUSHJ   P,GETDAT        	; CHANGE TO DAYS SINCE 1964
+        MOVE    R4,R1           	; SAVE IT FOR LATER
+        HRRZ    R1,GDBUFF+21    	; LET'S CHECK DATE COMPLETED
+	JUMPE	R1,FIXDAY		; if comp. date = 0, go fix it
+        PUSHJ   P,GETDAT        	; CHANGE NON DEC
+        SUB     R4,R1           	; LETS LOOK AT DIFF
+        SUBI    R4,2            	; NEED AT LEAST 2 DAYS
+        SKIPGE  R4              	; SKIP WE HAVE IT
+        POPJ    P,
+        JRST    RET1
+FIXDAY:	DATE	R1,			; get today's date
+	HRRM	R1,GDBUFF+21		; set completion date = today
+	PUSHJ	P,PUTGD			; write out corrected gd rec
+	POPJ	P,			; and return
+;
+;       GETDAT  CHANGES DATE PASSED IN R1 TO NON DEC FORMAT
+;
+GETDAT:
+        SETZ    R0,
+        MOVE    R3,[XWD -1,6]   	; FOR TZONE
+        GETTAB  R3,             	; GET IT
+        POPJ    P,
+        LSH R3,^D-28
+        ANDI    R3,77
+        HRLS    R3
+        IORI    R3,400000
+        MOVSS   R3              ; SWITCH TO MAKE CORRECT FROM,,TO
+        SETZ    R2,
+        MOVEI   R0,1
+        DATUUO  R0,
+        POPJ    P,
+        POPJ    P,
+;
+;       DELFD  DELETES THE FILE POINTED TO BY FDPTR
+;
+DELFD:
+        HRRZ    R1,FDPTR        	; LETS GET ADDR TO R0
+        MOVE    R11,1(1)        	; NAME
+        HLLZ    R12,2(1)        	; EXT
+        SETZ    R13,
+        MOVE    R14,SPLGAN      	; GAN
+        LOOKUP  FILCHL,R11
+        POPJ    P,
+        SETZ    R13,
+        MOVE    R14,SPLGAN
+        SETZB   R11,R12
+        RENAME  FILCHL,R11
+        JUMP
+        POPJ    P,
+;
+;       MONUPD  DOES MONTHLY UPDATE
+;
+MONUPD:
+        SETOM   OPNOUT
+        PUSHJ   P,INPMAP
+        PUSHJ   P,OPNGD
+        PUSHJ   P,OPNFD
+        PUSHJ   P,OPNTMP        	; OPEN TEMP FILES FOR NEW GD/FD
+        PUSHJ   P,DISABL        	; NO MORE ESCAPES NOW
+        SETZM   CURFD           	; ZERO IT
+        SETZB   R6,MAP          	; START NEW MAP--USE R6 FOR CNT
+        MOVEI   R0,1
+        MOVEM   R0,CURTMP
+MON1:
+        ADDI    R6,1            	; ADD ONE TO COUNT
+        MOVE    R0,R6           	; READY TO SET UP NEXTRE
+        CAMLE   R0,TOTREQ
+        JRST    MON3
+        ADDI    R0,20
+        MOVEM   R0,NEXTRE
+        PUSHJ   P,NEXTGD        	; NEED GD NOW
+        JRST    MON3            	; EOF
+        MOVE    R0,CURSTA
+        CAIGE   R0,%TAPCOM
+        JRST    MON2
+        CAILE   R0,%COMDEL      	; 5,6,7,10
+        JRST    MON1            	; 10
+        PUSHJ   P,GETGD         	; NEED THE GD NOW
+        PUSHJ   P,CHKMON        	; 5,6,7
+        JRST    MON1            	; NO SAVE
+        SKIPA
+MON2:   PUSHJ   P,GETGD
+        AOS 	MAP
+        PUSHJ   P,GETGDI
+        MOVE    R1,MAP          	; SETUP R1 FOR SETINF
+        PUSHJ   P,SETINF                ; SET MAP(R1)
+        PUSHJ   P,READFD
+        PUSHJ   P,SAVFD         	;WRITE TO TMP FD AND FIX GDBUFF
+        PUSHJ   P,SAVGD         	; SAVE GD TO TEMP GD
+        JRST    MON1
+MON3:
+        PUSHJ   P,FLUFD1        	; FLUSH THE FD DUMMY
+        DATE    R0,             	; NEED DATE OF UPDATE
+        MOVEM   R0,MAP+1        	; THATS WHERE IT GOES
+        MOVEI   R0,MAP+21
+        ADD     R0,MAP
+        SETZM   @R0
+        HRRZ    R1,R0
+        ADDI    R0,1
+        HRL     R0,R1
+        BLT     R0,MAP+MAPLEN-1 	; ZERO THE REST OF THIS
+        PUSHJ   P,DELOLD        	; RENAME GD/FD TO CORRECT
+        PUSHJ   P,SETMAP
+        PUSHJ   P,RELGD
+        PUSHJ   P,RELFD
+        PUSHJ   P,RELMAP
+        PUSHJ   P,RENABL        	; YOU CAN ESCAPE NOW
+        POPJ    P,
+;
+;       OPNTMP OPENS TEMP FILES FOR GD/FD
+;
+OPNTMP:
+        INIT    NGDCHL,17
+        SIXBIT  /DSK/
+        XWD     0,0
+        JRST	ERROR4
+        MOVE    R11,[SIXBIT /TEMPGD/]
+        SETZB   R12,R13
+        MOVE    R14,SPLGAN
+        ENTER   NGDCHL,R11
+        JRST    ERROR5
+        INIT    NFDCHL,17
+        SIXBIT  /DSK/
+        XWD     0,0
+        JRST 	ERROR7
+        MOVE    R11,[SIXBIT /TEMPFD/]
+        SETZB   R12,R13
+        MOVE    R14,SPLGAN
+        ENTER   NFDCHL,R11
+        JRST	ERRO10
+        POPJ    P,
+;
+;       SAVFD SAVES FD FOR THE CURRENT GD IN BUFFFD
+;
+SAVFD:
+        MOVE    R0,CURTMP
+        MOVEM   R0,GDBUFF+34            ; SAVE POS OF TEMPFD NOW
+SAVFD1:
+        ;The following statements fix the monthly update bug.
+        ;It fixes fdptr since it was being advanced by fndfd, and copies
+        ;a file record from the location pointed to by fdptr to a 
+        ;location pointed to by tmpptr.
+
+        hrrz    r0,fdptr
+        caige   r0,buflfd+200-1
+        jrst    .+3
+        aos     curfd
+        pushj   p,rdfn
+
+        PUSHJ   P,FNDFD         	; FIND IT
+        HRRZ    R0,TMPPTR
+        CAIL    R0,BUFFFD+200-1
+        PUSHJ   P,FLUFD         	; FLUSH TO TMP FILE AND RESTART
+        SOS     FDPTR
+        MOVEI   R3,FDSIZE
+SAVFD2:
+        ILDB    R0,FDPTR
+        IDPB    R0,TMPPTR
+        SOJG    R3,SAVFD2
+        SOJG    R7,SAVFD1
+        POPJ    P,
+;
+;       SAVGD SAVES GD TO NFDCHL
+;
+SAVGD:
+        SETSTS  NGDCHL,17
+        OUTPUT  NGDCHL,GDPTR
+        POPJ    P,
+        JRST    ERRO10
+;
+;       FLUFD FLUSHES THE FDBUFFER (BUFFFD)
+;
+FLUFD:
+        AOS     CURTMP
+        MOVE    R0,[POINT 36,BUFFFD]             ; POINTER TO BUFFFD
+        MOVEM   R0,TMPPTR
+        MOVE    R0,[IOWD 200,BUFFFD]
+        SETZ    R1,
+        OUTPUT  NFDCHL,R0
+        POPJ    P,
+        JRST    ERRO11
+;
+;       CHKMON CHECKS TO SEE IF MONTH TO DEL
+;
+CHKMON:
+        DATE    R1,
+        IDIVI   R1,^D31
+        HRRZ    R2,GDBUFF+21    	; DATE OF COMPLETION
+        IDIVI   R2,^D31
+        SUB     R1,R2
+        CAILE   R1,1
+        POPJ    P,
+        JRST    RET1
+;
+;       DELOLD RENAMES TEM GD/FD TO REAL THINGS
+;
+DELOLD:
+        MOVE     R0,SPLGAN       	;GET SPOOLER'S PPN
+        MOVE     R1,R0			;SAVE PPN FOR LATER
+        MOVEM    R0,NGDBLK+3     	;TO CREATE NEW GD
+        MOVEM    R0,NFDBLK+3     	;TO CREATE NEW FD
+        SETZM    ,NGDBLK+2       	;FOR NEW GD
+        SETZM    ,NFDBLK+2       	;FOR NEW FD
+        MOVE     R0,[SIXBIT/SPOOL/] 	;FOR NEW GD AND FD
+        MOVEM    R0,NGDBLK       	;FOR NEW GD
+        MOVEM    R0,NFDBLK       	;FOR NEW FD
+        MOVSI    R0,(SIXBIT/GDF/)       ;FOR NEW GD
+        MOVEM    R0,NGDBLK+1     	;SAME
+        MOVSI    R0,(SIXBIT/FDF/)       ;FOR NEW FD
+        MOVEM    R0,NFDBLK+1     	;SAME
+;
+;       DELETE OLD FILES AND CREATE THE NEW
+;
+        MOVEM   R1,DELBLK+3    		;STORE FOR DELETE
+        SETZM   ,DELBLK         	;ZERO FOR DELETE
+        RENAME  GDCHL,DELBLK    	;GET RID OF OLD GD
+        JRST    REERR1          	;CANT DELETE OLD GD
+        MOVEM   R1,DELBLK+3    		;STORE PPN FOR DELETE
+        SETZM   ,DELBLK         	;ZERO FOR DELETE
+        RENAME  FDCHL,DELBLK    	;DELETE OLD FD
+        JRST    REERR2          	;CANT DELETE OLD FD
+        RELEASE GDCHL,          	;RELEASE THE CHANNEL
+        RELEASE FDCHL,          	;RELEASE THE FD CHANNEL
+        RENAME  NGDCHL,NGDBLK   	;CREATE NEW GD FILE
+        JRST    REERR3          	;CANT CREATE NEW GD FILE
+        RELEASE NGDCHL,         	;RELEASE THE CHANNEL
+        RENAME  NFDCHL,NFDBLK   	;CREATE NEW NEW FD FILE
+        JRST    REERR4          	;CAN'T CREATE NEW FD FILE
+        RELEASE NFDCHL,         	;RELEASE THE CHANNEL
+        POPJ    P,
+;
+;       FLUFD FLUSHES THE FDBUFFER (BUFFFD)
+;
+FLUFD1:
+        AOS     CURTMP
+        HRRZ    R0,TMPPTR
+        SUBI    R0,BUFFFD-1
+        MOVNS   R0
+        HRLZS   R0
+        HRRI    R0,BUFFFD-1
+        SETZ    R1,
+        OUTPUT  NFDCHL,R0
+        POPJ    P,
+        JRST    ERRO11
+        END
+     U€
