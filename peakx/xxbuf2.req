@@ -1,0 +1,926 @@
+!! title Part Two of Tops-20 Buffer Sources ;
+! *************************************************************************
+*                                                                         *
+*                               XxBuf2.Req                                *
+*                                                                         *
+*             The Buffer/Checkpoint manager.  Tops20 version.             *
+*                       Ken Dawson   25-August-1983                       *
+*                                                                         *
+**************************************************************************;
+
+! These routines are not particularly homogeneous, taken as a whole, but
+! they fit into a smaller space than they did before.
+;
+
+! ----------------------------------------------------------------------- ;
+!! title Rtn B!CKFile ;
+! Recover from a Checkpoint file by hand, destroying the current
+! Checkpoint in the process.  (This routine is the exclusive province of
+! the Recover Checkpoint command.)
+;
+
+forward internal simple procedure B!DelCurrentBuffer;
+
+internal simple procedure B!CKFile (string ChkPntName);
+begin "B!CKFile"
+  if (F!FileExists(ChkPntName)) then
+  begin
+    B!DelCurrentBuffer;
+    B!RestoreChkPnt(ChkPntName);
+    W!Msg("Restore Complete");
+  end
+  else
+  begin
+    W!Msg("Checkpoint File (" & ChkPntName & ") does not exist.");
+    T!Bell;
+  end;
+end "B!CKFile";
+!! title Rtn B!DelCurrentBuffer ;
+! Delete the Checkpoint file, remove the current Buffer from the Chain,
+! add it to the free list and reset the current Buffer to the next Buffer
+! to the right if possible (or to the left if not).
+! Formerly called B!Kill.
+;
+
+internal simple procedure B!DelCurrentBuffer;
+begin "B!DelCurrentBuffer"
+  own integer
+    I,
+    Next;
+
+  for I _ GiantBase step 1 until (GiantBase + (EndOfBuffer - 1)) do
+  begin
+    ! For each memory page mapped to the Checkpoint file.
+    ;
+
+    pmap(-1, !MPg(I), 0);
+
+      ! Remove the page from memory
+      ;
+  end;
+
+  closf(B!Chan);
+  delf(B!Chan);
+  rljfn(B!Chan);
+
+    ! Close and delete the Checkpoint file.
+    ;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  if (B!!Head = B!!List) then B!!Head _ B!!Next[B!!List];
+
+  if (B!!Next[B!!List]) then
+  begin
+    Next _ B!!Next[B!!List];
+    B!!Last[Next] _ B!!Last[B!!List];
+
+    if (B!!Last[B!!List] neq 0) then
+      B!!Next[B!!Last[B!!List]] _ Next;
+  end
+  else if (B!!Last[B!!List]) then
+  begin
+    Next _ B!!Last[B!!List];
+    B!!Next[Next] _ B!!Next[B!!List];
+  end
+  else
+    Next _ 0;   ! into the void ... ;
+
+  B!!Next[B!!List] _ B!!Free;
+  B!!Free _ B!!List;
+  B!!List _ Next;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+  if (B!!List) then
+    B!RestoreChkPnt(B!!ChkPntFile[B!!List]);
+
+  W!SetB(B!!List);
+end "B!DelCurrentBuffer";
+!! title Rtn B!SetB ;
+! Routine to position to a specified buffer ;
+
+forward internal simple procedure B!CheckPoint (boolean Close);
+
+internal simple procedure B!SetB(integer BufNum);
+begin
+  define
+    Close = {true};                     ! Close the Checkpoint file. 
+                                        ;
+
+  if (BufNum = B!!List) then
+    return;
+
+  B!CheckPoint(Close);
+  B!!List _ BufNum;
+  W!SetB(BufNum);
+  B!RestoreChkPnt(B!!ChkPntFile[BufNum]);
+  W!NewS;
+end;
+!! title Rtn B!Step ;
+! Routine to step forwards or backwards along the buffer chain ;
+
+internal simple procedure B!Step(integer Dir);
+begin
+  define
+    Close = {true};                     ! Close the Checkpoint file. 
+                                        ;
+
+  if (Dir = FORWARDS) then
+  begin
+    if (B!!Next[B!!List] neq null) then
+    begin
+      B!CheckPoint(Close);
+      B!!List _ B!!Next[B!!List];
+      W!SetB(B!!List);
+      B!RestoreChkPnt(B!!ChkPntFile[B!!List]);
+      W!NewS;
+    end
+    else
+      W!Msg("No buffers left >");
+  end
+  else if (Dir = BACKWARDS) then
+  begin
+    if (B!!Last[B!!List] neq null) then
+    begin
+      B!CheckPoint(Close);
+      B!!List _ B!!Last[B!!List];
+      W!SetB(B!!List);
+      B!RestoreChkPnt(B!!ChkPntFile[B!!List]);
+      W!NewS;
+    end
+    else
+      W!Msg("No buffers left <");
+  end;
+end;
+!! title Rtn B!Cnt ;
+! Routine to tell us how many buffers to the left and right of the
+!  current buffer are active. Returns [#left,,#right] ;
+
+internal simple integer procedure B!Cnt;
+begin
+  own integer
+    Left,
+    Right,
+    Chain;
+
+  Chain _ B!!List;
+  Left  _ 0;
+
+  while (B!!Last[Chain] neq null) do
+  begin
+    incr(Left);
+    Chain _ B!!Last[Chain];
+  end;
+
+  Chain _ B!!List;
+  Right _ 0;
+
+  while (B!!Next[Chain] neq 0) do
+  begin
+    incr(Right);
+    Chain _ B!!Next[Chain];
+  end;
+
+  return(xwd(Left, Right));
+end;
+!! title Rtn B!Pcnt ;
+! Return the percentage that the point is into the buffer ;
+
+internal simple integer procedure B!Pcnt;
+  begin
+    return((B!Point * 100) div B!Size);
+  end;
+!! title Rtn B!GetP ;
+! Return the current value of the point. ;
+
+internal simple integer procedure B!GetP;
+  return(B!Point);
+!! title Rtn B!SetP ;
+! Set the point to an absolute position in the buffer.  If set to beginning
+!  and/or end, set the appropriate flags. ;
+
+internal simple procedure B!SetP (integer Position);
+  begin
+    B!BegP _ B!EndP _ false;
+    B!Point _ Position;
+    if (B!Point <= 0) then
+      begin
+        B!Point _ 0;
+        B!BegP _ true;
+      end;
+    if (B!Point >= B!Size) then
+      begin
+        B!Point _ B!Size;
+        B!EndP _ true;
+      end;
+  end;
+!! title Rtn B!GetL ;
+! Return the "last" point. ;
+
+forward internal simple integer procedure B!GetM (integer M);
+
+internal simple integer procedure B!GetL;
+begin
+  return(B!GetM(B!LastP));
+end;
+!! title Rtn B!SetL ;
+! Set the "Last" point.  (Used by the split window code). ;
+
+internal simple procedure B!SetL( integer Position );
+begin
+  B!SetM(B!LastP, Position);
+end;
+!! title Rtn B!AllocateMark ;
+! Allocate the first availible Real Mark to the caller and return its
+! index.  A return of -1 indicates that there are no more Marks
+! availible.
+;
+
+internal simple integer procedure B!AllocateMark;
+begin "B!AllocateMark"
+  integer
+    I;
+
+  for I _ FirstMark step 1 until MaxMarks - 1 do
+    if (Marks[I] = -1) then
+    begin
+      Marks[I] _ -2;
+
+      if (I - FirstMark = MarkCnt) then
+        incr(MarkCnt);
+
+      return(I);
+    end;
+
+  return(-1);
+end "B!AllocateMark";
+!! title Rtn B!DeAllocateMark ;
+! Remove a given Mark from circulation, and if possible decrease MarkCnt.
+;
+
+internal simple procedure B!DeAllocateMark (integer M);
+begin "B!DeAllocateMark"
+  integer
+    I;
+
+  if (M < 0 or M >= FirstMark + MarkCnt) then
+    usererr(0, 0, "Error in B!DeAllocateMark", "x")
+  else if (M < #UserMarks) then
+  begin
+    if (Marks[M] neq -1) then
+    begin
+      Marks[Marks[M]] _ -1;
+      Marks[M]        _ -1;
+    end;
+  end
+  else
+    Marks[M] _ -1;
+
+  for I _ FirstMark + MarkCnt - 1 step -1 until FirstMark do
+    if (Marks[I] = -1) then
+      decr(MarkCnt)
+    else
+      done;
+end "B!DeAllocateMark";
+!! title Rtn B!GetM ;
+! Return the current position of the mark ;
+
+internal simple integer procedure B!GetM (integer M);
+begin
+  if (M < 0 or M >= FirstMark + MarkCnt) then
+    usererr(0, 0, "Bad call to B!GetM", "x" )
+  else
+    return
+    (
+      if (M < #UserMarks) then
+        if (Marks[M] = -1) then
+          -1
+        else
+          Marks[Marks[M]]
+      else
+        Marks[M]
+    );
+end;
+!! title Rtn B!SetM ;
+! Set the mark to some position within the buffer ;
+
+internal simple procedure B!SetM (integer M, P);
+begin
+  if (P < 0) then
+    P _ 0
+  else if (P > B!Size) then
+    P _  B!Size;
+
+  if (M < 0 or M >= FirstMark + MarkCnt) then
+    usererr(0, 0, "Bad call to B!GetM", "x" )
+  else
+    if (M < #UserMarks) then
+    begin
+      if (Marks[M] = -1) then
+        Marks[M] _ B!AllocateMark;
+
+      Marks[Marks[M]] _ P;
+    end
+    else
+      Marks[M] _ P;
+end;
+!! title Rtn B!Move ;
+! Move forward or backward through the buffer.  If we reach the beginning
+!  and/or reach the end, set appropriate flags.  Note that with an empty
+!  buffer the point will be both at the beginning and the end. ;
+
+internal simple procedure B!Move(integer Dir);
+  begin "move"
+
+    B!Point _ B!Point + Dir;
+    B!BegP _ B!EndP _ false;
+
+    if (B!Point <= 0) then
+      begin
+        B!Point _ 0;
+        B!BegP _ true;
+      end;
+    if (B!Point >= B!Size) then
+      begin
+        B!Point _ B!Size;
+        B!EndP _ true;
+      end;
+
+  end "move";
+!! title Rtn B!Delete ;
+! Delete a character from the buffer.  The side of the point from which
+! the character is deleted depends on the flag Side.
+;
+
+internal simple procedure B!Delete (integer Side);
+begin
+  own integer
+    ChOfst,                             ! The offset of the character
+                                        ! preceding the Point.
+                                        ;
+    PtPg;                               ! Identity of the Virtual Page
+                                        ! containing the Point.
+                                        ;
+
+  if (B!Lock) then
+    ! <<  Should be DeleteLock.
+    ;
+    return;
+
+  B!ForceGap(PtPg, ChOfst);
+
+  if (Side > 0) then
+  begin
+    ! Delete from right of the Point.
+    ;
+
+    if (B!Point < B!Size) then
+    begin
+      start!code
+        define
+          AC1 = 1,
+          AC2 = 2,
+          AC3 = 3;
+        protect!acs
+          AC1,
+          AC2,
+          AC3;
+        label
+          Loop,
+          GoOn;
+
+          move      AC1, B!Point;
+          movei     AC2, access(Marks[FirstMark]);
+          move      AC3, MarkCnt;
+
+        Loop:
+          sojl      AC3, GoOn;
+          camge     AC1, (AC2);
+          sos       (AC2);
+          aoja      AC2, Loop;
+
+        GoOn:
+      end;
+
+      if (ChOfst >= 0) then
+        incr(PtPg);
+
+      while ($VFPg.TxtLen(PtPg) = 0) do
+        incr(PtPg);
+
+      incr($VFPg.LftGap(PtPg));
+      decr($VFPg.TxtLen(PtPg));
+      decr(B!Size);
+
+      if (B!Point = B!Size) then
+        B!EndP _ true;
+    end;
+  end
+  else
+  begin
+    ! Delete from left of the Point.
+    ;
+
+    if (B!Point > 0) then
+    begin
+      start!code
+        define
+          AC1 = 1,
+          AC2 = 2,
+          AC3 = 3;
+        protect!acs
+          AC1,
+          AC2,
+          AC3;
+        label
+          Loop,
+          GoOn;
+
+          move      AC1, B!Point;
+          movei     AC2, access(Marks[FirstMark]);
+          move      AC3, MarkCnt;
+
+        Loop:
+          sojl      AC3, GoOn;
+          camge     AC1, (AC2);
+          sos       (AC2);
+          aoja      AC2, Loop;
+
+        GoOn:
+      end;
+
+      decr($VFPg.TxtLen(PtPg));
+      decr($VFPg.RgtGap(PtPg));
+      decr(B!Point);
+      decr(B!Size);
+    end;
+  end;
+
+  if (not B!ModP) then
+  begin
+    B!ModP _ true;                      ! Buffer is now modified ;
+    W!FixS;
+  end;
+end;
+!! title Rtn B!Insert ;
+! Insert a character into the buffer to the right of the Point and
+! advance the Point.
+;
+
+internal simple procedure B!Insert(integer C);
+begin "insert"
+  own integer
+    PtBP,                               ! Byte pointer to the Point.
+                                        ;
+    PtPg,                               ! Identity of the Virtual Page
+                                        ! containing the Point.
+                                        ;
+    PtPgCh,                             ! Character address of said
+                                        ! Virtual File page.
+                                        ;
+    PtOfst;                             ! The character offset of the
+                                        ! Point in said page
+                                        ;
+
+
+  if (B!Lock) then
+    ! <<  Should be InsertLock.
+    ;
+    return;
+
+  start!code
+    define
+      AC1 = 1,
+      AC2 = 2,
+      AC3 = 3;
+    protect!acs
+      AC1,
+      AC2,
+      AC3;
+    label
+      Loop,
+      GoOn;
+
+      move      AC1, B!Point;
+      movei     AC2, access(Marks[FirstMark]);
+      move      AC3, MarkCnt;
+
+    Loop:
+      sojl      AC3, GoOn;
+      camge     AC1, (AC2);
+      aos       (AC2);
+      aoja      AC2, Loop;
+
+    GoOn:
+  end;
+
+  B!ForceGap(PtPg, PtOfst);
+
+  if (PtOfst = CharactersPerPage - 1) then
+  begin
+    incr(PtPg);
+    if (not InsertPage(PtPg)) then
+    begin
+      ! A garbage-collect of gaps has occured due to the PPM being full.
+      ! The previously acquired values of PtPg and PtOfst are now
+      ! invalid.  We must try again.
+      ;
+      
+      B!ForceGap(PtPg, PtOfst);
+
+      if (PtOfst = CharactersPerPage - 1) then
+      begin
+        if (not InsertPage(PtPg)) then
+        begin
+          B!FlushToEDT;
+          cfile(B!Chan);
+          usererr("B!Insert: PPM Overflow. CheckPoint File is intact",
+              0, 0);
+        end;
+
+        PtOfst _ 0;
+      end
+      else
+        incr(PtOfst);
+    end
+    else
+      PtOfst _ 0;
+  end
+  else
+    incr(PtOfst);
+
+  if (not (PtBP _ BldVFPtr(PtPg, PtOfst))) then
+    usererr("B!Insert: BldVFPtr failed (" &
+        cvs(PtPg) & ", " & cvs(PtOfst) & ")", 0, 0);
+
+  dpb(C, PtBP);
+  incr(B!Size);
+  incr(B!Point);
+  incr($VFPG.RgtGap(PtPg));
+  incr($VFPg.TxtLen(PtPg));
+
+  B!BegP _ false;
+
+  if (not B!ModP) then
+  begin
+    B!ModP _ true;                    ! buffer is now modified ;
+    W!FixS;
+  end;
+end "insert";
+!! title Rtn B!GetC ;
+! Return the character on to the right of the point ;
+
+internal simple integer procedure B!GetC;
+begin "B!GetC"
+  integer
+    ChrOfst,                            ! The byte offset of the Point on
+                                        ! the page.
+                                        ;
+    Dummy,                              ! A dummy variable.
+                                        ;
+    Pg,                                 ! Virtual File page on which the
+                                        ! Point resides.
+                                        ;
+    PgAdr,                              ! Memory address of said page.
+                                        ;
+    Pnt,                                ! Local copy of the Point.
+                                        ;
+    Result;                             ! Resulting character.
+                                        ;
+
+  if ((Pnt _ B!GetP) >= B!Size) then
+    return(0);
+
+  if (not LocatePoint(Pnt, Pg, Dummy, ChrOfst)) then
+    usererr("B!GetC: LocatePoint failed (" & cvs(Pnt) & ")", 0, 0);
+
+  if (ChrOfst = $VFPg.RgtGap(Pg) - 1) then
+  begin
+    incr(Pg);
+
+    while ($VFPg.TxtLen(Pg) = 0) do
+      incr(Pg);
+
+    ChrOfst _ $VFPg.LftGap(Pg);
+  end
+  else
+    incr(ChrOfst);
+
+  PgAdr _ Addrs(VFPtoMemory(Pg));
+
+!  print("B!GetC: Point (", Pnt, "), ");
+
+  start!code
+    move      2, ChrOfst;
+    idivi     2, 5;
+    add       2, PgAdr;
+    move      2, (2);                   ! pick up the word ;
+    imuli     3, 7;                     ! build a shift count ;
+    addi      3, 7;
+    lshc      1, (3);                   ! shift byte into ac 1 ;
+    andi      1, '177;                  ! mask to 7 bits ;
+    movem     1, Result;                ! Reclaim the result ;
+  end;
+
+!  print("Char (", cvos(Result), "q)", crlf);
+  return(Result);
+end "B!GetC";
+!! title Rtn B!AnyM ;
+! See if any buffers in the ring are modified ;
+
+internal simple boolean procedure B!AnyM;
+begin "B!AnyM"
+  integer
+    Ptr;
+
+  Ptr _ B!!Head;
+
+  while (Ptr) do
+  begin
+    if ((Ptr = B!!List and B!ModP and length(B!File)) or
+        (Ptr neq B!!List and B!!ModP[Ptr] and length(B!!File[Ptr]))) then
+      return(true);
+
+    Ptr _ B!!Next[Ptr];
+  end;
+
+  return(false);
+end "B!AnyM";
+!! title Rtn B!ModCnt ;
+! routine to return the number of buffers in the ring that are modified
+;
+
+internal simple integer procedure B!ModCnt;
+begin "B!ModCnt"
+  integer
+    Cnt,
+    Ptr;
+
+  Ptr _ B!!Head;
+  Cnt _ 0;
+
+  while (Ptr) do
+  begin
+    if ((Ptr = B!!List and B!ModP and length(B!File)) or
+        (Ptr neq B!!List and B!!ModP[Ptr] and length(B!!File[Ptr]))) then
+      incr(Cnt);
+
+    Ptr _ B!!Next[Ptr];
+  end;
+
+  return(Cnt);
+end "B!ModCnt";
+!! title Rtn B!Fini ;
+! B!Fini - walk the ring, optionally writing out modified files
+! and deleting the checkpoint files.
+;
+
+internal simple boolean procedure B!Fini(boolean WriteFiles);
+begin "B!Fini"
+  B!!ModP[B!!List] _ B!ModP;
+
+  while (B!!List) do
+  begin "each buffer"
+    if (WriteFiles and
+         B!!ModP[B!!List] and
+         length(B!!File[B!!List])) then
+    begin
+      if (not F!Writ(B!!File[B!!List])) then
+        return(false);
+
+      B!DelCurrentBuffer;
+    end
+    else
+      B!DelCurrentBuffer;
+  end "each buffer";
+
+  return(true);
+
+end "B!Fini";
+!! title Rtn B!BufStat ;
+! Routine to throw the list of buffers into the Box ;
+
+internal simple procedure B!BufStat;
+begin "buffer status"
+  integer L;
+  string S;
+
+  ! List starting with B!!Head;
+
+  L _ B!!Head;
+  while (L) do
+  begin "list buffers"
+    if (L = B!!List) then
+      S _ " > " else S _ "   ";
+
+    if (B!!Alias[L]) then
+      S _ S & B!!Alias[L]
+    else
+      S _ S & B!!File[L];
+
+    if (L = B!!List and B!ModP or
+        L neq B!!List and B!!ModP[L]) then
+      S _ S & " *";
+
+    W!BAdd(S);
+    L _ B!!Next[L];
+  end "list buffers";
+end "buffer status";
+!! title Rtn B!FileInsert ;
+! Insert an external Text file into the current Buffer after the Point.
+;
+
+internal simple boolean procedure B!FileInsert (string FName);
+begin "B!FileInsert"
+  integer
+    ChSize,
+    Dummy,
+    I,
+    ICBPg,
+    F!Chan,
+    MemPg,
+    MemPgAdr,
+    PgSize,
+    SavePoint,
+    VFPg;
+
+  if (not F!FileExists(FName)) then
+  begin
+    W!Msg("File doesn't exist: " & FName);
+    return(false);
+  end;
+
+  F!Chan _ openfile(FName, "ORE");
+
+  skip!) then
+  begin
+    DoErstr;
+    return(false);
+  end;
+
+  SavePoint _ B!GetP;
+
+  begin
+    PgSize _ sizef(F!Chan);
+    ChSize _ chsizef(F!Chan);
+  end;
+
+  B!ForceGap(VFPg, Dummy);
+  ICBPg _ GetICBPage;
+
+  MemPg    _ $ICBM.MemPg(ICBPg);
+  MemPgAdr _ Addrs(MemPg);
+
+  for I _ 0 step 1 until PgSize - 1 do
+  begin
+    pmap(!TPg(I), !MPg(MemPg), !Cow!);
+    memory[MemPgAdr] _ memory[MemPgAdr];
+
+      ! Map and touch the Text file page.
+      ;
+
+    incr(VFPg);
+
+    if (not InsertPage(VFPg, ICBPg)) then
+    begin
+      B!ForceGap(VFPg, Dummy);
+      incr(VFPg);
+
+      if (not InsertPage(VFPg, ICBPg)) then
+      begin
+        B!FlushToEDT;
+          ! <<  Unmap ChkPnt file.
+          ;
+        cfile(B!Chan);
+        usererr("B!FileInsert: PPM Overflow. CheckPoint File intact.",
+            0, 0);
+      end;
+    end;
+
+    if (I = PgSize - 1) then
+      decr(ChSize, CountSomeNulls(MemPg, PgSiz(I, PgSize - 1, ChSize) - 1));
+
+        ! Remove consideration of possible trailing nulls on the last
+        ! page.
+        ;
+
+    pmap(-1, !MPg(MemPg), 0);
+
+      ! Remove the page from memory.
+      ;
+
+    $ICBM.VFPg(ICBPg)    _ -1;
+    $ICBM.MissCnt(ICBPg) _ largeinteger;
+
+      ! Reset the ICB entry for ICBPg to a null (ie, unallocated) state,
+      ! to undo the effect of the InsertPage call.
+      ;
+
+    $VFPg.LftGap(VFPg) _ 0;
+    $VFPg.TxtLen(VFPg) _
+    $VFPg.RgtGap(VFPg) _ PgSiz(I, PgSize - 1, ChSize);
+    $VFPg.ICBIdx(VFPg) _ -1;
+
+      ! Setup the PPM entry to a meaningful value, but do not associate
+      ! it with an ICB page.
+      ;
+  end;
+
+  cfile(F!Chan);
+  incr(B!Size, ChSize);
+  B!SetP(SavePoint);
+  set(B!ModP);
+  return(true);
+end "B!FileInsert";
+!! title Rtn B!CheckPoint ;
+! Force the Checkpoint file to be in harmonious sync with reality, and if
+! specified, close the checkpoint file.
+;
+
+internal simple procedure B!CheckPoint (boolean Close);
+begin "B!CheckPoint"
+  B!FlushToEDT;
+
+  if (Close) then
+  begin
+    integer
+      I;
+
+    for I _ GiantBase step 1 until (GiantBase + EndOfBuffer - 1) do
+      pmap(-1, !MPg(I), 0);
+
+    cfile(B!Chan);
+
+      ! Close the Checkpoint file
+      ;
+  end;
+end "B!CheckPoint";
+!! title Rtn ShowMap ;
+! Show the pertinent features of the specified virtual file page in the
+! PPM and the ICBM.
+;
+
+internal simple procedure ShowMap (integer Pg);
+begin "ShowMap"
+  integer
+    IBas,                               ! The base of the corresponding
+                                        ! ICBM entry, if any.
+                                        ;
+    Idx,                                ! ICB index (if any) of the VF page.
+                                        ;
+    PBas;                               ! The base of the specified VF
+                                        ! entry in the PPM.
+                                        ;
+  define
+    LG = {0}                            ! LftGap
+                                        ;,
+    TL = {1}                            ! TxtLen
+                                        ;,
+    RG = {2}                            ! RgtGap
+                                        ;,
+    IX = {3}                            ! ICBIdx
+                                        ;,
+    CP = {4}                            ! ChkPg
+                                        ;,
+    MP = {0}                            ! MemPg
+                                        ;,
+    VP = {1}                            ! VFPg
+                                        ;,
+    MC = {2}                            ! MissCnt
+                                        ;;
+
+  print("B!MaxPgIdx: ", B!MaxPgIdx, crlf);
+  print("B!Size:     ", B!Size, crlf);
+  print("B!Point:    ", B!Point, crlf2);
+
+  PBas _ location($VFPg.LftGap(Pg));
+
+  if (Pg > B!MaxPgIdx or Pg < 0) then
+  begin
+    print("Page ", cvos(Pg), " does not exist.", crlf);
+    return;
+  end;
+
+  print("LftGap (", cvos(Pg), ")", cvos(memory[PBas + LG]), crlf);
+  print("TxtLen (", cvos(Pg), ")", cvos(memory[PBas + TL]), crlf);
+  print("RgtGap (", cvos(Pg), ")", cvos(memory[PBas + RG]), crlf);
+  print("ICBIdx (", cvos(Pg), ")", cvos(memory[PBas + IX]), crlf);
+  print("ChkPg  (", cvos(Pg), ")", cvos(memory[PBas + CP]), crlf);
+
+  if (Idx _ memory[PBas + IX] >= 0) then
+  begin
+    IBas _ location($ICBM.MemPg(memory[PBas + IX]));
+
+    print(crlf);
+    print("MemPg   (", cvos(Idx), ")", cvos(memory[IBas + MP]), crlf);
+    print("VFPg    (", cvos(Idx), ")", cvos(memory[IBas + VP]), crlf);
+    print("MissCnt (", cvos(Idx), ")", cvos(memory[IBas + MC]), crlf);
+  end;
+
+  print(crlf);
+end "ShowMap";
+
+
+! **************************  End XxBuf2.Req  *************************** ;
+   7#E2X
