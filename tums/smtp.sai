@@ -1,0 +1,546 @@
+begin	"SMTP"	comment
+
+	SMTP:	Simple Mail Transfer Protocol
+
+	[Crocker82] Crocker, D. (rev), "Standard for the Format of ARPA
+	    Internet Text Messages", RFC 822. University of Deleware,
+	    E.E. Dept., Newark, Deleware. Aug 13, 1982.
+	[Postel82] Postel, J., "Simple Mail Transfer Protocol", RFC 821.
+	    Information Science Institute (USC-ISI), University of Southern
+	    California, Marina del Rey, California. Aug 1982.
+;
+
+require "(SAILIB)SAIL.DEF" source!file;
+internal string ARGS;		! not using ARGS library at this time;
+require "(MPL)UUOSYM.SAI" source!file;
+require "LICENS.REQ" source!file;
+require "MAILIB.REQ" source!file;
+require "MAILOG.REQ" source!file;
+!get!definitions(TYMINT);
+!get!definitions(PROCES);
+!License!Required(WC OP SY JL AC WF);
+require '32 version;
+require processes;
+
+define	MAX!MSG!SIZE = 100000;	! size limit on message;
+define	MAX!RCV!SIZE = 2560;	! size limit on Received: field;
+define	MAX!IDLE!SECS = 120;	! time limit on wait for command or data;
+redefine jp!LOS = !bit(0);
+
+! v32 30-Jun-87 WRS	Set LOGOUT ON ZAP before running AUXMOX or FINDIT;
+! v31 25-Jun-87 WRS	Added R(SPL)FINDIT command;
+! v30 22-May-87 WRS	Added % processing;
+! v27 20-May-87 WRS	Added accounting to log;
+! v26 12-Mar-87 WRS	Added TMP file, MAX!RCV!SIZE, and more error log;
+! v25 18-Dec-86 WRS	Added MAX!IDLE!SECS to timeout inactivity;
+! v24 18-Dec-86 WRS	Added POLL command for McAuto, and zap interrupt;
+! v23 23-Jul-86 WRS	Added license checking;
+! v22 21-Jul-86 WRS	Cleaned up address handling for paths;
+! v21 23-Jun-86 WRS	Added SETLCH to set proper port modes;
+! v20 19-Jun-86 WRS	Fixup return path;
+! v17 12-Jun-86 WRS	Eliminated sensitivity to colon after MAIL command;
+! v16 12-Jun-86 WRS	Eliminated sensitivity to colon after RCPT command;
+! v15 12-Jun-86 WRS	Fixed bug causing mail from unet to fail;
+! v14			no histroy;
+
+string FPath,RPath;
+boolean RCPT.okay,DATA.okay;
+
+integer angleBrk;
+simple procedure BrkIni;
+begin
+    setbreak( angleBrk_getbreak, "<>", " "&#ht&crlf, "RINK" );
+end;
+require BrkIni initialization;
+
+!	global data structures
+;
+integer	loc.HostNumber		! local host's Tymnet host number;
+;
+string	rem.Domain		! remote domain;
+,	loc.Domain		! local host's domain name;
+,	SMTP!command		! current SMTP command, or NULL;
+;
+boolean	BlackBallSeen		! black ball received from network;
+;
+simple procedure initSMTP;
+begin
+    loc.HostNumber := calli( !xwd( '33, '11 ), '41 );
+    loc.Domain := maiHost& "."& maiNet;
+end;
+require initSMTP initialization[2];
+
+procedure err( string S );
+begin
+	print( S, crlf );
+	cprint( logChan, "% ", S, crlf );
+end;
+
+procedure Exit;
+begin
+    maiSend;
+    logExit;
+end;
+
+simple string procedure INCHWL;
+begin
+    string S,CQ;
+    integer CH;
+    calli( !xwd(1,MAX!IDLE!SECS), calli!SETTIM );
+    S := CQ := null;
+    while true do begin
+	CH := auxclv( -1,0,0 ) land '177;
+	case CH of begin
+	    [#cr] CQ := CH;
+	    [#lf] done;
+	    [else] begin
+		S := S& CQ& CH;
+		CQ := null;
+	    end
+	end;
+    end;
+    return( S );
+end;
+
+!	Setlch (Port,Value,(BitMsk))
+
+	Changes the specified bit field in the SETLCH word.  Other
+	bits remain unchanged.  If BitMsk is omited, whole word
+	is implied.
+;
+
+simple procedure SetLch (integer Port,Value,BitMsk(-1));
+begin "SetLch"
+    own integer T,I,J,PTR;
+    PTR := point( 36, I, 35 );
+    for I := 0 upto 35 do begin "forI"
+	if BitMsk lsh I < 0 then
+	    for J := I+1 upto 36 do
+		if BitMsk lsh J = 0 then begin
+		    PTR := point( J-I, T, J-1 );
+		    done "forI";
+		end;
+    end "forI";
+    start!code
+	protect!acs 1;
+    	MOVE 1,port;
+    	MOVEM 1,T;
+    	uuo!GETLCH T;
+    	MOVE 1,value;
+    	DPB 1,PTR;
+    	uuo!SETLCH T;
+    end;
+end "SetLch";
+
+comment
+	Interrupt logic to handle ZAP and NTQ and black balls.
+;
+
+procedure ZAPsvc;
+begin
+    if length(SMTP!command) then
+	cprint( logChan, "%zapped while processing command"& crlf )
+    else if RCPT.okay or DATA.okay then
+	cprint( logChan, "%zapped while RCPT or DATA expected"& crlf )
+    else
+	cprint( logChan, "[zapped]"& crlf );
+    Exit;
+end;
+
+procedure NTQsvc;
+begin
+    calli( cvsix("SMTP-Q"), calli!SETNAM );
+    if length(SMTP!command) then
+	cprint( logChan, "%NTQ while processing command"& crlf )
+    else if RCPT.okay or DATA.okay then
+	cprint( logChan, "%NTQ while RCPT or DATA expected"& crlf )
+    else
+	cprint( logChan, "[NTQ]"& crlf );
+    print( "421 ", loc.Domain, " Service not available, "&
+	"closing transmission channel"& crlf );
+    Exit;
+end;
+
+procedure LOSsvc;
+begin
+    cprint( logChan, "?black ball"& crlf );
+    BlackBallSeen := true;
+end;
+
+procedure TIMsvc;
+begin
+    if length(SMTP!command) then
+	cprint( logChan, "%timeout while processing command"& crlf )
+    else if RCPT.okay or DATA.okay then
+	cprint( logChan, "%timeout while RCPT or DATA expected"& crlf )
+    else
+	cprint( logChan, "[timeout]"& crlf );
+    print( "421 ", loc.Domain, " Service not available, timeout"& crlf );
+    Exit;
+end;
+
+item	INTPRO;
+simple procedure IntIni;
+begin "IntIni"
+    own safe integer array ZAPblk[1:2];
+    own safe integer array NTQblk[1:2];
+    own safe integer array LOSblk[1:2];
+    own safe integer array TIMblk[1:2];
+    ZAPblk[1] _ 2; 
+    ZAPblk[2] _ !hl(-1)+location(ZAPsvc);
+    NTQblk[1] _ 2; 
+    NTQblk[2] _ !hl(-1)+location(NTQsvc);
+    LOSblk[1] _ 2; 
+    LOSblk[2] _ !hl(-1)+location(LOSsvc);
+    TIMblk[1] _ 2;
+    TIMblk[2] _ !hl(-1)+location(TIMsvc);
+    intset ( INTPRO, STRINGSTACK(3)+PSTACK(4) );
+    intmap ( tinass(-1,!iaZAP,10), dfrint, location(ZAPblk[1]) );
+    enable ( newenb(10) );
+    intmap ( intass(!iaNTQ,11), dfrint, location(NTQblk[1]) );
+    enable ( newenb(11) );
+    intmap ( tinass(-1,!iaLOS,12), dfrint, location(LOSblk[1]) );
+    enable ( newenb(12) );
+    intmap ( intass(!iaTIM,13), dfrint, location(TIMblk[1]) );
+    enable ( newenb(13) );
+end "IntIni";
+require IntIni initialization;
+
+integer procedure replace( reference string STR; string OLD, NEW );
+comment
+    Replace all occurances of string OLD in string STR with string NEW.
+    Return a count of such.
+;
+begin
+    string S;
+    integer CNT;
+    CNT := 0;
+    S := STR;
+    while length(S) geq length(OLD) do
+	if kequ( OLD, S[1 to length(OLD)] ) then begin
+	    STR := STR[1 to inf-length(S)] & NEW & S[length(OLD)+1 to inf];
+	    S := S[length(OLD)+1 to inf];
+	    CNT := CNT + 1;
+	end
+	else lop(S);
+    return( CNT );
+end;
+
+integer procedure index( string S1, S2 );
+comment
+    Return the index of the first occurance of string S2 in string S1.
+    If not found, return 0.
+;
+begin
+    integer I;
+    I := 1;
+    while length(S1) geq length(S2) do
+	if kequ(S1[1 to length(S2)],S2)
+	    then return( I )
+	    else begin I := I + 1; lop(S1) end;
+    return( 0 );
+end;
+
+string procedure expand( string FPath );
+begin
+    string array QQ[1:10];	! recursion stack;
+    integer QI;			! stack pointer;
+    string QFile,RCPT,NPath;
+    integer B;
+    NPath := null;
+    QQ[QI_1] := FPath;
+    while QI > 0 do begin
+	while length( QQ[QI] ) do begin
+	    RCPT := maiAScan( QQ[QI], B );
+	    QFile := maiQFile( RCPT );
+	    case QFile of begin
+		[1] if QI < arrinfo(QQ,2) 
+		    then QQ[QI_QI+1] := QFile[2 to inf];
+		[else] maiCatList( NPath, RCPT )
+	    end;
+	end;
+	QI := QI - 1;
+    end;
+    return( NPath );
+end;
+
+procedure AUXMOX;
+begin
+    own integer array X[1:6];
+    logClose;
+    calli( calli( !xwd( -1, !gtPRV ), calli!GETTAB )
+	 land lnot jp!DOP lor !jpLOG * !bit(20)		! logout on zap;
+	 lor jp!LOS					! logout on stop;
+	 , calli!SETPRV );
+    X[1] := cvsix("SYS");
+    X[2] := cvsix("AUXMOX");
+    X[3] := X[4] := X[5] := 0;
+    X[6] := calli(!xwd(-1,-'20),'41) lor '777777;
+    calli(location(X[1]),'35);
+end;
+
+procedure FINDIT;
+begin
+    own integer array X[1:8];
+    logClose;
+    calli( calli( !xwd( -1, !gtPRV ), calli!GETTAB )
+	 land lnot jp!DOP lor !jpLOG * !bit(20)		! logout on zap;
+	 lor jp!LOS					! logout on stop;
+	 , calli!SETPRV );
+    X[3] := X[4] := X[8] := 0;
+    X[1] := cvsix("DSK");
+    X[2] := cvsix("FINDIT");
+    X[5] := location(X[7]);
+    X[6] := calli(!xwd(-1,-'20),'41) lor '777777;
+    X[7] := cvsix("SPL");
+    calli(location(X[1]),'35);
+end;
+
+procedure POLL( string ARG );
+begin
+    r!p(mai) M;
+    if kequ(ARG,"SLVMCL1") then begin
+	M := new!record( mai );
+	mai:RCPT[M] := "Poll@"& ARG& ".McAuto.Tymnet";
+	if maiQueue( M )
+	    then print( "250 okay"& crlf )
+	    else err( "554 Error processing request by maiQueue" );
+    end
+    else err( "553 Requested action not taken; "& ARG& " not valid for POLL" );
+end;
+
+procedure HELO( string ARG );
+begin
+    rem.Domain := ARG;
+    print( "250 ", rem.Domain, " okay"& crlf );
+end;
+
+procedure RSET;
+begin
+    FPath := null;
+    RPath := null;
+    RCPT.okay := false;
+    DATA.okay := false;
+    print( "250 okay"& crlf );
+end;
+
+procedure MAIL( string ARG );
+if length(rem.Domain) then begin
+    integer B1,B2;
+    string S1;
+    S1 := scan( ARG, angleBrk, B1 );
+    RPath := maiAScan( ARG, B2 );
+    if B1 neq "<" or not kequ( S1, "FROM:" ) 
+    or B2 neq 0 or length(RPath) = 0 then begin
+	err( "501 Syntax error: ""MAIL FROM:<...>"" expected" );
+	return;
+    end;
+    if index( RPath, "@" ) = 0 then
+	replace( RPath, ">", "@"& rem.Domain& ">" );
+    FPath := null;
+    print( "250 okay"& crlf );
+    RCPT.okay := true;
+    DATA.okay := false;
+end
+else err( "503 Bad sequence of commands, HELO expected" );
+
+procedure RCPT( string ARG );
+if RCPT.okay then begin
+    integer B1,B2;
+    string S1,S2,Q;
+    S1 := scan( ARG, angleBrk, B1 );
+    S2 := maiAScan( ARG, B2 );
+    if B1 neq "<" or not kequ( S1, "TO:" ) 
+    or B2 neq 0 or length(S2) = 0 then begin
+	err( "501 Syntax error: ""RCPT TO:<...>"" expected" );
+	return;
+    end;
+    if not index( S2, "@" ) then begin
+	err( "501 Syntax error: ""@"" expected in RCPT" );
+	return;
+    end;
+    if replace( S2, "tymnet!", null ) then cprint( logChan,
+	"%stripped ""tymnet!"" prefix"& crlf );
+    if replace( S2, ".Tymnet.ARPA", ".Tymnet" ) then cprint( logChan,
+	"%substituted "".Tymnet"" for "".Tymnet.ARPA"""& crlf );
+    if ( replace( S1 := S2, "@"& rem.Domain, null )
+      or replace( S1, "@"& maiHost& "."& maiNet, null ) )
+    and replace( S1, "%", "@" ) then begin
+	cprint( logChan, "[ substituted ", S1, " for ", S2, " ]"&crlf );
+	S2 := S1;
+    end;
+    Q := maiQFile( S2 );
+    case Q of begin
+	[0] err( "550 "& S2& " invalid, not sending mail" );
+	[1] begin
+	    S2 := expand( Q[2 to inf] );
+	    print( "251 okay, forwarding to ", S2, crlf );
+	    maiCatList( FPath, S2 );
+	    DATA.okay := true;
+	end;
+	[else] begin
+	    print( (if Q[inf to inf]="Q" then "251 " else "250 "),
+		S2, " okay"& crlf );
+	    maiCatList( FPath, S2 );
+	    DATA.okay := true;
+	end
+    end;
+end
+else err( "503 Bad sequence of commands: RCPT" );
+
+procedure VRFY( string ARG );
+begin
+    integer B2;
+    string S2,Q;
+    S2 := maiAScan( ARG, B2 );
+    if B2 neq 0 or length(S2) = 0 then begin
+	err( "501 Syntax error: ""VRFY username"" expected" );
+	return;
+    end;
+    if S2 neq "<" then S2 := "<"& S2& ">";
+    Q := maiQFile( S2 );
+    case Q of begin
+	[0] print( "550 ", S2, " not valid"& crlf );
+	[1] begin
+	    S2 := expand( Q[2 to inf] );
+	    print( "251 okay, forwarding to ", S2, crlf );
+	end;
+	[else] begin
+	    print( (if Q[inf to inf]="Q" then "251 " else "250 "),
+		S2, " okay"& crlf );
+	end
+    end;
+end;
+
+procedure DATA;
+if DATA.okay then begin
+    string TempFileName, S;
+    integer Chars,Lines;
+    r!p(mai) M;
+    integer C,B,E;
+    procedure DATAclean;
+    begin
+	if C geq 0 then begin
+	    rename( C, null, 0, E );
+	    release( C );
+	end;
+	cprint( logChan, "DATA (", Lines, " lines, ", Chars, " chars)"& crlf );
+    end;
+    cleanup DATAclean;
+    Chars := Lines := 0;
+    BlackBallSeen := false;
+    TempFileName := "(MAIL)"& cvs(call(0,"PJOB"))& "SMTP.TMP";
+    open( C_getchan, "DSK", '777000,4,4, Chars, B, E_-1 );
+    if E then begin
+	C := -1;
+	err( "451 Requested action aborted: unable to open DSK:" );
+	return;
+    end;
+    enter( C, TempFileName, E_-1 );
+    if E then begin
+    	err( "451 Requested action aborted: unable to create TMP file" );
+	return;
+    end;
+    print( "354 Start mail input; end with <CRLF>.<CRLF>"& crlf );
+    while true do begin
+	S := inchwl;
+	if equ( S, "." ) then done;
+	if S="." and S[2 to 2]="." then lop(S);
+	cprint( C, S, crlf );
+	if kequ( S[1 to 11], "Message-id:" ) then cprint( logChan, S, crlf );
+	Chars := Chars + length(S) + 2;
+	Lines := Lines + 1;
+    end;
+    if BlackBallSeen then begin
+	err( "451 Requested action aborted: black ball received" );
+	return;
+    end;
+    if Chars geq MAX!MSG!SIZE then begin
+	err( "552 Requested action aborted: message exceeds "&
+	    cvs(MAX!MSG!SIZE)& " characters" );
+	return;
+    end;
+    close( C );
+    lookup( C, TempFileName, E_-1 );
+    if E then begin
+	err( "451 Requested action aborted: TMP file vanished" );
+	return;
+    end;
+    M := maiMParse( input( C, 0 ) );
+    if length( FPath ) = 0 then begin
+	FPath := mai:RCPT[M];
+	cprint( logChan, "%using FPATH from message body: ", FPath, crlf );
+    end;
+    mai:Received[M] :=
+	"Received: from "& rem.Domain& " by "& loc.Domain& "; "&
+	maiDATE& crlf&
+	mai:Received[M];
+    if length(mai:Received[M]) > MAX!RCV!SIZE then begin
+	err( "554 Transaction failed: forwarding count exceeded" );
+	return;
+    end;
+    mai:RCPT[M] := FPath;
+    mai:Return.path[M] := RPath;
+    if maiQueue( M )
+	then print( "250 okay"& crlf )
+	else err( "554 Transaction rejected by maiQueue" );
+end
+else err( "503 Bad sequence of commands: DATA" );
+
+    label RESTART;
+    string CMD,ARG;
+
+    if calli( !xwd( -1, !gtUNM ), calli!GETTAB ) = cvsix("MAIL") then
+	calli( calli( !xwd( -1, !gtPRV ), calli!GETTAB )
+	     land lnot jp!DOP lor !jpCON * !bit(20)	! continue on zap;
+	     lor jp!LOS					! logout on stop;
+	     , calli!SETPRV );
+    auxcli( -1, io!NEC + !ioBIN, !axCFS );		! binary, no echo;
+    setlch( -1, 1, lc!NFC );				! don't wrap long line;
+    setlch( -1, 1, lc!HHT );				! don't expand tab;
+    setlch( -1, 1, lc!HFF );				! don't expand FF;
+    print( crlf );					! insure at col 1;
+RESTART:
+    print( "220 ", loc.Domain,
+	" SMTP server v", cvos(memory['137]),
+	" ready; ", maiDATE, crlf );
+    while true do begin
+	SMTP!command := null;
+	SMTP!command := inchwl;
+	if length(SMTP!command)=0 then continue;
+	if not kequ( SMTP!Command, "DATA" ) then
+	    cprint( logChan, SMTP!command, crlf );	! log whole dialog;
+	if kequ( SMTP!command, "R AUXMOX" ) then AUXMOX;
+	if kequ( SMTP!command, "R(SPL)FINDIT" ) then FINDIT;
+	CMD := SMTP!command[1 to 4];
+	ARG := SMTP!command[6 to inf];
+	     if kequ( CMD, "HELO" ) then HELO( ARG )
+	else if kequ( CMD, "MAIL" ) then MAIL( ARG )
+	else if kequ( CMD, "RCPT" ) then RCPT( ARG )
+	else if kequ( CMD, "DATA" ) then DATA
+	else if kequ( CMD, "RSET" ) then RSET
+	else if kequ( CMD, "VRFY" ) then VRFY( ARG )
+	else if kequ( CMD, "NOOP" ) then print(
+		"250 okay"& crlf )
+	else if kequ( CMD, "ECHO" ) then goto RESTART
+	else if kequ( CMD, "POLL" ) then POLL( ARG )
+	else if kequ( CMD, "HELP" ) then print(
+		"214-Commands implemented as per RFC 821:"& crlf&
+		"214-  HELO,MAIL,RCPT,DATA,VRFY,RSET,NOOP,HELP,QUIT"& crlf&
+		"214-Additional commands:"& crlf&
+		"214   POLL"& crlf )
+	else if kequ( CMD, "SEND" )
+	     or kequ( CMD, "SOML" )
+	     or kequ( CMD, "SAML" )
+	     or kequ( CMD, "EXPN" ) then err(
+		"502 Command not implemented: "& CMD )
+	else if kequ( CMD, "SET " )
+	     or kequ( CMD, "TTY " ) then print( crlf& "." )
+	else if kequ( CMD, "QUIT" ) then done
+	else err( "500 Syntax error, command unrecognized: "& CMD );
+    end;
+    print( "221 ", loc.Domain, " Service closing transmission channel"& crlf );
+    Exit;
+
+end	$
+ 
