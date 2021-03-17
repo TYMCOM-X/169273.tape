@@ -1,0 +1,263 @@
+begin "filtrn - A file transfer program"
+require "(SAILIB)SAIL.DEF" source!file;
+let routine=procedure;
+! this program is the Master program in a master/slave file transfer.;
+
+! program parameters: ;
+define	pause#time=5	! seconds. time per retry of setup handshake;
+,	max#retries=3	! number of times to attempt initial dialog;
+;
+
+integer	ForceUp		! convert string to upper case;
+,	ForceDown	! convert string to lower case;
+;
+simple procedure setupBreaks;
+begin
+setbreak(ForceUp_getbreak,null,null,"KIS");
+setbreak(ForceDown_getbreak,null,null,"CIS");
+end;
+require setupBreaks initialization;
+
+string routine Upper( string s );  return( scan(s,ForceUp,!skip!) );
+string routine Lower( string s );  return( scan(s,ForceDown,!skip!) );
+
+define ##=0;
+Preset!with null	define #ambiguous=#;
+ FORLC cmd=(quit, directory, retrieve, store, alter, process, protocol)
+   DOC {, cvps(cmd) redefine ##=##+1; define #} & {cmd=##;} ENDC
+; Own string array Commands[0:##];
+
+integer routine CmdNum( string s );
+! returns the command index for the string. 
+! -1 means no match, !skip!=true if exact match;
+begin	integer res, part;
+s_ lower(s); !skip!_true;
+! look for exact match;
+for res_ # step -1 until 0 do if equ(s,Commands[res]) then return(s);
+! look for partial match;
+for res_ # step -1 until 0
+   do if equ(s,Commands[res][1 for length(s)]) then done;
+! Check for equivalent partial match (ambiguous command);
+for part_ res-1 step -1 until 0
+   do if equ(s,Commands[res][1 for length(s)])
+	 then begin !skip!_ false; return(#ambiguous); end;
+!skip!_ false; return(res);	! either recognized or not found (-1);
+end;
+! for stub work: ;
+record!class interrupt( string name; integer proc; r!p(interrupt) nxt );
+r!p(interrupt) possible;
+procedure callProc( procedure toCall ); toCall;
+simple procedure doProc( integer toCall ); 
+	start!code jrst callProc; end;
+
+string procedure Inchwl;
+while true 
+   do begin "one input"	string s;
+			external string procedure Inchwl;
+	s_ inchwl;
+	if !skip!=#esc
+	 then begin	r!p(interrupt) r;
+		r_ possible;
+		while r 
+		 do if kequ(s,interrupt:name[r])
+			 then begin 
+				doProc(interrupt:proc[r]); 
+				continue "one input"; 
+			      end
+			 else r_ interrupt:nxt[r];
+		if equ(s,"?")
+		 then begin
+			outstr(crlf& "Available interrupts are:");
+			if r_ possible
+			 then do outstr(" """& interrupt:name[r]& """")
+				until null!record = r_ interrupt:nxt[r];
+			outstr(crlf& "Try again: ");
+		      end;
+		outstr("Cannot find interrupt named: " & s & crlf );
+	      end
+	 else return(s);
+      end;
+procedure int.set( string name; integer proc );
+begin	r!p(interrupt) r;
+r_ new!record(interrupt);
+interrupt:name[r]_ name; interrupt:proc[r]_ proc;
+interrupt:nxt[r]_ possible;
+possible_ r;
+end;
+
+simple procedure setupInterrupt( string name; procedure foo );
+	start!code jrst int.set; end;
+boolean routine accepts(string proposal);
+! returns true if the user at the terminal accepts the proposal;
+while true 
+   do begin	string reply;
+	print(proposal);
+	reply_ Inchwl; if !skip!=#can then reply_"no" & reply;
+	if !skip!=#lf then outchr(#cr) 
+	else if !skip! neq #cr then outstr(crlf);
+
+	if kequ(reply, "yes"[1 for length(reply)])
+	or kequ(reply,"ok") then return(true);	! OK must be spelled;
+	if kequ(reply, "no"[1 for length(reply)]) then return(false);
+	print("Please answer Yes or No" & crlf );
+      end;
+
+boolean routine refuses(string proposal);
+! returns true if the user at the terminal refuses the proposal;
+return( not accepts(proposal) );
+integer routine buffered.Read;
+begin	own string waiting;
+while length(waiting)=0 
+   do begin
+	print(crlf & "Reading: ");
+	waiting_ Inchwl;
+	if !skip! neq #cr then waiting_ waiting & !skip!;
+      end;
+return( lop( waiting) );
+end;
+
+integer procedure create.Circuit( procedure on.Zap );
+! build a circuit, associate a zap handler, and return a circuit ID;
+begin 
+setupInterrupt( "ZAP", on.zap );
+return(5);
+end;
+
+procedure transmit( integer circuit; string missive );
+begin	! send message out along circuit;
+print(" transmit(", circuit, ", """, missive, """ );" & crlf );
+end;
+
+boolean procedure ignore.Through(integer circuit; string expected;
+				integer pause );
+! wait for expected string.  return true if found (having passed it),
+  or false if nothing found and no characters received after pause
+  since last received characters
+;
+return( accepts( "Ignore.Through(" & cvs(circuit) & ", """ & expected &
+		""", " & cvs(pause) & " seconds. ) [boolean]: ") );
+
+procedure zap!circuit(integer circuit);
+print(" Zap!circuit(", circuit, ");" & crlf ); 
+simple procedure master.dialogue(integer circuit); 
+while true do
+begin	! do all file transfers;
+	string textPart;
+Print(" -> "); textPart_ inchwl;
+case cmd_ cmdNum( s_ scan(textPart, Token, !skip! ) )
+   of begin
+	[#quit] begin send( circuit, #quit, textPart ); return; end;
+	[#directory] begin send( circuit, cmd, textPart ); textGet; end;
+	[#retrieve] 
+...
+	[#store] accept.File( textPart );
+	[#alter] change.File( textPart );
+			! delete, prot, license(?), unit.append,
+			  Unit.replace, Unit.kill;
+	[#process] causeProcess( textPart );
+			! usually: create frame running program;
+	[#protocol] begin 
+		    end;
+print("communications are set up, but no program exists!" & crlf ); 
+end;
+boolean procedure insistInput( string expected );
+begin
+while length( expected )
+   do if buffered.Read neq lop(expected) then return(false);
+return(true);
+end;
+integer circuit;
+procedure waitFor( string want );
+! Warning: want should NOT have its first character 
+	replicated within the string later;
+begin	integer first, char;
+	string test;
+first_ lop(want);
+      begin ! verify arg: (debug);
+	test_ want;
+	while length(test)
+	   do if first = lop(test)
+		then usererr(0,1,"Bad want supplied to waitFor","X");
+      end;
+char_ buffered.Read;
+while true
+   do begin "one try"
+	test_ want;
+	while char neq first do char_ buffered.Read;
+	while length(test) 
+	   do if (char_ buffered.Read) neq lop(test)
+		 then continue "one try";
+	done;
+      end;
+end;
+
+procedure reply( string text );
+	print(crlf & " reply: """, text, """" & crlf );
+procedure slave;
+begin
+	routine logout;
+	begin
+	outstr(crlf & "Had this been a production program,"
+			& " you would have been logged out." );
+	call(0,"EXIT");
+	end;
+setupInterrupt( "DETACH", logout );
+do begin waitFor( "*HANDSHAKE" ); Reply( "WELCOME" ); end
+ until insistInput( "HOWDY" );
+while true 
+   do begin
+	receive.record;
+	case classify.slave.command
+	   of begin
+		[#quit] done;
+		[#directory] send.Directory( textPart );
+				! attributes head request;
+		[#retrieve] send.File( textPart );
+				! pending requests are in a file;
+		[#store] accept.File( textPart );
+		[#alter] change.File( textPart );
+				! delete, prot, license(?), unit.append,
+				  Unit.replace, Unit.kill;
+		[#process] causeProcess( textPart );
+				! usually: create frame running program;
+		[#protocol] begin 
+				set.Parameters(textPart); 
+				send.Parameters;
+			    end;
+		[else] Reply("Unknown command")
+	      end;
+      end;
+outstr(crlf & " slave dialog.");
+logout;
+end;
+procedure master;
+begin
+	simple procedure quick!exit; 
+	begin outstr(" Circuit Zap received."); call(0,"EXIT"); end;
+label top;
+top:
+circuit_ create.Circuit( quick!exit );	! quick!exit is called on zap;
+while true
+   do begin "establish discussion"
+		integer retries;
+	for retries_ 1 step 1 until max#retries
+	   do begin
+		transmit(circuit, "*HANDSHAKE");
+		if ignore.Through(circuit, "WELCOME", pause#time )
+		 then done "establish discussion";
+		! if pause#time seconds of no receptions, return false;
+	      end;
+	if refuses("Cannot establish link, shall I keep trying?")
+	 then begin zap!circuit(circuit); call(0,"EXIT"); go top end;
+      end "establish discussion";
+transmit(circuit,"HOWDY");
+master.dialogue( circuit );
+zap!circuit( circuit );
+end;
+external boolean rpgsw;
+
+if rpgsw then slave else master;
+print("Goodbye");
+
+end "filtrn - A file transfer program"
+
