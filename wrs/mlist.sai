@@ -1,0 +1,425 @@
+begin "MLIST"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(WRS)ARGS.REQ" source!file;
+require "(WRS)CPHR2.REQ" source!file;
+require "(WRS)FLIB.REQ" source!file;
+require "(WRS)OPSUB.REQ" source!file;
+require 11 version;
+
+string item FILE.MUD;
+
+integer LineBreak, DotBreak, BlankBreak;
+simple procedure BreakIni;
+begin
+    setbreak(LineBreak_getbreak,#lf,#cr,"SINK");
+    setbreak(DotBreak_getbreak,"."," ","SINK");
+    setbreak(BlankBreak_getbreak,0&" ",null,"SINK");
+end;
+require BreakIni initialization;
+
+define MaxSize = '377000;
+integer	HashAOBJN,MudSize,Hits;
+label Exit;
+boolean
+    LookFlag,		! true if anyone gets output;
+    StatFlag;		! true if collecting stats;
+
+procedure MudMap;
+begin
+    r!p(file) f.PWD;
+    integer MudPages;
+    f.PWD := fopen(datum(FILE.MUD), "r4E:.PWD");
+    MudSize _ file:LKB[f.PWD][5];	! size in words;
+    MudPages _ (MudSize + '777) lsh -9;	! size in pages;
+    HashAOBJN _ !xwd(-MudSize,'400000);
+    if MudPages = 0 then usererr( 0,0,"?MUD.PWD empty","X" );
+    fMap(f.PWD, '400, 1, MudPages, "r");
+    print(file:Name[f.PWD], ": ",MudSize," names loaded.",crlf);
+    fClose(f.PWD);
+end;
+
+r!p(file) f.MUD;
+
+procedure DirMap (integer FP);
+begin
+    own integer OFP;
+    if OFP neq FP then begin
+	fFree('777);
+	fMap(f.MUD, '777, FP, 1, "r");
+	OFP := FP;
+    end;
+end;
+
+record!class STAT (
+    string	PWD;
+    integer	CNT;
+    r!p(STAT)	linkf,linkb );
+r!p(STAT) StatBeg,StatEnd;
+integer StatCnt;
+define StatMax = 50;
+
+procedure UnLink( r!p(STAT) N );
+begin
+    own r!p(STAT) P,S;
+    P := STAT:linkb[N];
+    S := STAT:linkf[N];
+    if P
+	then STAT:linkf[P] := S
+	else StatBeg := S;
+    if S
+	then STAT:linkb[S] := P
+	else StatEnd := P;
+    STAT:linkf[N] :=
+    STAT:linkb[N] := null!record;
+    StatCnt := StatCnt - 1;
+end;
+
+procedure InsertAfter( r!p(STAT) P,N );
+begin
+    own r!p(STAT) S;
+    S := if P then STAT:linkf[P] else StatBeg;
+    STAT:linkb[N] := P;
+    STAT:linkf[N] := S;
+    if S
+	then STAT:linkb[S] := N
+	else StatEnd := N;
+    if P
+	then STAT:linkf[P] := N
+	else StatBeg := N;
+    StatCnt := StatCnt + 1;
+    if StatCnt > StatMax then UnLink( StatEnd );
+end;
+
+r!p(STAT) procedure NewStat( string PWD; integer CNT );
+begin
+    own r!p(STAT) N;
+    N := new!record( STAT );
+    STAT:CNT[N] := CNT;
+    STAT:PWD[N] := PWD;
+    return( N );
+end;
+
+procedure ResetStat;
+begin
+    if StatFlag then
+	while StatBeg do
+	    UnLink( StatBeg );
+    StatFlag := true;
+end;
+
+procedure AccuStat( string PWD; integer CNT );
+begin
+    own r!p(STAT) P;
+    if StatCnt < StatMax
+    or CNT > STAT:CNT[StatEnd] then begin
+	P := StatEnd;
+	while P do begin
+	    if STAT:CNT[P] > CNT
+		then done;
+	    if equ(STAT:PWD[P], PWD)
+		then return;
+	    P := STAT:linkb[P]
+	end;
+	InsertAfter( P, NewStat( PWD, CNT ) );
+    end;
+end;
+
+procedure PrintStat;
+begin
+    r!p(STAT) X;
+    integer T;
+    print( "[ top ",StatCnt," ]"& crlf&crlf );
+    X := StatBeg;
+    T := 0;
+    while X do begin
+	print( STAT:CNT[X], #ht, STAT:PWD[X], crlf );
+	T := T + STAT:CNT[X];
+	X := STAT:linkf[X];
+    end;
+    print( crlf& "[ ",T," total ]"& crlf&#ff );
+end;
+
+string procedure cvctl( integer CTL );
+begin
+    string S;
+    S := null;
+    if CTL land !bit(4+3)  then S := S& " so";	! shut override;
+    if CTL land !bit(4+4)  then S := S& " op";	! operator;
+    if CTL land !bit(4+10) then S := S& " tl";	! transparent login;
+    if CTL land !bit(4+13) then S := S& " ih";	! ignore host;
+    if CTL land !bit(4+15) then S := S& " np";	! no password;
+    if CTL land !bit(4+17) then S := S& " na";	! network administrator;
+    if CTL land !bit(4+18) then S := S& " as";	! account supervisor;
+    if CTL land !bit(4+19) then S := S& " au";	! auditor;
+    return( S[2 to inf] );
+end;
+
+preload!with
+    "???","Jan","Feb","Mar","Apr","May",
+    "Jun","Jul","Aug","Sep","Oct","Nov","Dec";
+string array MONTH[0:12];
+
+string procedure cvDecDate( integer DECD );
+begin
+    integer Y,M,D;
+    D := DECD mod 31 + 1;
+    M := DECD % 31 mod 12 + 1;
+    Y := DECD % (31*12) + 64;
+    return( cvs(D) & MONTH[M] & cvs(Y) );
+end;
+
+string procedure cvDate( integer D );
+begin
+    integer array X[0:2];
+    define DaysPast = '400020;	! flag for days past format date;
+    define DecForm  = '000020;	! flag for DEC format date;
+    if D > 10000 then		! convert cubs date to isis;
+    	D := (((D % 65536) * 3258 % 128) +
+	    ((D mod 65536) * 3258 % 8388608)) - 672;
+    X[0] := D + 3653;		! convert isis date to Tymcom-X;
+    X[1] := 0;
+    X[2] := !xwd( DaysPast, DecForm );
+    calli(location(X[0]), -'55);! convert to DEC format;
+    return(cvDecDate(X[0]));
+end;
+
+boolean procedure Check( integer AP,BIT );
+begin
+    integer N,I;
+    N _ (AP land '377777) lsh 3;
+    DirMap ((N lsh -9) + 1);
+    I _ '777000 lor (N land '777);
+    return( (memory[i+6] land BIT) neq 0 );
+end;
+
+string procedure User( integer AP );
+begin
+    integer N,I;
+    string S;
+    N _ (AP land '377777) lsh 3;
+    DirMap ((N lsh -9) + 1);
+    I _ '777000 lor (N land '777);
+    S := cvstr(memory[i+0])&cvstr(memory[i+1])&cvstr(memory[i+2]);
+    return (scan(S, blankBreak, !SKIP!));
+end;
+
+procedure puser( string Pwd; integer AP; string Remark(null) );
+begin
+    integer N,I;
+    string S;
+    print( Pwd, "                   "[length(PWD) to inf] );
+    N _ (AP land '377777) lsh 3;
+    DirMap ((N lsh -9) + 1);
+    I _ '777000 lor (N land '777);
+    print( cvstr(memory[i+0]), cvstr(memory[i+1]), cvstr(memory[i+2]) );
+    S _ "["& cvos(!lh(memory[i+5]))& ","& cvos(!rh(memory[i+5]))& "]";
+    print( S, "               "[length(S) to inf] );
+    S _ cvDate( memory[i+7] );
+    print( "      "[length(S) to inf], S, " " );
+    print( cvctl(memory[i+6]), Remark, crlf );
+end;
+
+procedure Hit( string Pwd; integer I; string S(null) );
+begin
+    string P;
+    integer X;
+    P := if length(PWD) then PWD else "--null--";
+    X := - (I ash -18);
+    Hits := Hits + X;
+    AccuStat( P, X );
+    if LookFlag then while I < 0 do begin
+	puser( P, I, S );
+	I _ I + !xwd(1,1);
+    end;
+end;
+
+integer I,Brk,Eof,Chan,Cnt;
+string L;
+
+simple integer procedure BSearch( integer Target );
+begin
+    begin!code
+	protect!acs 2,3,4,5,6,7;
+	define Lo=2,Hi=3,I=4,X=5,T1=6,T2=7;
+	label Loop,NotHi,NotLo,FRetn,SRetn,SRetn0,SRetn1,SRetn2,Retn;
+	HRRZ	Lo,HashAOBJN;	! search limits;
+	MOVN	Hi,HashAOBJN;
+	HLRZ	Hi,Hi;
+	ADDI	Hi,-1(Lo);
+	MOVE	X,Target;	! search target;
+	! while Lo leq Hi;
+Loop:	CAMLE	Lo,Hi;
+	 JRST	FRetn;
+	MOVE	I,Lo;		! divide interval;
+	ADD	I,Hi;
+	LSH	I,-1;
+	CAML	X,(I);
+	 JRST	NotHi;
+	MOVEI	Hi,-1(I);	! take lower block;
+	JRST	Loop;
+NotHi:	CAMG	X,(I);
+	 JRST	NotLo;
+	MOVEI	Lo,+1(I);	! take higher block;
+	JRST	Loop;
+NotLo:	! matched! - scan backwards to find first match in cluster;
+	MOVE	T1,I;
+SRetn2:	CAML	Lo,T1;
+	 JRST	SRetn1;
+	CAMN	X,-1(T1);
+	 SOJA	T1,SRetn2;
+SRetn1:	! now scan forward to find last match in cluster;
+	MOVE	T2,I;
+SRetn0:	CAMG	Hi,T2;
+	 JRST	SRetn;
+	CAMN	X,1(T2);
+	 AOJA	T2,SRetn0;
+SRetn:	HRR	1,T1;		! T1=lo, T2=hi word in range;
+	SUBI	T1,+1(T2);	! convert T1 to count;
+	HRL	1,T1;		! return AOBJN ptr (-cnt,lo);
+	JRST	Retn;
+FRetn:	! fail return;
+	SETZ	1,;
+Retn:	! return value in ac 1;
+    end;
+end;
+
+procedure Try (string Pwd);
+begin
+    integer I;
+    if I_ BSearch(Cphr2(Pwd)) then
+	Hit( Pwd, I );
+end;
+	
+procedure None;
+begin
+    integer I,H1;
+    H1 := Hits;
+    print( "[ --none-- ]"&crlf&crlf );
+    if I_ BSearch( -1 ) then Hit( "--none--", I );
+    print( crlf&"[ --none--: ",Hits-H1," hits ]"&crlf&#ff );
+end;
+
+procedure TryNull;
+begin
+    integer I,H1;
+    H1 := Hits;
+    print( "[ --null-- ]"&crlf&crlf );
+    if I_ BSearch( 0 ) then Hit( "--null--", I );
+    print( crlf&"[ --null--: ",Hits-H1," hits ]"&crlf&#ff );
+end;
+
+procedure Same;
+begin
+    integer I,H1;
+    I := HashAOBJN;
+    H1 := Hits;
+    print( "[ --same-- ]"&crlf&crlf );
+    while( I < 0 ) do begin
+	string Pwd;
+	if (memory[i] + 1) land -2 then begin
+	    Pwd := User( I );
+	    if Cphr2( Pwd ) = memory[i] then
+		Hit( Pwd, !xwd(-1,I) );
+	end;
+	I _ I + !xwd(1,1);
+    end;
+    print( crlf&"[ --same--: ",Hits-H1," hits ]"&crlf&#ff );
+end;
+
+recursive procedure DoCommand( string L );
+case L of begin
+    ["?"] print( "one of:
+  password	list names with specified password
+  ;NONE		list names with no password
+  ;NULL		list names with null password
+  ;SAME		list names with password same as name
+  ;STAT		list accumulated statistics
+  ;RESET	reset accumulated statistics
+  ;<file	take input from file
+  ;>file	log output to file
+  ;>		close log file and turn on terminal output
+  ;ON		turn on terminal output (default)
+  ;OFF		turn off terminal output
+  ;DETACH	turns off terminal output and detached job
+  ;QUIT		return to exec
+"); [";"] begin
+	if equ(L,";NONE") then None
+	else if equ(L,";NULL") then TryNull
+	else if equ(L,";SAME") then Same
+	else if equ(L,";ON") then setprint( null, "C" )
+	else if equ(L,";OFF") then setprint( null, "I" )
+	else if equ(L,";STAT") then PrintStat
+	else if equ(L,";RESET") then ResetStat
+	else if equ(L[1 to 2],";>") or equ(L[1 to 2],";.") then
+	    case getprint of begin
+		["T"] if length(L)>2 then setprint( L[3 to inf], "B" );
+		["F"]["N"] begin
+		    setprint( null, "N" );
+		    if length(L)>2 then setprint( L[3 to inf], "F" );
+		end;
+		["B"] begin
+		    setprint( null, "T" );
+		    if length(L)>2 then setprint( L[3 to inf], "B" );
+		end
+	    end
+	else if equ(L[1 to 2],";<") or equ(L[1 to 2],";,") then begin
+	    integer C,B,E,H1;
+	    open( C:=getchan,"DSK",0,4,0, 64,B,E_-1);
+	    lookup( C,L[3 to inf],E );
+	    if E then lookup( C,L[3 to inf]&".DIC",E );
+	    if E then print( "?file not found: ",L[3 to inf],crlf );
+	    H1 := Hits;
+	    print( "[ ",L[3 to inf]," ]"&crlf&crlf );
+	    while not E do begin
+		string S;
+		S := input( C, LineBreak );
+		if length(S)
+		    then if S=";"
+			then DoCommand( S )
+			else Try( S );
+	    end;
+	    print( crlf&"[ ",L[3 to inf],": ",Hits-H1," hits ]"&crlf&#ff );
+	    release( C );
+	end
+	else if equ(L,";DETACH") then begin
+	    print("Job ",call(0,"PJOB")," detaching...");
+	    calli(0,-6);
+	end
+	else if equ(L,";QUIT") or equ(L,";Q") then goto Exit
+	else print( "?illegal option: ",L,crlf );
+	LookFlag := getprint neq "N";
+    end;
+    [0] ;
+    [else] Try( L )
+end;
+
+begin "MAIN"
+    string S;
+    ttyup(true);
+    argparse(any, FILE.MUD, {}, args);
+    if not props(FILE.MUD) then datum(FILE.MUD) := "TYMNET";
+    datum(FILE.MUD) := scan(S_datum(FILE.MUD), DotBreak, !SKIP!);
+    if not OPER!LICENSE("WRS") then usererr(0,0,"Wizards only!","X");
+    LookFlag := true;
+    StatFlag := false;
+    MudMap;
+    f.MUD := fopen(datum(FILE.MUD), "r4E:.MUD");
+    while true do begin "TTYguess"
+	outstr("-");
+	L _ inchwl;
+	Hits := 0;
+	DoCommand( L );
+	if Hits then begin
+	    string MODE;
+	    MODE := getprint;
+	    setprint( null, "C" );
+	    print( "[ ",Hits," hits ]"&crlf );
+	    setprint( null, MODE );
+	end;
+    end "TTYguess";
+
+end "MAIN";
+Exit:
+end $
+  
