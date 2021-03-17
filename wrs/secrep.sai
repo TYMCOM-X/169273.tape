@@ -1,0 +1,636 @@
+begin	"SECURE"
+
+require "(SAILIB)SAIL.DEF" source!file;
+!get!module(APPEND);
+!get!module(MAPPING);
+require "(SAILIB)FRMRUN.REQ" source!file;
+require "LOGLIB.REQ" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+require 1024 system!pdl, 1024 string!pdl;
+
+boolean CRT;		! true if user has a CRT;
+string	LoginTime;	! date and time circuit was received;
+string	VTInfo;		! network information regarding circuit;
+boolean	New.Incident;	! true if first report for this incident;
+integer	Incident#;	! file number assigned to this incident;
+
+string	CaptureBuffer;	! place to buffer stuff for output;
+
+label	Login;
+label	Logout;
+
+forward recursive boolean procedure Ask.Y!N( string PM, HM );
+
+procedure Abort(
+    string	Reason );
+begin	"Abort"
+    print( crlf&crlf& "Security report aborted, reason is """,Reason,"""." );
+    goto Logout;
+end	"Abort";
+
+procedure Fatal(
+    string	Msg );
+begin	"Fatal"
+    print(
+	crlf&
+	"?Secure: FATAL error"& crlf&
+	"?", Msg, crlf&
+	"?"&crlf&
+	"Please contact System Resources (SRA)."&crlf
+    );
+    goto Logout;
+end	"Fatal";
+
+string procedure Get.VTInfo;
+!
+    return string of form
+	nnnn-ppp[tt]
+    nnnn = node in octal
+    ppp = port in octal
+    tt = tid in octal
+;
+begin	"Get.VTInfo"
+    integer	I,A,B; 
+    string	S;
+    I _ calli( !xwd( -1,!gtLOG ), calli!GETTAB );
+    getformat( A,B );
+    setformat( -4,0 );
+    S := cvos( ((I lsh -10) land '7700) lor ((I lsh -8) land '77) );
+    setformat( -3,0 );
+    S := S& "-"& cvos( I land '177 );
+    setformat( -2,0 );
+    S := S& "["& cvos( (I lsh -24) land '17 )& "]";
+    setformat( A,B );
+    return( S );
+end	"Get.VTInfo";
+
+integer procedure Assign.New.Incident#;
+begin	"Assign.New.Incident#"
+    integer C;
+    own integer A,X;
+    record!pointer( map1 ) M;
+    C := OPFILE( "SECURE.INO", "WOHM", getchan );
+    if C < 0 then Fatal( "Assign.New.Incident#: cant open file SECURE.INO" );
+    M := Map1Cr( 0,0 );
+    if not M then Fatal( "Assign.New.Incident#: cant create page holder" );
+    X := GetMap( M, "W", C, 1 );
+    if X < 0 then Fatal( "Assign.New.Incident#: cant map file page" );
+    A := location( Map1:a[M][0] );
+    begin!code
+	protect!acs 1;
+	AOS	1,@A;
+	MOVEM	1,X;
+    end;
+    GetMap( M, "YZ", C, 0 );
+    chniov( C, 0, !chREL );
+    return( X );
+end	"Assign.New.Incident#";
+
+recursive string procedure Ask. (
+    string	PromptMsg;
+    string	HelpMsg );
+begin "Ask."
+    string	InputLine;
+    label	Prompt, Input;
+    InputLine := null;
+Prompt:
+    print( PromptMsg, InputLine );
+Input:
+    InputLine := InputLine & inchwl;
+    case !SKIP! of begin
+	[#ctrl("R")] begin
+	    print( crlf );
+	    goto Prompt;
+	end;
+	[#ctrl("Q")]
+	[#ctrl("U")] begin
+	    if length( InputLine ) = 0 then begin
+		print( #bel );
+		goto Input;
+	    end;
+	    InputLine := null;
+	    print( crlf );
+	    goto Prompt;
+	end;
+	[#bs]
+	[#del]
+	[#ctrl("A")] begin
+	    string C;
+	    if length( InputLine ) = 0 then begin
+		print( #bel );
+		goto Input;
+	    end;
+	    C := InputLine[inf for 1];
+	    InputLine := InputLine[1 to inf-1];
+	    if CRT
+		then print( #bs&" "&#bs )
+		else print( "\"& C );
+	    goto Input;
+	end;
+	[#ctrl("C")]
+	[#esc] begin
+	    own boolean AbortFlag;
+	    if AbortFlag then Abort( "Escape" );
+	    print( crlf );
+	    AbortFlag := true;
+	    if Ask.Y!N (
+		"Abort report and logout?",
+		"You've typed "& ( if !SKIP! = #esc
+		    then "<escape>"
+		    else "<control-C>" ) &".  This character uaually"&crlf&
+		"indicates abort from a program.  If you wish to abort"&crlf&
+		"the security report and logout, answer ""Y"".  To"&crlf&
+		"continue at the current point, answer ""N""."&crlf
+	    ) then Abort( "Escape" );
+	    AbortFlag := false;
+	    goto Prompt;
+	end;
+	[#eot] begin
+	    print( crlf );
+	    !SKIP! := #eot;
+	    return( InputLine );
+	end;
+	[#cr]
+	[#lf] if InputLine="?"
+	    then begin
+		print( crlf, HelpMsg, crlf );
+		InputLine := null;
+		goto Prompt;
+	    end
+	    else return( InputLine );
+	[else] begin
+	    print( crlf& crlf&
+		"Unexpected control character: <control-"& (!SKIP!+'100),
+		    ">."&crlf&
+		"    valid control characters are:"&crlf&
+		"	<control-A>	erase last character"&crlf&
+		"	<control-Q>	erase current line"&crlf&
+		"	<control-R>	retype corrected line"&crlf&
+		"	<backspace>	erase last character"&crlf&
+		"	<return>	end input line"&crlf&
+		"	<escape>	abort and logout"&crlf&
+		crlf
+	    );
+	    goto Prompt;
+	end
+    end;
+end	"Ask.";
+
+recursive boolean procedure Ask.Y!N (
+    string	PromptMsg;
+    string	HelpMsg );
+while true do begin "Ask.Y!N"
+    string	S;
+    S := Ask. (
+        PromptMsg& " (Y,N,?) ",
+	HelpMsg );
+    if kequ( S,"YES"[1 for length(S)] ) then return( true );
+    if kequ( S,"NO"[1 for length(S)] ) then return( false );
+    print( crlf&
+	"Must answer ""YES"" or ""NO"", or answer ""?"" for help."&crlf&
+	crlf
+    );
+end	"Ask.Y!N";
+
+string procedure Ask.Phone (
+    string	PromptMsg;
+    string	HelpMsg );
+begin	"Ask.Phone"
+    integer	I;
+    string	S;
+    label	Prompt;
+Prompt:
+    S := Ask.( PromptMsg, HelpMsg );
+    if S="(" then begin
+	lop( S );
+    end;
+    for I := 4,8 do 
+	if S[I for 1] neq "-"
+	    and S[I for 1] neq "/"
+	    and S[I for 1] neq ")"
+	    and S[I for 1] neq " "
+	    then begin
+		print( crlf& "Format is 408-446-6000 x1234."&crlf&crlf );
+		goto Prompt;
+	    end;
+    for I := 1,2,3, 5,6,7, 9,10,11,12 do
+	if not ("0" leq S[I for 1] leq "9")
+	    then begin
+		print( crlf& "Format is 408-446-6000 x1234."&crlf&crlf );
+		goto Prompt;
+	    end;
+    S := S[1 to 3]& "-"& S[5 to 7]& "-"& S[9 to inf];
+    return( S );
+end	"Ask.Phone";
+
+integer procedure Ask.Integer (
+    string	PromptMsg;
+    string	HelpMsg;
+    integer	Default( !bit(0) ) );
+begin	"Ask.Integer"
+    integer	I,BRK;
+    string	S;
+    label	Prompt;
+Prompt:
+    S := Ask.( PromptMsg, HelpMsg );
+    if length( S ) = 0 and Default neq !bit(0) then begin
+	return( Default );
+    end;
+    I := IntScan( S, BRK );
+    if length( S ) > 0 or BRK = -1 or I < 0 then begin
+	print( crlf&
+	    "Expected a positive decimal integer.  Type ""?"" for help."&crlf&
+	    crlf
+	);
+	goto Prompt;
+    end;
+    return( I );
+end	"Ask.Integer";
+
+string procedure Ask.Line (
+    string	PromptMsg;
+    string	HelpMsg );
+begin	"Ask.Line"
+    return( Ask.( PromptMsg, HelpMsg ) );
+end	"Ask.Line";
+
+integer procedure Ask.Old.Incident# (
+    string	PromptMsg;
+    string	HelpMsg );
+begin	"Ask.Old.Incident#"
+    integer	Incident#;
+    integer	C,B,E;
+    label	Prompt;
+    open( C:=getchan, "DSK", 0,0,0, 0,0,E );
+Prompt:
+    Incident# := Ask.Integer( PromptMsg, HelpMsg, -1 );
+    if Incident# = -1 then begin
+	Incident# := Assign.New.Incident#;
+	print( crlf&
+	    "The new incident number is ",Incident#,", please save it"&crlf&
+	    "and always use it when reporting follow-up information."&crlf&
+	    crlf
+	);
+	release( C );
+	return( Incident# );
+    end;
+    lookup( C,"I"&cvs(Incident#)&".TXT",E );
+    close( C );
+    if E then begin
+	print( crlf&
+	    "There is no record of that incident number.  Enter correct"&crlf&
+	    "incident number or hit return to assign a new number."&crlf&
+	    crlf
+	);
+	goto Prompt;
+    end;
+    release( C );
+    return( Incident# );
+end	"Ask.Old.Incident#";
+
+string procedure Capture (
+    string	Tag;
+    string	Type;
+    string	PromptMsg;
+    string	HelpMsg );
+begin	"Capture"
+    string	S;
+    case Type of begin
+	["Integer"] S := Tag& Ask.Integer( PromptMsg, HelpMsg )& crlf;
+	["Y!N"] S := Tag& (if Ask.Y!N( PromptMsg, HelpMsg )
+	    then "Yes"
+	    else "No" )& crlf;
+	["Phone"] S := Tag& Ask.Phone( PromptMsg, HelpMsg )& crlf;
+	["Date"]
+	["Name"]
+	["Line"] S := Tag& Ask.Line( PromptMsg, HelpMsg )& crlf;
+	["Text"] begin
+	    print(
+		PromptMsg, crlf&
+		"(enter lines, end with <control-D>)"& crlf
+	    );
+	    S := Tag& crlf;
+	    do begin
+		S := S& "  "& Ask.(
+		    "> ",
+		    HelpMsg&
+		    "(enter lines, end with <control-D>)"& crlf
+		)& crlf;
+	    end until !SKIP! = #eot;
+	end;
+	[else] Fatal( "Capture: unexpected Type code" )
+    end;
+    CaptureBuffer := CaptureBuffer & S;
+    return( S );
+end	"Capture";
+
+comment -------------------------------------------------------------- comment
+	The main program begins here.
+	Initialization and welcome message.
+------------------------------------------------------------------------------
+;
+
+calli( calli( !xwd( -1,!GTSTS ), calli!GETTAB ) lor JB!JA2, calli!SETJAL );
+    ! set job status J-ACCT-2;
+auxcli( -1,IO!NEE+IO!FCS,!AXCFS );
+    ! set terminal for no-escape-echo and full-character-set mode;
+
+LoginTime := Time!Stamp;
+VTInfo := Get.VTInfo;
+
+Login:
+print(
+
+	crlf&
+	"Tymshare/Tymnet Security Incident Control System"&crlf,
+	LoginTime,"    ",VTInfo,crlf&
+	crlf
+
+);
+
+comment -------------------------------------------------------------- comment
+	Below is the actual dialog for entering a report.
+	All dialog changes should be made below.  If necessary,
+	new Ask.XXX procedures may be added above, each on its
+	own page.  Follow the examples of existing procedures.
+------------------------------------------------------------------------------
+;
+
+print(
+
+	"Type ""?"" at any time for a detailed explanation."&crlf&
+	crlf
+
+);
+CRT := Ask.Y!N (
+
+	"Are you using a CRT terminal? ",
+
+	"If you are using a CRT terminal, answer ""Y"", if you are"&crlf&
+	"using a printer, answer ""N"".  This information is only"&crlf&
+	"used to make editing easier."&crlf
+
+);
+if not Ask.Y!N (
+
+	"Do you have a security incident to report? ",
+
+	"This system is used to report potential security problems."&crlf&
+	"If you believe you have a Tymshare/Tymnet security problem"&crlf&
+	"to report, answer ""Y"" to this question, else answer ""N""."&crlf&
+	"If you are not sure, answer ""Y"" and indicate your concern"&crlf&
+	"in the comments section and someone will contact you."&crlf
+
+) then Abort( "No.Report" );
+New.Incident := Ask.Y!N (
+
+	"Is this the first report of this incident? ",
+
+	"If this is the first time you have reported information"&crlf&
+	"related to this incident, answer ""Y"", if you have already"&crlf&
+	"made a report, and this is a follow-up with additional"&crlf&
+	"information, answer ""N""."&crlf
+
+);
+if New.Incident
+then Incident# := Assign.New.Incident#
+else Incident# := Ask.Old.Incident# (
+
+	"Enter incident number you are following up: ",
+
+	"When you first reported this incident, you were assigned"&crlf&
+	"an incident number by this program.  In order to properly"&crlf&
+	"file the follow up report, you must have the incident no."&crlf&
+	"If you've lost it, you may hit return and a new number will"&crlf&
+	"be assigned.  Please make every effort to use the old number."&crlf
+
+);
+print(
+
+	crlf&
+	"Incident number:	",Incident#,crlf&
+	"Date and Time:		",LoginTime,crlf&
+	"Virtual terminal:	",VTInfo,crlf&
+	crlf
+
+);
+if not Ask.Y!N (
+
+	"Okay to proceed with rest of report? ",
+
+	"If the information shown above is correct, and you"&crlf&
+	"wish to proceed to report a possible security"&crlf&
+	"problem, answer ""Y"", otherwise, to start over"&crlf&
+	"and possibly logout, answer ""N""."&crlf
+
+) then goto LOGIN;
+	
+CaptureBuffer := 
+	"Incident number:	"& cvs(Incident#)& crlf&
+	"Date and Time:		"& LoginTime& crlf&
+	"Virtual terminal:	"& VTInfo& crlf&
+	crlf;	
+
+comment -------------------------------------------------------------- comment
+	Identification of person making report.
+------------------------------------------------------------------------------
+;
+
+Capture(
+
+	"Entered by:		", "NAME",
+	"Enter your full name: ",
+
+	"Enter your full name, in natural order."& crlf
+
+);
+Capture(
+
+	"Telephone:		", "PHONE",
+	"Enter your office telephone number: ",
+
+	"Enter the phone number, includeing area code and extension,"&crlf&
+	"to use in contacting you if there are questions regarding"&crlf&
+	"this report."&crlf
+
+);
+Capture(
+
+	"Mail address:		", "LINE",
+	"Enter your prefered Ontyme or TUMS address: ",
+	
+	"Enter the Ontyme name (account.username) or TUMS address"&crlf&
+	"(individual@host.network) you prefer to receive mail at."&crlf
+
+);
+
+comment -------------------------------------------------------------- comment
+	Body of dialog.
+------------------------------------------------------------------------------
+;
+if New.Incident
+then begin "NEW"
+
+    Capture(
+
+	"Division:		", "LINE",
+	"What Tymshare/Tymnet Division are you in? ",
+
+	"Enter the name or abbreviation of your division."&crlf
+
+    );
+    Capture(
+    
+	"Location:		", "LINE",
+	"What city and state are you located in? ",
+	
+	"Enter the name of the city and state your office"&crlf&
+	"is located in."&crlf
+
+    );
+    Capture(
+
+	"Detection date:		", "DATE",
+	"Enter date the incident was detected: ",
+
+	"Enter the date when the problem was most recently noticed,"& crlf&
+	"or suspected to have most recently occured."& crlf
+
+    );
+    Capture(
+
+	"Hosts, Usernames, etc:	", "TEXT",
+	"List the hosts, systems, usernames and files involved.",
+	
+	"List all host numbers, system numbers, usernames and"&crlf&
+	"files that were involved."&crlf
+
+    );
+    Capture(
+    
+	"Customer access:	", "Y!N",
+	"Were any customer accounts or data involved? ",
+	
+	"Did the incident involve unauthorized access to any customer"&crlf&
+	"data, user names or hosts?"&crlf
+
+    );
+    Capture(
+    
+	"File damage:		", "Y!N",
+	"Were any files or data damaged by the incident? ",
+
+	"Was there any damage believed to have been caused by"&crlf&
+	"the incident being reported?"& crlf
+
+    );
+    Capture(
+
+	"Discovery:		", "TEXT",
+	"Describe briefly how the problem was discovered.",
+	
+	"Describe by what means the problem was discovered.  What"&crlf&
+	"drew attention to the incident?"&crlf
+
+    );
+    Capture(
+
+	"Chronology:		", "TEXT",
+	"Describe the sequence of events pertinent to the incident.",
+	
+	"Describe briefly all events which are relavent to the"&crlf&
+	"matter being reported.  Indicate their sequence.  Be specific"&crlf&
+	"whenever possible (give names, times of day, node numbers,"&crlf&
+	"job numbers, user names, file names, etc.)."&crlf
+
+    );
+    Capture(
+
+	"Suspected cause:	", "TEXT",
+	"What do you feel was the cause of the incident?",
+	
+	"Describe what you suspect to be the cause of the incident."&crlf&
+	"Give any supporting details that aren't mentioned elsewhere."&crlf
+
+    );
+    Capture(
+
+	"Countermeasures:	", "TEXT",
+	"What countermeasures have been taken since the incident?",
+
+	"Indicate what has been done on your part in reaction to the"&crlf&
+	"incident.  (change passwords, restore files, delete files,"&crlf&
+	"cancel user name, monitor usage, people involved, etc.)"&crlf&
+	"Note: it is sometimes desirable to allow the intruder"&crlf&
+	"continued access in order to gain more information - this"&crlf&
+	"is a value judgement based on the relative risks involved."&crlf
+
+    );
+    
+end "NEW";
+
+Capture(
+
+	"Additional info:	", "TEXT",
+	"Enter any additional information or comments:",
+
+	"Enter any information which you feel may be helpful"&crlf&
+	"to the investigation which has not already been"&crlf&
+	"brought out."&crlf
+
+);
+
+comment -------------------------------------------------------------- comment
+	Verify and file the report.  Send copies to ONTYME as required.
+	Generate necessary audit trail.  Log user off.
+------------------------------------------------------------------------------
+;
+
+begin	"OutPut"
+    integer	C,B,E,I;
+    string	Ontyme;
+    open( C:=getchan, "DSK", 0,4,4, 2560,B,E );
+    if E then Fatal( "OutPut: cant open DSK:" );
+    for I := 15 downto 0 do begin
+	append( C,"I"&cvs(Incident#)&".TXT",E );
+	if E
+	    then calli( 1, calli!SLEEP )
+	    else done;
+    end;
+    if E then Fatal( "OutPut: cant append to incident file (15)" );
+    cprint( C,
+	CaptureBuffer,
+	crlf& #ff
+    );
+    close( C );
+    lookup( C,"SECURE.ADR",E );
+    if E then Fatal( "OutPut: cant read file SECURE.ADR" );
+    Ontyme := input( C,0 );
+    for I := 15 downto 0 do begin
+	append( C,"EMSAA.QUE",E );
+	if E
+	    then calli( 1, calli!SLEEP )
+	    else done;
+    end;
+    if E then Fatal( "OutPut: cant append to message file (15)" );
+    cprint( C,
+	":ERASE"& crlf&
+	"Subject: Security Incident Report ", Incident#, crlf&
+	crlf,
+	CaptureBuffer,
+	":SEND ", Ontyme
+    );    
+    release( C );
+end	"OutPut";
+
+Logout:
+begin	"LOGOUT"
+    integer FERR, PERR;
+    FRMRUN( "SECMSG", F.NTTY+F.NWAI, FERR, PERR );
+    if FERR then print( "%FrmRun: ", FERR, crlf );
+end	"LOGOUT";
+calli( !xwd(1,1), calli!LOGOFF );
+
+end	"SECURE"
+$
+ 
