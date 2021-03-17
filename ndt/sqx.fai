@@ -1,0 +1,392 @@
+ENTRY	SQUISH,MANGLE
+TITLE	SQUISH
+EXTERNAL .INVOK	;SAIL: call a procedure parameter (from AC=TEMP)
+EXTERNAL NODE.0, FREQ.0	;have the tree "mangled" for output
+
+OPDEF err. [5b9];SAIL: error opcode
+C.LNUM__200	; character code for line number
+?Z__0	; current input word	[count]
+?A__1	; input aobjn pointer	[input byte pointer]
+?B__2	; repetition count
+?C__3	; character / code
+?D__4	; collecting out bits word
+?E__5	; free bits in D
+?F__6	; output AOBJN word
+?G__7	; return for "out byte"
+?H__10	; repetition character
+?TEMP__14; bits in current out bitstream
+?P__17	;push-down stack
+
+MANGLE:	;mangle(code)
+	MOVM	A,-1(P)
+	SUBI	A,6
+	CAIL	A,2
+	 XORI	A,1
+	CAIG	A,2
+	 JUMPGE	A,CODEOK
+	ERR.	1,[ASCIZ "MANGLE: invalid code. Presuming -9"]
+	HRROI	TEMP,-9
+	MOVEM	TEMP,-1(P)
+	MOVEI	A,2
+CODEOK:	MOVE	B,[XWD	-100,0		;6-bit bytes
+		   XWD	-201,0		;7-bit bytes (+1 for C.LNUM)
+		   XWD	-1000,0](A)	;9-bit bytes
+
+CHRLUP:	SKIPGE	D,FREQ.0(B)
+	 JRST	E.UNDO
+	JFFO	D,WASON
+	SETZM	NODE.0(B)	;0 valid bits
+	AOBJN	B,CHRLUP
+	JRST	SETREP
+WASON:				;D = [000...01hufbits]
+	TLO	D,400000	;put a bit at the other end as well
+				;D = [100...01hufbits]
+	ROT	D,1(E)		;put data bytes in high-order bits
+				;D = [hufbits100...01]
+	MOVEM	D,FREQ.0(B)
+	SUBI	E,=35		;get number of bits in the data
+	MOVNM	E,NODE.0(B)	;store valid bits count
+	AOBJN	B,CHRLUP
+SETREP:	SKIPGE	B,-1(P)		;dont bother if reps are illegal
+	 MOVNI	B,=18
+REPLUP:	JUMPGE	B,ALLSET
+	SKIPGE	D,FREQ.0(B)
+	 JRST	E.UNDO
+	JFFO	D,NONZER
+	SETZM	NODE.0(B)	;0 valid bits
+	AOJA	B,REPLUP
+NONZER:				;D = [000...01hufbits]
+	TLO	D,400000	;put a bit at the other end as well
+				;D = [100...01hufbits]
+	ROT	D,1(E)		;put data bytes in high-order bits
+				;D = [hufbits100...01]
+	MOVEM	D,FREQ.0(B)
+	SUBI	E,=35		;get number of bits in the data
+	MOVNM	E,NODE.0(B)	;store valid bits count
+	AOJA	B,REPLUP
+ALLSET:	SUB	P,[XWD	2,2]
+	JRST	@2(P)
+
+
+E.UNDO:	ERR.	1,[ASCIZ "already mangled, will restore it"]
+	HRREI	B,(B)
+	JUMPGE	B,BLKFIX
+UNDOL1:	CAML	B,[-=18]
+	 SOJA	B,[SKIPE D,FREQ.0(B)	;D = [xhufbits100...01]
+		    JSP  G,UNDO
+		   JRST  UNDOL1]
+	MOVE	B,[ 100	;6-bit bytes
+		    201	;7-bit bytes (+1 for C.LNUM)
+		   1000](A)	;9-bit bytes
+BLKFIX:	SOJL	B,ALLSET
+UNDOL2:	SKIPE	D,FREQ.0(B)	;D = [xhufbits100...01]
+	 JSP	G,UNDO
+	SOJGE	B,UNDOL2
+	JRST	ALLSET
+
+UNDO: ;pattern was [truehuf100...01], thought it was [000...01hufbits] 
+				;D = [hufbits100...01]
+	ROT	D,@NODE.0(B)	;D = [100...01hufbits]
+	TLZ	D,400000	;D = [000...01hufbits]
+	MOVEM	D,FREQ.0(B)	;save old bit pattern
+;now replicate the NODE.0 value (number of bits in hufbits)
+				;D = [truehuf100...01]
+	TRZ	D,1		;must have ended in a 1 (if was huffed)
+	MOVEI	E,0		;will count up bits in truehuf here
+				;D = [truehuf100...00]
+				;so bits = # bits till shift makes 0
+LOOP:	LSH	D,1		;D = [ruehuf100...00]
+	JUMPE	D,.+2		;if shifted out the trailing bit, done
+	AOJA	E,LOOP		;otherwise count one bit of truehuf
+	MOVEM	E,NODE.0(B)	;save reproduced count
+	JRST	(G)		;and return
+DEFINE $top, <
+;	MOVE	A,-4(p)	;input AOBJN pointer
+;	MOVEI	E,=36		;no valid bits in D
+;	MOVE	F,-2(P)	;output AOBJN pointer 
+>
+DEFINE $bot(nxtbuf), <
+	DMOVEM	D,SAV.DE	;need new input buffer, save oword,bits
+	MOVEM	F,SAV.ZA	;save output buffer pointer (here ok)
+				;B,H not saved:no repeats across buffer
+	MOVE	TEMP,-3(P)	;where to get more input
+	PUSHJ	P,.INVOK	;call it (returns pointer in A)
+	MOVE	F,SAV.ZA	;recover saved values
+	DMOVE	D,SAV.DE
+	JUMPL	A,nxtbuf	;and loop or stop
+	JRST	RETURN
+>
+
+SAV.ZA:	0
+	0
+SAV.DE:	0
+	0
+SAV.GH:	0
+	0
+SAV.RP:	0	;for repeat code saving
+
+
+SQUISH:	;int_ SQUISH( code, input.AOBJN.pointer, more.in.procedure,
+	;		output.AOBJN.pointer, more.out.procedure )
+	MOVM	G,-5(P)
+	SUBI	G,6
+	CAIL	G,2
+	 XORI	G,1
+	CAIG	G,2
+	 JUMPGE	G,GOTCOD
+ER.ARG:	ERR. 1,[ASCIZ "SQUISH: Illegal code value"]
+	MOVEI	A,1
+	JRST	RET.A
+
+ER.IBG:	ERR. 1,[ASCIZ "Cannot start input"]
+	MOVEI	A,2
+	JRST	RET.A
+
+ER.OBG:	ERR. 1,[ASCIZ "Cannot start output"]
+	MOVEI	A,3
+	JRST	RET.A
+
+ER.ORM:	ERR.	1,[ASCIZ "short on output room"]
+	MOVEI	A,4
+	JRST	RET.A
+
+ER.ILC:	ERR.	1,[ASCIZ "Illegal character value (not in tree)"]
+	HRLI	F,5-1
+	JRST	RETURN	;so can save last good data at least
+
+ER.RPC:	ERR.	1,[ASCIZ "Unexpectedly large repeat count"]
+	HRLI	F,6-1
+	JRST	RETURN	;so can save last good data at least
+
+GOTCOD:	MOVE	G,[XWD OHAM6,OHAM6R
+		   XWD OHAM7,OHAM7R
+		   XWD OHAM9,OHAM9R](G)
+	SKIPL	-5(P)
+	 MOVS	G,G
+	SKIPL	A,-4(P)			;input AOBJN pointer
+	 JRST	[MOVEM	G,SAV.GH
+		 MOVE	TEMP,-3(P)	;where to get more input
+		 PUSHJ	P,.INVOK	;call the passed routine
+		 JUMPGE	A,ER.IBG
+		 MOVE	G,SAV.GH 
+		 JRST	.+1]
+	MOVEI	E,=36	;no valid bits in D
+	SKIPL	F,-2(P)	;output AOBJN pointer 
+	 JRST	[MOVEM	G,SAV.GH
+	 	 MOVEM	A,SAV.ZA
+		 MOVE	TEMP,-1(P)	;where to get more output room
+		 PUSHJ	P,.INVOK	;call the passed routine
+		 JUMPGE	A,ER.OBG 
+	 	 MOVE	F,A
+	 	 MOVE	A,SAV.ZA
+		 MOVE	G,SAV.GH
+		 JRST	.+1]
+	MOVEI	E,=36		;no valid bits in D
+	JRST	(G)		;go start the actual body
+
+RETURN:	LSH	D,(E)
+	MOVEM	D,(F)
+	HLRE	A,F
+	ADDI	A,1
+RET.A:	SUB	P,[XWD 6,6]
+	JRST	@6(P)
+OHAM7:
+BEGIN oh7
+	$top
+WRD7:	MOVE	Z,(A)
+	LDB	C,[POINT 7,Z,06]
+	JSP	G,LETRC
+	LDB	C,[POINT 7,Z,13]
+	JSP	G,LETRC
+	LDB	C,[POINT 7,Z,20]
+	JSP	G,LETRC
+	LDB	C,[POINT 7,Z,27]
+	JSP	G,LETRC
+	LDB	C,[POINT 7,Z,34]
+	JSP	G,LETRC
+
+	TRNE	Z,1
+	 JRST	[MOVEI	C,C.LNUM
+		 JSP	G,LETRC
+		 JRST	.+1]
+	AOBJN	A,WRD7
+	$bot(WRD7)
+BEND oh7
+LETRC:	;call: MOVEI C,char; JSP G,LETRC 
+	;result: JRST ER.ILC, JRST ER.ORM, or 
+	;	D,E,F updated [new output at -1(P) maybe called] 
+	;preserves: Z,A,G,H, if B=0 on entry then B=0 on return
+
+	SKIPG	TEMP,NODE.0(C)	;get bit count for huffman(character)
+	 JRST	ER.ILC		; need at least one bit, else undefined
+	MOVE	C,FREQ.0(C)	;get left-justified huff(char)
+	ROTC	C,(TEMP)	;rotate it into low bits of D
+	SUBI	E,(TEMP)	;reduce "unused bits in D" count
+	JUMPGE	E,(G)		;if still fits in D, continue
+
+				;here we spilled E bits from D to C
+	MOVEM	D,SAV.DE	;save the bits we want later
+	LSHC	C,(E)		;get top 36 bits back to D
+	MOVEM	D,(F)		;and dump them into the output buffer
+	ADDI	E,=36		;we removed 36 bits, so make them free
+	MOVE	D,SAV.DE	;recover low part of the output stream
+	AOBJN	F,(G)		;bump the buffer count and leave
+	MOVEM	E,SAV.DE+1	;unless we have to get more buffer
+	DMOVEM	Z,SAV.ZA	;save some vital ACs
+	DMOVEM	G,SAV.GH
+	MOVE	TEMP,-1(P)	;get "new output buffer" routine
+	PUSHJ	P,.INVOK	;and call it
+	MOVE	F,A		;new output buffer pointer returns in A
+	DMOVE	G,SAV.GH	;restore the saved ACs
+	DMOVE	Z,SAV.ZA
+	DMOVE	D,SAV.DE
+	MOVEI	B,0		;clear repetition count 
+				;LETRC is called with this =0 or unused
+	JUMPL	F,(G)		;if we got room, keep going
+	JRST	ER.ORM		;otherwise say we ran out of output room
+OHAM6:
+BEGIN oh6
+	$top
+WRD6:	MOVE	Z,(A)
+	LDB	C,[POINT 6,Z,05]
+	JSP	G,LETRC
+	LDB	C,[POINT 6,Z,11]
+	JSP	G,LETRC
+	LDB	C,[POINT 6,Z,17]
+	JSP	G,LETRC
+	LDB	C,[POINT 6,Z,23]
+	JSP	G,LETRC
+	LDB	C,[POINT 6,Z,29]
+	JSP	G,LETRC
+	LDB	C,[POINT 6,Z,35]
+	JSP	G,LETRC
+	AOBJN	A,WRD6
+	$bot(WRD6)
+BEND oh6
+OHAM9:
+BEGIN oh9
+	$top
+WRD9:	MOVE	Z,(A)
+	LDB	C,[POINT 9,Z,08]
+	JSP	G,LETRC
+	LDB	C,[POINT 9,Z,17]
+	JSP	G,LETRC
+	LDB	C,[POINT 9,Z,26]
+	JSP	G,LETRC
+	LDB	C,[POINT 9,Z,35]
+	JSP	G,LETRC
+	AOBJN	A,WRD9
+	$bot(WRD9)
+BEND oh9
+OHAM7R:
+BEGIN oh7r
+	$top
+BUF7A:	MOVEI	B,0		;no repeats outstanding
+	HRROI	H,-1		;repetition character
+WRD7A:	MOVE	Z,(A)
+	LDB	C,[POINT 7,Z,06]
+	JSP	G,LETRCX
+	LDB	C,[POINT 7,Z,13]
+	JSP	G,LETRCX
+	LDB	C,[POINT 7,Z,20]
+	JSP	G,LETRCX
+	LDB	C,[POINT 7,Z,27]
+	JSP	G,LETRCX
+	LDB	C,[POINT 7,Z,34]
+	JSP	G,LETRCX
+
+	TRNE	Z,1
+	 JRST	[MOVEI	C,C.LNUM
+		 JSP	G,LETRCX
+		 JRST	.+1]
+	AOBJN	A,WRD7A
+	JUMPN	B,[JSP	H,OUTREP
+		   JRST	.+1]
+	$bot(BUF7A)
+BEND oh7r
+LETRCX:	;call: MOVEI C,char; JSP G,LETRCX
+	;result: JRST ER.ILC, JRST ER.ORM, JRST ER.RPC, or
+	;	D,E,F updated [new output at -1(P) maybe called] 
+	;	H gets "last character", B is repetitions-1 of H
+	;preserves: Z,A,RH(G)
+
+	CAIN	H,(C)		;same as previous character
+	 AOJA	B,(G)		;yup, just count another repetition
+	JUMPG	B,REP.OU	;repetitions to discharge first?
+	MOVEI	H,(C)		;save as "previous character"
+	JRST	LETRC		;and output it
+
+REP.OU:	MOVEM	C,SAV.RP	;save character to follow count
+	JSP	H,OUTREP	;output repetition code(s)
+	MOVEI	B,0		;clear repetition count
+	MOVE	C,SAV.RP	;recover character
+	MOVEI	H,(C)		;save as "last character"
+	JRST	LETRC		;and go output it
+
+OUTREP:	;output repeat code for [B] characters
+	;Call: JSP H,OUTREP
+	;result: errors: ER.RPC, ER.ILC, ER.ORM [may call more.out]
+	;	D,E,F updated  Z,A,RH(G) preserved
+	HRLI	H,(G)		;save RH(G)
+	MOVEI	G,OUTRBT	;fake up a return address for LETRC
+	HRLI	G,(B)		;put count to output into G-left
+	MOVS	B,B		;and copy the left part into B
+	TRNN	B,-1		;make sure count less than 2^18, gtr 0
+	 JFFO	B,GOTBIT	;and find high-order bit count
+	JRST	ER.RPC
+GOTBIT:	LSH	G,1(C)	;clear bit in G
+	MOVNI	B,1(C)	;by shifting it off the left and then
+	LSH	G,(B)	;re-shifting word back in place
+	SUBI	C,=18	;get code for this bit (2^n code is 1-n)
+	JRST	LETRC	;return address set in G already
+
+OUTRBT:	HLLZ	B,G		;get bits not yet encoded
+	JFFO	B,GOTBIT	;and keep going till none left
+	HLRZ	G,H		;restore G right
+	JRST	(H)		;and return to whoever called us
+OHAM6R:
+BEGIN oh6r
+	$top
+BUF6A:	MOVEI	B,0		;no repeats outstanding
+	HRROI	H,-1		;repetition character
+WRD6A:	MOVE	Z,(A)
+	LDB	C,[POINT 6,Z,05]
+	JSP	G,LETRCX
+	LDB	C,[POINT 6,Z,11]
+	JSP	G,LETRCX
+	LDB	C,[POINT 6,Z,17]
+	JSP	G,LETRCX
+	LDB	C,[POINT 6,Z,23]
+	JSP	G,LETRCX
+	LDB	C,[POINT 6,Z,29]
+	JSP	G,LETRCX
+	LDB	C,[POINT 6,Z,35]
+	JSP	G,LETRCX
+
+	AOBJN	A,WRD6A
+	JUMPN	B,[JSP	H,OUTREP
+		   JRST	.+1]
+	$bot(BUF6A)
+BEND oh6r
+OHAM9R:
+BEGIN oh9r
+	$top
+BUF9A:	MOVEI	B,0		;no repeats outstanding
+	HRROI	H,-1		;repetition character
+WRD9A:	MOVE	Z,(A)
+	LDB	C,[POINT 9,Z,08]
+	JSP	G,LETRCX
+	LDB	C,[POINT 9,Z,17]
+	JSP	G,LETRCX
+	LDB	C,[POINT 9,Z,26]
+	JSP	G,LETRCX
+	LDB	C,[POINT 9,Z,35]
+	JSP	G,LETRCX
+
+	AOBJN	A,WRD9A
+	JUMPN	B,[JSP	H,OUTREP
+		   JRST	.+1]
+	$bot(BUF9A)
+BEND oh9r
+END
+    
