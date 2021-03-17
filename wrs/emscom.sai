@@ -1,0 +1,470 @@
+begin "EMSCOM"
+  require "(SAILIB)SAIL.DEF" source!file;
+  require '53 version;
+  require "(sailib)TYMINT.DEF" source!file;
+
+simple procedure OUTSTR (string X);
+start!code
+    define SP = '16;
+    hrroi 1,'67;	comment !AXOPC;
+    auxcal 1,-1(SP);	comment takes word 1 of a sail string;
+end;
+
+  integer PORT,EOF,BRK,DSK!IN,DSK!OUT,SLOT,BAUD,ESCAPE,LF!cnt;
+  integer CEof,CBRK,Com!File,DISK!WRD,DISK!PTR,CHR!RCD;
+  string LOG!STR,OUT!FILE,OLD!COM;
+  boolean ECHO!,COPY,BLANK,NO!LF,CARRIER,ECHO,YB!;
+  define CREAUX = -'44, ZAPCIR = -'45, AX!SIC = '10, AX!SIL = '50,
+    AX!STS = '61, AX!I8C = 0, AX!O8 = 3, AX!FSW = '64, AX!HNG = '60,
+    AX!IB = '15, AX!OB = '16, AX!IC = '44, AX!OCI = '51, AX!SI = '33,
+    HIBER = '72, AX!I8S = '1, AX!CBO = '7, AX!LDEM = '11;
+
+  define ac!lic = '400;
+  define BlockSize = 8;		! Chars between yellow balls;
+
+simple integer procedure GetLch;
+begin
+    integer I;
+    start!code
+	move 1,Port;
+	movem 1,I;
+	ttcall 6,I;
+	end;
+    return(I);
+    end;
+
+simple procedure YellowBall;
+begin
+    GetLch;
+    do begin
+	calli((PORT lsh (35-8))+!hl('140),HIBER);
+	if not !SKIP! then usererr(0,0,"HIBER uuo failed");
+    end until (Port=0) or (GetLch land '020000000000);
+end;
+
+simple procedure CRWait;
+begin
+    integer LF!tmp;
+    LF!tmp_LF!cnt;
+    do begin
+	calli(1000,HIBER);
+	if not !SKIP! then usererr(0,0,"HIBER uuo failed");
+    end until (Port=0) or (LF!tmp < LF!cnt);
+end;
+
+  define service!routine = {forward simple procedure};
+
+  define HELP!MESSAGE = {"Valid commands are:
+?			print this message
+Help			print this message
+Again			re-execute the last command
+@<file-name>		execute commands in file named
+Ems??? 			build circuit to an ONTYME switch (I.E. EMSAA)
+Force <string>		send string to host followed by <crlf>
+Input <file-spec>	send contents of file over circuit
+List			display current settings and connections
+Output <file-spec>	record all chars from host in file
+Resume			resume transparent connection
+Set COPY | NOCOPY	turn on and off recording
+Set BLANK | NOBLANK	turn on and off blank line suppression
+Set ECHO | NOECHO	turn on and off echo for message switch circuit
+Set LineFeed | YellowBall ;select type of handshake
+Set ^<char>		set escape character (default is ^P)
+Time <seconds>		wait until no chars rec'd for n secs (5)
+Wait <seconds>		wait for n seconds to elapse
+Zap			disconnect auxiliary connection
+"};
+
+  simple procedure turn!on(integer LIC); begin "ON"
+    integer I;
+    I:=call(-'20,"GETTAB");
+    if (I land (LIC lsh 18))=0
+      then calli(I lor (LIC lsh 18),-'10);
+  end;
+
+  simple procedure turn!off(integer LIC); begin "OFF"
+    integer I;
+    I:=call(-'20,"GETTAB");
+    if (I land (LIC lsh 18))and((I land LIC)=0)
+      then calli(I xor (LIC lsh 18),-'10);
+  end;
+
+  simple procedure diskout(integer CH); begin "DISKOUT"
+    dpb(CH,DISK!PTR);
+    ibp(DISK!PTR);
+    if !rh(DISK!PTR)neq location(DISK!WRD) then begin
+      WORDOUT(DSK!OUT,DISK!WRD);
+      DISK!PTR:=point(7,DISK!WRD,6);
+      DISK!WRD:=0;
+      end;
+  end "DISKOUT";
+
+  simple procedure CLOSE!OUT; begin "CO"
+    if OUT!FILE and (DISK!PTR neq point(7,DISK!WRD,6))
+      then wordout(DSK!OUT,DISK!WRD);
+    close(DSK!OUT);
+  end "CO";
+
+  service!routine ZAPPED;
+  service!routine CHARACTER;
+
+  simple procedure INTERRUPTS(integer PORT); begin "INTERRUPTS"
+    define
+      ZC = 5, SC = 6, CC = 7;   ! channels;
+    if PORT
+      then begin "TURN-ON"
+	calli('377777777777,-'35);	! INTACT uncause all;
+	enable(newenb(zc));
+	enable(newenb(cc));
+	intmap(tinass(PORT,cause!tty!zap,zc),ZAPPED,0);
+	intmap(tinass(PORT,cause!tty!chr,cc),CHARACTER,0);
+	end "TURN-ON"
+      else begin "TURN-OFF"
+	disable(newenb(zc));
+	disable(newenb(cc));
+	intmap(tinass(PORT,cause!tty!zap,0),ZAPPED,0);
+	intmap(tinass(PORT,cause!tty!chr,0),CHARACTER,0);
+	end "TURN-OFF";
+    end "INTERRUPTS";
+
+  simple procedure ZAPPED; begin "ZAPPED"
+    own integer SKIP;
+    SKIP:=!SKIP!;
+    if PORT then outstr(crlf&"[circuit zapped]"&crlf);
+    PORT:=0;
+    CARRIER:=false;
+    INTERRUPTS(0);
+    calli(-1,ZAPCIR);
+    !SKIP!:=SKIP;
+  end "ZAPPED";
+
+  simple integer procedure GETWRD(integer port);
+  begin	"GETWRD"
+	integer I,J;
+	I _ 0;
+	for J _ 3 step -1 until 0 do 
+	  I _ I lsh 8 lor auxclv(PORT,0,AX!IC);
+	return(I);
+  end  	"GETWRD";
+
+  simple procedure CHARACTER; begin "CHAR"
+    own integer CH,SKIP;
+    SKIP:=!SKIP!;
+    do begin "eat chars"
+      auxclv(PORT,0,AX!SIC);
+      if not !SKIP! then begin
+	auxclv(PORT,0,AX!LDEM);
+	done "eat chars";
+	end;
+      CH:=auxclv(PORT,0,AX!IC);
+      CHR!RCD:=CHR!RCD+1;
+      if CH='12 then LF!cnt_LF!cnt+1;
+      if CH>'40 then NO!LF:=false;
+      if (CH='12) and NO!LF and not BLANK then continue;
+      if CH='12 then NO!LF:=true;
+      if ECHO then auxclv(-1,CH,AX!O8);
+      if COPY then diskout(CH);
+      end "eat chars" until PORT=0;
+    !SKIP!:=SKIP;
+    end "CHAR";
+
+  simple procedure SLAVE; begin "SLAVE"
+    own integer CH;
+    ECHO:=true;
+    auxcli(-1,'314,AX!FSW);
+    do begin
+      CH:=auxclv(-1,0,AX!I8S) land '177;
+      if !SKIP! then begin
+        if CH = ESCAPE then done;
+        auxclv(PORT,CH,AX!O8);
+	if ECHO! then begin
+	    auxclv(-1,CH,AX!O8);
+	    if CH = #cr then auxclv(-1,#lf,ax!O8);
+	end;
+      end;
+      calli(!hl('10),HIBER);
+    end until PORT=0;
+    auxcli(-1,0,AX!FSW);
+    ECHO:=false;
+    if PORT then auxclv(PORT,0,AX!CBO);
+    outstr(crlf);
+    end "SLAVE";
+
+  boolean SendLf!;
+  simple procedure SEND(string FILE); begin "SEND"
+    own integer CH,Blips;
+    string FOO;
+    LF!cnt_Blips_0;
+    lookup(DSK!IN,FILE,EOF);
+    if EOF
+      then outstr("?Can't read file "&FILE)
+      else do begin
+	Foo _ input(Dsk!In, 5);	! break on LF (and skip);
+	if length(FOO)=0 then Foo _ #cr;! cope with CR LF LF;
+	Blips_Blips+length(foo);
+	while length(Foo) do begin
+	  integer CH;
+	  CH _ lop(Foo);
+	  auxclv(Port,CH,AX!O8);
+	end;
+	if Brk and SendLf! then auxclv(Port,Brk,AX!O8);
+	if YB! 
+	    then YellowBall 
+	    else if Brk then CRWait;
+	outstr(cvs(blips)&" ");
+	end until EOF or PORT=0;
+    close(DSK!IN);
+    outstr(crlf);
+    outstr(crlf);
+    end "SEND";
+
+  boolean procedure CREATE(string LOGSTR;
+	reference integer PORT); begin "CREATE"
+    integer array FOO[0:length(LOGSTR)%5+2];
+    integer I;
+    begin "sickening hack"
+	integer BT,BRK;
+	string XXX;
+	setbreak( BT_getbreak,":",null,"SINK" );
+	scan( XXX_LOGSTR, BT, BRK );
+	if BRK = 0 then begin "kludge check for F3 or KS2020"
+	    if 3 leq calli('41000011,'41) leq 4 then
+		LOGSTR := LOGSTR & ":TYMNET"; ! gag;
+	end;
+    end;
+    for I:=1 step 5 until length(LOGSTR)
+      do FOO[I%5]:=cvasc(LOGSTR[I for 5]);
+    PORT:=calli(location(FOO[0]),CREAUX);
+    if not !SKIP! then begin
+      outstr(crlf&"?Can't build circuit to "&LOGSTR&crlf);
+      case !lh(PORT) of begin
+	[0][7] case !rh(PORT) of begin
+	  [1] outstr("?Format error"&crlf);
+	  [2] outstr("?User name not in MUD"&crlf);
+	  [3] outstr("?Bad MUD"&crlf);
+	  [4] outstr("?System unavailable or out of ports"&crlf);
+	  [5] outstr("?Downline/dialout request failure"&crlf);
+	  [6] outstr("?Tymout"&crlf);
+	  [7] outstr("?Access barred"&crlf) end;
+	[1] outstr("?Too many circuits without AC license"&crlf);
+	[2] outstr("?Not your user name without AC license"&crlf);
+	[3] outstr("?No room for DDB"&crlf);
+	[4] outstr("?Supervisor not responding to request"&crlf);
+	[5] outstr("?Supervisor not responding to string"&crlf);
+	[6] outstr("?Supervisor not supplying a channel"&crlf) end;
+      return(false);
+      end;
+    return(true);
+    end "CREATE";
+
+boolean procedure BUILD(string USERNAME); begin "BUILD"
+ integer I;
+ boolean VALID!USR;
+ VALID!USR _ kequ(USERNAME[1 to 3],"EMS");
+ if VALID!USR then begin
+  if CREATE(USERNAME,PORT) then begin
+    outstr("[connected]"&crlf);
+    NO!LF:=true;
+    INTERRUPTS(PORT);
+    LOG!STR:=USERNAME;
+    return(not Com!File);
+    end;
+  LOG!STR:=null;
+  PORT:=0;
+  return(false);
+ end else begin
+  outstr("Not a Valid Message Host - Type HELP"&crlf);
+  return(false);
+ end;
+end "BUILD";
+
+  procedure OUTPUT(string FILE); begin "OUTPUT"
+    CLOSE!OUT;
+    enter(DSK!OUT,FILE,BRK);
+    if BRK
+      then outstr("?Can't enter file "&FILE&crlf)
+      else begin
+	OUT!FILE:=FILE;
+	COPY:=true;
+	DISK!PTR:=point(7,DISK!WRD,6);
+	DISK!WRD:=0;
+	end;
+    end "OUTPUT";
+
+  procedure LIST; begin "LIST"
+    if PORT then outstr("Remote="&LOG!STR&'40);
+    outstr((if COPY then "COPY " else "NOCOPY "));
+    if OUT!FILE then outstr("Output=DSK:"&OUT!FILE&'40);
+    outstr((if BLANK then "BLANK " else "NOBLANK "));
+    outstr((if ECHO! then "ECHO " else "NOECHO "));
+    outstr((if SendLf! then "SEND-LF " else "OMIT-LF "));
+    outstr(crlf);
+    end "LIST";
+
+  procedure SET(string ARG); begin "SET"
+    string FOO;
+    while ARG do begin
+      FOO:=scan(ARG,1,BRK);
+      if FOO="?" then outstr("SET followed by one of"&crlf
+	&"    COPY | NOCOPY | BLANK | NOBLANK"&crlf
+	&"  | YB | YELLOWBALL | LF | LINEFEED"&crlf
+	&"  | SENDLF | OMITLF | ECHO | NOECHO"&crlf )
+      else if FOO="^" then ESCAPE:=FOO[2 to 2] land '37
+      else if equ(FOO,"LF") then YB! _ false
+      else if equ(FOO,"LINEFEED") then YB! _ false
+      else if equ(FOO,"YB") then YB! _ true
+      else if equ(FOO,"YELLOWBALL") then YB! _ true
+      else if equ(FOO,"COPY") then COPY:=(OUT!FILE neq null)
+      else if equ(FOO,"NOCOPY") then COPY:=false
+      else if equ(FOO,"BLANK") then BLANK:=true
+      else if equ(FOO,"NOBLANK") then BLANK:=false
+      else if equ(FOO,"SENDLF") then SendLf!_true
+      else if equ(FOO,"OMITLF") then SendLf!_false
+      else if equ(FOO,"SEND") then SendLf!_true
+      else if equ(FOO,"OMIT") then SendLf!_false
+      else if equ(FOO,"ECHO") then ECHO! _ true
+      else if equ(FOO,"NOECHO") then ECHO! _ false
+      else begin 
+	outstr("?Unrecognized token: "&FOO&crlf);
+	done;
+	end;
+      end;
+    end "SET";
+
+  simple procedure COMMAND!FILE(string FILE); begin "COMMAND!FILE"
+    own boolean FOO;
+    own string FPN,AUN,S;
+    FPN:="["&cvos(!lh(calli(-'25,'41)))
+      &","&cvos(!rh(calli(-'25,'41)))&"]";
+    AUN:="["&cvos(!lh(calli(-'23,'41)))
+      &","&cvos(!rh(calli(-'23,'41)))&"]";
+    open(Com!File_getchan,"DSK",1,5,0,256,CBRK,CEof);
+    		 lookup(Com!File, FILE, CEof);
+    if CEof then lookup(Com!File, FILE&AUN, CEof);
+    if CEof then lookup(Com!File, FILE&FPN, CEof);
+    FOO:=CEof;
+    if FOO then while not CEof do begin
+      S:=input(Com!File,4);
+      if S="@" and equ(S[2 to inf],FILE) then done;
+      end;
+    if CEof then begin
+      outstr("?Command file "&FILE&" not found"&crlf);
+      release(Com!File);
+      Com!File:=0;
+      end;
+    end "COMMAND!FILE";
+
+simple procedure WAIT(integer TIME(0)); begin "WAIT"
+  own integer TARG;
+  if PORT and (TIME=0) then begin
+    YellowBall;
+    if not !SKIP! then usererr(0,1,"?HIBER failed durring WAIT");
+    end
+  else if PORT and (TIME>0) then begin
+    TARG:=call(0,"MSTIME")+TIME*1000+500;
+    while PORT and (call(0,"MSTIME")<TARG) do call(1,"SLEEP");
+    end
+  else if PORT and (TIME<0) then begin
+    calli(!hl(1)-TIME,HIBER);
+    if not !SKIP! then usererr(0,1,"?HIBER failed duriing WAIT -n");
+    end;
+  end "WAIT";
+
+simple procedure FORCE(string MSG); begin "FORCE"
+  if Msg[inf for 1]= "" 
+	then Msg _ Msg[1 to inf-1]
+	else Msg _ Msg & #cr;
+  if PORT then while Msg do auxclv(PORT,lop(Msg),AX!O8);
+  end "FORCE";
+
+simple procedure SLEEP(integer TIME); begin "SLEEP"
+  own integer TARG,IT;
+  if TIME=0 then TIME:=20;
+  do begin "bigone"
+    TARG_(IT:=call(0,"MSTIME"))+TIME*1000;
+    CHR!RCD:=0;
+    do begin
+      call(10,"SLEEP");
+      if call(0,"MSTIME")<IT then begin
+	IT:=call(0,"MSTIME");
+	TARG _ TARG - 1000*60*60*24;
+      end;
+      if CHR!RCD then continue "bigone";
+    end until TARG < call(0,"MSTIME");
+  end until CHR!RCD=0;
+end "SLEEP";
+
+begin "MAIN"
+  string COM,ARG;
+  outstr("version "&cvos(memory['137])&crlf);
+  ttyup(true);
+  setbreak(1," ",null,"KINS");
+  setbreak(2,null,'12,"FXNA");
+  setbreak(3,null,"-/() ","KINS");
+  setbreak(4,'12,'15,"FINS");
+  setbreak(5,'12,null,"FINS");
+  setbreak(6,"",null,"FINS");
+  setbreak(7,"",null,"FINS");
+  open(DSK!IN_getchan,"DSK",0,5,0,1024,BRK,EOF);
+  open(DSK!OUT_getchan,"DSK",'14,0,5,0,0,0);
+  BLANK:=true; BAUD:=2; ESCAPE:="P" land '37; YB!:=true; ECHO!:=true;
+  COPY:=false; ECHO:=false; OLD!COM:="";
+  while true do begin "COMMAND"
+    auxclv(-1,0,AX!SIL);
+    if COM!FILE then begin
+      ARG:=input(COM!FILE,4);
+      if CEOF or ARG="@" then begin
+        close(COM!FILE); release(COM!FILE);
+        COM!FILE:=0;
+        end;
+      end;
+    if not COM!FILE then begin
+      ECHO:=false;
+      outchr("*");
+      ARG:=inchwl;
+      end;
+    COM:=scan(ARG,1,BRK);
+    begin "Fixup () and <>"
+	string A;
+	integer Brk;
+	A _ null;
+	do begin
+	    A _ A & Scan(Arg,6,Brk);
+	    if Brk=0 then done;
+	    if Brk="" then auxclr(-1,memory['301],'64);
+	    outstr(Scan(Arg,7,Brk));
+	    A _ A & inchwl;
+	    if Brk="" then begin
+		auxclr(-1,memory[1],'64);
+		outstr(crlf);
+		end;
+	    end until 0;
+	Arg _ A;
+	end;
+    if COM[1 for 1]="A" then COM _ OLD!COM else OLD!COM _ COM;
+    case COM of begin
+      ["@"] COMMAND!FILE(COM[2 to inf]);
+      ["Ems##"] if BUILD(COM) then SLAVE;
+      ["Force"] FORCE(ARG);
+      ["Wait"] WAIT(cvd(ARG));
+      ["Time"] SLEEP(cvd(ARG));
+      ["Output"] OUTPUT(ARG);
+      ["Input"] SEND(ARG);
+      ["Set"] SET(ARG);
+      ["List"] LIST;
+      ["Zap"] ZAPPED;
+      ["Quit"] begin
+	close(DSK!IN);
+	CLOSE!OUT;
+	call(0,"EXIT");
+	end;
+      ["Resume"] if PORT then SLAVE
+        else outstr("?No circuit"&crlf);
+      ["?"] outstr(HELP!MESSAGE);
+      ["Help"] outstr(HELP!MESSAGE);
+      [null] ;
+      else outstr("Huh? - type ""?"" for help"&crlf) end;
+    end "COMMAND";
+  end "MAIN";
+end "EMSCOM"
+   
