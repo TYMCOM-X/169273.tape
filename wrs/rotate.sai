@@ -1,0 +1,398 @@
+begin	"1ROTATE"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "ARGS.REQ" source!file;
+require "AUXLIB.REQ" source!file;
+require !xwd( '1, '1 ) version;
+
+define	MAX = 192
+;
+
+record!class LNK (
+	integer Node1, Node2;
+	integer Owner;
+	integer Group );
+
+r!p(LNK) array LNKS[1:MAX];
+integer NGRP;
+integer NLNK;
+integer array RAWDAT[1:MAX];
+string SUP;
+
+string item LOGFILE;
+string item FILE;
+item READ;
+item SEND;
+string item SUPS;
+item TEST;
+integer item TIMEOUT;
+item TRACE;
+
+label NextSup;
+
+!
+    SYSMSG slave command codes
+;
+define	SYSMSG!RDIRC = 4
+,	SYSMSG!WRIRC = 6
+;
+
+define	lhw(X) = {((X lsh -16) land '177777)};
+define	rhw(X) = {(X land '177777)};
+define	xhw(L,R) = {((rhw(L) lsh 16) lor (rhw(R)))};
+
+string procedure cvhs( integer X, N(1) );
+begin
+    string S;
+    S := null;
+    while X or length(S) < N do begin
+	S := "0123456789abcdef"[(X land '17)+1 for 1] & S;
+	X := X lsh -4;
+    end;
+    return( S );
+end;
+
+procedure SupFail( string MSG );
+begin
+    ifcr compiler!switch("B")
+	thenc
+	    usererr( 0, 0, MSG, "B" );
+	elsec
+	    usererr( 0, 0, MSG, "C" );
+	    auxZap;
+	    goto NextSup;
+    endc
+end;
+
+string procedure lopsup( reference string SUPS );
+begin
+    integer C;
+    while length(SUPS) do
+	case C := lop(SUPS) of begin
+	    ["1"]["2"]["3"]["4"]["5"]["6"]["7"] return( "12"& C );
+	    ["*"] return( C )
+	end;
+    return( null );
+end;
+
+integer procedure findit( integer N1,N2 );
+begin
+    integer N;
+    for N := 1 upto NLNK do
+	if (lnk:Node1[LNKS[N]] = N1 and lnk:Node2[LNKS[N]] = N2)
+	or (lnk:Node1[LNKS[N]] = N2 and lnk:Node2[LNKS[N]] = N1)
+	    then return( N );
+end;
+
+comment
+	Circuit input routines.
+;
+
+integer procedure rdbyte( integer N(1) );
+begin
+    integer B,I,X;
+    X := 0;
+    for I := 1 upto N do begin
+	X := (X lsh 8) lor (B := auxIn(datum(TIMEOUT)) );
+	if B < 0 then SupFail(
+	    "?rdbyte("& cvs(N)&
+	    "): timeout waiting for response from SUP "& SUP );
+    end;
+    if props(TRACE) then print( "rd", N, " ", cvhs( X, N*2 ), crlf );
+    return( X );
+end;
+
+procedure rdarry( integer array A );
+begin
+    integer I;
+    for I := arrinfo(A,1) upto arrinfo(A,2) do
+	A[I] := rdbyte(4);
+end;
+
+comment
+	Circuit output routines.
+;
+
+procedure wrbyte( integer X, N(1) );
+begin
+    redefine !axO8 = '3;
+    integer I;
+    for I := N downto 1 do
+	auxclv( auxPort, X lsh (8-I*8), !axO8 );
+    if props(TRACE) then print( "wr", N, " ", cvhs( X, N*2 ), crlf );
+end;
+
+procedure wrarry( integer array A );
+begin
+    integer I;
+    for I := arrinfo(A,1) upto arrinfo(A,2) do
+	wrbyte( A[I], 4 );
+end;
+
+procedure handshake;
+begin
+    define hs = (1 lsh 24)+(2 lsh 16)+(3 lsh 8)+(4 lsh 0);
+    integer I;
+    I := 0;
+    wrbyte( hs, 4 );
+    while I neq hs do
+	I := (I lsh 8) lor rdbyte;
+end;
+
+integer TokBrk,LinBrk, C,B,E, LN,PG,SS;
+simple procedure BrkIni;
+begin
+    setbreak( TokBrk:=getbreak,";, "&#ht&crlf,", "&#ht&crlf&#ff,"SINKT" );
+    setbreak( LinBrk:=getbreak,#lf&#ff,#cr,"SINK" );
+end;
+require BrkIni initialization;
+
+string procedure getToken;
+begin
+    string S;
+    do begin
+	S := input( C, TokBrk );
+	if B = ";" then input( C, LinBrk );
+    end until E or length(S);
+    return( S );
+end;
+
+procedure SERR( string MSG );
+begin
+    print( crlf,
+	"Error in file ", datum(FILE),
+	" page ", PG+1,
+	" line ", LN+1,
+	crlf,
+	MSG  );
+    usererr( 0,0,null,"X" );
+end;
+
+procedure readFile( string FileName );
+begin
+    integer I;
+    boolean NOGROUP;
+    open( C:=getchan,"DSK", 0,4,0, 132,B,E );
+    lookup( C, FileName, E );
+    if E then usererr( 0,0,"?lookup: unable to read file "& FileName,"X" );
+    setpl( C, LN:=0, PG:=0, SS:=0 );
+    NLNK := NGRP := 0; NOGROUP := false;
+    arrclr( LNKS );
+    while not E do begin
+	string S;
+	S := getToken;
+	if E then done;
+	if equ(S,"NO")
+	    then if not equ(S:=getToken,"GROUP")
+		then SERR( """NO GROUP"" expected: "& S )
+		else S := "NOGROUP";
+	if equ(S,"GROUP") then begin
+	    if NOGROUP then SERR( "NOGROUP must be last group." );
+	    NGRP := NGRP + 1;
+	end
+	else if equ(S,"NOGROUP") then begin
+	    if NOGROUP then SERR( "NOGROUP specified more than once." );
+	    NOGROUP := true;
+	end
+	else if equ(S,"LINK") then begin
+	    r!p(LNK) L;
+	    if B = "," then SERR( "Node number expected: "",""" );
+	    LNKS[NLNK:=NLNK+1] := L := new!record( LNK );
+	    lnk:Node1[L] := cvo(S:=getToken);
+	    if not equ(S,cvos(lnk:Node1[L]))
+	    or not (0 < lnk:Node1[L] < '100000)
+		then SERR( "Node number expected: "& S );
+	    if B neq "," then SERR( ""","" expected: "& getToken );
+	    lnk:Node2[L] := cvo(S:=getToken);
+	    if not equ(S,cvos(lnk:Node2[L]))
+	    or not (0 < lnk:Node2[L] < '100000)
+		then SERR( "Node number expected: "& S );
+	    if findit( lnk:Node1[L], lnk:Node2[L] ) < NLNK
+		then SERR( "Link appears more than once: "&
+		    cvos(lnk:Node1[L])& ","& cvos(lnk:Node2[L]) );
+	    if equ(S:=B,",")
+	    or not equ(S:=getToken,"IRC")
+		then SERR( """IRC"" expected: "& S );
+	    lnk:Owner[L] := cvd(S:=getToken);
+	    if not equ(S,cvs(lnk:Owner[L]))
+	    or not (0 < lnk:Owner[L] < 256)
+		then SERR( "IRC number expected: "& S );
+	    lnk:Group[L] := NGRP;
+	end
+	else SERR( "Unrecognized token: "& S );
+    end;
+    release( C );
+end;
+
+procedure assemble( integer array A );
+begin
+    integer I,N,CurrPointer,LastGroup;
+    I := 0;
+    arrclr( A );
+    for N := 1 upto NLNK do
+	A[I:=I+1] := xhw( lnk:Node1[LNKS[N]], lnk:Node2[LNKS[N]] );
+    A[I:=I+1] := 0;
+    for N := 1 upto ((NLNK+3) land -4) do begin
+	if N mod 4 = 1 then I := I + 1;
+	A[I] := A[I] lsh 8;
+	if LNKS[N] then A[I] := A[I] lor lnk:Owner[LNKS[N]];
+    end;
+    LastGroup := -1;
+    for N := 1 upto NLNK do begin
+	if LastGroup neq lnk:Group[LNKS[N]] then
+	    CurrPointer := 4 * ( (LastGroup := lnk:Group[LNKS[N]]) + N - 1 );
+	A[I:=I+1] := if lnk:Group[LNKS[N]] then CurrPointer else -4;
+    end;
+    LastGroup := -1;
+    for N := 1 upto NLNK do if lnk:Group[LNKS[N]] then begin
+	if LastGroup neq lnk:Group[LNKS[N]] then begin
+	    A[I:=I+1] := 0;
+	    LastGroup := lnk:Group[LNKS[N]];
+	end;
+	A[I:=I+1] := xhw( lnk:Node1[LNKS[N]], lnk:Node2[LNKS[N]] );
+    end;
+    A[I:=I+1] := 0;
+end;
+
+procedure disassemble( integer array A );
+begin
+    procedure Barf( string MSG );
+	SupFail( "?disassemble: the IRC data from SUP "& SUP&
+	    " is corrupt:"& crlf& MSG );
+    integer I,N;
+    r!p(LNK) L;
+    NLNK := NGRP := 0;
+    arrclr( LNKS );
+    I := arrinfo(A,1);
+    while A[I] do begin
+	LNKS[NLNK:=NLNK+1] := L := new!record(LNK);
+	lnk:Node1[L] := lhw(A[I]);
+	lnk:Node2[L] := rhw(A[I]);
+	I := I + 1;
+    end;
+    N := 0;
+    while N < NLNK do begin
+	integer B,Y;
+	I := I + 1;
+	for Y := -24 step 8 until 0 do begin
+	    B := (A[I] lsh Y) land '377;
+	    if LNKS[N:=N+1]
+		then if B
+		    then lnk:Owner[LNKS[N]] := B
+		    else Barf( "Zero found in Owner-Table." )
+		else if B
+		    then Barf( "Zero fill missing at end of Owner-Table." );
+	end;
+    end;
+    if A[I+NLNK+1] then Barf( "Zero missing at end of Group-Pointer table." );
+    comment	I = index of word in front of pointer table;
+    for N := 1 upto NLNK do begin
+	if A[I+N] neq A[I+N-1] then begin
+	    NGRP := NGRP + 1;
+	    if A[I+N] land '3 then Barf( "Pointer not word aligned." );
+	    if A[I+NLNK+A[I+N]%4] then Barf( "Zero missing before group "&
+		cvs(NGRP)& " Group-Table." );
+	end;
+	if lhw(A[I+N]) = 0
+	    then begin
+		lnk:Group[LNKS[N]] := NGRP;
+		if A[N] neq A[I+N+NLNK+NGRP] then Barf(
+		    "Link-Table/Group-Table inconsistency for link "&
+		    cvs(N) );
+	    end
+	    else
+		lnk:Group[LNKS[N]] := 0;
+    end;
+    if A[I+NLNK*2+NGRP+1] then Barf( "Zero missing after group "&
+	cvs(NGRP)& " Group-Table." );
+    if A[I+NLNK*2+NGRP+2] then Barf( "Zero missing after Group-Tables." );
+end;
+
+procedure cprintTables( string FileName );
+begin
+    integer C,B,E, I, LastGroup;
+    r!p(LNK) L;
+    open( C:=getchan,"DSK",0,0,4, 0,0,E );
+    enter( C, FileName, E );
+    if E then usererr( 0,0,"?enter: unable to write file "& FileName,"X" );
+    LastGroup := -1;
+    for I := 1 upto NLNK do begin
+	L := LNKS[I];
+	if LastGroup neq lnk:Group[L]
+	    then cprint( C, if lnk:Group[L] then "GROUP" else "NOGROUP",crlf );
+	LastGroup := lnk:Group[L];
+	cprint( C,
+	    "LINK ", cvos(lnk:Node1[L]),
+	    ",", cvos(lnk:Node2[L]),
+	    " IRC ", lnk:Owner[L],
+	    crlf  );
+    end;
+    release( C );
+end;
+
+datum(SUPS) := "1234567";
+datum(TIMEOUT) := 60;
+if ARGC < 2 then print( "
+Too few arguments.  Correct form is one of following:
+
+  ROTATE /READ/SUPS:12345	(read data from sups 1-5 to file ROTATE.12#)
+  ROTATE ROT.DAT/SEND/SUP:23	(send data from file ROT.DAT to sups 2 and 3)
+
+See ROTATE.DOC for further instructions.
+", call(0,"EXIT") );
+    
+argparse( LOGFILE, FILE, {READ,SEND,SUPS,TEST,TIMEOUT,TRACE}, ARGS );
+if props(LOGFILE) then setprint( datum(LOGFILE), "B" );
+if props(TEST) then begin
+    readFile( datum(FILE) );
+    assemble( RAWDAT );
+    disassemble( RAWDAT );
+    cprintTables( "ROTATE.TST" );
+    call(0,"EXIT");
+end;
+if not props(READ) and not props(SEND) then usererr(0,0,
+    "Must specify either /READ or /SEND.", "X" );
+if props(SEND) and not props(FILE) then usererr(0,0,
+    "Must specify name of rotation file to be sent.", "X" );
+if props(FILE) and not props(SEND) then usererr(0,0,
+    "Rotation file name specified without /SEND.", "X" );
+if props(FILE) then readFile( datum(FILE) );
+
+NextSup:
+while SUP := lopsup(datum(SUPS)) do begin
+    integer SUPN;
+    print( "Building circuit to sup ", SUP, "..." );
+    creaux( 4&"SYSMSG1:"& SUP );
+    if not !SKIP! then SupFail( "Unable to build circuit." );
+    handshake;
+    SUPN := rdbyte;
+    print( "SUP Host ", SUPN );
+    if not equ(cvs(SUPN),SUP) then print( " (", SUP, ")" );
+    print( crlf );
+    if props(READ) then begin
+	wrbyte( SYSMSG!RDIRC );
+	rdarry( RAWDAT );
+	disassemble( RAWDAT );
+	cprintTables( "ROTATE."& cvs(SUPN) );
+	print( "[rotation data from sup ", SUPN,
+	    " written to file ROTATE.", SUPN, "]"& crlf );
+    end;
+    if props(SEND) then begin
+	readFile( datum(FILE) );
+	assemble( RAWDAT );
+	wrbyte( SYSMSG!WRIRC );
+	wrarry( RAWDAT );
+	case E := rdbyte of begin
+	    [6] print( "[rotation data from file ", datum(FILE),
+		" sent to sup ", SUPN, "]"& crlf );
+	    [4] print( "?error 4: disk operation failed on sup ", SUPN, crlf );
+	    [7] print( "?error 7: command rejected by sup ", SUPN, crlf );
+	    [else] print( "?error ", E,
+		": unknown return code from sup ", SUPN, crlf )
+	end;
+    end;
+    auxZap;
+end;
+
+end	"1ROTATE";
+ 
