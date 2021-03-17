@@ -1,0 +1,237 @@
+entry s!Data, s!EOR, s!EOF, sendOne, end!buffer, plain!room!size;
+begin "send package"
+external procedure x!packet( string packet );
+
+COMMENT this package defines:
+	plain!room!size( integer maximum!actual!bytes!in!record ):
+	sendOne( integer aByte, class!spec(-1) ):
+	s!EOF( integer c!spec(-1) ):
+	s!EOR( integer c!spec(-1) ):
+	s!Data( string data: integer c!spec(-1) ):
+	end!buffer:
+and calls x!packet for buffer out (a call with NULL indicates flush)
+;
+require "(SAILIB)SAIL.DEF" source!file;
+!get!definitions(ASSERT);
+require "FTPBIT.DEF" source!file;
+let routine=procedure;
+define eif="else if";
+
+define #E.BL='100;	! ebcdic blank;
+
+integer routine dec( reference integer variable; integer val(1) );
+	return( variable := variable - val );
+
+integer routine inc( reference integer variable; integer val(1) );
+	return( variable := variable + val );
+
+simple string procedure construct!string( integer bytepointer, size );
+begin!code	define temp='14;
+	push	sp,size;
+	push	sp,bytepointer;
+	pop	p,temp;
+	sub	p,[!xwd(2,2)];
+	jrst	(temp);
+end;
+integer	buffer!room	! chars left in the current i/o buffer;
+,	buffer!pointer	! byte pointer into the current i/o buffer;
+,	current!class	! data class byte current block is going to.;
+,	buffer!size	! length of i/o buffer (resets buffer!room);
+,	buffer!base	! origin of i/o buffer (resets buffer!pointer);
+;
+
+integer routine room!check;
+! returns a number of bytes that you WILL be able to get by request;
+return( if buffer!room > 2 then buffer!room-1 else buffer!size-1 );
+	! -1 for the class byte, better find at least one byte;
+
+routine flush!buffer;
+! flush current buffer and error check for safety.;
+if buffer!size neq buffer!room
+ then begin	string packet;
+	if not(0 <= buffer!room < buffer!size-1)  ! -1 for class byte.;
+	 then usererr( buffer!room, 3, "Unexpected buffer space:" );
+	packet := construct!string( buffer!base, 
+					buffer!size - buffer!room );
+	x!packet( packet );
+	buffer!room := buffer!size; buffer!pointer := buffer!base;
+	current!class := -1;	! a nice invalid class;
+      end;
+
+internal procedure plain!room!size( integer maximum!bytes );
+begin	integer array buf[0 : (maximum!bytes lsh -2)];
+	own string this!invocation;	! cleared on startup;
+	own integer old!buf;
+if length( this!invocation ) = 0
+ then begin	! once per program run.;
+	this!invocation := cvs(maximum!bytes); ! dynamic string;
+	old!buf := 0;
+      end
+ else flush!buffer;
+buffer!size := maximum!bytes;
+buffer!base := point(8, buf[0], -1);
+buffer!room := buffer!size;
+buffer!pointer := buffer!base;
+current!class := -1;	! a nice invalid class;
+memory[location(buf)] swap old!buf;
+end;
+
+routine set!maximum!transmission!length( integer len );
+begin
+!	 1	Leadin			"*"
+!	 2	Shift-in		"%"
+!	 3: 4	Packet Type Data	"w"
+!	 5: 6	Packet ID		"!"
+!	 7: 8	Data Class		??
+!	 9:10	DataHeader Asis(?)	20+? hex
+!	11:m-4	(m-14)/2 encoded characters
+!	m-3:m	Checksum		?? ??
+!	m+1	Trailer			crlf
+;
+plain!room!size( (len-14) lsh -1 );	! insure short enough records;
+end;
+
+simple procedure setup!buffers;
+	set!maximum!transmission!length(72);	! insure short records;
+require setup!buffers initialization;
+INTERNAL routine end!buffer; 
+begin
+flush!buffer;
+x!packet( null );
+end;
+
+integer procedure class!set( integer alloc!size, class!spec(-1) );
+! returns a byte pointer to opened room (dpb to first one);
+begin	integer r;
+if class!spec = -1 then class!spec := current!class;
+if buffer!room < alloc!size
+or (buffer!room < alloc!size+2 and current!class neq class!spec)
+ then begin 
+	flush!buffer;
+	if buffer!room <= alloc!size
+	 then usererr( buffer!room, 3, "Indivisible Request too big:");
+	idpb( current!class := class!spec, buffer!pointer );
+	dec( buffer!room );
+      end;
+if current!class neq class!spec
+ then begin
+	idpb( dataHeader.op0.EOC, buffer!pointer );
+	idpb( current!class := class!spec, buffer!pointer );
+	dec( buffer!room );
+	dec( buffer!room );
+      end;
+dec( buffer!room, alloc!size );
+ibp(buffer!pointer); 
+if dec(alloc!size)<1 then return( buffer!pointer )
+ else begin
+	r := buffer!pointer;
+	if alloc!size>4 then buffer!pointer := adjbp( alloc!size, r )
+	 else do ibp(buffer!pointer) until dec(alloc!size) = 0;
+	return( r );
+      end;
+end;
+INTERNAL routine sendOne( integer aByte, class!spec(-1) ); 
+begin
+dpb( aByte, class!set( 1, class!spec ) );
+end;
+
+routine sendTwo( integer aByte, nextByte, class!spec(-1) ); 
+begin	integer ptr;
+dpb( aByte, ptr := class!set( 2, class!spec ) );
+idpb(nextByte, ptr);
+end;
+
+routine sendShortStream( integer aByte; string rest;
+				integer class!spec(-1) ); 
+begin	integer ptr;
+dpb( aByte, ptr := class!set( 1 + length(rest), class!spec ) );
+while length(rest) do idpb( lop(rest), ptr );
+end;
+
+INTERNAL routine s!EOF( integer c!spec(-1) );
+		dpb(dataHeader.op0.EOF, class!set(1,c!spec));
+INTERNAL routine s!EOR( integer c!spec(-1) );
+		dpb(dataHeader.op0.EOR, class!set(1,c!spec));
+INTERNAL procedure s!Data( string data; integer target );
+! sends all the characters in <data> in the current data class;
+begin
+	procedure send1( integer byte ); 
+		sendOne( byte, target );
+	procedure send2( integer b1, b2 );
+		sendTwo( b1, b2, target );
+	procedure sendX( integer b; string s ); 
+		sendShortStream( b, s, target );
+while length(data)
+   do begin	integer ch, reps;
+		string copy;
+	copy := data;
+	ch := lop(data);
+	if ch = data then begin
+		for reps := 1 step 1 while length(data)	! count em up;
+		   do if ch neq lop(data)	! ...;
+			then begin data:= copy[reps+1 to inf]; done; end
+			eif reps >= 31
+			 then begin
+				dec(reps,31);
+				copy := copy[32 to inf];
+				if ch=0 then send1( 31
+						+ dataHeader.opx.ZERO )
+				eif ch=#SP then send1( 31
+						+ dataHeader.opx.SPACE )
+				eif ch=#E.BL then send1( 31
+						+ dataHeader.opx.BLANK )
+				else send2(31+dataHeader.opx.COPY, ch);
+			      end;
+		if ch=0 then send1( reps + dataHeader.opx.ZERO )
+		eif ch=#SP then send1( reps + dataHeader.opx.SPACE )
+		eif ch=#E.BL then send1( reps + dataHeader.opx.BLANK )
+		else if reps = 1 then data := copy   ! 32 copies case;
+		else send2( reps + dataHeader.opx.COPY, ch );
+	      end
+	eif ch=0 then send1( DataHeader.opx.ZERO + 1 )
+	eif ch=#sp then send1( DataHeader.opx.SPACE + 1 )
+	eif ch=#E.BL then send1( DataHeader.opx.BLANK + 1 )
+	 else begin "as is"	! good old vanilla data;
+			integer lenFloor, len;
+! it is worth it to drop the count;
+!  for 2-in-a-row Nulls, Spaces, or Blanks (even money & new count);
+! 	... <rep(sp):2> <asis 1> ...  <=>  ... <sp> <sp> ...;
+!  for 3-in-a-row anything;
+! 	... <rep(next):3> <W> <asis 1> ...  <=>  ... <W> <W> <W> ...;
+! sometimes better to stop before the last white in a unit instead of;
+!;
+! eat off a bunch of characters:
+! no less than 1
+! no more than 31
+! no more than room!check-1 (the asis byte and a data byte)
+! no more than the total number of characters available
+!	maxeat := 1 max (room!check-1) min 31 min length(copy)
+!	lc := length(copy)
+!	lenFloor := lc - maxeat
+!	lenFloor := lc -(1 max (room!check-1) min 31 min lc)
+!	lenFloor := lc + (-1 min (1-room!check) max -31 max -lc)
+!	lenFloor := ( lc + (-1 min (1-room!check) max -31) ) max 0
+;
+		lenFloor := 0 max ( length(copy) - 
+				(1 max (room!check-1) min 31) );
+		while length(data) > lenFloor
+		   do begin "another asis char"
+			ch := lop(data);
+			if length(data) and ch = data
+			 then begin	! a match;
+				if ch=0 or ch=#sp or ch=#E.BL
+				or ch = data[2 for 1]
+				 then begin   ! went one too far;
+					data := copy[inf - length(data)
+							to inf];
+					done "another asis char";
+				      end;
+			      end;
+		      end "another asis char";
+		assert( length(data) neq length(copy) );
+		sendX( DataHeader.opx.AsIs + length(copy) - length(data)
+			, copy[1 for inf-length(data)] );
+	      end "as is";
+      end;
+end;
+end "send package" .
