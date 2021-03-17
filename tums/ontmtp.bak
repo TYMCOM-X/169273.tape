@@ -1,0 +1,374 @@
+begin	"ONTMTP - Ontyme Mail Transfer Program"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "ARGS.REQ" source!file;
+require "AUXLIB.REQ" source!file;
+require "MAILIB.REQ" source!file;
+require "MAILOG.REQ" source!file;
+require "ONTLIB.REQ" source!file;
+require '41 version;
+require 1024 system!pdl;
+require 2048 string!pdl;
+
+define	MAX!CC!SIZE = 480;
+
+! v41	12-Jun-87 WRS	Process mail from SYSTEM.ONTYME properly.
+! v40	15-Apr-87 WRS	Discard mail to POSTMASTER from SYSTEM.ONTYME.
+! v37	19-Dec-86 WRS	Fixed bug regarding supplementary addresses.
+! v36	17-Dec-86 WRS	Added MAX!CC!SIZE = 480 for benefit of Unix.  Limits
+			length of significant contents of CC: field.
+! v35	12-Dec-86 WRS	Moved change regarding removal of leading "-" from
+			host name field to the ONTLIB.  Added more friendly
+			explanation to mail returned due to missing supp.
+			address on TUMS.GATEWAY;
+! v34	25-Nov-86 WRS	Removed "-" from front of ontyme host names before
+			use for building circuit or sending in message.  A
+			leading "-" is used to alter the sort order in the
+			ONTYME.DAT file.;
+! v33	21-Jul-86 WRS	Added otHost name to domain in From: to make reply
+			work if recipient has more than one registration.;
+! v32			no history;
+
+integer LineBreak,TokenBreak,LabelBreak,TrimBreak,DotBreak,TrimCrlfBreak;
+simple procedure BreakIni;
+begin
+    define TokTrm = {", "&crlf&#ht&#ff&0};
+    setbreak(LineBreak:=getbreak,#lf,#cr,"SIN");
+    setbreak(TokenBreak:=getbreak,TokTrm,TokTrm,"SIT");
+    setbreak(LabelBreak:=getbreak,":>"," -._|"&#ht,"SIK");
+    setbreak(TrimBreak:=getbreak," "&#ht&#cr&#lf&#ff,null,"RX");
+    setbreak(TrimCrlfBreak:=getbreak,#cr&#lf&#ff,null,"RX");
+    setbreak(DotBreak:=getbreak,". "&#ht," "&#ht,"RIT");
+end;
+require BreakIni initialization;
+
+item TRACE,MSGTEST;
+string item ID,READID;
+
+simple procedure Fatal( string MSG );
+usererr(0,0,MSG);
+
+simple boolean procedure wkequ( string A, B );
+begin
+    while length(A) or length(B) do begin
+	integer CA, CB;
+	CA := lop(A);
+	CB := lop(B);
+	if not (kequ(CA,CB) or CA="#" or CB="#")
+	    then return( false );
+    end;
+    return( true );
+end;
+
+simple string procedure CcParse( string TXT );
+begin
+    integer B,CcCnt;
+    string A,S,CcAdr,otACCT;
+    otACCT := scan( S:=otID, DotBreak, B );	! get current user's account;
+    CcCnt := 0;
+    CcAdr := null;
+    while length( TXT ) do begin
+	A := otACCT;				! account same as TO;
+	S := scan( TXT, DotBreak, B );		! get a token;
+	if B neq "." then scan( TXT, trimBreak, B );
+	while B = "." do begin
+	    lop(TXT);
+	    A := S;				! save account;
+	    S := scan( TXT, DotBreak, B );	! get ID;
+	end;
+	if length(S) = 0 then continue;
+	if not kequ(A,"TUMS") or not kequ(S,"GATEWAY") then begin
+	    CcCnt := CcCnt + 1;
+	    CcAdr := (if length(CcAdr) then CcAdr&", " else null)&
+		A& "."& S& "@Ontyme.Tymnet";
+	end;
+    end;
+    return( if length(CcAdr) > MAX!CC!SIZE
+	then "("& cvs(CcCnt)& " names)"
+	else CcAdr );
+end;
+
+simple string procedure FromParse( string Field; integer FldCnt(0) );
+begin
+    integer B;
+    string T1,T2,D;
+    T1 := scan( Field, DotBreak, B );
+    do begin
+	if B = "." then lop(Field);
+	T2 := scan( Field, DotBreak, B );
+    end until B neq ".";
+    D := if FldCnt then null else "@"& otHost& ".Ontyme.Tymnet";
+    return( if length(T2)
+	then T1&"."&T2&D
+	else scan(T2:=otID,DotBreak,B)&"."&T1&D    );
+end;
+
+string procedure ToParse( string Field );
+begin
+    string S;
+    S := FromParse( Field );
+    return( if kequ(S[1 to 12],"TUMS.GATEWAY") then null else S );
+end;
+
+procedure SYSTEM.ONTYME( r!p(mai) M );
+begin	"SYSTEM.ONTYME"
+    r!p(mai)	M1;
+    string	S;
+    string	FakePrompt;
+    string	MsgBuf;
+    string	msgid;
+    integer	STATE;
+    if kequ(mai:Text[M][1 for 9],"Message #")
+	then msgid := mai:Text[M][10 for 6]
+	else begin
+	    cprint( logChan, "%SYSTEM.ONTYME(): can't parse message"& crlf );
+	    mai:Text[M] := mai:Text[M]& "
+-----------------------------------------------------------------------------
+ONTMTP unable to parse message (above) from SYSTEM.ONTYME to find ""Message #""
+as expected in first 9 characters of body of message.
+";	    mai:To[M] := "POSTMASTER";
+	    return;
+	end;
+    MsgBuf := null;
+    FakePrompt := null;
+    auxOut( "get "& msgid& #cr ); STATE_1;
+    while true do
+	case AuxRead ( S, otTimeOut ) of begin
+	    [aux!Zap] begin
+		cprint( logChan, "?SYSTEM.ONTYME(): zapped ", STATE, crlf );
+		otHost := otID := null;
+		done;
+	    end;
+	    [aux!Line] begin
+		if length(FakePrompt) then begin
+		    S := FakePrompt& S;
+		    FakePrompt := null;
+		end;
+		case STATE of begin
+		    [1] if equ(S,"PLACED IN WORKSPACE"&crlf)
+			then STATE_2
+			else cprint( logChan,
+			    "?SYSTEM.ONTYME(): ", STATE, " ", S );
+		    [2] ;
+		    [3] MsgBuf := MsgBuf& S;
+		    [4] if equ(S,"ACCEPTED"&crlf)
+			then STATE_5
+			else cprint( logChan,
+			    "?SYSTEM.ONTYME(): ", STATE, " ", S );
+		    [5] ;
+		    [else] cprint( logChan,
+			"?SYSTEM.ONTYME(): bad state (text) ", STATE, crlf )
+		end;
+	    end;
+	    [aux!Prompt] if equ(":",S)
+		then case STATE of begin
+		    [2] begin auxOut( "TYPE"& #cr ); STATE_3; end;
+		    [3] begin auxOut( "ERASE"& #cr ); STATE_4; end;
+		    [5] done;
+		    [else] cprint( logChan,
+			"?SYSTEM.ONTYME(): bad state (prompt) ", STATE, crlf )
+		end
+		else FakePrompt := FakePrompt& S;
+	    [aux!Timeout] begin
+		cprint( otMsgChan, "?SYSTEM.ONTYME(): timeout ", STATE, crlf );
+		otHost := otID := null;
+		done;
+	    end
+	end;
+    while length(MsgBuf) and MsgBuf leq " " do
+	lop(MsgBuf);
+    while length(MsgBuf) and MsgBuf[inf for 1] leq " " do
+	MsgBuf := MsgBuf[1 to inf-1];
+    if equ( MsgBuf[1 for 10], "Received: " )
+    then begin
+	M1 := maiMParse( MsgBuf );
+	mai:To[M] := maiRPath( M1 );
+    end
+    else
+	cprint( logChan, "%SYSTEM.ONTYME(): original not TUMS"& crlf );
+    mai:Text[M] := mai:Text[M]& "
+(undelivered message follows)
+------------------------------------------------------------------------
+"&	MsgBuf& crlf;
+    cprint( logChan, msgid, " undeliverable, RTS: ", mai:To[M], crlf );
+end	"SYSTEM.ONTYME";
+
+string FPath;
+
+procedure MsgProc( reference string RawMessage );
+begin
+    r!p(mai) M;
+    integer B,HeadingCount;
+    string S,Field,FieldId,Msg#,TXT;
+    M := new!record( mai );
+    mai:Rcpt[M] := null;
+    mai:Received[M] :=
+	"Received: from "& otHost& ".Ontyme.Tymnet by "&
+	maiHost& "."& maiNet& "; "&
+	maiDATE& crlf;
+    mai:To[M] := otID& "@Ontyme.Tymnet";
+    TXT := RawMessage;
+    do begin
+	Field := scan( TXT, LineBreak, B );
+	FieldId := scan( Field, LabelBreak, B );
+	scan( Field, TrimBreak, B );
+	if length(FieldId) then while equ(TXT[1 to 4],"    ") do begin
+	    string S;
+	    S := scan( TXT, LineBreak, B );
+	    scan( S, TrimBreak, B );
+	    Field := Field& " "& S;
+	end;
+	case FieldId of begin
+	    ["Msg#"] mai:Message.ID[M] :=
+		(Msg#:=scan( Field, TokenBreak, B ))&
+		"@Ontyme.Tymnet";
+	    ["F"] case FieldId[2 to inf] of begin
+		["Rom"] mai:From[M] := FromParse( Field );
+		["Or"] mai:To[M] := mai:To[M]& " ("& FromParse( Field, 1 )& ")"
+	    end;
+	    ["To"] mai:To[M] := ToParse( Field );
+	    ["S"] case FieldId[2 to inf] of begin
+	        ["Ent"] mai:Date[M] := Field;
+	        ["Ubj"] mai:Subject[M] := Field
+	    end;
+	    ["Cc"] mai:Cc[M] := CcParse( Field );
+	    [else]
+	end;
+    end until length(FieldId)=0;
+    scan( mai:Date[M], TrimBreak, B );
+    scan( TXT, TrimCrlfBreak, B );
+    if kequ( TXT[1 to 15], "Received: from " )
+	then begin
+	    M := maiMParse( TXT );
+	    TXT := null;
+	    mai:Received[M] :=
+		"Received: from "& otHost& ".Ontyme.Tymnet by "&
+		maiHost& "."& maiNet& "; "&
+		maiDATE& crlf&
+		mai:Received[M];
+	end
+	else
+	    mai:Text[M] := TXT;
+    HeadingCount := 15;
+    while length( TXT ) and (HeadingCount > 0) do begin
+	string SaveTXT;
+	SaveTXT := TXT;
+	Field := scan( TXT, LineBreak, B );
+	FieldId := scan( Field, LabelBreak, B );
+	if B then begin
+	    if equ(FieldId,"SUBJECT")
+	    or equ(FieldId,"SUBJ")
+	    or equ(FieldId,"SBJT")
+	    or equ(FieldId,"SBJ")
+	    or equ(FieldId,"RE") then begin
+		scan( Field, TrimBreak, B );
+		if length( Field )
+		    then mai:Subject[M] := (if length(mai:Subject[M])
+			then mai:Subject[M]& crlf& #ht
+			else null )& Field;
+	    end;
+	    if kequ(Field[inf-5 to inf],"(TUMS)")
+	    and ( equ(FieldId,"TO") or equ(FieldId,"CC") ) then begin
+		mai:Text[M] := mai:Text[M][1 to inf-length(SaveTXT)]& TXT;
+		Field := Field[1 to inf-6];
+		while length(Field) do begin
+		    r!p(adr) A;
+		    string SA;
+		    A := maiAParse( SA := maiAScan( Field, B ));
+		    maiCatList( mai:RCPT[M], maiAMake( A ));
+		    case FieldId of begin
+			["T"] maiCatList( mai:To[M], SA );
+			["C"] maiCatList( mai:Cc[M], SA )
+		    end;
+		end;
+	    end;
+	end
+	else HeadingCount := HeadingCount - 1;
+    end;
+    if length(mai:RCPT[M]) = 0
+	then mai:RCPT[M] := FPath
+	else if FPath neq "?"
+	    then mai:RCPT[M] := FPath& ","& mai:RCPT[M];
+    if length(mai:From[M])
+	then begin
+	    own string oldRCPT;
+	    own string oldMsg#;
+	    if not kequ( mai:RCPT[M], oldRCPT ) then begin
+		cprint( logChan, "RCPT: ",mai:RCPT[M], " (", otID, ")"& crlf );
+		oldRCPT := mai:RCPT[m];
+		oldMsg# := null;
+	    end;
+	    if kequ("SYSTEM.ONTYME",Mai:From[M][1 to 13])
+		then system.ontyme( M );
+	    cprint( logChan, Msg#, " From: ", mai:From[M] );
+	    if equ( Msg#, oldMsg# )
+		then cprint( logChan, "  -- flushed" )
+		else if mai:RCPT[M] neq "?"
+		    then maiQueue( M )
+		    else maiRTS( M, "No supplementary address found.
+
+"& otID& " is a gateway into the Tymnet Universal Mail System (TUMS).
+Mail sent to "& otID& " must have one or more supplementary addresses
+provided in the first non-blank lines of the message.  The addresses
+should be contained in a line or lines of the form:
+    TO: user@domain (TUMS)
+Please refer to the file ""*** TUMS.GATEWAY"" for more details." );
+	    cprint( logChan, crlf );
+	    oldMsg# := Msg#;
+	end
+	else cprint( logChan, "?bad header:"& crlf, RawMessage );
+end;
+
+procedure SendTestMsg( string ID );
+begin
+    r!p(mai) M;
+    M := new!record( mai );
+    mai:To[M] := ID;
+    mai:Subject[M] := "Testing";
+    mai:Text[M] := "This is a test message, please ignore."& crlf;
+    otSend( M );
+end;
+
+procedure ReadMail;
+begin
+    integer C,B,E;
+    string xxHost;
+    xxHost := null;
+    while otFMap do begin
+	if not props(ID) or
+	wkequ( otm:ID[otFMap][inf-length(datum(ID))+1 to inf], datum(ID) )
+	then begin
+	    if not kequ( xxHost, otm:Host[otFMap] ) then begin
+		string ConnectHost;
+		ConnectHost := otm:Host[otFMap];
+		if otID then otLogout;
+		if not otConnect( ConnectHost ) then
+		    cprint( logChan, "?connection to ",
+		    	ConnectHost, " failed"& crlf );
+	    end;
+	    FPath := otm:Addr[otFMap];
+	    if otHost and otSignon( otm:ID[otFMap],otm:KEY[otFMap] ) then begin
+		if props(MSGTEST) then SendTestMsg( otID );
+		otRead( MsgProc, datum(READID) );
+	    end;
+	    xxHost := otm:Host[otFMap];
+	end;
+	otFMap := otm:Link[otFMap];
+    end;
+    otLogout;
+end;
+
+begin	"M A I N"
+
+    ArgParse( ANY, ANY, {TRACE,ID,MSGTEST,READID}, ARGS );
+    if ARGV[1]="?" then logExit;
+    auxTrace := auxEcho := props(TRACE);
+    otMsgChan := logChan;		! log errors in log;
+    otGetMap;
+    ReadMail;
+    maiSend;
+    logExit;
+
+end	"M A I N"
+end $
+   
