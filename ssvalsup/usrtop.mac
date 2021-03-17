@@ -1,0 +1,1224 @@
+TITLE USRVAL - Tymshare cust.r/user validation program
+SUBTTL DEFS - equates
+SALL
+
+SEARCH UUOSYM(DSK:UUOSYM.UNV)
+SEARCH SLVCOD(DSK:SLVCOD.UNV)
+
+.REQUIRE DISGET
+.REQUIRE GETPSW
+.REQUIRE FNP
+
+; 1.0 (03/01/84) release to branch validations
+; 1.1 (05/24/84) add NEW IAFP command and modify CANCEL USER command
+; 1.2 (05/31/84) add all mud update commands for privileged users
+;                change finance division district to 205
+;                allow FUJIMOTO as district user
+;                modify NEW ARMY, ADD MDISK, CHANGE MDISK CYLINDER, REMOVE
+;                DEVICE and CANCEL USER commands; when army corp. (VALADM1)
+;                using these commands and encounter error, USRVAL will eat
+;                up rest of input until someone enters 99999
+; 1.3 (07/05/84) turn on CHANGE CUSTOMER DISTRICT, CANCEL (REQUEST) and ASK
+;                commands to Tymnet users
+; 1.4 (08/06/84) ask for 18-bit uun in all new user commands, allow acctg.
+;                to use TYPE command, make ADD CUSTOMER request stop at
+;                acctg.
+; 1.5 (09/30/84) provide customer type user CHANGE USER PASSWORD command
+;                on the company basis only.
+;                modify the NEED EXAM command which will only display those
+;                requests which either have been or need not be approved
+;                by accounting dept.
+;                turn off CANCEL GAN and REMOVE GAN commands from branch
+;                users; Update default pricing code/district table ---
+;                district 228
+; 1.6 (01/21/85) prompt for cost code when add user into Tymnet data base.
+;                prompt for sales rep. name, product and dept. number in
+;                NEW CUSTOMER COMMAND
+; 1.7 (04/10/85) delete the prompt for host number in CHANGE USER NAME and
+;                CANCEL user commands. Create NEW COEES command for Tymnet
+; 1.8 (09/20/85) give DIST70A control of Paris districts. Create DELETE USER
+;                (pdp-10)LUD command for WC license users. Create UNSET TGY
+;                command for TYMRES
+; 1.9 (11/25/85) check ACS districts. Get cid from accounting instead of cud.
+;                modify NEW GAN command to get price code from cid. Create
+;                information to the slave program when CHANGE USER NAME and
+;                CANCEL USER. Code change user district in 940 lud. Modify
+;                NEW ARMY command - only validate new user, no new customer
+;                any more. Make country code mandatory. Create SET COLON
+;                command.raise the maximum number of cylinders allowed to
+;                3590. stop ADD FTS MDISK command. 
+;                add 'Minimum Session Charge' option for detail code. create
+;                CANCEL MUD command for cancel Tymshare user through a file.
+; 2.0 (12/01/86) stop all CHANGE CUSTOMER commands except CHANGE CUSTOMER
+;                DISTRICT which will be processed by the programmer.
+; 2.1 (01/10/87) close 940 entries. Remove misc. control bits from the MUD.
+REL==2			; release number
+VER==1			; version number
+ IF2 <
+        LOC .JBVER
+IFNDEF DEBUG,<
+        XWD     REL,VER>
+IFDEF  DEBUG,<
+        OCT     -1>
+        RELOC
+ >
+IF1 <
+   IFDEF DEBUG, <
+	PRINTX ** ASSEMBLING DEBUG CODE ** >
+   IFDEF TEST, <
+	PRINTX ** ASSEMBLING TEST CODE ** >
+   IFNDEF TEST, < IFNDEF DEBUG, <
+	PRINTX ** ASSEMBLING PRODUCTION VERSION ** > >
+>
+IF2 <
+    PRINTX PASS 2 >
+
+
+        TWOSEG  400000
+
+; **** external routines
+        EXTERNAL GETLIC, DISGET, FNPAR
+; **** internals
+        INTERNAL TATALE         ; for getlic routine
+ 
+
+; **** accumulator definitions
+
+AC==    0               ; temp or sub arg holder
+AC1==   1               ; temp
+AC2==   2               ; temp
+AC3==   3               ; temp
+AC4==   4               ; temp
+
+FLG=    5               ; process flags word
+FLG2=	6		; another process flags word
+MY.DIS==7               ; our district
+ESCCHR==10              ; escape character
+IF.P==  11              ; input file index
+SAC==   12              ; place to save ac (or ac1, ac2, ac3, ac4)
+LPOST== 13              ; char position on tty line
+LPOSF== 14              ; char position on tout file line
+AP==    16              ; argument block pointer
+ACX==   16              ; ap and acx are the same register
+P==     17              ; stack pointer
+; **** end of accumulator definitions
+
+
+; **** bit definitions
+
+; bit definitions for FLG  (left half)
+; all bits checked by the command parsers must be in left half.
+U.CS==  (1B0)           ; user has c/s license
+U.DIS== (1B1)           ; user logged in as a district name
+U.WC==  (1B2)           ; frame has write core license
+U.TYM== (1B3)           ; frame has tymshare privilage
+U.SB1== (1B3)           ; user logged in SBILL1
+U.NET==	(1B4)		; network status (logged into TYMRES)
+U.TOUT==(1B5)           ; we are doing output to a file
+U.NOTY==(1B6)           ; we are suppressing tty output
+U.CRLF==(1B7)           ; follow output with a crlf
+U.FTTY==(1B8)           ; force tty output regardless of U.NOTY
+U.CUS== (1B9)           ; user logged in as a customer name
+U.ASV== (1B10)          ; frame has acct sup privilege
+U.IND== (1B11)          ; we are doing input from a com or ind file
+U.AP==  (1B12)          ; we have actg programs lic
+U.SRA== (1B13)          ; we are resources personnel
+U.IMM== (1B14)          ; executing in immediate mode
+U.UPD== (1B15)          ; updates will be allowed if this is set.
+U.IEOF==(1B16)          ; eof found on terminal input device
+U.EOL== (1B17)          ; last terminal input was end of line
+U.PRV== U.WC!U.CS       ; privilaged user, c/s and/or wc lic
+; bit definitions for FLG  (right half)
+U.PEK== 1B18            ; we have peeked ahead one character
+U.NOES==1B19            ; logical escape not allowed
+U.ACT== 1B20            ; we have an accounting circuit
+U.CUD== 1B21            ; we have a cud circuit
+U.TMR== 1B22            ; we have armed for a timer interrupt
+U.NNIB==1B23            ; do not get a new buffer after eof on input
+U.HOM== 1B24            ; group or class is home
+U.OCN== 1B24            ; output cusnam flag (or cusnum)
+U.OKAY==1B25            ; last command completed ok
+U.UDF== 1B26            ; processing a self defining class
+U.OGN== 1B26            ; for list cus names, output gan.
+U.OST== 1B26            ; output system type for list dist cust
+U.OLD== 1B27            ; we have an old lud circuit
+U.NEW== 1B28            ; we have a new lud circuit
+U.OVF== 1B29            ; string or token input was truncated
+U.LFO== 1B30            ; we are doing list to file output
+U.C377==1B31            ; stop inputting bytes if we receive a 377 on g#byte
+U.SIX==	1B32		; sixbit conversion on numeric to char
+U.SBL==	1B33		; suppress extra space after tattle tale file output
+U.NTT==	1B34		; opening a new tattle tale file.
+U.RFI==	1B35		; term input is coming from a request file.
+
+; bit definitions for FLG2 (left half)
+V.NPS==	(1B0)		; space or numeric seen in password.
+V.NPJ==	(1B1)		; non alpha char in pswd just seen.
+V.NPF==	(1B2)		; this is the first char in password.
+V.HDX==	(1B3)		; our terminal is half duplex
+V.OFS== (1B4)           ; process was started at STPT+1
+V.QUO==	(1B5)		; quoting next char
+V.ESC==	(1B6)		; escape typed.
+V.INP==	(1B7)		; doing input via strin routine
+V.INI==	(1B8)		; processing init file
+V.PRQ==	(1B9)		; processing a request
+V.EXQ==	(1B10)		; examining a request
+V.LSQ==	(1B11)		; listing a request
+V.NBU==	(1B12)		; no request backup file to delete
+V.EXC==	(1B13)		; changing items during request exam
+V.CHG==	(1B14)		; request changed during exam
+V.RER==	(1B15)		; error seen during request input
+; bit definitions for FLG2 (right half)
+V.INS==	1B18		; inputting a whole line
+V.1R==	1B19		; examining, approving, or processing one request
+V.NIR==	1B20		; (a request) or (not immediate mode)
+V.AGA== 1B21            ; add new gan after add customer request
+V.NGA== 1B22            ; add new gan after new customer request
+V.NCS== 1B23            ; new customer request
+V.ACS== 1B24            ; add customer request
+V.XNC== 1B25            ; new customer request of special ast
+V.GAN== V.NGA!V.AGA     ; new gan command or request
+V.F99== 1B26            ; flag for writing 99 file
+V.TFLG== 1B27           ; flag for user existing in tuserdb
+V.LUD== 1B28            ; flag for change user name or cancel user
+V.POCT== 1B29           ; flag for printing oct. number in ttl file
+V.NNR== 1B30            ; flag for username which is not all numeric chars.
+V.FST== 1B31            ; flag for first char. of new username
+
+; bit definitions for words in reques.dir
+R.NEX==	(1B0)		; needs exam by validations
+R.NSRA==(1B1)		; needs approval by SRA
+R.INT==	(1B2)		; internal request
+R.RDY==	(1B3)		; this request ready to process
+R.HLD==	(1B4)		; this request in hold status
+R.COM==	(1B5)		; this request is complete
+R.CAN==	(1B6)		; this request is cancelled SRA or VALIDATIONS
+R.UCN==	(1B7)		; this request is cancelled by other then R.CAN
+R.ERR==	(1B8)		; this request has an error condition
+R.LCK==	(1B9)		; locked request
+R.DCH== (1B10)          ; this request is ready to change customer district
+R.NACC== (1B11)         ; needs approval by accounting
+
+R.NAC==	R.CAN!R.UCN!R.COM ; not active (can, ucan, com)
+R.NAC2==R.NAC!R.HLD		; not active or in hold
+
+;  the right half of the word is reserved for the aun of the originator
+
+comment `
+
+Request files :
+
+  xxxx.con - control information
+  xxxx.req - actual request
+  xxxx.dat - data
+
+format of xxxx.con file:
+
+  release number of USRVAL writing this request
+  version number of USRVAL writing this request
+  Logged in name of requestor
+  status name of requestor
+  requestor's telephone number or Ontyme-II name
+  if request is internal then SRA approver's status name
+  Validations processor's status name
+  Request command dispatcher index
+  Request error code or zero
+`
+; **** defs not in uuosym
+ LC.WF== 2B17           ;  write files license
+ LC.CS== 1B15           ;  cs license from password file
+ LC.AP== 1B14           ;  ap license from password file
+ LC.VL== 1B10           ; validator license
+ IA.CLR==4              ; clear intadr
+ IA.REE==2              ; (re-)enable intadr
+ IA.DIS==1              ; disable intadr
+
+; **** defs for hiber
+HI.SEC==1               ; time in seconds
+HI.CHR==10              ; return when char arrives
+HI.AUX==100             ; aux port specified
+HI.WFI==HI.SEC!HI.CHR!HI.AUX  ; time in sec, wait for char, aux port
+HI.SHF==^D27            ; bits to shift port number for hiber
+HI.WAI==^D20            ; wait time
+
+SL.WAI==^D10            ; sleep time
+
+; **** item length defs
+B.VOPT== 1              ; vm option
+B.MDI==	3		; mdisk address
+B.MOD== 1               ; mdisk mode
+B.CORE== 2              ; core bytes
+B.DTY== 1               ; device type byte
+B.CYL==	2		; cylinder bytes
+B.FS==	1		; file system
+B.MIS==	1		; misc bits from 10 lud
+B.BUD==	3		; tru budget
+B.CLN== 1               ; nmcoln
+B.CDST==2               ; dist in cud
+B.CC==3                 ; cost code
+B.FOCF==1               ; flat focus fee
+B.IRC== 1               ; irc num
+B.CPR== 2               ; cparw
+B.PDT== 3               ; password date stamp
+B.ASY== 1               ; act sys type
+B.TDS== 2               ; tymuse days
+B.UUN== 3               ; uun is 3 bytes
+B.GAN== 3               ; gan is 3 bytes
+B.IND== 2               ; size of industry codes
+B.940W==3               ; 940 word size
+B.SLS== 1               ; salesman
+B.PRI== 2               ; default pricecode
+B.VPRI==1               ; variable pricing flag, change core flag
+B.DET== 2               ; detail code
+B.INV== 2               ; invoice code
+B.MIN== 1               ; minimum code
+B.POMX==3               ; pomax
+B.PODT==3               ; po start and stop dates
+B.RES== 1               ; resource code
+B.CUR== 1               ; currency code
+B.LAN== 1               ; language code
+B.TZ==  1               ; time zone
+B.HST== 2               ; hosts
+B.DIS== 1               ; 1 byte for district
+B.CYP== 4               ; length of password cipher
+B.ACOM==1               ; accounting command is one byte
+B.CCOM==1               ; cud command is one byte
+B.LCOM==1               ; lud command is one byte
+B.CLS== 2               ; size of class
+B.GRPH==2               ; size of host or group
+B.CID==3                ; cid
+B.PRV== 3               ; priv bits for tym-10 lud
+B.QUOT==3               ; disk quotas for tym-10 lud
+L.MOD== 3               ; length of input mdisk mode
+L.OFS== 3               ;  size of mdisk format
+L.CORE== 6              ; size of input core in characters
+L.SIPL== 8              ; size of IPL
+L.SPA== 3               ; size of spool address
+L.SPL== 1               ; size of spool class
+L.HOST== 3              ; size of host number or MUD in characters
+L.MDI==	3		; size of mdisk name
+L.PKGP==8		; size of packgroup entry
+L.INF==	6		; init file name
+L.UNM== ^D12            ; size of username
+L.ESAMT==^D15           ; max size of est. monthly billing amt.
+L.SRN==^D25             ; max. size of Sales Rep. Name
+L.PRD==^D25             ; max. size of Product
+L.DPT==^D4              ; max. size of Dept. Number
+L.CUSN==^D51            ; size of customer name
+L.PO==  ^D30            ; po number
+L.ST==^D40              ; number of chars per line of mailing addrs.
+L.STRE==^D51            ; cus. address street1 & street2
+L.CITY==^D13            ; city
+L.STAT==2               ; state
+L.ZIP== 5               ; zip
+L.CTRY==5               ; country
+L.ATTN==^D51            ; attention line
+L.CC==4                 ; output size for costcode
+L.IND== 6               ; industry code
+L.INDN==^D51            ; industry code description
+L.UNM3==^D8             ; size of uname for asyscode 3
+L.CID== 5               ; field size for right justified cid
+L.LAB== 6               ; label length
+L.DTY== 4               ; device type length
+L.GAN== 6               ; field size for right justified gan
+PW.MIN==7               ; min password size
+PW.MAX==^D30            ; max password size
+
+; **** common tab positions
+T.P0==  5               ; all T.P# positions are relative to this.
+T.P1==  T.P0+4          ; node, host, and class tab to here in L U C
+T.P2==  T.P0+^D15       ; most items start at this position
+T.P3==  T.P2+5          ; home flag for hosts and groups in L U C
+
+; **** other defs
+MAX.CY==^d3590          ; max mdisk cylinders 
+MIN.COR==^d320          ; minimum core size
+MAX.COR==^d16384        ; maximum core size
+TR.UFD==3		; number of times to try making ufd in move cmd
+TZMASK==40
+ACT.OK==1               ; ok answer from acctg
+CUD.OK==1               ; ok answer from cud
+LUD.OK==1               ; ok anser from lud
+MAXHER==CXERR%          ; highest host circuit request error code
+MAXHSC==^D200           ; max host numbers for any one user
+.CR==   15              ; carriage return
+.LF==   12              ; line feed
+.CRCUD==155             ; 940 style cariage return
+BLNK==  " "             ; space
+ATSIN== "@"             ; commercial at sign
+CTRLC== 3               ; control c
+CTRLD== 4               ; control d
+ESC==   33              ; escape
+QUOT==  "'"
+CMA==   ","
+SEMIC== ";"             ; semi colon
+LCA==   "a"             ; lower case a
+UPAR==  "^"
+CUD.TR==40              ; cud terminator char
+
+; note: channels 41 to 45 used by commands files
+TOUCHN==^D40            ; tout file channel
+ODFCHN==^D39            ; list output file channel
+TATCHN==^D38		; tattle tale file channel
+RDFCHN==^D37		; request directory channel
+REQCHO==^D36		; request body channel for output
+DATCHO==^D35		; request data file channel for output
+CONCHO==^D34		; request control info channel for output
+REQCHI==^D33		; request body channel for input
+DATCHI==^D32		; request data file channel for input
+CONCHI==^D31		; control control file channel for input
+TMPCHN==^D30		; channel for quick temp chores
+
+REQMAX==17777		; max request number
+RDFSIZ==<REQMAX+1>/1000	; size of request file in pages
+IF1 <
+  IFN REQMAX - <RDFSIZ*1000-1>, 
+    < PRINTX **** ERROR: REQMAX+1 MUST BE DIVISIBLE BY 1000 ****>
+>
+TIM.CH==1               ; intadr channel for timer interrupt
+T.SEC== 1               ; choose seconds for timer units
+T.SNM== ^D180           ; set timer for 3 minutes
+T.SM1== ^D60            ; set timer for 1 minute for CHGPSW salve program
+FIN.DI==^D205           ; finance division district
+RUNHOS==^D35		; host we run from
+JOBCHN==1               ; channel for (pj)jobs.dat
+PJ.ACT==(1B5)           ; act sys bit in (pj)jobs.dat
+PJ.CUD==(1B0)           ; cud sys bit in (pj)jobs.dat
+PJ.FSW==15              ; first system record in (pj)jobs.dat
+A10==   1               ; DEC-10 system type
+A940==  2               ; 940 system type
+A370==  3               ; 370 system type
+M.940==	1		; mask for 940 in bit mask representation
+M.10==	2		; mask for Dec-10
+M.370==	4		; mask for 370
+
+N30== ^D30              ; default pricing code for FORD customer
+D.CLS== 2               ; default and standard class
+D.GRP== 1               ; default and standard group
+
+
+; **** ppn's
+
+JCLMIN==11447,,271412   ; test dir
+VALDEV==1,,364312       ; debugging directory
+USEVAL==6,,144222       ; production directory
+  IFDEF TEST, <
+DB.DIR==VALDEV          ; data file directory
+PJ==    VALDEV  >       ; pj
+  IFNDEF TEST, <
+DB.DIR==USEVAL          ; data file directory
+PJ==    6,,214  >       ; pj
+LU.DIR==VALDEV          ; directory for ludupd files
+
+NET.AUN==10056,,160405	; tymres
+ES1.AUN==10056,,677020 ; tymres1
+ES2.AUN==10056,,670605	; tymres2
+ES3.AUN==10056,,670606	; tymres3
+ES4.AUN==10056,,670607	; tymres4
+ES5.AUN==10056,,670610	; tymres5
+NT1.AUN==41320,,113323  ; hqtech1
+SRA.AUN==1,,215254	; sra
+ACT.AUN==37101,,232714  ; accntrl
+FDM.AUN==51316,,611141  ; lkreysar
+; **** error codes for this program
+ERR.WF==^D1             ; no wf process license
+ERR.AC==^D2             ; no ac process license
+ERR.DI==^D3             ; error trying to find our district
+ERR.LI==^D4             ; not enough license
+ERR.FI==^D5        ; file operation error
+ERR.NX==^D7             ; cannot run from aux circuit
+ERR.HO==^D8             ; this is not the correct host
+ERR.PJ==^D9             ; error with (pj)jobs.dat
+ERR.CI==^D10            ; circuit error (fatal)
+ERR.IN==^D11		; error during init file.
+ERR.PG==^D12		; error processing password gan exception file
+ERR.RN==^D13		; reques.dir not found
+ERR.R2==^D14		; fatal error in reques.dir
+ERR.R3==^D15		; fatal error in request file output
+ERR.R4==^D16		; fatal error in request file
+SUBTTL MACS - macro definitions
+
+DEFINE BOMB(ERRCOD<^D9999>) <  ; type an error code and exit
+        JRST    [
+                MOVEI   AC,ERRCOD
+                JRST    ERREX]      >
+
+; TCR types out crlf sequences
+DEFINE TCR(CRNUM<1>) <
+ IFDIF <CRNUM>, <1>, <
+        MOVEI   AC4,CRNUM  >    ; set to do crnum crlf's
+        TLO     FLG,U.CRLF      ; set up for crlf
+        PUSHJ   P,CRLF          ; do it
+ IFDIF <CRNUM>, <1>, <
+        SOJG    AC4,.-2  >      ; do the rest
+  >
+
+; TCRNL calls TCR if not going to list output. Output is always to term/tout.
+DEFINE TCRNL(CRNUM<1>,%NL) <
+        TRNE    FLG,U.LFO
+         JRST   %NL
+        TCR     (CRNUM)
+;LALL
+%NL:    ;XALL
+>
+
+; TCRLO calls TCR if going to list output only.  Output always to term/tout.
+DEFINE TCRLO(CRNUM<1>,%NL) <
+        TRNN    FLG,U.LFO               ; skip if going to list output file
+         JRST   %NL
+        TCR     (CRNUM)
+;LALL
+%NL:    ;XALL
+>
+
+; TYPSTR outputs a string to the terminal and/or tout file.
+; straddr = address of string
+; maxlen = maximum length of string
+; spac = number of spaces to output before string
+; tab = position to tab to before string
+; crlf = Y to type a crlf at the end, this is default
+; fortty = Y to force tty output even if U.NOTY is on, default is N
+DEFINE TYPSTR(STRADR,MAXLEN<777>,SPAC<0>,TAB<0>,CRLF<Y>,FORTTY<N>) <
+  IFDIF <SPAC>, <0>, <
+        MOVEI   AC,SPAC      ; set to output spac spaces
+        PUSHJ   P,SPACES  >     ; do it
+  IFDIF <TAB>, <0>, <
+        MOVEI   AC,TAB       ; set to tabulate to char pos tab
+        PUSHJ   P,TABS  >       ; do it
+        MOVEI   AC,STRADR       ; put string address in ac
+        MOVEI   AC1,MAXLEN   ; put max length in ac1
+   IFIDN <CRLF>, <Y>, <
+        TLO     FLG,U.CRLF >    ; set to type a carriage return
+   IFIDN <FORTTY>, <Y>, <
+        TLO     FLG,U.FTTY >    ; force tty output
+        PUSHJ   P,STROUT        ; type the string
+   IFIDN <FORTTY>, <Y>, <
+        TLZ     FLG,U.FTTY >    ; reset force tty output flag
+   >
+ 
+; TYPLIS outputs using TYPSTR if U.LFO is unset, otherwise outputs to list file
+; all args are same as TYPSTR. SPAC, TAB, CRLF, & FORTTY are only used if
+; U.LFO is unset
+DEFINE TYPLIS(STRADR,MAXLEN<777>,SPAC<0>,TAB<0>,CRLF<Y>,FORTTY<N>,%LF,%TLD) <
+        TRNE    FLG,U.LFO       ; skip if not going to a list file
+         JRST   %LF
+        TYPSTR  (STRADR,MAXLEN,SPAC,TAB,CRLF,FORTTY)
+        JRST    %TLD
+%LF:
+        MOVEI   AC,STRADR
+        MOVEI   AC1,MAXLEN
+        PUSHJ   P,ODFOUT
+;LALL
+%TLD:   ;XALL
+ >
+
+; TYPSNL outputs using TYPSTR only if U.LFO is not set.  Output is to term/tout.
+DEFINE TYPSNL (STRADR,MAXLEN<777>,SPAC<0>,TAB<0>,CRLF<Y>,FORTTY<N>,%NL) <
+        TRNE    FLG,U.LFO       ; skip if not going to list file
+         JRST   %NL
+        TYPSTR  (STRADR,MAXLEN,SPAC,TAB,CRLF,FORTTY)
+;LALL
+%NL:    ;XALL
+>
+
+; TYPSLO outputs using TYPSTR only if U.LFO is set.  Output is to term/tout.
+DEFINE TYPSLO (STRADR,MAXLEN<777>,SPAC<0>,TAB<0>,CRLF<Y>,FORTTY<N>,%NL) <
+        TRNN    FLG,U.LFO       ; skip if going to list file
+         JRST   %NL
+        TYPSTR  (STRADR,MAXLEN,SPAC,TAB,CRLF,FORTTY)
+;LALL
+%NL:    ;XALL
+>
+
+DEFINE SETFM(BYTES) <
+        MOVEI   AC,BYTES        ; field size is bytes
+        MOVEM   AC,NUMLEN       ; for num output routines
+>
+
+; TYPNUM outputs a number in octal or decimal to terminal and/or tout file.
+; numadr may not be ac thru ac4.
+DEFINE TYPNUM(NUMADR,RAD<O>,SPAC<0>,TAB<0>,CRLF<Y>,FORTTY<N>) <
+  IFDIF <SPAC>, <0>, <
+        MOVEI   AC,SPAC      ; set to output spac spaces
+        PUSHJ   P,SPACES  >     ; do it
+  IFDIF <TAB>, <0>, <
+        MOVEI   AC,TAB       ; set to go to char position tab
+        PUSHJ   P,TABS    >     ; do it
+        MOVE    AC,NUMADR       ; get the number
+  IFIDN <CRLF>, <Y>, <
+        TLO     FLG,U.CRLF >    ; set to type a carriage return
+  IFIDN <FORTTY>, <Y>, <
+        TLO     FLG,U.FTTY >    ; force tty output
+  IFIDN <RAD>, <O>, <
+        PUSHJ   P,OCTOUT >      ; output it
+  IFIDN <RAD>, <D>, <
+        PUSHJ   P,DECOUT >      ; output it
+  >
+
+; LISNUM outputs a number to either terminal/tout or list output file.
+DEFINE LISNUM(NUMADR,RAD<O>,SPAC<0>,TAB<0>,CRLF<Y>,FORTTY<N>,%LF,%TLD) <
+        TRNE    FLG,U.LFO       ; skip if not doing list file output
+         JRST   %LF
+        TYPNUM  (NUMADR,RAD,SPAC,TAB,CRLF,FORTTY)
+        JRST    %TLD
+;LALL
+%LF:    ;XALL
+        MOVE    AC,NUMADR
+ IFIDN  <RAD>, <O>, <
+        PUSHJ   P,OCTLIS >      ; octal list output
+ IFIDN  <RAD>, <D>, <
+        PUSHJ   P,DECLIS >      ; decimal list output
+;LALL
+%TLD:   ;XALL
+>
+
+; INSTR inputs an entire line or a single token from the current
+; command input device (may be a request body file).
+; promp = the address of a string to use as a prompt, or NONE.
+; stradr = the address of the block to put the input string or token in.
+; lengt = the maximum length of the string to be input.
+; type = S to input a line, T to input a token.
+; delim = a location to store the delimiting character in.
+; fortty = Y to force prompt output to tty regardless of U.NOTY.
+; skneof = N to try the next device on eof (for nesting) and always
+;          just return, or Y if we want to skip return if not eof
+;          or just return if eof is found (for list input).
+; pr = Y to save the address of the prompt as the last prompt.  The 
+;	 of last prompt is used if reprompting is necessary.
+; Note: if U.RFI is set, then prompt is not output, ind input will be
+;	from xxxx.req file.
+DEFINE INSTR(PROMP,STRADR,LENGT,TYP<S>,DELIM<AC>,FORTTY<N>,SKNEOF<N>,PR<Y>,%NP) <
+  IFDIF <PROMP>, <NONE>, <
+  IFIDN <PR>, <Y>, <
+        MOVEI   AC,PROMP
+        MOVEM   AC,LASPRM  >    ; save address of prompt
+	TRNE	FLG,U.RFI	; skip if input from request file
+	 JRST	%NP		; don't prompt if from request file
+        TLNN    FLG,U.EOL       ; skip if last input ended by eol
+         JRST   %NP             ; skip prompt
+        TYPSTR  (PROMP,777,0,0,N,FORTTY)   ; type the prompt
+;LALL
+%NP:    ;XALL    >
+        MOVEI   AC,STRADR       ; address of string space
+        MOVEI   AC1,LENGT      ; the maximum length is lengt
+  IFIDN <SKNEOF>, <Y>, <
+        TRO     FLG,U.NNIB  >   ; set no new buffer on eof
+  IFIDN <TYP>, <S>, <
+        TRO     FLG2,V.INS  >    ; set line flag
+  IFIDN <TYP>, <T>, <
+        TRZ     FLG2,V.INS  >    ; reset line flag
+        PUSHJ   P,STRIN         ; get it
+  IFDIF <DELIM>, <AC>, <
+        MOVEM   AC,DELIM  >     ; store delimiter
+  IFIDN <SKNEOF>, <Y>, <
+        TRZ     FLG,U.NNIB      ; reset flag
+        TLZE    FLG,U.IEOF  >   ; skip if not eof
+  >
+
+; INNUM inputs a number from term/tout/req body.  Skip return if input
+;       was numeric.  Integer value in AC1.
+DEFINE INNUM(PROMP,RAD<O>) <
+        INSTR   (PROMP,CNVHLD,^D9,T)
+        MOVEI   AC,CNVHLD
+IFIDN  <RAD>, <O>, <
+        PUSHJ   P,CNVO0  >              ;call octal conversion routine
+IFIDN  <RAD>, <D>, <
+        PUSHJ   P,CNVD0  >              ;call decimal conversion routine
+  >
+
+; INDAT inputs a date
+DEFINE INDAT(PROMP) <
+	INSTR	(PROMP,DATSPC,^D14,T)
+	PUSHJ	P,INPDT
+ >
+
+
+; GETYR inputs a yes or no
+DEFINE GETYR (PROMP<NONE>,%NP) <
+ IFDIF <PROMP>, <NONE>, <
+        MOVEI   AC,PROMP        ; get address of prompt
+        MOVEM   AC,LASPRM       ; save it
+	TRNE	FLG,U.RFI	; skip if not reading from request file
+	 JRST	%NP
+        TYPSTR  (PROMP,777,0,0,N)
+ >
+%NP:
+        PUSHJ   P,YORN          ; get yes or no
+>
+
+; *** AUX CIRCUIT MACROS ***
+; SNDBYT send bytes over aux circuit
+; port contains the port number
+; bts is the number of bytes to send.  If this is symbolic, the number
+;     value must be interpreted by the macro exapander, use the backslash
+;     prefix, ex: \B.LCOM.
+; if typ is C then adr contains the value to send, if typ is not C then
+;    adr is the value to send, although any value should work, I for immed
+;    is best.
+DEFINE SNDBYT(PORT<ACTPRT>,BTS<1>,ADR<AC2>,TYP<C>) <
+ IFDIF <PORT>, <AC>, <
+        MOVE    AC,PORT  >      ; get the line number from port
+ IFDIF <ADR>, <AC2>, <
+   IFIDN <TYP>, <C>, <
+        MOVE    AC2,ADR  >      ; get adr
+   IFDIF <TYP>, <C>, <
+        MOVEI   AC2,ADR  >  	; send immediate adr
+      >
+ IFIDN <BTS>, <1>, <
+        PUSHJ   P,S1BYT  >      ; send it
+ IFIDN <BTS>, <2>, <
+        PUSHJ   P,S2BYT >       ; send them
+ IFIDN <BTS>, <3>, <
+        PUSHJ   P,S3BYT >       ; send them
+ IFIDN <BTS>, <4>, <
+        PUSHJ   P,S4BYT >       ; send them
+ >
+
+; GETBYT - gets bytes from aux circuit
+; port is the port number
+; bts is the number of bits. If symbolic, with backslash prefix.
+; if CHTM is Y then set u.c377 and if the 1st byte is 377 then stop
+DEFINE GETBYT(PORT<ACTPRT>,BTS<1>,CHTM<N>) <
+ IFDIF <PORT>, <AC>, <
+        MOVE    AC,PORT  >              ; get line num from port
+ IFIDN <CHTM>, <Y>, <
+        TRO     FLG,U.C377 >            ; terminate if 1st byte a 377
+ IFIDN <BTS>, <1>, <
+        PUSHJ   P,G1BYT >               ; get it
+ IFIDN <BTS>, <2>, <
+        PUSHJ   P,G2BYT >               ; get bts bytes
+ IFIDN <BTS>, <3>, <
+        PUSHJ   P,G3BYT >               ; get bts bytes
+ IFIDN <BTS>, <4>, <
+        PUSHJ   P,G4BYT >               ; get bts bytes
+ >
+
+; GETSTR inputs a string from an aux circuit
+; PORT contains the port number
+; LENGT is the maximum length.  May be symbolic, does not need backslash.
+; ADR is the address of the string result
+DEFINE GETSTR(PORT<AC>,LENGT,ADR) <
+ IFDIF  <PORT>, <AC>, <
+        MOVE    AC,PORT >       ; move port to ac
+        MOVEI   AC1,LENGT       ; the max length is lengt
+        MOVEI   AC2,ADR         ; put string in adr
+        PUSHJ   P,AUXSIN        ; get the string
+ >
+
+; SNDSTR sends a string over an aux circuit
+; PORT contains the port number
+; LENGTH is the number of bytes to send
+; ADR is the address of the string to send
+DEFINE SNDSTR(PORT<AC>,LENGT,ADR) <
+ IFDIF  <PORT>, <AC>, <
+        MOVE    AC,PORT >       ; move port to ac
+        MOVEI   AC1,LENGT       ; the length is lengt
+        MOVEI   AC2,ADR         ; get the string from adr
+        PUSHJ   P,AUXSOT        ; send the string
+ >
+
+; SUBCOM generates a subcommand parser
+; PROMP is the address of an asciz format prompting string, may be a
+;       literal.
+; ABRV is a three char string, unique to all calls to subcom.
+; MAC is a macro, previously defined, with one entry for each subcommand
+;    as follows:
+;
+;   X COMD,MINCHR,ADRS,FLG1,FLG2
+;
+;  COMD is the 5 char or less command itself (.ie USER, CUSTO, GAN, etc.)
+;  ADRS is the address of the routine that will process the command.
+;    ** Note :
+;       Since SUBCOM gens its own address using ABRV as described above,
+;       in the format CMD'ABRV then if this subcom level will have 
+;       other calls to subcom under it, then care must be taken to make
+;       adrs in the same format.
+;  FLG1 and FLG2 are bit masks that the left half of FLG will be tested
+;  against, in sequence.  Thus if FLG1=U.PRV!U.DIS and FLG2=U.CUS
+; the command will require (U.PRV or U.DIS) and U.CUS to be set.
+;
+; example :
+;
+;  DEFINE SBX <
+;  X USER,1,CMDLUS,-1,-1
+;  X CUSTO,1,CMDLUC,U.PRV!U.DIS!U.CUS,-1 >
+;  SUBCOM([ASCIZ/LIST :/],LIS,SBX)
+;
+DEFINE SUBCOM (PROMP,ABRV,MAC) <
+ DEFINE X(A,B,C,D,E) <
+        ASCII /A/ >
+ABRV'TAB: MAC
+ABRV'LEN==.-ABRV'TAB
+ DEFINE X(A,B,C,D,E) <
+        EXP     B       >
+ABRV'MIN: MAC
+ DEFINE X(A,B,C,D,E) <
+        EXP     C       >
+ABRV'ADR: MAC
+ DEFINE X(A,B,C,D,E) <
+        XWD     D,E >
+ABRV'FLG: MAC
+
+; CMD'ABRV
+ ;XALL
+CMD'ABRV: INSTR   (PROMP,STRSP,5,T) ; input token
+        MOVEI   AC,STRSP        ; address of token
+        MOVEI   AC1,5           ; max length of subcommand
+        PUSHJ   P,CNTCHR        ; find actual length
+        JUMPE   AC,CMD'ABRV      ; try again if he input a null
+        SETZ    AC2,            ; prepare index
+ABRV'LP:   HLLZ   AC,ABRV'FLG(AC2)     ; get first check bits
+        TDNN    FLG,AC          ; skip if not all masked bits eq 0
+         JRST   ABRV'LP1        ; no go, he doesn't have it
+        HRLZ  AC,ABRV'FLG(AC2)     ; get 2nd bits
+        TDNN    FLG,AC          ; skip if he's got one
+         JRST   ABRV'LP1        ; no he is not
+        MOVE    AC,ABRV'MIN(AC2)         ; get minimum length
+        CAMGE   AC1,AC          ; skip if enough input
+         JRST   ABRV'LP1          ; do next check
+        MOVE    AC,ABRV'TAB(AC2)          ; get the string to compare to
+        AND     AC,MSK(AC1)             ; dump extra chars
+        OR      AC,NMSK(AC1)            ; put in blanks
+        CAMN    AC,STRSP                ; skip if not match
+         JRST   ABRV'LPD                  ; found a match
+ABRV'LP1:  AOJ    AC2,            ; increment index
+        CAIG    AC2,ABRV'LEN      ; skip if overflow
+         JRST   ABRV'LP           ; try again
+        JRST    ABRV'LPE          ; no entries left
+ABRV'LPD:   PUSHJ   P,@'ABRV'ADR(AC2)   ; do the command
+        SKIPA
+        AOS     0(P)            ; reflect the skip return
+        POPJ    P,              ; return
+ABRV'LPE:   PUSHJ   P,WASLIN
+        MOVNI   ACX,ABRV'LEN            ; for aobjn
+        HRLZS   ACX
+        TYPSTR  ([ASCIZ/Options are :/])
+ABRV'LE2:   HLLZ   AC,ABRV'FLG(ACX)
+        TDNN    FLG,AC
+         JRST   ABRV'LE5        ; skip display of this option
+        HRLZ   AC,ABRV'FLG(ACX)
+        TDNN    FLG,AC
+         JRST   ABRV'LE5
+        TYPSTR  (ABRV'TAB(ACX),5,0,2)
+ABRV'LE5:    AOBJN   ACX,ABRV'LE2
+        TCR     (1)
+        JRST    CMD'ABRV
+ >
+
+; ** TATLE TALE FILE MACROS **
+; GETT attempts to open a tattle tale file, EXT is the extention, example :
+;  GETT (/TTL/).  /TTL/ is the default ext value.  Skip return if ok.
+DEFINE GETT (EXT</TTL/>) <
+	HRLZI	AC,(SIXBIT EXT)
+	MOVEM	AC,TATTXE	; tt file extention is ext
+	PUSHJ	P,GETTTF	; open it
+ >
+
+; TTFSTR outputs a string to the tattle tale file, SUPSP should be Y if
+;        an extra blank following the string is not wanted.
+DEFINE TTFSTR (STRADR,MAXLEN<777>,CRLF<Y>,SUPSP<N>) <
+	MOVEI	AC,STRADR	; move address of stradr to ac
+	MOVEI	AC1,MAXLEN	; move maxlen to ac1
+ IFIDN <CRLF>, <Y>, <
+	TLO	FLG,U.CRLF >	; set flag indicating crlf
+ IFIDN <SUPSP>, <Y>, <
+	TRO	FLG,U.SBL  >
+	PUSHJ	P,TTFOUT	; output it
+ >
+
+; TTFNUM outputs a number to the tattle tale file.
+DEFINE TTFNUM (NUMADR,RAD<O>,CRLF<Y>,SUPSP<N>) <
+        MOVE    AC,NUMADR       ; get the number
+ IFIDN <CRLF>, <Y>, <
+        TLO     FLG,U.CRLF >
+ IFIDN <SUPSP>, <Y>, <
+	TRO	FLG,U.SBL  >
+ IFIDN  <RAD>, <O>, <
+        PUSHJ   P,OCTTTF >
+ IFIDN <RAD>, <D>, <
+        PUSHJ   P,DECTTF  >
+ >
+
+; ** REQUEST MACROS **
+; REQINP takes one argument, ON or OFF.  If the argument is ON and
+; V.PRQ or V.EXQ or V.LSQ is set then U.RFI is set.
+; If the argument is OFF then U.RFI is reset.
+DEFINE REQINP (FLAG<ON>) <
+IFIDN	<FLAG>, <ON>, <
+	PUSHJ	P,[
+		  TRZ	FLG,U.RFI		; reset u.rfi
+		  TLNE	FLG2,V.PRQ!V.EXQ!V.LSQ	; skip if this is not request
+		   TRO	FLG,U.RFI		; set u.rfi
+		  POPJ	P,			; return
+		  ]
+    >
+IFIDN	<FLAG>,	<OFF>, <
+	TRZ	FLG,U.RFI		; reset u.rfi
+   >
+> ;  end of reqinp
+
+; reqout outputs an ascii string to a request file
+; FILE = con or req or dat
+; STRADR = address string to output
+; MAXLEN = max length of string
+DEFINE REQOUT (FILE, STRADR, MAXLEN<120>) <
+IFIDN	<FILE>,	<REQ>, <
+	SETZ	AC2,		; index into tables >
+IFIDN	<FILE>,	<DAT>, <
+	MOVEI	AC2,1		; index into tables >
+IFIDN	<FILE>,	<CON>, <
+	MOVEI	AC2,2		; index into tables >
+	MOVEI	AC,STRADR	; address of STRADR
+	MOVEI	AC1,MAXLEN	; max length of string
+	PUSHJ	P,REQSTO
+> ;  end of reqout
+
+; reqnot outputs a number to a request file.
+; FILE = con or req or dat
+; NUMADR = address of number to output
+; RAD = radix indicator (O or D)
+DEFINE REQNOT (FILE, NUMADR, RAD<O>) <
+IFIDN	<RAD>,	<O>, <
+	MOVEI	AC4,^D8		; set for octal output >
+IFIDN	<RAD>,	<D>, <
+	MOVEI	AC4,^D10	; set for decimal output >
+	MOVE	AC,NUMADR	; get number
+	PUSHJ	P,NUMOUT
+	REQOUT	(FILE, NUMSP, ^D15)
+> ; end of reqnot
+
+; REQINS inputs a string from a request type file
+; FILE = req or con or dat
+; STRADR = address of receiving buffer
+; LENGT = length of input in chars
+DEFINE REQINS (FILE,STRADR,LENGT) <
+IFIDN	<FILE>,	<REQ>,	<
+	SETZ	AC2,		; index into tables >
+IFIDN	<FILE>,	<DAT>,	<
+	MOVEI	AC2,1		; index into tables >
+IFIDN	<FILE>,	<CON>,	<
+	MOVEI	AC2,2		; index into tables>
+	MOVEI	AC,STRADR	; move STRADR to ac
+	MOVEI	AC1,LENGT	; max chars is LENGT
+	PUSHJ	P,QSTRIN	; do the input
+> ; end of reqins
+
+; REQINN - inputs a number from a request type file
+DEFINE REQINN (FILE,RAD<O>) <
+	REQINS	(FILE, CNVHLD, ^D9)
+	MOVEI	AC,CNVHLD
+IFIDN	<RAD>,	<O>,	<
+	PUSHJ	P,CNVO0		; call octal conversion routine >
+IFIDN	<RAD>,	<D>,	<
+	PUSHJ	P,CNVD0		; call decimal conversion routine >
+> ; end of reqinn
+
+; EXMMAC - sets up examine routines
+; ABRV - abbreviation to use for generating addresses, must be 3 chars
+;	 and unique in all calls to EXMMAC.
+; MAC  - a macro, previously defined, with one entry for each item
+;	 that this command must input and examine. Described below.
+;
+; DISIND - dispatcher index for request command dispatcher.  This is
+;	   take care to match this entry with RCOM in STOR.MAC.
+; VALRT -  the name of a subroutine that will set up the value of REQVAL
+;	   for a new request.  REQVAL is written in reques.dir.  An example
+;	   of a VALRT is USRREQ in REQS.MAC.
+;
+;  Description of MAC, each entry in MAC is as follows:
+;
+;	X (DISRT, ACCRT, REQRT, CPRADR, MAS, FLG1, FLG2) 
+;
+; DISRT - a routine that will display the current value of the item.
+; ACCRT - a routine that will accept a value into the item.
+; REQRT - a routine that will output the item into a request file.
+; CPRADR - an address whose contents will be tested under a 36 bit
+;	   mask.  If at least one masked bit is one, the corresponding
+;	   routines (DISRT, ACCRT, or REQRT) will be called.  This is
+;	   so that one command may handle different situations,
+;	   especially different syste types.  If the mask is all ones,
+;	   then the routines are called regardless of the value of
+;	   CPRADR, even if it is zero. CPRADR defaults to <AC>.
+;	   an example of a good way to use CPRADR is the situation where
+;	   data requirements for a command are different for different
+;	   system types.  One of the first input routines would
+;	   determine the system type and create a mask.  Subsequent
+;	   entries will be called only if the mask matches.  Remember
+;	   that the default mask of all ones matches always.  So if
+;	   a routine needs to be called all the time just let it default.
+; MAS	- the 36 bit mask for use with CPRADR.  Default is <-1>
+; FLG1 and FLG2 - 18 bit masks to be tested against the left half of
+;	  FLG.  Both masks must mask at least one '1' bit in order
+;	  for the corresponding item to be output in the examine
+;	  menu.  These masks do not prevent the calling of the
+;	  routines (ACCRT, etc.), they just effect the menu display.
+;	  These masks are for use with default values.  Example,
+;	  the customer number for a customer user is always assumed
+;	  and never input from the terminal; but the routines must
+;	  still be called to establish the default and to output the
+;	  default into the request files.  Both flags default to <-1>.
+;
+; NOTES:  Since the same routine is called to accept the original input
+;	  and for changing during examine, the routine may test
+;	  V.EXC in left half of FLG2.  If the bit is on, we are changing
+;	  if off, then we are doing original input.
+
+
+DEFINE EXMMAC (ABRV, MAC, DISIND, VALRT) <
+	JRST	ABRV'STP	; jump over tables
+
+; EXMMAC tables
+
+DEFINE X (DISRT, ACCRT, REQRT, CPRADR<AC>, MAS<-1>, FLG1<-1>, FLG2<-1>) <
+	EXP	DISRT		; routine to display >
+
+ABRV'EXD:
+	MAC
+ABRV'LXM==.-ABRV'EXD
+
+DEFINE X (DISRT, ACCRT, REQRT, CPRADR<AC>, MAS<-1>, FLG1<-1>, FLG2<-1>) <
+	EXP	ACCRT		; accept routine >
+
+ABRV'EXA:
+	MAC
+
+DEFINE X (DISRT, ACCRT, REQRT, CPRADR<AC>, MAS<-1>, FLG1<-1>, FLG2<-1>) <
+	EXP	REQRT		; request routine >
+
+ABRV'EXR:
+	MAC
+
+DEFINE X (DISRT, ACCRT, REQRT, CPRADR<AC>, MAS<-1>, FLG1<-1>, FLG2<-1>)<
+	EXP	CPRADR		; address for mask compare >
+
+ABRV'EXC:
+	MAC
+
+DEFINE X (DISRT, ACCRT, REQRT, CPRADR<AC>, MAS<-1>, FLG1<-1>, FLG2<-1>)<
+	EXP	MAS		; mask for cpradr >
+
+ABRV'EXM:
+	MAC
+
+DEFINE X (DISRT, ACCRT, REQRT, CPRADR<AC>, MAS<-1>, FLG1<-1>, FLG2<-1>) <
+	XWD	FLG1,FLG2	; flags for compare agains LH(FLG) >
+
+ABRV'EFL:
+	MAC
+
+; EXMMAC code
+
+ABRV'STP:
+	TLZ	FLG2,V.RER!V.CHG	; reset error bit and changed bit
+	MOVEI	AC,DISIND	; dispatcher index
+	MOVEM	AC,REQCOM	; save
+	MOVEI	AC,ABRV'LXM	; number of entries
+	MOVEM	AC,EXMCT	; save
+	SETZM	EXMIN
+	TLZ	FLG2,V.EXC	; reset changing flag
+ABRV'INP:
+	MOVE	AC1,EXMIN	; get index
+	MOVE	AC,ABRV'EXM(AC1)	; get mask
+	CAMN	AC,[-1]		; skip if not -1
+	 JRST	.+3		; do
+	TDNN	AC,@ABRV'EXC(AC1)	; test under mask
+	 JRST	.+3		; don't
+	PUSHJ	P,@ABRV'EXA(AC1)
+	 JFCL
+	SOSG	EXMCT
+	 JRST	ABRV'ST2
+	AOS	EXMIN
+	JRST	ABRV'INP
+
+ABRV'ST2:
+	MOVEI	AC,ABRV'LXM
+	MOVEM	AC,EXMCT
+	SETZM	EXMIN
+	TCR	(1)
+ABRV'EXS:	; beg of loop
+	MOVE	AC1,EXMIN
+	MOVE	AC,ABRV'EXM(AC1)	; get mask
+	CAMN	AC,[-1]		; skip if not -1
+	 JRST	.+3		; do
+	TDNN	AC,@ABRV'EXC(AC1)	; test under mask
+	 JRST	ABRV'EX2		; don't
+	HLLZ	AC,ABRV'EFL(AC1)	; get left half of requirement flags
+	TDNN	FLG,AC			; skip if at least one masked bit set
+	 JRST	ABRV'EX2
+	HRLZ	AC,ABRV'EFL(AC1)	; get right half of flags
+	TDNN	FLG,AC
+	 JRST	ABRV'EX2
+	TLNN	FLG2,V.LSQ!V.PRQ	; skip if listing or processing
+	 PUSHJ	P,EXMNMO		; output menu number
+	MOVE	AC1,EXMIN
+	PUSHJ	P,@ABRV'EXD(AC1)
+	 JFCL
+ABRV'EX2:
+	SOSG	EXMCT
+	 JRST	.+3		; go to changing section
+	AOS	EXMIN
+	JRST	ABRV'EXS	; display the next entry
+	TLNE	FLG2,V.EXQ	; skip if not examining
+	 JRST	ABRV'EX3	; go give him chance to change
+	TLNN	FLG,U.IMM	; skip if immediate mode
+	 JRST	ABRV'EX3	; let him change if not immediate mode
+	TLNN	FLG2,V.PRQ!V.LSQ ; skip if processing or listing
+	 JRST	ABRV'EX3	; let him change if not proc or listing
+	JRST	ABRV'EX4	; if we get here skip change routines
+ABRV'EX3:
+	REQINP	OFF
+ABRV'XSD:
+	TLO	FLG2,V.EXC	; set flag indicating changing
+	TCR	(1)
+	INNUM	([ASCIZ /Item to change : /],D)
+	 JRST	[TLNE	FLG,U.IND
+		  JRST	GETCMD
+		 JRST	ABRV'XSD]
+	CAILE	AC1,ABRV'LXM	; skip if number not too big
+	 JRST	[TLNE	FLG,U.IND
+		  JRST	GETCMD
+		 JRST	ABRV'XSD]
+	MOVE	AC,CNVHLD
+	CAMN	AC,[ASCII/     /]	; skip if user did not input null
+	 JRST	ABRV'XDD	; done with changing
+	JUMPE	AC1,ABRV'ST2	; if he input a zero, display again.
+	SOJ	AC1,		; correct
+	MOVEM	AC1,EXMIN	; save item number to change
+	MOVE	AC,ABRV'EXM(AC1)	; get mask
+	CAMN	AC,[-1]		; skip if not -1
+	 JRST	.+3		; do
+	TDNN	AC,@ABRV'EXC(AC1)	; test under mask
+	 JRST	ABRV'XSD		; don't
+	TLO	FLG2,V.CHG	; set item changed flag
+	PUSHJ	P,@ABRV'EXA(AC1) ; accept the item
+	 JFCL
+	TLZ	FLG2,V.RER	; reset error seen flag (assume he fixed)
+	JRST	ABRV'XSD	; do another item
+ABRV'XDD:
+	TLZ	FLG2,V.EXC	; reset flag
+	REQINP	ON
+ABRV'EX4:
+; here when exam is complete, now decide what to do
+	TLNN	FLG,U.IMM	; skip if immediate mode
+	 JRST	ABRV'NIM	; not immediate
+	TLNN	FLG2,V.CHG	; skip if an item was changed
+	 JRST	ABRV'NRQ
+	TLNN	FLG2,V.EXQ	; skip if we were examining
+	 JRST	ABRV'NRQ
+	PUSHJ	P,ABRV'WRQ	; rewrite request
+	PUSHJ	P,RELRQI
+	POPJ	P,		; return to command dispatcher
+ABRV'NRQ:
+; here when either this was not a request or nothing was changed
+	TLNE	FLG2,V.PRQ	; skip if not processing
+	 JRST	ABRV'XXX	; go do it if processing
+	TLNN	FLG2,V.EXQ!V.LSQ ;skip if examining or listing
+	 JRST	ABRV'XXX	; go do it if not a request
+	PUSHJ	P,RELRQI	; release input channels if open
+	POPJ	P,		; return to command dispatcher
+
+ABRV'NIM:
+; here when not in immediate mode, must be user entering a request
+	PUSHJ	P,VALRT		; set up reqval
+	PUSHJ	P,INCON		; get requestor place of contact
+        PUSHJ   P,GTODAY        ; get today's date
+        MOVEM   AC,REQDAT       ; save it
+	PUSHJ	P,ABRV'WRQ	; write new request
+	TCR	(1)
+	TYPSTR	([ASCIZ/Request number =/],777,0,0,N)
+	TYPNUM	(REQNUM,D,1)
+        TRNN    FLG2,V.NCS      ; skip if it is new customer request
+         JRST   .+3
+        MOVE    AC,REQNUM
+        MOVEM   AC,REQNM1       ; save request number for future request
+        TRNN    FLG2,V.GAN      ; skip if it is a new gan request
+         JRST   .+3
+        MOVE    AC,REQNUM
+        MOVEM   AC,REQNM2       ; save request number for new user request
+	SETZM	REQNUM
+        TRNN    FLG2,V.ACS!V.NCS
+         JRST   ABRV'NGN
+        GETYR   ([ASCIZ/Do you want to add user to this customer ?/])
+         SKIPA
+          JRST  ABRV'USX              ; ask for adding new user or new gan
+        TRO     FLG,U.OKAY
+        TRZ     FLG2,V.ACS
+        TRZ     FLG2,V.NCS
+        POPJ    P,
+ 
+ABRV'NGN:
+; for new user request after adding new gan for add or new customer request
+        TRNN    FLG2,V.GAN
+         JRST   ABRV'NUR
+        GETYR   ([ASCIZ/Do Another ?/])
+         JRST   ABRV'DNX
+        TRNN    FLG2,V.NGA   ; skip if this is new gan of new cust. request
+         JRST   [PUSHJ   P,NUNGAC     ; call new user of new gan after add
+                 JRST    ABRV'DNX]    ; customer routine
+        PUSHJ   P,NUNGNC    ; call new user of new gan after new cust. routine
+        JRST    ABRV'DNX
+ 
+ABRV'NUR:
+	GETYR	([ASCIZ/Do Another ?/])
+	 SKIPA
+	  JRST	ABRV'ST2	; one more time
+	TRO	FLG,U.OKAY	; set everything okay
+	POPJ	P,		; return to command dispatcher
+
+ABRV'WRQ:
+; write a request
+	PUSHJ	P,CONHDR	; write header
+	MOVEI	AC,ABRV'LXM	; number of entries
+	MOVEM	AC,EXMCT
+	SETZM	EXMIN
+ABRV'WR2:
+	MOVE	AC1,EXMIN
+	MOVE	AC,ABRV'EXM(AC1)	; get mask
+	CAMN	AC,[-1]			; skip if not -1
+	 JRST	.+3			; if mask all ones, don't test
+	TDNN	AC,@ABRV'EXC(AC1)	; test against contents of comp adrs
+	 JRST	ABRV'WR3		; no bits masked, do not output
+	PUSHJ	P,@ABRV'EXR(AC1)	; write out the item
+ABRV'WR3:
+	SOSG	EXMCT
+	 JRST	.+3
+	AOS	EXMIN
+	JRST	ABRV'WR2
+	PUSHJ	P,RELRQO	; close the request
+	POPJ	P,
+
+ABRV'XXX:
+	TLNE	FLG2,V.RER	; skip if error bit not set
+	 POPJ	P,		; return
+        JRST    ABRV'YYY
+ 
+ABRV'USX: ; this routine is called after new or add customer request is created
+        ; based on the answers of prompts it will branch to different new gan
+        ; or new user routines.
+ 
+        TRNN    FLG2,V.NCS
+         JRST   ABRV'USY
+        GETYR   ([ASCIZ/Is the global account established ?/])
+         JRST   [PUSHJ   P,NGANNC     ; call new gan after new cust. routine
+                JRST     ABRV'DNX]
+        PUSHJ   P,NUOGNC              ; call new user of old gan after new
+        JRST    ABRV'DNX              ; customer routine
+ABRV'USY: ; if this is after add customer request
+        GETYR   ([ASCIZ/Is the global account established ?/])
+         JRST   [PUSHJ   P,NGANAC     ; call new gan after add cust. routine
+                 JRST    ABRV'DNX]
+        GETYR   ([ASCIZ/Is user established ?/])
+         JRST   [PUSHJ   P,NUOGAC     ; call new user of old gan after add
+                 JRST    ABRV'DNX]    ; customer routine
+        PUSHJ   P,AUHOAC              ; call add user host after add customer
+        JRST    ABRV'DNX              ; routine
+ 
+ABRV'DNX:
+        TRO     FLG,U.OKAY
+        TRZ     FLG2,V.GAN
+        POPJ    P,
+ 
+ABRV'YYY:
+        SETZM   AC
+>  ; end of exmmac
+  c   –
