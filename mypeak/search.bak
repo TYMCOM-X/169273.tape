@@ -1,0 +1,1286 @@
+entry;
+begin "search"
+  require "Ded.Def" source!file;
+!! title Search - Search and Replace logic ;
+! *************************************************************************
+*									  *
+*                               Search.Sai                                *
+*									  *
+***************************************************************************
+
+                All Search and Replace logic resides here.
+
+**************************************************************************;
+
+
+!                      Forward routine declarations
+;
+
+  forward simple integer procedure BackwardsMSearch;
+  forward simple boolean procedure BackwardsSearch;
+  forward simple integer procedure ForwardsMSearch;
+  forward simple boolean procedure ForwardsSearch;
+  forward simple boolean procedure SearchStrFullPrompt;
+  forward simple         procedure SetMSearchDir (integer Dir);
+  forward simple         procedure SetSearchDir  (integer Dir);
+  forward simple boolean procedure SetupMSearch (string Str; integer Dir);
+  forward simple boolean procedure SetupSearch  (string Str; integer Dir);
+
+  require "Search.Def" source!file;
+
+
+!                         From the Buffer Module
+;
+
+  external boolean
+    B!BegP;
+  external simple procedure
+    B!Delete(integer Dir);
+  external boolean
+    B!EndP;
+  external simple integer procedure
+    B!GetC;
+  external simple integer procedure 
+    B!GetM(integer Mark);
+  external simple integer procedure
+    B!GetP;
+  external simple integer procedure 
+    B!GetSize;
+  external simple procedure
+    B!Insert(integer Char);
+  external simple procedure
+    B!Move(integer Dir);
+  external simple procedure
+    B!SetM(integer Mark, Place);
+  external simple procedure
+    B!SetP(integer Loc);
+
+
+!                         From the Command Module
+;
+
+  external integer
+    C!ArgV;
+  external simple boolean procedure
+    C!ChrP;
+  external integer
+    C!Cmd;
+  external simple integer procedure
+    C!GetC;
+  external boolean
+    C!MAbort;
+  external boolean procedure
+    C!ReadESCString (string Prompt);
+  external boolean procedure
+    C!ReadString (string Prompt; integer Delim1, Delim2);
+  external string
+    C!String;
+  external safe integer array
+    C!Tab[0:'177];
+  external boolean
+    G!CaseMatch;
+
+
+!                        From the Redisplay Module
+;
+
+  external procedure
+    T!Bell;
+
+
+!                         From the Window Module
+;
+
+  external procedure
+    W!Disp(boolean Foo);
+  external procedure
+    W!Msg(string Str);
+  external boolean
+    W!MsgF;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+!! title Internal Storage ;
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                            Internal Storage
+;
+
+  define
+    StringsMatch (X, Y) =
+        {
+          (if G!CaseMatch then (equ(X,Y)) else (kequ(X,Y)))
+        };
+
+  integer
+    MSearchDir,
+    SearchDir,
+    StrCount,
+    StrLen;
+
+  string
+    MSearchString,
+    QNewString,
+    QOldString,
+    SearchString;
+
+  integer array
+    F1      [1:MAXSEARCHLENGTH],
+    P1      [1:MAXSEARCHLENGTH],
+
+    F2      [1:MAXMSEARCHCOUNT,1:MAXSEARCHLENGTH],
+    P2      [1:MAXMSEARCHCOUNT,1:MAXSEARCHLENGTH],
+    J2      [1:MAXMSEARCHCOUNT],
+    StrLen2 [1:MAXMSEARCHCOUNT];
+
+! ************************************************************************;
+!! title Rtn BackwardsMSearch ;
+!  This is the vehicle for performing a simultaneous backwards search for a
+!  number of different strings.  It was derived from the forwards version
+!  on 16-Aug-86.
+;
+
+  simple integer procedure BackwardsMSearch;
+  begin "BackwardsMSearch"
+    integer
+      C,
+      DoneIdx,
+      I,
+      CharCount,
+      SavePt;
+
+
+    if (MSearchDir neq BACKWARDS) then
+      return(0);
+
+    arrclr(J2, 1);
+    DoneIdx   _ 0;
+    SavePt    _ B!GetP;
+    CharCount _ SavePt;
+    B!Move(BACKWARDS);
+
+    if (G!CaseMatch) then
+    begin
+      while (DoneIdx = 0 and CharCount > 0) do
+      begin
+        C _ B!GetC;
+
+        for I _ 1 step 1 until StrCount do
+        begin
+          while (true) do
+          begin
+            if (P2[I,J2[I]] = C) then
+            begin
+              incr(J2[I]);
+              done;
+            end
+            else
+            begin
+              if (J2[I] = 1) then
+                done
+              else
+                J2[I] _ F2[I,J2[I]-1]+1;
+            end;
+          end;
+
+          if (J2[I] > StrLen2[I]) then
+          begin
+            DoneIdx _ I;
+            done;
+          end;
+        end;
+
+        B!Move(BACKWARDS);
+        decr(CharCount);
+      end;
+    end
+    else
+    begin
+      while (DoneIdx = 0 and CharCount > 0) do
+      begin
+        C _ B!GetC;
+
+        for I _ 1 step 1 until StrCount do
+        begin
+          while (true) do
+          begin
+            if (P2[I,J2[I]] = rh(C!Tab[C])) then
+            begin
+              incr(J2[I]);
+              done;
+            end
+            else
+            begin
+              if (J2[I] = 1) then
+                done
+              else
+                J2[I] _ F2[I,J2[I]-1]+1;
+            end;
+          end;
+
+          if (J2[I] > StrLen2[I]) then
+          begin
+            DoneIdx _ I;
+            done;
+          end;
+        end;
+
+        B!Move(BACKWARDS);
+        decr(CharCount);
+      end;
+    end;
+
+  !                              Close Up Shop
+  ;
+
+    if (DoneIdx = 0) then
+      B!SetP(SavePt)
+    else if (CharCount > 0) then
+      B!Move(FORWARDS);
+    
+    return(DoneIdx);
+  end "BackwardsMSearch";
+!! title Rtn BackwardsSearch ;
+!  Search backwards through the buffer for a string. ;
+!
+!  Reworked 5/22/82 to reduce use of stringspace. ;
+!
+!  Redesigned 4-Aug-86 (kmd) to use the fast Knuth-Morris-Pratt algorithm.
+!  Code duplicated to avoid testing for case matching inside the search
+!  loop.  Note that we fill the P and F arrays with the reverse of the
+!  search string to facilitate the search.  This is of course incompatible
+!  with the realization of the same string for forward search.
+;
+
+  simple boolean procedure BackwardsSearch;
+  begin "BackwardsSearch"
+    integer
+      C,
+      I,
+      J,
+      CharCount,
+      SavePt;
+
+
+    if (SearchDir neq BACKWARDS) then
+      return(false);
+
+    I         _ 1;
+    SavePt    _ B!GetP;
+    CharCount _ SavePt;
+    B!Move(BACKWARDS);
+
+    if (G!CaseMatch) then
+    begin
+      while (I <= StrLen and CharCount > 0) do
+      begin
+        if (P1[I] = B!GetC) then
+        begin
+          incr(I);
+          decr(CharCount);
+          B!Move(BACKWARDS);
+        end
+        else if (I = 1) then
+        begin
+          decr(CharCount);
+          B!Move(BACKWARDS)
+        end
+        else
+          I _ F1[I-1] + 1;
+      end;
+    end
+    else
+    begin
+      while (I <= StrLen and CharCount > 0) do
+      begin
+        if (P1[I] = rh(C!Tab[B!GetC])) then
+        begin
+          incr(I);
+          decr(CharCount);
+          B!Move(BACKWARDS);
+        end
+        else if (I = 1) then
+        begin
+          decr(CharCount);
+          B!Move(BACKWARDS)
+        end
+        else
+          I _ F1[I-1] + 1;
+      end;
+    end;
+
+
+  !                              Close Up Shop
+  ;
+
+    if (I <= StrLen) then
+    begin
+      B!SetP(SavePt);
+      return(false);
+    end
+    else if (CharCount > 0) then
+      B!Move(FORWARDS);
+
+    return(true);
+  end "BackwardsSearch";
+!! title Rtn ForwardsMSearch ;
+!  This is the vehicle for performing a simultaneous forwards search for a
+!  number of different strings.  It was totally rewritten 10-Aug-86 to use
+!  a modified Knuth-Morris-Pratt approach.
+;
+
+  simple integer procedure ForwardsMSearch;
+  begin "ForwardsMSearch"
+    integer
+      C,
+      DoneIdx,
+      I,
+      CharCount,
+      SavePt;
+
+
+    if (MSearchDir neq FORWARDS) then
+      return(0);
+
+    arrclr(J2, 1);
+    DoneIdx   _ 0;
+    SavePt    _ B!GetP;
+    CharCount _ B!GetSize - SavePt;
+
+    if (G!CaseMatch) then
+    begin
+      while (DoneIdx = 0 and CharCount > 0) do
+      begin
+        C _ B!GetC;
+
+        for I _ 1 step 1 until StrCount do
+        begin
+          while (true) do
+          begin
+            if (P2[I,J2[I]] = C) then
+            begin
+              incr(J2[I]);
+              done;
+            end
+            else
+            begin
+              if (J2[I] = 1) then
+                done
+              else
+                J2[I] _ F2[I,J2[I]-1]+1;
+            end;
+          end;
+
+          if (J2[I] > StrLen2[I]) then
+          begin
+            DoneIdx _ I;
+            done;
+          end;
+        end;
+
+        B!Move(FORWARDS);
+        decr(CharCount);
+      end;
+    end
+    else
+    begin
+      while (DoneIdx = 0 and CharCount > 0) do
+      begin
+        C _ B!GetC;
+
+        for I _ 1 step 1 until StrCount do
+        begin
+          while (true) do
+          begin
+            if (P2[I,J2[I]] = rh(C!Tab[C])) then
+            begin
+              incr(J2[I]);
+              done;
+            end
+            else
+            begin
+              if (J2[I] = 1) then
+                done
+              else
+                J2[I] _ F2[I,J2[I]-1]+1;
+            end;
+          end;
+
+          if (J2[I] > StrLen2[I]) then
+          begin
+            DoneIdx _ I;
+            done;
+          end;
+        end;
+
+        B!Move(FORWARDS);
+        decr(CharCount);
+      end;
+    end;
+
+  !                              Close Up Shop
+  ;
+
+    if (DoneIdx = 0) then
+      B!SetP(SavePt);
+    
+    return(DoneIdx);
+  end "ForwardsMSearch";
+!! title Rtn ForwardsSearch ;
+!  Routine to search through the buffer for a string.
+!
+!  This code rewritten 4/14/82 for case matching. 
+!  Revamped 4/22/82 to reduce use of string-space.
+!  Redesigned 30-Apr-86 (kmd) to use the fast Knuth-Morris-Pratt algorithm.
+!    Code duplicated to avoid testing for casematching inside the search
+!    loop.
+;
+
+  simple boolean procedure ForwardsSearch;
+  begin "ForwardsSearch"
+    integer
+      C,
+      CharCount,
+      I,
+      J,
+      SavePt;
+
+
+    if (SearchDir neq FORWARDS) then
+      return(false);
+
+    SavePt    _ B!GetP;
+    CharCount _ B!GetSize - SavePt;
+    I         _ 1;
+
+    if (G!CaseMatch) then
+    begin
+      while (I <= StrLen and CharCount > 0) do
+      begin
+        if (P1[I] = B!GetC) then
+        begin
+          incr(I);
+          decr(CharCount);
+          B!Move(FORWARDS);
+        end
+        else if (I = 1) then
+        begin
+          decr(CharCount);
+          B!Move(FORWARDS)
+        end
+        else
+          I _ F1[I-1] + 1;
+      end;
+    end
+    else
+    begin
+      while (I <= StrLen and CharCount > 0) do
+      begin
+        if (P1[I] = rh(C!Tab[B!GetC])) then
+        begin
+          incr(I);
+          decr(CharCount);
+          B!Move(FORWARDS);
+        end
+        else if (I = 1) then
+        begin
+          decr(CharCount);
+          B!Move(FORWARDS)
+        end
+        else
+          I _ F1[I-1] + 1;
+      end;
+    end;
+
+
+  !                              Close Up Shop
+  ;
+
+    if (I <= StrLen) then
+    begin
+      B!SetP(SavePt);
+      return(false);
+    end;
+
+    return(true);
+  end "ForwardsSearch";
+!! title Rtn SearchStrFullPrompt ;
+!  Ask the user what to do when the search string fills up in the process
+!  of a copy to it
+;
+
+  simple integer procedure SearchStrFullPrompt;
+  begin "SearchStrFullPrompt"
+    integer
+      Char;
+    string
+      Prompt;
+    define
+      UpShift (X) = {(X land (lnot '40))},
+      ToUpper (X) = {(if ("a" <= X <= "z") then UpShift(X) else X)};
+
+
+    Char   _ 0;
+    Prompt _ "Search String Full - Enter (A)bort or (P)roceed: ";
+
+    while (not Char) do
+    begin
+      if (not C!ReadString(Prompt, CR, ESC)) then
+        Char _ 0
+      else
+        Char _ ToUpper(C!String);
+
+      if (Char) then
+      begin
+        W!Msg(
+          Prompt & 
+            (if (Char = "A") then "Abort"
+            else if (Char = "P") then "Proceed"
+            else Char)
+        );
+
+        W!Disp(true);
+
+        if (Char = "A" or Char = "P") then
+          done
+        else
+          Char _ 0;
+      end;
+
+      T!Bell;
+    end;
+
+    return(Char);
+  end "SearchStrFullPrompt";
+!! title Rtn SetMSearchDir ;
+!  Set the multiple search direction to the indicated value.
+;
+
+  simple procedure SetMSearchDir (integer Dir);
+  begin "SetMSearchDir"
+    MSearchDir _ Dir;
+  end "SetMSearchDir";
+!! title Rtn SetSearchDir ;
+!  Set the seach direction to the indicated value.
+;
+
+  simple procedure SetSearchDir (integer Dir);
+  begin "SetSearchDir"
+    SearchDir _ Dir;
+  end "SetSearchDir";
+!! title Rtn SetupMSearch ;
+!  Prepare to do a multiple search, and return the success of the
+!  operation. 
+;
+
+  simple boolean procedure SetupMSearch (string Str; integer Dir);
+  begin "SetupMSearch"
+    integer
+      C,
+      Delim,
+      I,
+      J,
+      K;
+
+    arrclr(StrLen2);
+    StrCount _ 0;
+    Delim    _ Str[inf for 1];
+
+    if (Dir = FORWARDS) then
+    begin
+      while (length(Str)) do
+      begin
+        incr(StrCount);
+
+        if (StrCount > MAXMSEARCHCOUNT) then
+        begin
+          W!Msg("Too many search strings specified.");
+          return(false);
+        end;
+
+        while ((C _ lop(Str)) neq Delim) do
+        begin
+          incr(StrLen2[StrCount]);
+
+          if (StrLen2[StrCount] > MAXSEARCHLENGTH) then
+          begin
+            W!Msg("Search String " & cvs(StrCount) & "Too Long");
+            return(false);
+          end;
+
+          P2[StrCount, StrLen2[StrCount]] _
+              if (G!Casematch) then C else rh(C!Tab[C]);
+        end;
+      end;
+    end
+    else if (Dir = BACKWARDS) then
+    begin
+      Str _ Delim & Str[1 for inf-1];
+
+      while (length(Str)) do
+      begin
+        incr(StrCount);
+
+        if (StrCount > MAXMSEARCHCOUNT) then
+        begin
+          W!Msg("Too many search strings specified.");
+          return(false);
+        end;
+
+        while ((C _ Str[inf for 1]) neq Delim) do
+        begin
+          Str _ Str[1 for inf-1];
+          incr(StrLen2[StrCount]);
+          P2[StrCount, StrLen2[StrCount]] _
+              if (G!Casematch) then C else rh(C!Tab[C]);
+        end;
+
+        Str _ Str[1 for inf-1];
+      end;
+    end
+    else
+      return(false);
+
+
+    for I _ 1 step 1 until StrCount do
+    begin
+      F2[I,1] _ 0;
+
+      for J _ 2 step 1 until StrLen2[I] do
+      begin
+        K _ F2[I,J-1];
+
+        while (K > 0 and P2[I,J] neq P2[I,K+1]) do
+          K _ F2[I,K];
+
+        if (P2[I,J] = P2[I,K+1]) then
+          F2[I,J] _ K+1
+        else
+          F2[I,J] _ 0;
+      end;
+    end;
+
+    MSearchDir _ Dir;
+    return(true);
+  end "SetupMSearch";
+!! title Rtn SetupSearch ;
+!  Establish the contents of the P1 and F1 and StrLen variables.  Return
+!  the success of the operation.
+;
+
+  simple boolean procedure SetupSearch (string Str; integer Dir);
+  begin "SetupSearch"
+    integer
+      C,
+      I,
+      J;
+
+    if (length(Str) > MAXSEARCHLENGTH) then
+    begin
+      W!Msg("Search String Too Long");
+      return(false);
+    end;
+
+    StrLen _ 0;
+
+    if (Dir = FORWARDS) then
+    begin
+      while (C _ lop(Str)) do
+      begin
+        incr(StrLen);
+        P1[StrLen] _ if (G!CaseMatch) then C else rh(C!Tab[C]);
+      end;
+    end
+    else if (Dir = BACKWARDS) then
+    begin
+      while (C _ Str[inf for 1]) do
+      begin
+        incr(StrLen);
+        P1[StrLen] _ if (G!CaseMatch) then C else rh(C!Tab[C]);
+        Str        _ Str[1 for inf-1];
+      end;
+    end
+    else
+      return(false);
+
+    F1[1] _ 0;
+
+    for J _ 2 step 1 until StrLen do
+    begin
+      I _ F1[J-1];
+
+      while (I > 0 and P1[J] neq P1[I+1]) do
+        I _ F1[I];
+
+      if (P1[J] = P1[I+1]) then
+        F1[J] _ I + 1
+      else
+        F1[J] _ 0;
+    end;
+
+    SearchDir _ Dir;
+    return(true);
+  end "SetupSearch";
+!! title Rtn S!ChangeString ;
+! Change one string to another.
+;
+
+  internal simple procedure S!ChangeString;
+  begin "S!ChangeString"
+    integer
+      ChangeCount,
+      I,
+      SavePt;    
+    string
+      AbortStr,
+      OldString,
+      Prompt,
+      NewString;
+
+    Prompt   _ "Change: ";
+    AbortStr _ Prompt & "  [Aborted]";
+
+    if (not C!ReadString(Prompt, ESC, ESC)) then
+    begin
+      W!Msg(AbortStr);
+      C!ArgV _ 0;
+      return;
+    end;
+
+    if (length(C!String) = 0) then
+    begin
+      W!Msg(AbortStr);
+      C!ArgV _ 0;
+      return;
+    end;
+
+    appnd(Prompt, (OldString _ C!String) & " to: ");
+
+    if (not (C!ReadString(Prompt, ESC, ESC))) then
+    begin
+      W!Msg(AbortStr);
+      C!ArgV _ 0;
+      return;
+    end;
+
+    appnd(Prompt, (NewString _ C!String));
+
+    set(W!MsgF);
+    W!Disp(true);
+    clear(W!MsgF);
+
+    ChangeCount _ 0;
+
+    SetupSearch(OldString, FORWARDS);
+
+    if (not C!ArgV) then
+      C!ArgV _ maxinteger;
+
+    while (C!ArgV > 0) do
+    begin "each arg"
+      SavePt _ B!GetP;
+      ForwardsSearch;
+
+      if (SavePt = B!GetP) then
+        C!ArgV _ 0
+      else
+      begin
+        for I _ 1 upto length(OldString) do
+          B!Delete(BACKWARDS);
+
+        for I _ 1 upto length(NewString) do
+          B!Insert(NewString[i for 1]);
+
+        incr(ChangeCount);
+        decr(C!ArgV);
+      end;
+    end "each arg";
+
+    SetSearchDir(UNKNOWN);
+    W!Msg(Prompt & "  [" & cvs(ChangeCount) & "]");
+
+    C!ArgV _ 0;
+  end "S!ChangeString";
+!! title Rtn S!CopyToSearch ;
+! Copy text into the search string.
+;
+
+  internal simple procedure S!CopyToSearch;
+  begin "S!CopyToSearch"
+    integer
+      Mark,
+      HowMany,
+      Temp;
+
+    Mark   _ C!ArgV;
+    C!ArgV _ 0;
+
+  !                                *   *   *
+  ;
+
+    if ((Mark < 0) or (Mark > 9)) then
+    begin
+      W!Msg("Bad Mark Number - " & cvs(Mark));
+      T!Bell;
+      return;
+    end;
+    if (B!GetM(Mark) < 0) then
+    begin
+      W!Msg("Mark " & cvs(Mark) & " not set");
+      T!Bell;
+      return;
+    end;
+
+    if (B!GetM(Mark) = B!GetP) then
+    begin
+      W!Msg("The Point and Mark " & cvs(Mark) & " are in the same place");
+      T!Bell;
+      return;
+    end;
+
+  !                                *   *   *
+  ;
+
+    HowMany _ abs(B!GetP - B!GetM(Mark));
+
+    if (HowMany > MAXSEARCHLENGTH) then
+    begin
+      if (SearchStrFullPrompt neq "P") then
+        return
+      else
+        HowMany _ MAXSEARCHLENGTH;
+    end;
+
+  !                                *   *   *
+  ;
+
+    SearchString _ NULL;
+
+    if (B!GetP > B!GetM(Mark)) then
+    begin
+      Temp _ B!GetP;
+      B!SetP(B!GetM(Mark));
+      B!SetM(Mark, Temp);
+    end;
+
+    while (HowMany > 0) do
+    begin
+      SearchString _ SearchString & B!GetC;
+      B!Move(FORWARDS);
+      decr(HowMany);
+    end;
+
+  !                                *   *   *
+  ;
+
+    W!Msg("Search String Set");
+  end "S!CopyToSearch";
+!! title Rtn S!DoMSearch ;
+!  Perform a multiple search in the indicated direction and return the
+!  success of the attempt.
+;
+
+  internal simple boolean procedure S!DoMSearch (integer Dir);
+  begin "S!DoMSearch"
+    string
+      TmpStr;
+
+    if (Dir neq FORWARDS and Dir neq BACKWARDS) then
+    begin
+      C!ArgV _ 0;
+      return(false);
+    end;
+
+    TmpStr _ if (Dir = BACKWARDS) then "Reverse " else null;
+    appnd(TmpStr, "M-Search: ");    
+
+    if (not C!ReadESCString(TmpStr)) then
+    begin
+      W!Msg(TmpStr & " [Aborted]");
+      C!ArgV _ 0;
+      return(false);
+    end;
+
+    if (length(C!String) = 0) then
+    begin
+      if (length(MSearchString) = 0) then
+      begin
+        W!Msg("No M-Search String");
+        C!ArgV _ 0;
+        return(false);
+      end
+      else
+        W!Msg(TmpStr & MSearchString & "  [Working]");
+    end
+    else
+      MSearchString _ C!String;
+
+    W!MsgF _ true;
+
+    if (not C!ChrP) then
+      W!Disp(true);
+
+    W!MsgF _ false;
+
+    if (length(C!String) > 0 or MSearchDir neq Dir) then
+    begin
+      if (not SetupMSearch(MSearchString, Dir)) then
+      begin
+        W!Msg(TmpStr & " [<Setup Failed>]");
+        C!ArgV _ 0;
+        return(false);
+      end;
+    end;
+
+    C!ArgV _ C!ArgV max 1;
+
+    if (Dir = FORWARDS) then
+    begin
+      while (C!ArgV > 0) do
+      begin
+        if (not ForwardsMSearch) then
+          C!ArgV _ -1
+        else
+          decr(C!ArgV);
+      end;
+    end
+    else
+    begin
+      while (C!ArgV > 0) do
+      begin
+        if (not BackwardsMSearch) then
+          C!ArgV _ -1
+        else
+          decr(C!ArgV);
+      end;
+    end;
+
+    if (C!ArgV < 0) then
+    begin
+      W!Msg(TmpStr & MSearchString & "  [Failed]");
+      C!MAbort _ true;
+      C!ArgV _ 0;
+      return(false);
+    end
+    else
+      W!Msg(TmpStr & MSearchString & "  [Complete]");
+
+    C!ArgV _ 0;
+    return(true);
+  end "S!DoMSearch";
+!! title Rtn S!DoSearch ;
+!  Command processing for the Search commands.
+;
+
+  internal simple boolean procedure S!DoSearch (integer Dir;
+      boolean Repeat (false));
+  begin "S!DoSearch"
+    string
+      TmpStr;
+
+    if (Dir neq FORWARDS and Dir neq BACKWARDS) then
+    begin
+      C!ArgV _ 0;
+      return(false);
+    end;
+
+    TmpStr _ if (Dir = BACKWARDS) then "Reverse " else null;
+    appnd(TmpStr, "Search: ");    
+
+    if (Repeat) then
+    begin
+      if (length(SearchString) = 0) then
+      begin
+        W!Msg("No Search String");
+        C!ArgV _ 0;
+        return(false);
+      end;
+
+      if (Dir neq SearchDir) then
+        SetupSearch(SearchString, Dir);
+    end
+    else
+    begin
+      if (not C!ReadString(TmpStr, ESC, ESC)) then
+      begin
+        W!Msg(TmpStr & " [Aborted]");
+        C!ArgV _ 0;
+        return(false);
+      end;
+
+      if (length(C!String) = 0) then
+      begin
+        if (length(SearchString) = 0) then
+        begin
+          W!Msg("No Search String");
+          C!ArgV _ 0;
+          return(false);
+        end;
+
+        if (Dir neq SearchDir) then
+          SetupSearch(SearchString, Dir);
+      end
+      else
+      begin
+        if (Dir neq SearchDir or not StringsMatch(SearchString, C!String)) then
+          SetupSearch(C!String, Dir);
+
+        SearchString _ C!String;
+      end;
+    end;
+
+    W!Msg(TmpStr & SearchString & "  [Working]");
+    W!MsgF _ true;
+
+    if (not C!ChrP) then
+      W!Disp(true);
+
+    W!MsgF _ false;
+    C!ArgV _ C!ArgV max 1;
+
+    if (Dir = FORWARDS) then
+    begin
+      while (C!ArgV > 0) do
+      begin
+        if (not ForwardsSearch) then
+          C!ArgV _ -1
+        else
+          decr(C!ArgV);
+      end;
+    end
+    else
+    begin
+      while (C!ArgV > 0) do
+      begin
+        if (not BackwardsSearch) then
+          C!ArgV _ -1
+        else
+          decr(C!ArgV);
+      end;
+    end;
+
+    if (C!ArgV < 0) then
+    begin
+      W!Msg(TmpStr & SearchString & "  [Failed]");
+      C!MAbort _ true;
+      C!ArgV _ 0;
+      return(false);
+    end
+    else
+      W!Msg(TmpStr & SearchString & "  [Complete]");
+
+    C!ArgV _ 0;
+    return(true);
+  end "S!DoSearch";
+!! title Rtn S!Init ;
+!  Initialize the search and replace data structures.
+;
+
+  internal simple procedure S!Init;
+  begin "S!Init"
+    SearchDir     _ UNKNOWN;
+    MSearchDir    _ UNKNOWN;
+    SearchString  _ null;
+    MSearchString _ null;
+    QNewString    _ null;
+    QOldString    _ null;
+    StrCount      _ 0;
+    StrLen        _ 0;
+    arrclr(F1);
+    arrclr(P1);
+    arrclr(F2);
+    arrclr(P2);
+    arrclr(J2);
+    arrclr(StrLen2);
+  end "S!Init";
+!! title Rtn S!MatchDelim ;
+! command to find matching delimiters ;
+
+  internal simple procedure S!MatchDelim;
+  begin
+    own integer SavePt;
+    own integer Delim, MatchDelim, Dir, DelimCount, C;
+
+    if (( C!Cmd land '177 ) = "(" ) then
+      begin
+	Delim := ")";  MatchDelim := "(";
+	Dir := BACKWARDS;
+      end
+    else if (( C!Cmd land '177 ) = ")" ) then
+      begin
+	Delim := "(";  MatchDelim := ")";
+	Dir := FORWARDS;
+      end
+    else
+      begin
+	W!Msg( "Not set up to match that!" );
+	return;
+      end;
+
+    if ( C!ArgV = 0 ) then DelimCount := 1 else DelimCount := C!ArgV;
+    C!ArgV := 0;
+
+    SavePt := B!GetP;
+    B!Move( Dir );
+
+    while ( true ) do
+      begin
+	if ( Dir = FORWARDS ) and B!EndP then done;
+	C := B!GetC;
+	if ( C = MatchDelim ) then
+	  DelimCount := DelimCount - 1
+	else if ( C = Delim ) then
+	  DelimCount := DelimCount + 1;
+	if ( DelimCount = 0 ) then done;
+	if ( Dir = BACKWARDS ) and B!BegP then done;
+	B!Move( Dir );
+      end;
+
+    if ( DelimCount neq 0 ) then
+      begin
+	B!SetP( SavePt );
+	W!Msg( "Match Failed" );
+	C!MAbort := true;
+      end;
+  end;
+!! title Rtn S!QChange ;
+! "Query Change" - user-friendliness in action.
+;
+
+  internal simple boolean procedure S!QChange (boolean Repeat (false));
+  begin "S!QChange"
+    string
+      AbortStr,
+      Prompt;
+    own integer
+      I,
+      Response,
+      N;
+
+
+    if (Repeat) then
+    begin
+      if (not length(QOldString)) then
+      begin
+        W!Msg("No Previous Q-Change Command");
+        T!Bell;
+        C!ArgV _ 0;
+        return(false);
+      end;
+
+      Prompt _ "Q-Change: " & QOldString & " to: " & QNewString;
+    end
+    else
+    begin
+      Prompt   _ "Q-Change: ";
+      AbortStr _ Prompt & "  [Aborted]";
+
+      if (not C!ReadString(Prompt, ESC, ESC)) then
+      begin
+        W!Msg(AbortStr);
+        C!ArgV _ 0;
+        return(false);
+      end;
+
+      if (length(C!String) = 0) then
+      begin
+        W!Msg(AbortStr);
+        C!ArgV _ 0;
+        return(false);
+      end;
+
+      appnd(Prompt, (QOldString _ C!String) & " to: ");
+
+      if (not C!ReadString(Prompt, ESC, ESC)) then
+      begin
+        W!Msg(AbortStr);
+        C!ArgV _ 0;
+        return(false);
+      end;
+
+      appnd(Prompt, (QNewString _ C!String));
+    end;
+
+  !                                *   *   *
+  ;
+
+    set(W!MsgF);
+    W!Msg(Prompt);
+    W!Disp(true);
+    clear(W!MsgF);
+
+  !                                *   *   *
+  ;
+
+    N _ 0;
+
+    if (not C!ArgV) then
+      C!ArgV _ MaxInteger;
+
+    SetupSearch(QOldString, FORWARDS);
+
+    while (C!ArgV > 0) do
+    begin
+      if (not ForwardsSearch) then
+        done
+      else
+      begin "query"
+        W!Msg(Prompt & " ?");
+        Response _ C!GetC;
+
+        if (C!Tab[Response] land IsYes) then
+        begin "change"
+          W!Msg(Prompt & " [Yes]");
+          incr(N);
+
+          for I _ 1 upto length(QOldString) do
+            B!Delete(BACKWARDS);
+
+          for I _ 1 upto length(QNewString) do
+            B!Insert(QNewString[I for 1]);
+        end "change"
+        else
+          W!Msg(Prompt & " [No]");
+
+        W!Disp(false);
+
+        if (C!Tab[Response] land IsAbort) then
+          C!ArgV _ 0
+        else
+          decr(C!ArgV);
+      end "query";
+    end;
+
+    SetSearchDir(UNKNOWN);
+    W!Msg(Prompt & "  [" & cvs(N) & "]");
+    C!ArgV _ 0;
+    return(true);
+  end "S!QChange";
+!! title Rtn S!ShowSearch ;
+! Display the single- and multiple-search strings ;
+
+  internal simple procedure S!ShowSearch;
+  begin
+    string
+      TmpStr;
+
+
+    TmpStr _ null;
+
+    if (SearchString) then
+      appnd(TmpStr, "Search: """ & SearchString & """");
+
+    if (MSearchString) then
+      appnd(TmpStr, "   M-Search: """ & MSearchString & """");
+
+    if (not length(TmpStr)) then
+      appnd(TmpStr, "No Search Strings");
+
+    W!Msg(TmpStr);
+    C!ArgV _ 0;
+  end;
+end "search";
+
+                             
+! ************************** End of Search.Sai ***************************;
+    K`þ
