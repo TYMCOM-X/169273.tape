@@ -1,0 +1,314 @@
+begin "xmodem"
+  require "(sailib)sail.def" source!file;
+
+  integer T!LCH, T!XON;
+  integer dsk, count, brchar, eof, mode;
+  simple procedure Terminal!Init;
+    Begin!Code
+      seto	1,;
+      ttcall	6,1;		! getlch 1;
+      movem	1,T!LCH;	! save them ;
+      tlo	1,'220;		! set some magic bits ;
+      ttcall	7,1;		! setlch 1;
+      hrroi	1,'64;
+      auxcal	1,'714;		! set no-echo, break on all bits ;
+      setzm	T!XON;		! want the xon bit off ;
+      hrroi	1,'55;
+      auxcal	1,T!XON;	! turn it off, save old value ;
+      jfcl;
+    end;
+  simple procedure Terminal!Fini;
+    Begin!Code
+      hrli	1,'41;		! wait for output to complete ;
+      hrri	1,5;		! wait 5 seconds before timeout ;
+      calli	1,'72;		! hiber will send yellow ball ;
+       jfcl;			! ignore timeout (so we lose...) ;
+      move	1,T!LCH;	! restore original line characteristics ;
+      ttcall	7,1;		! setlch 1;
+      hrroi	1,'64;		! turn off bits in file status word ;
+      auxcal	1,0;		! clear the bits ;
+       jfcl;
+      hrroi	1,'55;
+      auxcal	1,T!XON;	! restore xon setting ;
+       jfcl;
+    end;
+  simple integer procedure CharP;
+    begin
+      integer C;
+
+      start!code
+	hrroi  1,1;		! -1,,1 = .axi8s ;
+	auxcal 1,2;		! input image character and skip ;
+	 seto  2,;		! no character so return -1 ;
+	movem  2,C;		! save it for later return ;
+      end;
+      return( C );
+    end;
+  simple integer procedure GetC;
+    begin
+      integer C;
+
+      start!code
+	    label getc, waitc, gotc;
+      getc:  hrroi  1,1;	! -1,,1 = .axi8s ;
+	     auxcal 1,2;	! input image character and skip ;
+	      jrst  waitc;	! no character so wait for one ;
+	     jrst   gotc;	! found one, so go home ;
+      waitc: hrroi  1,0;	! -1,,0 = .axi8c ;
+	     auxcal 1,2;	! block until receive a character ;
+	       jfcl;
+      gotc:  movem  2,C;
+      end;
+      return( C );
+    end;
+  simple integer procedure Get!with!Timeout;
+    begin
+      integer C;
+
+      start!code
+	    label getc, waitc, gotc, timeout, done;
+      getc:  hrroi  1,1;	! -1,,1 = .axi8s ;
+	     auxcal 1,2;	! input image character and skip ;
+	      jrst  waitc;	! no character so wait for one ;
+	     jrst   gotc;	! found one, so go home ;
+      waitc: hrlzi  1,'11;	! wait for character + seconds ;
+	     hrri   1,'10;	! 10 (seconds) ;
+	     calli  1,'72;	! hiber for 10 seconds or until input ;
+	       jrst  timeout;	! waited too long ;
+	     hrroi  1,1;	! -1,,1 = .axi8s ;
+	     auxcal 1,2;	! input image character and skip ;
+	       jrst  timeout;	! shouldn't happen ;
+      gotc:  movem  2,C;	! got one ;
+	     jrst   done;	! and go home ;
+      timeout:
+	     setom  C;		! indicate an error ;
+      done:
+      end;
+      return( C );
+    end;
+  simple procedure Init!Dsk( string InOut );
+    begin
+      string answer;
+
+      do
+	begin
+	  print( InOut, " to be Text or Binary? " );
+	  answer := inchwl;
+	end
+      until answer = "T" or answer = "B";
+
+      if answer = "T" then
+	mode := 0		! ASCII mode for text ;
+      else
+	mode := 2;		! KANA mode for binary ;
+
+      count := 128;
+      open( dsk := getchan, "DSK", mode, 2, 2, count, brchar, eof );
+      if eof then
+	usererr( 0, 0, "Unable to INIT the DSK:." );
+    end;
+  simple procedure Open!File( boolean InP );
+    begin
+      string File, answer;
+      boolean cont;
+
+      do
+	begin
+	do
+	  begin
+	    print( "Local file for ", if InP then "sending" else "receiving",
+		   " data: " );
+	    File := inchwl;
+	  end
+	until length( File );
+
+	lookup( dsk, File, eof );
+	if not InP and not eof then
+	  begin
+	    do
+	      begin
+		print( "File ", File, " already exists.  Proceed? " );
+		answer := inchwl;
+	      end
+	    until answer = "Y" or "N";
+	    cont := (answer = "Y");
+	  end
+	else if InP and not eof then
+	  cont := false
+	else
+	  cont := true;
+
+	if cont then
+	  begin
+	    enter( dsk, file, eof );
+	    if eof then
+	      print( "Unable to ENTER ", File, "." & crlf );
+	  end
+	else
+	  eof := false;
+	end
+      until not eof;
+    end;
+  simple procedure Receive;
+    begin
+      integer char, packet, cksum, i;
+      boolean cont;
+      string sector;
+
+      ! We are supposed to send a NAK first, but if the sender times out ;
+      ! he will send a CAN and wait for another NAK.  I elected to wait  ;
+      ! for that timeout because of the prompts to the user.             ;
+
+      do
+	begin
+	  call( 3, "SLEEP" );
+	  ioneou( #NAK );
+	end
+      until (char := Get!with!Timeout) neq #CAN and char neq -1;
+
+      ! All the stuff sent is 8-bit bytes ;
+
+      ! Then for each sector to be sent, he starts with a 3 byte header: ;
+      !      SOH, sector number (binary), '377 - sector number           ;
+      ! Then he sends 128 bytes of data followed by an 8-bit checksum    ;
+
+      while char = #SOH do
+	begin "read a packet"
+	  packet := GetC;
+	  cont := ((packet + GetC) = '377);
+	  sector := null;
+	  cksum := 0;
+	  for i := 1 upto 128 do
+	    begin "read a sector"
+	      cksum := (cksum + (char := GetC)) land '377;
+	      if mode = 0 and char = #LF then
+		sector := sector & char!w( #CR + '400, 9 );
+	      sector := sector & char!w( char + '400, 9 );
+	      ! The reason for turning on the high order bit in the     ;
+	      ! incoming byte is so that we don't store nulls on the    ;
+	      ! disk.  Sail won't give us the nulls in an input stream. ;
+	    end "read a sector";
+	  if ( cksum = (char := GetC) and cont ) then
+	    begin	! if the checksums match and the header was right ;
+	      cprint( dsk, sector );		! write the sector to dsk ;
+	      ioneou( #ACK );			! tell the sender         ;
+	    end
+	  else
+	    ioneou( #NAK );	! something wrong, make him resend ;
+	  char := GetC;		! and read the start of the next packet ;
+	end "read a packet";
+
+      ! He sends EOT when all done and expects an ACK back. ;
+      ioneou( #ACK );
+      close( dsk );
+    end;
+    simple procedure Send;
+    begin
+      integer cksum, char, tries, sector, how!many;
+      string bytes;
+      boolean send!again;
+
+      ! Wait for the initial NAK.  If not in time, send CAN and wait again. ;
+      tries := 0;
+      while (char := Get!with!Timeout) neq #NAK do
+	begin
+	  ioneou( #CAN );
+	  if (tries := tries + 1) > 9 then
+	    usererr( 0, 0, "Too many errors." );
+	end;
+
+      sector := 0;
+      while true do
+	begin "send sector"
+
+	  ! read 128 bytes (or less) from file into bytes ;
+	  ! use predefined breaktable 0 to read 128 characters ;
+
+	  bytes := input( dsk, 0 );
+	  if not length( bytes ) then
+	    done "send sector";
+
+	  ! For each sector send SOH, sector!number, '377 - sector!number,  ;
+	  !   128 8-bit bytes of data, 8-bit checksum.                      ;
+	  ! Then wait for ACK or NAK.  If ACK send next sector, if NAK just ;
+	  ! resend the same one.  When all out of sectors send EOT and wait ;
+	  ! for ACK.                                                        ;
+
+	  tries := 0;
+	  sector := (sector + 1) land '377;
+	  do
+	    begin "try sector"
+	      send!again := true;
+	      how!many := length( bytes );
+	      cksum := 0;
+
+	      ioneou( #SOH );			! start of header ;
+	      if CharP > 0 then
+		continue "try sector";
+	      ioneou( sector );			! sector number ;
+	      if CharP > 0 then
+		continue "try sector";
+	      ioneou( '377 - sector );		! and some error checking ;
+	      if CharP > 0 then
+		continue "try sector";
+
+	      while length( bytes ) do		! send the characters ;
+		begin
+		  cksum := cksum + (char := lop( bytes ));
+		  ioneou( char );
+		end;
+	      if CharP > 0 then
+		continue "try sector";
+
+	      for char := 1 upto 128 - how!many do  ! ensure 128 chars sent ;
+		ioneou( #NUL );
+	      if CharP > 0 then
+		continue "try sector";
+
+	      ioneou( cksum land '377 );	! send checksum ;
+	      if Get!with!Timeout = #ACK then
+		send!again := false
+	      else
+		if (tries := tries + 1) > 9 then
+		  usererr( 0, 0, "Too many errors sending sector "&
+				 cvs(sector)&"." );
+	    end "try sector"
+	  until not send!again;
+	end "send sector";
+
+      ! Send EOT when out of sectors, and wait for an ACK. ;
+      ioneou( #EOT );
+      while (char := Get!with!Timeout) = -1 or char = #CAN do
+	ioneou( #EOT );
+    end;
+  string answer;
+
+  ttyup( true );
+  print( crlf & "XMODEM handler here." & crlf & crlf );
+  do
+    begin
+      print( "Am I to Send or Receive a file? <EXIT> " );
+      answer := inchwl;
+    end
+  until answer = "S" or "R" or " ";
+
+  if answer = "R" then
+    begin
+      Init!Dsk( "Output" );
+      Open!File( false );
+      Terminal!Init;
+      print( crlf & "You may fire when ready, Gridley." & crlf );
+      Receive;
+      Terminal!Fini;
+    end
+  else if answer = "S" then
+    begin
+      Init!Dsk( "Input" );
+      Open!File( true );
+      Terminal!Init;
+      print( crlf & "Waiting for initial NAK." & crlf );
+      Send;
+      Terminal!Fini;
+    end;
+end "xmodem"
+   
