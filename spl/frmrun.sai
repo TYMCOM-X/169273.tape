@@ -1,0 +1,492 @@
+entry
+	FRMRUN
+;
+Begin "FRMRUN Module"
+
+  require "(SAILIB)SAIL.DEF" source!file;
+  require "(MPL)UUOSYM.DEF" source!file;
+
+comment .dcl begin;
+
+define
+    F.CCL  = 1		! start program at start+1 ;
+,   F.NTTY = 2		! do not pass TTY: to child ;
+,   F.NWAI = 4		! do not wait for child to terminate ;
+,   F.NEOL = 8		! do not add (#cr-#lf) at end of tmpcor data ;
+,   F.NLIC = 16		! do not pass user license to child frame ;
+,   F.SAVE = 32		! save terminated frame ;
+
+,   E.NOER = 000	! no errors detected (EXIT or F.NWAI+started) ;
+,   E.HNHS = 001	! child halted with no halt status ( ? ^C) ;
+,   E.OPN  = 002	! open failure for device DSK: ;
+,   E.ENT  = 003	! enter failure for temp file (on disk) ;
+,   E.OUT  = 004	! output error for temp file (on disk) ;
+,   E.GTAB = 005	! gettab failed (frame probably vanished) ;
+,   E.HIBR = 006	! HIBER failed, should never happen ;
+,   E.IFS  = 007	! Illegal program-name specification ;
+
+,   E.HS   = 10000	! Unexpected halt status ( code 1CCTT ) ;
+,   E.FO   = 20000	! FRMOP error ( code is 2XXXX ) ;
+,   E.RT   = 30000	! RETACH error ( code is 3XXXX ) ;
+;
+comment .dcl end;
+
+
+  internal integer procedure FRMRUN(
+	    String  ProgramName;
+	    Integer ProgramFlags;
+	    Reference Integer ProgramCode;
+	    String  TempFileName;
+	    String  TempFileData;
+	    String  SaveFileName(null) );
+
+  begin "FRMRUN"
+
+    Define
+	HSBLEN = 7		! size of halt-status block ;
+
+    ,   GetCnt = 0		! .FOGET block count (5) ;
+    ,   GetDev = 1		! .FOGET device name ;
+    ,   GetPpn = 2		! PPN ;
+    ,   GetNam = 3		! name ;
+    ,   GetExt = 4		! extension ;
+    ,   GetLic = 5		! license ;
+    ,   GetUnm = 6		! user name (1st word) ;
+    ,   GetUn1 = 7		! user name (2nd word) ;
+    ;
+    Own safe Integer Array GETARG[ GetCnt:GetUn1 ];
+    Own safe Integer Array SAVARG[ GetCnt:GetUn1 ];
+
+    Define FRMCNT=0,FRMPPN=1,FRMPRV=2,FRMAUN=3,FRMUNM=4,FRMUN1=5,FRMLIC=6;
+    Own Safe Integer Array Frame!Block[ FRMCNT : FRMLIC ];
+
+    Preset!with !Xwd( 1,3 ), CvSix( "SYS" ), 0, CvSix( "LOGOUT" );
+    Own safe Integer array LOGOUT[ 0:3 ];
+    Own safe Integer array FRMHSB[ 0:HSBLEN ];
+    Own Integer Child, FD;
+    Own Integer Flags, Status, Code;
+
+
+    Simple Procedure SetupParentFrame;
+    begin
+	Redefine CF!LIC = !bit(16);	! until UUOSYM.DEF is right;
+
+	ArrClr( Frame!Block );
+
+	Frame!Block[ FrmCNT ]_ (CF!LIC lor 5);
+	Frame!Block[ FrmPPN ]_ calli( !Xwd( -1,!GTPPN ), calli!GETTAB );
+	Frame!Block[ FrmPRV ]_ calli( !Xwd( -1,!GTPRV ), calli!GETTAB );
+	Frame!Block[ FrmAUN ]_ calli( !Xwd( -1,!GTAUN ), calli!GETTAB );
+	Frame!Block[ FrmUNM ]_ calli( !Xwd( -1,!GTUNM ), calli!GETTAB );
+	Frame!Block[ FrmUN1 ]_ calli( !Xwd( -1,!GTUN1 ), calli!GETTAB );
+
+	If ( 0 = Flags land F.NLIC )
+	 then Frame!Block[ FrmLIC ]_ calli( !Xwd( -1,!GTLIC ), calli!GETTAB );
+
+    end;
+
+
+    Simple Boolean Procedure HSERR;
+    Start!code
+	Define T1=1, T2=2;    protect!acs T1,T2;
+
+	HRRZM	T1,T2;			! T2/ TT ;
+	HLRZ	T1,T1;			! T1/ CC ;
+	IMULI	T1,100;			! T1/ CC00 ;
+	ADD	T1,T2;			! T1/ CCTT ;
+	ADDI	T1,E.HS;		! add in tag for halt status ;
+	MOVEM	T1,Status;		! store status code ;
+	SETZ	T1,;			! return 0 on error ;
+    end;
+
+
+    Simple Boolean Procedure FOERR;
+    Start!Code
+	Define T1=1;    protect!acs T1;
+
+	ADDI	T1,E.FO;		! add tag to frmop error code ;
+	MOVEM	T1,Status;		! store status code ;
+	SETZ	T1,;			! return 0 on error ;
+    end;
+
+
+  Simple Boolean Procedure WaitForHalt;
+  Start!code
+    Define T1=1, T2=2, P='17;    protect!acs T1, T2;
+    label WaitAgain, HiberError, GettabError, GoHome;
+
+WaitAgain:
+	MOVSI	T1,'400;		! wait for child frame to halt ;
+	uuo!HIBER  T1,;
+	 JRST	HiberError;
+	MOVS	T1,FD;
+	HRRI	T1,!GTSTS;
+	uuo!GETTAB  T1,;		! get child's run state ;
+	 JRST	GettabError;
+	JUMPL	T1,WaitAgain;		! try again - still running ;
+	MOVE	T2,FRMHSB[2];		! get old halt count ;
+	MOVE	T1,FD;
+	HRLI	T1,!FOHST;
+	uuo!FRMOP  T1,FRMHSB[0];	! read halt status ;
+	 JRST	FOERR;
+	CAMN	T2,FRMHSB[2];		! did count increment? ;
+	 SETOM	FRMHSB[1];		! set = -1 for ^C (assumed) ;
+	SETO	T1,;			! successful return ;
+	JRST	GoHome;
+
+HiberError:
+	MOVEI	T1,E.HIBR;
+	MOVEM	T1,Status;
+	SETZ	T1,;
+	JRST	GoHome;
+
+GettabError:
+	MOVEI	T1,E.GTAB;
+	MOVEM	T1,Status;
+	SETZ	T1,;
+GoHome:
+  end;
+
+
+  Simple Integer Procedure CreateFrame;
+  Start!Code
+    Define T1=1;    protect!acs T1;
+
+	MOVSI	T1,!FOCFM;		! create frame ;
+	uuo!FRMOP  T1,Frame!Block[0];	! default all parameters ;
+	 JRST	FOERR;
+	MOVEM	T1,FD;			! save frame descriptor ;
+	MOVE	T1,[!Xwd('400,1)];	! wait for child to halt or 1 mS ;
+	uuo!HIBER  T1,;			! to clear "child halted" condition ;
+	 JFCL;
+	MOVEI	T1,HSBLEN;
+	MOVEM	T1,FRMHSB[0];		! setup HSB length count ;
+	MOVE	T1,FD;
+	HRLI	T1,!FOHST;
+	uuo!FRMOP  T1,FRMHSB[0];	! read initial halt status ;
+	 JRST	FOERR;
+	MOVE	T1,FD;			! return frame descriptor ;
+  end;
+
+
+  Simple Boolean Procedure SaveFrame;
+  Start!code
+    Define T1=1, P='17;    protect!acs T1;    label NoWait;
+
+	MOVEI	T1,5;			! size of GET block ;
+	MOVEM	T1,SAVARG[GETCNT];
+	MOVE	T1,FD;			! child frame descriptor ;
+	HRLI	T1,!FOSAV;
+	uuo!FRMOP  T1,SAVARG[0];	! do the SAV ;
+	 JRST	FOERR;
+	PUSHJ	P,WaitForHalt;		! wait ;
+	 JUMPE	T1,NoWait;
+	MOVE	T1,FRMHSB[1];		! get CLASS,,TYPE ;
+	CAME	T1,[!Xwd(HC!EXI,HT!JSV)];
+	 JRST	HSERR;
+	SETO	T1,;			! successful completion ;
+NoWait:
+  end;
+
+
+  Simple Boolean Procedure ClearFrame;
+  Start!code
+    Define T1=1;    protect!acs t1;
+
+	MOVE	T1,FD;
+	HRLI	T1,!FOCLR;
+	uuo!FRMOP  T1,;			! request child to clear ;
+	 JRST	FOERR;
+	JRST	WaitForHalt;		! wait for frame to clear ;
+  end;
+
+
+  Simple Boolean Procedure KillFrame;
+  Start!code
+    Define T1=1;    protect!acs T1;
+
+	MOVE	T1,FD;			! get frame descriptor ;
+	HRLI	T1,!FORUN;		! then to get rid of the child ;
+	uuo!FRMOP  T1,LOGOUT[0];	! run LOGOUT in the frame ;
+	 JRST	FOERR;			! report any errors ;
+    end;
+
+
+  Simple Procedure CheckHaltStatus;
+  Start!code
+    Define T1=1, T2=2;    protect!acs T1,T2;
+    label HaltNoStatus, ClearStatus, GoHome;
+
+	MOVE	T1,FRMHSB[1];		! get CLASS,,TYPE ;
+	CAMN	T1,[-1];		! ^C ;
+	 JRST	HaltNoStatus;
+	CAMN	T1,[!Xwd(HC!EXI,HT!EXI)];
+	 JRST	ClearStatus;
+	CAMN	T1,[!Xwd(HC!EXI,HT!EX1)];
+	 JRST	ClearStatus;
+	CAME	T1,[!Xwd(HC!EXI,HT!FEX)];
+	 JRST	ClearStatus;
+	MOVE	T2,FRMHSB[6];
+	MOVEM	T2,access( Code );
+	JRST	HSERR;
+
+HaltNoStatus:
+	MOVEI	T1,E.HNHS;
+	MOVEM	T1,Status;
+	JRST	GoHome;
+
+ClearStatus:
+	SETZM	Status;
+	SETZM	Code;
+GoHome:
+  end;
+
+
+  Simple Boolean Procedure GetProgram;
+  Start!code
+    Define T1=1, P='17;    protect!acs T1;    label NoWait;
+
+	MOVEI	T1,5;			! size of GET block ;
+	MOVEM	T1,GETARG[GETCNT];
+	MOVE	T1,FD;			! child frame descriptor ;
+	HRLI	T1,!FOGET;
+	uuo!FRMOP  T1,GETARG[0];	! do the get ;
+	 JRST	FOERR;
+	PUSHJ	P,WaitForHalt;		! wait ;
+	 JUMPE	T1,NoWait;
+	MOVE	T1,FRMHSB[1];		! get CLASS,,TYPE ;
+	CAME	T1,[!Xwd(HC!EXI,HT!JSU)];
+	 JRST	HSERR;
+	SETO	T1,;			! successful completion ;
+NoWait:
+  end;
+
+
+  Simple Boolean Procedure StartProgram;
+  Start!code
+    Define T1=1, T2=2;    protect!acs T1,T2;
+
+	HRREI	T2,SV!NSA;		! normal start address ;
+	MOVE	T1,FLAGS;		! get flag word ;
+	TRNE	T1,F.CCL;		! user request CCL start? ;
+	 HRREI	T2,SV!CCL;		! then use that vector ;
+	MOVE	T1,FD;
+	HRLI	T1,!FOSVA;
+	uuo!FRMOP  T1,T2;		! start at vector address ;
+	 JRST	FOERR;
+	SETO	T1,;			! successful return ;
+  end;
+
+
+  Simple Boolean Procedure MoveTTY;
+  Start!code
+    Define T1=1, T2=2, T3=3;    protect!acs T1,T2,T3;
+    label AllDone;
+
+	MOVEI	T3,T1;			! address of arguments ;
+	uuo!RETACH  T3,;		! move the logical tty ;
+	 SKIPA	T1,[0];			! oops! error ;
+	SETO	T1,;			! normal return ;
+	JUMPN	T1,AllDone;		! off to the end? ;
+	ADDI	T3,E.RT;		! tag for RETACH error code ;
+	MOVEM	T3,Status;		! store error code ;
+AllDone:
+  end;
+
+
+  Simple Boolean Procedure GiveAwayTTY;
+  Start!code
+    Define T1=1, T2=2;
+
+	HRRO	T1,FD;			! source,,target ;
+	HRLOI	T2,'300000;		! user mode,,cmd port ;
+	JRST	MoveTTY;		! off to common code ;
+  end;
+
+
+  Simple Boolean Procedure RetrieveTTY;
+  Start!code
+    Define T1=1, T2=2;
+
+	HRLO	T1,FD;			! source,,target ;
+	HRLOI	T2,0;			! saved mode,,cmd port ;
+	JRST	MoveTTY;		! off to common code ;
+  end;
+
+
+Simple Boolean Procedure ParseFileName( String FileName; integer array ARG );
+begin "Parse File"
+    Own Integer Spec, Ppns, User, Brk;
+    Own Integer MyPPN, MyProj, MyProg;
+    Own Integer Word, Size;
+    Own String Byte;
+
+    ArrClr( ARG );			! initially empty ;
+    ARG[ GetDev ]_ CvSix("DSK");	! default device name ;
+
+    setbreak( Spec_ GetBreak, ":(.[,", null, "KINS" );
+    setbreak( Ppns_ GetBreak, ",]", null, "KINS" );
+    setbreak( User_ GetBreak, ")", null, "KINS" );
+
+    Size_ 6;
+    Word_ GetNam;
+
+    Do begin
+      Byte_ Scan( FileName, Spec, Brk );
+
+      Case Brk of
+       begin "parse cases"
+
+	["("] begin
+		ARG[ Word ]_ CvSix( Byte[1 for Size] );
+		Byte_ Scan( FileName, User, Brk );
+		If ( Brk neq ")" )
+		 then Return( False );
+		ARG[ GetUnm ]_ CvSix( Byte[1 for 6] );
+		ARG[ GetUn1 ]_ CvSix( Byte[7 for 6] );
+		ARG[ GetPpn ]_ Location( ARG[ GetUnm ] );
+		Size_ 6;
+		Word_ GetNam;
+	      end;
+
+	[":"] begin
+		ARG[ GetDev ]_ CvSix( Byte[1 for 6] );
+		Size_ 6;
+		Word_ GetNam;
+	      end;
+
+	["."] begin
+		ARG[ GetNam ]_ CvSix( Byte[1 for 6] );
+		Size_ 3;
+		Word_ GetExt;
+	      end;
+
+	["["] begin
+		ARG[ Word ]_ CvSix( Byte[1 for Size] );
+		MyPPN_ Calli(0,calli!GETPPN);
+		Byte_ Scan( Filename, Ppns, Brk );
+		If ( Brk neq "," )
+		 then Return( False );
+		MyProj_ Cvo( Byte );
+		If ( MyProj = 0 )
+		 then MyProj_ !lh( MyPPN );
+		Byte_ Scan( Filename, Ppns, Brk );
+		If ( Brk neq "]" )
+		 then Return( False );
+		MyProg_ Cvo( Byte );
+		If ( MyProg = 0 )
+		 then MyProg_ !rh( MyPPN );
+		ARG[ GetPpn ]_ !Xwd( MyProj, MyProg );
+		Size_ 6;
+		Word_ GetNam;
+	     end;
+
+	[ELSE]	ARG[ Word ]_ CvSix( Byte[1 for Size] )
+
+      end "parse cases";
+    end until ( 0 = Length( FileName ) );
+
+    Return( True );
+
+end "Parse File";
+
+
+
+  Simple Boolean Procedure WriteTempFile( Integer Job );
+  begin
+    Own Integer TempChan, TempEof, Width, Digits;
+    Own String  TempName;
+
+    Open( TempChan_ getchan, "DSK", 0, 0,1, 0,0, TempEof_ -1 );
+    If ( TempEof )
+     then begin
+	Status_ E.OPN;		! open failure for device DSK: ;
+	Return( False );
+     end;
+
+    GetFormat( Width, Digits );
+    SetFormat( -3, 0 );
+    TempName_ Cvs(Job land '777) & TempFilename[1 for 3] & ".TMP";
+    SetFormat( Width, Digits );
+
+    Enter( TempChan, TempName, TempEof_ -1 );
+    If ( TempEof )
+     then begin
+	Status_ E.ENT;		! enter failure for temp file (on disk) ;
+	Return( False );
+     end;
+
+    Out( TempChan, TempFileData );
+    If ( 0 = Flags land F.NEOL )
+     then Out( TempChan, CRLF );
+
+    If ( TempEof )
+     then begin
+	Status_ E.OUT;			! output error for temp file ;
+	Return( False );
+     end;
+
+    Close( TempChan );
+    Release( TempChan );
+
+    Return( True );
+  end;
+
+    !  Main line routine begins here ;
+
+    ProgramCode_ Code_ Status_ 0;	! Initially, no error status ;
+    Flags_ ProgramFlags;		! A matter of access rights ;
+
+    If not ( ParseFileName( ProgramName, GETARG ) )
+     then Return( E.IFS );		! Error if not a proper Name ;
+    If not ( ParseFileName( SaveFileName, SAVARG ) )
+     then Return( E.IFS );		! Error if not a proper Name ;
+
+    SetupParentFrame;			! Set child frame attributes ;
+    If ( 0 = Child_ CreateFrame )	! Attempt to create a child frame ;
+     then Return( Status );		! If it failed, return error code ;
+
+    If ( Length( TempFileName ) )	! If user specified a temp file ;
+     then If not ( WriteTempFile( Child ) )
+	   then begin			!    If any problems ;
+	      KillFrame;		!     kill the frame ;
+	      Return( Status );		!     and return ;
+	   end;
+
+    If ( 0 = Flags land F.NTTY )	! If user is giving away the TTY ;
+     then If not ( GiveAwayTTY )	!  then try to give it away ;
+	   then begin			!    If any problems ;
+	      RetrieveTTY;		!     make sure we have the TTY ;
+	      KillFrame;		!     kill the frame ;
+	      Return( Status );		!     and return ;
+	   end;
+
+    If not (( GetProgram ) and		! If we can't get the program (or);
+	    ( StartProgram )  )		!    we can't start the program	 ;
+     then begin				!  then ;
+	ClearFrame;			!     first empty the frame ;
+	If ( 0 = Flags land F.NTTY )	!     if we gave the TTY away ;
+	 then RetrieveTTY;		!      then get it back first ;
+	KillFrame;			!     kill the frame ;
+	Return( Status );		!     and return ;
+     end;
+
+    If ( 0 = Flags land F.NWAI )	! Decide whether to stay ;
+     then begin
+	WaitForHalt;			!     and wait if the user asks ;
+	CheckHaltStatus;		!     to see what happenned ;
+	If Flags land F.SAVE
+	    then SaveFrame;		!     save the core image;
+	ClearFrame;			!     first empty the frame ;
+	If ( 0 = Flags land F.NTTY )	!     if we gave the TTY away ;
+	 then RetrieveTTY;		!      then get it back ;
+	KillFrame;			!     Now!  Kill the frame ;
+     end;
+
+    ProgramCode_ Code;			! Set "any" program code ;
+    Return( Status );			!   and return to the caller ;
+
+end "FRMRUN";
+end "FRMRUN Module";
+
+  
