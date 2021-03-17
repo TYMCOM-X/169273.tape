@@ -1,0 +1,12 @@
+
+SLBCVD
+SLBUFD
+SLBAGN
+SLBDUL
+SLBDAT
+SLBTIM
+SLBSCN
+SLBRPG
+SLBSRC
+;#
+; current sources on (sailib:39)SLB
