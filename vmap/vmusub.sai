@@ -1,0 +1,623 @@
+
+entry
+	MyPPN		comment integer -               - user ppn ;
+,	CvNAME		comment string  - [AUN]         - return username ;
+,	GetDIR		comment boolean - "CMD" "F" "T" - get direction ;
+,	FScan		comment (file)  - "CMD"         - get file spec ;
+
+,	DoCopy		comment         - (To) (From)   - copy files ;
+,	DoKill		comment         - (To) (From)   - delete files ;
+,	DoList		comment         - (To) (From)   - directory ;
+,	DoWipe		comment         - (To) (From)   - expunge files ;
+,	DoName		comment         - (To) (From)   - rename files ;
+,	DoXDel		comment         - (To) (From)   - undelete files ;
+;
+
+
+begin "VMUSUB"
+
+require "  V-Map Utility Subroutines " message;
+
+require "MYSAIL.DEF" source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "BRKINI.REQ" source!file;
+require "CMDSCN.REQ" source!file;
+require "CVFNAM.REQ" source!file;
+require "VMCOPY.REQ" source!file;
+
+Record!Class Link ( Integer F, FM;	! File Name, Mask ;
+		    Integer E, EM;	! File Ext, EMask ;
+		    Integer P, PM;	! File PPN, PMask ;
+		    Integer PRT;	! File Protection ;
+		    String  U;		! File Username   ;
+		    r!p (link) Next )	! pointer to next ;
+;
+
+Own r!p (link) FromFile, ToFile, NextFile;
+
+Own String  Last.User;
+Own Integer Last.Fppn, Last.Tppn;
+Own Integer Ochan, Base, Files;
+
+Preset!with
+	"File not found",
+	"Incorrect PPN",
+	"Protection failure",
+	"File being modified",
+	"File already exists",
+	"Illegal sequence of UUOs",
+	"Data transmission error",
+	"Not a SAV file",
+	"Not enough memory",
+	"Device not available",
+	"No such device",
+	"Please find a wizard (#13)",
+	"No room on disk, out of quota",
+	"Please find a wizard (#15)",
+	"Insufficient monitor free core",
+	"Please find a wizard (#17)",
+	"Please find a wizard (#20)",
+	"Please find a wizard (#21)",
+	"Please find a wizard (#22)";
+Own String Array LKPERR[ 0:'22];
+
+Preset!with ['5000] 0;
+Own Integer Array VM[ 0:'4777 ];
+Own Integer Array FNew[ 0:'41 ];
+
+Own Internal Integer MyPPN;
+
+
+Simple Procedure InitStuff;
+begin
+    MyPPN_ Calli( !Xwd(-1,!GTPPN), calli!GETTAB );
+    Base_ ( Location( VM[0] ) + '777 ) lsh -9;
+    MFDset( '17, 0,0, 0 );
+end;
+require InitStuff Initialization;
+
+
+
+Internal String Procedure CvNAME( integer AUN );
+begin
+    string Name;
+    integer CvnChan,CvnEof;
+    integer array Look[ 0 : !RBUNM+1 ];
+
+    Look[ !RBCNT ]_ !RBUNM+1;		! PPN->USER;
+    Look[ !RBPPN ]_ !Xwd( 1,1 );	! (UFD)  ;
+    Look[ !RBNAM ]_ AUN;		! [user] ;
+    Look[ !RBEXT ]_ CVSIX("UFD   ");	! .UFD   ;
+
+    Open(CvnChan_getchan,"DSK",'17,0,0, 0,0, CvnEof_-1);
+
+    If not ( CvnEof )
+     then begin "lookup ufd"
+
+	Chnior(CvnChan,Look[!RBCNT],!CHLK);
+	CvnEof_ not ( !SKIP! );
+	Release(CvnChan);
+
+     end "lookup ufd";
+
+    If ( CvnEof )
+     then Return( Cvos(!lh(Aun))&","&Cvos(!rh(Aun)) )
+     else Return( Cv6str(Look[!RBUNM])&Cv6str(Look[!RBUNM+1]) );
+
+end;
+
+
+Internal R!P (link) Procedure FScan( Reference String S );
+begin
+    r!p (link) F, H;
+
+    H_ F_ new!record( link );
+
+    Do begin "scanning files"
+
+	F_ Link:Next[F]_ new!record( link );
+
+	CvFNam( S, Link:F[F], Link:E[F], Link:P[F],
+		Link:FM[F], Link:EM[F], Link:PM[F], Link:PRT[F] );
+
+	If ( 0 = (Link:P[F] lor Link:PM[F]) )
+	 then Link:P[F]_ MyPpn;
+
+	If ( 0 = ( Link:F[F] lor Link:FM[F] ) )
+	 then begin
+	    Link:F[F]_ CvSix("######");
+	    Link:FM[F]_ -1;
+	 end;
+
+	If ( 0 = ( Link:E[F] lor Link:EM[F] ) )
+	 then begin
+	    Link:E[F]_ CvSix("###");
+	    Link:EM[F]_ (-1 lsh 18);
+	 end;
+
+	Scan( S, BrkWht, Brk );
+
+	If ( Brk = "," )
+	 then Brk_ Lop( S );
+
+    end "scanning files" until ( Brk neq "," );
+
+    Return( Link:Next[H] );
+
+end;
+
+
+Boolean Procedure NameMatch( Integer File, Ext, Ppn );
+Return( True );		! incomplete ;
+
+
+Procedure MergeMasks( Reference Integer File, Ext, Ppn );
+begin
+    r!p (link) R;
+
+    R_ FromFile;
+    File_ Ext_ Ppn_ 0;
+
+    Do begin
+	File_ File lor Link:FM[R];
+	Ext_  Ext  lor Link:EM[R];
+	Ppn_  Ppn  lor Link:PM[R];
+     end until ( null!record = R_ Link:Next[R] );
+
+	! incomplete ;
+
+end;
+
+
+
+Internal Simple Boolean Procedure GetDir( Reference String S;
+					  String T.Str, F.Str;
+					  Boolean NeedTo(True) );
+begin "get direction"
+    Integer Reverse;
+
+    Reverse_ False;
+
+    If ( Length( S ) and ( Brk = "=" or Brk = "_" ) )
+     then begin
+	Reverse_ True;
+	Brk_ Lop( S );
+     end;
+
+    Scan( S, BrkWht, Brk );
+
+    If ( ( Brk = 0 ) and ( NeedTo ) )
+     then begin "end of line"
+	Print( If (CmdEOL = #Esc)
+		then #BS &" "& #BS
+		else "",
+	       If ( Reverse )
+		then F.Str
+		else T.Str    );
+	S_ Inchwl;
+	CmdEOL_ !Skip!;
+     end "end of line";
+
+    Return( Reverse );
+
+end "get direction";
+
+
+Boolean Procedure Temps( Reference Integer Filename, Extension );
+begin "temps"
+
+    Return( Extension = CvSix("TMP") );
+
+end "temps";
+
+Boolean Procedure NoTemps( Reference Integer Filename, Extension );
+begin "no temps"
+
+    Return( ( Extension          neq CvSix("TMP") ) or
+	    ( Link:E[FromFile] =   CvSix("TMP") )     );
+
+end "no temps";
+
+
+String Procedure CvXPPN( Integer Aun );
+Return( "["&Cvos(!lh(Aun))&","&Cvos(!rh(Aun))&"]" );
+
+Integer Procedure Aply( Integer Fx, Tx, Tm );
+Return( (Fx land Tm) lor (Tx land lnot Tm) );
+
+
+Procedure CopyProc( Reference Integer Chan, Count, Brk, FileEof;
+		    Integer Array LKB );
+
+If ( 0 = ( LKB[!RBLIC] land '001000000000 ) ) or
+   ( Link:E[FromFile] = CvSix("TMP") )
+ then begin "we have something"
+
+    Files_ Files + 1;
+    If ( Link:P[FromFile] neq MyPpn )
+     then begin
+	If ( Last.Fppn neq Link:P[FromFile] )
+	 then Link:U[FromFile]_ CvName( Last.Fppn_ Link:P[FromFile] );
+	Print( "(", Link:U[FromFile], ")" );
+     end;
+
+    Print( Cv6str( LKB[!RBNAM] ), ".",
+	   Cv6str( LKB[!RBEXT] land (-1 lsh 18) ),
+	   " ==> "  );
+
+    ArrTran( FNew, LKB );
+    FNew[ !RBPPN ]_ Aply(LKB[!RBPPN], Link:P[ToFile], Link:PM[ToFile]);
+    FNew[ !RBNAM ]_ Aply(LKB[!RBNAM], Link:F[ToFile], Link:FM[ToFile]);
+    FNew[ !RBEXT ]_ Aply(LKB[!RBEXT] land(-1 lsh 18),
+			 Link:E[ToFile], Link:EM[ToFile] )
+					lor !rh( LKB[!RBEXT] );
+    If ( Link:PRT[ToFile] neq 0 )
+     then Dpb( Link:PRT[ToFile], Point(9,FNew[!RBPRV],8) );
+
+    If ( FNew[ !RBPPN ] neq MyPpn )
+     then begin
+	If ( Last.Tppn neq FNew[ !RBPPN ] )
+	 then Link:U[ToFile]_ CvName( Last.Tppn_ FNew[ !RBPPN ] );
+	Print( "(", Link:U[ToFile], ")" );
+     end;
+
+    Print( Cv6str(FNew[!RBNAM]), ".", Cv6str(FNew[!RBEXT] land (-1 lsh 18)) );
+
+    If ( Link:PRT[ToFile] neq 0 )
+     then Print( "<", ("00"&Cvos(Link:PRT[ToFile]))[Inf-2 to Inf], ">" );
+
+    Open( Ochan_getchan, "DSK", (LKB[!RBPRV] lsh -23) land '17, 0,0, 0,0, 0);
+    Chnior( Ochan, FNew[ !RBCNT ], !chENT );
+    If ( !Skip! )
+     then begin "working"
+	VMCopy( Ochan,Chan, LKB[!RBSIZ], Base, 4 );
+	Close( Ochan ); Release( Ochan );
+	Print( " [ok]" );
+     end "working"
+     else
+	Print( " [ ",LKPERR[ !rh(FNew[!RBEXT]) ]," ]" );
+
+    Print( Crlf );
+
+ end "we have something";
+
+
+Procedure DeleteProc( Reference Integer Chan, Count, Brk, FileEof;
+		    Integer Array LKB );
+
+If ( 0 = ( LKB[!RBLIC] land !bit(8) ) ) or
+   ( Link:E[FromFile] = CvSix("TMP") )
+ then begin "we have something"
+
+    If ( Files = 0 )
+     then Print( "Files ""deleted""." & Crlf );
+
+    Files_ Files + 1;
+    If ( Link:P[FromFile] neq MyPpn )
+     then begin
+	If ( Last.Fppn neq Link:P[FromFile] )
+	 then Link:U[FromFile]_ CvName( Last.Fppn_ Link:P[FromFile] );
+	Print( "(", Link:U[FromFile], ")" );
+     end;
+
+    Print( Cv6str( LKB[!RBNAM] ), ".",
+	   Cv6str( LKB[!RBEXT] land (-1 lsh 18) )  );
+
+    LKB[ !RBVER ]_ LKB[ !RBPPN ];	! Save old PPN ;
+    LKB[ !RBFUT ]_ LKB[ !RBNAM ];	! Save old Name ;
+    LKB[ !RBFT1 ]_ LKB[ !RBEXT ];	! Save old Ext ;
+
+    LKB[ !RBPPN ]_ 0;
+    LKB[ !RBNAM ]_ ( LKB[!RBNAM] + LKB[!RBEXT] + Calli(0,calli!MSTIME) )
+		    lor !Xwd( 1,1 );
+    LKB[ !RBEXT ]_ CvSIX( "TMP   " );
+    LKB[ !RBLIC ] _ LKB[!RBLIC] lor !BIT(8);	! Temp file ;
+
+    Do begin
+
+	Chnior( Chan, LKB[ !RBCNT ], !chREN );
+	If not ( !Skip! )
+	 then If ( !rh( LKB[!RBEXT] ) = 4 )
+	       then LKB[!RBNAM]_ (LKB[!RBNAM] + 1) lor !bit(1);
+
+     end until ( !Skip! or ( !rh( LKB[!RBEXT] ) neq 4 )  );
+
+    If ( !Skip! )
+     then Print( "  [ok]" )
+     else Print( "  [failed]" );
+
+    Close( Chan );
+
+    Print( Crlf );
+
+ end "we have something";
+
+
+
+Procedure DirectoryProc( Reference Integer Chan, Count, Brk, FileEof;
+		    Integer Array LKB );
+
+If ( 0 = ( LKB[!RBLIC] land !bit(8) ) ) or
+   ( Link:E[FromFile] = CvSix("TMP") )
+ then begin "we have something"
+
+    Files_ Files + 1;
+    If ( Link:P[FromFile] neq MyPpn )
+     then begin
+	If ( Last.Fppn neq Link:P[FromFile] )
+	 then Link:U[FromFile]_ CvName( Last.Fppn_ Link:P[FromFile] );
+	Print( "(", Link:U[FromFile], ")" );
+     end;
+
+    Print( Cv6str( LKB[!RBNAM] ), ".",
+	   Cv6str( LKB[!RBEXT] land (-1 lsh 18) )  );
+
+    Print( Crlf );
+
+ end "we have something";
+
+
+
+Procedure ExpungeProc( Reference Integer Chan, Count, Brk, FileEof;
+			Integer Array LKB );
+
+If ( ( LKB[!RBLIC] land !bit(8) ) or
+     ( LKB[!RBVER] and LKB[!RBFUT] )  )
+ then begin "we have something"
+    Integer Name;
+
+    If not ( NameMatch( LKB[!RBFUT], LKB[!RBFT1], LKB[!RBVER] ) )
+     then Return;
+
+    If ( Files = 0 )
+     then Print( "Files Expunged:" & Crlf );
+
+    Files_ Files + 1;
+    If ( LKB[!RBVER] neq MyPpn )
+     then begin
+	If ( Last.Fppn neq LKB[!RBVER] )
+	 then Last.User_ CvName( Last.Fppn_ LKB[!RBVER] );
+	Print( "(", Last.User, ")" );
+     end;
+
+    Print( Cv6str( LKB[!RBFUT] ), ".",
+	   Cv6str( LKB[!RBFT1] land (-1 lsh 18) ) );
+
+    Name_ LKB[ !RBNAM ];
+    LKB[ !RBNAM ]_ 0;
+    Chnior( Chan, LKB[ !RBCNT ], !chREN );
+
+    If ( !Skip! )
+     then Print( "  [ok]" )
+     else Print( "  [failed] ", Cv6str(Name), ".TMP" );
+
+    Close( Chan );
+
+    Print( Crlf );
+
+ end "we have something";
+
+
+
+Procedure RenameProc( Reference Integer Chan, Count, Brk, FileEof;
+		    Integer Array LKB );
+
+If ( 0 = ( LKB[!RBLIC] land !bit(8) ) ) or
+   ( Link:E[FromFile] = CvSix("TMP") )
+ then begin "we have something"
+
+    Files_ Files + 1;
+    If ( Link:P[FromFile] neq MyPpn )
+     then begin
+	If ( Last.Fppn neq Link:P[FromFile] )
+	 then Link:U[FromFile]_ CvName( Last.Fppn_ Link:P[FromFile] );
+	Print( "(", Link:U[FromFile], ")" );
+     end;
+
+    Print( Cv6str( LKB[!RBNAM] ), ".",
+	   Cv6str( LKB[!RBEXT] land (-1 lsh 18) ),
+	   " ==> "  );
+
+    LKB[ !RBPPN ]_ Aply(LKB[!RBPPN], Link:P[ToFile], Link:PM[ToFile]);
+    LKB[ !RBNAM ]_ Aply(LKB[!RBNAM], Link:F[ToFile], Link:FM[ToFile]);
+    LKB[ !RBEXT ]_ Aply(LKB[!RBEXT] land(-1 lsh 18),
+			 Link:E[ToFile], Link:EM[ToFile] )
+					lor !rh( LKB[!RBEXT] );
+    If ( Link:PRT[ToFIle] neq 0 )
+     then LKB[!RBPRV]_ ( LKB[!RBPRV] land '777777777 )
+			    lor ( Link:PRT[ToFile] lsh 27 );
+
+    If ( LKB[ !RBPPN ] neq MyPpn )
+     then begin
+	If ( Last.Tppn neq LKB[ !RBPPN ] )
+	 then Link:U[ToFile]_ CvName( Last.Tppn_ LKB[ !RBPPN ] );
+	Print( "(", Link:U[ToFile], ")" );
+     end;
+
+    Print( Cv6str(LKB[!RBNAM]), ".", Cv6str(LKB[!RBEXT] land (-1 lsh 18)) );
+
+    If ( Link:PRT[ToFile] neq 0 )
+     then Print( "<", ("00"&Cvos(Link:PRT[ToFile]))[Inf-2 to Inf], ">" );
+
+    Chnior( Chan, LKB[ !RBCNT ], !chREN );
+
+    If ( !Skip! )
+     then Print( "  [ok]" )
+     else Print( "  [failed]" );
+
+    Close( Chan );
+
+    Print( Crlf );
+
+ end "we have something";
+
+
+Procedure UnDeleteProc( Reference Integer Chan, Count, Brk, FileEof;
+			Integer Array LKB );
+
+If ( ( LKB[!RBLIC] land !bit(8) ) or
+     ( LKB[!RBVER] and LKB[!RBFUT] )  )
+ then begin "we have something"
+
+    If not ( NameMatch( LKB[!RBFUT], LKB[!RBFT1], LKB[!RBVER] ) )
+     then Return;
+
+    If ( Files = 0 )
+     then Print( "Files Restored:" & Crlf );
+
+    Files_ Files + 1;
+    If ( LKB[!RBVER] neq MyPpn )
+     then begin
+	If ( Last.Fppn neq LKB[!RBVER] )
+	 then Last.User_ CvName( Last.Fppn_ LKB[!RBVER] );
+	Print( "(", Last.User, ")" );
+     end;
+
+    Print( Cv6str( LKB[!RBFUT] ), ".",
+	   Cv6str( LKB[!RBFT1] land (-1 lsh 18) ) );
+
+    LKB[ !RBPPN ]_ LKB[ !RBVER ];
+    LKB[ !RBNAM ]_ LKB[ !RBFUT ];
+    LKB[ !RBEXT ]_ LKB[ !RBFT1 ];
+    LKB[ !RBVER ]_ LKB[ !RBFUT ]_ LKB[ !RBFT1 ]_ 0;
+    If ( (LKB[!RBEXT] lsh -18) neq CvSix("   TMP") )
+     then LKB[!RBLIC]_ LKB[!RBLIC] land (lnot (!bit(8)) );
+
+    Chnior( Chan, LKB[ !RBCNT ], !chREN );
+
+    If ( !Skip! )
+     then Print( "  [ok]" )
+     else Print( "  [failed]" );
+
+    Close( Chan );
+
+    Print( Crlf );
+
+ end "we have something";
+
+
+
+Internal Simple Integer Procedure DoCopy( Reference R!P (link) T, F );
+begin
+
+    FromFile_ F;
+    ToFile_ T;
+
+    Last.Fppn_ Last.Tppn_ Files_ 0;
+
+    Do begin
+
+	UfdScn( Link:P[FromFile],
+		Link:F[FromFile],
+		Link:E[FromFile],
+		-1, NoTemps, CopyProc );
+
+     end until ( null!record = (F_ Link:Next[F]) );
+
+    Return( Files );
+
+end;
+
+
+Internal Simple Integer Procedure DoKill( Reference R!P (link) T, F );
+begin
+
+    ToFile_ T;
+    FromFile_ F;
+
+    Last.Fppn_ Last.Tppn_ Files_ 0;
+
+    Do begin
+	UfdScn( Link:P[FromFile],
+		Link:F[FromFile],
+		Link:E[FromFile],
+		-1, NoTemps, DeleteProc );
+     end until ( null!record = (F_ Link:Next[F]) );
+
+    Return( Files );
+
+end;
+
+
+Internal Simple Integer Procedure DoList( Reference R!P (link) T, F );
+begin
+
+    ToFile_ T;
+    FromFile_ F;
+
+    Last.Fppn_ Last.Tppn_ Files_ 0;
+
+    Do begin
+	UfdScn( Link:P[FromFile],
+		Link:F[FromFile],
+		Link:E[FromFile],
+		-1, NoTemps, DirectoryProc );
+     end until ( null!record = (F_ Link:Next[F]) );
+
+    Return( Files );
+
+end;
+
+
+Internal Simple Integer Procedure DoWipe( Reference R!P (link) T, F );
+begin
+    Integer File, Ext, Ppn;
+
+    ToFile_ T;
+    FromFile_ F;
+
+    Last.Fppn_ Last.Tppn_ Files_ 0;
+
+    MergeMasks( File, Ext, Ppn );
+
+    UfdScn( Ppn, File, CvSix( "TMP " ),
+	    -1, Temps, ExpungeProc );
+
+    Return( Files );
+
+end;
+
+
+Internal Simple Integer Procedure DoName( Reference R!P (link) T, F );
+begin
+
+    ToFile_ T;
+    FromFile_ F;
+
+    Last.Fppn_ Last.Tppn_ Files_ 0;
+
+    Do begin
+	UfdScn( Link:P[FromFile],
+		Link:F[FromFile],
+		Link:E[FromFile],
+		-1, NoTemps, RenameProc );
+     end until ( null!record = (F_ Link:Next[F]) );
+
+    Return( Files );
+
+end;
+
+
+Internal Simple Integer Procedure DoXDel( Reference R!P (link) T, F );
+begin
+    Integer File, Ext, Ppn;
+
+    ToFile_ T;
+    FromFile_ F;
+
+    Last.Fppn_ Last.Tppn_ Files_ 0;
+
+    MergeMasks( File, Ext, Ppn );
+
+    UfdScn( Ppn, File, CvSix( "TMP " ),
+	    -1, Temps, UndeleteProc );
+
+    Return( Files );
+
+end;
+
+
+end "VMUSUB";
+
+    
