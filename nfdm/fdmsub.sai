@@ -1,0 +1,1235 @@
+
+entry
+	MyPPN		comment integer -               - user ppn ;
+,	CvNAME		comment string  - [AUN]         - return username ;
+,	FScan		comment (file)  - "CMD"         - get file spec ;
+
+,	DoMOpn		comment Ptr     - File		- open master ;
+,	DoMCls		comment	-	-		- close master ;
+,	DoExit		comment -	-		- close and exit ;
+,	DoKill		comment Ptr     - @File [,list]	- delete files ;
+,	DoList		comment Ptr     - [@File[,list]]- directory [all] ;
+,	DoMake		comment Ptr	- [@File[,list]]- invent checksums ;
+,	DoRead		comment	Ptr	- @File [,list]	- read files ;
+,	DoType		comment	Ptr	- File		- type file ;
+,	DoXDel		comment Ptr     - @File [,list]	- undelete files ;
+,	DoVery		comment	Ptr	- [@File[,list]]- verify files ;
+,	DoXWrt		comment	Ptr	- @File [,list]	- write files ;
+,	DoWChk		comment	-	- { [ON], OFF }	- check filenames ;
+;
+
+
+begin "FDMSUB"
+
+require "  FDM File Utility Subroutines " message;
+
+require "MYSAIL.DEF" source!file;
+require "FDMDEF.DEF" source!file;
+require "(SAILIB)UUOSYM.DEF" source!file;
+require "(SAILIB)MFDSCN.REQ" source!file;
+require "(SAILIB)PRICHK.REQ" source!file;
+require "BRKINI.REQ" source!file;
+require "CMDSCN.REQ" source!file;
+require "CVFNAM.REQ" source!file;
+require "DAYTIM.REQ" source!file;
+require "MEMCHK.REQ" source!file;
+require "VMCOPY.REQ" source!file;
+
+
+ReDefine Link.Dot = !bit(0);
+ReDefine Link.Ind = !bit(1);
+
+Record!Class Link ( Integer Flag;	! Flags (Dot,Ind)   ;
+		    Integer F,  E,  P;	! File Name,Ext,PPN ;
+		    Integer FM, EM, PM;	! Mask File,Ext,PPN ;
+		    Integer PRT;	! File Protection   ;
+		    Integer Ver;	! File Version      ;
+		    String  U;		! File Username     ;
+		    r!p (link) Next )	! pointer to next   ;
+;
+
+Record!Class FDM (  Integer File;	! Sixbit name       ;
+		    Integer Ext;	! Sixbit extension  ;
+		    Integer Size;	! Size in words     ;
+		    Integer Date;	! Creation date     ;
+		    Integer Time;	! Creation time     ;
+		    Integer Word;	! Word in file      ;
+		    Integer Edit;	! File version/edit ;
+		    String  XSum;	! File checksum     ;
+		    Boolean Mark;	! Deletion mark     ;
+		    r!p (FDM) Copy;	! pointer to copy   ;
+		    r!p (FDM) Next )	! pointer to next   ;
+;
+
+Record!Class Mark ( r!p (FDM) This;	! pointer to file   ;
+		    r!p (Mark) Next )	! pointer to next   ;
+;
+
+Define
+    FDMVersion	=	0		! decimal version, I guess? ;
+,   FDMName1	=	FDMVersion + 1	! ascii filename (part 1) ;
+,   FDMName2	=	FDMName1 + 1	! ascii filename (part 2) ;
+,   FDMSize	=	FDMName2 + 1	! decimal file size in words ;
+,   FDMDate1	=	FDMSize  + 1	! ascii create date (part 1) ;
+,   FDMDate2	=	FDMDate1 + 1	! ascii create date (part 2) ;
+,   FDMTime1	=	FDMDate2 + 1	! ascii create time (part 1) ;
+,   FDMTime2	=	FDMTime1 + 1	! ascii create time (part 2) ;
+,   FDMXSum1	=	FDMTime2 + 1	! ascii checksum (part 1) ;
+,   FDMXSum2	=	FDMXSum1 + 1	! ascii checksum (part 2) ;
+,   FDMHeaderLength =	FDMXSum2 + 1	! length of header block ;
+;
+
+
+Own r!p (link) Links, NextFile;
+Own r!p (mark) Marks, NxtMrk;
+Own r!p (FDM) MHead, MEntry, MWork, MCopy;
+
+Own String  Scratch;
+Own String  Last.User;
+Own Integer Last.Fppn, Last.Tppn;
+Own Integer Bchan, BEof, Base, Files;
+Own Integer MChan, MEof, Merr, MFiles, MWords;
+Own Boolean MFound, MasterOpen, WRead;
+Own Boolean AnyChange, ReadChange, DeleteChange;
+
+Preset!with
+	"File not found",
+	"Incorrect PPN",
+	"Protection failure",
+	"File being modified",
+	"File already exists",
+	"Illegal sequence of UUOs",
+	"Data transmission error",
+	"Not a SAV file",
+	"Not enough memory",
+	"Device not available",
+	"No such device",
+	"Please find a wizard (#13)",
+	"No room on disk, out of quota",
+	"Please find a wizard (#15)",
+	"Insufficient monitor free core",
+	"Please find a wizard (#17)",
+	"Please find a wizard (#20)",
+	"Please find a wizard (#21)",
+	"Please find a wizard (#22)";
+Own String Array LKPERR[ 0:'22];
+
+Preset!with '17, cvSIX( "DSK   " ), '0;
+Own Safe Integer Array Dsk[ 0 : 2 ];
+
+Define	VM#Size = 10
+,	VM#Words = VM#Size * 512;
+
+Preset!with [ VM#Words ] 0;
+Own Safe Integer Array VM[ 0:VM#Words-1 ];
+Own Safe Integer Array Daytime[ 0:2 ];
+Own Safe Integer Array MLkb[ 0:'41 ];
+Own Safe Integer Array FLkb[ 0:'41 ];
+
+Define	FDM#Chan = '20;
+Own Safe Integer Array Channels[ FDM#Chan : FDM#Chan+10 ];
+
+Own Internal Integer MyPPN;
+
+
+Simple Procedure InitStuff;
+begin
+
+    MyPPN_ Calli( !Xwd(-1,!GTPPN), calli!GETTAB );
+
+    Base_ ( Location( VM[0] ) + '777 ) lsh -9;
+
+    MFDset( '17, 0,0, 0 );
+
+    MasterOpen_ ReadChange_ DeleteChange_ AnyChange_ False;
+
+    ArrClr( Channels );
+
+end;
+require InitStuff Initialization;
+
+
+
+Integer Procedure FDMChan;
+begin
+    Integer Index;
+
+    For Index_ FDM#Chan step 1 until FDM#Chan+10
+     do If not( Channels[ Index ] )
+	 then begin
+	    Channels[ Index ]_ -1;
+	    Return( Index );
+	 end;
+
+    Usererr( 0,0, "% Need more than 10 channels in FDM.", "X" );
+
+end;
+
+
+Procedure RelChan( Integer Chan );
+If ( FDM#Chan leq Chan leq (FDM#Chan+10) )
+ then Channels[ Chan ]_ 0
+ else Release( Chan );
+
+
+
+Integer Procedure GetWord( Integer Wanted );
+begin "Get Word"
+    Own Integer Array FMap[0:1];
+    Own Integer WBegin, WEnd, Err;
+
+    If ( not( WRead ) or not( WBegin leq Wanted leq WEnd ) )
+     then begin "must read page"
+
+	Calli( !Bit(7) lor !Xwd( 1, Base ), calli!VCLEAR );
+
+	FMap[0]_ !PRRO lor !Xwd( 1, Base );
+	FMap[1]_ ( Wanted lsh -9 ) + 1;
+
+	Chnior( MChan, FMap[0], !chMFP );
+	Start!code Movem 3,Err; end;
+
+	If not ( !Skip! )
+	 then begin "oops"
+	    Usererr( 0,0, "% GetWord MFP error: "&
+			    Cvos(!lh(Err))&",,"&Cvos(!rh(Err)) );
+	    Return( Err );
+	 end "oops";
+
+	WBegin_ Wanted land '777777777000;
+	WEnd_   Wanted lor '777;
+	WRead_  True;
+
+     end "must read page";
+
+    Return( Memory[ ( Base lsh 9 ) + Wanted-WBegin ] );
+
+end "Get Word";
+
+
+Procedure SetWord( Integer Wanted, NewValue );
+begin "Set Word"
+    Own Integer Array FMap[0:1];
+    Own Integer WBegin, WEnd, Err;
+
+    If ( not( WRead ) or not( WBegin leq Wanted leq WEnd ) )
+     then begin "must read page"
+
+	Calli( !Bit(7) lor !Xwd( 1, Base ), calli!VCLEAR );
+
+	FMap[0]_ !PRRW lor !Xwd( 1, Base );
+	FMap[1]_ ( Wanted lsh -9 ) + 1;
+
+	Chnior( MChan, FMap[0], !chMFP );
+	Start!code Movem 3,Err; end;
+	If not ( !Skip! )
+	 then Usererr( 0,0, "% SetWord MFP error: "&
+			    Cvos(!lh(Err))&",,"&Cvos(!rh(Err)) );
+
+	WBegin_ Wanted land '777777777000;
+	WEnd_   Wanted lor '777;
+	WRead_  True;
+
+     end "must read page";
+
+    Memory[ ( Base lsh 9 ) + Wanted-WBegin ]_ NewValue;
+
+end "Set Word";
+
+
+Procedure CheckDuplicateNames;
+Return;
+
+Procedure CheckFollyDoThisLater;
+begin "check duplicate file names"
+
+    MCopy_ MHead;
+    While ( MCopy_ FDM:Next[ MCopy ] )
+     do begin "check entry"
+
+	If ( MCopy = MEntry )
+	 then Done;
+
+	If ( ( FDM:File[ MCopy ] = FDM:File[ MEntry ] ) and
+	     ( FDM:Ext[ MCopy ]  = FDM:Ext[ MEntry ] ) )
+	 then begin "multiple versions"
+
+	    While ( FDM:Copy[ MCopy ] )
+	     do MCopy_ FDM:Copy[ MCopy ];
+
+	    FDM:Copy[ MCopy ]_ MEntry;
+	    FDM:Edit[ MEntry ]_ FDM:Edit[ MCopy ] + 1;
+
+	 end "multiple versions";
+
+     end "check entry";
+
+end "check duplicate file names";
+
+
+Procedure BuildFileList;
+begin "build file list"
+    String  Str;
+    Integer Word;
+
+    MFiles_ MWords_ Word_ WRead_ 0;
+    MHead_ MEntry_ new!record( FDM );
+
+    While ( Word < MLkb[ !RBSIZ ] )
+     do begin "page through file"
+
+	If ( GetWord( Word ) )
+	 then begin "valid file entry"
+
+	    MEntry_ FDM:Next[ MEntry ]_ new!record( FDM );
+	    Str_  CvAstr( GetWord( Word+FDMName1 ) )
+		& CvAstr( GetWord( Word+FDMName2 ) );
+
+	    FDM:File[ MEntry ]_ CvSIX( Scan( Str, BrkNam, Brk ) );
+	    FDM:Ext[ MEntry ]_  CvSIX( Str[2 to Inf] );
+	    FDM:Size[ MEntry ]_ GetWord( Word+FDMSize );
+	    FDM:Date[ MEntry ]_ CvDate( CvStr( GetWord( Word+FDMDate1 ) )
+			    & CvStr( GetWord( Word+FDMDate2 ) ) );
+	    FDM:Time[ MEntry ]_ CvTime( CvStr( GetWord( Word+FDMTime1 ) )
+			    & CvStr( GetWord( Word+FDMTime2 ) ) );
+	    FDM:XSum[ MEntry ]_ CvAstr( GetWord( Word+FDMXSum1 ) )
+				& CvAstr( GetWord( Word+FDMXSum2 ) );
+	    FDM:Word[ MEntry ]_ Word + FDMHeaderLength;
+
+	    MFiles_ MFiles + 1;
+	    MWords_ MWords + FDMHeaderLength + FDM:Size[ MEntry ];
+	    Word_ Word + FDMHeaderLength + FDM:Size[ MEntry ];
+	    CheckDuplicateNames;
+
+	 end "valid file entry"
+	 else begin "invalid entry"
+
+	    Word_ Word + FDMHeaderLength;
+
+	 end "invalid entry";
+
+     end "page through file";
+
+    If not( Mwords = MLkb[ !RBSIZ ] )
+     then Print( "% Possible size mismatch." &Crlf );
+
+    Print( MFiles, " files, ", MLkb[!RBSIZ], " words in master file." &Crlf );
+    MWords_ MLkb[ !RBSIZ ];
+
+end "build file list";
+
+
+String Procedure CvXPPN( Integer Aun );
+Return( "["&Cvos(!lh(Aun))&","&Cvos(!rh(Aun))&"]" );
+
+
+Internal String Procedure CvNAME( integer AUN );
+begin
+    string Name;
+    integer CvnChan, CvnEof;
+    safe integer array Look[ 0 : !RBUNM+1 ];
+
+    Chnior( CvnChan_FDMChan, Dsk[0], !chOPN );
+    If not( CvnEof_ not( !Skip! ) )
+     then begin "lookup ufd"
+
+	Look[ !RBCNT ]_ !RBUNM+1;		! PPN->USER;
+	Look[ !RBPPN ]_ !Xwd( 1,1 );		! (UFD)  ;
+	Look[ !RBNAM ]_ Aun;			! [user] ;
+	Look[ !RBEXT ]_ CvSIX("UFD   ");	! .UFD   ;
+
+	Chnior( CvnChan, Look[!RBCNT], !chLK );	! Lookup() ;
+	CvnEof_ not( !Skip! );			! Invert flag ;
+	Chniov( CvnChan, 0, !chREL );
+	RelChan( CvnChan );
+
+     end "lookup ufd";
+
+    If ( CvnEof )
+     then Return( Cvos(!lh(Aun))&","&Cvos(!rh(Aun)) )
+     else Return( Cv6str(Look[!RBUNM])&Cv6str(Look[!RBUNM+1]) );
+
+end;
+
+
+! ----------------------------------------------------------------------;
+!									;
+!	PrintName	Returns the text name of the FDM record which	;
+!			is passed.  Simple enough, but used pretty	;
+!			often.						;
+!									;
+! ----------------------------------------------------------------------;
+String Procedure PrintName( r!p (FDM) Nxt );
+Return(
+
+    Cv6str( FDM:File[ Nxt ] ) &
+    (If ( FDM:Ext[ Nxt ] )
+      then "."& Cv6str(FDM:Ext[ Nxt ])
+      else "")
+
+    );
+
+
+Procedure PrintInfo( Reference r!p (FDM) Nxt );
+! ----------------------------------------------------------------------;
+!									;
+!	PrintInfo	Prints various information about the current	;
+!			FDM record entry.  Current info is Name, Size,	;
+!			Creation date-time, Checksum and Edit level.	;
+!									;
+! ----------------------------------------------------------------------;
+begin "Print info"
+
+    Print(
+	(PrintName( Nxt )&"            ")[1 for 12],
+	("            " & Cvs( FDM:Size[ Nxt ] ))[Inf-11 to Inf],
+	("  "), CvSDat( FDM:Date[ Nxt ] ), " ",
+	CvSTim( FDM:Time[ Nxt ] ), "  ",
+	FDM:XSum[ Nxt ],
+	If ( FDM:Edit[ Nxt ] )
+	 then ("        " & Cvs( FDM:Edit[ Nxt ] ))[Inf-8 to Inf]
+	 else Null
+    );
+
+end "Print info";
+
+
+! ----------------------------------------------------------------------;
+!									;
+!	FScan								;
+!									;
+! ----------------------------------------------------------------------;
+Internal r!p (link) Procedure
+  FScan( Reference String S; Boolean WantVer( False ) );
+begin
+    r!p (link) F, H;
+    Integer Flag;
+    Integer Array FileArray[ CvF.Flag : CvF.Ver ];
+
+    H_ F_ new!record( link );
+    If ( WantVer )
+     then Flag_ CvF.VOk
+     else Flag_ 0;
+
+    Do begin "scanning files"
+
+	F_ Link:Next[F]_ new!record( link );
+
+	If ( CvFNam( S, Flag, FileArray ) )
+	 then ArrBlt( Link:Flag[F], FileArray[ CvF.Flag ], CvF.Count )
+	 else Return( H_ F_ null!record );
+
+	If ( 0 = (Link:P[F] lor Link:PM[F]) )
+	 then Link:P[F]_ MyPpn;
+
+	If ( 0 = ( Link:F[F] lor Link:FM[F] ) )
+	 then begin
+
+	    Link:F[F]_ CvSix("######");
+	    Link:FM[F]_ -1;
+
+	    If not( ( Link.Dot land Link:Flag[F] ) or
+		    ( Link:E[F] lor Link:EM[F] ) )
+	     then begin
+		Link:E[F]_ CvSix("###");
+		Link:EM[F]_ (-1 lsh 18);
+	     end;
+
+	 end;
+
+	Scan( S, BrkWht, Brk );
+
+	If ( Brk = "," )
+	 then Brk_ Lop( S );
+
+    end "scanning files" until ( Brk neq "," );
+
+    Return( Link:Next[H] );
+
+end;
+
+
+Procedure MergeMasks( Reference Integer File, Ext, Ppn );
+! ----------------------------------------------------------------------;
+!									;
+!	MergeMasks	Create a new set of masks to use for reading	;
+!			the master directory (MFD) or each user file	;
+!			directory (UFD).				;
+!									;
+! ----------------------------------------------------------------------;
+begin
+    r!p (link) R;
+
+    R_ Links;
+    File_ Ext_ Ppn_ 0;
+
+    Do begin "each mask"
+
+	File_ File lor Link:FM[R];
+	Ext_  Ext  lor Link:EM[R];
+	Ppn_  Ppn  lor Link:PM[R];
+
+     end "each mask" until ( null!record = R_ Link:Next[R] );
+
+! may want to look at *.*[*,*] if everything is null? ;
+! but, I doubt it!!!! ;
+
+end;
+
+
+
+! ----------------------------------------------------------------------;
+!									;
+!	CollapseMarks	Compare each of the Mark records with each	;
+!			other and remove any duplicate records which	;
+!			may have been created using any overlapping	;
+!			wildcard expressions.				;
+!									;
+! ----------------------------------------------------------------------;
+Procedure CollapseMarks;
+begin "collapse marks"
+    r!p (mark) M, L;
+
+    NxtMrk_ Marks;
+
+    While ( NxtMrk_ Mark:Next[ NxtMrk ] )
+     do begin "each entry"
+
+	M_ L_ NxtMrk;
+
+	While ( M_ Mark:Next[ M ] )
+	 do If ( Mark:This[ NxtMrk ] = Mark:This[ M ] )
+	     then Mark:Next[ L ]_ Mark:Next[ M ]
+	     else L_ M;
+
+     end "each entry";
+
+end "collapse marks";
+
+
+! ----------------------------------------------------------------------;
+!									;
+!	AMatch		Compare FDM name record against each given	;
+!			link record and return TRUE if the masked	;
+!			names match.					;
+!									;
+! ----------------------------------------------------------------------;
+Boolean Procedure AMatch( r!p (FDM) M; r!p (link) L );
+begin "match it"
+    Integer FM, EM;
+
+    FM_ Link:FM[ L ];
+    EM_ Link:EM[ L ];
+
+    Return(
+	( ( FDM:File[M] lor FM ) = ( Link:F[L] lor FM ) ) and
+	( ( FDM:Ext[M]  lor EM ) = ( Link:E[L] lor EM ) ) and
+	( ( Link:Ver[L] = -1 ) or ( FDM:Edit[M] = Link:Ver[L] ) )
+	    );
+
+end "match it";
+
+
+! ----------------------------------------------------------------------;
+!									;
+!	Worker		The main routine which does all the work of	;
+!			piecing together the results from scanning	;
+!			the command line and calling the appropriate	;
+!			routine for each file which matches the given	;
+!			specification list.				;
+!									;
+! ----------------------------------------------------------------------;
+Integer Procedure Worker( Reference r!p (link) Ptr;
+			  Procedure It );
+begin "work work work"
+
+    If not( MasterOpen )
+     then begin "no no no"
+	Print( Crlf& "% No master file open." &Crlf );
+	Return( -1 );
+     end "no no no";
+
+    If not( MHead )
+     then begin "not really"
+	Print( Crlf& "% Master file NOT REALLY open." &Crlf );
+	Return( -1 );
+     end "not really";
+
+    Links_ Ptr;
+    Do If ( ( Link:E[Links] lor Link:EM[Links] ) = 0 )
+	    and not( Link.Dot land Link:Flag[Links] )
+	 then begin "apply wild cards"
+
+	    Link:E[ Links ]_ CvSIX( "###" );
+	    Link:EM[ Links ]_ -1 lsh 18;
+
+	 end "apply wild cards"
+     until ( null!record = ( Links_ Link:Next[ Links ] ) );
+
+    Links_ Ptr;
+    Marks_ NxtMrk_ new!record( mark );
+
+    Do begin
+
+	MWork_ MHead;
+	While ( MWork_ FDM:Next[ MWork ] )
+	 do If ( AMatch( MWork, Links ) )
+	     then begin "each match"
+		NxtMrk_ Mark:Next[ NxtMrk ]_ new!record( mark );
+		Mark:This[ NxtMrk ]_ MWork;
+	     end "each match";
+
+     end until ( null!record = (Links_ Link:Next[Links]) );
+
+    Files_ 0;
+
+    If ( Mark:Next[ Marks ] )
+     then begin "we have work to do"
+
+	CollapseMarks;
+
+	NxtMrk_ Marks;
+	While ( NxtMrk_ Mark:Next[ NxtMrk ] )
+	 do It( Mark:This[ NxtMrk ] );
+
+     end "we have work to do";
+
+    Return( Files );
+
+end "work work work";
+
+
+Boolean Procedure Temps( Reference Integer Filename, Extension );
+begin "temps"
+
+    Return( Extension = CvSix("TMP") );
+
+end "temps";
+
+Boolean Procedure NoTemps( Reference Integer Filename, Extension );
+begin "no temps"
+
+    Return( ( Extension          neq CvSix("TMP") ) or
+	    ( Link:E[Links] =   CvSix("TMP") )     );
+
+end "no temps";
+
+
+
+Procedure ReadProc( Reference Integer Chan, Count, Brk, FileEof;
+		    Integer Array LKB );
+
+If ( 0 = ( LKB[!RBLIC] land !bit(8) ) ) or
+   ( Link:E[Links] = CvSix("TMP") )
+ then begin "we have something"
+
+    If ( Files = 0 )
+     then Print( Crlf& "Reading files:" &Crlf );
+
+    Files_ Files + 1;
+
+    If ( Link:P[Links] neq MyPpn )
+     then begin
+	If ( Last.Fppn neq Link:P[Links] )
+	 then Link:U[Links]_ CvName( Last.Fppn_ Link:P[Links] );
+	Print( "(", Link:U[Links], ")" );
+     end;
+
+    Print( CvXstr( LKB[!RBNAM] ), " ",
+	   CvXstr( LKB[!RBEXT] land (-1 lsh 18) )[1 FOR 3],
+	   ("            "&Cvs(LKB[!RBSIZ]))[INF-11 to INF],
+	   "  " );
+
+    AnyChange_ ReadChange_ True;	! try adding to master ;
+
+    If ( LKB[!RBSIZ] )
+     then Merr_ VMCopy( MChan, Chan, Lkb[!RBSIZ], Base, VM#Size-1,
+		MWords+FDMHeaderLength, 0, True )
+     else Merr_ !Xwd( 0, -1 );		! [cough] [cough] empty file ;
+
+    If ( Merr )
+     then begin "somethings wrong"
+
+	Chniov(MChan, MWords, !chFTR);	! truncate back to size ;
+	Print( "  [aborted] " );
+	VMCErr( Merr );
+	Print( Crlf );
+
+     end "somethings wrong"
+     else begin "looks good to me"
+
+	MEntry_ FDM:Next[ MEntry ]_ new!record( FDM );
+	FDM:File[ MEntry ]_ LKB[!RBNAM];
+	FDM:Ext[ MEntry ]_  LKB[ !RBEXT ] land (-1 lsh 18);
+	FDM:Size[ MEntry ]_ LKB[ !RBSIZ ];
+
+	Daytime[ 0 ]_ ((LKB[!RBEXT] lsh -2) land '30000)
+			lor (LKB[!RBPRV] land '7777);
+	Daytime[ 1 ]_ ( (((LKB[!RBPRV] lsh -12) land '3777) * 60)
+			+ ((LKB[!RBLIC] lsh -18) land '77) ) * 60;
+	Daytime[ 2 ]_ !Xwd( '400020, '400000 ) +
+	    ((Calli( !Xwd(-1,!GTPRV), calli!GETTAB ) rot 8) land '77);
+	Calli( location(Daytime[0]), calli!DATUUO );
+	FDM:Date[ MEntry ]_ Daytime[ 0 ];
+	FDM:Time[ MEntry ]_ Daytime[ 1 ] div 60;
+
+	WRead_ False;		! Force SETWORD to start fresh ;
+
+	SetWord( MWords+FDMVersion, 100 stupid OLD program ;
+
+	Scratch_ (Cv6str( Lkb[!RBNAM] ) & ( If ( !rh(Lkb[!RBEXT]) )
+		    then "." & Cv6str( Lkb[!RBEXT] land (-1 lsh 18) )
+		    else "" ) & "          ");
+	SetWord( MWords+FDMName1, CvAsc( Scratch[1 for 5] ) );
+	SetWord( MWords+FDMName2, CvAsc( Scratch[6 for 5] ) );
+    
+	SetWord( MWords+FDMSize, Lkb[!RBSIZ] );
+
+	Scratch_ TymDay( !Xwd( Daytime[0], Daytime[1] div 60 ) );
+	SetWord( MWords+FDMDate1, CvAsc( Scratch[1 for 5] ) );
+	SetWord( MWords+FDMDate2, CvAsc( Scratch[6 for 5] ) );
+	SetWord( MWords+FDMTime1, CvAsc( Scratch[11 for 5] ) );
+	SetWord( MWords+FDMTime2, CvAsc( Scratch[16 for 5]&"  " ) );
+
+	Scratch_ FDM:XSum[ MEntry ]_ PriChk( VMXSum );
+	SetWord( MWords+FDMXSum1, CvAsc( Scratch[1 for 5] ) );
+	SetWord( MWords+FDMXSum2, CvAsc( Scratch[6 for 5] ) );
+
+	FDM:Word[ MEntry ]_ MWords + FDMHeaderLength;
+	MWords_ MWords + FDMHeaderLength + Lkb[!RBSIZ];
+	MFiles_ MFiles + 1;
+	Print( "  ", Scratch, " [ok]" );
+	CheckDuplicateNames;
+
+     end "looks good to me";
+
+    Chniov( Chan, CL!RST lor CL!ACS, !chCLS );
+
+
+    Print( Crlf );
+
+ end "we have something";
+
+
+
+Simple Integer Procedure BackupMaster( Reference Integer Chan );
+begin "backup master file"
+    Integer OldExt;
+
+    ArrBlt( FLkb[!RBCNT], MLkb[!RBCNT], !RBNAM+1 );
+    FLkb[!RBEXT]_ CvSix("BAK   ");
+
+    Chnior( Chan, FLkb[!RBCNT], !chLK );
+    If ( !Skip! )
+     then begin "must delete old backup"
+
+	FLkb[!RBPRV]_ FLkb[!RBPRV] land (-1 lsh -9);
+	Chnior( Chan, FLkb[!RBCNT], !chREN );
+
+	If ( !Skip! )
+	 then begin "now delete it"
+	    FLkb[!RBNAM]_ 0;
+	    Chnior( Chan, FLkb[!RBCNT], !chREN );
+	 end "now delete it";
+
+	If not( !Skip! )
+	 then Return( !Xwd( 0, FLkb[!RBEXT] ) );
+
+     end "must delete old backup";
+
+    MLkb[!RBLIC]_ MLkb[!RBLIC] lor !BIT(8);
+    MLkb[!RBEXT]_ !Xwd( CvSix("xxxBAK"), OldExt_MLkb[!RBEXT] );
+
+    Chnior( MChan, MLkb[!RBCNT], !chREN );	    
+    MLkb[!RBLIC]_ MLkb[!RBLIC] land lnot (!bit(8));
+    OldExt Swap MLkb[!RBEXT];
+    If not( !Skip! )			! rename error ;
+     then Return( !Xwd( 1, OldExt ) );
+
+    Chan swap MChan;			! swap channels ;
+
+    ArrBlt( FLkb[!RBCNT], MLkb[!RBCNT], !RBNAM+1 );
+    FLkb[!RBEXT]_ CvSix("BAK   ");
+    Chnior( Chan, FLkb[!RBCNT], !chLK );
+    If not( !Skip! )
+     then Return( !Xwd( 1, FLkb[!RBEXT] ) );
+
+    Chnior( MChan, MLkb[!RBCNT], !chENT );
+    If not( !Skip! )
+     then Return( !Xwd( 1, MLkb[!RBEXT] ) )
+     else Return( 0 );			! *** SUCCESS *** ;
+
+
+end;
+
+
+Procedure ExpungeMasterFile;
+begin "expunge master"
+
+    Calli( !bit(7) lor !Xwd( VM#Size-1, Base ), calli!VCLEAR );
+    WRead_ False;
+
+    Chnior( BChan_FDMChan, Dsk[0], !chOPN );
+    If not( !Skip! )
+     then Usererr(0,0,Crlf&"% Serious DSK error, cannot open DSK"&Crlf);
+
+    If not( Merr_ BackupMaster( BChan ) )
+     then begin "expunge"
+
+	MWords_ 0;			! reset file size ;
+	MEntry_ MHead;			! start at the top ;
+
+	While ( MEntry_ FDM:Next[ MEntry ] )
+	 do If not( FDM:Mark[ MEntry ] )
+	     then begin "copy file"
+
+		Merr_ VMCopy( MChan, BChan,
+			      FDMHeaderLength + FDM:Size[ MEntry ],
+			      Base, VM#Size-1,
+			      MWords, FDM:Word[ MEntry ]-FDMHeaderLength,
+			      False );
+		If ( Merr )
+		 then begin "copy error"
+
+		    Chniov( MChan, MWords, !chFTR );
+		    Print( "% Error rewriting master, " );
+		    VMCErr( MErr );
+		    Print( Crlf );
+		    PrintInfo( MEntry );
+		    Print( Crlf );
+
+		 end "copy error"
+		 else MWords_ MWords+FDMHeaderLength+FDM:Size[MEntry];
+
+	     end "copy file";
+
+     end "expunge";
+
+    Chniov( BChan, 0, !chCLS );		! close backup file ;
+    Chniov( BChan, 0, !chREL );		! release the channel ;
+    RelChan( BChan );			! tell FDM it's free ;
+
+    Chniov( MChan, 0, !chCLS );		! close master file ;
+
+end "expunge master";
+
+
+Simple Procedure CloseMaster( Integer Bits( 0 ) );
+begin
+
+    DeleteChange_ False;
+
+    MEntry_ MHead;
+    While ( MEntry_ FDM:Next[ MEntry ] )
+     do If ( FDM:Mark[ MEntry ] )
+	 then begin "sigh it changed"
+
+	    DeleteChange_ AnyChange_ True;
+	    Done;
+
+	 end "sigh it changed";
+
+    If ( DeleteChange )
+     then ExpungeMasterFile
+     else Chniov( MChan, CL!ACS lor CL!RST, !chCLS );
+
+    Chniov( MChan, 0, !chREL );
+    RelChan( MChan );
+
+    Print( Crlf& "[Master file ",
+	    (If MLkb[!RBPPN] neq MyPPN
+	     then "("& CvName( MLkb[!RBPPN] ) &")"
+	     else Null ), Cv6str(MLkb[!RBNAM]),
+	    (If !lh(MLkb[!RBEXT])
+	     then "." & Cv6str( MLkb[!RBEXT] land (-1 lsh 18) )
+	     else Null ), " closed.",
+	    (If not( AnyChange ) or ( Bits )
+	     then " (no changes)"
+	     else Null ), "]" &Crlf,
+	    MFiles, " files, ",
+	    MWords, " words in master file." &Crlf );
+
+    MasterOpen_ False;			! clear the open flag ;
+    MFiles_ MWords_ WRead_ 0;		! clear various counts ;
+    MHead_ MEntry_ null!record;		! clear out the FDM records ;
+    ArrClr( MLkb );			! and the master file info ;
+
+end;
+
+
+Internal Simple Procedure DoExit;
+begin
+
+    If ( MasterOpen )
+     then CloseMaster;
+
+    While ( True )
+     do begin "we are done"
+
+	Print( Crlf& "End of FDM execution." &Crlf );
+					! finish up with a message ;
+	Memory[ '120 ]_ 0;		! clear start to fix bug?? ;
+	Calli( 0, calli!EXIT );		! actually "calli 1,exit"  ;
+
+     end "we are done";
+
+end;
+
+
+Internal Simple Procedure DoMCls( Integer Bits( 0 ) );
+begin
+
+    If ( MasterOpen )
+     then begin "close it"
+
+	CloseMaster( Bits );
+	Print( Crlf );
+
+     end "close it"
+     else Print( Crlf& "% Master file not open." &Crlf&Crlf );
+
+end;
+
+
+Internal Simple Integer Procedure DoMOpn( Reference r!p (link) Ptr );
+begin "OPEN master"
+
+    If ( Link.Ind land Link:Flag[Ptr] )	! If indirect set, complain ;
+     then begin "indirect files illegal"
+	Print(Crlf& "% Indirect specification illegal in master file." &Crlf);
+	Return( -1 );
+     end "indirect files illegal";
+
+    If ( Link:FM[ Ptr ] or Link:EM[ Ptr ] or Link:PM[ Ptr ] )
+     then begin "wildcard master illegal"
+	Print( Crlf& "% Wildcards illegal in master file." &Crlf );
+	Return( -1 );
+     end "wildcard master illegal";
+
+    If ( MasterOpen )			! if master already open ;
+     then DoMCls;			!  then close it. ;
+
+    Chnior( MChan_ FDMChan, Dsk[0], !chOPN );
+    If ( MEof_ not !Skip! )
+     then begin "serious disk error"
+	Print( Crlf& "% Serious DSK error, cannot open DSK" &Crlf );
+	Return( -1 );
+     end "serious disk error";
+
+    MLkb[ !RBCNT ]_ '41;
+    MLkb[ !RBPPN ]_ Link:P[ Ptr ];
+    MLkb[ !RBNAM ]_ Link:F[ Ptr ];
+    MLkb[ !RBEXT ]_ Link:E[ Ptr ];
+
+    Chnior( MChan, MLkb[!RBCNT], !chLK );
+    If not( MFound_ !Skip! )
+     then begin "we need a master"
+
+	MEof_ !rh( MLkb[!RBEXT] );
+	If not( ( Link.Dot land Link:Flag[ Ptr ] ) or ( MEof ) )
+	 then begin "force default"
+
+	    MLkb[!RBEXT]_ Link:E[ Ptr ]_ CvSIX( "FDM" );
+
+	    Chnior( MChan, MLkb[!RBCNT], !chLK );
+	    If not( MFound_ !Skip! )
+	     then MEof_ !rh( MLkb[!RBEXT] );
+
+	 end "force default";
+
+	If ( not( MFound ) and ( MEof ) )
+	 then begin "lookup error"	! Error other than not found ;
+
+	    Chniov( MChan, CL!ACS, !chREL );
+	    RelChan( MChan );
+	    Print( Crlf&"% Lookup error: ", LkpErr[ MEof ], Crlf );
+	    Return( -1 );
+
+	 end "lookup error";
+
+     end "we need a master";
+
+    If not( MFound )
+     then Print( "[New file: " )
+     else Print( "[Old file: " );
+
+    Print(  (If MLkb[!RBPPN] neq MyPPN
+	     then "("& CvName( MLkb[!RBPPN] ) &")"
+	     else Null ), Cv6str(MLkb[!RBNAM]),
+	    (If ( !lh(MLkb[!RBEXT]) )
+	      then "." & Cv6str( MLkb[!RBEXT] land (-1 lsh 18) )
+	      else Null), "]" & Crlf );
+
+    MLkb[!RBPRV]_ 0;			! update creation/access ;
+    MLkb[!RBEXT]_ MLkb[!RBEXT] land ( -1 lsh 18 );
+
+    Chnior( MChan, MLkb[!RBCNT], !chENT );
+    If not ( !Skip! )
+     then begin "cannot update/enter file"
+
+	Chniov( MChan, CL!ACS lor CL!RST, !chREL );
+	RelChan( MChan );
+	Print( Crlf& "% Enter error: ", LkpErr[!rh(MLkb[!RBEXT])], Crlf );
+	Return( -1 );
+
+     end "cannot update/enter file";
+
+    AnyChange_ ReadChange_ DeleteChange_ False;
+    MasterOpen_ True;			! we have a file ;
+    BuildFileList;			! make a new file list ;
+    Return( -1 );			! placate worker/do.cmd ;
+
+end "OPEN master";
+
+
+Internal Simple Integer Procedure DoRead( Reference r!p (link) Ptr );
+begin
+
+    If not( MasterOpen )
+     then begin "no no no"
+	Print( Crlf& "% No master file open." &Crlf );
+	Return( -1 );
+     end "no no no";
+
+    Links_ Ptr;
+    Last.Fppn_ Last.Tppn_ Files_ 0;
+
+    Do UfdScn(  Link:P[Links],
+		Link:F[Links],
+		Link:E[Links],
+		-1,
+		NoTemps,
+		ReadProc )
+     until ( null!record = (Links_ Link:Next[Links]) );
+
+    Return( Files );
+
+end;
+
+
+Procedure DeleteFile( Reference r!p (FDM) Nxt );
+begin "Delete file"
+
+   If not( FDM:Mark[ Nxt ] )
+    then begin "list deletions"
+
+	If not( Files )
+	 then Print( "Files deleted:"&Crlf );
+
+	Print( PrintName( Nxt ), Crlf );
+	FDM:Mark[ Nxt ]_ True;
+	MFiles_ MFiles - 1;
+	Files_ Files + 1;
+
+    end "list deletions";
+
+end "Delete file";
+
+
+Internal Simple Integer Procedure DoKill( Reference r!p (link) Ptr );
+Return( Worker( Ptr, DeleteFile ) );
+
+
+
+Procedure ListFile( Reference r!p (FDM) Nxt );
+begin "list file"
+
+    If not( FDM:Mark[ Nxt ] )
+     then begin "list data"
+
+	If not( Files )
+	 then Print( Crlf &
+	     "Filename           Words  Date      Time      Checksum  (Edit)"
+	     & Crlf );
+
+	PrintInfo( Nxt );
+	Print( Crlf );
+	Files_ Files + 1;
+
+     end "list data";
+
+end "list file";
+
+
+Internal Simple Integer Procedure DoList( Reference r!p (link) Ptr );
+Return( Worker( Ptr, ListFile ) );
+
+
+
+Procedure WriteFile( Reference r!p (FDM) Nxt );
+begin "Write files"
+
+    If not( FDM:Mark[ Nxt ] )
+     then begin "writing files"
+
+	incr( Files );
+	PrintInfo( Nxt );
+
+	Chnior( BChan_ FDMChan, DSK[0], !chOPN );
+	If not( !Skip! )
+	 then usererr( 0,0, "no DSK?", "X" );
+
+	ArrClr( FLkb );
+	FLkb[!RBCNT]_ '41;
+	FLkb[!RBNAM]_ FDM:File[ Nxt ];
+	FLkb[!RBEXT]_ FDM:Ext[ Nxt ];
+
+	If ( FDM:Date[ Nxt ] )
+	 then begin "it's a real date"
+
+	    Daytime[ 0 ]_ FDM:Date[ Nxt ];
+	    Daytime[ 1 ]_ FDM:Time[ Nxt ] * 60;
+	    Daytime[ 2 ]_ !Xwd( '400000, '400020 ) +
+	      (((Calli( !Xwd(-1,!GTPRV), calli!GETTAB ) rot 8) land '77) lsh 18);
+	    Calli( location(Daytime[0]), calli!DATUUO );
+    
+	    FLkb[!RBEXT]_ FLkb[!RBEXT] lor ((Daytime[0] land '30000) lsh 2);
+	    Daytime[ 1 ]_ Daytime[1] div 60;
+	    FLkb[!RBLIC]_ (Daytime[1] mod 60) lsh 18;
+	    FLkb[!RBPRV]_ (Daytime[0] land '7777) lor
+			    (((Daytime[1] div 60) land '37777) lsh 12);
+
+	 end "it's a real date";
+
+	Chnior( BChan, FLkb[!RBCNT], !chENT );
+	If not( !Skip! )
+	 then begin "enter error"
+
+	    Print(" % Enter error: ",LkpErr[!rh(FLkb[!RBEXT])],Crlf);
+	    Chniov( BChan, CL!ACS lor CL!RST, !chREL );
+
+	 end "enter error"
+	 else begin "write the file"
+
+	    Merr_ VMCopy( BChan, MChan,
+			  FDM:Size[ Nxt ], Base, VM#Size-1,
+			  0, FDM:Word[ Nxt ],
+			  False );
+
+	    If ( Merr )
+	     then begin "write error"
+
+		Print( " [aborted]" &Crlf );
+		Chniov( BChan, CL!ACS lor CL!RST, !chREL );
+
+	     end "write error"
+	     else begin "written ok"
+
+		Print( " [ok]" &Crlf );
+		Chniov( BChan, 0, !chCLS );
+		Chniov( BChan, 0, !chREL );
+
+	     end "written ok";
+
+	 end "write the file";
+
+	RelChan( BChan );
+
+     end "writing files";
+
+end "Write files";
+
+
+Internal Simple Integer Procedure DoXWrt( Reference r!p (link) Ptr );
+Return( Worker( Ptr, WriteFile ) );
+
+
+
+Procedure MakeChecksum( Reference r!p (FDM) Nxt );
+begin "Verify file"
+
+    If not( FDM:Mark[ Nxt ] )
+     then begin "verifying files"
+
+	Files_ Files + 1;
+
+     end "verifying files";
+
+end "Verify file";
+
+
+Internal Simple Integer Procedure DoMake( Reference R!P (link) Ptr );
+Return( Worker( Ptr, MakeChecksum ) );
+
+
+Procedure VerifyFile( Reference r!p (FDM) Nxt );
+begin "Verify file"
+
+    If not( FDM:Mark[ Nxt ] )
+     then begin "verifying files"
+
+	Files_ Files + 1;
+
+     end "verifying files";
+
+end "Verify file";
+
+
+Internal Simple Integer Procedure DoVery( Reference r!p (link) Ptr );
+Return( Worker( Ptr, VerifyFile ) );
+
+
+
+Procedure UndeleteFile( Reference r!p (FDM) Nxt );
+begin "Undelete file"
+
+    If ( FDM:Mark[ Nxt ] )
+     then begin "undeleting files"
+
+	If not( Files )
+	 then Print( "Files undeleted:"&Crlf );
+
+	Print( PrintName( Nxt ), Crlf );
+	FDM:Mark[ Nxt ]_ False;
+	MFiles_ MFiles + 1;
+	Files_ Files + 1;
+
+     end "undeleting files";
+
+end "Undelete file";
+
+
+Internal Simple Integer Procedure DoXDel( Reference r!p (link) Ptr );
+Return( Worker( Ptr, UndeleteFile ) );
+
+
+
+Procedure TypeFile( Reference r!p (FDM) Nxt );
+begin "Type file"
+
+    If not( FDM:Mark[ Nxt ] )
+     then begin "typing files"
+
+	Print(  Crlf &
+	    "Filename           Words  Date      Time      Checksum  (Edit)"
+	    & Crlf );
+
+	PrintInfo( Nxt );
+	Print( Crlf & Crlf );
+
+	! put the guts of the typeout routine here... ;
+	Print( "File typeout not quite implemented." );
+
+	Files_ Files + 1;
+
+     end "typing files";
+
+end "Type file";
+
+
+Internal Simple Integer Procedure DoType( Reference r!p (link) Ptr );
+Return( Worker( Ptr, TypeFile ) );
+
+
+
+Internal Simple Integer Procedure DoWChk;
+begin
+
+    Return( -1 );
+
+end;
+
+
+end "FDMSUB";
+
+ 2  \V
