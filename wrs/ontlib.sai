@@ -1,0 +1,515 @@
+entry;
+begin
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "AUXLIB.DCL" source!file;
+require "MAILIB.DCL" source!file;
+
+internal record!class otm (
+    string	Host;
+    string	Id;
+    string	Key;
+    string	Addr;
+    r!p(otm)	Link );
+internal r!p(otm) otFMap;	! forwarding data from (MAIL)ONTYME.DAT;
+internal r!p(otm) otRMap;	! reverse data from (MAIL)ONTYME.DAT;
+internal string otHOST;		! current host name;
+internal string otID;		! current user ID;
+internal integer otMsgChan;	! msg channel, default -1;
+internal integer otTimeOut;	! time limit - default 300;
+internal integer otPOS;		! position on output line [0:n];
+
+define calli!SLEEP = '31;
+
+integer	break.token,break.dat,break.quote;
+simple procedure otINIT;
+begin
+    setbreak( break.token := getbreak, " "&#lf, " "&#cr, "TIS" );
+    setbreak( break.dat := getbreak, ""","&#lf&#ff, " "&#ht&#cr, "SIN" );
+    setbreak( break.quote := getbreak, """", null, "SIN" );
+    otHOST := null;	! not connected;
+    otID := null;	! not signed on;
+    otMsgChan := -1;	! default to standard output;
+    otTimeOut := 600;	! ten minute default;
+end;
+require otINIT initialization[0];
+
+! ----------------------------------------------------------------------
+
+		    syntax of (MAIL)ONTYME.DAT
+
+    <line>	::= <host>, <id>, <key>, <faddr>, <raddr-list> <crlf>
+    <host>	::= EMSAA
+    <id>	::= <account>.<name>
+    <account>	::= (ontyme account designator)
+    <name>	::= (ontyme user name withing account)
+    <key>	::= (password)
+    <faddr>	::= (internet address to forward incomming mail to)
+    		| <null> (to not poll for mail)
+    <raddr-list>::= <raddr>, <raddr-list>
+    		| <raddr>
+    <raddr>	::= (internet address to accept outgoing mail from)
+
+------------------------------------------------------------------------
+
+    <host>	the host nam ethe account is valid on
+    <id>	the Ontyme user id
+    <key>	the key associated with that user id
+    <faddr>	the forwarding TUMS address for mail received from Ontyme
+		to this user id - if null, will not poll this user id
+		for mail at all
+    <raddr>	the list of TUMS addresses that may send mail through
+		this user id - the delivery system will use the last
+		user id in the ONTYME.DAT file which contains a <raddr>
+		which matches the from TUMS address the mail was sent by
+
+------------------------------------------------------------------------
+;
+internal procedure otGetMap;
+if not ( otFMap or otRMap ) then begin
+    integer C,B,E,LineNo,PageNo,SosNo;
+    string procedure inputString;
+    begin
+	string S;
+	S := input( C, break.dat );
+	if B = """" and length(S) then begin
+	    cprint( otMsgChan,
+		"?(MAIL)ONTYME.DAT bad string syntax in page ",
+		PageNo, " line ", LineNo+1, " at ", S, """"& crlf );
+	    S := null;
+	end;
+	while B = """" do begin
+	    string S1;
+	    if length(S) then S := S& """";
+	    S := S& input( C, break.quote );
+	    S1 := input( C, break.dat );
+	    if length(S1) then cprint( otMsgChan,
+		"?(MAIL)ONTYME.DAT bad string syntax in page ",
+		PageNo, " line ", LineNo+1, " at """, S, """", S1, crlf );
+	end;
+	return( S );
+    end;
+    open( C:=getchan, "DSK", 0,4,0, 256,B,E );
+    lookup( C, "(MAIL)ONTYME.DAT", E );
+    if E then cprint( otMsgChan, "?(MAIL)ONTYME.DAT not found", crlf );
+    LineNo := 0; PageNo := 1;
+    setpl( C, LineNo, PageNo, SosNo );
+    while not E do begin
+	string Host,ID,KEY;
+	procedure linkUp( reference r!p(otm) ROOT; string Addr );
+	if length( Addr ) then begin
+	    r!p( otm ) R;
+	    integer B;
+	    R := new!record( otm );
+	    otm:Link[R] := ROOT;
+	    ROOT := R;
+	    otm:Host[R] := Host;
+	    otm:ID[R] := ID;
+	    otm:KEY[R] := KEY;
+	    otm:Addr[R] := maiAScan( Addr, B );
+	end;
+	define formatError = {
+	begin
+	    cprint( otMsgChan,
+		"?(MAIL)ONTYME.DAT format error in page ",
+		PageNo, " line ", LineNo+1, crlf );
+	    continue;
+	end };
+	Host := inputString;
+	if B neq "," then continue;
+	ID := inputString;
+	if B neq "," then formatError;
+	KEY := inputString;
+	if B neq "," then formatError;
+	linkUp( otFMap, inputString);
+	while B = "," do linkUp( otRMap, inputString );
+    end;
+    release( C );
+end;
+
+internal r!p(otm) procedure otRLook( string RPath,Host(null) );
+begin
+    r!p(otm) R;
+    r!p(adr) A1,A2;
+    integer B;
+    A1 := maiAParse( maiAScan( RPath, B ));
+    if not otRMap then otGetMap;
+    R := otRMap;
+    while R do begin
+	A2 := maiAParse( otm:Addr[R] );
+	if (length(Host)=0           or kequ(otm:Host[R]    ,Host           ))
+	and(equ("*",adr:User[A2]   ) or kequ(adr:User[A1]   ,adr:User[A2]   ))
+	and(equ("*",adr:Host[A2]   ) or (
+		kequ(adr:SubHost[A1],adr:SubHost[A2])
+	    and kequ(adr:Host[A1]   ,adr:Host[A2]   )
+	    and kequ(adr:Net[A1]    ,adr:Net[A2]    ) ))
+		then return( R )
+		else R := otm:Link[R];
+    end;
+    return( null!record );
+end;
+
+internal boolean procedure otSync;
+begin	"otSync"
+    string Txt;
+    while true do case AuxRead( Txt, otTimeOut ) of begin
+	[aux!Prompt] if equ( Txt, ":" ) then return( true );
+	[aux!Line] ;
+	[else] begin
+	    cprint( otMsgChan, "?otSync: unable to sync"& crlf );
+	    return( false );
+	end
+    end;
+end	"otSync";
+
+
+! .DCL begin;
+define
+    OKAY = true;
+! .DCL end;
+internal boolean procedure otACmd( string CMDLINE; boolean IsOKAY(false) );
+!
+    Simple command - expects reply of ACCEPTED.
+;
+begin	"ACmd"
+    string Txt,Rsp;
+    boolean ACCEPTED;
+    Rsp := null;
+    ACCEPTED := false;
+    AuxOut( CMDLINE );
+    AuxOut( #cr );
+    while true do case AuxRead( Txt, otTimeOut ) of begin
+	[aux!Zap] begin
+	    cprint( otMsgChan, "?ACmd(", CMDLINE, "): circuit zapped"& crlf );
+	    otHost := otID := null;
+	    return( false );
+	end;
+	[aux!Timeout] begin
+	    cprint( otMsgChan, "?ACmd(", CMDLINE, "): timeout"& crlf );
+	    return( false );
+	end;
+	[aux!Prompt] begin
+	    if equ( Txt, ":" ) then begin
+		if not ACCEPTED and not IsOKAY then cprint( otMsgChan,
+		    "?ACmd(", CMDLINE, "): unexpected response..."&crlf, Rsp );
+		return( ACCEPTED );
+	    end;
+	    cprint( otMsgChan, "?ACmd(", CMDLINE, "): unexpected prompt: ",
+		Txt, crlf );
+	    return( false );
+	end;
+	[aux!Line] if length(Txt) > 2 then begin
+	    ACCEPTED := equ(Txt,"ACCEPTED"&crlf);
+	    Rsp := Rsp& Txt;
+	end
+    end;
+end	"ACmd";
+
+internal boolean procedure otLCmd( string CMDLINE; procedure PROC );
+!
+    Simple command - expects reply of ACCEPTED.
+;
+begin	"LCmd"
+    string Txt;
+    AuxOut( CMDLINE );
+    AuxOut( #cr );
+    while true do case AuxRead( Txt, otTimeOut ) of begin
+	[aux!Zap] begin
+	    cprint( otMsgChan, "?LCmd(", CMDLINE, "): circuit zapped"& crlf );
+	    otHost := otID := null;
+	    return( false );
+	end;
+	[aux!Timeout] begin
+	    cprint( otMsgChan, "?LCmd(", CMDLINE, "): timeout"& crlf );
+	    return( false );
+	end;
+	[aux!Prompt] begin
+	    if equ( Txt, ":" ) then return( true );
+	    cprint( otMsgChan, "?LCmd(", CMDLINE, "): unexpected prompt: ",
+		Txt, crlf );
+	    return( false );
+	end;
+	[aux!Line] if not equ( Txt, CMDLINE& crlf )
+	    then PROC( Txt )
+    end;
+end	"LCmd";
+
+boolean needSetBreak;
+
+internal boolean procedure otConnect (
+    string	HOST );
+begin	"otConnect"
+    integer I;
+    string S;
+    needSetBreak := true;
+    otHOST := otID := null;
+    for I := 0 upto 12 do begin "RETRY"
+	AuxZap;
+	Creaux( HOST );
+	if AuxSync( "ONTYME"&crlf, otTimeOut ) then begin
+	    if I then cprint( otMsgChan,
+		"[otConnect: host ",HOST,"; ",I," retries]"& crlf );
+	    otHost := HOST;
+	    return( true );
+	end;
+	calli( !xwd( 1, case I of (1,1,2,4,8,15,30,[else]60) ), '72 );
+    end;
+    cprint( otMsgChan, "otConnect: unable to connect to ",HOST,crlf );
+    return( false );
+end	"otConnect";
+
+internal boolean procedure otSignon (
+    string	ID;
+    string	KEY );
+begin	"otSignon"
+    string	S;
+    boolean	ID.sent, KEY.sent;
+    if length( otHost ) = 0 then begin
+	cprint( otMsgChan, "?otSignon: no host connection"& crlf );
+	return( false );
+    end;
+    if length(otID) then begin
+	AuxOut( "signon"&#cr );
+	otID := null;
+    end;
+    ID.sent := KEY.sent := false;
+    while true do
+	case AuxRead( S, otTimeOut ) of begin
+	    [aux!Zap] begin
+		otHOST := otID := null;
+		cprint( otMsgChan, "?otSignon: lost circuit"& crlf );
+		return( false );
+	    end;
+	    [aux!Prompt] case S of begin
+		["I"] begin
+		    auxEcho := false;
+		    if ID.sent then begin
+			cprint( otMsgChan, "?otSignon: ",ID, (if KEY.sent
+			    then " bad KEY" else " bad ID"), crlf );
+			AuxOut( #cr );
+			return( false );
+		    end;
+		    AuxOut( ID& #cr );
+		    ID.sent := true;
+		end;
+		["K"] begin
+		    AuxOut( KEY& #cr );
+		    KEY.sent := true;
+		end;
+		["D"] AuxOut( "Y"&#cr );
+		[":"] done;
+		[else] begin
+		    cprint( otMsgChan,
+			"?otSignon: bad prompt """,S,""""&crlf );
+		    return( false );
+		end
+	    end;
+	    [aux!Line] begin
+		if kequ( S, "ACCEPTED"& crlf ) then begin
+		    auxEcho := auxTrace;
+		    AuxOut( ":command"&#cr );
+		end;
+		if ID.sent and (
+		  kequ( S[1 to 7], "DROPPED" ) 
+		  or kequ( S[1 to 18], "NOW LEAVING ONTYME" ) ) then
+		    otConnect( otHost );
+	    end;
+	    [aux!Timeout] begin
+		cprint( otMsgChan, "?otSignon: timeout"&crlf );
+		return( false );
+	    end
+	end;
+    otID := ID;
+    return( true );
+end	"otSignon";
+
+internal boolean procedure otSend( r!p(mai) M );
+begin	"otSend"
+    label ReQ;
+    string S, FPath, SendList, Log;
+    boolean MsgOK;
+    string RTS!addrs, REQ!addrs;
+    if length( otID ) = 0 then usererr(0,0,
+	"%otSend: not signed on", "X" );
+    mai:Received[M] :=
+	"Received: from "& maiHost& "."& maiNet&
+	" by "& otHost& ".Ontyme.Tymnet;"&
+	maiDate& crlf&
+	mai:Received[M];
+    if not otACmd( "erase" ) then goto ReQ;
+    if needSetBreak then begin
+	if not otACmd( "set break "&#eot ) then goto ReQ;
+	needSetBreak := false;
+    end;
+    FPath := maiFPath( M );
+    mai:RCPT[m] := mai:Bcc[m] := null;
+    AuxOut( "transparency"& #cr );
+    AuxOut( maiMMake( M ) );
+    if not AuxWait( 300 ) then
+	cprint( otMsgChan, "%otSend: orange ball timeout (5 minutes)"& crlf );
+    calli(60,calli!SLEEP);	! a delay until clrbfi bug fixed in Ontyme;
+    calli(60,calli!SLEEP);	! a delay until clrbfi bug fixed in Ontyme;
+    AuxOut( #eot );
+    if not otSync then begin
+	cprint( otMsgChan, "?otSend: transparency mode stuck"& crlf );
+	goto ReQ;
+    end;
+    Log := null;
+    RTS!addrs := null;
+    REQ!addrs := null;
+    while length( FPath ) do begin ":SEND"
+	string CMD, FPath!;
+	CMD := "send";
+	SendList := null;
+	FPath! := FPath;
+	while length( FPath! ) do begin
+	    r!p(adr) A;
+	    integer B;
+	    string RCPT, ota;
+	    RCPT := maiAScan( S := FPath!, B );
+	    A := maiAParse( RCPT );
+	    ota := adr:User[A];
+	    if length(CMD)+length(ota)+1 > 128
+		then done;
+	    FPath! := S;
+	    CMD := CMD& " ";
+	    if ota = "*" then begin
+		while ota = "*" do CMD := CMD& lop(ota);
+		CMD := CMD& " ";
+	    end;
+	    CMD := CMD& ota;
+	    maiCatList( SendList, adr:User[A] );
+	end;
+	AuxOut( CMD );
+	AuxOut( #cr );
+	Log := Log& ":"& CMD& crlf;
+	MsgOK := false;
+	while true do
+	    case AuxRead( S, otTimeOut ) of begin
+		[aux!Zap] begin
+		    otHost := otID := null;
+		    cprint( otMsgChan, "?otSend: lost circuit"&crlf, Log );
+		    maiCatList( REQ!addrs, FPath );
+		    done ":SEND";
+		end;
+		[aux!Line] begin
+		    while 0 < S < " " do lop(S);
+		    if length(S) leq 2 or equ( S[1 to 5],"send " )
+			then continue;
+		    Log := Log& S;
+		    if kequ( S, "NO SUCH RECIPIENT"&crlf ) then begin
+			string Sa,Si;
+			integer B;
+			AuxRead( S, otTimeOut );
+			while 0 < S < " " do lop(S);
+			Log := Log& S;
+			Sa := scan( S, break.token, B );
+			Si := scan( S, break.token, B );		    
+			S := "<"& Sa& "."& Si& "@"& otHost& ".Ontyme.Tymnet>";
+			maiCatlist( RTS!addrs, S );
+			FPath := FPath!;
+		    end
+		    else if kequ( S[1 to 6], "MSG # " ) then begin
+			MsgOK := true;
+			cprint( otMsgChan,
+			    S[7 to inf-3], "  ", SendList, crlf );
+		    end
+		    else if kequ( S, "NO VALID RECIPIENT"& crlf )
+			 or kequ( S, "ACCEPTED"& crlf ) then
+		    else if length(S) > 2 then cprint( otMsgChan,
+			"%otSend: unrecognized response"& crlf, Log );
+		end;
+		[else] begin
+		    if equ( S, ":" ) then done;
+		    if length(S) then Log := Log& S& crlf;
+		    cprint( otMsgChan, "?otSend: timeout"& crlf );
+		    maiCatList( REQ!addrs, FPath );
+		    auxZap;
+		    done ":SEND";
+		end
+	    end;
+	if not MsgOK then
+	    maiCatList( RTS!addrs, FPath[1 to inf-length(Fpath!)] );
+	FPath := Fpath!;
+    end ":SEND";
+    if length( RTS!addrs ) then begin
+	cprint( otMsgChan,
+	    "%delivery failed to: ", RTS!addrs, crlf,
+	    Log,
+	    "[return to sender ", maiRPath(M), "]"& crlf );
+	mai:RCPT[m] := RTS!addrs;
+	maiRTS( M,
+	    "The request was rejected by "& otHost& ".Ontyme.Tymnet",
+	    "The response was:",
+	    Log );
+    end;
+    if length( REQ!addrs ) then begin
+	cprint( otMsgChan,
+	    "%delivery failed to: ", REQ!addrs, crlf,
+	    Log );
+	mai:RCPT[m] := REQ!addrs;
+ReQ:	cprint( otMsgChan, "[requeued]"& crlf );
+	maiQueue( M );
+    end;
+end	"otSend";
+
+internal boolean procedure otRead (
+    procedure	MsgSvc );
+while true do begin	"otRead"
+    string	S;
+    string	FakePrompt;
+    string	MsgBuf;
+    boolean	Msg#.seen;
+    if length( otID ) = 0 then usererr( 0, 0,
+	"%otRead: not signed on", "X" );
+    AuxOut( "read"&#cr );
+    MsgBuf := null;
+    FakePrompt := null;
+    Msg#.seen := false;
+    while true do
+	case AuxRead ( S, otTimeOut ) of begin
+	    [aux!Zap] begin
+		cprint( otMsgChan, "?otRead: lost circuit"&crlf );
+		otHost := otID := null;
+		return( false );
+	    end;
+	    [aux!Line] begin
+		S := FakePrompt& S;
+		FakePrompt := null;
+		if Msg#.seen
+		    then MsgBuf := MsgBuf& S
+		    else if equ( S[1 to 5], "MSG#:" )
+			then begin
+			    Msg#.seen := true;
+			    MsgBuf := S;
+			end;
+	    end;
+	    [aux!Prompt] if equ(":",S)
+		then done
+		else FakePrompt := FakePrompt& S;
+	    [aux!Timeout] begin
+		cprint( otMsgChan, "?otRead: timeout"& crlf );
+		return( false );
+	    end
+	end;
+    while length(MsgBuf) and MsgBuf[inf for 1] leq " " do
+	MsgBuf := MsgBuf[1 to inf-1];
+    MsgBuf := MsgBuf& crlf;
+    if Msg#.seen
+	then MsgSvc( MsgBuf )
+	else return( true );
+end	"otRead";
+
+internal boolean procedure otLogout;
+begin	"otLogout"
+    if length( otHost ) and length( otID ) then begin
+	otHost := otID := null;
+	AuxOut( "logout"&#cr&#cr );
+	return( AuxSync( "NOW LEAVING ONTYME"&#lf, otTimeOut ));
+    end;
+    otHost := otID := null; 
+    AuxZap;
+end	"otLogout";
+
+end $
+  
