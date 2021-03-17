@@ -1,0 +1,317 @@
+module vueutl = begin
+
+!
+!  This module contains mostly utility routines, that is those
+!  routines which are not dedicated to a single function and tend
+!  to be used by many parts of the editor.
+!
+
+!
+!  Variables defined elsewhere::
+!
+external
+
+	p, lowend, lowptr,		! buffer address, count, pointer
+	hbot, hend, hptr,		! buffer bottom, top, pointer
+	mark,				! location of the mark
+	curline,			! the current line on the screen
+	ocline,				! copy of old curline
+	physlin, physpos,		! physical line, position on screen
+	curbuf,				! current buffer
+	bfrpag, bfrlin,			! page, line in the current buffer
+
+	indent, iudent,			! left,right margins (0,72)
+	indend,				! indenting flag
+	spaces,				! flag for spaces rather than tabs
+	tabwidth, tabsize, tabstops,	! indentation width, tab width, etc.
+	sosmod,				! flag for page mode
+	bsback,				! flag for counting backspaces as -1
+	silent,				! flag for output to screen
+
+	hatuvl,				! repeat count for C-U
+	modpos,				! text window sixe
+	spacect,			! ? space count
+	commentpos,			! comment character position
+	autoinc, autotime,		! variables for auto save
+	autowrit, autoloss,		!  and checkpoint facility
+
+	nowait,				! flag for terminal wait (readch)
+	scrmod,				! screen modified flag
+	muline,				! multi-line change flag
+	csnum,				! command level count
+	newcount,			! macro-character needed flag
+	allmod,				! buffer modified flag
+	defdsk,				! definition of "dsk"
+	freestk,			! stack to hold freezone
+	freezone,			! some sort of file variable
+	ppn,				! user id
+	comchar,			! actual command character
+	repcount,			! command repeat count
+	flush,				! input flush flag
+	scrsze, maxss,			! screen size, max screen size
+	distbl, discat;			! dispatch table, rebind list
+
+!
+!  The following routines are declared elsewhere::
+!
+external
+
+	writeloss,			! output a character
+	writestring,			! output a string
+	ToPrompt,			! print a message in prompt area
+	ToStatus, FromStatus,		! point to and reset status pointer
+	flubfr,				! flush the output buffer
+
+	moveforward,			! move forward in the buffer
+	moveback,			! move backward in the buffer
+	whtBreak, eolBreak, eolType,	! test buffer character
+	getchxr,			! get character from the buffer
+	updatecursor,			! calculate line position + char
+
+	Asktty,				! prompt user for terminal type
+	bufini,				! initialize buffer module
+	winit,				! initialize window module
+	initdispatch,			! initialize dispatch table
+	reset, setlab,			! reset / validity check, reentry
+	fef,				! initialize terminal
+	cclstuff, dorescan,		! get initial file to read/edit
+	clearline, clearscreen,		! clear to end of line on screen
+	getppn, getaun,			! get ppn and aun from monitor
+
+	getstr, filescan,		! get a string, filespec
+	open, lookup, buffers,		! file i/o routines
+
+	readch, readcc,			! read a character, command
+	ttyidle,			! true if noting in input buffer
+	goxy,				! position cursor on screen
+	coresize, relcore, corecheck,	! perform memory manipulations
+	qreg,				! return pointer to macro space
+	redisp;				! main redisply routine
+
+!
+!  The following routines are in module VUECMD
+!
+
+external beglin, endlin;		! beginning of line, end of line
+external begtxt, endtxt;		! beginning of text, end of text
+external appkbf, clrkbf, inskbf;	! kill buffer append, clear, insert
+external SelfI;				! self-insertion command
+external excmrk;			! exchange mark and point
+
+!
+!  The following routines are in module VUEMAN
+!
+
+external zapmac;
+
+!
+!  Bindings and definitions::
+!
+
+bind extra = 100;
+bind CtrlXValue = #400, MetaValue = #200;
+
+structure based[i] = (@.based+.i)<0,36>;
+structure odas[i] = .odas + .i; !based at zero array
+structure tdas[i,j]=.tdas+(.j-1)+(.i-1)*132;
+
+bind kilsiz=5000;
+own kilbuf[kilsiz],killen,killer,laskil,lasmov,kilptr;
+
+own qbp;
+own dskbuf[132],dskbfh[4];
+
+global XPrefix="?X";
+
+global rptr,vecadr,cclflag;
+global MetaPrefix=#033;
+global EscValue=#033;
+global DelValue=#177;
+global bind maxcalls=100;
+global rstk[MaxCalls*2+2],callchar;
+global cstk[MaxCalls+1];
+
+map odas cstk;
+map odas rstk;
+
+global routine killforward(flag)  = begin local ch;
+    if .hbot eql .hend			! if we don't have anything
+     then return 0;			!  past pointer, then return
+    ch_ scann(hptr);			! copy character
+    incp(hptr);				! then position to next
+    if .flag and			! if we-are-killing and
+       (.killen lss 5*kilsiz)		!    there is room for it
+     then begin				!  then
+	replacei(kilptr,.ch);		!    copy character to killbuffer
+	killen_ .killen+1		!    and increment size
+    end;
+    if eolBreak(.ch) then muline_ 1;	! if end-of-line then mark multi
+    if .mark neq 0 and			! if we have a mark
+       .lowend lss .mark		! and it is past point
+     then mark_ .mark-1;		!  then back it up 1
+    hbot_ .hbot+1;			! move counter
+    allmod[.curbuf]_ 1;			! mark buffer modified
+    scrmod_ 1				! mark screen modified
+end;
+
+global routine delforward = killforward(0);
+global routine delbackward  = begin
+    moveback(1);
+    killforward(0)
+end;
+
+global routine insertchar(ch) =  begin
+    corecheck();			! make sure a place to put it
+    replacei(lowptr,.ch);		! deposit character
+    if eolBreak(.ch)			! if end-of-line
+     then begin				!  then add to line counts
+	curline_ .curline+1;		!  used by buffer/screen
+	bfrlin_ .bfrlin+1;		!  used only by buffer
+	muline_ 1			!  multi-line changes
+     end;
+    if .ch eql "?L"			! if page-mark
+     then begin				!  then reset counts
+	bfrlin_ 0;			!  of lines to 0
+	bfrpag_ .bfrpag+1		!  and increment pages
+     end;
+    if .mark neq 0 and			! if mark exists
+       .lowend lss .mark		!  and is past point
+     then mark_ .mark+1;		!  then move it forward
+    lowend_ .lowend+1;			! increment counter also
+    scrmod_ 1;				! mark screen modified
+    allmod[.curbuf]_ 1;			! mark buffer modified
+end;
+
+Global Routine GetIndent( killflag ) = begin
+    register char;
+    local width;
+
+    width_ 0;
+    BegLin();
+    while WhtBreak( char_scann(hptr) )
+     do begin
+	if .hend eql .hbot then exitloop;
+	width_ if .char eql " "
+		  then .width + 1
+		  else (((.width div 8) * 8) + 8);
+	if .killflag
+	 then delforward()
+	 else moveforward(1)
+    end;
+    return .width
+end;
+
+Global Routine SetIndent( count ) = begin
+    if .count lss 1 then return;
+    if .spaces
+     then
+	incr i from 1 to .count do insertchar(" ")
+     else begin
+	incr i from 1 to .count div .tabsize do insertchar("?I");
+	incr i from 1 to .count mod .tabsize do insertchar(" ")
+     end
+end;
+
+
+routine GetPos (npcol) = begin  local place,temp;
+
+!This routine tells you what column you will be in, when the
+! redisplay will finally calms down.
+
+    place_.lowend;
+    while 1 do begin		       !decrement from lowend-1 down.
+	if .place eql 1 then exitloop; !we have found start of line.
+	temp_getchxr(.place-1);
+	if .temp eql "?M" or (.temp eql "?L" and .sosmod) then exitloop;
+	place_.place-1
+    end;
+
+! Now move forward.
+    .npcol_1;
+    incr i from .place to .lowend-1 do begin !all the stuff to where we are
+	temp_getchxr(.i);	       !get the data.
+	.npcol_updatecursor(.temp,..npcol)
+    end
+end;
+
+
+global routine echord = begin local tp;
+    tp_readch();		! read a character
+    if .tp eql #177 or .tp eql #10 or
+       .tp eql .DelValue or .tp eql #7 then begin
+	flush_1;		!mark it as a loss.
+	writestring(plit asciz 'Aborted')
+    end;
+    writeloss(.tp);		! print it out.
+    return .tp
+end;
+
+global routine errstr (foo) = begin
+    silent_ 0;
+    ToPrompt(.foo);
+    repcount_ 1;
+    csnum_ 0;
+    return 0
+end;
+
+
+global routine munchnnl (line,prompt,terminator) = begin local tc,i;
+    writestring(.prompt);
+    i_1;
+    while .i lss 132 do begin
+	tc_readch();			! read a character.
+	if .tc eql #177 or .tc eql #10 or .tc eql .DelValue then begin
+	    if .i leq 1 then exitcompound[2];
+	    i_.i-1;
+	    if .(.line+.i) gtr "?Z"
+		then goxy(.physpos-1,.physlin)
+		else goxy(.physpos-1,.physlin);
+	    clearline();
+	    .line_.i-1;
+	    exitcompound[2]
+	end;
+	if .tc eql .terminator then begin
+	    flubfr();
+	    return 1
+	end;				! if we are done.
+	if .tc eql 7 then return 0;	!lossage
+	if .tc eql "?Q" then tc _ readch();
+	writeloss(.tc);
+	(.line+.i)_.tc;			! set the char.
+	.line_.i;
+	i_.i+1
+    end					! the inner loop.
+end;					! the routine.
+
+
+global routine munchline(line,prompt,terminator) = begin local retval;
+    ToPrompt(plit asciz'');
+    retval_munchnnl(.line,.prompt,.terminator);
+    WriteLoss("$");
+    flubfr();
+    return .retval
+end;
+
+global routine ctrln2  = begin
+    while .hend neq .hbot
+     do begin
+	moveforward(1);
+	if eolBreak(scann(lowptr))
+	 then return eolType(scann(lowptr))
+     end;
+    return zapmac()
+end;
+
+
+global routine ctrlp2  = begin
+    while .lowend gtr 1
+     do begin
+	moveback(1);
+	if eolBreak(scann(hptr))
+	 then return (BegLin();eolType(scann(lowptr)))
+     end;
+    return zapmac()
+end;
+
+end eludom
+    
