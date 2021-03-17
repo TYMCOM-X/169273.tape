@@ -1,0 +1,373 @@
+begin	"DSTAT"	require "(SAILIB)SAIL.DEF" source!file;
+!get!module(EXTEND);
+	
+define	calli!DATE   = '14;
+define	calli!MSTIME = '23;
+define	calli!GETPPN = '24;
+define	calli!GETTAB = '41;
+define	!gtCNF = '11;
+define	calli!DSKCHR = '45;
+define	calli!SYSPHY = '51;
+define	!CHPSI = '31;
+
+define
+RIBRIB='0, RIBRPS='1, RIBSZS='2, RIBSNM='3, RIBSFS='4, RIBPPN='4, 
+RIBNAM=RIBPPN+1, RIBEXT=RIBNAM+1, RIBMSC=RIBEXT, RIBPVW='7,
+RIBPRV=RIBPVW, RIBSIZ='10, RIBVER=RIBSIZ+1, RIBFUT='12, RIBEST='13,
+RIBALC='14, RIBPOS='15, RIBFT1='16, RIBLCW='17, RIBMTA='20, RIBDEV='21,
+RIBSTS='22, RIBELB='23, RIBXT1='24, RIBQTF='25, RIBQTO='26, RIBMXA='27,
+RIBUSD='30, RIBAUT='31, RIBUNM='32, RIBUN1='33, RIBTRU='34, RIBXT2='35,
+RIBALP='36, RIBPJC='37, RIBPJ1='40, RIBPJ2='41, RIBPID='42, RIBALT='43,
+PTSUNI=8, PTNUNI=16, PTSPNO=19, PTNPNO=35,
+RBSPAR='400000, RBREAL='200000, RBINDX='100000, 
+RIBPFS='51, RIBCOD='776, CODRIB='666666, RIBLST=RIBCOD-1,
+RBLVPR=RIBLST-RIBPFS+1, RBLVSP=RIBLST-RIBSFS+1, RIBSLF='777,
+UFDNAM='0, UFDEXT='1, UFDPRV='1, UFDUF2='1, UFDUF1='2, UFDXCD='2,
+UFDCTM='2, UFDCDT='2, UFDALP='3, UFDLIC='3, UFDRIB='4, UFDHSI='7,
+UFDLNK=511, UFDSIZ='5;
+
+!	ReadUFD (PPN,PROC)
+
+Procedure to read a UFD directly as a file (not using !CHUFD).
+PROC, which must be declared like
+    procedure PROC (integer array UFDENTRY),
+will be called exactly once for each active UFD entry found in the UFD.
+The array argument will contain the data of the current UFD entry.  The
+array dimensions will be [0:UFDSIZ-1].
+;
+
+recursive procedure ReadUFD (integer PPN; procedure USER);
+begin
+!	call USER(U) for each file in given UFD where U is an integer
+	array containing 1 UFD entry [0:4].
+;
+    integer	C,E;		! channel variables;
+    integer array P[0:101,0:UFDSIZ-1];
+    integer array U[0:UFDSIZ-1];
+    open (C_getchan,"DSK",'16,0,0, 0,0,E);
+    lookup (C,"(UFD)'"&cvos(PPN)&".UFD",E);
+    if E then begin
+	print("?cant read (UFD)'",cvos(PPN),".UFD - error ",cvos(E),crlf);
+	return end;
+    while not E do begin "for each page"
+	integer I;
+	arryin (C,P[0,0],arrinfo(P,0));
+	if not E then
+	    for I _ arrinfo(P,1) upto arrinfo(P,2) do "for each entry"
+		if P[i,0] then begin
+		    arrblt (U[0],P[i,0],arrinfo(U,0));
+		    USER (U);
+		end;
+    end;
+    release (C);
+end;
+
+!	ReadAbs (DP,PAGE)
+
+Read the disk page described by the disk-pointer DP into array PAGE
+beginning with PAGE[0].
+;
+define UNIMAX = 64;
+integer array DSKCHR[0:UNIMAX,0:'14];	! place to keep unit related stuff;
+integer UNIN;			! number of last unit on system;
+integer PPU;			! pages per unit;
+integer	AbsChan,AbsEOF;		! for ReadAbs channel use;
+
+simple procedure DSKCHRini;
+begin
+    integer U,X;
+    X _ 0;
+    for U _ 0 upto UNIMAX do begin
+	DSKCHR[U,0] _ X _ calli(X,calli!SYSPHY);
+	if not X then begin UNIN _ U -1; done end;
+	calli(!xwd(arrinfo(DSKCHR,4)+1,location(DSKCHR[U,0])),calli!DSKCHR);
+    end;
+    PPU _ DSKCHR[0,'06];	! define pages per unit in structure;
+    open(AbsChan_getchan,"DSK",'16,0,0, 0,0,AbsEOF);
+end;
+require DSKCHRini initialization;
+
+simple integer procedure CnvPag (integer DP);
+! return relative page within structure given DP;
+return (
+    ldb(point(PTSUNI,DP,PTNUNI)) * PPU + 
+    ldb(point(PTSPNO,DP,PTNPNO))  );
+
+procedure ReadAbs (integer DP; integer array P);
+begin	! read absolute page DP into array P;
+    chniov (AbsChan, CnvPag(DP), !CHPSI);
+    arryin (AbsChan, P[0], arrinfo(P,0));
+    if AbsEOF then print("?error reading page ",cvos(DP),crlf);
+end;
+
+!	statistic support routines
+;
+
+simple integer procedure ILOG2 (integer X);
+start!code
+    label ILOG2Z;
+	MOVE	1,X;
+	JFFO	1,ILOG2Z;
+	 MOVEI	2,36;
+ILOG2Z:	MOVEI	1,36;
+	SUB	1,2;
+end;
+
+!	S T A T I S T I C S   gathering routines
+;
+integer	RIBNAM!FAIL;		! # times RIBNAM neq UFDNAM;
+integer	RIBCOD!FAIL;		! # times RIBCOD neq CODRIB;
+integer	RIBSLF!FAIL;		! # times RIBSLF neq DP;
+integer	DEPTH!FAIL;		! # times DEPTH > 3;
+integer	RIB!DEPTH;		! nesting level of rib;
+integer array RLH[1:3];		! rib level histogram;
+integer array FSH[0:36];	! file size histogram LOG2(words);
+integer	UFDS;			! # UFDs;
+integer FILES;			! # files;
+integer FILES!PER!UFD;		! # files this UFD;
+integer PAGES!PER!FILE;		! # real in this file;
+integer array USH[0:36];	! UFD size histogram LOG2(files);
+integer HOLES;			! # hole pages seen;
+boolean HAS!HOLE;		! set if current file has a hole;
+integer HOLY!FILES;		! # files that have holes;
+integer	LAST!REAL;		! last real page (for contig check);
+integer CLUSTER!SIZE;		! size of running cluster;
+integer CLUSTER!DP;		! disk page of begin of cluster;
+integer CLUSTER!FP;		! file page of begin of cluster;
+integer	array CSH[0:36];	! frequency of cluster by size;
+integer array CFH[0:36];	! # of contig files by size;
+integer array PPUPF[0:UNIMAX];	! pages per unit per file;
+integer array SUH[0:36];	! # of single unit files;
+
+procedure SETUP.STATS;
+begin
+    integer I;
+    print(crlf,crlf,"analysis of ",cv6str(DSKCHR[0,'4]),": on ");
+    for I _ 0 upto 4 do print(cvastr(calli(!xwd(i,!gtCNF),calli!GETTAB)));
+    print(" ",stdate(calli(0,calli!DATE),'31),crlf,crlf);
+end;
+
+procedure MFD.BEG;
+begin
+end;
+
+procedure UFD.BEG (integer array MFD);
+begin
+    FILES!PER!UFD _ 0;
+end;
+
+procedure FILE.BEG (integer array RIB);
+begin
+    PAGES!PER!FILE _
+    CLUSTER!SIZE _
+    LAST!REAL _ 0;
+    HAS!HOLE _ false;
+    arrclr(PPUPF,0);
+    print (cvxstr(RIB[ribnam]),".",cvxstr(RIB[ribext] land !hl(-1)),
+	crlf);
+end;
+
+simple procedure CLUSTER;
+if CLUSTER!SIZE then begin
+    integer I;
+    setformat(-6,0);
+    print ("    ",cvos(!lh(CLUSTER!DP)),",,",
+	cvos(!rh(CLUSTER!DP)) );
+    setformat(0,0);
+    print ("    ",CLUSTER!FP);
+    if CLUSTER!SIZE > 1 then print ("-",CLUSTER!FP+CLUSTER!SIZE-1);
+    print (crlf);
+    CSH[i_ILOG2(CLUSTER!SIZE)] _ CSH[i] +1;
+    CLUSTER!SIZE _ 0;
+end;
+
+procedure REALPAGE (integer DP);
+begin
+    own integer I;
+    PAGES!PER!FILE _ PAGES!PER!FILE +1;
+    if LAST!REAL + 1 neq DP then CLUSTER;
+    if CLUSTER!SIZE = 0 then begin
+	CLUSTER!FP _ PAGES!PER!FILE;
+	CLUSTER!DP _ DP;
+    end;
+    CLUSTER!SIZE _ CLUSTER!SIZE +1;
+    PPUPF[i_ldb(point(PTSUNI,DP,PTNUNI))] _ PPUPF[i] +1;
+    LAST!REAL _ DP;
+end;
+
+procedure HOLEPAGE (integer DP);
+begin
+    HAS!HOLE _ 
+    HOLES _ HOLES +1;
+end;
+
+procedure FILE.END (integer array RIB);
+begin
+    own integer I,U;
+    I _ 0;
+    for U _ 0 upto UNIN do	! I gets # units file has >=1 pg on;
+	if PPUPF[u] then I _ I +1;
+    if I=1 then SUH[i_ilog2(PAGES!PER!FILE)] _ SUH[i] +1;
+    if CLUSTER!SIZE = PAGES!PER!FILE	! totally contiguous;
+	then CFH[i_ILOG2(PAGES!PER!FILE)] _ CFH[i] +1;
+    if CLUSTER!SIZE then CLUSTER;
+    if HAS!HOLE then HOLY!FILES _ HOLY!FILES +1;
+    RLH[RIB!DEPTH] _ RLH[RIB!DEPTH] +1;
+    FSH[i_ILOG2(RIB[ribsiz])] _ FSH[i] +1;
+    FILES!PER!UFD _ FILES!PER!UFD +1;
+end;
+
+procedure UFD.END (integer array MFD);
+begin
+    own integer I;
+    FILES _ FILES +FILES!PER!UFD;
+    USH[i_ILOG2(FILES!PER!UFD)] _ USH[i] +1;
+    UFDS _ UFDS +1;
+    print("total files: ",FILES!PER!UFD,crlf);
+end;
+
+procedure MFD.END;
+begin
+    if RIBNAM!FAIL then print("% RIBNAM failures: ",RIBNAM!FAIL,crlf);
+    if RIBCOD!FAIL then print("% RIBCOD failures: ",RIBCOD!FAIL,crlf);
+    if RIBSLF!FAIL then print("% RIBSLF failures: ",RIBSLF!FAIL,crlf);
+    if DEPTH!FAIL then print("% rib DEPTH failures: ",DEPTH!FAIL,crlf);
+end;
+
+procedure PRINT.STATS;
+begin
+    own integer I;
+    procedure PLOG2 (string S; integer array X; string U1,U2(null));
+    begin
+	own integer I,M,T;
+	simple integer procedure PERCENT (integer X,T);
+	    return(100*X/T+0.5);
+  	print(S,crlf);
+	M _ T _ 0;
+	for I _ 0 upto 36 do begin
+	    T _ T + X[i];	    
+	    if X[i] then M _ I;
+	end;
+	for I _ 0 upto M do if I leq 9 or length(U2)=0
+	    then if I = 0
+		then print(#ht,X[i], #ht,PERCENT(X[i],T), #ht&"0 ",U1,crlf)
+		else print(#ht,X[i], #ht,PERCENT(X[i],T), #ht,1 lsh (I-1)," <= X < ",1 lsh I," ",U1,crlf)
+	    else print(#ht,X[i], #ht,PERCENT(X[i],T), #ht,1 lsh (I-10)," <= X < ",1 lsh (I-9)," ",U2,crlf);
+	print(#ht,T, #ht&"100"& #ht&"total"& crlf);
+    end;
+
+    print(crlf,crlf);
+    print("number of free pages by unit: ",crlf);
+    for I _ 0 upto UNIN do 
+	print(#ht,DSKCHR[i,'3],#ht,cv6str(DSKCHR[i,'14]),crlf);
+    print("total free pages: ",DSKCHR[0,'2],crlf);
+    PLOG2("number of files by file size:",FSH,"words","pages");
+    PLOG2("number of UFDs by UFD size:",USH,"files");
+    PLOG2("number of clusters by cluster size:",CSH,"pages");
+    PLOG2("number of contiguous files by file size:",CFH,"pages");
+    PLOG2("number of single unit files by file size:",SUH,"pages");
+    print("number of files by RIB depth:",crlf,
+	#ht,RLH[1],#ht&"1 level",crlf,
+	#ht,RLH[2],#ht&"2 level",crlf,
+	#ht,RLH[3],#ht&"3 level",crlf );
+    print("number of files with hole pages: ",HOLY!FILES,crlf);
+    print("number of hole pages: ",HOLES,crlf);
+end;
+
+!	structure scanning procedures and main program
+
+This code interfaces with the statistics gathering code by making calls:
+    SETUP.STATS		called first thing at start of program
+    PRINT.STATS		called last thing at end of program
+    MFD.BEG		called just before scanning the MFD
+    MFD.END		called just after scanning the MFD
+    UFD.BEG (MFD)	called just before scanning a UFD
+    UFD.END (MFD)	called just after scanning a UFD
+    FILE.BEG (RIB)	called just before scanning a FILE
+    FILE.END (RIB)	called just after scanning a FILE
+    REALPAGE (DP)	called for each RBREAL pointer encountered
+    HOLEPAGE (DP)	called for each "hole" pointer encountered
+;
+integer array PRIB[0:511];	! the prime rib of the current file;
+integer DEPTH;			! used to keep track of rib depth;
+forward recursive procedure SPARERIB (integer DP);
+
+recursive procedure SCANRIB (integer array RIB; integer A,B);
+begin
+    integer I;
+    RIB!DEPTH _ RIB!DEPTH max (DEPTH _ DEPTH +1);
+    if DEPTH > 3 then begin DEPTH!FAIL _ DEPTH!FAIL +1; DEPTH _ DEPTH -1; return end;
+    for I _ A upto B do begin
+	if RIB[i] = 0 then done;
+	if RIB[i] land !hl(rbspar) then SPARERIB(RIB[i]);
+	if RIB[i] land !hl(rbreal) then REALPAGE(RIB[i]);
+!	if RIB[i] land !hl(rbindx) then INDXPAGE(RIB[i]);
+	if RIB[i] land !hl(rbspar+rbreal) = 0 then HOLEPAGE(RIB[i]);
+    end;
+    DEPTH _ DEPTH -1;		! rib nesting depth;
+end;
+
+recursive procedure SPARERIB (integer DP);
+begin	! called by itself or GETRIB for each RBSPAR pointer;
+    integer array RIB[0:511];	! note: dynamicaly allocated;
+    integer I;
+    ReadAbs (DP,RIB);
+    if RIB[ribcod] neq CODRIB then begin RIBCOD!FAIL _ RIBCOD!FAIL +1; return end;
+    if RIB[ribslf] neq DP then begin RIBSLF!FAIL _ RIBSLF!FAIL +1; return end;
+    SCANRIB (RIB,ribsfs,riblst);
+end;
+
+procedure GETRIB (integer array UFD);
+begin	! called for each UFD entry to get the RIB and look it over;
+    own integer I;
+    DEPTH _ RIB!DEPTH _ 0;	! reset depth accumulators;
+    ReadAbs (UFD[ufdrib],PRIB);	! get prime rib;
+    FILE.BEG (PRIB);		! call accounting routine;
+    if PRIB[ribnam] neq UFD[ufdnam] then begin RIBNAM!FAIL _ RIBNAM!FAIL +1; return end;
+    if PRIB[ribcod] neq CODRIB then begin RIBCOD!FAIL _ RIBCOD!FAIL +1; return end;
+    if PRIB[ribslf] neq UFD[ufdrib] then begin RIBSLF!FAIL _ RIBSLF!FAIL +1; return end;
+    SCANRIB (PRIB,ribpfs,riblst);! scan prime rib pointers;
+    FILE.END (PRIB);		! call accounting routine;
+end;
+
+procedure GETUFD (integer array MFD);
+begin	! called for each MFD entry to get UFD and look it over;
+    UFD.BEG (MFD);		! call accounting;
+    ReadUFD (MFD[0],GETRIB);	! scan all this guy's files;
+    UFD.END (MFD);		! call accounting;
+end;
+
+
+begin "MAIN PROGRAM"
+    integer array MFD[0:4];	! for 1 user;
+    integer array UN[0:1];	! user name;
+    string USR;
+    print("gather statistics for user: ");
+    USR _ inchwl;
+    begin
+	string F,D,T;
+	D _ stdate(calli(0,calli!DATE),'31);
+	T _ cvs(100+calli(0,calli!MSTIME)%3600000);
+	F _ D[1 to 2]& "DP"& T[2 to 3]& "."& D[4 to 6];
+    	print ("[output file ",F,crlf);
+	setprint(F,"B");	! copy to file too;
+    end;
+    SETUP.STATS;		! set up things and initialize;
+    MFD.BEG;			! call accounting;
+    if USR = "*" then 
+	ReadUFD('1000001,GETUFD)
+    else if length(USR)=0 then begin
+	MFD[0] _ calli(0,calli!GETPPN);
+	GETUFD (MFD);
+    end else begin
+	UN[0] _ cvsix(USR);
+	UN[1] _ cvsix(USR[7 for 6]);
+	MFD[0] _ location(UN[0]);
+	GETUFD (MFD);
+    end;
+    MFD.END;			! call accounting;
+    PRINT.STATS;
+end;
+
+end $
+ 
