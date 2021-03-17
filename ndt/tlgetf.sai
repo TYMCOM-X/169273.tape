@@ -1,0 +1,336 @@
+entry dataBlock;
+begin "receive file"
+
+COMMENT handles data destination records.  This side therefore does the
+	file receive protocol.
+;
+simple integer procedure current!time;
+require "current!time is a horrible kluge, fix it later." & '15&'12 message;
+	start!code own integer clock; aos 1,clock; end;
+
+require "(SAILIB)SAIL.DEF" source!file;
+!get!module(extend);
+!get!module(append);
+!get!definitions(assert);
+require "FTPBIT.DEF" source!file;
+require "OUTCOD.DCL" source!file;
+require "FTPCNV.DCL" source!file;
+let routine=procedure;
+define eif="else if";
+define #E.BL='100;	! ebcdic blank;
+
+string	pending!text
+,	receiving!name
+;
+integer	former!class
+,	receiving!file!type
+,	receiving!chan
+,	receiving!eof
+,	time!correction
+;
+boolean	receiving!file
+,	receiving!open
+;
+simple procedure init!vbls;
+begin
+pending!text := null; 
+former!class := -1;
+time!correction := -1;
+receiving!file := receiving!open := false;
+end;
+require init!vbls initialization;
+
+routine output!error( string where!seen("while writing") );
+begin	string why;
+	integer error!bits;
+error!bits := !lh(receiving!eof);
+if error!bits land '400000 then why := "improper mode," else why:= null;
+if error!bits land '200000 then why := why & "parity error,";
+if error!bits land '100000 then why := why & "data error,";
+if error!bits land '040000 then why := why & "record num?,";
+if error!bits land '020000 then why := why & "end-of-file?,";
+if error!bits land '010000 then why := why & "invalid name,";
+if length(why) = 0 then why := "For some unknown reason";
+usererr(0,1,"Error on writing the file " & where!seen & #sp & why &
+		" EOF = '" & cvos(!lh(receiving!eof)) & 
+		",," & cvos(!rh(receiving!eof)) );
+receiving!open := false;
+close(receiving!chan);
+end;
+routine data!EOR;
+begin
+if receiving!file and receiving!open
+ then begin
+	if receiving!file!type = file.type.AST
+	 then cprint( receiving!chan, pending!text, crlf )
+	 else cprint( receiving!chan, pending!text );
+	if receiving!eof then output!error;
+      end
+ else usererr(0,1,"File unavailable for record");
+pending!text := null;
+end;
+routine data!EOF;
+begin
+if length(pending!text)
+ then begin	! warning: incomplete record;
+	usererr(0,1,"incomplete record at eof");
+	data!EOR;
+      end;
+if receiving!file
+ then begin
+	if receiving!open
+	 then if receiving!chan>=0 then release( receiving!chan ) else
+	 else usererr(0,1,"File already closed, why two EOFs?");
+	receiving!open := false;
+      end
+ else usererr(0,1,"Inappropriate EOF (not currently receiving file)");
+end;
+string	author
+;
+integer	update
+,	creation
+,	treatment
+,	guess!bytes
+,	record!size
+,	guess!records
+;
+
+routine clear!variables;
+begin
+receiving!file := receiving!open := false;
+receiving!file!type := 0;
+receiving!eof := 0;
+receiving!chan := -1;
+receiving!name := null;
+creation := update := 0;
+treatment := 0;
+guess!bytes := record!size := guess!records := 0;
+author := null;
+end;
+
+boolean routine check!and!default; 
+begin
+require "kluge " message;
+if length(receiving!name)=0 then receiving!name := "TLPORT.REC";
+if receiving!file!type = 0 then receiving!file!type := file.type.AST;
+receiving!eof := false;
+if treatment=0 then treatment := treatment.replace;
+
+if treatment.replace neq treatment neq treatment.append
+ then usererr(treatment,3,"Unknown (or unimplemented) treatment: ");
+if receiving!file!type neq file.type.AST
+ then usererr( receiving!file!type,3,"Only AST files done for now: ");
+
+return(true);
+end;
+
+routine open!for!transfer;
+begin	string dev, file;
+print("About to write file `", receiving!name, "', replacement name: ");
+if length(file := inchwl)
+ then dev := receiving!name := file
+ else dev := file := receiving!name;
+while 0 neq lop(dev) neq ":" do begin end;
+if length(dev)
+ then begin	integer dev.length;
+	dev.length := length(file) - length(dev) - 1; 
+	file := dev; 
+	dev := receiving!name[1 for dev.length];
+      end
+ else dev := "DSK";
+if kequ(dev,"TTY"[1 for length(dev) max 1])
+ then begin 
+	receiving!chan := -1;
+	receiving!eof := false;
+	receiving!file := receiving!open := true;
+      end
+eif (receiving!chan := getchan) < 0
+ then usererr(receiving!chan,3, "Sorry, cannot get a channel for IO")
+ else begin
+	open( receiving!chan, "DSK",'750000, 
+		(if treatment=treatment.append then 1 else 0),4, 
+		0,0,receiving!eof:=true );
+	if receiving!eof
+	 then output!error("on OPEN")
+	 else begin	integer error!flag;
+		if treatment=treatment.append
+		 then append( receiving!chan, file, error!flag )
+		 else enter( receiving!chan, file, error!flag );
+
+		if error!flag
+		 then output!error( "on ENTER (flag='" 
+					& cvos(error!flag) & ")" )
+		eif receiving!eof then output!error("EOF on ENTER")
+		 else receiving!file := receiving!open := true;
+	      end;
+      end;
+end;
+routine command!EOR;
+begin	integer op;
+op := lop(pending!text);
+if op neq ApplControl.op.stop.xfr	! transfer in progress is OK;
+ then begin
+	if receiving!file and receiving!open
+	 then usererr(op,3,"Data control op during a file reception:");
+      end;
+case op of begin
+[ApplControl.op.stop.xfr]     begin 
+				if receiving!file and receiving!open
+				and receiving!chan>=0
+				 then release( receiving!chan );
+				clear!variables;
+			      end;
+[ApplControl.op.stop.FTP] usererr(0,1,"Requested EXIT", "X");
+[ApplControl.op.do.send] usererr(0,1,"I don't do windows or send");
+[ApplControl.op.do.receive]   begin	! clear the decks for a receive;
+				if length(pending!text)
+				 then usererr(0,1, "Text on receive?");
+				clear!variables;
+				receiving!file := true;
+			      end;
+[ApplControl.op.start.xfr]    begin
+				if length(pending!text)
+				 then usererr(0,1, "Text on receive?");
+				if check!and!default
+				 then open!for!transfer;
+			      end;
+[ApplControl.op.size.bytes] guess!bytes := cvNumber(pending!text); 
+[ApplControl.op.rec.size] record!size := cvNumber(pending!text); 
+[ApplControl.op.size.recs] guess!records := cvNumber(pending!text); 
+[ApplControl.op.is.name] receiving!name := pending!text;
+[ApplControl.op.author] author := pending!text;
+[ApplControl.op.treatment] treatment := cvNumber(pending!text); 
+[ApplControl.op.File.type] receiving!file!type := cvNumber(pending!text);
+[ApplControl.op.create] creation := 
+				cvWhen(pending!text) + time!correction;
+[ApplControl.op.update] update :=
+				cvWhen(pending!text) + time!correction;
+[ApplControl.op.now] begin	! facilitate time zone corrections;
+				integer correction, secs;
+			correction := current!time - (
+				cvWhen(pending!text) + time!correction);
+			! adjust by hours if within five minutes;
+			secs := (correction + time!correction) mod 3600;
+			if 0 < secs <= 300
+			 then correction := correction - secs
+			eif 3300 <= secs < 3600
+			 then correction := correction + 3600 - secs;
+
+			if creation then creation:=creation+ correction;
+			if update then update:=update+ correction;
+			time!correction:=time!correction+ correction;
+		      end;
+[else] usererr(op,3,"Unknown option data command: ")
+ end;	! of case;
+pending!text := null;
+end;
+routine command!EOF; usererr(0,1,"I don't know what a command EOF is");
+string routine replicate( string txt; integer count );
+begin
+while length(txt) < count do txt := txt & txt;
+return( txt[1 for count] );
+end;
+
+string routine spaces( integer count );
+begin
+assert( 1 leq count leq 31 );
+return( ( #sp&#sp&#sp&#sp & #sp&#sp&#sp&#sp & #sp&#sp&#sp&#sp
+	& #sp&#sp&#sp&#sp & #sp&#sp&#sp&#sp & #sp&#sp&#sp&#sp
+	& #sp&#sp&#sp&#sp & #sp&#sp&#sp )[1 for count] );
+end;
+
+string routine blanks( integer count );
+begin
+assert( 1 leq count leq 31 );
+return( ( #e.bl&#e.bl&#e.bl&#e.bl & #e.bl&#e.bl&#e.bl&#e.bl 
+	& #e.bl&#e.bl&#e.bl&#e.bl & #e.bl&#e.bl&#e.bl&#e.bl 
+	& #e.bl&#e.bl&#e.bl&#e.bl & #e.bl&#e.bl&#e.bl&#e.bl 
+	& #e.bl&#e.bl&#e.bl&#e.bl & #e.bl&#e.bl&#e.bl )[1 for count] );
+end;
+
+string routine zeroes( integer count );
+begin
+assert( 1 leq count leq 31 );
+return( ( 0&0&0&0 & 0&0&0&0 & 0&0&0&0 & 0&0&0&0 
+	& 0&0&0&0 & 0&0&0&0 & 0&0&0&0 & 0&0&0 ) [1 for count] );
+end;
+simple procedure tackon( string val ); 
+begin	define huge = 10000;	! maximum record size;
+if length(pending!text) >= huge then return;
+
+if length(pending!text) + length(val) >= huge	! some huge number;
+ then begin
+	usererr( length(pending!text)+length(val), 3,
+		"Huge record without EOR. Size at least: ");
+	if former!class land dataClass.isControl = 0
+	and receiving!file and receiving!open
+	 then begin	! well, its going to a file. write away.;
+		cprint( receiving!chan, pending!text ); 
+		if receiving!eof then output!error;
+		pending!text := null;
+	      end;
+	! else nothing -- just don't keep growing it.;
+      end;
+pending!text := cmcat( pending!text, val );
+end;
+INTERNAL routine dataBlock( integer class!code; string packet );
+! called with the slave/master distinction handled, the destination was
+! target.dest.data in order to get here.  Commands and data have not 
+! been split up yet.
+;
+begin
+	define	isData	="(class!code land dataClass.isControl = 0)"
+	,	isVital	="(class!code land dataClass.isVital)" 
+	,	meaning	="(class!code land dataClass.meaning.mask)"
+;
+	label newClass; newClass:
+
+if length(pending!text) and class!code neq former!class
+ then usererr(0,1,"Warning: text under code '" & cvos(former!class)
+		& " was dribbled into this code: '", cvos(class!code) );
+if meaning neq !Reply.Optional
+ then usererr(meaning,3,"Cant give or accept replies, meaning code: ");
+if isData and not (receiving!file and receiving!open)
+ then usererr( 0,1, "Data unexpectedly arrived, where to put it?");
+former!class := class!code;
+while length(packet)
+   do begin	integer count, dataHeader;
+		string data;
+	dataHeader := lop(packet);
+	if count := dataHeader.count.Mask land dataHeader
+	 then case dataHeader.opcode.extract( dataHeader ) of begin
+		[!opx.AsIs] begin
+			assert( length(packet) geq count );
+			tackon( packet[1 for count] );
+			packet := packet[count+1 to inf];
+		      end;
+		[!opx.Copy] begin
+			assert( length(packet) geq 1 );
+			tackon( replicate(packet[1 for 1], count) );
+			lop(packet);
+		      end;
+		[!opx.Zero]  tackon( zeroes(count) );
+		[!opx.Space] tackon( spaces(count) );
+		[!opx.Blank] tackon( blanks(count) );
+		[else] usererr( dataHeader.opcode.extract(dataHeader),3,
+			"Unknown opcode on counted data. code = ")
+	      end ! of case;
+	 else if dataHeader = dataHeader.op0.EOR
+			 then if isData then data!EOR else command!EOR
+		eif dataHeader = dataHeader.op0.EOF
+			 then if isData then data!EOF else command!EOF
+		eif dataHeader = dataHeader.op0.EOC
+			 then if length(packet) = 0
+				then usererr(0,1,"EndClass ends packet")
+				else begin
+					class!code := lop(packet);
+					! might check target + server;
+					go newClass;
+				      end
+		else usererr( dataHeader.opcode.extract(dataHeader),3,
+			"Unknown opcode on no-count data. code = ");
+      end; ! per dataHeader;
+end;
+end "receive file" 
+$
+ 
