@@ -1,0 +1,577 @@
+begin 	"CrshID"
+
+require "(SAILIB)SAIL.DEF" source!file;
+!get!definitions(GOGTAB);
+!get!definitions(TYMINT);
+require "(SAILIB)FRMRUN.REQ" source!file;
+require "(SAILIB)REDUFD.REQ" source!file;
+require "CIDANL.DCL" source!file;	! crash analysis module;
+require "CIDDBM.DCL" source!file;	! crash data base manager;
+require "CIDFRM.DCL" source!file;	! crash frame module;
+require "CIDSYM.DCL" source!file;	! symbol module;
+require "CIDSYS.DCL" source!file;	! crash systat module;
+require "(MPL)UUOSYM.SAI" source!file;
+    redefine !cnSID = '43;
+require '102 version;			! WRS 4/84;
+require crlf&"License required: AC JL RF" message;
+
+! .DCL begin;
+!
+    absolute addresses in crash file
+;
+define	DdtSym = '036;		! EDDT symbol table ptr setup by ONCE;
+define	JobSym = '116;		! Where to find symbols in monitor files;
+define	JobVer = '137;		! Pointer to CONFIG;
+define	!CNCPU = '41;		! CPU type code index into CONFIG;
+define	Key620 = '150;		! Key620 location;
+define	Key = '633751506262; 	! Key620 healthy value;
+
+!
+    table offsets in crash file
+;
+define	cnf.CRSDB  = -2;	! xwd CRSDB,NUMTAB;
+define	crs.PISTS  = '0;	! CONI  PI,  (RDPI)	ILS3;
+define	crs.APRSTS = '1;	! CONI  APR, (RDAPR)    ILS3;
+define	crs.PAGDTI = '2;	! DATAI PAG, (RDUBR)    ILS3;
+define	crs.PAGCNI = '3;	! CONI  PAG, (RDEBR)    ILS3;
+define	crs.AIDSTS = '4;	! BLKI  APR, (APRID)    .LS.;
+define	crs.APRDTI = '5;	! DATAI APR,     	IL.3;
+define	crs.CRSHAC = '14;	! xwd EPT,CRSHAC;
+define	crs.SAV30  = '15;	! value of 30 saved here;
+define	crs.STOPCN = '16;	! count of times we tried to crash;
+define	crs.STOPPC = '17;	! real PC of first STOPCD we hit;
+
+!
+    some special bit values
+;
+define
+    STAUTO	= !bit(17),
+    STSUPR	= !bit(19),
+    STSHUT	= !bit(18),
+    STRLB	= !bit(20);
+
+!
+    date and time definitions
+;
+define	GMT = '20;	! GMT time zone;
+define	Local = -1;	! Time zone code for user's local time zone;
+define	DECForm = 0;	! DEC formated date flag;
+define	DaysPast = '400000; ! Days past 1/1/64 date format flag;
+
+!
+    define cpu type values KI, KL, KS and F3
+;
+define cpu!! = 0;
+forlc cpu! = (KI,KL,KS,F3) 
+    doc { redefine cpu!! = cpu!! + 1; define cpu! = cpu!!; } endc
+	
+!
+    miscelaneous
+;
+require 100 polling!interval;
+
+! .DCL end;
+
+! ----------------------------------------------------------------------
+		Global Data Structures
+---------------------------------------------------------------------- ;
+
+boolean
+    Quit;			! set to true to exit command scanner;
+
+integer
+    UpTok.brk,			! break table for upper case tokens;
+    Brk;			! Break character temp;
+
+string
+    Args;			! unscanned args of current command;
+
+simple procedure BreakIni;
+begin
+    setbreak( UpTok.brk:=getbreak, " "&#ht&#lf, " "&#ht&#cr, "TISK" );
+end;
+require BreakIni initialization;
+
+external integer array GOGTAB[0:'77777];
+
+! ----------------------------------------------------------------------
+		Interrupt and Cleanup Code
+---------------------------------------------------------------------- ;
+
+procedure Main.CleanUp;
+begin
+    setprint(null,"T");		! close output file (if any);
+    RelFrm;			! discard the crash frame;
+end;
+
+procedure ESCsvc;
+begin
+    print( crlf&"^C" );
+    Main.CleanUp;
+    begin!code
+	uuo!EXIT;
+    end;
+end;
+
+procedure NTQsvc;
+begin
+    print( crlf&"?Notice to Quit"&crlf );
+    Main.CleanUp;
+    begin!code
+	MOVSI 0;
+	uuo!LOGOFF;
+	uuo!EXIT;
+    end;
+end;
+
+item	INTPRO;
+simple procedure IntIni;
+begin "IntIni"
+    own safe integer array ESCblk[1:2];
+    own safe integer array NTQblk[1:2];
+    ESCblk[1] _ 2; 
+    ESCblk[2] _ !hl(-1)+location(ESCsvc);
+    NTQblk[1] _ 2; 
+    NTQblk[2] _ !hl(-1)+location(NTQsvc);
+    intset ( INTPRO, 0 );
+    intmap ( tinass(-1,!IAESC,10), dfrint, location(ESCblk[1]) );
+    enable ( newenb(10) );
+    intmap ( intass(!IANTQ,11), dfrint, location(NTQblk[1]) );
+    enable ( newenb(11) );
+end "IntIni";
+require IntIni initialization;
+
+!	Send file to development system ;
+
+integer Port;			! port number of circuit (optomist);
+
+simple procedure SendM33 (string text);
+begin
+    auxclv (Port,0,!AXCBI);	! clear input buffer;
+    while length(text) 		! output all characters except lf;
+	do auxclv (Port,lop(text),!AXO8);
+    auxclv (Port,#cr,!AXO8);	! CR at end;
+end;
+
+
+!	SendFile ("filename")
+
+This routine should be called in order to setup output to port.  It
+will not return until a circuit is established.  Really.
+;
+procedure SendFile (string FileName);
+begin "SF"
+    integer Built,J,JobN,RetryCnt;
+    integer array LogString [0:10];	! login string for CREAUX;
+    integer C,E;
+    open(C_getchan,"DSK",'17,0,0, 0,0,E);
+    lookup(C,"(SYS)CRSHID.DAT",E);
+    if E 
+	then LogString[0] _ cvasc("M33;")
+	else arryin(C,LogString[0],arrinfo(LogString,0));
+    release(C);
+    RetryCnt _ 0;
+    if calli(!xwd('33,'11),calli!GETTAB)=930 then begin "930"
+	while calli(!xwd(!CNSTS,!GTCNF),calli!GETTAB) land '400000
+	    do calli(15,calli!SLEEP);	! wait for un-shut if we are;
+	calli(60,'31);			! give SUP an extra minute;
+    end "930";
+    do begin "build"			! build the circuit;
+	Port _ calli (location(LogString[0]),calli!CREAUX);
+	Built _ !SKIP!;
+	if not Built then begin
+	    RetryCnt_RetryCnt+1;
+	    if Port=4   		! check error (if was one);
+		then calli(!xwd(2,20),calli!HIBER)  ! wait 20 mins if down;
+		else calli(!xwd(2,10),calli!HIBER); ! else wait 10 mins;
+	end;
+    end "build" until Built;		! loop until it works;
+    SendM33 (#cr&#cr&#cr&		! initialize the circuit;
+	"SET LOGOUT"& #cr&		! just in case;
+	"TTY LC"& #cr&			! might as well make it pretty;
+	"PDP"& #cr&			! so ^Z will work;
+	"COPY T,"& FileName);		! (SendM33 appends CR);
+end "SF";
+
+!	CloseCircuit
+
+Call this guy to zap the circuit after sending all the data.
+;
+simple procedure CloseCircuit;
+if Port then begin
+    SendM33 ( #ctrl("Z")& "LOGOUT"& #cr );
+    auxclv (Port,0,!AXLDE);
+    calli (!bit(8)*port+!xwd('141,300),calli!HIBER);
+    calli (Port,calli!ZAPCIR);
+    Port := 0;
+end;
+
+preload!with
+    "-000-","-Jan-","-Feb-","-Mar-","-Apr-","-May-",
+    "-Jun-","-Jul-","-Aug-","-Sep-","-Oct-","-Nov-","-Dec-";
+string array MONTH[0:12];
+
+internal string procedure cvDate( integer DECD );
+begin
+    integer A,B,Y,M,D;
+    string S;
+    D := DECD mod 31 + 1;
+    M := DECD % 31 mod 12 + 1;
+    Y := DECD % (31*12) + 64;
+    if DECD < 0 or Y > 94
+	then return( "??-???-??" );
+    getformat( A,B );
+    setformat( 2,0 );
+    S := cvs(D) & MONTH[M] & cvs(Y);
+    setformat( A,B );
+    return( S );
+end;
+
+internal string procedure cvTime( integer SECS );
+begin
+    integer A,B;
+    string S;
+    getformat( A,B );
+    S := cvs( SECS % 3600 ) &  ":";
+    setformat(-2,0);
+    S := S & cvs( SECS % 60 mod 60 ) & ":" &
+        cvs( SECS mod 60 );
+    setformat( A,B );
+    return( S );
+end;
+
+internal string procedure cvZone( integer Z );
+begin
+    Z := Z land '37;
+    return( case Z of (
+	['06] "HT", ['10] "PT", ['11] "MT", ['12] "CT",
+	['13] "ET", ['14] "AT", ['20] "UT",
+	[else] "???YXWVUTSRQPONZABCDEFGHIJKLM???"[Z to Z] ));
+end;
+
+internal string procedure cvDayTime( integer D,T,Z(Local) );
+begin
+    integer array X[0:2];
+    if Z = Local then
+	Z := (calli(!xwd(-1,!gtPRV),calli!GETTAB) lsh (7-35)) land '77;
+    X[0] := D;
+    X[1] := T * 60;	! convert to jiffies past midnight;
+    X[2] := !xwd( DaysPast+GMT, DecForm+Z );
+    calli( location(X[0]), calli!DATUUO );
+    return( cvDate( X[0] ) & " " & cvTime( X[1] % 60 ) & " " & cvZone( Z ) );
+end;
+
+integer
+    SB1,
+    SB2,
+    SB3;
+
+simple procedure sbini;
+begin
+    setbreak(SB1_getbreak,";",null,"SINK");
+    setbreak(SB2_getbreak,",",null,"SINK");
+    setbreak(SB3_getbreak,"/",null,"RINK");
+end;
+require sbini initialization;
+
+simple procedure LookupUFD (reference integer Chan, PPN, Eof);
+begin "lookupUFD"
+    own integer array L[0:3];
+    L[0] _ arrinfo(L,2);
+    L[1] _ !xwd(1,1);
+    L[2] _ PPN;
+    L[3] _ cvsix("UFD");
+    chnior(Chan, L[0], 4);
+    if !SKIP! then PPN _ L[2];
+    Eof _ not !SKIP!;
+end "lookupUFD";
+
+procedure Sort;
+if SpecCnt > 1 then begin "Bluble Sort"
+
+    record!pointer (spec) array Ptrs[1:SpecCnt];
+    integer I,J;
+
+    SpecPtr _ SpecHdr;
+    for I := 1 upto SpecCnt do begin
+	Ptrs[i] := SpecPtr;
+	SpecPtr := spec:Link[SpecPtr];
+    end;
+
+    do begin
+	J := 0;
+	for i := 2 upto SpecCnt do 
+	    if Spec:IDate[Ptrs[i-1]] > Spec:IDate[Ptrs[i]]
+		or (Spec:IDate[Ptrs[i-1]] = Spec:IDate[Ptrs[i]]
+		and Spec:ITime[Ptrs[i-1]] > Spec:ITime[Ptrs[i]])
+		then begin
+		    Ptrs[i-1] swap Ptrs[i];
+		    J := J + 1;
+	        end;
+    end until J=0;
+
+    SpecHdr := Ptrs[1];
+    for i := 1 upto SpecCnt-1 do
+	spec:Link[Ptrs[i]] := Ptrs[i+1];
+    spec:Link[Ptrs[SpecCnt]] := null!record;
+
+end "Bluble Sort";
+
+procedure Directory( string FileSpecs );
+begin	"Directory"
+    string Template;
+    integer PPN;
+    boolean procedure NextFile( integer array UfdData );
+    begin "NextFile"
+	SpecPtr := new!record(Spec);
+	spec:Name[SpecPtr] :=
+	    cv6str(UfdData[0])
+	    & "." & cv6str(UfdData[1])
+	    & "[" & cvos(!lh(PPN))
+	    & "," & cvos(!rh(PPN))
+	    & "]";
+	Spec:IDate[SpecPtr] := !lh(UfdData[2]);
+	Spec:ITime[SpecPtr] := !rh(UfdData[2]);
+	Spec:IName[SpecPtr] := UfdData[0];
+	spec:Link[SpecPtr] := SpecHdr;
+	SpecHdr := SpecPtr;
+	SpecCnt := SpecCnt + 1;
+	return( false );
+    end "NextFile";
+    if length(FileSpecs)=0 then FileSpecs := "(SYS)";
+    while length(FileSpecs) do begin "NextToken"
+	string Tok;
+	define BadTok (Msg) = {
+	    begin "BadTok"
+		print("?", Msg, crlf);
+		continue "NextToken";
+	    end "BadTok"
+	};
+	Tok := scan(FileSpecs,SB2,Brk);
+	Template := cv6str(cvfil(Tok,Brk,PPN));
+	if Brk then BadTok("Extension not expected: "&Tok);
+	if Template=0 then Template := "CRA0##";
+	Template := Template&
+	    ".SAV["& cvos(!lh(PPN))& ","& cvos(!rh(PPN))& "]";
+	SpecHdr := null!record;
+	SpecCnt := 0;
+	RedUFD( NextFile, Template, "C" );
+    end "NextToken";
+end	"Directory";
+
+procedure PrintSpec (
+    r!p(spec)	P );
+begin	"PrintSpec"
+    print(
+	cvxstr(Spec:IName[P]),
+	"  ",
+	( if length( Spec:Info[P] )
+	    then Spec:Info[P]
+	    else cvDayTime( Spec:IDate[P], Spec:ITime[P] ) ),
+	crlf,
+	Spec:Anal[P] );
+end	"PrintSpec";
+
+procedure SetSpec (
+    r!p(SPEC) P );
+begin	"SetSpec"
+    string	S;
+    integer	I;
+
+    Spec:Info[P] :=
+	cvDayTime( RPM(CONFIG+!CNDAT), RPM(CONFIG+!CNTIM) % 60 )&
+	"  "&
+	cvstr( RPM(CONFIG+!CNFG0+0) )&
+	cvstr( RPM(CONFIG+!CNFG0+1) )&
+	cvstr( RPM(CONFIG+!CNFG0+2) )&
+	cvstr( RPM(CONFIG+!CNFG0+3) )&
+	cvstr( RPM(CONFIG+!CNFG0+4) )&
+	"  #"&
+	cvos( RPM(CONFIG+!CNSER) )&
+	"["&
+	(case RPM(CONFIG+!CNCPU) of ("??","KI","KL","KS","F3") )&
+	"]";
+    Spec:Anal[P] :=
+	Anal.Short;
+
+end	"SetSpec";
+
+procedure Setup( string S );
+begin	"Setup"
+    if length( S ) = 0 then begin
+	SpecPtr := if CraSpec
+	    then SPEC:link[CraSpec]
+	    else SpecHdr;
+    end else begin
+	SpecPtr := SpecHdr;
+	while SpecPtr do begin
+	    if ( cvsix( S ) = Spec:IName[SpecPtr] )
+	    or ( cvd( S ) = cvd( cv6str( Spec:IName[SpecPtr] lsh 18 )) )
+		then done;
+	    SpecPtr := SPEC:link[SpecPtr];
+	end;
+    end;
+    if SpecPtr
+	then begin
+	    CraSpec := SpecPtr;
+	    GetCrash( SPEC:name[SpecPtr] );
+	    GetSymbols( RPM( RPM(JobVer)+!CNSID) );
+	    SetSpec( SpecPtr );
+	end
+	else print( "?no crash found ", S, crlf );
+end	"Setup";
+
+! ----------------------------------------------------------------------
+		Command Definition Macros
+---------------------------------------------------------------------- ;
+
+define
+    command ( #cmd, #help ) = {
+	redefine
+	    CmdN = CmdN + 1,
+	    !CmdList = cvms(!CmdList) & {,"#cmd"},
+	    !CmdHelp = cvms(!CmdHelp) & {,"#help"},
+	    !CmdCase = cvms(!CmdCase) & {;#cmd}&{.cmd};
+	procedure #cmd}&{.cmd },
+    CmdN = 0,
+    !CmdList = {"?"},
+    !CmdHelp = {"list of commands"},
+    !CmdCase = {HELP.cmd},
+    !CmdBack = {
+	preload!with !CmdList; string array CmdList[0:CmdN];
+	preload!with !CmdHelp; string array CmdHelp[0:CmdN];
+	procedure CmdCase( integer I ); case I of begin !CmdCase end; };
+
+Command (GET,select and setup crash for processing);
+begin
+    Setup( Args );
+    PrintSpec( CraSpec );
+end;
+
+Command	(DDT,run filddt for current crash);
+!
+	Run the appropriate FILDDT out of M33 for the current crash.
+	If no FILDDT is found, and we have symbols, make one.
+	Pass it a TMP file containing the crash name.
+	Kill frame and return when it halts.
+;
+begin	"DDT"
+    integer	SID;		! system identifier (serial number);
+    integer	FERR;		! frame error code;
+    integer	PERR;		! program error code;
+    string	FILDDT;		! filename of FILDDT;
+    string	MONITR;		! filename of monitor;
+    string	CMDS;		! commands for FILDDT;
+    integer	I;
+    if not CraSym then begin
+	print( "?no current crash"& crlf );
+	return;
+    end;
+    if not SYM:haveSym[CraSym] then begin
+	print( "?no symbols for current crash"& crlf );
+	return;
+    end;
+    SID := SYM:sysid[CraSym];
+    FILDDT := "(M33)F"&cv6str(SID lsh 6);
+    MONITR := SYM:source[CraSym][1 to inf-4];
+    if not equ( FILDDT, MONITR ) then begin "makeDDT"
+	print( "[creating new FILDDT - please wait]"&crlf );
+	CMDS := MONITR& "/S"& crlf& "/X";
+	FERR := FrmRun( "(SYS)FILDDT",F.CCL+F.SAVE,PERR,"DDT",CMDS,FILDDT );
+	if FERR then begin
+	    print( "?FrmRun error ",FERR,crlf );
+	    return;
+	end;
+	print( "[FILDDT created - proceeding]"&crlf );
+    end "makeDDT";
+    CMDS := "(SYS)"& cv6str(Spec:IName[CraSpec]);
+    FERR := FrmRun( FILDDT,F.CCL,PERR,"DDT",CMDS );
+    print( #cr );		! overwrite prompt (kludge);
+end	"DDT";
+
+Command	(SYSTAT,simulate a SYSTAT command at time of crash);
+begin	"SYSTAT"
+    Systat( Args );
+end	"SYSTAT";
+
+Command (LIST,display list of outstanding crashes);
+begin
+    r!p(spec)	P;
+    P := SpecHdr;
+    while P do begin
+	print( if P = CraSpec then "* " else "  " );
+	PrintSpec( P );
+	P := Spec:Link[P];
+    end;
+end;
+
+Command (LOG,open log file);
+begin
+    if length( Args ) = 0 then begin
+	print( "Log file name: " );
+	Args := inchwl;
+    end;
+    setprint( Args, "B" );
+end;
+
+Command	(NOLOG,close log file);
+begin
+    setprint( null, "T" );
+end;
+
+forward procedure HELP;
+
+Command (HELP,list valid commands);
+HELP;
+
+Command	(QUIT,return to exec);
+QUIT := true;
+
+!CmdBack;			! define command arrays, etc.;
+
+procedure HELP;
+begin
+    integer I;
+    print( "Valid commands are:"&crlf );
+    for I := 1 upto CmdN do print (
+	"  ",
+	CmdList[I],
+	(#ht&#ht)[(length(CmdList[I])+2)%8+1 to inf],
+	CmdHelp[I],
+	crlf );
+end;
+
+begin "Main"
+
+    ttyup( true );		! all input to upper case;
+    CreFrm;			! create frame to get crashes in;
+
+    print( "CRSHID v",cvos(memory[JobVer]),crlf&crlf );
+    Directory( "(SYS)CRA0##" );
+    print( "[", SpecCnt, " crashes]"& crlf );
+    Sort;
+
+    Quit := false;
+    do begin
+	integer B,Index,MatchIndex,MatchCnt;
+	string Cmd;
+	print( "# " );
+	Args := inchwl;
+	if length( Args ) = 0 then continue;
+	Cmd := scan( Args, UpTok.brk, B );
+	MatchCnt := 0;
+	for Index := 0 upto CmdN do
+	    if equ( Cmd, CmdList[ Index ][ 1 to length( Cmd ) ] ) then begin
+		MatchIndex := Index;
+		MatchCnt := MatchCnt +1;
+	    end;
+	case MatchCnt of begin
+	    [0] print( "?invalid command """,Cmd,""", type ? for help"&crlf );
+	    [1] CmdCase( MatchIndex );	! call the actual command procedure;
+	    [else] print( "?ambiguous"&crlf )
+	end;
+    end until Quit;
+    Main.Cleanup;
+end "Main";
+end "CrshID" $
+    
