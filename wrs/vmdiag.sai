@@ -1,0 +1,283 @@
+begin	"RUNNER"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+
+simple integer procedure FRMOPR(
+	integer FD; 
+	reference integer A; 
+	integer FO);
+begin!code
+	protect!acs 1;
+	MOVE 1,FD;
+	HRL 1,FO;
+	SETOM !SKIP!;
+	uuo!FRMOP 1,A;
+	 SETZM !SKIP!;
+end;	
+	
+simple integer procedure FRMOPV(
+	integer FD,A,FO);
+begin!code
+	protect!acs 1;
+	MOVE 1,FD;
+	HRL 1,FO;
+	SETOM !SKIP!;
+	uuo!FRMOP 1,A;
+	 SETZM !SKIP!;
+end;	
+	
+simple integer procedure ReadFrame(
+	integer FD,A );
+begin!code
+	protect!acs 0,1,2;
+	MOVE 2,FD;
+	HRLI 2,!foRVA;
+	MOVE 0,A;		! address in 0;
+	SETOM !SKIP!;
+	uuo!FRMOP 2,0;		! return data in 1;
+	 SETZM !SKIP!;
+end;
+	
+begin	"M A I N"
+    integer FrameCnt;
+    integer MEMSIZ,MONSIZ,FCdefault;
+    ttyup(true);
+    MEMSIZ _ calli(!xwd(!NSMMS,!GTNSW),calli!GETTAB);
+    MONSIZ _ calli(!xwd(!CNSIZ,!GTCNF),calli!GETTAB);
+    FCdefault _ (512*512-1+MEMSIZ-MONSIZ)/(512*512);
+    print("physical memory = ",MEMSIZ%512,"P",crlf);
+    print("user memory = ",(MEMSIZ-MONSIZ)%512,"P",crlf);
+    do begin
+	string S;
+	print("How many frames [",FCdefault,"]? ");
+	FrameCnt _ cvd(S_inchwl);
+	case S of begin
+	    [null] FrameCnt _ FCdefault;
+	    ["HELP"] print("
+This program will create a number of child frames and run a simple
+user mode diagnostic in each one.  The diagnostic expands its virtual
+address space to 512P and performs a general memory test.  Since this
+will likely cause virtual memory to exceed physical memory, this also
+puts a considerable load on the paging system.  The default number of 
+frames to run is computed by the formula
+	(MEMSIZ-MONSIZ)/512P		[result is rounded up]
+	(",MEMSIZ,"-",MONSIZ,")/",512*512," = ",FCdefault,"
+where MEMSIZ is the extent of physical memory and MONSIZ is the number
+of words used by the monitor.  This will produce an ""active swapping
+ratio"" of at least 1.0.
+");	    ["?"] print("one of:
+  number		to start 'number' frames
+  <CR>			to use default of ",FCdefault,"
+  HELP			for more information
+");	    else 
+	end;
+    end until FrameCnt > 0;
+    
+    begin "do it"
+	integer array FD[1:FrameCnt];	
+	integer array HSB[1:FrameCnt,0:7];
+	integer array STS[1:FrameCnt];
+
+require "VMDSLV" load!module;
+external integer S!REAL;	! actual start address;
+external integer S!ORG;		! phased start address;
+external integer S!END;		! phased end address;
+external integer S!STRT;	! phased start address;
+external integer S!PASS;	! pass counter register;
+external integer S!AOBJ;	! AOBJ counter register;
+external integer S!CODE;	! test type code register;
+external integer S!VALU;	! expected value register;
+
+procedure RunDiagnostic (integer I);
+if (HSB[i,2] = 0) or (HSB[i,1] = !xwd(HC!EXI,HT!FCL))
+    then begin "run it" 
+	own integer ERR;
+	begin!code 
+	label CPY,ERRX;
+	protect!acs 0,1,2,3;
+	MOVE 0,access(FD[i]);	! frame number (used later);
+	MOVE 1,0;		! get frame # in 1;
+	SETZM ERR;		! 0=SETOTF failed;
+	uuo!SETOTF 1,;		! define other frame;
+	 JRST ERRX;
+	MOVSI 1,'207000;	! create 512 pages R/W in other frame;
+	AOS ERR;		! 1=VCREAT failed;
+	uuo!VCREAT 1,;		! create pages;
+	 JRST ERRX;
+	AOS ERR;		! 2=WVA failed;
+	HRLI 0,!foWVA;		! 0 already has FD in rh;
+	MOVEI 1,S!REAL;		! real address;
+	MOVEI 2,S!ORG;		! phase address;
+CPY:	MOVE 3,(1);		! data;
+	uuo!FRMOP 0,2;		! write in other frame;
+	 JRST ERRX;
+	AOS 1;
+	AOS 2;
+	CAIE 2,S!END;		! at the end yet?;
+	 JRST CPY;
+	AOS ERR;		! 3=SAA failed;
+	HRLI 0,!foSAA;		! 0 already has FD in rh;
+	MOVEI 1,S!STRT;		! start address;
+	HRLI 1,'400000;		! absolute start address;
+	uuo!FRMOP 0,1;
+	 JRST ERRX;
+	SETOM ERR;		! no errors!;
+ERRX:	JFCL;
+	end;
+	case ERR of begin
+	    [0] print("?SETOTF failed in RunDiagnostic",crlf);
+	    [1] print("?VCREAT failed in RunDiagnostic",crlf);
+	    [2] print("?!foWVA failed in RunDiagnostic",crlf);
+	    [3] print("?!foSAA failed in RunDiagnostic",crlf);
+	else end;
+	if ERR geq 0 then begin
+	    FD[i] _ 0;		! give up;
+	    print("?",#ht,"taking frame off active list",crlf);
+	end;
+    end
+    else begin "clear it"
+	FRMOPV(FD[i],0,!foCLR);	
+	! when frame halts, we will get called again to start it;
+	if not !SKIP! then begin
+	    FD[i] _ 0;		! give up;
+	    print("?cant clear frame ",cvos(FD[i]),crlf,
+		"?",#ht,"taking frame off active list",crlf);
+	end;
+    end;
+
+begin	"create frames"
+    integer I,C;
+    C _ 0;
+    for I _ 1 upto FrameCnt do begin
+	FD[i] _ FRMOPV(0,0,!foCFM);
+	if not !SKIP! then begin
+	    print("?cant create frame: ",case FD[i] of (
+		"no disk room",
+		"frame capacity exceeded",
+		"bad argument or no license",
+		"cant create command port DDB" ),crlf);
+	    FD[i] _ 0;
+	    continue;
+	end;
+	RunDiagnostic(I);
+	print("[frame ",cvos(FD[i])," created]",crlf);
+	C _ C +1;
+    end;
+    print("[",C," frames created]",crlf);
+end	"create frames";
+
+while true do begin "watch frames"
+    integer I;
+    calli(5,calli!SLEEP);
+    for I _ 1 upto FrameCnt do if FD[i] then begin "check frames"
+	integer S;
+	S _ calli(!xwd(FD[i],!gtSTS),calli!GETTAB);
+	if not !SKIP! then begin
+	    print("?cant gettab status for frame ",cvos(FD[i]),crlf);
+	    continue;
+	end;
+	if 0 = (S land JB!RUN) then begin "frame halted"
+	    integer HCNT,HT;
+	    HCNT _ HSB[i,2];			! get old halt count;
+	    HSB[i,0] _ arrinfo(HSB,4);
+	    FRMOPR(FD[i],HSB[i,0],!foHST);
+	    if not !SKIP! then begin
+		print("?cant read halt status for frame ",cvos(FD[i]),crlf,
+		    "?",#ht,"frame removed from active list",crlf);
+		FD[i] _ 0;
+		continue end;
+	    if HCNT = HSB[i,2] then begin	! did it change? ;
+		print("?halt count not incrimented for frame ",cvos(FD[i]),crlf,
+		    "?",#ht,"clearing and restarting frame",crlf);
+		RunDiagnostic(I);
+		continue end;
+	    if HSB[i,1] = !xwd(HC!EXI,HT!FCL) then begin
+		RunDiagnostic(I);
+		continue end;
+	    if HSB[i,1] = !xwd(HC!EXI,HT!EX1) then begin
+		integer PASS;
+		PASS _ ReadFrame(FD[i],location(S!PASS));
+		print("[frame ",cvos(FD[i])," starting pass ",PASS,"]",crlf);
+		FRMOPV(FD[i],SV!CON,!foSVA);
+		if not !SKIP! then begin
+		    print("?cant continue frame ",cvos(FD[i]),crlf,
+			"?",#ht,"clearing and restarting frame",crlf);
+		    RunDiagnostic(I) end;
+		continue end;
+	    if HSB[i,1] = !xwd(HC!ILL,HT!HLT) then begin
+		integer CODE,VALU,AOBJ,MEM;
+		print("%program detected error in frame ",cvos(FD[i]),crlf);
+	  	CODE _ ReadFrame(FD[i],location(S!CODE));
+	  	AOBJ _ ReadFrame(FD[i],location(S!AOBJ));
+	  	VALU _ ReadFrame(FD[i],location(S!VALU));
+		MEM _ ReadFrame(FD[i],!rh(AOBJ));
+		case CODE of begin
+		    [1] print(
+			"%",#ht,"failed peak test at ",cvos(!rh(AOBJ)),crlf,
+			"%",#ht,"data wrote: ",cvos(VALU),crlf,
+			"%",#ht,"data read:  ",cvos(MEM),crlf);
+		    [2] print(
+			"%",#ht,"failed valley test at ",cvos(!rh(AOBJ)),crlf,
+			"%",#ht,"data wrote: ",cvos(VALU),crlf,
+			"%",#ht,"data read:  ",cvos(MEM),crlf);
+		    [3] print(
+			"%",#ht,"failed count test at ",cvos(!rh(AOBJ)),crlf,
+			"%",#ht,"data wrote: ",cvos(AOBJ),crlf,
+			"%",#ht,"data read:  ",cvos(MEM),crlf);
+		    else print(
+			"?",#ht,"unknown error code: ",cvos(CODE),crlf)
+		end;
+		FRMOPV(FD[i],SV!CON,!foSVA);	! continue frame;
+		if not !SKIP! then begin
+		    print("?cant continue frame ",cvos(FD[i]),crlf);
+		    RunDiagnostic(I);
+		    continue end;
+		continue;
+	    end;
+	    HT _ !rh(HSB[i,1]);
+	    case !lh(HSB[i,1]) of begin
+		[HC!MEM] print(case HT of (
+		    "?PC out of bounds",
+		    "?illegal memory reference",
+		    "?write violation",
+		    "?ill mem ref in UUO",
+		    "?illegal interrupt address",
+		    "?address break",
+		    "?PDL overflow"));
+		[HC!SYS] print(case HT of (
+		    "?page I/O error",
+		    "?disk full during copy of .PRCW page",
+		    "?paging hardware error",
+		    "?too many pages locked",
+		    "?context page I/O error",
+		    "?user parity error"));
+		[HC!ILL] print(case HT of (
+		    "?illegal UUO",
+		    "?UUO error",
+		    "?illegal instruction",
+		    "?HALT"));
+		[HC!RUN] print(case HT of (
+		    "?transmission error",
+		    "?more pages required",
+		    "?device not available",
+		    "?program not found",
+		    "?not a save file",
+		    "?enter UUO failed",
+		    "?no croe argument",
+		    "?magtape high segment format bad",
+		    "?REMAP UUO fatal error",
+		    "?magtape GET failure",
+		    "?no start address"));
+		else print("?unexpected frame halt ",cvos(HSB[i,1]))
+	    end;
+	    print(" for frame ",cvos(FD[i]),crlf);
+	    RunDiagnostic(I);
+	end "frame halted";
+    end "check frames";
+end	"watch frames";
+
+    end "do it";
+    
+end	"M A I N";
+end 	$
