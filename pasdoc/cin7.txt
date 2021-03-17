@@ -1,0 +1,1187 @@
+
+
+
+
+
+
+
+
+
+
+
+                          Compiler Implementation Notes #7
+
+                             Summary Data Flow Analysis
+
+
+
+
+          1.  Introduction
+
+               When  we  perform  common  subexpression  elimination   (see
+          CIN-#5),  we need to know which variables may be modified by each
+          statement in the  program,  so  that  we  can  tell  whether  two
+          references  to  the  same  variable are in fact references to the
+          same value.  This means that we need to know which variables  may
+          be  modified by a call on a given procedure or function.  We also
+          need to know which variables may be referred to as a result of  a
+          call on a given procedure or function, so that we don't eliminate
+          an assignment to such a variable, thinking that it is  redundant.
+          The  analysis  required  to  obtain  this  sort of information is
+          called summary data flow analysis (since it produces a summary of
+          the  effects of each procedure and function).  A general approach
+          to summary data flow analysis is developed by  Jeffrey  Barth  in
+          [Barth   1977],  which  is  well  summarized  in  an  article  in
+          Communications of the ACM [Barth 1978].  Barth's style  is  clear
+          and  readable,  and our approach to summary data flow analysis is
+          closely based on his; therefore, the reader is urged to refer  to
+          at least the Communications article.
+
+               The objective of our summary data flow analysis procedure is
+          the determination of  two  relations,  MOD  and  USE.  These  are
+          defined as:
+
+               x  MOD  y  if  x is a subroutine, and y is a variable, and a
+               call to x can result in a modification of the value of y.
+
+               x USE y if x is a subroutine, and y is  a  variable,  and  a
+               call to x may result in a use of the current value of y.
+
+               Section  2  of this paper is devoted to a summary of Barth's
+          algorithm.  Since  our  treatment  of  subroutine  variables   is
+          similar  to  Barth's  suggestions  for handling formal subroutine
+          parameters, we also consider those suggestions.  Our notation  is
+          essentially  that  of  Barth, with some changes.  We also propose
+          some  simplifying  assumptions,  which  should  not  degrade  the
+          performance  of  the  algorithm  when  applied  to any reasonable
+          programs.
+
+
+
+                                        - 1 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+               The computation of the summary  data  flow  relations  makes
+          extensive  use  of  the  call  graph, which indicates the calling
+          relations between procedures.  Therefore, section 3 discusses the
+          construction  of  the  call graph, giving particular attention to
+          the problems posed by  external  subroutines,  formal  subroutine
+          parameters, and subroutine variables.
+
+               Finally,   in   section   4   we  consider  the  problem  of
+          implementing the  summary  data  flow  algorithm  efficiently.  A
+          rudimentary interprocedural flow algorithm of Hecht [Hecht 1977],
+          based  on  Tarjan's  algorithm  for  finding  strongly  connected
+          components  in a directed graph [Tarjan 1972], appears to provide
+          the basis for a reasonable implementation.
+
+
+
+
+          2.  Summary of Barth's Algorithm
+
+
+          2.1    The Basic Algorithm
+
+               Initially, we assume  a  language  without  var  parameters,
+          subroutine parameters or variables, or external subroutines.  Let
+          PP represent the set of all the procedures and functions  in  the
+          program,  and let VV represent the set of all the variables which
+          are declared in the the main program or  in  any  subroutine.  We
+          assume  the  availability  of the three relations MOD0, USE0, and
+          CALLS (these can be computed from the information  in  the  cross
+          reference  file--see  CIN-#6).  MOD0  is  a  relation on PP x VV,
+          where p MOD0 x if procedure p  contains  a  statement  which  can
+          change  the  value of variable x.  USE0 is a relation on PP x VV,
+          where p USE0 x if procedure p contains a statement which uses the
+          value  of  variable  x.  CALLS  is a relation on PP x PP, where p
+          CALLS q if procedure p contains a call to procedure q.
+
+               Our objective is to compute the relations MOD and  USE.  MOD
+          is a relation on PP x VV, where p MOD x if, as a consequence of a
+          call on procedure p, the value of variable x may be changed.  USE
+          is a relation on PP x VV, where p USE x if, as a consequence of a
+          call on procedure p, the value of variable x may  be  used.  Now,
+          the exact computation of the MOD and USE relations is recursively
+          unsolvable, so we will have to settle for as much precision as we
+          can  get.  It  is  acceptable  if our computed relations indicate
+          that a call on procedure p can use or modify variable x, when  in
+          fact it can't, since this can result in a less optimized program,
+          but never in an  incorrect  one.  However,  relations  indicating
+          that  p  cannot modify or use x, when in fact it can, may lead to
+          invalid optimizations, and thus are unacceptable.
+
+               Throughout much of the remainder of the discussion, we  will
+          discuss  only  the  MOD  relation.  The  development  of  the USE
+          relation is equivalent.
+
+
+                                        - 2 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+               The first approximation to the MOD relation is simply to see
+          if  p  can  modify x, or if some routine which can be called by p
+          modifies x.  That is,
+
+               MOD = CALLS* MOD0                                     (1)
+
+               CALLS* is the reflexive  transitive  closure  of  the  CALLS
+          relation--p  CALLS* r if p is r, or if p CALLS r, or if there are
+          one or more procedures q1, q2, ...  qn,  such  that  p  CALLS  q1
+          CALLS q2 ...  CALLS qn CALLS r.  Thus, this formulation indicates
+          that p MOD x if p MOD0 x, or p CALLS r and r MOD0 x, or  p  CALLS
+          q1 CALLS r and r MOD0 x, etc.
+
+               The  main  shortcoming  of  this  formula for MOD is that it
+          ignores scope considerations.  Remember that if  a  procedure  is
+          called  recursively,  each invocation of the procedure results in
+          new incarnations of  all  local  (non-static)  variables  of  the
+          procedure.  Thus,  even  though  p CALLS* q and q MOD0 x, we need
+          not conclude that p MOD x if we know that the x modified by q and
+          the   x   which  exists  when  p  is  called  must  be  different
+          incarnations of x.  For the  simplest  example,  suppose  that  a
+          directly  recursive  procedure  p  has  a local variable x, whose
+          value it modifies at some point.  Then p CALLS p, and p  MOD0  x.
+          However,  the  x  which  is modified by the called p is different
+          from the x which exists in the calling p, so we do  not  need  to
+          conclude that p MOD x.
+
+               Let  LEVEL be a function which maps procedures and variables
+          into integers.  If p is the main  program,  then  LEVEL(p)  =  1.
+          Otherwise,  if  procedure  p  is  defined  within  procedure  (or
+          program) q, then LEVEL(p) = LEVEL(q) + 1.  For a variable x which
+          is  declared  in  a  procedure  p, LEVEL(x) = LEVEL(p).  In other
+          words, LEVEL is simply the lexical nesting  level  of  procedures
+          and variables in the program.  Barth introduces a relation called
+          SCOPE, defined on PP  x  VV,  where  p  SCOPE  x  if  LEVEL(p)  >
+          LEVEL(x).  Obeserve  that  if  LEVEL(p) < LEVEL(x), then p cannot
+          refer to x at all--x cannot be in the scope of p.  If LEVEL(p)  =
+          LEVEL(x),  then  p  can refer to x only if x is declared in p, in
+          which case the x referred to by p must always be  an  incarnation
+          of  x  which  was created with the call to p.  Only if LEVEL(p) >
+          LEVEL(x), that is, if p  SCOPE  x,  can  p  refer  to  x  without
+          creating a new incarnation of it.
+
+               The  best  possible relation which can be computed with this
+          information (in Barth's terminology, a relation which is "precise
+          up  to  symbolic  execution") is as follows:  Given a procedure p
+          and a variable x, consider all the  possible  call  chains:  p=q0
+          CALLS q1 ...  CALLS qn=r, where n > 0 and r MOD x.  Let qq be the
+          set of all the qi which occur in any such call  chain.  If  there
+          is  some  procedure  q in qq, such that LEVEL(q) < LEVEL(x), then
+          the x modified by r must be a different incarnation from the x in
+          p, and p ~MOD x.  If there is no such q in qq, then p MOD x.
+
+
+
+                                        - 3 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+               Unfortunately,  in  practice there does not appear to be any
+          easy way to compute this relation.  Barth proposes a much simpler
+          relation:
+
+               MOD = (CALLS* (MOD0 and SCOPE)) and SCOPE             (2)
+
+               This  formulation  is  similar to (1), but requires that the
+          call to p does not create a new incarnation of x (the final  "and
+          SCOPE"  term),  and  that  the procedure that actually modifies x
+          does not create a new incarnation of  x  (the  "MOD0  and  SCOPE"
+          term).  Although  examples  can  be  constructed  for  which this
+          version of the MOD relation is not precise up symbolic execution,
+          they will all be as elaborate as the following one:
+
+               +----
+               |P
+               |  declare x
+               |
+               |  +----
+               |  |Q
+               |  |  call P
+               |  +----
+               |
+               |  +----
+               |  |R
+               |  |  modify x
+               |  +----
+               |
+               |  call R
+               +----
+
+               Here  we  have q CALLS p CALLS r and r MOD0 x, so that q MOD
+          x, even though the occurrence of p in the call chain  means  that
+          the  x  modified  by  r must be different from the x in existence
+          when q is called.
+
+
+
+
+          2.2    Language Extensions and Simplifying Assumptions
+
+               There is no way to know what actual variable is referred  to
+          by  a  statement  which refers to a var parameter.  Barth devotes
+          considerable analysis to this  aliasing  problem,  modifying  his
+          formulas so they still produce correct results in the presence of
+          var parameters.  This analysis is necessary  in  the  context  of
+          standard  Pascal,  for  two  reasons.  First, in standard Pascal,
+          value parameters must be copied, and the only  efficient  way  to
+          pass  a  large array or record is as a var parameter, even if its
+          value is never modified (see  Pascal:  User  Manual  and  Report,
+          page  72).  Second,  standard  Pascal  allows  a  variable  to be
+          referenced in a procedure both by a global  name  and  as  a  var
+          parameter  (although  distinct  var parameters are supposed to be
+
+
+                                        - 4 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+          bound to distinct variables--ibid., page  71).  In  this  Pascal,
+          however,   value  parameters  are  no  less  efficient  than  var
+          parameters, so there is no reason to declare a parameter  as  var
+          if  its  value is never changed.  In other words, in this Pascal,
+          it is reasonable to assume that if a variable is passed as a  var
+          parameter,  then  it  will be modified.  Furthermore, this Pascal
+          explicitly forbids any aliasing effects--a variable  may  not  be
+          referred  to  by  more than one name within a procedure (although
+          there are no compile-time checks for this condition).
+
+               Thus, we can eliminate  Barth's  aliasing  analysis,  making
+          instead  the  simple assumptions that (a) passing a variable as a
+          var  parameter  always  changes  its  value,  and  (b)  within  a
+          procedure,  a var parameter is not the same variable as any other
+          variable which is referrenced  in  the  procedure.  (It  is  less
+          reasonable  to assume that the value of a var parameter is always
+          used, but the cost  of  making  this  assumption  incorrectly  is
+          considerably  lower.) These simplified assumptions actually allow
+          us to obtain more precise information than  Barth's  formulation,
+          since Barth's algorithm indicates that any variable which is ever
+          passed to a procedure as a var parameter may be modified  by  any
+          call  to  that procedure, while our assumptions limit the effects
+          of the procedure to the variables which are actually passed to it
+          in a given call.
+
+               We  may  apply  a  similar  argument  in  the case of formal
+          subroutine  parameters.  Barth  devotes  a  certain   amount   of
+          analysis to the problem of determining when a subroutine which is
+          passed as a formal subroutine parameter will actually be invoked.
+          We  may  simply  assert  that declaring a procedure with a formal
+          subroutine parameter which is never called would be an irrational
+          thing  to  do,  and  make  the  assumption that formal subroutine
+          parameters are always called.  That is, when we encounter a  call
+          such  as  "p(q)",  where  q  is  a formal subroutine parameter to
+          procedure p, we may simply assume that the set of variables which
+          may  be modified by the call comprises the set of variables which
+          may be modified by either a call to p or a call to q.
+
+               Barth's treatment of  formal  subroutine  parameters  is  of
+          interest,  however, since it provides the basis for our treatment
+          of subroutine variables.  Basically, Barth observes that  in  the
+          presence  of  formal  subroutine  parameters,  the  scoping rules
+          presented in section 2.1 are no longer valid.  For example:
+
+
+
+
+
+
+
+
+
+
+
+
+                                        - 5 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+               +----
+               |P(F)
+               |
+               |  +----
+               |  |Q
+               |  |  declare x
+               |  |
+               |  |  +----
+               |  |  |R
+               |  |  |  modify x
+               |  |  +----
+               |  |
+               |  |  call P(R)
+               |  +----
+               |
+               |  call F
+               +----
+
+               In this case, p ~SCOPE x, so according  to  formula  (2),  p
+          ~MOD  x.  However,  when  p  is called with r as its argument, it
+          will call r, which is in the scope  of  x,  and  can  modify  the
+          existing  incarnation of x.  Barth proposes a modification of (2)
+          to cope with formal subroutine parameters.  First, he extends the
+          set PP to include the formal subroutine parameters of the program
+          as well as the actual subroutines, and  introduces  the  relation
+          BINDS,  defined  on  PP  x  PP,  where p BINDS q if p is a formal
+          subroutine  parameter  which  is  bound  to  actual  argument   q
+          somewhere   in  the  program.  Then  he  proposes  the  following
+          formula:
+
+               MOD = ((CALLS* (MOD0 and SCOPE)) and SCOPE)  or       (3)
+                     (CALLS* BINDS (CALLS or BINDS)* MOD0)
+
+               The first line is the same as (2), reflecting the fact  that
+          in  a  call  chain  which  does  not include any formal parameter
+          calls, the peculiar scope effects described above  cannot  occur.
+          The second line simply describes any call chain consisting of any
+          sequence of calls and formal parameter bindings,  with  at  least
+          one binding in the chain, and indicates that if a procedure which
+          is called by such a sequence modifies  some  variable,  then  all
+          scope  information  about the procedures and the variable will be
+          ignored.  Actually, Barth overlooks the fact  that  the  argument
+          for including SCOPE in the "MOD0 and SCOPE" term still holds.  If
+          the procedure which actually modifies x is the procedure in which
+          x  is declared, then no matter what sort of call chain led to the
+          call on that procedure, it will still create a new incarnation of
+          x.  Thus, Barth's formulation may immediately be improved to:
+
+               MOD = ((CALLS* (MOD0 and SCOPE)) and SCOPE)  or       (4)
+                     (CALLS* BINDS (CALLS or BINDS)* (MOD0 and SCOPE))
+
+
+
+
+
+                                        - 6 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+          3.  Call Graph Construction
+
+               If   we   have  neither  external  procedure  calls,  formal
+          subroutine parameters, nor subroutine variables, then computation
+          of  the  CALLS  relation  is  straightforward.  To determine i          CALLS q, we simply need to see if procedure p calls  procedure  q
+          anywhere in the program.  External subroutines, formal subroutine
+          parameters,  and  subroutine   variables   all   complicate   the
+          situation,   however.   We   will   consider   these   extensions
+          independently, and then combine their solutions.
+
+
+          3.1    External Subroutines
+
+               The main problem introduced by external subroutines is  that
+          we have no way of knowing which subroutines in this module may be
+          called from other modules.  A satisfactory solution  to  this  is
+          not  too  difficult.  We  let PP be the set of all subroutines in
+          this  module,  plus  a  single  element  called  <extern>,  which
+          represents  all subroutines in other modules.  We then say that p
+          CALLS q if any of the following hold:
+
+            1) p and q are both subroutines in this module, and p calls q
+            2) p is <extern>, and q is a public subroutine
+            3) q is <extern>, and p calls some external subroutine
+
+
+
+               3.2   Subroutine Variables
+
+               Since it is not feasible to  keep  track  of  each  distinct
+          subroutine  variable  in  the  module (there might, after all, be
+          whole arrays of  them),  we  will  deal  instead  with  types  of
+          subroutine   variables.   We  let  PP  be  the  set  of  all  the
+          subroutines defined in  this  module,  augmented  with  an  extra
+          element,  <typei>  (which  we  call a subroutine class), for each
+          distinct subroutine type in the module such that some  subroutine
+          variable  is  declared  to  be  of that type.  We then say that p
+          CALLS q if either of the following holds:
+
+            1) p is a subroutine, and q is a subroutine  or  class,  and  p
+               calls q
+            2) p  is  a  class, and q is a subroutine, and somewhere in the
+               program there is an assignment of the form "v := q", where v
+               is a subroutine variable of the type associated with class p
+
+
+
+
+          3.3  Subroutine Variables and Formal Parameters
+
+               The  treatment  of formal subroutine parameters at the point
+          of call has been discussed in section 2.2.  However, we must also
+
+
+                                        - 7 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+          consider  the  question  of  recognizing  which  subroutines  may
+          actually  be  invoked  by  a  call  on  a  particular  parameter.
+          Unfortunately,   due   to   the  interaction  between  subroutine
+          variables and parameters, a really good answer to  this  question
+          appears  to  be  infeasible.  Therefore, we will treat subroutine
+          parameters with  an  extension  of  the  mechanism  we  used  for
+          subroutine   variables.  We  retain  the  concept  of  subroutine
+          classes, but we have a subroutine class, not just for  subroutine
+          types  which  have  variables declared in terms of them, but also
+          for subroutine types which have  formal  parameters  declared  in
+          terms  of  them.  We  then  say  that  p  CALLS  q  if any of the
+          following hold:
+
+            1) p and q are subroutines, and p calls q  or  passes  q  as  a
+               parameter
+            2) p is a subroutine and q is a class, and p contains a call to
+               a subroutine variable of the  type  associated  with  q,  or
+               passes  a  subroutine variable of the type associated with q
+               as a parameter.
+            3) p is a class and q is a subroutine,  and  somewhere  in  the
+               program there is an assignment of the form "v := q", where v
+               is a subroutine variable of the type associated with class p
+            4) p is a class and q is a subroutine,  and  somewhere  in  the
+               program  subroutine  q is bound to a formal parameter of the
+               type associated with class p.
+
+               Conditions (1), (2), and (3) are the same as the  conditions
+          described   for   subroutine   variables   alone.  Condition  (4)
+          indicates that a subroutine may be put in a subroutine  class  by
+          being  passed  as  a parameter, as well as by being assigned to a
+          variable.
+
+               Note that we do not have p CALLS q if p is a procedure and q
+          is  the  class  of  a  formal subroutine parameter which p calls.
+          This goes back to the argument in section 2.2.  If  procedure  p1
+          has  a  formal  procedure  parameter  q,  and  is  called  with a
+          statement like "p1(p2)", we do not want  our  summary  data  flow
+          algorithm  to  tell us that p1 changes all the variables that are
+          changed  by  p2.  This  would  happen  if  we  allowed  p1  CALLS
+          class(q),  since  we  would  then  have the call chain p1 CALLS q
+          CALLS p2.  Instead, when we want to know the variables  that  are
+          changed  by  the  particular call statement "p1(p2)", then we can
+          union together the summary data flow information  for  procedures
+          p1  and p2.  We do need q CALLS p2 in our relation, since when we
+          are optimizing p1 and encounter the call to q, we  have  to  know
+          that it might involve a call to p2.
+
+
+          3.4    Complete Analysis
+
+               To  put  all of this together, we define PP to be the set of
+          all the subroutines in the  module,  plus  the  element  <extern>
+          defined  in  section  3.1  and  the  elements  <typei> defined in
+
+
+                                        - 8 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+          section 3.2.  The final definition of the CALLS relation is  that
+          p CALLS q if any of the following hold:
+
+            1) p  and  q  are  subroutines,  and p calls q or passes q as a
+               parameter
+            2) p is a subroutine and q is a class, and p contains a call to
+               a  variable of the type associated with class q, or passes a
+               variable of the type associated with q as a parameter
+            3) p is a subroutine and  q  is  <extern>,  and  p  calls  some
+               external subroutine
+            4) p is <extern> and q is a public subroutine
+            5) p is <extern> and q is a class
+            6) p  is  a  class  and q is a subroutine, and somewhere in the
+               program q is either assigned  to  a  variable  of  the  type
+               associated with class p, or bound to a parameter of the type
+               associated with class p
+            7) p is a class and q is <extern>
+
+               Cases (1), (2), and (6) are the  same  as  in  section  4.3.
+          Cases  (3)  and  (4)  are  the  same as in section 4.1.  Case (5)
+          reflects the assumption that any subroutine which is passed as  a
+          parameter or assigned to a variable may thereby become externally
+          accessible.  Similarly, case (7) reflects the assumption that the
+          value  of  a  subroutine parameter or variable may actually be an
+          external subroutine.
+
+               If p is a subroutine,  p  MOD0  x  and  LEVEL(p)  should  be
+          defined  as  they were in section 2.1.  <Extern> MOD0 x should be
+          true if x is a public or external  variable,  or  if  it  is  any
+          variable  on  the  heap.  LEVEL(<extern>)  should  be 2, the same
+          level as any public subroutines.  <Typei> MOD0 x should always be
+          false,  and  LEVEL(<typei>)  should be 0.  (This is irrelevant to
+          the formulas as they have been defined so  far,  but  will  prove
+          useful with the algorithms to be developed in the next section.) 
+          If x is an ordinary variable, LEVEL(x) should be  defined  as  it
+          was  in section 2.1.  If x is a public, external, heap, or static
+          variable, then LEVEL(x) should be 1 (i.e., all such variables are
+          implicitly defined in the main block).
+
+               It  should  be  noted  that, since this version of the CALLS
+          relation includes the relation that was called  BIND  in  section
+          2.2,  it  is subject to the same problems with respect to the use
+          of scope information.  Based on formulas  (2)  and  (4),  we  can
+          produce the following:
+
+               MOD = CALLS* (MOD0 and SCOPE)                         (5)
+
+          The  information from formula (5) will be reasonable, although it
+          will not be as good as the information from formula (2).  This is
+          discussed  in  more detail in section 4, where we present both an
+          implementation for formula (5) and an implementation  to  compute
+          summary  data  flow  information  which  is  good  up to symbolic
+          execution.
+
+
+                                        - 9 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+          4.  Implementation
+
+               Barth proposes representing the various relations by boolean
+          matrices.  CALLS* can then be computed with Warshall's algorithm,
+          and relational composition can be computed  with  boolean  matrix
+          multiplication.  This  approach  can  be  highly efficient with a
+          bit-vector representation of the relational matrices.
+
+               An alternative approach to implementation is to exploit  the
+          isomorphism between relations and directed graphs.  Let the CALLS
+          relation be represented by a directed graph, whose  vertices  are
+          the elements of PP, and which has an edge from vertex p to vertex
+          q if and only if p CALLS q.  Associated with each vertex  p,  let
+          there  be the set MOD0(p), defined as MOD0(p) = {x|p MOD0 x}.  We
+          will compute the set MOD(p)  for  each  vertex,  where  MOD(p)  =
+          {x|p MOD x}.
+
+
+          4.1    Strongly Connected Components
+
+               Suppose G is a directed graph whose set of vertices is V and
+          whose set of edges is E  (represented  as  "G = (V,E)").  We  can
+          partition  V  into  maximal  subsets  Vi having the property that
+          within each subset Vi, there is a path from  any  vertex  to  any
+          other  vertex.  Let  Ei  be  the  set of edges in E which connect
+          pairs  of  vertices  in  Vi,  and  let  Gi = (Vi,Ei).  Then   the
+          subgraphs  Gi are called the strongly connected components of the
+          graph G.
+
+               We can define the condensation of G as a graph G' = (V',E').
+          V'  contains  a  single  vertex  vi  for  each strongly connected
+          component Gi of G, and E' contains an  edge  from  vertex  vi  to
+          vertex  vj  if  and  only if vi and vj are distinct vertices, and
+          there is an edge in E from some vertex in Vi to some edge in  Vj.
+          Thus,  G'  is  a  directed  acyclic  graph representing the paths
+          between strongly connected components of G.
+
+               If p is a vertex in V,  let  SCC(p)  be  the  vertex  in  V'
+          corresponding to the Vi which contains p.
+
+
+          4.2    The Set Propagation Problem
+
+               Suppose that we have two sets, V and S, a relation R defined
+          over V x V, and a relation F defined over V  x  S,  and  that  we
+          would like to compute F', a relation over V x S, which is defined
+          as F' = R* F.  Several of the problems that we will consider have
+          this  general  form.  For  example, the evaluation of formula (5)
+          fits this schema, with V = PP, S = VV, R = CALLS, F =  (MOD0  and
+          SCOPE), and F' = MOD.
+
+               The same problem may be defined in terms of directed graphs.
+          Let G = (V,ER), where there is an edge from p to q in ER  if  and
+
+
+                                       - 10 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+          only  if  p  R  q.  Let  f be a function mapping vertices in V to
+          subsets of S, with the definition:  f(p) = {x | p  F  x}.  Define
+          SUCC(p)  = {q | there is an edge from p to q in ER}.  Let f' be a
+          function mapping vertices in V to subsets of S, which is  defined
+          to be the minimal solution to the set of equations (6):
+
+               For each p in V, f'(p) =     U   f'(q)  U  f(p)       (6)
+                                       q in SUCC(p)
+
+          Lemma 1.  f'(p) = {x | p F' x}.
+
+          Proof:
+
+               Suppose  that p F' x.  Then p R* F x, which means that there
+          is a chain:  p=qo R q1 ...  R qn, where n > 0  and  qn F x.  This
+          implies  that (a) there are edges in Er from q0 to q1, from q1 to
+          q2, ...  and from qn-1 to qn; and (b) x is f(qn).  Now, from  (a)
+          and  equations  (6)  we  can conclude that f'(q0) > f'(q1) ...  >
+          f'(qn) > f(qn).  But x is in f(qn), so x is in f'(q0),  which  is
+          to say, x is in f'(p).
+
+               Suppose  x is in f'(p).  Since f' is the minimal solution to
+          the equations (6), we will have x in f'(p) only if there is  some
+          path (p=q0, q1, ...  qn) in G, such that x is in f(qn).  But this
+          means that p=q0 R q1 ...  R qn, and that  qn F x,  which  implies
+          that p R* qn and qn F x, so p F' x.
+
+          End Proof.
+
+               Now  consider the condensation G' of G.  We can observe that
+          p R* q if and only if SCC(p) = SCC(q), or there is a path  in  G'
+          from  SCC(p)  to  SCC(q).  By the definition of f', if there is a
+          path in G from p to q, then f'(q) < f'(p).  Since there is a path
+          between  any two vertices in a strongly connected component, this
+          means that if SCC(p) = SCC(q), then f'(p) = f'(q), and  if  there
+          is an edge in G' from SCC(p) to SCC(q), then f'(q) < f'(p).
+
+               Lemma  1  implies that we can compute the relation F' either
+          directly  (for  example,  using  bit  vector  algorithms)  or  by
+          computing  the function f' on the graph G.  From the observations
+          in the preceding paragraph, we can see that instead of  computing
+          f'(p)  for every p in V, we only need to compute f'(vi) for every
+          vi in V'.  We will then have f'(p) = f'(SCC(p)).  But since G' is
+          acyclic,   we  can  perform  this  computation  easily  with  the
+          following algorithm:
+
+
+
+
+
+
+
+
+
+
+                                       - 11 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+               ------------------------------------------------------------
+
+               Algorithm 1.  Solution to the set propagation problem.
+
+               Inputs:  G = (V,ER), f
+               Output:  f'
+
+               Let G' = (V',ER') be the condensation of G.
+
+               For each strongly connected component Gi of  G,  in  reverse
+               topological  order  of G' (i.e., starting with the component
+               which has no edges leaving it), do:
+
+                   f'(vi) := {}
+
+                   For each successor vj of vi in G' (all  such  successors
+                   must  have  been processed already, because of the order
+                   of processing), do:
+                       f'(vi) := f'(vi) U f'(vj)
+
+                   For each vertex p in Vi do:
+                       f'(vi) := f'(vi) U f(p)
+
+               End of Algorithm 1.
+
+               ------------------------------------------------------------
+
+
+               Using Tarjan's  algorithm  for  finding  strongly  connected
+          components,  the  running time of Algorithm 1 is O(|V|+|ER|).  An
+          expansion of Algorithm 1 using Tarjan's  algorithm  is  given  in
+          Appendix A.
+
+
+          4.3    Computation of MOD by Formula 5
+
+               As  we noted above, the computation of MOD by formula (5) is
+          a problem of  the  same  form  as  the  general  set  propagation
+          problem.  Therefore,  the following algorithm will compute MOD by
+          formula (5).
+
+
+               ------------------------------------------------------------
+
+               Algorithm 2.  Computation of MOD by formula 5
+
+               Apply Algorithm 1, letting V = PP, S = VV, R =  CALLS,  F  =
+                   (MOD0 and SCOPE), and F' = MOD.
+
+               End of Algorithm 2.
+
+               ------------------------------------------------------------
+
+
+
+                                       - 12 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+          4.4    A More Precise Algorithm
+
+               We  can  also construct an algorithm to compute a version of
+          MOD which will be precise up to symbolic execution in the absence
+          of  subroutine  parameters  and variables, and which will be very
+          good in all reasonable cases.  To begin with, we observe that  if
+          p  CALLS  q, then either LEVEL(p) > LEVEL(q) - 1, or LEVEL(p) = 0
+          (and p is a subroutine class).  If LEVEL(p) < LEVEL(q) - 1 and  p
+          is  not a class, then q is not accessible in the scope of p, so p
+          cannot possibly call q.  Next, we observe that a new  incarnation
+          of  a  variable x can only be created by a call on the subroutine
+          in which x is declared.
+
+               Let us assume that variable x is declared in subroutine  p',
+          and  is  modified  in  subroutine r, and that r <> p' (if r = p',
+          then r MOD0 x, but r ~SCOPE x, so it is  irrelevant  to  the  MOD
+          relation).  Consider  a  call  chain:  p=q0  CALLS  q1 ...  CALLS
+          qn=r.  We would like to know if the incarnation  of  x  which  is
+          modified  by  r  may be the same as the incarnation of x which is
+          visible when  p  is  called.  We  may  answer  this  question  by
+          considering  the  qi's in reverse order, from qn back towards q0,
+          until we find a qi such that LEVEL(qi) < LEVEL(x),  if  there  is
+          such  a  qi.  Since  LEVEL(qi)  <  LEVEL(x),  and  LEVEL(qi+1)  >
+          LEVEL(x), we  must  have  LEVEL(qi)  <  LEVEL(qi+1),  so  by  the
+          observations  in  the  preceding  paragraph, there are only three
+          possibilities:
+
+               Case A.  There is no qi such that LEVEL(qi) <  LEVEL(x),  so
+               the incarnation of x which is modified by r must be the same
+               as the incarnation of x which is visible when p is called.
+
+               Case  B.  LEVEL(qi)  =  LEVEL(qi+1) - 1  =  LEVEL(x).   This
+               implies  that  qi+1 is declared in qi, and that qi+1 ...  qn
+               are all lexically contained in qi.  Since qn modifies x,  we
+               must conclude that qi = p'.  But that means that the call to
+               qi creates a new incarnation of x, and no subsequent call to
+               a  subroutine variable occurs, so the incarnation of x which
+               is modified by r must be different from the incarnation of x
+               which is visible when b is called.
+
+               Case  C.  LEVEL(qi)  =  0, and qi is a subroutine class.  In
+               this case, there is  the  possibility  that  the  subroutine
+               variable  represented  by  the  class  qi is such that r can
+               modify the incarnation of x  which  is  visible  when  p  is
+               called.
+
+               Thus,  if  for  all  r such that p CALLS* r and r MOD0 x, we
+          find that all call chains from p to r satisfy case (B),  then  we
+          can  conclude  that p ~MOD x.  However, if there is any such call
+          chain which satisfies cases (A) or (C), then p MOD x.
+
+               We  begin  by  ignoring  all   subroutine   parameters   and
+          variables,  and computing a version of MOD which would be correct
+
+
+                                       - 13 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+          and precise up to symbolic execution if there were no  subroutine
+          classes  in  the call graph.  To do this, we observe that, in the
+          absence of subroutine classes, a variable which  is  declared  at
+          level  i  can  only  be modified by a call chain in which all the
+          subroutines are  at  level  i+1  and  below.  Therefore,  we  can
+          compute  MOD  in NLEVELS passes, where NLEVELS = max{LEVEL(x) | x
+          in VV}.  In each pass we will compute, for some i between  1  and
+          NLEVELS,  and  for  each subroutine p such that LEVEL(p) > i, all
+          the elements x of MOD(p) such that LEVEL(x) = i.  We do  this  by
+          Algorithm  2,  restricting PP to the procedures at levels greater
+          than i, and processing only variables which are declared at level
+          i.
+
+               This computation leaves us with a version of MOD which takes
+          into account only those call chains  which  do  not  contain  any
+          calls  on  subroutine classes.  To complete the relation, we must
+          account for the effect of those chains which do contain calls  on
+          subroutine  classes.  We  begin by considering those chains which
+          contain only a  single  subroutine  class,  which  is  the  first
+          element  in  the  chain.  To do this, we simply compute CLASSMOD0
+          for each subroutine class, where CLASSMOD0(p) is defined  as  the
+          union, over all the subroutines q such that p CALLS q, of MOD(q).
+          Thus, CLASSMOD0(p) is the set of variables which may  be  changed
+          by  a  call  on  subroutine  class  p,  provided  that  no  other
+          subroutine classes are called in the call chain starting with  p.
+          We  also  define  CLASSMOD0(p)  to be the empty set if p is not a
+          subroutine class.
+
+               Given CLASSMOD0, we can compute CLASSMOD, where  CLASSMOD(p)
+          is  defined  as  the set of variables which can be changed by any
+          call chain beginning with a  call  to  subroutine  or  subroutine
+          class  p,  and containing at least one subroutine class somewhere
+          in the chain.  Now, any such chain can be divided up as q0  CALLS
+          q1  ...  CALLS  qi CALLS qi+1 ...  CALLS qn, where qi is the last
+          occurrence of a subroutine class in the chain.  Such a  chain  is
+          of  the form described above as case (C).  But the subchain qi ..
+          qn is of the form which was processed above, and the total effect
+          of  such a chain is summarized as CLASSMOD0(qi).  By the argument
+          of case (C) above, scope  considerations  do  not  apply  in  the
+          subchain  q0  ...  qi-1, so CLASSMOD can be computed by Algorithm
+          2, with CLASSMOD0 taking the place of MOD0, and  CLASSMOD  taking
+          the place of MOD.
+
+               Now  we  have  the  effect  of  all call chains which do not
+          include subroutine classes summarized in MOD, and the  effect  of
+          all call chains which do include subroutine classes summarized in
+          CLASSMOD, so to compute the effect of all call chains  of  either
+          type,  all we have to do is to merge CLASSMOD into MOD.  The full
+          algorithm is as follows:
+
+
+
+
+
+
+                                       - 14 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+               ------------------------------------------------------------
+
+               Algorithm 3.  Compute MOD more precisely.
+
+               Define PPi = {p | p in PP and LEVEL(p) > i}
+
+               Define VVi = {x | x in VV and LEVEL(x) = i}
+
+               Define CALLSi = {(p,q) | (p,q) in CALLS and p in PPi  and  q
+                   in PPi}
+
+               /*  Compute  the  MOD  information for the variables at each
+                   level, ignoring subroutine classes.  */
+
+               For all p in PP, do:
+                   MOD(p) := {}
+
+               For i := 1 to NLEVELS, do:
+
+                   Apply Algorithm 1 with V = PPi, S = VVi, R = CALLSi, F =
+                       (MOD0 and SCOPE), F' = MODi
+
+                   For all p in PP, do:
+                       MOD(p) := MOD(p) U MODi(p)
+
+               /*  Compute  the  variables  which  can  be  modified by the
+                   subroutines accessible from each subroutine class.  */
+
+               For each p in PP - PP0 /* the set of subroutine classes  */,
+                   do:
+
+                   CLASSMOD0(p) := {}
+
+                   For each q in {q | q in PP and p CALLS q}, do:
+                       CLASSMOD0(p) := CLASSMOD0(p) U MOD(q)
+
+               For each p in PP0, do:
+                   CLASSMOD0(p) := {}
+
+               /*  Now  compute  the set of variables which can be modified
+                   by each procedure as a result  of  calls  to  subroutine
+                   classes.  */
+
+               Apply  Algorithm  1  with  V  =  PP,  S = VV, R = CALLS, F =
+                   CLASSMOD0, F' = CLASSMOD
+
+               For all p in PP, do:
+                   MOD(p) := MOD(p) U CLASSMOD(p)
+
+               End of Algorithm 3.
+
+               ------------------------------------------------------------
+
+
+
+                                       - 15 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+          Appendix A.  Algorithm 1 with Tarjan's Algorithm
+
+               In [Tarjan 1972], Tarjan introduced a linear-time  algorithm
+          to compute the strongly connected components of a directed graph.
+          This same algorithm is presented, with somewhat more explanation,
+          in  [Aho and Ullman 1974], pp 189-195.  Hecht uses this algorithm
+          as the basis for  an  interprocedural  flow  algorithm  which  is
+          essentially  the  same  as  our  Algorithm 1, in [Hecht 1977], pp
+          198-200.  Since  Tarjan's   algorithm   produces   the   strongly
+          connected components of a graph G in reverse topological order of
+          its condensation G', and since all the vertices in  a  particular
+          strongly  connected component are found at the same time, Hecht's
+          modification is very straightforward.  The heart of the algorithm
+          is  in  procedure  DFS, which performs a depth-first search.  The
+          algorithm itself is simply as follows:
+
+
+               ------------------------------------------------------------
+
+               Algorithm 1a.  Detailed Algorithm 1.
+
+               Inputs:  G = (V,ER), f
+               Output:  f'
+
+               Let S be a stack of vertices
+               Let COUNT be an integer.
+               Let DFNUMBER and LOWLINK be arrays of |V| integers
+               Let SCCROOT be an array of |V| vertices
+
+               Initially:
+                   S is empty
+                   COUNT := 0
+                   For each vertex p in V:
+                       p is marked "unvisited"
+                       f'(p) := f(p)
+
+               While there is an "unvisited" vertex p in V, do:
+                   DFS (p)
+
+               For each vertex p in V, do:
+                   f'(x) := f'(SCCROOT(x))
+
+               End of Algorithm 1a.
+
+               ------------------------------------------------------------
+
+
+               The procedure DFS is as follows:
+
+
+
+
+
+
+
+                                       - 16 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+               ------------------------------------------------------------
+
+               Procedure DFS (p):
+
+                   Mark p "visited"
+                   DFNUMBER(p), LOWLINK(p), COUNT := COUNT + 1
+                   Push p on stack S
+
+                   For each vertex q in {q | (p,q) in ER} do:
+                       If q is marked "unvisited" then do:
+                           DFS (q)
+                           LOWLINK(p) := min (LOWLINK(p),LOWLINK(q))
+                       Otherwise, if DFNUMBER(q) < DFNUMBER(p) and
+                           q is on stack S then do:
+                               LOWLINK(p) := min (LOWLINK(p),DFNUMBER(q))
+
+                       If q is not on stack S, then do:
+                           f'(p) := f'(p) U f'(SCCROOT(q))
+
+                   if LOWLINK(p) = DFNUMBER(p) then do:
+                       Repeat:
+                           Pop q from stack S
+                           f'(p) := f'(p) U f'(q)
+                           SCCROOT(q) := p
+                       Until q = p
+
+               End of Procedure DFS.
+
+               ------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                       - 17 -
+
+
+
+
+
+
+          CIN-#7
+          Summary Data Flow Analysis
+          2 November 1978
+
+                                     REFERENCES
+
+
+          Aho, A. V.  and J. D. Ullman [1974].  The Design and Analysis  of
+               Computer Algorithms, Addison-Wesley, Reading, Mass.
+
+          Barth, J. M. [1977].   "A  Practical  Interprocedural  Data  Flow
+               Analysis Algorithm  and  its  Applications",  Ph.D.  Thesis,
+               Dept.   of   Computer  Science,  University  of  California,
+               Berkeley.
+
+          Barth, J. M. [1978].  "A  Practical  Interprocedural  Data   Flow
+               Analysis   Algorithm",   Communications   of  the  ACM  21:9
+               (September 1978), 724-736.
+
+          Hecht, M. S. [1977].  Flow   Analysis   of   Computer   Programs,
+               North-Holland, New York.
+
+          Tarjan, R. E. [1972].   "Depth-First   Search  and  Linear  Graph
+               Algorithms", SIAM Journal of  Computing,  1:2  (June  1972),
+               146-160.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                       - 18 -
+
+
+
+
+K%^å
