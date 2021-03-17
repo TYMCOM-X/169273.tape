@@ -1,0 +1,299 @@
+begin	"XEXEC"	
+comment	
+
+    Kludge to get by until new INITIA:
+	Started by INITIA at system startup.  Runs forever.
+	Wakes once an hour and reads (SYS)XEXEC.CTL (format below).
+	Creates frames and runs programs as indicated in CTL file.
+	Programs may be run only once per system startup (interval
+	omited or 0), or may be run every N hours (interval specified).
+	If a frame with matching UNM,FPN,NAM already exists, a warning 
+	is logged and no action is taken.  This is to prevent filling
+	the system up with dead servers in case of a bug or such.
+
+    expects (SYS)XEXEC.CTL of form:
+	0,<username>,<command>		- run only at system startup
+	<n>,<username>,<command>	- run when ( HRS ) mod <n> = 0
+	<n>+<o>,<username>,<command>	- run when ( HRS + <o> ) mod <n> = 0
+    where
+	<username> is user to log frame in to
+	<command> is one of
+		RUN <program>
+		CCL <program>
+		PCOM <pcom-command-line>
+	<n> is hours between runs (0 means at system startup)
+	    Note: every week, runs at 00:00 Wednesday mornings.
+	<o> is offset from origin date/time
+	HRS is hours since Jan 1, 1964 00:00 local time
+
+    Known problems:
+	Code stollen from (MPL)COPY - beware hacks!
+	Should change .FOCFM stuff after new LOGINN is up.
+	Should log major failures to CTY.
+	Should limit size of log file.
+	Should watch for and log halted children.
+	Should watch for NTQ.
+;
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(MPL)UUOSYM" source!file;
+!get!module(APPEND);
+!get!module(EXTEND);
+require 2 version;
+
+integer procedure Gettab (integer J,T);
+begin!code
+	SETOM	!SKIP!;
+	HRL	1,J;
+	HRR	1,T;
+	uuo!GETTAB 1,;
+	 SETZM	!SKIP!;
+end;
+
+integer simple procedure frmopV( integer frame, arg, opcode );
+start!code	protect!acs 1; 
+	setom	!skip!;
+	move	1,frame;	! get address of arg;
+	hrl	1,opcode;	! get opcode;
+	frmop	1,arg;		! call by value (val on stack);
+	 setzm	!skip!;
+end;
+
+integer simple procedure frmopR( integer frame; 
+			reference integer arg; integer opcode );
+start!code	protect!acs 1;
+	setom	!skip!;
+	move	1,frame;	! get address of arg;
+	hrl	1,opcode;	! get opcode;
+	frmop	1,arg;		! call by reference (actually indirect);
+	 setzm	!skip!;
+end;
+
+
+simple integer procedure DayTime;
+return( calli( 0,-'143 ));	! secs past 1/1/64 00:00;
+
+comment		SYS:XEXEC.LOG setup and finish code
+
+The program keeps a log in (SYS)XEXEC.LOG which is appended to without
+bound.  The file contains text blocks of the form:
+    <header>
+    <body>
+<header> is one of
+    <date> <time> system startup
+    <date> <time>
+<body> is a collection of one or more of
+    [<username> <progname> on job <jobno>]
+    %<username> <progname> already on job <jobno>
+    %<warning message>
+    ?<error message>
+
+Each time the program wakes up, it repoens the log file in order to
+minimize the window in which data may be lost.
+;
+
+integer LOG;			! channel number for log file;
+integer LOG!E;			! log channel error variable;
+
+procedure LogIni( boolean Pass1 );
+begin
+    integer A,B,D,T;
+    getformat(A,B);
+    setformat(-2,0);
+    do begin 
+	D_ calli( 0,calli!DATE );
+	T_ calli( 0,calli!MSTIME ) % 1000;
+    end until D = calli( 0,calli!DATE );
+    open( LOG_getchan,"DSK",0,4,4, 0,0,LOG!E_-1 );
+    append( LOG, "(SYS)XEXEC.LOG", LOG!E );
+    cprint( LOG,
+	StDate( D, '31 ),
+	" ", T % 3600,
+	":", T % 60 mod 60,
+	(if Pass1 then " system startup" else null),
+	crlf );
+    setformat(A,B);
+end;
+
+procedure LogFin;
+begin
+    close( Log );
+    release( Log );
+end;
+
+comment		Frame Manipulation Operations
+
+PPN   _	CvPPN ("user")		 - return PPN from user name
+JobNo _	FindProg ("user","prog") - return job no of frame running prog
+	RunProg ("user","prog")	 - create frame, run prog in it
+;
+
+integer procedure cvppn(string user);
+begin
+    own integer U0,U1,CH,E;
+    own integer array X[0:3],U[0:1];
+    U0_ cvsix(user[1 for 6]);
+    U1_ cvsix(user[7 for 6]);
+    if U0 = U[0] and U1 = U[1] then return( X[2] );
+    X[0]_ 3;
+    X[1]_ '1000001;
+    X[2]_ location(U[0]);
+    X[3]_ cvsix("UFD");
+    U[0]_ U0;
+    U[1]_ U1;
+    open( CH_getchan,"DSK",0,0,0, 0,0,E );
+    if E then usererr(0,0,"?can't init disk");
+    chnior( CH,X[0],!CHLK );
+    if not !SKIP! then cprint( Log, "%no UFD for ",user,crlf );
+    return( X[2] );
+end;
+
+integer procedure FindProg ( string User, Prog );
+begin
+    own integer J,LOGN,UNM,UN1,NAM,T1,T2;
+    LOGN_ gettab( !NSHJB,!GTNSW );
+    UNM_ cvsix( User[1 for 6] );
+    UN1_ cvsix( User[7 for 6] );
+    NAM_ cvfil( Prog, T1, T2 );
+    for J_ 1 upto LOGN do 
+	if Gettab( J,!GTUNM ) = UNM 
+	and Gettab( J,!GTUN1 ) = UN1
+	and Gettab( J,!GTNAM ) = NAM
+	then return( J );
+    return( 0 );
+end;
+
+procedure RunProg ( string User, Prog; integer StartInc(0) );
+begin "RunProg"
+    integer FD,I,E;
+    integer array X[0:4];
+    X[0] _ gettab(-1,!GTNAM);
+    X[1] _ gettab(-1,!GTPRV) lor JP!NAT lor JP!RCM;
+    X[2] _ gettab(-1,!GTAUN);
+    X[3] _ gettab(-1,!GTUNM);
+    X[4] _ gettab(-1,!GTUN1);
+    if length(user) then begin
+	! change this when LOGINN callable by !FOCFM;
+        X[0] _ X[2] _ cvppn(user);
+	X[1] _ JP!NAT + JP!COR + JP!RCM + JP!CRM;
+        X[3] _ cvsix(user[1 for 6]);
+        X[4] _ cvsix(user[7 for 6]);
+    end;
+    E_ FD_ frmopv( 0,!xwd( -5,location(X[0]) ), !FOCFM );
+    if not !SKIP! then begin
+	cprint( Log, "?cant create ",User," ",Prog," .FOCFM ",cvos(E),crlf );
+	return end;
+    X[0] _ !xwd( StartInc, 4 );
+    X[1] _ cvsix("DSK");
+    X[3] _ cvfil(Prog,X[4],X[2]);
+    E_ frmopr( FD,X[0],!FORUN );
+    if not !SKIP! then begin
+	cprint( Log, "?cant run ",User," ",Prog," .FORUN ",cvos(E),crlf );
+	return end;
+    cprint( Log, "[",User," ",Prog," on job ",FD land '777,"]",crlf );
+end "RunProg";
+
+procedure RunPcom ( string User, Cmd );
+begin "RunPcom"
+    integer FD,I,E;
+    integer array X[0:4];
+    X[0] _ gettab(-1,!GTNAM);
+    X[1] _ gettab(-1,!GTPRV) lor JP!NAT;
+    X[2] _ gettab(-1,!GTAUN);
+    X[3] _ gettab(-1,!GTUNM);
+    X[4] _ gettab(-1,!GTUN1);
+    if length(user) then begin
+	! change this when LOGINN callable by !FOCFM;
+        X[0] _ X[2] _ cvppn(user);
+	X[1] _ JP!NAT + JP!COR + JP!CRM;
+        X[3] _ cvsix(user[1 for 6]);
+        X[4] _ cvsix(user[7 for 6]);
+    end;
+    E_ FD_ frmopv( 0,!xwd( -5,location(X[0]) ), !FOCFM );
+    if not !SKIP! then begin
+	cprint( Log, "?cant create ",User," PCOM .FOCFM ",cvos(E),crlf );
+	return end;
+    begin "file for PCOM"
+	integer C,E;
+	string F;
+	F := "("&user&")"&(cvs(1000+(FD land '7777))[2 to 4])&"PCO.TMP";
+	open(C_getchan,"DSK",0,0,4, 0,0,E);
+	if not E then enter(C,F,E);
+	if not E then cprint(C,Cmd,"/NODETACH");
+	close(C); release(C);
+	if E then begin
+	    cprint(Log, "?error writting ",F," for PCOM",crlf );
+	    return end;
+    end;
+    X[0] _ !xwd( 1, 4 );
+    X[1] _ cvsix("DSK");
+    X[3] _ cvfil("(SYS)PCOM",X[4],X[2]);
+    E_ frmopr( FD,X[0],!FORUN );
+    if not !SKIP! then begin
+	cprint( Log, "?cant run ",User," (SYS)PCOM .FORUN ",cvos(E),crlf );
+	return end;
+    cprint( Log, "[",User," PCOM ",Cmd," on job ",FD land '777,"]",crlf );
+end "RunPcom";
+
+comment		Main Program Loop
+
+Executes loop "MAIN" every hour.  To eliminate need for keeping last
+run date/time for each job, a periodic job with an interval of
+<interval> is run if and only if:
+	<hours-since-1/1/64-00:00> mod <interval> = 0
+;
+boolean	Pass1;			! This is the first pass;
+integer Int;			! dummy integer;
+integer BT,BL;			! break table;
+
+setbreak( BT_getbreak," ,+"&#lf," "&#cr,"TSINK");
+setbreak( BL_getbreak,#lf,#cr,"SINK");
+Pass1_ true;
+while DayTime = 0 do calli( 1, calli!SLEEP );
+while true do begin "MAIN"
+
+    integer C,B,E;		! channel vars;
+    integer J;			! job number?;
+
+    LogIni( Pass1 );		! initialize log;
+    open( C_getchan,"DSK",0,4,0, 256,B,E_-1 );
+    lookup( C,"(SYS)XEXEC.CTL",E );
+    if E then cprint( Log, "?no (SYS)XEXEC.CTL",crlf );
+    while not E do begin
+	string User,Cmd,Arg;	! user name, command, argument;
+	integer Interval;	! hours between runs;
+	integer Offset;		! offset for run time (see header page 1);
+	integer StartInc;	! start address incriment;
+	Interval_ cvd( input( C,BT ));
+	if E then done;
+	if B="+"
+	    then Offset _ input( C,BT )
+	    else Offset _ 0;
+	if B=","
+	    then User_ input( C,BT )
+	    else begin cprint( Log,"?insufficient input",crlf ); continue end;
+	if B=","
+	    then Cmd_ input( C,BT )
+	    else begin cprint( Log,"?insufficient input",crlf ); continue end;
+	if B neq #lf
+	    then Arg_ input( C,BL )
+	    else Arg_ null;
+	if (Interval = 0 and Pass1) 
+	  or ((DayTime/3600 + Offset) mod Interval = 0) then
+	    case Cmd of begin
+		["RUN"]["CCL"] if J_ FindProg( User, Arg )
+		    then cprint( Log,
+			"%already running ",User," ",Arg," on job ",J,crlf )
+		    else RunProg( User, Arg, StartInc );
+		["PCOM"] RunPcom( User, Arg );
+		[else] cprint( Log, "?bad command: ", Cmd, " ", Arg, crlf )
+	    end;
+    end;
+    release( C );		! release control file;
+    LogFin;			! terminate log;
+
+    Pass1_ false;
+    calli( !xwd( 1, 3600 - DayTime mod 3600 ), calli!HIBER );
+
+end	"MAIN";
+end $
