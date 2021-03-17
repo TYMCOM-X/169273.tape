@@ -1,0 +1,640 @@
+	search	kirtsm
+;    +--------------------------------------------------------------+
+;    |                                                              |
+;    |                          R T M O N                           |
+;    |                          - - - - -                           |
+;    |                                                              |
+;    +--------------------------------------------------------------+
+;    
+;    PURPOSE:  This file contains the primary  support  routines  for
+;       PASCAL    programs,    including    stack   and   environment
+;       initialization, DEBUG interface, and procedure  and  function
+;       interfaces.  The  three  modules  in  this  file  are PASMON,
+;       STACK, and PNTRY.
+;    
+;    ENTRY POINTS:
+;    
+;       INITP.      is called from the mainline to set up  the  stack
+;                   and environment.
+;    
+;       STACK.      determines  whether  a  user  specifies  a larger
+;                   stack-size at link time.
+;    
+;       PNTRY.      sets up the stack on procedure entry.
+;    
+;       PRTRN.      restores the stack on a procedure return.
+;    
+;    NOTES:  The PASMON module is conditionally  compiled  under  the
+;       DEBUGF  flag  to  support  the  debugger.  The  DEBMON module
+;       should precede PASMON in the library.
+;    
+;       External symbols PSA.1 AND  PSA.2  delimit  the  PSA  request
+;       blocks  which  must  appear at the end of the library.  These
+;       blocks enable the PASCAL monitor to allocate the PSAs and  to
+;       give  modules  the  opportunity to perform initialization and
+;       cleanup.
+;    
+;    ----------------------------------------------------------------
+
+debugf==0
+	IFE	DEBUGF,<
+	$MODULE	PASMON
+	ENTRY	INIT0.
+	ENTRY	INITP.>
+	IFN	DEBUGF,<
+	$MODULE	DEBMON
+	ENTRY	INIT1.
+	ENTRY	DEBUG.
+	ENTRY	STMT.
+	INTERN	INITP.
+	INTERN	INIT0.>
+	extern	psa.1	;start of psa request blocks
+	extern	psa.2	;end of psa request blocks
+	extern	ins.sm
+	INTERN	EXIT.
+	INTERN	END.
+	INTERN	DIE.
+	INTERN	WRTPC.
+	INTERN	WRTDC.
+	INTERN	TRACE
+	intern	REE.AC
+	extern	REE.TV
+	intern	DDT.AC
+	extern	DDT.TV
+	IFN	DEBUGF,<
+	EXTERN	DEBUG$
+	EXTERN	RT$BASE
+	EXTERN	DB$BASE
+	EXTERN	ST$BASE
+	INTERN	PNTRY.
+	INTERN	ONTRY.
+	INTERN	PRTRN.
+	INTERN	BST.AC
+	INTERN	BACK$TEP
+	EXTERN	BST.TV
+;
+; DEBUG PSEUDO-PARAMETERS PASSED IN "REASON"
+;
+NOREASON==0		;SHOULD NOT HAPPEN
+INIT==1		;FIRST CALL TO DEBUG
+TRAP==2		;ILL MEM REF, ETC.
+RUNTIMERROR==3	;E. G., UNITITIALIZED POINTER
+STEP==4		;STATEMENT STEPPING
+BREAKPOINT==5	;USER SET BREAKPOINT REACHED
+BREAK==6		;CONTROL-C
+MAXBREAKPOINT==^D9
+;
+; defined offsets within the debugger RTBASE pseudo-static area:
+;
+cstmt==0		;indicates current statement
+indebugger==1		;true while debugger running
+reason==2		;reason debugger is entered
+stepcount==3		;STEP and SSTEP cmd step counts
+procskip==4		;true if not stepping across proc calls
+brkskip==5		;breakpoint proceed count
+brkptrnum==6		;number of breakpoint reached
+brkactive==7		;index of largest active breakpoint
+brktable==10		;breakpoint table
+regsave==brktable+maxbreakpoint+1	;reg save area
+rest==regsave+16	;remainder of debugger storage
+>
+	EXTERN	TWAIT.
+	EXTERN	.JBSA,.JBREL,.JBREN,.JBOPC,.JBTPC
+	EXTERN	STACK.
+
+	$TEMP	RSAVE,16
+	PROTECTION==40		;PROTECT RUNTIME TEMPS
+
+	SUBTTL	ENVIRONMENT INITIALIZATION AND TERMINATION
+;
+; ENVIRONMENT INITIALIZATION
+;
+; CALLED BY PASCAL PROGRAM MAIN PROCEDURE.
+;
+; AT ENTRY,
+;	(BASIS) = DESIRED STACK SIZE
+;	(EXP6) = RETURN ADDR
+;
+; AT EXIT,
+;	(BASIS) = <0,,STACK ADDRESS>
+;	(TOP)  = <-STACK SIZE,,STACK ADDR>
+;	FURTHER, ALL ENVIRONMENT INITIALIZATION IS COMPLETE.
+;
+; ALL REGISTER ARE ASSUMED TO BE FREE.
+;
+NIL==377777
+INIT1.:
+INIT0.:
+DEBUG.:
+INITP.:
+; OBTAIN NEEDED CORE
+	MOVEI	R1,STACK.	;IF STACKSIZE SPECIFIED AT LINK TIME
+	JUMPE	R1,.+2
+	MOVEI	BASIS,STACK.	;THEN USE IT INSTEAD
+	IFN	DEBUGF,<
+	ADDI	BASIS,^D1000>	;DEBUGGER NEEDS LARGER STACK
+	HLRZ	R1,.JBSA	;PICK-UP HOW MUCH CORE WE HAVE
+	ADD	R1,BASIS	;ADD IN STACK REQUIREMENTS
+	ADDI	R1,$PDASIZE	;ADD IN REQUIRED PDA LOCATIONS
+;
+; Now scan PSA request blocks for allocation of PSA areas.
+;
+	MOVEI	EXP1,PSA.1
+S.LOOP:	CAIL	EXP1,PSA.2	;WHILE MORE PSA REQUEST BLOCKS
+	JRST	GET.CORE
+	HRRZ	EXP3,0(EXP1)	;GET SIZE OF REQUESTED PSA
+	ADD	R1,EXP3
+	ADDI	EXP1,2
+	JRST	S.LOOP		;NEXT BLOCK
+GET.CORE:
+	CAMGE	R1,.JBREL	;DID USER SPECIFY EVEN MORE?
+	MOVE	R1,.JBREL	;YES, USE HIS LARGER SPEC.
+	$DOUUO	CORE,R1,0,INI.90
+;
+; Allocate PDA and PSA blocks
+;
+	$getpda
+	MOVEI	EXP1,PSA.1	;ADDR OF FIRST PSA REQUEST BLOCK
+	MOVEI	R1,$PDASIZE(PDA);ADDR OF FIRST PSA
+A.LOOP:	CAIL	EXP1,PSA.2
+	JRST	R.INIT
+	HRRZ	EXP3,0(EXP1)	;GET PSA SIZE
+	JUMPE	EXP3,A.NEXT
+	HLRZ	PSA,0(EXP1)	;GET PDA INDEX
+	ADD	PSA,PDA		;NOW ADDR OF PDA WORD
+	MOVEM	R1,0(PSA)	;STORE ADDR OF PSA
+	ADD	R1,EXP3		;ADVANCE BY REQUESTED SIZE
+A.NEXT:	ADDI	EXP1,2		;NEXT PSA BLOCK
+	JRST	A.LOOP
+R.INIT:		;NOW R1 IS BASE OF STACK
+; RESERVE ROOM FOR STACK, AND CONSTRUCT STACK POINTER
+	MOVNI	TOP,-60(BASIS)	;NEGATIVE WORD COUNT
+	HRL	TOP,TOP
+	HRR	TOP,R1
+	EXCH	BASIS,R1	;MAIN'S BASIS HAS ZERO LEFT HALF
+	ADD	R1,BASIS	;NEW .JBFF
+	MOVEM	R1,$STACK(PDA)	;SET TOP OF STACK FOR FILE BUFFERS
+	ADDI	R1,1		;START .JBFF AT NEXT LOC
+	SETZM	$BFPNT(PDA)	;NO BUFFERS ALLOCATED
+; CLEAN-UP JOB'S STATE
+	HRLM	R1,.JBSA	; PREVENT LOSS OF CORE THRU RESET
+	RESET			; (ALSO SETS (.JBFF) = LH(.JBSA))
+	HRLM	PDA,.JBSA	;SAVE PDA ADDRESS
+; SAVE ADDRESS OF MAIN'S CALL ON STACK FOR LINK TO DEBUG INFO
+;
+	HRRZM	EXP6,0(BASIS)
+;
+; SET UP FOR REENTRY
+;
+	MOVEI	R1,REE.TV
+	HRRM	R1,.JBREN
+;
+; Give PASCAL routines shot at initialization through
+; PSA request blocks.
+;
+	MOVEI	EXP1,PSA.1	;FIRST BLOCK
+I.LOOP:	CAIL	EXP1,PSA.2
+	JRST	I.DONE
+	HLRZ	EXP2,1(EXP1)	;GET INIT ADDRESS
+	JUMPE	EXP2,I.CONT	;IF ZERO NO INIT REQUESTED
+	PUSH	TOP,EXP1	;SAVE PSA REQ BLOCK ADDR
+	HLRZ	PSA,0(EXP1)	;GET PDA INDEX
+	ADD	PSA,PDA		;ADDR OF ENTRY IN PDA
+	MOVE	PSA,0(PSA)	;ADDR OF PSA
+	PUSHJ	TOP,0(EXP2)	;INIT ROUTINE
+	POP	TOP,EXP1	;RETRIEVE PSA REQ BLK ADDR
+I.CONT:	ADDI	EXP1,2		;ADDR OF NEXT BLOCK
+	JRST	I.LOOP
+I.DONE:
+;
+; IF DEBUG, GIVE DEBUGGER FIRST SHOT
+;
+	IFN	DEBUGF,<
+; .JBDDT IS SET AT LINK TIME TO FORCE LOAD OF SYMBOLS
+	MOVEI	R1,DDT.TV
+	MOVEM	R1,.JBDDT
+	MOVEI	R1,INIT
+	$GETPSA	RTBASE
+	MOVEM	R1,REASON(PSA)
+	PUSHJ	TOP,DBUG$	;DEBUGGER GETS FIRST SHOT
+>
+	IFE	DEBUGF,<
+DDT.AC=:0			>	; define it to keep things OK
+
+; RETURN TO MAIN LINE CODE
+	MOVE	R1,0(BASIS)
+	JRST	1(R1)
+;
+; HERE, MONITOR REFUSES TO HONOR OUR CORE REQUEST
+;
+INI.90:
+	OUTSTR	[ASCIZ /
+?	Unable to obtain storage for stack.
+/]
+				;FALL INTO EXIT
+;
+; TERMINATION HANDLER
+;
+EXIT.:
+END.:
+;
+; Check PSA request blocks to determine if any modules
+; require attention at termination.
+;
+	movei	exp1,psa.1	;addr of first
+t.loop:	cail	exp1,psa.2
+	jrst	t.out
+	hrrz	exp2,1(exp1)	;addr of exit point
+	jumpe	exp2,t.next
+	push	top,exp1
+	hlrz	psa,0(exp1)	;set up its psa addr
+	add	psa,pda
+	move	psa,0(psa)
+	pushj	top,0(exp2)
+	pop	top,exp1
+t.next:	addi	exp1,2
+	jrst	t.loop
+t.out:
+	EXIT	0,		;EXIT AND PERFORM RESET
+;
+; "REENTRY" POINT
+;
+REE.AC:
+	jsr  	ins.sm
+	ADJSP	TOP,PROTECT	;PROTECT RUNTIME TEMPS
+	$SAVE	RSAVE,R0,PDA	;SAVE ALL REGS
+	jsr  	ins.sm
+	ADJSP	TOP,16		;PROTECT SAVED REGISTERS
+	MOVE	R0,.JBOPC	;GET RETURN ADDRESS FOR CONTINUE
+	$GETPDA
+	MOVEM	R0,$RETADR(PDA)	;AND SAVE IT
+	JRST	DIE1
+;
+; AFTER A RUNTIME ERROR
+;
+DIE.:
+	MOVEI	R1,DIE.		;REENTER AFTER RUNTIME ERROR
+	MOVEM	R1,.JBREN	;WILL JUST GO HERE AGAIN
+	$GETPDA
+	SETZM	$RETADR(PDA)	;NO CONTINUE ALLOWED
+	IFN	DEBUGF,<
+	$GETPSA	RTBASE
+	MOVEI	R0,RUNTIMERROR
+	MOVEM	R0,REASON(PSA)>
+	MOVE	R0,0(TOP)	;GET ABORT ADDRESS FOR TRACE
+DIE1:	EXIT	1,		;CONTinue for trace
+	PUSHJ	TOP,TRACE.	;DUMP STACK STRACE
+	SKIPN	$RETADR(PDA)
+	JRST	DIE1
+	jsr  	ins.sm
+	ADJSP	TOP,-16		;UNFRAME SAVED REGISTERS
+	$RESTORE RSAVE,R0,PSA
+	jsr  	ins.sm
+	ADJSP	TOP,-PROTECTION
+    	EXIT	1,
+;
+; If user CONTinued again check RETADR to see if can return to his program
+;
+	SKIPN	.JBTPC
+	SKIPN	$RETADR(PDA)
+	EXIT	0,		;FORGET IT
+	MOVE	PDA,$RETADR(PDA);GET RETURN ADDRESS
+	EXCH	PDA,PROTECTION+PDA+RSAVE;GET SAVED PDA
+	JRSTF	@PROTECTION+PDA+RSAVE	;CONTINUE
+
+	IFN	DEBUGF,<
+;
+; COME HERE IF DDT TYPED TO MONITOR PROMPT
+;
+DDT.AC:
+	jsr  	ins.sm
+	ADJSP	TOP,PROTECTION	;SAVE RUNTIME TEMPS
+	$GETPDA
+	MOVEM	PSA,RSAVE	;SAVE PSA
+	$GETPSA	RTBASE
+	SKIPN	INDEBUGGER(PSA)	;IF DEBUGGER WAS NOT RUNNING...ENTER IT
+	JRST	OKDDT
+	MOVE	PSA,RSAVE
+	jsr  	ins.sm
+	ADJSP	TOP,-PROTECTION
+	JRSTF	@.JBOPC
+OKDDT:
+
+	MOVE	R0,REGSAVE(PSA)
+	MOVE	R0,.JBOPC
+	MOVEM	R0,$RETADR(PDA)	;MIGHT WANT CONTINUATION
+	MOVEI	R0,NOREASON
+	CAME	R0,REASON(PSA);DEBUG PARAMETER ALREADY KNOWN?
+	JRST	JBDDT1		;YES, KEEP IT
+	MOVEI	R0,BREAK
+	SKIPE	.JBTPC		;CAN THIS BE CONTINUED?
+	MOVEI	R0,TRAP	;NO
+	MOVEM	R0,REASON(PSA)
+JBDDT1:
+	MOVEM	R1,1+REGSAVE(PSA)
+	MOVE	R1,RSAVE
+	MOVEM	R1,PSA+REGSAVE(PSA)
+	PUSHJ	TOP,DBUG$	;SAVE REGISTERS AND CALL DEBUGGER
+	MOVE	R1,$RETADR(PDA)
+	MOVEM	R1,RSAVE	;COPY RET ADDR
+	DMOVE	R0,REGSAVE(PSA)	;RESTORE R0 AND R1
+	MOVE	PSA,PSA+REGSAVE(PSA);AND PSA
+	SKIPN	.JBTPC		;SKIP IF CONTINUE NOT POSSIBLE
+	SKIPN	RSAVE		;CONTINUE IF WE KNOW WHERE TO RESUME
+	EXIT	0,
+	SETZM	.JBOPC
+	$GETPDA
+	jsr  	ins.sm
+	ADJSP	TOP,-PROTECTION
+	JRSTF	@RSAVE
+;
+; SAVE REGISTERS{EXP1 TO PSA-1 PLUS BASIS BEFORE CALLING DEBUG$
+;
+DBUG$:
+	SETOM	INDEBUGGER(PSA)
+	$SAVE	EXP1+REGSAVE(PSA),EXP1,PSA-1
+	MOVEM	BASIS,BASIS+REGSAVE(PSA)
+	PUSHJ	TOP,TWAIT.##	;CLEAR TTY OUTPUT BUFFER
+	PUSHJ	TOP,DEBUG$
+	$GETPDA			;SINCE DEBUGGER MAY STOMP IT
+	$GETPSA	RTBASE
+	SETZM	INDEBUGGER(PSA)
+	$RESTORE EXP1+REGSAVE(PSA),EXP1,PSA-1
+	SETZM	INDEBUGGER(PSA)
+	POPJ	TOP,
+;
+; Statement interception under debug. Check for breakpoints, etc.
+;
+STMT.:
+	MOVE	R0,PSA		;SAVE PSA REG
+	$GETPSA	RTBASE
+	HRRZM	R1,CSTMT(PSA)	;SAVE POINTER TO STMT BLOCK
+;	MOVEM	EXP1,EXP1+REGSAVE(PSA);SAVE ANOTHER REG
+	SKIPL	STEPCOUNT(PSA)	;IF STEPPING
+	SOSE	STEPCOUNT(PSA)	;AND IF LAST STEP
+	JRST	STMT10
+	MOVEI	R1,STEP		;THEN SET UP PARAMETERS
+	JRST	STMT50		;AND CALL DEBUG
+STMT10:
+	SKIPL	BRKACTIVE(PSA)		; if no breakpoints active
+	JRST	STMT15			;   whoops, there is one
+STMT12:	MOVE	PSA,R0			; none, just restore PSA
+	JRST	1(R1)			;   and split
+
+STMT15:	MOVEM	EXP1,EXP1+REGSAVE(PSA)	; save a register
+	MOVE	EXP1,BRKACTIVE(PSA)	; index of largest active
+	MOVEM	EXP1,BRKPTRNUM(PSA)	; store to count down with
+	ADDI	EXP1,BRKTABLE(PSA)	; meanwhile get table addr
+STMT20:	HLL	R1,0(EXP1)	;ONLY COMPARING RIGHT HALFWORDS
+	JUMPGE	R1,STMT25	;CHECK IN-CORE FLAG, SKIP ENTRY IF NOT SET.
+	CAMN	R1,0(EXP1)	;BREAKPOINT MATCH?
+	JRST	STMT40		;YES, GO CALL DEBUG
+STMT25:	SOSL	BRKPTRNUM(PSA)	;NO, KEEP CHECKING
+	SOJA	EXP1,STMT20
+STMT30:	MOVE	EXP1,EXP1+REGSAVE(PSA)
+	JRST	STMT12
+STMT40:	SKIPL	BRKSKIP(PSA)	;SKIP IF NO PROCEED COUNT IN EFFECT (TAKE BREAK)
+	SOSG	BRKSKIP(PSA)	;COUNT DOWN IF COUNT IN EFFECT
+	JRST	.+2		;IF COUNT ZERO OR NOT IN EFFECT, TAKE BREAK
+	JRST	STMT30		;IF COUNT POSITIVE, IGNORE BREAKPOINT
+	MOVEI	R1,BREAKPOINT
+	MOVE	EXP1,EXP1+REGSAVE(PSA)
+STMT50:	MOVEM	R1,REASON(PSA)
+	MOVEM	R0,PSA+REGSAVE(PSA)
+	PUSHJ	TOP,DBUG$
+	MOVE	R1,CSTMT(PSA)
+	MOVE	PSA,PSA+REGSAVE(PSA)
+	JRST	1(R1)
+>
+WRTPC.:	OUTSTR	USERPC
+WRADR.:	HRRZI	2, 6
+	MOVE	3,[POINT 3,R0,17]
+PCLOOP:
+	SOJL	2,RETURN
+	ILDB	R1, EXP2
+	ADDI	R1, "0"
+	OUTCHR	R1
+	JRST	PCLOOP
+;
+; WRTDC. outputs a decimal number to TTY
+;
+; On entry, (3) = #
+; On return, 2 and 3 are destroyed
+;
+WRTDC.:	IDIVI	2,^D10		;DIVIDE BY 10
+	PUSH	TOP,3		;SAVE REMAINDER MODULO 10
+	CAIE	2,0		;DONE IF QUOTIENT = 0
+	PUSHJ	TOP,WRTDC.	;ELSE RECURSE
+	POP	TOP,3		;RETRIEVE REMAINDER
+	ADDI	3,"0"		;CONVERT TO ASCII
+	OUTCHR	3		;AND PRINT IT
+RETURN:	POPJ	TOP,
+;
+; WRTSTR writes a string to TTY. On entry register 6 contains
+; the address of the block from which the string is extracted.
+; ==> 2(6) is the length and 3(6) starts the string.
+;
+WRTSTR:
+	SKIPG	7,2(6)		;GET LENGTH
+	POPJ	TOP,		;DONE IF NULL STRING
+	MOVEI	6,3(6)		;ELSE ADDRESS STRING
+	HRLI	6,440700	;WITH BYTE POINTER
+STLOOP:
+	SOJL	7,RETURN
+	ILDB	1,6		;GETS CHARACTER
+	OUTCHR	1		;AND PRINTS IT
+	JRST	STLOOP
+;
+; WRT50. prints the radix50 name which is in register 6.
+;
+WRT50.:
+	TLZ	6,740000	;CLEAR THE CODE FIELD
+WRT501:
+	JUMPE	6,WRT502	;WHEN ALL DECODED, GO PRINT
+	IDIVI	6,50		;GET LAST CHAR
+	ADDI	7,"0"-1		;1-12 => 0-9
+	CAILE	7,"9"
+	ADDI	7,"A"-"9"-1	;13-44 => A-Z
+	CAILE	7,"Z"
+	SUBI	7,"Z"+1-"$"	;46,47 => $,%
+	CAIN	7,"#"
+	MOVEI	7,"."		;45 => .
+	PUSH	TOP,7		;SAVE THE CHAR
+	JRST	WRT501
+WRT502:
+	POP	TOP,6		;GET A CHAR
+	TRNE	6,777400	;IS IT A CHAR?
+	JRST	0(6)		;NO, THE RETURN ADDRESS!
+	OUTCHR	6		;YES, PRINT IT
+	JRST	WRT502
+;
+; TRACE. outputs to TTY a trace of procedure/function calls 
+; by chasing the dynamic BASIS chain up the stack to the main program.
+; TRACE is a Pascal-callable entry to it.  TRACE. assumes
+; that R0 contains the return address of the TRACE call
+; (for a reenter/continue trace, the continue address).
+;
+TRACE:	MOVE	R0,0(TOP)	;GET THE RETURN ADDR FOR TRACE.
+
+TRACE.:	PUSH	TOP,R0		;SAVE RETURN/ABORT ADDRESS
+	PUSHJ	TOP,TWAIT.	;EMPTY TTY BUFFER FIRST
+	OUTSTR	HEADER
+	MOVE	4,BASIS		;STACK PTR.
+	POP	TOP,R0		;RETRIEVE RETURN/ABORT ADDRESS
+TRACE2:	TLNN	4,777777	;AT MAIN?
+	JRST	INFO.		;YES, RETURN THROUGH INFO.
+	HLR	4,4		;NO, SET STACK POINTER TO CALLER'S FRAME
+	PUSHJ	TOP,INFO.	;AND PRINT IT'S INFO
+	MOVE	4,1(4)		;BACK ONE FRAME
+	JRST	TRACE2
+;
+; INFO. prints the current location in, name of (if any), module
+; containing, and module address of the procedure whose BASIS
+; stack pointer is in 4.
+;
+INFO.:	PUSHJ	TOP,WRADR.	;PRINT THE CURRENT LOCATION
+	OUTSTR	IN
+	TLNE	4,777777	;CHECK FOR MAIN
+	JRST	INFO10		;NO
+	HRRZ	5,0(4)		;LINK WORD STORED DIFFERENTLY FOR MAIN PROC
+	CAIA	0
+INFO10:	HRRZ	5,3(4)		;ADDRESS OF ENTRY POINT + 1
+	HRRZ	6,0(5)		;ADDRESS OF PROCEDURE BLOCK OR NIL
+	CAIE	6,NIL		;COMPILED WITH TRACE IN EFFECT?
+	JRST	INFO20
+	OUTSTR	UNKNOWN		;NO
+	MOVEI	R0,-1(5)	;GET ADDRESS OF ENTRY POINT
+	JRST	INFO30
+INFO20:	PUSHJ	TOP,WRTSTR	;YES, WRITE IT
+	HRRZ	6,0(5)		;ADDRESS OF PROCEDURE BLOCK
+	HLRZ	6,1(6)		;ADDRESS OF PROGRAM BLOCK OR NIL
+	CAIN	6,NIL
+	JRST	INFO25		;NO PROGRAM BLOCK ADDRESS
+	MOVEI	R0,-1(6)	;MODULE ADDRESS
+	MOVE	6,-1(6)		;RADIX-50 MODULE NAME
+	OUTSTR	IN
+	PUSHJ	TOP,WRT50.	;PRINT THE MODULE NAME
+	JRST	INFO30
+INFO25:	HRRZ	R0,0(5)
+INFO30:	OUTSTR	AT
+	PUSHJ	TOP,WRADR.	;PRINT IT
+	TLNN	4,777777	;AT MAIN?
+	JRST	INFO40		;YES, NO CALLER
+	MOVE	5,0(4)		;ADDRESS OF CALL + 1
+	MOVEI	R0,-1(5)	;CORRECTED
+INFO40:
+	OUTSTR	CR
+	POPJ	TOP,
+	IFN	DEBUGF,<
+ONTRY.:			;CALLED FROM PUBLIC, OVERLAID, DEBUG MODULES!
+	$GETPSA	RTBASE
+	SKIPL	STEPCOUNT(PSA)	;IF STEPPING
+	SKIPG	PROCSKIP(PSA)	;AND SKIPPING CALLS
+	JRST	ENTRY0
+	PUSH	TOP,STEPCOUNT(PSA);PRESERVE STEP COUNT
+	PUSH	TOP,[EXP BST.TV];DUMMY RETURN ADDRESS
+	JRST	ENTRY0		;AND CONTINUE ENTRY
+PNTRY.:
+;
+; PROCEDURE ENTRY SEQUENCE FOR KL
+;
+	$GETPSA	RTBASE
+	SKIPL	STEPCOUNT(PSA)	;IF STEPPING
+	SKIPG	PROCSKIP(PSA)	;AND IF SKIPPING CALLS
+	JRST	ENTRY1
+	PUSH	TOP,STEPCOUNT(PSA)	;SAVE OLD STEP COUNT
+	PUSH	TOP,[EXP BST.TV];AND DUMMY UP RETURN ADDRESS
+ENTRY0:
+	SETOM	STEPCOUNT(PSA)	;NO LONGER STEPPING
+ENTRY1:
+	DMOVEM	BASIS,1(TOP)
+	HRRZM	R1,3(TOP)
+	MOVEI	BASIS,0(TOP)
+	HRLI	BASIS,0(BASIS)
+	JRST	1(R1)
+BACK$TEP:
+BST.AC: POP	TOP,R1	;RETRIEVE OLD STEP COUNT
+	MOVE	R0,FV+2(TOP)	;MUST SHIFT FUNCTION VALUE UP 2 WORDS
+	MOVEM	R0,FV(TOP)
+	MOVE	R0,FV+3(TOP)
+	MOVEM	R0,FV+1(TOP)
+	$GETPSA	RTBASE
+	SKIPGE	STEPCOUNT(PSA)	;IF NOT CURRENTLY STEPPING
+	SKIPG	PROCSKIP(PSA)	;AND IF STILL SKIPPING CALLS
+	POPJ	TOP,
+	MOVEM	R1,STEPCOUNT(PSA)	;THEN RESTORE STEP COUNT
+	POPJ	TOP,
+;
+; PROCEDURE EXIT SEQUENCE FOR KL
+;
+PRTRN.:
+	DMOVE	BASIS,1(BASIS)
+	TLNE	BASIS,777777
+	HLR	BASIS,BASIS
+	POPJ	TOP,
+>
+	IFN	DEBUGF,<
+	.JBDDT==74
+	$ABS	.JBDDT
+	EXP	DDT.AC>
+;	SET RELOCATION BACK TO HIGH SEGMENT SO LITERALS GO THERE
+	$HIGH
+USERPC:	ASCIZ	/ at user PC /
+	IFN	DEBUGF,<
+FSTRING:ASCIZ	/File /
+PSTRING:ASCIZ	/, page /
+LSTRING:ASCIZ	/, line /
+>
+CR:	ASCIZ	/
+/
+IN:	ASCIZ	/ in /
+AT:	ASCIZ	/ at /
+HEADER:	ASCIZ	/
+Trace of active routines:
+/
+UNKNOWN:ASCIZ	/Unknown/
+	$LIT
+	prgend
+	search	kirtsm
+	$module	stack
+	entry	stack.
+
+;
+; If loaded, indicates user did NOT specify an explicit
+; stack size to the loader and the compiler supplied
+; value is to be used.
+;
+	$abs	0
+stack.:	block	0
+	prgend
+	search	kirtsm
+	$module	pntry
+	entry	pntry.
+	entry	prtrn.
+
+pntry.:	dmovem	basis,1(top)
+	hrrzm	r1,3(top)
+	movei	basis,0(top)
+	hrli	basis,0(basis)
+	jrst	1(r1)
+
+prtrn.:	dmove	basis,1(basis)
+	tlne	basis,777777
+	hlr	basis,basis
+	popj	top,
+	prgend
+	search	kirtsm
+	$module	pcall
+	entry	pcall.
+
+;
+; PCALL. intercepts calls to formal procedures and functions,
+; setting the stack frame for the called routine.
+;
+
+pcall.:
+	tlne	r1,777777	;if not a level 1 routine
+	hlr	basis,r1	;then set parent's stack frame ptr
+	jrst	0(exp1)		;actual entry to routine
+	end
+ 
