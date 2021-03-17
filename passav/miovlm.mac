@@ -1,0 +1,1346 @@
+;
+;  MMOVLM - overlay manager code loaded with the user program.
+;
+;
+;  ***** HACK ***** 
+;	This module calls the RDLIB routine JOBINF.  In order to avoid
+;    	assumptions about where RDLIB resides the INFPAC rel file
+;	should be concatenated to the end of the rel file for this module.
+;
+        search  ovirts
+	search	oviopd
+	sall
+        $MODULE OVLTV
+;
+; Pseudo-static declarations for us
+;
+	define 	CUROVL,<0(PSA)>
+	define	MRUKEY,<1(PSA)>
+	define	RUNOVL,<2(PSA)>
+	define	CHN,<3(PSA)>
+	define	NSMCNT,<4(PSA)>
+;
+; Dispatch values for RUNOVL cell
+;
+	DSOVLT=0			; when reading an overlay
+	DSOVRT=1			; when restoring an overlay
+	DSDBUG=2			; when debugger needs overlay
+;
+; Other constant definitions for various fields
+;
+	OVORIG=0			; LH of NS entry, area origin
+	FILIDX=0			; RH of both sharable and NS -- gives
+					;   index into file table
+	SHARST=0			; static init bit for sharables
+	STVRFY=1			; second word to verify static
+	VERSID=2			; current version to use
+	STINIT=3			; for non-sharables
+	DBPTR=3				; save db pointer if appropriate
+;
+; Definitions for portion of static area involving files
+;
+	MAXCHN=0			; max permitted by ODMS
+	CURCHN=1			; number currently in use
+	MAXFIL=2			; size of file table
+	FILTAB=3			; start of the file table
+;
+; Definitions for entries in file table
+;
+	FTESIZ=^o13			; File Table Entry SIZe
+	CHNUM=0				; in RH, channel # if open
+	BUFPTR=0			; in LH, if nonzero, is database file
+					; points to TENIO buffer which
+					; permits non-block operations
+	MRUFIL=1			; MRU index of most recent use
+	FLEN=2				; length of string [40] filename
+	FNAME=3				; the text
+;
+; Offset definitions for ODMS control pointers in databases
+;
+	XVERS=^o20			; integer version ID
+	XTIME=XVERS+1			; timestamp
+	XNEXTP=XVERS+2			; pointer to next version on chain
+;
+; Register equates for the system
+;
+	OVPTR=EXP2			; points to module table entry
+	OVIDX=OVPTR+1			; index of overlay
+	EXD=OVPTR+2			; points to buffer with .EXE dir'y
+	KEXE=OVPTR+3			; word offset of .EXE dir'y in file
+	APTR=OVPTR+4			; points to area table entry
+	VFY=OVPTR+5			; contains static verification word
+	FILE=EXP1			; points to file table entry
+	T1=OVPTR+6			; TENIO argument registers
+	T2=T1+1				; must be consecutive
+	T3=T1+2
+;
+; Externs needed to pull TENIO if not already present
+;
+	extern	TENIO.,BUF.0,PASUO.,PPGRG.
+	page
+;
+; The initialization routine, coerces pointer to static area
+;   produced by ODMS and stores in PDA for use by other segments
+;   in a purely register-relative manner.
+;
+;  This routine also appends the PPN of the account which the main
+;  hiseg resides in to each (initial) entry in the file table.
+;
+	extern	OVSTA.
+	extern	OPR.TV
+	extern	jobinf
+	extern	ins.sm
+
+	$local	seginf,^o40		; record returned by JOBINF
+
+progdir=^o16
+
+OVLINI:
+	$frame
+	MOVEI	R0,OVSTA.		; just pick it up
+	MOVEM	R0,$OVLTV(PDA)		;   and plonk it down
+
+	movei	exp1,seginf		; call RDLIB routine JOBINF to get
+	pushj	top,jobinf		; ppn (in string[15] format).
+
+	move	psa,r0
+	movei	exp1,3+nsmcnt		; Calc address of file table within
+	add	exp1,-3(exp1)		;   ovelay manager's pseudo-static
+	add	exp1,-2(exp1)		;   area.
+	add	exp1,-1(exp1)
+	move	exp4,maxfil(exp1)	; exp4 - number of file table entries.
+	addi	exp1,filtab		; exp1 - addr of 1st file table entry.
+	move	exp2,[point 7,progdir+1+seginf]	; exp2 - bptr to ppn.
+	move	exp5,exp2		; exp5 - save a copy of bptr to ppn.
+
+;  Loop through the file table.  PPN is concatenated to every non-null
+;  entry in the (initial) file table.  
+;  Register usage:
+;    exp1 - addr of start of current file table entry,
+;    exp2 - byte pointer to ppn,
+;    exp4 - number of file table entries not yet processed.
+
+nxtfil:	move	r1,progdir+seginf	; R1 - length of ppn.
+	move	exp3,flen(exp1)		; exp3 - length of file name.
+	jumpe	exp3,cont		; forget concatenation if no name.
+	addm	r1,flen(exp1)		; increment name length in file table
+	jsr	ins.sm
+	adjbp	exp3,[point 7,fname(exp1)]	; exp3 - bptr to first byte
+					;   beyond file name.
+nxtbyt:
+	ildb	r0,exp2			; append ppn to file name
+	idpb	r0,exp3			; of current file table entry.
+	sojg	r1,nxtbyt
+
+	move	exp2,exp5			; restore byte pointer to ppn.
+cont:	addi	exp1,ftesiz		; bump file table pointer by 1 entry.
+	sojg	exp4,nxtfil		; continue if move table entries.
+
+	$return
+        page
+; OVL.AC -- central routine for interception of inter-overlay procedure
+;   calls.  Arrive here from MTV, possibly through PORTAL in LTV of
+;   sharable segment.  Get here via a PUSHJ. The word following
+;   the PUSHJ has the module index in the left half and the dispatch
+;   address in the right half.  We insure that the desired overlay is
+;   addressible, save status of previous overlay if necessary, and go.
+
+	entry	OVL.AC
+
+OVL.AC:	EXCH	EXP1,0(TOP)		; save EXP1, get addr of word
+	PUSH	TOP,EXP2		; save a few others needed
+	PUSH	TOP,PSA
+	MOVE	PSA,$OVLTV(PDA)		; need pointer
+	SETZM	0,RUNOVL		; to set up dispatch return
+;	JRST	DOOVL.			; fall into DOOVL.
+	page
+; DOOVL. -- overlay control routine.  This routine decides if an overlay
+;   read or GETSEG is necessary, and then does it.  Note that the dispatch
+;   return from RDOVL must be set up by jumper.
+
+	entry	HSR.AC
+
+DOOVL.:	HLRE	EXP2,0(EXP1)		; module index
+	MOVE	R0,EXP2			; save a copy of the index
+	JUMPLE	EXP2,DOSHR		; non-positive, sharable
+	LSH	EXP2,2			; expand into table index
+	CAMLE	EXP2,NSMCNT		; within range?
+	JRST	ERRIMI			;   no, illegal module index
+	ADDI	EXP2,-3+NSMCNT		; form address of mod table entry
+
+	SKIPL	0,STINIT(EXP2)		; stinit bit set?
+	JRST	RDOVL			; yes, must read this overlay
+	HLRZ	R1,OVORIG(EXP2)		; check first word within area
+	HLRZ	R1,0(R1)		; through area table to area
+
+RDNSHR:	CAME	R0,^o10(R1)		; does it have this mod's index?
+	JRST	RDOVL			; read overlay in
+HSR.AC:	SOSGE	R1,RUNOVL		; were we called from debugger?
+	JRST	OVDSP			; reading overlay for calling
+	SOJL	R1,OVRTD		; reading overlay for returning
+	JRST	DBRTN.			; reading overlay for debugger
+OVDSP:	HLRE	R0,0(EXP1)		; reload overlay index
+	HRL	EXP1,CUROVL		; remember overlay to restore
+	MOVEM	R0,CUROVL		;   and remember new one
+	POP	TOP,PSA
+	POP	TOP,EXP2
+	HRRZ	R1,0(EXP1)		; grab dispatch LTV address
+	HLLM	EXP1,-1(TOP)		; stuff mod # for later
+	HRRZI	EXP1,OPR.TV		; segment LTV for returning here
+	EXCH	EXP1,0(TOP)		; stack it, restore EXP1
+	JRST	0(R1)			;   and dispatch
+
+DOSHR:	MOVN	EXP2,EXP2		; make module index positive
+	LSH	EXP2,1			; mult for two word entries
+	MOVE	R1,NSMCNT		; size of non-sharable sections
+	ADDI	R1,1+NSMCNT		; skip table
+	CAMLE	EXP2,0(R1)		; did we exceed non-sharable size?
+	JRST	ERRIMI			;   yep, bad index
+	SKIPG	0,0(R1)			; make sure there are sharables
+	JRST	HSR.AC			;   else it's just a resid. return
+	ADDI	EXP2,1(R1)		; addr of zero-based entry
+	MOVEI	R1,^o400000		; "overlay origin addr"
+	JRST	RDNSHR			; go see if it's in
+
+ERRIMI:	MOVE	R0,EXP1			; use MTV addr in error message
+	$FTERR	MSGIMI
+MSGIMI:	asciz/
+?	Illegal overlay index/
+	page
+; OPR.AC -- intercept return from overlaid procedure.  Since we have to
+;   remove a word from the stack, any function value may have to be moved
+;   to compensate.  We just dive into the "read an overlay" code.
+
+	intern	OPR.AC
+
+	PAD=7				; padding to get over old stack frame
+
+OPR.AC:	MOVEM	EXP1,1(TOP)		; get register needed later
+	MOVE	EXP1,6(TOP)		; play the function value move game
+	EXCH	EXP1,5(TOP)
+	MOVEM	EXP1,4(TOP)
+	MOVEI	EXP1,0(TOP)		; pointer to magic word
+	jsr	ins.sm
+	ADJSP	TOP,PAD			; get some insulation
+	PUSH	TOP,EXP2		; save the others
+	PUSH	TOP,PSA
+	MOVE	PSA,$OVLTV(PDA)		; we have to set up dispatch
+	MOVEI	EXP2,DSOVRT
+	MOVEM	EXP2,RUNOVL
+	JRST	DOOVL.			; take care of it
+
+OVRTD:	HLRE	R0,-PAD-2(TOP)		; what overlay did we restore?
+	MOVEM	R0,CUROVL		;   who cares? the next overlay read!
+	POP	TOP,PSA			; restore 'em
+	POP	TOP,EXP2
+	jsr	ins.sm
+	ADJSP	TOP,-7			; strip off insulation
+	MOVE	EXP1,1(TOP)		; last reg to restore
+	POP	TOP,R1			; get real return address
+	JRST	0(R1)			;   and dispatch
+	page
+; RDOVL -- read in an overlay.  May involve either disk I/O or GETSEG
+;   for reading in the code portion, but common code for static area.
+;   Right off, sharable and non-sharable overlays are handled different-
+;   ly.  In essence, there are three distinct cases to handle.  Sharable
+;   overlays are easy.  We only have to open the file in order to
+;   initialize the static.  Thus, we can go ahead and use a stack buffer
+;   for TENIO, in order to do the static read using non-block bounded
+;   I/O operations.  For databases, we always have to be able to do
+;   fully random I/O, so we just keep a heap buffer all the time.  But for
+;   external non-sharables, we need the buffer only to initialize the
+;   static.  Use a stack buffer, but ***KLUDGE*** rely on TENIO to never
+;   use it again after the static is initialized, since all subsequent
+;   reading of overlays will be in page quanta.
+;
+	$LOCAL	RSV,T3-EXP1+1
+	$LOCAL	DIRBLK,^o200
+	$LOCAL	STKBUF,^o200
+
+	extern	NEW.,DSPOS.,DOSEG.,P.FID.
+
+RD$OVL:	$FRAME				; called from debugger support
+	$SAVE	RSV,EXP1,T3		; save 'em all
+	MOVE	OVIDX,EXP1		; loading overlay index
+	JRST	RDOVL2			; assume pointer in EXP2 (OVPTR)
+
+RDOVL:	$FRAME
+	$SAVE	RSV,EXP1,T3
+	HLRE	OVIDX,0(EXP1)		; we get it from MTV return addr
+
+RDOVL2:	HRRZ	FILE,FILIDX(OVPTR)	; pointer into file table
+	SKIPN	0,MRUFIL(FILE)		; is it associated?
+	JRST	ERRFNA			;   no, that's fatal, folks
+	PUSHJ	TOP,OVL$IN		; tell the debugger what's up
+	HRRZ	R1,CHNUM(FILE)		; some constant stuff before
+	MOVEM	R1,CHN			; we go
+	AOS	R1,MRUKEY		; splitting off sharables --
+	MOVEM	R1,MRUFIL(FILE)		; load channel num and promote
+	JUMPLE	OVIDX,RDSHR		; to MRU, then split shrs off
+
+	HLRZ	APTR,OVORIG(OVPTR)	; load pointer into area table
+	SKIPE	0,CHN			; is the file open?
+	JRST	RDOVEX			;   yes, go read exe
+	HRLZI	T1,^o406000		; prepare TENIO bits
+	HLRZ	T2,BUFPTR(FILE)		; is this a database file?
+	JUMPE	T2,RDNOTD		;   no, some other way
+	TLZ	T1,^o4000		; db's always take buffers
+	CAIE	T2,^o400000		; is this the sentinel value?
+	JRST	OPNFIL			;   no, the value is the buffer addr
+	MOVEI	T2,^o200		; yes, we must cons up a buffer
+	PUSHJ	TOP,NEW.		;   on the heap, natch
+	  ARG	T2,0(T2)
+	HRLM	T2,BUFPTR(FILE)		; remember for next time
+	JRST	OPNFIL
+
+RDNOTD:	MOVEI	T2,STKBUF		; assume we need a buffer
+	SKIPL	0,STINIT(OVPTR)		; has module's static been initted?
+	TLZ	T1,^o4000		;   no, we'll need buffer later
+
+OPNFIL:	PUSHJ	TOP,GETCHN		; figure out what channel to use
+	HRR	T1,FLEN(FILE)		; length of name, preserve bits
+	MOVEI	T3,FNAME(FILE)		; compose byte pointer to text
+	HRLI	T3,^o440700		; standard fare
+	OPENF	T1,CHN			; do it
+	JRST	ERRFNF			; if we got this far, must have file!
+
+RDOVEX:	MOVEI	EXD,DIRBLK		; we'll read it in here
+	PUSHJ	TOP,RDEXED		; magic helper to get .EXE directory
+	PUSHJ	TOP,RDNSOV		; read a non-sharable overlay, bud
+	SKIPGE	0,STINIT(OVPTR)		; is the static initialized?
+	JRST	RDDONE			;   yep, the read (deed) is done
+
+	HLRZ	R1,0(APTR)		; get origin of area from table
+	CAME	OVIDX,^o10(R1)		; make sure we loaded the right overlay
+	JRST	ERRIOI			;   wouldn't that be a bite?
+	MOVEI	EXD,DIRBLK		; restore exe directory pointer
+	MOVE	VFY,^o11(R1)		; get verify word to compare with
+	HLRZ	R0,2(R1)		; fetch loseg break from VJDA
+	CAILE	R0,0(VFY)		; is loseg break within it?
+	JRST	ERRLSO			;   no, low segment overflow
+
+	PUSHJ	TOP,RDSTAT		; static reader helper
+	HRLZI	R0,^o400000		; set static init bit
+	ORM	R0,STINIT(OVPTR)	; to avoid creaming static later
+RDDONE:	$RESTORE RSV,EXP1,T3		; let's get out of here
+	$UNFRAME
+	JRST	HSR.AC
+	page
+; RDSHR -- read sharable overlay.  In order to set up for the GETSEG,
+;   we have to initialize the static if necessary.  But to do so, we
+;   need the verification word in the high segment.  So, just read that
+;   word in by hand.  Any time a sharable overlay is opened, a buffer is
+;   used; any time a heap buffer is used, its address is recorded in
+;   the file table entry.  This happens only on non-default sharable
+;   overlay files.  The default files have never been examined, so no buffer
+;   was allocated for them.  In this case, use the stack buffer.
+
+RDSHR:	SKIPGE	0,SHARST(OVPTR)		; is the static initialized?
+	JRST	FIXFIL			;   yes -- close and do GETSEG
+	SKIPN	0,CHN			; if file isn't open
+	JRST	RDSHOP			;   then take it from the top
+	HLRZ	T1,BUFPTR(FILE)		; just because it's open doesn't
+	JUMPN	T1,RDSHST		; mean we can do non-block I/O
+	CLOSEF	T1,CHN			; must re-open w/buff -- let TENIO 
+					;   skip return go over channel call
+
+RDSHOP:	PUSHJ	TOP,GETCHN		; get us a channel
+	MOVEI	T3,FNAME(FILE)		; compose byte pointer to text
+	HRLI	T3,^o440700
+	MOVEI	T2,STKBUF		; we definitely need a buffer
+	MOVE	T1,FLEN(FILE)		; length of string
+	HRLI	T1,^o402000		; TENIO bits
+	OPENF	T1,CHN			; how about it?
+	JRST	ERRFNF			;   file not found.
+
+RDSHST:	MOVEI	EXD,DIRBLK		; get the .EXE directory page
+	PUSHJ	TOP,RDEXED
+	MOVEI	R1,1(EXD)		; search for first page
+	HRLZI	R0,^o400000		;   composing high segment
+
+HSLOOP:	TDNE	R0,0(R1)		; are you a high segment page?
+	JRST	GOTHS			;   yep, good enough for me
+	ADDI	R1,2			; increment to next page entry
+	JRST	HSLOOP			;   and do again
+
+GOTHS:	HRRZ	T2,0(R1)		; get file page number
+	LSH	T2,^o11			; convert to word address
+	ADDI	T2,^o11			; only the word at 400011
+	RDWRDR	T1,CHN			;   in the overlay -- get it
+	JSP	R1,ERRIO		; ech
+	JSP	R1,ERRIO		; ech
+	MOVE	VFY,T1			; give that to read_static
+	SUBI	T2,^o10			; giving 400002 in T2
+	RDWRDR	T1,CHN			; get word that would go in VJDA
+	JSP	R1,ERRIO
+	JSP	R1,ERRIO
+	HLRZ	R0,T1			; loseg break from VJDA
+	CAILE	R0,0(VFY)		; within end of static area?
+	JRST	ERRLSO			;   nope
+	PUSHJ	TOP,RDSTAT		; is there an echo in here???
+	HRLZI	R0,^o400000		; set the static init bit
+	ORM	R0,SHARST(OVPTR)	;   like so
+
+FIXFIL:	HLRZ	T1,BUFPTR(FILE)		; see if there's a buffer to chuck
+	JUMPE	T1,CLSFIL		;   no
+	PUSHJ	TOP,DSPOS.		; off it
+	  ARG	0,0(T1)
+	HRRZS	0,BUFPTR(FILE)		; clear stored pointer
+CLSFIL:	SKIPE	0,CHN			; don't bother if nothing to close!
+	PUSHJ	TOP,OVCLSF
+
+DOSEG:	MOVEI	EXP1,FLEN(FILE)		; addr of string
+	MOVEI	EXP2,STKBUF		; where to parse it into
+	PUSH	TOP,EXP2		; remember that addr
+	PUSHJ	TOP,P.FID.		; do it
+	JRST	ERRFNP			; unparseable???
+	$GETPDA
+
+	$RESTOR	-1+RSV,EXP1,T3		; registers as in our caller
+	POP	TOP,R0			; addr of parsed name in R0
+	$UNFRAME			; fix the stack
+	JRST	DOSEG.			; swap the segment
+	page
+; RDEXED -- read exe directory.  We assume that the address of the block
+;   buffer in which to read the first block of the .EXE directory is in
+;   register EXD.  If the file is a database, and if we don't have a
+;   database pointer for the module, call DBQRY to get one.
+
+RDEXED:	SETZ	KEXE,0			; assume zero-based file
+	JUMPLE	OVIDX,NODBEX		; if sharable overlay, no DB to check
+	HRROI	R1,0			; compose the word 777777,,0
+	TDNN	R1,BUFPTR(FILE)		; is the file a database?
+	JRST	NODBEX			;   no, use zero pointer
+	MOVE	KEXE,DBPTR(OVPTR)	; pick up stored DB pointer
+	TLZ	KEXE,^o400000		; mask out static init bit
+	JUMPN	KEXE,NODBEX		; got something, must be it
+	PUSHJ	TOP,DBQRY		; nothing, go get it
+	JRST	ERRVNF			;   version not found, error
+	MOVEM	KEXE,DBPTR(OVPTR)	; store pointer, reinit static
+	JRST	GOTXRD			; DBQRY already read the exedir
+
+NODBEX:	MOVEI	T1,0(EXD)		; core addr for the read
+	MOVEI	T2,^o200		; just one block
+	MOVE	T3,KEXE			; word address in file
+	RDBLKR	T1,CHN
+	JSP	R1,ERRIO
+	JSP	R1,ERRIO
+
+GOTXRD:	HLRZ	R1,0(EXD)		; just a check that the first word
+	CAIN	R1,^o1776		;   is right for an exe directory
+	POPJ	TOP,0			; looks good to me
+ERRDNX:	MOVE	R1,OVIDX		; "user PC <overlaynumber>"
+	$FTERR	MSGDNX
+MSGDNX:	asciz/
+?	Overlay not in .EXE format/
+	page
+; DBQRY -- query database for module/version.  We also assume that EXD
+;   contains the address of a block buffer for use in reading the exe
+;   directories that we must examine.  There is a slight chance that
+;   the module does not exist within the database (only if module indices
+;   above 127 exist in the overlaid system).  We don't error out just
+;   because we can't find the version, but we skip return if we do.
+;   Note that we leave the exe directory in the EXD block as a nice side
+;   effect.
+
+DBQRY:	MOVEI	KEXE,^o200		; start with second block of DB
+	MOVEI	R0,-1(OVIDX)		; compute mod#+1 div 127 + 1
+	IDIVI	R0,^o177		; to index db directory block
+	ADDI	R1,1			; with remainder 1..127
+
+DBDIRL:	MOVEI	T1,0(EXD)		; read into here
+	MOVEI	T2,^o200		; one block
+	MOVE	T3,KEXE			; our file word address
+	RDBLKR	T1,CHN			; do it
+	JSP	R1,ERRIO
+	JSP	R1,ERRIO
+	SOJL	R0,DBGOTD		; maybe we have correct directory
+	SKIPE	KEXE,0(EXD)		; no, get ptr to next one
+	JRST	DBDIRL			; got it, try again
+	JRST	ERRIMI			; illegal module index
+
+DBGOTD:	MOVEI	KEXE,0(EXD)		; got directory, load mod pointer
+	ADDI	KEXE,0(R1)		; indexing by modulo mod index
+	MOVE	KEXE,0(KEXE)
+	JUMPE	KEXE,DBVNF		; nothing, not found
+
+DBVRSL:	MOVEI	T1,0(EXD)		; read in the exe directory
+	MOVEI	T2,^o200		; just the first block
+	MOVE	T3,KEXE			; examine it
+	RDBLKR	T1,CHN
+	JSP	R1,ERRIO
+	JSP	R1,ERRIO
+
+	MOVE	R1,XVERS(EXD)		; what version did we get?
+	CAMN	R1,VERSID(OVPTR)	; don't care, is it what we want?
+	JRST	DBVERF			;   yep, version found
+	SKIPE	KEXE,XNEXTP(EXD)	; no, pick up pointer to next version
+	JRST	DBVRSL			;   something yet to check
+
+DBVNF:	POPJ	TOP,0			; noskip return, version not found
+
+DBVERF:	AOS	0,0(TOP)		; take the skip return
+	POPJ	TOP,0
+	page
+; RDNSOV -- read non-sharable overlay.  Reads in the correctly relocated
+;   high segment of an overlay.  We read on a page basis, not starting
+;   if the first page does not locate at our area address.  We check
+;   for overflowing the area later, after we do so.
+
+RDNSOV:	HLRZ	APTR,OVORIG(OVPTR)	; get ptr to area descriptor
+	HLRZ	T1,0(APTR)		; start of overlay area
+	HRRZ	R1,0(EXD)		; compute number of dir ents
+	LSH	R1,-1
+	ADDI	EXD,1			; skip control word
+
+RNOFHS:	MOVE	R0,0(EXD)		; pick up first word
+	TLNE	R0,^o400000s page part of high segment?
+	JRST	RNOGHS			;   yes, check it out
+RDNSDA:	ADDI	EXD,2			; advance to next one
+	SOJG	R1,RNOFHS		; loop again if more to do
+
+RDOCLN:	HLRZ	R0,0(APTR)		; low limit of area
+	HRRZ	R1,0(APTR)		; area size
+	ADD	R1,R0			; addr 1 wd beyond end
+	CAILE	T1,0(R1)		; did we overwrite?
+	JRST	ERRHSO			;   that's right, overflow
+	CAIL	T1,0(R1)		; are we right on the edge?
+	POPJ	TOP,0			;   yes, hell with formalities
+	SETZM	0,1(T1)			; BLT the block with zeroes
+	HRLI	T1,1(T1)		; start with first (zeroed) word
+	ADDI	T1,2			; correct right half
+	BLT	T1,-1(R1)		; blast out till end of area
+	POPJ	TOP,0
+
+RNOGHS:	LSH	R0,^o11			; compose file word pointer
+	MOVE	T3,R0			; put in place for TENIO
+	ADD	T3,KEXE			; don't forget EXEdir correction
+	HRRZ	T2,1(EXD)		; compute core address for page
+	LSH	T2,^o11
+	CAIL	T2,0(T1)		; is there space to zero
+	JRST	RNORHS			;   no, read highseg page
+
+	SETZM	0,0(T1)			; let's clear up to new page
+	HRLI	T1,0(T1)		; we'll fix T1 later
+	ADDI	T1,1
+	BLT	T1,0(T2)
+
+RNORHS:	MOVEI	T1,0(T2)		; update core pointer to read into
+	HLRZ	T2,1(EXD)		; number of words
+	ADDI	T2,^o1000
+	RDBLKR	T1,CHN			; get the pages
+	JSP	R1,ERRIO
+	JRST	ERRCHK			; read past EOF???
+	JRST	RDNSDA			; back up
+ERRCHK:	CAIL	T2,^o1000		; Read past eof ok if unread
+	JSP	R1,ERRIO		;   length is less than one
+
+	JRST	RDNSDA			;   disk block.
+	page
+; RDSTAT -- read an overlay's static area.  We get the static verification
+;   word in VFY, which is origin,,size.  This we compare to the one in
+;   the module table, which is pointed to by OVPTR.
+
+RDSTAT:	HLRZ	R1,VFY			; the origin
+	HLRZ	R0,STVRFY(OVPTR)	;   and the smallest allowed here
+	CAIE	R0,0(R1)		; exact match on relocation!
+	JRST	ERRLSO			;   yes, forget you, jack
+	HRRZ	R1,VFY			; last allowed in file
+	HRRZ	R0,STVRFY(OVPTR)	;   and in system
+	CAIGE	R0,0(R1)		; did we blow it?
+	JRST	ERRLSO			;   yes
+
+	HLL	R1,STVRFY(OVPTR)	; zero out the whole static area
+	HLR	R1,R1			; compose a blt pointer
+	SETZM	0,0(R1)
+	ADDI	R1,1
+	HRRZ	R0,STVRFY(OVPTR)	; last valid addr here
+	BLT	R1,@R0
+;
+; Now, we just get candidate pages.  If they are within the bounds of
+;   the static area, we can read them in.  If they overlap either or
+;   both boundaries, adjust the addresses and read size.
+;
+	HRRZ	R1,0(EXD)		; size of exe directory in words
+	LSH	R1,-1			; number of entries
+	MOVE	EXP3,R1			; save for later error checks
+	ADDI	EXD,1			; start with first entry
+
+RSTFLS:	MOVE	R0,0(EXD)		; first word of entry
+	TLNN	R0,^o400000		; part of the high segment
+	JRST	RSTGLS			;   no, got a lowseg page
+RSTCHK:	ADDI	EXD,2			; advance pointer
+	SOJG	R1,RSTFLS		; go back if more
+RSDONE:	POPJ	TOP,0			; out, let caller set bit
+
+RSTGLS:	LSH	R0,^o11			; compute file word addr
+	JUMPE	R0,RSTCHK		; skip any all zero pages
+	MOVE	T3,R0			; in right reg for TENIO
+	ADD	T3,KEXE			; forget not the db offset
+	HRRZ	T1,1(EXD)		; process page number
+	LSH	T1,^o11			; turn into core addr
+	HLRZ	T2,1(EXD)		; number of words to read
+	ADDI	T2,^o1000		; stored as pages-1 bits 0..9
+
+	HLRZ	VFY,STVRFY(OVPTR)	; compare to low end
+	CAIG	VFY,0(T1)		; would we read below it?
+	JRST	RSTCKH			;   no, check high bound
+	SUBI	VFY,0(T1)		; compute correction
+	ADDI	T1,0(VFY)		; and apply to core address
+	ADDI	T3,0(VFY)		; disk address
+	SUBI	T2,0(VFY)		;   and total read length
+
+RSTCKH:	HRRZ	VFY,STVRFY(OVPTR)	; compute high limit
+	MOVEI	R0,0(T1)		; compute highest addr
+	ADDI	R0,-1(T2)		; we would currently read into
+	CAIG	R0,0(VFY)		; would we go off edge?
+	JRST	RSDORD			;   no, go ahead and read
+	SUBI	R0,0(VFY)		; compute hangover
+	SUB	T2,R0			;   and correct total read length
+	JUMPG	T2,RSDORD		; if not complete miss, do the read
+
+	CAMN	R1,EXP3			; First directory entry???
+	JRST	RSTCHK			; yes - allow the complete miss 1st 
+					;   time only to allow for job data area
+	JRST	ERRLSO			; no - fatal error
+
+RSDORD:	RDBLKR	T1,CHN			; do it
+	JSP	R1,ERRIO
+	JSP	R1,ERRIO
+	JRST	RSTCHK			; back up to top
+	page
+; Random error routines
+;
+ERRIO:	$FTERR	MSGIO
+MSGIO:	asciz!
+?	Unexpected I/O error in overlay read!
+
+ERRIOI:	$FTERR	MSGIOI
+MSGIOI:	asciz/
+?	Incorrect module index in overlay read/
+
+ERRFNP:	$GETPDA
+ERRFNF:	$FTERR	MSGFNF
+MSGFNF:	asciz/
+?	Overlay file not found/
+
+ERRFNA:	$FTERR	MSGFNA
+MSGFNA:	asciz/
+?	Overlay file table entry not associated/
+
+ERRVNF:	$FTERR	MSGVNF
+MSGVNF:	asciz/
+?	Overlay version not found/
+
+ERRMNF:	$FTERR	MSGMNF
+MSGMNF:	asciz/
+?	Overlay module not found in database/
+
+ERRHSO:	$FTERR	MSGHSO
+MSGHSO:	asciz/
+?	Overflow in non-sharable overlay read/
+
+ERRLSO:	$FTERR	MSGLSO
+MSGLSO:	asciz/
+?	Overlay static area overflow/
+	page
+; GETCHN -- get channel for overlay operations.  If the channel halfword
+;   in a file table entry is non-zero, it is assumed that the file is
+;   open using that channel.  However, in order to perform I/O on an
+;   overlay file, it must be opened on a channel.  Now, we are limited
+;   in the number of channels which we may use, as specified by the
+;   ODMS user in the BUILD MAIN command.  So, if we are already at the
+;   max, we must close the LRU file.  In all cases (except within this
+;   routine and OVCLSF), the words CURCHN and MAXCHN are accurate, and
+;   the channel number entries in the file table reflect this total.
+
+	extern	GETCN.
+
+GETCHN:	PUSH	TOP,EXP2		; get a register
+	MOVEI	EXP2,3+NSMCNT		; get to file table part of
+	ADD	EXP2,-3(EXP2)		; static area
+	ADD	EXP2,-2(EXP2)
+	ADD	EXP2,-1(EXP2)
+
+	SKIPN	R1,MAXCHN(EXP2)		; are we working with a limit?
+	JRST	CHALLO			;   no, just allocate a channel
+	CAMLE	R1,CURCHN(EXP2)		; are we within the limit?
+	JRST	CHALLO			;   yes, allocate
+
+	PUSH	TOP,EXP3		; must do LRU search, grab a
+	PUSH	TOP,EXP4		;   couple of registers
+	MOVEI	R1,FILTAB(EXP2)		; first entry
+	MOVE	R0,MAXFIL(EXP2)		; number to check
+	HRLOI	EXP3,^o377777		; current LRU is largest integer
+	SETZ	EXP4,0			; haven't found candidate yet
+
+CHLRUL:	SKIPN	0,MRUFIL(R1)		; is file block in use?
+	JRST	CHLRUN			;   no, get next, forget this one
+	CAMG	EXP3,MRUFIL(R1)		; is it better than current?
+	JRST	CHLRUN			;   no, get next
+	MOVE	EXP3,MRUFIL(R1)		; it wins, set up as new candidate
+	MOVEI	EXP4,0(R1)		;   by remembering addr and key
+CHLRUN:	ADDI	R1,FTESIZ			; advance to next table entry
+	SOJG	R0,CHLRUL		; up to top if more to check
+
+	MOVEI	R0,0(EXP4)		; our candidate to close
+	POP	TOP,EXP4		; restore regs used in search
+	POP	TOP,EXP3
+
+	PUSH	TOP,FILE		; save current file pointer
+	MOVE	FILE,R0			; close this one
+	PUSHJ	TOP,OVCLSF		; right there
+	POP	TOP,FILE		; restore FILE register
+
+CHALLO:	PUSHJ	TOP,GETCN.		; get channel from PASCAL runtime
+	MOVEM	R0,CHN			; store in our PSA area
+	HRRM	R0,CHNUM(FILE)		;   and in current entry's locn
+	AOS	0,CURCHN(EXP2)		; increment current usage count
+	POP	TOP,EXP2		; restore borrowed register
+	POPJ	TOP,0			;   and split back
+	page
+; OVCLSF -- close overlay file.  Simply return the channel to PASCAL,
+;   zero the channel number entry in the file table, and decrement the
+;   channel usage count.  Note that any explicit buffers must be
+;   DISPOSEd by callers -- we make no assumptions about databases or
+;   buffers or whatever.
+
+	extern	FRECN.
+
+OVCLSF:	HRRZ	R0,CHNUM(FILE)		; the channel we're closing
+	SETZ	R1,0			; options for TENIO close
+	CLOSEF	R1,R0			; just do it
+	CAI	0,0			;   don't look, mom
+	PUSHJ	TOP,FRECN.		; like that
+	HLLZS	0,CHNUM(FILE)		; clear cell in file table
+
+	MOVEI	R1,3+NSMCNT		; compute addr of usage count
+	ADD	R1,-3(R1)		; portion of static area
+	ADD	R1,-2(R1)		; by skipping dynamic portions
+	ADD	R1,-1(R1)		; of table
+
+	SOS	0,CURCHN		; dec the count
+	POPJ	TOP,0			;   and split
+	page
+; LD$OVL -- load overlay for the debugger.  Just a wrapper for RDOVL.,
+;   we have to compute the overlay table address for the desired overlay.
+;   Set the cell RUNOVL non-zero so that the return from swapping a new
+;   high segment will come here instead of the overlay dispatcher.
+
+	entry	LD$OVL
+
+LD$OVL:	PUSH	TOP,PSA			; keep debugger happy
+	PUSH	TOP,EXP2		;   by saving registers
+	PUSH	TOP,EXP3		; 
+	MOVE	PSA,$OVLTV(PDA)		; load our data area pointer
+	MOVEI	EXP2,DSDBUG		; set dispatcher for return
+	MOVEM	EXP2,RUNOVL
+	LSH	EXP1,1			; sign-extend the 17-bit value
+	HRREI	EXP1,0(EXP1)		; by making bit 17 bit 18 for a sec
+	ASH	EXP1,-1			; and scale back, keeping sign
+
+	MOVEI	EXP2,-3+NSMCNT		; to compute overlay table addr
+	JUMPLE	EXP1,LDSHR		; sharable, skip non-shrs
+	MOVEI	R1,0(EXP1)		; copy overlay index
+	LSH	R1,2			; multiply by four
+	ADDI	EXP2,0(R1)		; computing entry addr in EXP2
+	SKIPL	0,STINIT(EXP2)		; if static area not inited then we
+	JRST	RD$OVL			;   MUST do the read.
+	HLRZ	EXP3,OVORIG(EXP2)	; get area table ptr
+	HLRZ	EXP3,0(EXP3)		; get area origin
+	CAME	EXP1,^o10(EXP3)		; skip read if module already in core.
+	JRST	RD$OVL			; if not in core, do the read
+
+DBRTN.:	POP	TOP,EXP3		; clean up and go home
+	POP	TOP,EXP2
+	SETZM	0,RUNOVL		; we aren't here anymore
+	POP	TOP,PSA
+	POPJ	TOP,0
+
+LDSHR:	ADD	EXP2,3(EXP2)		; skip non-sharable table
+	ADDI	EXP2,5			; correct for zero-based indices
+	CAMN	EXP1,^o400010		; is that module loaded now?
+	JRST	DBRTN.			;   yes, why go further?
+	MOVN	R1,EXP1			; of sharable overlays
+	LSH	R1,1			; two word table entries
+	ADDI	EXP2,0(R1)		; get it
+	JRST	RD$OVL			; new calling sequence
+	JRST	DBRTN.			; should never come here!
+	page
+; OVL$IN -- tell debugger about overlay swap.  We have to keep the debugger's
+;   breakpoint table up to date concerning the residency of overlays with
+;   breakpoints.  Call this routine during RDOVL, when OVIDX and OVPTR are
+;   good.  We take care of the rest.  We also have to update cur_stmt_rec
+;   and def_mod_rec.
+
+	SAVESIZE=<T3-VFY+1>		; define our own LOCAL
+	define	RGS,<-SAVESIZE+1(TOP)>	; since we can't reset $LOCAL
+
+OVL$IN:	jsr	ins.sm
+	ADJSP	TOP,SAVESIZE
+	$SAVE	RGS,VFY,T3
+
+	SKIPN	VFY,$RTBAS(PDA)		; the runtime info pointer
+	JRST	OVDOUT			; debugger must not be loaded
+	SKIPN	0,1(VFY)		; are we in_debugger?
+	JRST	DONODB			;   no, need not update recs
+
+	SKIPN	VFY,$DBBAS(PDA)		; get addr of cur_stmt_rec
+	JRST	OVDOUT			;   debugger not loaded, forget it
+	JSP	T3,DOOVL		; update it
+	ADDI	VFY,1			; get addr of def_mod_rec
+	JSP	T3,DOOVL		;   and update it too
+	MOVE	VFY,$RTBAS(PDA)		; reload former pointer
+
+DONODB:	ADDI	VFY,^o10		; compute addr of breakpoint table
+	HRLI	VFY,-^o11		; left half gets # bks - 1
+
+DOBKLP:	HRRZ	T2,0(VFY)		; get stmt pointer
+	CAIE	T2,$NIL			; if not NIL
+	JSP	T3,DOOVL		;   then there's a BP there
+	AOBJN	VFY,DOBKLP		; back if more
+
+OVDOUT:	$RESTOR	RGS,VFY,T3
+	jsr	ins.sm
+	ADJSP	TOP,-SAVESIZE
+	POPJ	TOP,0
+	page
+; DOOVL -- helper for OVL$IN.  VFY points to a statement record to be
+;   updated.  We must figure out if the status of the statement with
+;   respect to overlay residency is going to change.  Either the statement
+;   is in core, and may be overwritten, or it is out of core, and may be
+;   brought in.  We check for both cases.
+
+DOOVL:	SKIPGE	0,0(VFY)		; split right away for currently out
+	JRST	DOISIN			;   and currently in
+	HLRZ	T1,0(VFY)		; extract stored module number
+	LSH	T1,1			; shift out in-core bit
+	HRREI	T1,0(T1)		; extend out from bit 1
+	ASH	T1,-1			;   and scale
+
+	CAME	T1,OVIDX		; is this the overlay coming in?
+	JRST	0(T3)			;   no, we're done
+	HRLZI	T1,^o400000		; yes, set the in_core bit
+	ORM	T1,0(VFY)		; like so
+	JRST	0(T3)			;   and split
+
+DOISIN:	HRRZ	R0,0(VFY)		; load valid core address from table
+	JUMPLE	OVIDX,DOINSH		; new module is sharable!
+	HLRZ	R1,OVORIG(OVPTR)	; get area table pointer
+	HLRZ	T1,0(R1)		;   through it for area origin
+	CAIGE	R0,0(T1)		; if break is before origin
+	JRST	0(T3)			;   then it can't be within this ovl
+	HRRZ	R1,0(R1)		; grab size of overlay area
+	ADDI	T1,0(R1)		; compute last addr in area
+	CAILE	R0,0(T1)		; if break is beyond end
+	JRST	0(T3)			;   then it's over edge
+
+	HLRZ	R1,OVORIG(OVPTR)	; it's going out, get its overlay
+	HLRZ	R1,0(R1)		;   number by getting origin of
+	HRR	R1,^o10(R1)		;   new one, then checking mod# field
+
+DOCLR:	TRZ	R1,^o400000		; clear the incore bit
+	HRLM	R1,0(VFY)		;   and store it
+	JRST	0(T3)			;   and split
+
+DOINSH:	CAIGE	R0,^o400000		; is breakaddr in high segment?
+	JRST	0(T3)			;   no, no effect, we return
+	HRR	R1,^o400010		; get # of overlay currently in hiseg
+	JRST	DOCLR			;   and update table
+	page
+; BK$OVL -- update breakpoint table for invalidation.  Some overlay operations
+;   completely invalidate any existing breakpoints in overlays (such as
+;   switching versions).  In these cases, we get called from the overlay
+;   system, with EXP1 indicating the dying overlay.
+;   We decide whether in-core
+;   or out-of-core overlay breakpoints are being affected, and enter the
+;   appropriate loop.   One loop checks out-of-core entries for their
+;   module index; the other checks the core address of the overlay to see
+;   if it lies within the range of the overlay.
+
+BK$OVL:	jsr	ins.sm
+	ADJSP	TOP,SAVESIZE
+	$SAVE	RGS,VFY,T3
+	PUSH	TOP,OVPTR		; we're going to set it up
+	PUSH	TOP,PSA			; we need PSA to set up OVPTR
+	MOVE	PSA,$OVLTV(PDA)
+	MOVE	OVPTR,EXP1		; need a copy of overlay index
+	JUMPL	EXP1,BKSH		; sharable
+	LSH	OVPTR,2			; compute overlay table address
+	ADDI	OVPTR,-3+NSMCNT
+	JRST	DOBKOV			; off PSA pointer and go
+
+BKSH:	MOVE	T1,NSMCNT		; size of nonshar table
+	ADDI	T1,2+NSMCNT		; addr of first shar entry
+	LSH	OVPTR,1			; compute table offset
+	ADDI	OVPTR,0(T1)
+
+DOBKOV:	SKIPN	VFY,$RTBAS(PDA)		; need other data area
+	JRST	BKOVDN			;   debugger not loaded
+	ADDI	VFY,7			; addr of breakpoint table
+	HRLI	VFY,-^o11		; negative count less one
+	JUMPLE	EXP1,BKCKSH		; if sharable dying, check hiseg
+	HLRZ	R1,OVORIG(OVPTR)	; get area table pointer
+	HLRZ	R1,0(R1)		;   and overlay area origin
+	CAMN	EXP1,^o10(R1)		; statue, joe?
+	JRST	BKOINC			;   in core, baby
+	JRST	BKONIC
+BKCKSH:	CAMN	EXP1,^o400010		; check hiseg's ID
+	JRST	BKOINC			;   hit the incore loop
+
+BKONIC:	SKIPGE	T1,0(VFY)		; incore bit set in table?
+	JRST	BKONXT			;   yes, we're not interested then
+	MOVEI	T2,$NIL			; get one handy
+	CAIN	T2,0(T1)		; is there really one there?
+	JRST	BKONXT			;   no, just fooling
+	HLRZ	T1,T1			; OK, normalize its module index
+	LSH	T1,1			; sign extend from bit 1
+	HRREI	T1,0(T1)		;   instead of bit 0
+	ASH	T1,-1			;   to skip incore bit
+	CAMN	T1,EXP1		; is it really it?
+	MOVEM	T2,0(VFY)		;   yes, NIL it out
+BKONXT:	AOBJN	VFY,BKONIC		; back up if more
+	JRST	BKOVDN			;   else cleanup and split
+
+BKOINC:	SKIPL	T1,0(VFY)		; incore bit set in table
+	JRST	BKINXT			;   no, we're not interested here
+	MOVEI	T2,$NIL			; get one ready
+	CAIN	T2,0(T1)		; is there really a BP here?
+	JRST	BKINXT			;   no, a hoax
+	HRRZ	T1,0(VFY)		; load up breakpoint core addr
+	JUMPLE	EXP1,BKOISH		; sharable overlay, check for hiseg
+	HLRZ	T3,OVORIG(OVPTR)	; area table pointer
+	HLRZ	R1,0(T3)		; start of area
+	HRRZ	T3,0(T3)		; size of area
+	ADDI	T3,0(R1)		;   plus origin equals end of area
+	CAIGE	T1,0(T3)		; if over edge
+	CAIGE	T1,0(R1)		; or before start
+	JRST	BKINXT			;   then forget it, not in area
+BKICLR:	MOVEM	T2,0(VFY)		; fix the table entry
+BKINXT:	AOBJN	VFY,BKOINC		; back up if more
+BKOVDN:	POP	TOP,PSA
+	POP	TOP,OVPTR
+	$RESTOR	RGS,VFY,T3
+	jsr	ins.sm
+	ADJSP	TOP,-SAVESIZE
+	POPJ	TOP,0
+
+BKOISH:	CAIGE	T1,^o400000		; if addr is in the hiseg
+	JRST	BKINXT			;   skip it if not
+	JRST	BKICLR			;   clear it if it is
+
+BERROR:	jsr	ins.sm
+	ADJSP	TOP,-SAVESIZE		; get return addr for error msg
+	POP	TOP,R1
+	$FTERR	BMSG
+BMSG:	asciz/
+?	Attempt to kill active overlay/
+	page
+; OVEXTF, OVMODF, OVDELF, and OVLVER -- user control entries for the overlay
+;   manager.  Pascal callable routines to install a new file, set an overlay
+;   to be read from that file, delete a file entry, and change a version
+;   identification.  We have to save all registers, and still be able to
+;   call other routines in the manager.  This is not a problem if we're
+;   hooked into the dispatcher which does the return from RDOVL., in those
+;   cases where we actually have to read an overlay.
+;
+; Return codes from our routines:
+;
+	OVCOK=0				; normal
+	OVCFNF=1			; file not found (EXTF)
+	OVCTMF=2			; too many files in use (EXTF)
+	OVCBFI=3			; bad file index (all except VER)
+	OVCUMI=4			; unknown module index (MODF and VER)
+	OVCVRF=5			; verification fails (MODF and VER)
+	OVCNDB=6			; file is not database (VER)
+	OVCVNF=7			; version not found (VER)
+	OVCBDB=^o10			; bad database format (VER)
+	OVCFID=^o11			; file is database (MODF)
+	OVCOVA=^o12			; overlay is active (MODF)
+	OVCCDD=^o13			; can't delete defaults (DELF)
+	page
+; OVEXTF -- associate external file.  We slap it into an empty table entry,
+;   if we have one.  Then we have to get a channel, maybe a buffer if this
+;   new file is a database, open it up to see if it's there.
+
+OVEXTF::PUSH	TOP,EXP5		; regs on top of parameters
+	PUSH	TOP,PSA
+	MOVE	PSA,$OVLTV(PDA)
+	MOVEI	EXP5,3+NSMCNT		; get pointer to file data area
+	ADD	EXP5,-3(EXP5)
+	ADD	EXP5,-2(EXP5)
+	ADD	EXP5,-1(EXP5)
+	MOVE	R0,MAXFIL(EXP5)		; how many entries to check
+	MOVEI	R1,FILTAB(EXP5)		; addr of the first one
+
+OXTFL:	SKIPN	0,MRUFIL(R1)		; are you in use?
+	JRST	OXTGOT			;   no, gotcha
+	ADDI	R1,FTESIZ			; advance to next entry
+	SOJG	R0,OXTFL		; go up again if more
+	MOVEI	R0,OVCTMF		; too many files error
+	JRST	OERRTN			; dive for home
+
+OXTGOT:	AOS	0,MRUFIL(R1)		; mark as in use
+	HRLI	R0,0(EXP1)		; BLT in the new file name
+	HRRI	R0,FLEN(R1)		; length word included
+	BLT	R0,^o12(R1)
+	MOVEI	FILE,0(R1)		; pass it off in EXP1 (file)
+	SETZM	0,BUFPTR(FILE)		; assume not database
+	PUSHJ	TOP,GETCHN		; get us a channel
+	JUMPE	EXP2,OXTCKF		; not database, we're done
+	MOVEI	EXP2,^o200		; get a buffer
+	PUSHJ	TOP,NEW.##		;   by calling NEW
+	  ARG	EXP2,0(EXP2)
+	HRLM	EXP2,BUFPTR(FILE)	; remember it
+
+OXTCKF:	PUSH	TOP,FILE		; gotta save file block in case of err
+	HRRZM	FILE,0(EXP3)		; return addr to user
+	HRRZ	R0,CHNUM(FILE)		; store channel number in global
+	MOVEM	R0,CHN			;   for TENIO
+	HRLI	EXP1,^o406000		; option bits (save FILE rh)
+	JUMPE	EXP2,OXTCK2		; not DB, just go ahead
+	TLZ	EXP1,^o4000		; else don't forbid buff (addr EXP2)
+OXTCK2:	MOVEI	EXP3,FNAME(FILE)	; addr of text of name
+	HRR	EXP1,FLEN(FILE)		; length rh of optionbits reg
+	HRLI	EXP3,^o440700		; hoke byte ptr in R3 to TENIO
+	OPENF	EXP1,CHN		; how about it?
+	JRST	OXTFNF			;   no like
+	POP	TOP,R0			; adjust stack, get rid of extra
+	SETZM	0,0(EXP4)		; no errors
+
+OXRTN:	POP	TOP,PSA			; restore and split
+	POP	TOP,EXP5
+	POPJ	TOP,0
+
+OXTFNF:	POP	TOP,FILE		; recover file block addr
+	PUSHJ	TOP,OVCLSF		; recycle the channel
+	SETZM	0,MRUFIL(FILE)		; mark file as free
+	MOVEI	R0,OVCFNF		; code "file not found"
+OERRTN:	MOVEM	R0,0(EXP4)		; return var code to user
+	JRST	OXRTN			; restore and split
+	page
+; OVDELF -- recycle file table entry.  We have to find any and all overlays
+;   using the file, and reset them to their defaults.  This includes clear-
+;   ing static init for all kinds, finding the right default block for
+;   sharables, and clearing any database pointer for nonsharables.
+;   We also have to reset the file table entry, which includes returning
+;   any channel in use, and any heap buffer.
+
+OVDELF::PUSH	TOP,EXP5		; save a few
+	PUSH	TOP,PSA
+	MOVE	PSA,$OVLTV(PDA)		; the usual
+	MOVEI	EXP5,3+NSMCNT		; find file info part of static area
+	ADD	EXP5,-3(EXP5)		;   by skipping other parts
+	ADD	EXP5,-2(EXP5)
+	ADD	EXP5,-1(EXP5)
+	MOVEI	R0,0(EXP1)		; copy alleged file table pointer
+	SUBI	R0,FILTAB(EXP5)		; subtract origin of table
+	JUMPL	R0,ODBFI		; not within table -- error
+	IDIVI	R0,FTESIZ			; divide remaining offset by size
+	JUMPN	R1,ODBFI		; if remainder non-zero, barf
+	JUMPE	R0,ODCDD		; similarly for default database
+	CAMLE	R0,MAXFIL(EXP5)		; index within file table?
+	JRST	ODBFI			;    nope.
+	MOVEI	R1,1+NSMCNT		; find number of sharable overlays
+	ADD	R1,-1(R1)		; by skipping non-sharable table
+	MOVE	R1,0(R1)		; load size of table for shars
+	LSH	R1,-1			; divide by table size
+	CAMG	R0,R1			; better not delete default for shar!
+	JRST	ODCDD
+
+	MOVEI	R1,1+NSMCNT		; walk nonsharable table looking
+	MOVE	R0,-1(R1)		;   for modules assoc'd w/file
+	LSH	R0,-2			; R0 gets number of nonshars
+	SOJL	R0,ODCKSH		;   indeed, if any there
+
+ODCKNS:	HRRZ	PSA,FILIDX(R1)		; extract file table pointer
+	CAIN	PSA,0(EXP1)		; do you know this man?
+	JRST	ODRSND			;   i confess, so torture me!
+ODCKNN:	ADDI	R1,4			; on to next table entry
+	SOJGE	R0,ODCKNS		; back if more to do
+
+ODCKSH:	ADDI	R1,1			; advance ptr to shar table
+	MOVE	R0,-1(R1)		; fetch number of sharables
+	LSH	R0,-1			; divide by two (entry size)
+	SOJL	R0,ODBLOT		; nothing to do
+
+ODCKSL:	HRRZ	PSA,FILIDX(R1)		; are u assoc'd with this file?
+	CAIN	PSA,0(EXP1)		; well...
+	JRST	ODRSSD			;   yeah.
+ODCKNH:	ADDI	R1,2			; next table entry
+	SOJGE	R0,ODCKSL		; indeed if any
+
+ODBLOT:	MOVE	PSA,$OVLTV(PDA)		; restore that file pointer
+	PUSHJ	TOP,OVCLSF		; restore channel (PSA&FILE OK)
+ODBDSP:	HLRZ	EXP4,BUFPTR(EXP1)	; fetch out any buffer pointer
+	JUMPE	EXP4,ODBCLR		; none to worry about
+	CAIN	EXP4,^o400000		; make sure it's not unitted DB
+	JRST	ODBCLR			;   we're dealing with
+	PUSHJ	TOP,DSPOS.##		; off it
+	  ARG	0,0(EXP4)
+ODBCLR:	SETZM	0,BUFPTR(EXP1)		; completely clear it out
+	SETZM	0,MRUFIL(EXP1)		; mark as unused
+	JRST	OXRTN			; restore and split (prev page)
+
+ODOVA:	MOVEI	R0,OVCOVA		; code "overlay active"
+	MOVEM	R0,0(EXP2)		; store in user return cell
+	JRST	OXRTN
+
+ODBFI:	MOVEI	R0,OVCBFI		; code "bad file index"
+	MOVEM	R0,0(EXP2)		; store in return cell
+	JRST	OXRTN
+
+ODCDD:	MOVEI	R0,OVCCDD		; code "can't delete database"
+	MOVEM	R0,0(EXP2)		;   "or other default file"
+	JRST	OXRTN
+
+ODRSND:	MOVEI	PSA,FILTAB(EXP5)	; addr of default database entry
+	HRRM	PSA,FILIDX(R1)		;   as default for nonsharables
+	SETZM	0,VERSID(R1)		; return to version zero
+	SETZM	0,STINIT(R1)		; clear stinit and db ptr
+	MOVE	PSA,$OVLTV(PDA)		; gotta compose overlay index
+	MOVEI	PSA,-3+NSMCNT		; addr before table
+	SUBM	R1,PSA			; puts table offset in PSA
+	LSH	PSA,-2			; now overlay index
+	EXCH	EXP1,PSA		; put in proper register
+	PUSH	TOP,R1			; save and restore around call
+	PUSHJ	TOP,BK$OVL		; invalidate brkpts in old module
+	POP	TOP,R1			; restore after call
+	EXCH	EXP1,PSA
+	HLRZ	PSA,OVORIG(R1)		; to invalidate overlay
+	HLRZ	PSA,0(PSA)		;   we have to get area origin
+	SETOM	0,^o10(PSA)		;   and cream loc with overlay idx
+	JRST	ODCKNN			; back into loop for next one
+
+ODRSSD:	MOVE	PSA,$OVLTV(PDA)		; for sharables, must find
+	MOVEI	PSA,2+NSMCNT		; start of sharabl table
+	ADD	PSA,-2(PSA)		; less one
+	SUBI	PSA,0(R1)		; less current entry addr gives offset
+	ASH	PSA,-1			; suddenly the overlay number (-)
+	EXCH	PSA,EXP1		; put in right register
+	PUSHJ	TOP,BK$OVL		; fix up
+	EXCH	PSA,EXP1		; restore EXP1
+	CAMN	PSA,^o400010		; just curious, is it active ovl?
+	JRST	ODOVA			;   not valid, can't do that!
+	MOVN	PSA,PSA			; get positive overlay index
+	IMULI	PSA,FTESIZ		; then into file table offset
+	ADDI	PSA,FILTAB+FTESIZ(EXP5)	; finally into file table addr
+	HRRZM	PSA,FILIDX(R1)		; whew!  clear static init too
+	JRST	ODCKNH			; dive back into loop
+	page
+; OVMODF -- associate module with file.  As long as the file index is OK,
+;   and if the user doesn't try to associate a sharable overlay with a
+;   database, then we're OK.  Note a wrinkle in the proceedings occurs
+;   when we get a zero file pointer.  This involves resetting the module
+;   to its default file block, wherever it may be.  For sharable mods,
+;   this can be a bit tricky.
+
+OVMODF::PUSH	TOP,EXP5		; standard entry
+	PUSH	TOP,PSA
+	MOVE	PSA,$OVLTV(PDA)
+	MOVEI	EXP5,3+NSMCNT		; gotta find the file data area
+	ADD	EXP5,-3(EXP5)
+	ADD	EXP5,-2(EXP5)
+	ADD	EXP5,-1(EXP5)
+	MOVEI	R0,0(EXP2)		; copy of the alleged file pointer
+	JUMPE	R0,OMDEF		; default, worry about it later
+	SUBI	R0,FILTAB(EXP5)		; get offset within file table
+	JUMPL	R0,OMBFI		; below table, too crass
+	IDIVI	R0,FTESIZ			; divied by entry size
+	JUMPN	R1,OMBFI		;   if nonzero remainder, points
+	CAMLE	R0,MAXFIL(EXP5)		;   between blocks.  How about
+	JRST	OMBFI			;   being off edge of table?
+
+OMDEF:	MOVEI	R1,1+NSMCNT		; we have to correct user scalar
+	ADD	R1,-1(R1)		;   denoting module index by
+	MOVE	R0,0(R1)		;   subtracting number of sharables
+	LSH	R0,-1			;   (NOT the size of the table!)
+	SUB	EXP1,R0
+	AOJ	EXP1,0			; remember MAIN is sharable too
+	JUMPE	EXP1,OMUMI		; unknown module index if zero
+	PUSHJ	TOP,BK$OVL		; fix up debugger
+	JUMPL	EXP1,OVMDOS		; for sharable defaults
+	LSH	EXP1,2			; multiply by table size (4)
+	CAMLE	EXP1,NSMCNT		; a legal table index?
+	JRST	OMUMI			;   nope.
+	ADDI	EXP1,-3+NSMCNT		; turn it into table pointer
+	SETZM	0,VERSID(EXP1)		; zero out version and staticinit
+	SETZM	0,DBPTR(EXP1)
+	HLRZ	R1,OVORIG(EXP1)		; go through area table to get
+	HLRZ	R1,0(R1)		;   overlay's low segment origin
+	SETOM	0,^o10(R1)		;   and bash cell with module index
+	JUMPN	EXP2,OVMASC		; if we have a file ptr, go
+	MOVEI	EXP2,FILTAB(EXP5)	;   else set up noshr with def db
+	JRST	OVMASC
+
+OVMDOS:	MOVN	EXP1,EXP1		; make index positive
+	JUMPN	EXP2,OVMDS2		; file block OK, get table ptr
+	MOVEI	EXP2,0(EXP1)		; while we have it, copy index
+	IMULI	EXP2,FTESIZ		; expand by file table entry size
+	ADDI	EXP2,FILTAB(EXP5)	;   and generate file table ptr
+
+OVMDS2:	LSH	EXP1,1			; multiply by table size (2)
+	CAMLE	EXP1,0(R1)		; over edge?
+	JRST	OMUMI			;   I give up.
+	HLRZ	R0,BUFPTR(EXP2)		; must make sure file is not database
+	JUMPN	R0,OMISDB		; for sharable module
+	ADDI	EXP1,1(R1)		; convert mod tab offset to ptr
+	HRRZS	0,SHARST(EXP1)		; clear static init bit
+	SETZ	PSA,0			; remember we were sharable
+
+OVMASC:	HRRM	EXP2,FILIDX(EXP1)	; associate mod with file!!!!!
+	JUMPE	PSA,OMOKSP		; sharable, we're done
+	HLRZ	R0,BUFPTR(EXP2)		; same with nonshar database
+	JUMPN	R0,OMOKSP		; only noshar nodb we have to close
+
+	MOVE	PSA,$OVLTV(PDA)		; reset PSA ptr
+	MOVEI	EXP1,0(EXP2)		; reg FILE points to ent to close
+	PUSHJ	TOP,OVCLSF		; do it
+
+OMOKSP:	SETZM	0,0(EXP3)		; OK
+	JRST	OXRTN
+
+OMBFI:	MOVEI	R0,OVCBFI		; code "bad file index"
+OMOUT:	MOVEM	R0,0(EXP3)		; install
+	JRST	OXRTN
+
+OMUMI:	MOVEI	R0,OVCUMI
+	JRST	OMOUT
+
+OMISDB:	MOVEI	R0,OVCFID
+	JRST	OMOUT
+	page
+; OVLVER -- change overlay version.  We just do as the user says.  Just
+;   store the new version number, call DBQRY to try to find it.  Either
+;   it does, in which case we store the pointer and everything's ok, or
+;   it doesn't, in which case the stored version number (the new one)
+;   isn't any good any more.  That's the breaks.
+
+OVLVER::PUSH	TOP,PSA			; first save PSA
+	$FRAME				;   and then duplicate RDOVL sequence
+	$SAVE	RSV,EXP1,T3
+	MOVE	PSA,$OVLTV(PDA)
+
+	MOVEI	R1,1+NSMCNT		; convert user scalar to module
+	ADD	R1,-1(R1)		;   index by adding offset
+	MOVE	R0,0(R1)		; fetch size of sharable table
+	LSH	R0,-1			; convert to # of shars
+	SUB	EXP1,R0			;   and do the correction
+	aoj	exp1,0			; but don't forget MAIN is sharable
+	JUMPLE	EXP1,ORUMI		; no good
+	PUSHJ	TOP,BK$OVL		; fix up
+	MOVEI	OVIDX,0(EXP1)		; load it while we have it
+	LSH	EXP1,2			;   beofre converting to pointer
+	CAMLE	EXP1,NSMCNT		; are we over the edge?
+	JRST	ORUMI			;   yep
+	ADDI	EXP1,-3+NSMCNT		; convert offset to pointer
+
+	MOVEM	EXP2,VERSID(EXP1)	; stre the damn thing
+	MOVEI	OVPTR,0(EXP1)		; load up proper registers
+	SETZ	KEXE,0
+	MOVEI	EXD,DIRBLK		; where to do the search
+	HRRZ	FILE,FILIDX(OVPTR)	; load it up
+	HRRZ	R0,CHNUM(FILE)		; are we open?
+	JUMPE	R0,OVVOPN		;   no, go take care of it
+	MOVEM	R0,CHN			; store for tenio
+
+OVVDO:	PUSHJ	TOP,DBQRY		; go for it
+	JRST	OVVNF			;   nope
+	MOVEM	KEXE,DBPTR(OVPTR)	; store it, cream static bit
+	SETZ	R1,0			; status OK
+	HLRZ	EXP1,OVORIG(OVPTR)	; through area table
+	HLRZ	EXP1,0(EXP1)		;   to obtain overlay area origin
+	SETOM	0,^o10(EXP1)		; and bash cell with overlay ID
+OVVQ:	$RESTOR	RSV,EXP1,T3		; the work is done
+	MOVE	R0,XTIME+DIRBLK		; update daytime
+	MOVEM	R0,0(EXP3)		; return parameter
+	MOVEM	R1,0(EXP4)		; return code
+	POP	TOP,PSA			; split
+	$UNFRAME
+	POPJ	TOP,0
+
+ORUMI:	MOVEI	R1,OVCUMI		; code "unknown module index"
+	JRST	OVVQ
+
+OVVNF:	MOVEI	R1,OVCVNF
+	JRST	OVVQ
+
+OVVOPN:	HRLZI	T1,^o402000		; standard tenio bits for database
+	HRR	T1,FLEN(FILE)		; length of file name
+	HLRZ	T2,BUFPTR(FILE)		; buffer pointer addr
+	CAIE	T2,^o400000		; ever got a buffer?
+	JRST	OVVOP2			;   yes
+	MOVEI	T2,^o200		; else get one
+	PUSHJ	TOP,NEW.##
+	  ARG	T2,0(T2)
+	HRLM	T2,BUFPTR(FILE)		; forget me not
+OVVOP2:	MOVEI	T3,FNAME(FILE)		; addr of text
+	HRLI	T3,^o440700		; byte pointer
+	PUSHJ	TOP,GETCHN		; we know we need a channel
+	OPENF	T1,CHN			; go get it
+	JRST	OVVNF			;   well, we can't find it!
+	JRST	OVVDO			;   dive back in
+	page
+; SF$VFY -- verify stack frame.  Our parameter is a stack frame pointer.
+;   Starting with our caller, we go up the dynamic chain until we reach
+;   the frame designated by our parameter.  In the meanwhile, we keep
+;   track of any overlay manager return addresses we come across.  When
+;   we find one, we record the overlay number (to be restored) stored
+;   with it.  Upon reaching the desired frame, the most recently recorded
+;   overlay number (if any) is the overlay which must be restored before
+;   a non-local goto to that stack frame (such as ONESCAPE) can be done.
+
+	extern	SFV.TV
+	intern	SFV.AC
+SF$VFY::PUSH	TOP,EXP2		; grab a coupla regs
+	PUSH	TOP,EXP3
+	PUSH	TOP,EXP1
+	MOVE	EXP1,R1
+	PUSH	TOP,R1
+	MOVEI	EXP1,0(EXP1)		; make sure left half is clear
+	HRLZI	R0,^o400000		; sentinel for "no overlay to restore"
+	MOVEI	R1,0(BASIS)		; start with our caller's frame
+
+SFLOOP:	CAIN	R1,0(EXP1)		; are you the target of the search?
+	JRST	SFGOT			;   yes
+	MOVE	EXP2,2(R1)		; no.  Get this frame's return addr
+	HRRZ	EXP3,0(EXP2)		;   by reaching through stored R17
+	CAIN	EXP3,OPR.TV		; Overlay manager?
+	HLRE	R0,-1(EXP2)		;   yes, snatch recorded overlay number
+
+	HRRZ	R1,1(R1)		; stored R16 is dynamic chain link
+	JRST	SFLOOP			;   back to it
+
+SFGOT:	CAMN	R0,[400000,,0]		; is it our sentinel value?
+	JRST	SFSPLI			;   yes, nothing to do
+
+	MOVE	EXP1,R0			; overlay index to be loaded
+	PUSH	TOP,EXP1		; save overlay number for later
+	MOVEI	R0,SFV.TV		; our return addr (vectored)
+	PUSH	TOP,R0			;    in case of getseg
+	JRST	LD$OVL			;   return right below
+
+SFV.AC:	
+	POP	TOP,EXP1		; the overlay number just brought in
+	MOVE	EXP2,$OVLTV(PDA)	; install as current overlay
+	MOVEM	EXP1,0(EXP2)		; assume CUROVL is first word!
+SFSPLI:	POP	TOP,R1			; clean up and go
+	POP	TOP,EXP1
+	POP	TOP,EXP3
+	POP	TOP,EXP2
+	POPJ	TOP,0
+	page
+;MOE.AC -- missing overlay entry.  Crucially important routine for confusing
+;   constructors of overlaid systems.  Prints a message if someone jumps to
+;   a slot which used to be there.  R1 is the JSP register.
+
+	entry	MOE.AC
+MOE.AC:	$FTERR	MOEMSG
+MOEMSG:	asciz/
+?	Reference to deleted overlay symbol/
+	$END	OVLTV,OVLINI
+	prgend
+	entry	OVSTA.
+OVSTA.=:0
+	end
+' >¨
