@@ -1,0 +1,555 @@
+begin	"SETOP"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+require "SETOPR.DCL" source!file;	! record definitions;
+!get!definitions(RECORD);
+require 1 version;
+redefine lc!WF = (!lcWF lsh 18);	! define WF license field;
+redefine memloc(VAR) = {memory[location(VAR)]};
+
+define
+	DBfile = {"(SYS)SETOP.DAT"},
+	OPfile = {"(SYS)DRWSPR.EPO"};
+
+comment
+	globals
+;
+
+string	loginName;		! frame's login user name;
+integer Proc!FrameLicense;	! license on caller's process and frame;
+define	dbOrg = '400000;	! origin address of data base in memory;
+integer NPGS;			! number of pages mapped from data base;
+integer DBchan;			! data base file channel number;
+r!p(DBH)HEAD;			! data base header (virtual record);
+string	opName, opPass;		! operator's name and password;
+r!p(DBL)opL;			! operator's license record;
+string	CmdLine;		! current command line;
+string	Cmd;			! current command;
+string	Args;			! current (unparsed) arguments;
+
+comment
+	ini - initialize break tables and other globals
+;
+integer brkTok;
+
+simple procedure ini;
+begin
+    Proc!FrameLicense
+	:= calli( !xwd( -1, !gtLIC ), calli!GETTAB );
+    loginName :=
+	cv6str( calli( !xwd( -1, !gtUNM ), calli!GETTAB ))&
+	cv6str( calli( !xwd( -1, !gtUN1 ), calli!GETTAB ));
+    if Proc!FrameLicense land (lc!WC+lc!WF) neq (lc!WC+lc!WF) then
+	usererr(0,0,"?SETOP: license WC WF required","X");
+    setbreak( brkTok_getbreak, ", "&#ht&crlf, ", "&#ht&crlf, "SINKT" );
+end;
+require ini initialization;
+
+comment
+	exit - exit SETOP
+	fatal - abend SETOP due to fatal error
+;
+
+label ExitLabel;
+
+procedure Exit;
+begin
+    calli( !xwd( NPGS, dbOrg lsh -9 ), calli!VCLEAR );
+    goto ExitLabel;
+end;
+
+procedure Fatal;
+    Exit;
+
+comment
+	sizeof - return size of record in fields
+	mkptr - return record pointer to memory block
+	
+		** MAGIC ** WIZARDS ONLY **
+;
+
+r!p($CLASS) procedure classof( r!p(any!class) R );
+begin
+    r!p($CLASS) C;
+    memloc(C) := !xwd( -1, memory[!rh(memloc(R))] );
+    return( C );
+end;
+
+integer procedure sizeof( r!p(any!class) R );
+begin
+    r!p($CLASS) C;
+    memloc(C) := !xwd( -1, memory[!rh(memloc(R))] );
+    return( $CLASS:RECSIZ[C] + 1 );
+end;
+
+r!p(any!class) procedure mkptr( integer Adr );
+begin
+    r!p(any!class) P;
+    memloc(P) := !xwd( -1, Adr );
+    return( P );
+end;
+
+define !45!A (A) = {
+  redefine !45!M = A-!45!P;
+  ifcr !45!M 
+    thenc redefine !45!X = cvms(!45!X) & {[} & cvms(!45!M) & {]'54,};
+    elsec endc
+  redefine !45!P = A};
+
+define !45!1 (A,B) = {
+  !45!A (A);
+  redefine !45!X = cvms(!45!X) & cvps(B) & {,};
+  redefine !45!P = A+1};
+
+define !45!2 (A,B,C) = {
+  !45!A (A);
+  redefine !45!M = C;
+  forc !45!P _ A stepc 1 untilc B doc {
+    redefine !45!X = cvms(!45!X) & cvms(!45!M) & {,};
+    redefine !45!M = !45!M+1;
+    } endc
+  redefine !45!P = B+1};
+
+define !45!P = 0;
+define !45!M = 0;
+define !45!X = {};
+
+!45!1('40,'0);
+!45!1('44,'54);
+!45!1('47,'53);
+!45!1('52,'52);
+!45!2('54,'72,'33);
+!45!2('101,'132,'1);
+!45!2('141,'172,'1);
+
+!45!A('200);
+redefine !45!X = cvms(!45!X)[1 to inf-1];
+
+preload!with !45!X;
+own integer array CHRTAB[0:'177];
+
+own integer array ASCOTB[0:44];
+simple procedure ASCini;
+begin
+    integer I;
+    for I := 0 upto '177 do
+	ASCOTB[CHRTAB[i]] := I;
+    ASCOTB[0] := " ";		! special case 0 = blank;
+end;
+require ASCini initialization;
+
+comment
+	cv45s - converts radix 45 text to string
+;
+
+string procedure cv45s( integer NAM1,NAM2 );
+begin	"cv45s"
+    string NS;
+    if NAM2 and not NAM1 then
+	return( "["& cvos(!lh(NAM2))& ","& cvos(!rh(NAM2))& "]" );
+    NS := null;
+    while NAM1 or NAM2 do begin
+	integer CHR;
+	start!code
+		define T1=1,T2=2,NM1=3,NM2=4;
+		protect!acs T1,T2,NM1,NM2;
+		MOVE	NM1,access(NAM1);
+		MOVE	NM2,access(NAM2);
+		MOVE	T1,NM1;
+		IDIVI	T1,45;
+		MOVE	NM1,T2;
+		DIVI	NM1,45;
+		MOVEM	NM2,CHR;
+		MOVEM	T1,access(NAM1);
+		MOVEM	NM1,access(NAM2);
+	end;
+	if length(NS) or CHR then
+	    NS := ASCOTB[CHR] & NS;
+    end;
+    return( NS );
+end	"cv45s";
+
+comment
+	cvs45 - convert string to radix 45 data
+;
+
+integer Nam1,Nam2;		! result returned here;
+integer procedure cvs45( string NS );
+begin
+    integer C;
+    NS _ (NS & "            ")[1 for 12];
+    Nam1 _ Nam2 _ 0;
+    while length(NS) do begin
+	C _ CHRTAB[lop(NS)];
+	start!code
+	    protect!acs 1,2,3,4;
+	    MOVE 3,Nam1;
+	    MOVE 1,Nam2;
+	    IMULI 3,45;
+	    MULI 1,45;
+	    ADD 1,3;
+	    ADD 2,C;
+	    MOVEM 1,Nam1;
+	    MOVEM 2,Nam2;
+	end;
+    end;
+    return( Nam1 );
+end;
+
+comment
+	hash - hash a password
+;
+
+integer procedure hash( string PW );
+begin
+    integer C,FIVES,T1,T2,T3,T4;
+    integer array X[0:4];
+    X[0] := X[2] := X[4] := '555555555555;
+    X[1] := X[3] := '361275431652;
+    FIVES := '343277244615;
+    T3 := 0;
+    while length(PW) do begin "PSWLP"
+	C := lop(PW);
+	X[0] := X[0] + C;
+	X[3] := X[3] + C;
+	T4 := '40;
+	do begin "RAND"
+	    T1 := X[T3];
+	    start!code
+		MOVE 1,T1;
+		MUL 1,FIVES;
+		MOVEM 1,T1;
+		MOVEM 2,T2;
+	    end;
+	    T3 := T3 + 1;
+	    X[T3] := X[T3] + T2;
+	    if T3 = 4 then begin
+		T3 := X[4] lsh -'42;
+		X[0] := X[0] + X[4];
+	    end;
+	end "RAND" until (T4:=T4-1) leq 0;
+    end "PSWLP";
+    return( X[0] );
+end;
+
+
+
+comment
+	newDB - create new data base file
+;
+
+procedure newDB;
+begin
+    integer C,I;
+    integer array X[0:!rbLIC];
+    if Proc!FrameLicense land lc!WC = 0 then
+	usererr(0,0,"?newDB: license WC required on frame","X");
+    usererr(0,0,"Enter ""C"" to create new data base file, ""X"" to exit");
+    print( crlf );
+    X[0] := !rbLIC;
+    X[!rbNAM] := cvfil( DBfile, X[!rbEXT], X[!rbPPN] );
+    X[!rbLIC] := !lh(lc!WC);
+    open( C:=getchan,"DSK",'14,0,4, 0,0,!SKIP!:=-1 );
+    chnior( C, X[0], !chENT );
+    if not !SKIP! then begin
+	print( "?enter failure for data base file "& DBfile& crlf );
+	case !rh(X[!rbEXT]) of begin
+	    [!erPRT] print( ".erPRT: protection failure"& crlf );
+	    [!erFBM] print( ".erFBM: file being modified"& crlf );
+	    [else] print( "'",cvos(!rh(X[!rbEXT])),
+		    ": unexpected error"& crlf )
+	end;
+	Fatal;
+    end;
+    begin
+	r!p(DBH) H;
+	r!p(DBP) P;
+	r!p(DBL) L;
+	H := new!record( DBH );
+	dbh:RecordType[H] := dbhType;
+	P := new!record( DBP );
+	dbp:RecordType[P] := dbpType;
+	L := new!record( DBL );
+	dbl:RecordType[L] := dblType;
+	dbh:SetopVersion[H] := memory[!jbVER];
+	dbh:RecSize[H] := sizeof(P) max sizeof(L);
+	dbh:First[H] := '1000;
+	dbh:Last[H] := '1000 + dbh:RecSize[H];
+	dbh:Host0[H] := calli( !xwd( !cnSYS, !gtCNF ), calli!GETTAB );
+	dbl:Nam1[L] := cvs45( "ROOT" );
+	dbl:Nam2[L] := Nam2;
+	dbl:DOE!Mgr0[L] := !xwd( calli( 0, calli!DATE ), 0 );
+	dbl:Lic0[L] := -1;
+	dbl:Sys0[L] := -1;
+	arryout( C, dbh:SetopVersion[H], sizeof(H) );
+	for I := sizeof(H) upto dbh:First[H]-1 do
+	    wordout( C, 0 );
+	arryout( C, dbl:Nam1[L], sizeof(L) );
+    end;
+    release( C );
+    print( DBfile, " created"& crlf& crlf );
+end;
+
+comment
+	dbMap - map data base into memory at dbOrg protected R/W
+;
+
+r!p(DBH) procedure dbMap;
+begin
+    label LK;
+    integer array X[0:!rbLIC];
+    X[0] := !rbLIC;
+    X[!rbNAM] := cvfil( DBfile, X[!rbEXT], X[!rbPPN] );
+    open( DBchan:=getchan,"DSK",0,0,0, 0,0,!SKIP!:=-1 );
+LK: chnior( DBchan, X[0], !chLK );
+    if not !SKIP! then begin
+	print( "?lookup failure for data base file "& DBfile& crlf );
+	case !rh(X[!rbEXT]) of begin
+	    [!erFNF] begin
+		print( ".ERFNF: file not found"& crlf );
+		if Proc!FrameLicense land lc!WC then begin
+		    newDB;
+		    goto LK;
+		end;
+	    end;
+	    [!erPRT] print( ".ERIPP: no such directory"& crlf );
+	    [!erPRT] print( ".ERPRT: protection failure"& crlf );
+	    [else] print( "'",cvos(!rh(X[!rbEXT])),
+		": unexpected error"& crlf )
+	end;
+	Fatal;
+    end;
+    if X[!rbLIC] land !bit(5) then begin
+	print( "?data base file "& DBfile& " bad (disk error)"& crlf );
+	Fatal;
+    end;
+    if X[!rbLIC] land !lh(lc!WC) = 0 then begin
+	print( "?data base file "& DBfile& " bad (tampered)"& crlf );
+	Fatal;
+    end;
+    chnior( DBchan, X[0], !chMEN );
+    if not !SKIP! then begin
+	print( "?enter failure for data base file "& DBfile& crlf );
+	case !rh(X[!rbEXT]) of begin
+	    [!erPRT] print( ".erPRT: protection failure"& crlf );
+	    [!erFBM] print( ".erFBM: file being modified"& crlf );
+	    [else] print( "'",cvos(!rh(X[!rbEXT])),
+		    ": unexpected error"& crlf )
+	end;
+	Fatal;
+    end;
+    NPGS := ( X[!rbSIZ] + '777 ) lsh -9;
+    X[0] := !prRW + !xwd( NPGS, dbOrg lsh -9 );
+    X[1] := 1;
+    chnior( DBchan, X[0], !chMFP );
+    if not !SKIP! then begin
+	print( "?error mapping data base file "& DBfile& crlf );
+	Fatal;
+    end;
+    return( mkptr( dbOrg ));
+end;
+
+comment
+	checkDB - do a quick check of the data base to ensure that
+	it is likely to be compatible with the current version of
+	this program.  Checks to make sure the header record, and
+	first two data records are of the correct class, and that the
+	class records are where they are expected to be.
+;
+boolean procedure checkDB( r!p(DBH) H );
+return(
+    classof(H) = $DBH and
+    classof(mkptr(dbh:First[H])) = $DBP and
+    classof(mkptr(dbh:First[H]+dbh:RecSize[H])) = $DBL );
+
+r!p(DBP) procedure dbpFind( integer EmpNo );
+begin
+    integer PTR;
+    r!p(DBP) P;
+    for PTR := dbh:First[HEAD] step dbh:RecSize[HEAD] until dbh:Last[Head] do
+	if memory[dbOrg+PTR,r!p($CLASS)] = $DBP then begin
+	    P := mkptr( dbOrg+PTR );
+	    if dbp:EmpNo[P] = EmpNo
+		then return( P );
+	end;
+    return( null!record );
+end;
+
+r!p(DBL) procedure dblFind( string NS );
+begin
+    integer PTR;
+    r!p(DBL) L;
+    cvs45( NS );		! value returned in Nam1, Nam2;
+    for PTR := dbh:First[HEAD] step dbh:RecSize[HEAD] until dbh:Last[Head] do
+	if memory[dbOrg+PTR,r!p($CLASS)] = $DBL then begin
+	    L := mkptr( dbOrg+PTR );
+	    if dbl:Nam1[L] = Nam1
+	    and dbl:Nam2[L] = Nam2
+		then return( L );
+	end;
+    return( null!record );
+end;
+
+procedure login;
+begin
+    label namep, passp, fail;
+namep:
+    outstr( "Enter your name: " );
+    opName := inchwl;
+    if opName = "?" then begin
+	print( "Enter your OPER license name or <CR> to use ",
+	    loginName, "."& crlf );
+	goto namep;
+    end;
+    if length( opName ) = 0 then
+	opName := loginName;
+    auxcli( -1, io!NEC, !axCFS );	! no echo;
+passp:
+    outstr( "Password: " );
+    opPass := inchwl;
+    if equ( opPass, "?" ) then begin
+	outstr( "?"& crlf );
+	print( "Enter the password for OPER name ", opName );
+	if Proc!FrameLicense land !lh(lc!WC) then
+	    print( crlf& "or ""!"" to override due to WC license" );
+	print( "."& crlf );
+	goto passp;
+    end;
+    outstr( crlf );
+    auxcli( -1, 0, !axCFS );		! normal echo;
+    opL := dblFind( opName );
+    if opL = null!record then goto fail;
+    if Proc!FrameLicense land !lh(lc!WC) and equ(opPass,"!") then return;
+    if dbl:Password[opL] = 0 then goto fail;
+    if dbl:Password[opL] neq hash( opPass ) then begin
+fail:	print( "?name or password incorrent"& crlf );
+	Exit;
+    end;
+end;
+
+comment
+	commandProcedure - macro to declare a command procedure
+		builds command table
+		builds help messages
+		declares procedure
+;
+define
+    commandProcedure(CMD,HLP) = {
+	redefine TCMD = cvms(TCMD)& {,"}& {CMD}& {"};
+	redefine HCMD = cvms(HCMD)& {,"}& {HLP}& {"};
+	redefine CCMD = cvms(CCMD)& {;command!}& {CMD};
+	redefine NCMD = NCMD + 1;
+	procedure command!}&{CMD
+    },
+    TCMD = {"?","HELP"},
+    HCMD = {"same as HELP","display this list"},
+    CCMD = {command!HELP;command!HELP},
+    NCMD = 1;
+
+commandProcedure(ADD,add a new name);
+begin
+end;
+
+ifcr compiler!switch("B") thenc
+ commandProcedure(BAIL,enter SAIL debugger);
+ begin
+    if Proc!FrameLicense land !lh(lc!WC)
+	then usererr(0,0,0,"B")
+	else print( "?requires WC frame license to enter BAIL"& crlf );
+ end;
+endc
+
+commandProcedure(CLOSE,close SETPRINT output file);
+begin
+    setprint( null, "T" );
+end;
+
+commandProcedure(QUIT,finish SETOP);
+    Exit;
+
+commandProcedure(SETPRINT,specify output file);
+begin
+    string FN,QF;
+    integer B;
+    FN := scan( ARGS, brkTok, B );
+    QF := scan( ARGS, brkTok, B );
+    if FN = "?" then begin
+	print( "SETPRINT - specify output file
+	SETPRINT filename [QUIET]
+" );	return;
+    end;
+    setprint( FN, if length(FN) then 
+	if length(QF) then "F" else "B" else "T" );
+end;
+
+comment
+	exec - execute a statement (command line)
+;
+
+preload!with TCMD;
+string array CmdTab[0:NCMD];
+preload!with HCMD;
+string array CmdHlp[0:NCMD];
+redefine commandProcedure = null;
+
+procedure command!HELP;
+begin
+    integer I;
+    print( "Valid commands are:"& crlf );
+    for I := 1 upto NCMD do
+	print( "  ", CmdTab[i],
+	    (#ht&#ht&#ht)[(2+length(CmdTab[i]))%8+1 to inf],
+	    CmdHlp[i], crlf );
+end;
+
+procedure exec( string CmdLine! );
+begin
+    string Cmd, CmdN;
+    integer I, B;
+    CmdLine := CmdLine!;
+    CmdN := null;
+    Cmd := scan( Args := CmdLine, brkTok, B );
+    for I := 0 upto NCMD do
+	if equ( Cmd, CmdTab[i][1 to length(Cmd)] )
+	    then if length(Cmd) = length(CmdTab[i])
+		then begin
+		    CmdN := char!w( I, 36 );
+		    done;
+		end
+		else CmdN := CmdN& char!w( I, 36 );
+    if length(CmdN) < 1 then begin
+	print( "?command ", Cmd, " not recognized"& crlf );
+	return;
+    end;
+    if length(CmdN) > 1 then begin
+	print( "?command ", Cmd, " is ambiguous among the following:", crlf );
+	while length(CmdN) do print( "  ", CmdTab[lop(CmdN)], crlf );
+	return;
+    end;
+    case CmdN of begin
+	CCMD;			! this macro expands to procedure calls;
+    end;
+    if length(ARGS) then begin
+	string S;
+	integer B;
+	if length( scan( S:=ARGS, brkTok, B ))
+	    then print( "%extraneous arguments ignored: ", ARGS, crlf );
+	ARGS := null;
+    end;
+end;
+
+ifcr compiler!switch("B") thenc command!BAIL; endc
+print( "SETOP v", cvos(memory[!jbVER]), crlf );
+HEAD := dbMap;
+if not checkDB( HEAD ) then
+    usererr(0,0,"?SETOP: data base not compatible with this version","X");
+login;
+while true do begin
+    outstr( "*" );
+    exec( inchwl );
+end;
+
+ExitLabel:
+end	"SETOP"
+$    
