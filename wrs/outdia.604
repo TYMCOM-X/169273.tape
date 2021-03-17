@@ -1,0 +1,1214 @@
+    SUBTTL	OUTDIA.602 - THE OUTDIAL DRIVER FUNCTIONS
+: ******************************************************************
+: **                  PROPRIETARY INFORMATION                     **
+: **                                                              **
+: **  This  source code listing constitutes the proprietary pro-  **
+: **  perty of TYMNET, Incorporated. The recipient, by receiving  **
+: **  this program listing, agrees that neither this listing nor  **
+: **  the   information  disclosed herein nor any  part  thereof  **
+: **  shall be  reproduced or transferred to other documents  or  **
+: **  used  or  disclosed to others for manufacturing or for any  **
+: **  other purpose except as specifically authorized in writing  **
+: **  by  TYMNET, Incorporated.                                   **
+: ******************************************************************
+: **                   MODULE IDENTIFICATION                      **
+: **                                                              **
+: **  File Name          :  OUTDIA.602     last change: 11/20/86  **
+: **                                                              **
+: **  File Description   :  The outdial driver brings up a host   **
+: **			    and accepts commands used to dial a   **
+: **			    number and initiate a connection.     **
+: **                                                              **
+: **  File Abstract      :  This module is used to handle the     **
+: **			    logging in to a command port, parsing **
+: **			    of commands, seizing a port for       **
+: **			    dialing, and either initiate a        **
+: **			    connection or handle the failure      **
+: **			    condition.                            **
+: **                                                              **
+: ******************************************************************
+: **                    CHANGE LOG                                **
+: **                                                              **
+: **  Ver   Date    By   PIR/NSR  Changes (most recent at top)    **
+: ** ----- -------- ---  -------- ------------------------------- **
+: ** 06.02 11/20/86 dwl		  Fixed accounting bug at D.LGC8  **
+: ** 06.02 11/11/86 cab		  Rewrote area code checking.     **
+: ** 06.02 10/22/86 cab		  Changed accounting connect msg  **
+: **				  from 31.xx.0 to 31.xx.255	  **
+: ** 06.01 09/22/86 cab		  Added O.DOTS to send "." every  **
+: **				  3 seconds while dialing.	  **
+: ** 06.01 09/17/86 cab		  Changed TERSE to use CCITT speed**
+: ** 06.01 09/12/86 dlg		  Changed instru to RX3 format to **
+: **				  prevent assembly error 	  **
+: ** 06.01 07/23/86 sdw           Added prompt                    **
+: ** 06.01 07/23/86 sdw           digital response are now 3 digit**
+: ** 06.01 07/23/86 sdw           BPS accepts spaces before value **
+: ** 06.01 07/23/86 sdw           internal parse logic changed    **
+: ** 06.01 07/23/86 sdw           a line of spaces is not a error **
+: ** 06.01 07/23/86 sdw           HELP, BPS, SET and DIAL leave   **
+: **                              digital response mode           **
+: ** 06.01 07/23/86 sdw           TERSE syntax now processes      **
+: **                              the number field after a space  **
+: ** 06.01 07/23/86 sdw           added speed field to TERSE using**
+: **                              CCITT speeds.                   **
+: ** 06.00 05/29/86 LH		  Change RX1 to RX3 to avoid      **
+: **				  operand out of range.		  **
+: ** 04.03 02/24/86 SDW  PIR 1653 Created                         **
+: **                                                              **
+: ******************************************************************
+
+
+        SUBTTL   (OUTDIAL)  OUTDIAL STATIC DATA
+
+        SEG     A.CODE
+
+        IF      OUTDIA
+        MO      .,OUTDIA
+
+        LO      DATA
+
+:   table lookups for the command parser.  .OPU is ignored punctuation.
+:   O.DCOM is dial subcommands.  O.NUM is numbers.
+
+.OPUNC  WC      90F70030        :all of these start at A0
+        WC      0000001E        :just about any punc is ok
+O.DCOM  WC      00080000
+        WC      00008800        :, P T 
+O.NUM   WC      0000FFC0
+        WC      0               :0-9
+
+        GL      VMODEM,XOTDIA,OT.HS,OT.IZ,OTDNED,MODIZ,ZAPMOD
+        GL      GCDALT,IGCSCN,GCSCN,HDWDTR,HDWCP,O.NCAP
+        GL      PRTSWI,GENRPT,CKHSTA,SIGNAL
+        GL      M.TIME,O.TIME,O.DOTS
+
+.DTBUF  EQ      .LGBUF          :we need it and logger can't use it
+TODTBF  EQ      GOLOG           :AND the data present array
+
+:       Macro which defines a command string and the routine to goto on
+:       matching.
+PARCOM  MACRO(CMD,ROUT)[
+        SC      /CMD/
+        HC      EA(ROUT)
+]
+
+    SUBTTL	(OUTDIA) OUTDIAL HOST STATUS
+    
+OCMDRY  EQ      @(1^(20-NOPORT))+1      :array of possible command ports
+                                        :a zero is put in a word of ones
+                                        :and then adding one zeroes all bits to
+                                        :the right and sets the zeroed bit.
+
+:       OT.HS  links on R5, returns number of free ports on R0
+:       The rules for shutting are: less than 1/8 of command ports free,
+:       less than 1/16 outdial capable modems free.
+:       The rules for opening are: more than 1/4 command ports free, more
+:       than 3/32+1 outdial capable modems free.
+:       The host status will not be changed if it falls between the
+:       requirements of opening or shutting.
+:            
+OT.HS   L       R0,OT.COM       :count number of used command prts
+        XI      R0,OCMDRY       :used command prts
+        ST      R0,O.TMP	:
+        LIS     R9,0            :free ports
+OT.HS1  L       R0,O.TMP	:
+        JFFO    R0,OT.HS2	:
+        JFS     OT.HS3		:
+OT.HS2  RBT     R1,O.TMP	:
+        AIS     R9,1            :count one in use
+        JBS     OT.HS1		:
+
+OT.HS3  LIS     R0,0		:
+        CHI     R9,7*NOPORT/8   :shut if less than 1/8 command ports free
+        JGR     R5		:
+        CHI     R9,3*NOPORT/4   :do nothing if between 1/4 and 1/8
+        JG      CKHSTA,,        :check host abort this host number
+        LHL     R0,O.NCAP       :enough com prts, check if enough modems
+        AIS     R0,8            :shut ranges are 0-8, 8-24,24-40
+        SRHLS   R0,4            :divide by 16
+        AR      R9,R0           :number of ports needed
+        STH     R9,O.TMP3       :if less than this then shut
+        SRHLS   R0,1            :calc number to open
+        AR      R9,R0           :3/32+1 is needed to be open
+
+        LHI     RPOL,(NAGRP-1)*2 :count number of free modems
+OT.HS4  LHL     R0,OT.CAP,RPOL  :capable ports
+        LR      R1,R0           :make copy for cancel effect
+        NH      R0,RLA,RPOL     :now have active capable ports
+        XR      R0,R1           :not it and get inactive capable ports
+        STH     R0,O.TMP        :
+OT.HS5  LHL     R0,O.TMP	:
+        JFFOH   R0,OT.HS6	:
+        SIS     RPOL,2		:
+        JGEBS   OT.HS4          :do next halfword
+        CH      R9,O.TMP3       :enough to stay in current state or auto shut
+        JL      CKHSTA,,        :no change
+        LIS     R0,0		:
+        JR      R5		:
+
+OT.HS6  RBT     R1,O.TMP	:
+        SIS     R9,1		:
+        JLR     R5              :r0 >0 
+        J       OT.HS5		:
+
+    SUBTTL	(OUTDIA) COMMAND PORT RECEIVER
+:       XOTDIA  is the outdial input routine.  It gets its data from ISIS
+:               and echoes it back to the user.  Data is put into buffers
+:
+XOTDIA
+        JAL     RCH,GETCHR,,	:
+        J       SIG.OT		:
+        TBT     RP,OT.MOD       :trash chars if dialing
+        JN      VRET,,		:
+        SBT     RP,ACTIME       :port is active
+        LR      R0,RBC          :make copy of data
+        NHI     R0,7F           :allow comparisons
+        SIS     R0,8            :backspace? ^H
+        JE      OTBS            :yes, backspace it
+        SIS     R0,0A-8         :^J linefeed?
+        JE      OTRANS          :process command line
+        SIS     R0,0D-0A        :^M carraige return
+        JE      OTRANS          :process command line
+        SIS     R0,18-0D        :^X?
+        JE      OT.ESC          :flush with CRLF
+        SIS     R0,1B-18	:
+        JE      OT.ESC		:
+        SIS     R0,20-1B        :unused control char?
+        JL      XRET,,          :yes, gobble it
+        TBT     RP,CHAFDX       :half duplex person?
+        JNFS    XOTD1           :no need to echo
+        L       RBP,.FTBUF,RPI  :echo char
+        JAL     RCH,PUTCHR,,    :and echoed
+XOTD1   L       RBP,.OTBUF,RPI  :store for translator
+        OHI     RBC,80          :set bit for trans
+        CHI     RBC,0E0         :store uppercae
+        JLEFS   XOTD2		:
+        SHI     RBC,20          :make uppercase
+XOTD2   JAL     RCH,PUTCHR,,	:
+        J       XRET,,		:
+
+        LO      SIGNAL
+
+SIG.OT  SIGBGN(ETMSIG,EADSIG,LADSIG)
+        SIGEXC(ZAPSIG,OT.ZAP)
+        SIGEXC(SHGSIG,OT.ZAP)
+        SIGEND
+
+        FO      SIGNAL
+
+    SUBTTL	(OUTDIA) GENERAL COMMAND PORT ROUTINES
+:       OT.ZAP is when the command port is zapped by either the command
+:       logout or reciept of a zapper before a call can be connected.
+
+OT.ZAP  LHI     R1,(-.OPORT),RP :set command port free
+        SBT     R1,OT.COM	:
+        L       RBP,.OTBUF,RPI  :outdial translator buffer
+        JAL     RCH,EMPTY,,     :free it
+        L       RBP,.DTBUF,RPI  :stored number
+        JAL     RCH,EMPTY,,	:
+        JAL     R8,ZAPMOX       :zap modem from command port
+        RBT     RP,RLA		:
+        J       OTFLUS		:
+
+
+:       OTBS    backspaces over a char and moves back the buffer pointer
+OTBS
+        TBT     RP,TOTRANS	:
+        JE      XRET,,		:
+        L       RBP,.FTBUF,RPI	:
+        LIS     RBC,8           :backspace
+        JAL     RCH,PUTCHR,,	:
+        SLLS    RBC,2           :quick way to get a space 20 hex
+        JAL     RCH,PUTCHR,,	:
+        LIS     RBC,08          :backspace
+        JAL     RCH,PUTCHR,,	:
+        L       RBP,.OTBUF,RPI  :pointer to last char buffer
+        JAL     RCH,GCDALT,,    :and erase
+        J       XRET,,		:
+
+:       OTFLUS  flushes the command line buffer.
+:       gotten by typing ESC or control-X.
+
+.OPRMT  .MOPRM                  :calls macro that has prompt
+        HS      0
+OT.ESC  L       RBP,.FTBUF,RPI	:
+        LHI     RBC,5C          :backslash
+        JAL     RCH,PUTCHR,,	:
+        LIS     RBC,0D		:
+        JAL     RCH,PUTCHR,,	:
+        LIS     RBC,0A		:
+        JAL     RCH,PUTCHR,,	:
+OTFLUS  L       RBP,.OTBUF,RPI	:
+        JAL     RCH,EMPTY,,	:
+OTPRMT  L       RBP,.FTBUF,RPI  :send prompt
+        LA      R6,.OPRMT	:
+        JAL     R9,MSG,,	:
+        J       XRET,,		:
+
+
+
+:       OTRANS  translates the info in the buffer into the command
+:               if the DIAL command is included then the dial logic is called
+:
+:       O.CMDS  is the start of SC strings containing the valid commands in
+:               alphabetacal order. 
+:
+O.CMDS  PARCOM( ,O.SPAC)
+        PARCOM(?,O.HELP)
+        PARCOM(BPS,O.BPS)
+        PARCOM(DIAL,O.DIAL)
+        PARCOM(HELP,O.HELP)
+        PARCOM(LOGOUT,O.LOGT)
+        PARCOM(RETRY,O.RTRY)
+        PARCOM(SET,O.SET)
+        PARCOM(TERSE,O.TERS)
+        AC      /"00"00/                :terminates valid commands
+        HS      0
+
+OTRANS
+        L       RBP,.FTBUF,RPI	:
+        TBT     RP,CHAFDX       :hafdux users don't need anothe CR
+        JNFS    OTRAN1		:
+        LHI     RBC,8D		:
+        JAL     RCH,PUTCHR,,	:
+OTRAN1  LIS     RBC,0A          :send CR LF to user
+        JAL     RCH,PUTCHR,,	:
+        TBT     RP,TOTRAN       :data to translator
+        JE      OTPRMT          :no, data but new line & prompt
+        L       RBP,.OTBUF,RPI	:
+        LA      R5,O.CMDS       :pointer to commands
+        LIS     R10,0           :set error msg (huh? msg)
+        STH     R10,O.ERCD	:
+        JAL     R6,OPARSE       :parse input line
+        J       SNDERR		:
+
+
+:       SNDERR  sends standard error message, then flushes
+SNDER1  L       RBP,.DTBUF,RPI  :flush
+        JAL     RCH,EMPTY,,	:
+SNDERR  LHL     R10,O.ERCD      :current error code
+SNDERQ  L       RBP,.FTBUF,RPI  :error goes to terminal
+        TBT     RP,OTDIGT       :word error codes
+        JEFS    SNDER2		:
+        AIS     R10,(ERRDGT-ERRIDX)     :change pointer to digital
+SNDER2  LB      R6,ERRIDX,R10,	:
+        LA      R6,OERMSG,R6,   :address of msg
+        JAL     R9,MSG,		:
+        J       OTFLUS          :flush
+
+:       O.SMSG send message and returns by r9.
+:
+O.SMSG  L       RBP,.FTBUF,RPI  :Message server   msgno=r6, link r9
+O.SMGB  TBT      RP,OTDIGT      :digital
+        JEFS    O.SMS1		:
+        LB      R6,M.DMSG,R6,   :displacement of msg
+        LA      R6,DMSG30,R6,	:
+        J       MSG		:
+O.SMS1  SLLS    R6,1            :make byte disp to a halfword disp
+	LHL     R6,M.MSG,R6,    :displacement of address
+        LA      R6,BASE,R6,     :actual adress of msg
+        J       MSG             :let msg return
+    SUBTTL	(OUTDIA) COMMAND PARSER
+:
+:       OPARSE  parses the data into accepted commands. It returns
+:               on R6 if no match is found.  If a match is found it
+:               jumps to the routine at the end of the SC string
+:               and RBC contains the non matching char.
+:               R0 = -1 if nonmatching character is a space or comma
+:                     0 if every char matched, but no more chars to match
+:                     1 if nonmatching char is not a space or comma
+:               Expects R5 to point to desired PARCOM list.
+OPARSE  JAL     RCH,GETCHR,,	:
+        J       SNDERR          :bufferlet was zapper for too many chars
+OPARS1  LB      R0,1,R5         :first char of command
+        JER     R6              :finished list - no match - 
+        SR      R0,RBC		:
+        JGR     R6              :cannot match- list is alphabetical
+        JEFS    OPARS3          :got a match
+        LB      R0,0,R5         :get to next possible command
+        AR      R5,R0		:
+        AIS     R5,4            :1 for SC, 2 for routine 2 for halfword
+        NHI     R5,-2           :get on halfword bound (needed for geting byt)
+        J       OPARS1          :no match try next command
+OPARS3  LB      R9,0,R5         :get count
+OPARS5  TBT     RP,TOTRAN       :more data?
+        JE      OPAR13		:
+        AIS     R5,1            :move pointer along
+        SIS     R9,1            :Closer to the end
+        JLE     OPAR17          :at end of command
+        JAL     RCH,GETCHR,,    :move along input line
+        J       SNDERR          :bufferlet was zapped for too many chars
+        CHI     RBC,0E1         :still need uppercase
+        JLFS    OPARS7		:
+        SHI     RBC,20          :now uppercase
+OPARS7  CLB     RBC,1,R5        :get next letter of command
+        JE      OPARS5          :match - loop again
+OPARS9  SHI     RBC,0AC         :last char a comma?
+        JEFS    OPAR11		:
+        AIS     RBC,0AC-0A0     :ending char a space?
+        JEFS    OPAR11		:
+        LIS     R0,1            :bad end of command
+        JFS     OPAR15		:
+OPAR11  LCS     R0,1            :-1 is comma code
+        JFS     OPAR15		:
+OPAR13  LIS     R0,0            :no more data char
+OPAR15  LHL     R7,2,R9,R5      :end is R5-1 +R9 &halfword bound
+        J       BASE,R7,	:
+OPAR17  TBT     RP,TOTRAN       :at end but out of data?
+        JEBS    OPAR13          :yes give 0 code
+        JAL     RCH,GETCHR,,    :jump with next char
+        J       SNDERR		:
+        J       OPARS9          :check out the following char
+
+:       SEND 'OK' to the user.
+OUTOK   L       RBP,.FTBUF,RPI	:
+        LIS     R6,0		:
+        TBT     RP,OTDIGT	:
+        JEFS    OUTOK1		:
+        LIS     R6,4            :other message for digit codes
+OUTOK1  L       R6,OKMSG,R6     :successful commands followed by OK
+        JAL     R9,MSG,		:
+        J       OTPRMT		:
+
+    SUBTTL	(OUTDIA) OUTDIAL COMMANDS
+:       GOBBLE a line of spaces
+O.SPAC  LR      R0,R0		:
+        JE      SNDERR          :blank line is a not really an error
+O.SPC1  TBT     RP,TOTRAN	:
+        JE      OTPRMT          :and send prompt
+        JAL     RCH,GETCHR,,	:
+        J       SNDERR		:
+        CLHI    RBC,0A0		:
+        JEBS    O.SPC1          :spaces are ok
+        J       OTFLUS		:
+
+:       For HELP command send list of commands
+O.HELP  LR      R0,R0           :make sure end of command line
+        JN      SNDERR		:
+        RBT     RP,OTDIGT       :no longer digital msgs
+        L       RBP,.FTBUF,RPI  :where to dump the help info
+        LA      R6,OHLPMG,,	:
+        JAL     R9,MSG          :output error message
+        J       OTPRMT          :and print out promt
+
+OKMSG1  AC      /OK"0D"0A/
+        AC      /"00/   :terminates
+DGTOK   AC      /000"0D"0A"00/
+        WS      0
+OKMSG   WC      OKMSG1,DGTOK
+:       O.DIAL  stores the number along with delay token (,)
+:               and pulse or touch tone dial (P or T).
+:               It is buffred in the .otdbuf (currently equated
+:               to the .lgbuf (login buffer)
+O.DIAL  LR      R0,R0           :space after ?
+        JGE     SNDERR		:
+        RBT     RP,OTDIGT       :not digital
+O.DIAT  L       RBP,.DTBUF,RPI  :entry for terse
+        JAL     RCH,EMPTY,,     :remove old num
+        LCS     R9,1            :char count starts at -1
+        LIS     R5,0            :init area code string =0
+        ST      R5,O.TMP        :pos for area code (neg for international)
+O.DI01  LHI     R0,-0A0,RBC     :copy and subtract
+        TBT     R0,.OPUNC	:
+        JN      O.DI09          :valid but ignored punctuation
+        TBT     R0,O.DCOM       :single letter dial subcommands
+        JN      O.DI07		:
+        TBT     R0,O.NUM        :a number?
+        JE      O.DI17		:no, take error exit
+	AIS     R9,1		:bump char counter
+	JNFS	O.DI03		:first char?
+        CLHI    RBC,0B0		:first char=0?
+	JNFS	O.DI02		:
+  IF	.OKINT
+	LCS	R5,1		:
+	ST	R5,O.TMP	:set area code to -1 (international)
+	LIS	R9,4		:and bypass area code logic
+	J	O.DI05
+  ELSE
+           O.DI15		:error exit if international not allowed
+  EI
+O.DI02	CHI	RBC,0B1		:first char=1? (possible 1+area code)
+	JEFS	O.DI05		:yes
+	AIS	R9,1		:no, bump R9 from 0 to 1
+O.DI03	CHI	R9,3		:possible area code digit?
+  	JGFS	O.DI05		:
+	L	R5,O.TMP	:get partial area code
+	SLLS	R5,8		:make room
+	STBR	RBC,R5		:merge byte
+	ST	R5,O.TMP	:
+O.DI05  CHI     R9,$A32         :more digits than accounting msgs?
+        JGE     O.DI15          :send error msg
+O.DI07  L       RBP,.DTBUF,RPI  :storage
+        JAL     RCH,PUTCHR,,	:
+O.DI09  TBT     RP,TOTRAN	:
+        JEFS    O.DI11          :exit if no more chars
+        L       RBP,.OTBUF,RPI  :command chars
+        JAL     RCH,GETCHR,,	:
+        J       SNDERR          :bufferlet zapped or such
+        J       O.DI01          :LOOP for next char
+
+:       only 1 of either .og0 or .ob0 can be defined.  They require
+:       that a list of prefixes (either way) is defined (null list is ok).
+O.DI11
+  IF	.OKINT
+	L	R5,O.TMP	:
+	JL	O.DI19		:if international, go dial
+  EI
+	CHI	R9,$A10		:need to check area code?
+	JL	O.DI19		:add CR and go dial
+  IF	\.OG0			:list of good
+	LHI     R6,.OGNUM*4+4   :number and displacement
+        L       R5,O.TMP	:get area code
+O.DI13  SIS     R6,4		:
+        JLFS    O.DI15		:error exit if good list finished
+        C       R5,AREACD,R6,   :get area code
+        JNBS    O.DI13		:repeat if no match
+        J       O.DI19          :dial exit if a match
+  ELSE    
+	LHI     R6,.OBNUM*4+4	:
+        L       R5,O.TMP	:
+O.DI13  SIS     R6,4		:
+        JL      O.DI19          :dial exit if bad list finished
+        C       R5,AREACD,R6,   :get area code
+        JNBS    O.DI13		:repeat if no match
+  EI
+O.DI15  LIS     R10,3           :illegal prefix and bad area code routine
+        STH     R10,O.ERCD	:
+        J       SNDER1		:
+
+O.DI17  L       RBP,.DTBUF,RPI  :not a valid char
+        JAL     RCH,EMPTY,,	:flush buffer
+        J       SNDERR		:
+
+O.DI19  L       RBP,.DTBUF,RPI  :
+	LIS     RBC,0D          :finish it off before actually dialing it
+        JAL     RCH,PUTCHR,,    :number followed by a CR
+X.DIAL  JAL     R7,D.LGIC       :v.dial is used to goto d.lgic then XRET
+        J       XRET,,		:
+
+
+:       O.RTRY  redials the last number stored in .dtbuf
+O.RTRY	LR	R0,R0		:
+        JN      SNDERR          :must be terminated by a CR
+        TBT     RP,TODTBF       :stored number?
+        JN      X.DIAL		:
+        LIS     R10,2           :type 2 error (no stored number)
+        STH     R10,O.ERCD	:
+        J       SNDERR		:
+
+
+:       O.SET for set command. Find what options follow.
+
+O.SET1  TBT     RP,TOTRAN	:
+        JE      OUTOK           :did all data without err
+        JFS     O.SET3		:
+O.SET   LR      R0,R0           :set followed by a space
+        JGE     SNDERR		:
+        RBT     RP,OTDIGT	:
+O.SET3  LA      R5,OSETOP       :the set options
+        JAL     R6,OPARSE       :parse it
+        JBS     O.SET           :remove spaces
+
+OSETOP  PARCOM(CRDELAY,O.CRDL)
+        PARCOM(EVEN,O.PAR)
+        PARCOM(HALF,O.HALF)
+        PARCOM(RXON,O.RXON)
+        PARCOM(SPACE,O.SPAR)
+        PARCOM(XON,O.XON)
+        AC      /"00"00/
+        HS      0
+
+:  wants even parity after connection to destination device.
+
+O.PAR   LR      R0,R0           :termed by a comma or cr
+        JG      SNDERR          :neither - error
+        RBT     RP,SEVBIT       :contradictory parities
+        JNFS    PARERR		:
+        SBT     RP,PARITY	:
+        J       O.SET1		:
+
+PARERR  LIS     R10,1		:
+        J       SNDERQ          :parity error msg
+
+:  space parity after connection.
+O.SPAR  LR      R0,R0           :comma or cr
+        JG      SNDERR		:
+        RBT     RP,PARITY       :make sure didn't set PAR
+        JNBS    PARERR		:
+        SBT     RP,SEVBIT	:
+        J       O.SET1          :loop for next options
+
+: And following series of set options just set a bit.
+O.RXON  LR      R0,R0           :or a CR
+        JG      SNDERR          :neither - error
+        SBT     RP,YONENA	:
+        J       O.SET1		:
+O.XON   LR      R0,R0           :or a CR
+        JG      SNDERR          :neither - error
+        SBT     RP,XONENA	:
+        J       O.SET1		:
+O.HALF  LR      R0,R0		:
+        JG      SNDERR		:
+        SBT     RP,HAFDUX	:
+        J       O.SET1		:
+O.CRDL  LR      R0,R0		:
+        JG      SNDERR		:
+        SBT     RP,CRDE		:
+        J       O.SET1		:
+
+
+: The TERSE command.  It requires the set options in a particular order
+: and dials the phone number and changes responses from text to numbers.
+
+O.TPTR  HC      HAFDUX,XONENA,YONENA,PARITY,CRDE
+NMCHR   EQ      5               :5(choices counting at end\
+TERDAT  AC      /HXRED/         :S is checked in code (stead of E)
+
+O.TERS  LR      R0,R0           :followed by a space
+        JGE     SNDERR          :followed by a set or a comma
+        SBT     RP,OTDIGT       :good start, set digit response
+        LIS     R9,0            :count till E or S and position
+O.TER1  TBT     RP,TOTRAN	:
+        JE      SNDERR		:
+        JAL     RCH,GETCHR,,	:
+        J       SNDERR          :bufferlet must have been zapped
+        CLB     RBC,TERDAT,R9   :char of command
+        JNFS    O.TER2          :not a match
+        LHL     R5,O.TPTR,R9,R9 :pointer to desired bit array
+        SBT     RP,0,R5         :set that bit
+        J       O.TER5		:
+O.TER2  CHI     R9,3            :fourth char could also be a S
+        JNFS    O.TER3		:
+        CHI     RBC,0D3         :test against the S
+        JNFS    O.TER3		:
+        SBT     RP,SEVBIT	:
+        JFS     O.TER5		:
+O.TER3  CHI     RBC,0CE         :if no match, better be a N
+        JEFS    O.TER5          :N is ok
+        CLHI    RBC,0A0         :could be a space
+        JE      O.DIAT		:
+O.TER5  AIS     R9,1		:
+        CHI     R9,NMCHR        :compare against max num of char
+        JN      O.TER1		:
+        TBT     RP,TOTRAN       :check for CCITT speed
+        JE      SNDERR		:
+        JAL     RCH,GETCHR,,	:get speed (X.25 throughput class)
+        J       SNDERR		:
+        LHI     R0,-0A0,RBC     :space?
+        JE      O.DIAT          :then dial logic
+        SHI     R0,0B5-0A0      :char 5? (5 = 300 bps)
+        JNFS    O.TER7		:
+        LIS     R0,2		:yes, select 300 bps
+        JFS     O.TER9		:
+O.TER7  SIS     R0,0B7-0B5      :char 7? (7 = 1200 bps)
+        JNFS    O.TER8		:
+        LIS     R0,1		:yes, select 1200 bps
+        JFS     O.TER9		:
+O.TER8  SIS     R0,0B8-0B7	:char 8? (8 = 2400 bps)
+        JN      SNDERR          :final field must be a blank or the speed
+        LIS     R0,0		:select 2400 bps
+O.TER9  STB     R0,OPORTD,RP	:save speed select
+        TBT     RP,TOTRAN	:
+        JE      SNDERR		:error if no more chars
+        JAL     RCH,GETCHR,,	:
+        J       SNDERR		:error if signal
+	CHI	RBC,0A0		:
+	JN	SNDERR		:error if no space before number
+        J       O.DIAT          :go dial number
+
+
+: LOGOUT was typed by the user.
+
+O.LOGT  LR      R0,R0           :check last char
+        JN      SNDERR          :no followinn spaces or chars allowed
+        JAL     RCH,EMPTY,,     :empty command buffer
+        LIS     R6,4            :msg 4 (goodbye)
+        JAL     R9,O.SMSG       :general msg server
+        J       XRET,,
+
+: O.BPS and SPEEDS are setup to have the default as 0 and each speed has
+:       a number (0=2400 BPS 1=1200 BPS 2=300 BPS
+SPEEDS  WC      0B2B4B0B0	:
+        WC      0B1B2B0B0       :1200 bps
+        WC      0B3B0B0		:
+        WC      0
+O.BPS   LR      R0,R0		:
+        JGE     SNDERR          :must be followed by a space
+        RBT     RP,OTDIGT	:
+        LIS     R5,4            :max number of numbers
+        LIS     R9,0		:
+O.BPS1  TBT     RP,TOTRAN       :data?
+        JE      SNDERR          :none so error
+        JAL     R7,GETCHR,,	:
+        J       SNDERR		:
+        CLHI    RBC,0A0         :leading space
+        JEBS    O.BPS1          :yes eat it
+        JFS     O.BPS5          :start in right spot
+O.BPS3  TBT     RP,TOTRAN       :data to translate?
+        JE      O.BPS7		:
+        JAL     RCH,GETCHR,,	:
+        J       SNDERR          :bufferlet zapped so command is wrong
+O.BPS5  SLLS    R9,8		:
+        AR      R9,RBC          :create word to compare
+        SIS     R5,1		:
+        JG      O.BPS3          :max of four char for speed
+        TBT     RP,TOTRAN       :make sure end of line
+        JN      SNDERR		:
+O.BPS7  LCS     R5,4		:
+O.BPS9  AIS     R5,4		:
+        L       R7,SPEEDS,R5	:
+        JE      SNDERR          :null entry is end
+        CR      R9,R7		:
+        JNBS    O.BPS9		:
+        SRLS    R5,2		:
+        STB     R5,OPORTD,RP    :contains baud rate
+        J       OUTOK		:
+    SUBTTL	(OUTDIA) MODEM RECEIVE/TRANSMIT ROUTINES
+
+:  transmitter routine to modem
+XMODEM  JAL     RCH,GETCHR,,    :no foolong around just get and put
+        J       XMD.SIG		:
+        JAL     RCH,APUTCH,,    :put char with no delay (fast CRCR B)
+        J       XRET,,          :and bye
+
+XMD.SI  SIGBGN(LADSIG)
+        SIGEXC(6,XMDEL)
+        SIGEND
+
+
+:  delay to modem so it can wake up without losing any data.
+XMDEL   JAL     RCH,ADELYG,,    :delay
+        J       XRET,,		:
+
+: receiver from modem, check for responses
+VMODEM  JAL     RCH,AGETCH,,	:
+        J       VMESC		:
+        NHI     RBC,7F		:
+        LR      R9,RBC		:
+        SIS     R9,0D           :parse if a carraige ret
+        JE      MPARSE		:
+        AIS     R9,0D-0A        :junk LF
+        JE      VRET,,		:
+        L       RBP,.OTBUF,RPI	:
+        JAL     RCH,PUTCHR,,	:
+        J       VRET,,		:
+VMESC   J       VRET,,		:
+        WS      0
+
+    SUBTTL	(OUTDIA) MODEM RESPONSE PARSER
+: the list of possible modem messages (in space par so CHI would work).
+MODMSG
+        WC      43464C         :CFL - call failed
+        WC      494321         :IC! incoming call
+        WC      4E4154         :NAT - no answer tone
+        WC      4E4454         :No Dial Tone
+        WC      5230           :R0 -2400 BPS
+        WC      5231           :R1 -1200 bps
+        WC      5232           :R2 -300 bps
+        WC      425359         :BSY - busy tone
+        WC      4E4F52         :NOR - no ringing detected
+        WC      4E4F41         :NOA - no answer detected
+        WC      554E54         :UNT - unknown tone
+        WC      564454         :VDT - voice detected
+        WC      0              :zero terminates
+M.ROUT  WC      M.CFL,M.IC,M.NAT,M.NTD,M.2400,M.1200,M.300
+        WC      M.BSY,M.NRG,M.NOA,M.UNT,M.VDT
+
+: finds the routine for the modem response.
+MPARSE  LIS     R9,0		:
+MPARS1  L       RBP,.OTBUF,RPI	:
+        TBT     RP,TOTRAN       :data to parse
+        JEFS    MPARS2		:
+        JAL     RCH,GETCHR,,	:
+        J       M.CFL           :bufferlet zapped-this aint gonna work
+        SLLS    R9,8		:
+        AR      R9,RBC          :R9 contains brief string
+        JBS     MPARS1		:
+MPARS2  LR      R1,R9		:
+        NHI     R1,7FFF		:
+        CLHI    R1,4F4B         :ok msg could be preceded by garbage
+        JE      M.COM           :so do it manually
+        LIS     R5,0		:
+MPARS3  L       R1,MODMSG,R5    :possible modem messages
+        JE      VRET,,		:
+        CR      R9,R1		:
+        JEFS    MPARS4		:
+        AIS     R5,4		:
+        JBS     MPARS3		:
+MPARS4  L       R7,M.ROUT,R5	:
+        JR      R7		:
+
+    SUBTTL	(OUTDIA) MODEM RESPONSE ROUTINES
+: got an ok, set as capable if wasn't dialing.  or cancel modem response
+: timouts.
+M.COM   SBT     RP,OT.CAP       :obviously capable of dialing
+        JNFS    M.COM2          :not initialization
+        LIS     R0,1		:
+        AHM     R0,O.NCAP       :number of capable modems
+        JAL     R15,ZAPMOD      :zap modem on init
+        J       VDEF            :deffered output
+M.COM2  RBT     RP,OT.MO1       :cancel timouts
+        RBT     RP,OT.MO2	:
+        J       VRET,,		:
+
+:  incoming call collison. got an incoming call while in command mode but
+:  before the modem could busy out the line.
+M.IC    RBT     RP,DTRON	:
+        STH     RP,O.TMP5	:
+                                :remember which port has call collison
+        LH      RP,OTPMAP,RP,RP :get our command port
+        GETPTP(RPI,RP,RP)       :get its table
+        JAL     R7,D.LGIC       :dial a number
+        LHL     RP,O.TMP5       :get back our port
+        TS      OTPMAP,RP,RP    :remove mapping
+        RBT     RP,RLA          :this port is not active
+        RBT     RP,OT.MOD	:
+        RBT     RP,OT.MO1	:
+        RBT     RP,OT.MO2	:
+        SBT     RP,DTRON	:
+        J       VRET,,		:
+
+: list of accounting msgs, each call failure has it's own.
+        HS      0
+A.MGNT  AC      /"E0"1F"00"05/     :no dial tone
+A.MGNA  AC      /"E0"1F"00"04/     :no answer
+A.MGNR  AC      /"E0"1F"00"03/     :no ringing
+A.MGNM  AC      /"E0"1F"00"02/     :no modem ava
+A.MGBS  AC      /"E0"1F"00"01/     :busy
+A.MGCF  AC      /"E0"00"00"20/  :call failed
+A.MGUT  AC      /"E0"00"00"1F/     :unknown tone
+A.MGAT  AC      /"E0"00"00"1E/   :no answer tone
+AC.MFL  EQ      0E01F0005       :modem failur-no response
+
+O.ACCM  EQ      .-6             :first six of index aren't used
+        BC      (A.MGNT-A.MGNT) :index 6
+        BC      (A.MGCF-A.MGNT) :index 7
+        BC      (A.MGAT-A.MGNT) :index 8 - answer ton
+        BC      0               :not used
+        BC      (A.MGBS-A.MGNT)	:
+        BC      (A.MGNR-A.MGNT) :11 - no ring
+        BC      (A.MGNA-A.MGNT) :12- no answer
+        BC      (A.MGUT-A.MGNT) :13- unknown tone
+        HS 0
+
+
+    SUBTTL	(OUTDIA) CALL FAILED MODEM RESPONSES
+M.NTD   SBT     RP,NOTONE       :remember error condition
+        LIS     R6,6            :msg 6 - no dial tone
+        JFS     M.CFLA		:
+
+M.BSY   LIS     R6,0A           :msg 0a - busy
+        JFS     M.CFLA		:
+
+M.NRG   LIS     R6,0B           :msg 0b - no ringing
+        JFS     M.CFLA		:
+
+M.NOA   LIS     R6,0C           :msg 0c - no answer
+        JFS     M.CFLA		:
+
+M.VDT                   :voice detected- modem unreliable to dif UNT
+M.UNT   LIS     R6,0D           :msg 0d - unknown tone
+        JFS     M.CFLA
+
+M.NAT   LIS     R6,8            :msg 8 - no answer tone
+        JFS     M.CFLA
+
+: M.CFL is unknown call failure 'CFL'.  M.CFLA is the general call failure
+: handling routine once we know the message type.
+M.CFL   LIS     R6,7            :call failed msg
+M.CFLA  TBT     RP,OT.MO1       :we caught garbage data from elsewhere since
+        JN      VRET,,          :modem has yet to wake up (send ok)
+        RBT     RP,OT.MOD       :if zero then already zapped modem
+        JE      VRET,,		:
+        LH      R9,OTPMAP,RP,RP	:
+        JL      M.CFL3          :no command port
+        LR      R13,RP		:save our port #
+        LR      RP,R9           :rp for command port for acc msg
+        LB      R7,O.ACCM,R6    :accounting msg
+        L       R7,A.MGNT,R7    :word of accounting info
+        JAL     R5,GENRPT,,     :tell the world
+        LR      RP,R13   	:restore port number
+        GETPTP(R9,R9,R9)        :get port table for command port
+        L       RBP,.FTBUF,R9   :command port buffer
+	JAL     R9,O.SMGB       :send message with known buffer
+M.CFL3  JAL     R15,ZAPMOD      :clear out modem
+        J       VRET,,		:
+
+    SUBTTL	(OUTDIA) MODEM CALL CONNECTED
+A.CCT   BC      1,0C,10         :Cct for 300,1200,2400
+        HS      0
+
+: we got a connection since we got a connection speed.
+M.2400  LIS     R10,2           :third msg
+        J       M.CONN		:
+M.1200  LHI     R10,0105        :2ND msg, speed 05=1200
+        JFS     M.RATE		:
+M.300   LIS     R10,02          :first msg (00) speed 02=300
+M.RATE  LBR     R0,R10          :get speed
+        STB     R0,OBRATE,RP	:
+        STB     R0,IBRATE,RP	:
+        JAL     R9,A.VID        :set up baud rate
+        EXBR    R10,R10         :get msg displacement
+        LBR     R10,R10         :clear baud rate 
+M.CONN  LA      R0,XASCI        :put in normal transmitter and reciever
+        ST      R0,.XSTAT,RPI	:
+        LA      R0,VASCI	:
+        ST      R0,.VSTAT,RPI   :now have normal I/O
+        LHL     R9,OTPMAP,RP,RP :our command port
+        JAL     R7,PRTSWI,,     :switch ports (to & fro network)
+        LB      R7,A.CCT,R10    :get cct for accounting
+        EXBR    R7,R7           :it belongs middle right in word
+        OI      R7,0E01F00FF    :the connect msg (was 00)
+        JAL     R5,GENRPT,,     :report it
+        TS      OTPMAP,RP,RP	:
+        TS      OTPMAP,R9,R9    :now longer crosstalk (command done)
+        LHI     R1,(-.OPORT),R9 :get outdial relative port
+        SBT     R1,OT.COM       :NOT a command port
+        SBT     RP,OT.AP        :now an outdial connection
+        SBT     RP,DTRON        :let dtr be turned off
+        RBT     R9,RLA          :command port no longer active
+        RBT     R9,OT.MOD       :both ways finished with modem talk
+        RBT     RP,OT.MOD	:
+        RBT     RP,CP           :we want to use hang answer
+        RBT     RP,DSR          :without causing immediate
+        RBT     RP,NEWDSR       :hang or answer.  This is needed
+        RBT     RP,CPSAMP       :since OT.MOD bit is no longer
+        RBT     RP,CPSAMP+2*NAGRP	:disabling H/A
+        RBT     RP,CPSAMP+4*NAGRP	:
+        RBT     RP,CPSAMP+6*NAGRP	:
+        SBT     RP,AH.TO	:
+        SBT     RP,AH.TO1	:
+        SBT     RP,AH.TO2	:
+        LCS     R3,2		:
+M.CON0  AIS     R3,2		:
+        LHL     R1,VIDBA,R3     :pointer to flags
+        JEFS    M.CON2          :zero terminates list
+        RBT     RP,0,R1         :reset unless set
+        TBT     R9,0,R1         :was it set for command port
+        JEBS    M.CON0          :was it set
+        SBT     RP,0,R1		:
+        JBS     M.CON0		:
+M.CON2
+        MAKEBF(R1,TOISIS,RP)	:
+        L       RBP,.FTBUF,RPI	:
+        JAL     R3,CHNGBF,,     :Buffer connected
+        JAL     RCH,EMPTY,,	:
+        RBT     RP,LOGING       :not a logger
+        RBT     RP,NEWLOG       :not new logger
+        LBR     R6,R10          :msg number
+        JAL     R9,O.SMSG       :report speed
+        J       VRET,,		:
+
+    SUBTTL	(OUTDIA) MODEM DIALING AND ZAPPING ROUTINES
+:       D.LGIC  finds a free outdial capable port-connects it
+:               then sends the number to the modem. it also stores the
+:               number in .OTBUF and if call unsuccessful moves it back
+:               to .OTDBF
+        HS      0
+D.LGIC
+        ST      R7,O.TMP4       :save return
+        LHI     R5,(NAGRP-1)*2  :first find free modem
+D.LGC1  STH     R5,O.TMP2	:
+        LHL     R0,OT.CAP,R5	:capable modem
+        XH      R0,BUSY.O,R5    :requested not to be used
+        LHL     R1,RLA,R5	:not active
+        NR      R1,R0		:
+        XR      R1,R0           :replace active and cap by inact & cap
+        STH     R1,O.TMP	:
+D.LGC6  LHL     R1,O.TMP	:
+D.LGC3  JFFOH   R1,D.LGC2       :incase port about to be answered
+        SIS     R5,2		:
+        JGE     D.LGC1		:
+        LIS     R10,4           :no modem avaible
+        J       SNDERQ		:
+D.LGC2  RBT     R2,O.TMP        :note port we tried
+        LHL     R3,MHSTID       :fastest modem speed allowed
+        LB      R0,OPORTD,RP    :max connect speed
+        SIS     R0,1		:
+        JLFS    D.LG02		:
+        JGFS    D.LG01		:
+        LHI     R3,TIDM12       :1200 bps
+        JFS     D.LG02		:
+D.LG01  LHI     R3,TIDM3        :300 bps
+D.LG02  STH     R3,M.TID        :it has right speed
+        STH     RP,O.TMP3	:
+        LR      RP,R5		:get free port num
+        SLLS    RP,3            :right group
+        AR      RP,R2		:
+        JAL     RLINK,MODIZ	:
+        J       D.LGC6		:
+        LR      R9,RP		:
+        LHL     RP,O.TMP3	:
+        LHI     R1,OUTIME/0A	:
+        STH     R1,.OTIME-(2*.OPORT),RP,RP :new timout
+        STH     RP,OTPMAP,R9,R9 :create cross mapping
+        STH     R9,OTPMAP,RP,RP	:
+        LI      R7,0E0010100    :accounting word for seize port
+        OR      R7,R9           :get port number of modem
+        JAL     R5,GENRPT,,     :send it
+        GETPTP(RPI,RP,RP)         :for command port (killed in MODIZ)
+        GETPTP(R10,R9,R9)       :for modem port
+        SBT     RP,OT.MOD       :command port has modem
+        RBT     R9,OTDIGT       :init word msgs
+        TBT     RP,OTDIGT       :copy digit msgs to modem port
+        JEFS    D.LGC8		:
+        SBT     R9,OTDIGT       :Wants digital msgs
+D.LGC8
+        LIS     R6,3            :Dialing msg
+        JAL     R9,O.SMSG	:
+
+:the following part of the dial logic is modem dependent
+
+:initialize accounting info to be sent after each 4 numbers
+        L       RBP,.TTBUF,R10	:
+        LHI     RBC,0C4         :D  for Dial command
+        JAL     RCH,PUTCHR,,    :put it
+        LI      R0,0E017FFFF    :the first in a series of accounting msgs
+        ST      R0,O.TMP2	:
+        LCS     R0,4		:
+        STH     R0,O.TMP3       :number of digits per msg
+
+        L       RBP,.DTBUF,RPI	:
+        JAL     RBF,IGCSCN,,    :init get char without removing it
+        J       D.LG12          :no data
+D.LGC5
+        L       RBP,.DTBUF,RPI	:
+        JAL     RBF,GCSCN,,     :get without removing
+        J       D.LG12          :no more data 
+D.LGC7
+        CHI     RBC,0D4         :T for Tone?
+        JNFS    D.LG10		:
+        LHI     RBC,0CD         :converted to M
+        JFS     D.LGC9		:
+D.LG10  CHI     RBC,0AC         :a comma?
+        JNFS    D.LGC9		:
+        LHI     RBC,0CF         :gets converted to a O
+D.LGC9  L       RBP,.TTBUF,R10	:
+        JAL     RCH,PUTCHR,,	:
+        SHI     RBC,0B0         :set it up for accounting (nibble)
+        JL      D.LGC5          :not a digit
+        CHI     RBC,0A          :too big for a number?
+        JGE     D.LGC5          :not a number
+        LHL     R0,O.TMP2+2     :number part of accounting msg in o.tmp2
+        SLHLS   R0,4            :move over and make room
+        OR      R0,RBC          :add it in
+        STH     R0,O.TMP2+2     :store accounting data
+        LIS     R0,1		:
+        AHM     R0,O.TMP3       :count of chars
+        JN      D.LGC5          :next char
+        L       R7,O.TMP2       :get word of accounting data
+        JAL     R5,GENRPT,,     :send it
+        LIS     R7,1		:
+        AHM     R7,O.TMP2       :increment msg number
+        TS      O.TMP2+2        :clear old number (safety play)
+        LCS     R0,4		:
+        STH     R0,O.TMP3       :setup count again
+        J       D.LGC5		:
+
+D.LG12  LH      R9,O.TMP3       :number of remaining spaces
+        L       R7,O.TMP2       :get accounting msg
+D.LG13  SLHLS   R7,4            :shift the data and number the msg number
+        OHI     R7,0F           :pad it with 0f
+        AIS     R9,1		:
+        JN      D.LG13          :still more to do
+        JAL     R5,GENRPT,,     :send the data
+D.LRET  L       R7,O.TMP4	:
+        JR      R7		:
+
+
+: ZAPMOX zaps modem from command port
+ZAPMOX  RBT     RP,OT.MOD	:
+        LH      R1,OTPMAP,RP,RP :change to modem port number
+        JLR     R8		:
+        STH     RP,O.TMP4	:
+        LR      RP,R1		:
+        GETPTP(RPI,RP,RP)	:
+        JAL     R15,ZAPMOD      :zap modem
+        LHL     RP,O.TMP4	:
+        GETPTP(RPI,RP,RP)	:
+        JR      R8		:
+
+ZAPMOD                          :zap and remove modem
+        L       RBP,.TTBUF,RPI  :empty buffers
+        JAL     RCH,EMPTY,,	:
+        L       RBP,.OTBUF,RPI  :returns buffers to free pool
+        JAL     RCH,EMPTY,,	:
+        SBT     RP,HDWDTR       :turn DTR off now
+        JAL     R6,A.CLR,,      :clear async rings
+        SBT     RP,HANGWT       :hang port
+        RBT     RP,RLA          :disconnect modem
+        RBT     RP,OT.MO1       :cancel timout
+        RBT     RP,OT.MO2       :do it right
+        SBT     RP,DTRON        :let dtr be turned off
+        RBT     RP,OT.MOD       :no longer using modem
+        LH      R9,OTPMAP,RP,RP :and remove cross mappings
+        JLR     R15             :none to remove
+        RBT     R9,OT.MOD       :not talking to modem
+        TS      OTPMAP,RP,RP	:
+        TS      OTPMAP,R9,R9	:
+        JR      R15		:
+
+: sends ok to the modem and sets up all of the bit arrays.
+: normal return if modem just answered a call (not enough time to be
+: answered yet).  skip (+4) if successful.
+MODIZ   TBT     RP,HDWCP        :don't use ports about to be answered
+        JER     RLINK           :failure, port active
+        GETPTP(RPI,RP,RP)	:
+        L       R4,SLOWC,,      :get time for duration
+        ST      R4,.TIME,RPI	:
+        SBT     RP,RLA          :port is active
+        RBT     RP,DTRON        :force dtr on
+        SBT     RP,OT.MOD       :modem command mode
+        SBT     RP,OT.MO1       :invoking command mode
+        RBT     RP,OT.MO2       :don't timout immedatily
+        SBT     RP,ASYNC        :async port
+        RBT     RP,BRK          :no break
+        RBT     RP,RXON         :no reverse X-on
+        SBT     RP,XONOUT       :init already out
+        RBT     RP,HDWDTR       :turn dtr on now!
+        LHL     R4,M.TID        :whatever speed & xasci & vmodem
+        JAL     R5,IZPORT,,     :init port
+        JAL     R9,A.VID	:
+        SBT     RP,TAM          :turn TAM on
+        LHI     RBC,0C20D       :B & CR
+        L       RBP,.TTBUF,RPI	:
+        JAL     RCH,PUTCHR,,    :one for the money
+        JAL     RCH,PUTCHR,,    :two for the show
+        EXBR    RBC,RBC         :now send B
+        JAL     RCH,PUTCHR,,    :three to get ready
+        EXBR    RBC,RBC         :another CR
+        JAL     RCH,PUTCHR,,    :CRCRBCR 
+        LIS     R4,6            :delay signal
+        LIS     RBC,8           :1/4 sec
+        JAL     RCH,PUTSIG,,	:
+        J       4,RLINK         :ready for modem to answer
+
+    SUBTTL	(OUTDIA) COMMAND PORT INITIALIZATION
+:       OTDNED  is the envir independent part of needle proccessing
+
+OT.MG1  O.MSGM                  :greeting message and prompt
+
+OTDNED  ST      R0,O.TMP	:
+        SBT     RP,RLA		:
+        RBT     RP,OTDIGT       :default word msgs
+        LHI     R0,OUTIME/0A    :timeout
+        STH     R0,.OTIME-2*.OPORT,RP,RP
+        L       R4,SLOWC,,      :save time
+        ST      R4,.TIME,RPI    :for monitor ability
+        LHI     R4,TIDCOM       :command Tid
+        JAL     R5,IZPORT       :initialize terminal bit arrays for
+                                :set terminal msgs (ISIS b1)
+        RBT     RP,CHAFDX       :is builder a hafdux
+        LHL     R0,O.TMP2       :get cct
+        NHI     R0,20           :half dux are above 32d
+        JEFS    OTDNE1		:
+        SBT     RP,CHAFDX	:
+OTDNE1
+        LIS     R0,0            :for 2400 bps
+        STB     R0,OPORTD,RP	:
+        L       RBP,.FTBUF,RPI	:
+        LA      R6,OT.MG1	:
+        JAL     R9,MSG          :send greeting message
+        L       RBP,.DTBUF,RPI	:
+        JAL     RCH,EMPTY,,	:
+        L       R0,O.TMP	:
+        JR      R0		:
+
+    SUBTTL	(OUTDIA) OUTDIAL TIMERS
+:       O.TIME  is the outdial timout routine.  Main purpose is to
+:               timout users after OTIMAX seconds (called every 10 secs)
+O.TIME  L       R0,OT.COM       :possible users of command ports
+        XI      R0,OCMDRY       :array of possible command ports
+O.TIM2  JFFO    R0,O.TIM1	:
+        J       CSDISM,,	:
+O.TIM1  ST      R0,O.TMP        :R1 contains relative Outdial portnum
+        RBT     R1,O.TMP        :port done
+        LR      RP,RPOL		:
+        SLLS    RP,3		:
+        LHI     RP,.OPORT,R1    :make actual port number
+        GETPTP(RPI,RP,RP)	:
+        RBT     RP,ACTIME       :Recently active
+        JEFS    O.TIM3		:
+        LHI     R4,OUTIME/0A    :reset timer if active
+        JFS     O.TIM4		:
+O.TIM3  LHL     R4,.OTIME,R1,R1 :get timer value
+        JEFS    O.TIM5          :take action if expired
+        SIS     R4,1		:
+O.TIM4  STH     R4,.OTIME,R1,R1 :store timer
+O.TIM6  L       R0,O.TMP        :restore poll status
+        J       O.TIM2		:
+
+O.TIM5  TBT     RP,OT.MOD       :could have time out modem
+        JN      O.TIM8		:
+                        :but timed out user
+        LIS     R6,5            :msg 5= timout
+        JAL     R9,O.SMSG	:
+        J       O.TIM6		:
+O.TIM8          :timout expired for modems - call failed
+        LHI     R4,OUTIME/0A	:
+        STH     R4,.OTIME,R1,R1	:
+        LIS     R6,9		:
+        JAL     R9,O.SMSG       :send modem timout msg
+        LI      R7,AC.MFL       :modem failure msg
+        JAL     R5,GENRPT,,     :accounting info
+        JAL     R8,ZAPMOX	:
+        J       O.TIM6		:
+
+
+:  O.DOTS send a period "." every three seconds while dialing.
+:
+O.DOTS	LHI     RPOL,(NGRP-1)*2 :needed for initialization of ports
+O.DOT1	LHL     R0,OT.MOD,RPOL	:grabbed modem for dialing?
+	STH	R0,P.DONE	:
+O.DOT2	LHL	R0,P.DONE	:
+        JFFOH   R0,O.DOT3	:
+        SIS     RPOL,2		:
+	CHI	RPOL,.OPORT/10	:any more OUTDIAL command ports?
+        JGEBS   O.DOT1		:yes, keep processing
+        J       CSDISM,,        :no, finished
+O.DOT3	RBT	R1,P.DONE	:service only once
+	LR      RP,RPOL		:
+        SLLS    RP,3            :port group
+        AR      RP,R1		:
+        TBT	RP,OTDIGT	:digital response?
+	JN	O.DOT2		:if yes, skip
+        GETPTP(RPI,RP,RP)	:
+        L       RBP,.FTBUF,RPI  :buffer pointer
+	LHI	RBC,2E		:char "."
+        JAL     RCH,PUTCHR,,	:
+        J       O.DOT2		:
+
+:  M.TIME times out the modem after 90 seconds.  This is to prevent a modem
+:  error from messing things up for forever.
+M.TIME  LHI     RPOL,(NAGRP-1)*2        :needed for initialization of ports
+M.TIM2  LHL     R0,OT.MO1,RPOL	:
+        LHL     R1,OT.MO2,RPOL  :modem timout for getting into command mode
+        STH     R0,OT.MO2,RPOL	:
+        NR      R0,R1           :both set then timout
+        JFFOH   R0,M.TIM3	:
+        SIS     RPOL,2		:
+        JGEBS   M.TIM2		:
+        J       CSDISM,,        :finished
+M.TIM3  LR      RP,RPOL		:
+        SLLS    RP,3            :port group
+        AR      RP,R1		:calculated RP
+        LH      R10,OTPMAP,RP,RP :command port
+        JL      M.TIM5		:
+        SBT     RP,MODEAD       :modem is no longer responding
+        GETPTP(R9,R10,R10)	:
+        L       RBP,.FTBUF,R9   :buffer
+        LIS     R6,9            :modem failure
+        JAL     R9,O.SMGB       :print with known buffer
+        LR      R13,RP		:
+        LR      RP,R10          :for accounting 
+        LI      R7,AC.MFL       :modem failure msg
+        JAL     R5,GENRPT,,	:
+        LR      RP,R13		:
+M.TIM5  GETPTP(RPI,RP,RP)	:
+        JAL     R15,ZAPMOD	:
+        J       M.TIM2		:
+
+        FO      DATA
+        EM
+        EI      :OUTDIAL
+    $@P
