@@ -1,0 +1,602 @@
+entry
+
+	IntIni,  IntZap,  IntFin,  IntCause,  IntLog
+
+;
+begin "PCOINT"
+
+require "(SAILIB)SAIL.DEF" source!file;
+
+define PRELIMINARY = FALSE;	! debugging switch;
+
+require "UUOSYM.DEF" source!file;
+
+!get!definitions(tymint);
+!get!definitions(proces);
+require processes;
+
+external simple procedure abort( Reference Integer Why );
+
+define	VirtualPages = '5
+,	Int!TIM      = 10
+,	Int!CHR      = 11
+,	Int!ZAP      = 12
+,	Int!ORG      = 13
+,	Int!NTQ      = 14
+,	Int!ESC      = 15;
+
+
+record!class buffer( 
+	integer	room		! used by interrupt: -left,,written;
+	,	bytePointer	! used by interrupt to write;
+	;
+	r!p(buffer) next	! chased by interrupt for more storage;
+	;
+	integer basePointer 	! deferred interrupt: reset bytePointer;
+	,	basePage	! page offset to add to bytecount for eof;
+	);
+define #room=1, #bytptr=2, #next=3; ! indices for immediate interrupt;
+
+! add fields at end only!;
+
+
+record!class Circuit(
+ r!p(buffer) forInterrupt	! buffer(s) with room for output;
+				! seen by immediate interrupt;
+ ;
+ integer auxArg			! for ease/speed holds port,,!axI8S;
+ ,	auxDef			!  "    "    "     "   port,,!axLDE;
+ ,	auxTyp			!  "    "    "     "     -1,,!axOCI;
+ ,	logging			! 0 means suppress output to logfile;
+ ,	chan			! the channel used for output ; 
+				! if zero, treat as if logging=0;
+ ,	spaceCount		! -1 means "noSpace" is ok to defer;
+  				! (prevents over-filling queue);
+ ,	doneComing		! dones since sent "ranout";
+ ,	immed.proc0		! the "immediate interrupt procedure";
+ ,	immed.proc1		! which is just "movei 1,rec / jrst do";
+ ;
+! the above are seen by the immediate interrupt;
+
+ r!p(buffer) pending		! buffer(s) not yet consumed;
+ ;				! seen by deferred interrupt;
+
+ integer enableCode		! the "character arrived" interrupt;
+ ,	buffering.proc		! called: end-of-buffer and when empty;
+ ,	filepage		! current file page to be mapped;
+ ,	filesize		! initial file-size;
+ ,	filetop			! working file-size;
+);
+define	#forInterrupt=1, #auxArg=2,	#auxDef=3,	#auxTyp=4
+,	#logging=5,	 #chan=6,	#spaceCount=7,	#doneComing=8
+,	#p.loc=9
+;
+! so the immediate interrupt can access these things;
+internal boolean
+	TIM!, ZAP!, ORG!, NTQ!;	! true for interrupt causes;
+
+integer array M[0:35,0:4];	! interrupt data area;
+! note:	M[c,0] is count of locations used for DF1INT call (4);
+!	M[c,1] is addr of M[c,4] for ref arg to XINT;
+!	M[c,2] is addr of service routine for proc arg to XINT;
+!	M[c,3] is pointer to XINT for DF1INT;
+!	M[c,4] is -1 for ok to queue, >=0 for pending (already queued);
+
+r!p(Circuit) the!int; 
+
+! create a static page cache from which our buffers
+! and file pages can be manipulated;
+Own Integer Array ring[0:VirtualPages, 0:1]; Define Pag = 0, Nxt = 1;
+Own Integer Array VirtualStorage[ 0 : (VirtualPages + 1) * '1000 ];
+Own Integer BasePage, UnmapPage, Idx;
+
+simple procedure SetupBasePage;
+begin					! Virtual page to start buffers;
+    BasePage _ (Location(VirtualStorage[0]) +'777) lsh -9;
+    UnmapPage _ 0;			! initially no page to unmap;
+    the!int _ null!record;		! initially no interrupt/port;
+    For Idx _ 1 step 1 until VirtualPages
+     do begin				! setup ring for buffer pages;
+	 ring[ Idx, Pag ] _ BasePage - 1 + Idx;
+	 ring[ Idx, Nxt ] _ Idx + 1;
+     end;
+    ring[ 0, Pag ] _ BasePage;
+    ring[ 0, Nxt ] _ ring[ VirtualPages, Nxt ] _ 1;
+    Calli( !Xwd( '2000+VirtualPages, BasePage ), -'66 );
+end;
+require SetupBasePage initialization;
+
+Ifcr PRELIMINARY thenc
+    own integer logNum;
+	define logBits=6, logMask= 1 ash logBits - 1;
+    own safe integer array log[0:logMask];
+
+    simple procedure initititit;
+    begin logNum_-1; end;
+    
+    simple procedure !LOGIT(integer logelement);
+    begin!code  define a=1, b=2;
+	exch	a,logelement;	! save register with swap;
+	push	p,b;		! save another register;
+	aos	b,logNum;	! indivisibly get the next index;
+	andi	b,logMask;	! mask it into range (cyclical buffer);
+	movem	a,log[0](b);	! store the data;
+	pop    p,b;		! restore the acs;
+	exch	a,logelement;	! and get out;
+    end;    
+    define !LOG6(name) = "!logit(cvsix(cvps(name)))";
+elsec
+    define !logit(val)="", !LOG6(name)=""; 
+endc
+
+! the interrupt cause routine;
+
+Internal simple procedure IntCause( integer intChan );
+start!code
+	move	1,intChan;	! channel with bits set;
+	andi	1,'77;		! mask out newenb;
+	movn	2,1;		! negate;
+	movsi	1,'400000;	! set bit 0;
+	rot	1,(2);		! rotate the right number of channels;
+	tlo	1,'400000;	! set cause interrupt flag;
+	calli	1,-'35;		! intact (interrupt activate);
+	 setom	!skip!;
+end;
+
+! this is just a cheat to get around SAIL;
+
+procedure does!call!proc( r!p(Circuit) why; r!p(buffer) what;
+				procedure Perform );
+	perform( why, what );
+
+
+simple procedure call!proc( r!p(Circuit) why; r!p(buffer) what;
+				integer toPerform );
+start!code jrst does!call!proc; end;
+
+recursive procedure noSpace( r!p(Circuit) which );
+! scheduled on interrupt with no room.  (After the bufferFinished's);
+begin	integer ichan;
+ichan_ Circuit:enableCode[which];
+disable( ichan );
+!LOG6(B NoSP);
+if Circuit:forInterrupt[which] = null!record
+and Circuit:doneComing[which] = 0
+ then begin	r!p(buffer) blank; integer proc;
+	! no hope for continuation, let him try to fix the problem;
+	blank_ null!record;	! flag that a real problem exists;
+	proc_ Circuit:buffering.proc[which];
+	call!proc( which, blank, proc );
+	ichan_ Circuit:enableCode[which];
+	if Circuit:forInterrupt[which] = null!record
+	and Circuit:doneComing[which] = 0
+	 then return;	! he didn't fix it, leave the interrupt off;
+      end;
+Circuit:spaceCount[which]_ -1;	! set for another of these;
+IntCause( ichan );		! make sure no interrupts ignored;
+enable( ichan );	! and turn them back on;
+!LOG6(E NoSP);
+end;
+recursive procedure bufferFinished( r!p(Circuit) which; 
+				    r!p(buffer) r );
+! scheduled once per completed buffer;
+begin	integer proc; 
+!LOG6(B Bfin);
+!LOGIT( Buffer:basepointer[r] land '777777 );
+
+if r = null!record
+   then usererr(0,1,"Buffer finished with null!record");
+
+if r neq Circuit:pending[which]
+   then usererr(0,1,"buffers delivered out of sync");
+
+if r then Circuit:pending[which]_ buffer:next[r];
+proc_ Circuit:buffering.proc[which];
+call!proc( which, r, proc );
+!LOG6(E Bfin);
+end;
+internal boolean simple procedure finishTop( r!p(Circuit) it );
+! returns true iff anything put into deferred queue;
+start!code	define ic=1, r=2, a=3, p='17;
+		label done;
+	skipe	ic,it;
+	 skipn	r,#forInterrupt(ic);	! check to make sure of storage;
+	  jrst	done;
+	aos	#doneComing(ic); ! increment count of dones in pipe;
+	push	p,[4];		! temp.1: "buffer completed" deferral;
+	push	p,ic;		! temp.2: which interrupt caused this;
+	push	p,r;		! temp.3: the buffer that was completed;
+Ifcr PRELIMINARY thenc
+	push	p,r;		! copy r to log list;
+	pushj	p,!Logit;	! ...;
+endc
+	hrrz	r,#next(r);	! get pointer to the next buffer;
+	movem	r,#forInterrupt(ic);	! and save its address away;
+	hrroi	r,bufferFinished; ! temp.4: procedure to call;
+	push	p,r;
+Ifcr PRELIMINARY thenc 
+	push	p,r;		! copy r to log list;
+	pushj	p,!Logit;	! ...;
+endc
+	movei	r,-3(p);	! "AOBJN pointer" to defer block;
+	push	p,r;		! note: 0,,address is now OK;
+	pushj	p,dfr1in;	! do the deferral;
+	sub	p,[!xwd(4,4)];	! clear out the temps now.;
+	skipa	1,[-1];		! indicate we did do the flush;
+done:	 movei	1,0;
+end;
+simple procedure setIntMap( integer index; r!p(Circuit) theRec );
+	! contains the actual code called, does the intmap;
+begin!code	define a=1, t=2, ch=3, c=5, r=6, ic=7, log='10;
+			! log: 0 if not logging;
+			! Note: 0,B,CH,FSM Fixed! (MAKFSM determined);
+			! 0 used in case tableAddress=0;
+		label rPort, nextBuffer, defer, updateGo, allDun, retry;
+		label mov.op, jmp.op, doit, setR, allOut, realEnd;
+		define readChSkip="auxcal a,ch";
+
+	hrrz	ic,theRec;
+	movei	c,#p.loc(ic);	! get the address of the two words;
+	move	r,mov.op;	! to write the procedure in;
+	hrr	r,ic;		! which is: movei ic,theRec;
+	movem	r,(c);
+	move	r,jmp.op;	! then: jrst doit;
+	movem	r,1(c);		! put it away;
+	push	p,index;	! now build a call to INTMAP;
+	push	p,c;
+	push	p,[0];
+	pushj	p,intmap;	! call it and go home;
+	jrst	realEnd;
+
+mov.op:	movei	ic,0;		! prototypic procedure: this get recptr;
+jmp.op:	jrst	doit;		! then we start the real code;
+
+doit:	push	p,ic;		! save pointer to the record;
+retry:	move	ic,(p);
+	skipe	log,#chan(ic);	! is there a file channel?;
+	 move	log,#Logging(ic); ! if so, are we logging it?;
+	jumpe	log,setR;	! no -- then all this is pointless;
+	hrrz	r,#forInterrupt(ic);	! check to make sure of storage;
+	jumpe	r,defer;	! no buffers showing;
+	skipl	c,#room(r);	! room for next character?;
+	 jrst	nextBuffer;	! no, try for more room;
+setR:	skipe	a,#auxArg(ic);	! AUXCAL to read a char, if no opcode;
+				! act just like no chars waiting;
+rPort:	 readChSkip;
+	  jrst	updateGo;	! no PTY chars, we've finished;
+	skipe	t,#auxTyp(ic);	! if not detached;
+	 auxcal	t,(ch);		!   output char to terminal "OUTCHR";
+	jumpe	log,rPort;	! if not really logging, ignore input;
+	idpb	ch,#bytptr(r);	! store the character we got.;
+	camn	ch,#triggerChar(ic);	! stop on trigger character.;
+	 aosle	#triggerCount(ic);	! only if armed (negative);
+	 aobjn	c,rPort;	! loop while we have room.;
+	caige	c,0;		! why did we stop? if not end-of-buffer;
+	 add	c,[1 lsh 18 + 1]; ! then we missed the count update;
+	movem	c,#room(r);	! save count for this buffer.;
+				! then get some more room.;
+nextBuffer:	! ran out on current buffer. get more, then try again;
+		! (may have stopped due to trigger character in buffer);
+	push	p,ic;		! finish out out the top buffer;
+	pushj	p,finishTop;
+	jrst	retry;
+
+defer:	! cannot finish now, wait for user level, but force return;
+	aosle	#spaceCount(ic); ! if this is already pending, all done;
+	 jrst	allOut;		 ! don't do a levdef -- ;
+	setzm	#doneComing(ic); ! clear count of dones in pipe;
+	push	p,[3];		! temp.1: number of words in deferral;
+	push	p,ic;		! temp.2: interrupt identity record;
+	hrroi	a,noSpace;	! temp.3: procedure to call;
+	push	p,a;
+Ifcr PRELIMINARY thenc 
+	push	p,a;		! make a copy on the logging list;
+	pushj	p,!logit;
+endc
+	movei	a,-2(p);	! AOBJN pointer for processor (zero OK);
+	push	p,a;
+	pushj	p,dfr1in;	! schedule the deferred interrupt;
+	sub	p,[!xwd(3,3)];	! remove the temps from the stack;
+	jrst	allDun;		! and leave.  cause will occur later;
+
+updateGo: skipe	#chan(ic);	! must not access (r) if no buffers;
+	movem	c,#room(r);	! completed reads.  update count and go;
+allDun:	skipe	a,#auxdef(ic);	! get his port,,auxcal;
+	 auxcal a,0;		! do levdef;
+allOut:	pop	p,ic;		! restore ic;
+	popj	p,;		! return;
+
+realEnd:
+end;
+internal recursive procedure addBuffer( r!p(Circuit) which; 
+					r!p(buffer) r );
+begin	r!p(buffer) last, temp;
+!LOG6(B AddB);
+!LOGIT( Buffer:basepointer[r] land '777777 );
+
+buffer:next[r]_ null!record;
+disable( Circuit:enableCode[which] );
+if last_ Circuit:forInterrupt[which]
+ then begin
+	while (temp_ buffer:next[last]) and (last_ buffer:next[temp])
+	 do;
+	if temp then last_ temp;
+	buffer:next[last]_ r;
+      end
+ else if last_ Circuit:pending[which]
+       then begin
+	      while (temp_ buffer:next[last]) and (last_ buffer:next[temp])
+	       do;
+	      if temp then last_ temp;
+	      Circuit:forInterrupt[which]_ buffer:next[last]_ r;
+	    end
+	else Circuit:forInterrupt[which]_ r;
+
+if Circuit:pending[which] = null!record
+ then Circuit:pending[which]_ r;
+	
+!LOG6(E ADDB);
+enable( Circuit:enableCode[which] );
+end;
+
+r!p(buffer) recursive procedure new!buffer( integer chars,
+					    bytePointer;
+					    r!p(circuit) int );
+begin	r!p(buffer) r;
+if chars < 1 or chars land (-1 lsh 18)
+ then usererr(chars,3,"new!buffer: Ridiculous byte count given: ");
+
+if bytePointer land ('37 lsh 18) or bytePointer land (-1 lsh 18) = 0
+ then usererr(bytePointer,3,"new!buffer: bad byte pointer given: ");
+
+!LOG6(NEWBUF);
+r_ new!record(buffer);
+buffer:room[r]_ -chars ash 18;
+buffer:bytePointer[r]_ bytePointer;
+buffer:basePointer[r]_ bytePointer;
+buffer:basePage[r]_ Circuit:FilePage[int] - 1;
+return(r);
+end;
+
+internal r!p(Circuit) recursive procedure new!circuit(
+	integer port		! port to read from;
+	, interruptChannel	! the "character arrived" interrupt;
+	, logfileChannel	! the channel used for logfile output;
+	, currentFilePage	! the current page just mapped;
+	, initialFileSize	! the initial file size;
+	, parentTerminal	! how to print on the parent's terminal;
+	; procedure buffering.proc ! called with circuit and buffer
+				! when buffers completed, called with
+				! circuit and null!record when runs out;
+	);
+begin	r!p(Circuit) int;	integer toCheat;
+!LOG6(NEWCIR);
+int_ new!record(Circuit);
+  start!code	define a=1; protect!acs a;
+	movei	a,parentTerminal; ! must be arg before buffering.proc;
+	move	a,1(a); 
+	movem	a,toCheat; 
+  end;
+Circuit:buffering.proc[int]_ toCheat;
+Circuit:enableCode[int]_ newenb(interruptChannel);
+Circuit:auxArg[int]_ !xwd(port,!AXI8S);
+Circuit:auxDef[int]_ !xwd(port,!AXLDE);
+Circuit:auxTyp[int]_ parentTerminal;
+Circuit:spaceCount[int]_ -1;
+Circuit:chan[int]_ logfileChannel;
+Circuit:filePage[int]_ currentFilePage;
+Circuit:fileSize[int]_ initialFileSize;
+Circuit:fileTop[int]_ 0;
+return(int);
+end;
+
+recursive integer procedure NewFilePage( r!p(circuit) c );
+begin
+    own integer array arg[0:1];
+    ring[ 0,Pag ]_ ring[ ring[0,Nxt],Pag ];	! set next page to make;
+    ring[ 0,Nxt ]_ ring[ ring[0,Nxt],Nxt ];	! set next next to make;
+    Arg[ 0 ]_ !Xwd( '6001, ring[ 0,Pag ] );	! current available page;
+    If Circuit:FileSize[c] < 0 then Circuit:FileSize[c]_ 0;
+    If Circuit:filePage[c] < 0			! First time: appending?;
+     then if Circuit:fileSize[c] > 0		!    and something there?;
+	 then Circuit:filePage[c] _ (Circuit:fileSize[c] lsh -9) + 1
+	 else Chnior( Circuit:Chan[c], Circuit:filePage[c], !chCFP )
+     else begin					! No -- not first append;
+	Circuit:fileSize[c]_ 0;			! Clear size & increment;
+	Circuit:filePage[c]_ Circuit:filePage[c]+1;
+	Chnior( Circuit:Chan[c], Circuit:filePage[c], !chCFP )
+      end;
+
+! Print(" ** (",Circuit:FilePage[c],", ",Circuit:FileSize[c],") ** ",crlf);
+    Arg[ 1 ]_ Circuit:filePage[c];		! use newest file-page;
+    Chnior( Circuit:Chan[c], Arg[0], !chMFP );	! map file page;
+    If not !skip! then usererr(0,1,"Cannot map file page");
+    Return( ('440700 lsh 18)  lor		! Point 7,         ;
+	    (ring[0,Pag] lsh 9) lor		!     Base Address ;
+	    (Circuit:fileSize[c] land '777)  );	!   + Offset       ;
+end;
+
+recursive procedure one.sample( reference r!p(Circuit) int;
+				reference r!p(buffer) r );
+if Circuit:chan[ int ] > 0
+ then begin "Something to do"
+  if r=null!record
+    then usererr(0,1,"I ran out of buffer space!")
+    else begin	integer size, basePointer; 
+	!LOG6(ONE.SA);
+	size_ !rh(buffer:room[r]);
+	if size > 0
+	 then begin
+	   Circuit:FileTop[int] _ ( buffer:bytepointer[r] land '777 )
+				+ ( buffer:basePage[r] * '1000 ) + 1;
+	 end;
+	if UnmapPage
+	 then Calli( !Xwd( '2001, UnmapPage ), -'66);
+	UnmapPage _ !rh(buffer:bytepointer[r]) lsh -9;
+
+	if buffer:room[r] > 0
+	 then begin
+	    buffer:bytepointer[r]_ buffer:basePointer[r]_ 
+						NewFilePage(int);
+	    buffer:room[r]_ -'5000 ash 18;
+	    buffer:basePage[r] _ Circuit:FilePage[int] - 1;
+	    addBuffer(int,r);
+	  end
+	 ! else short buffer: shutting down;
+      end;
+  end "Something to do";
+Internal simple procedure IntZap;
+begin
+    disable (newenb(Int!TIM));		! timer;
+    disable (newenb(Int!CHR));		! character input from pty;
+    disable (newenb(Int!ZAP));		! circuit zapper;
+    disable (newenb(Int!ORG));		! orange balls;
+    disable (newenb(Int!NTQ));		! notice to quit;
+    disable (newenb(Int!ESC));		! user types <esc>;
+end;
+procedure ZAP;
+begin
+    abort(ZAP!);			! stop processing;
+    IntCause( Int!CHR );		! finish characters in pipe;
+end;
+
+simple procedure ORG;	ORG! _ true;	! wake up SYNC;
+simple procedure NTQ;	abort(NTQ!);	! abort & wake up SYNC;
+simple procedure TIM;	abort(TIM!);	! abort & wake up SYNC;
+
+
+procedure XINT (reference integer MC4; procedure MC2);
+while true do
+ begin	! called by INTPRO as result of queued request from QINT;
+	integer oldCount;
+	boolean endIt;
+    oldCount_ MC4; MC2; ! call int service procedure;
+    endIt_ false;
+      start!code	define a=1; protect!acs a;
+	hrroi	a,-1;	! say OK to schedule another;
+	exch	a,MC4;	! go find out if something happened during MC2;
+	came	a,oldCount;	! (would have incremented the count);
+	 aose	a,MC4;	! something happened during MC2, need another;
+			! stop deferring and see if interrupt snuck in;
+	  setom	endIt;	! either we did not collide with another, or an;
+			! interrupt is coming down the pipe. All done;
+      end;
+    if endIt then return;
+  IFCR FALSE THENC
+   ! with << >> around indivisible operations, the above looks like: 
+   NOPOLL_ true; endIt _ true;
+   << a := MC4; MC4 := -1; >>;	! allow deferrals, get old count;
+   if a NEQ oldCount then begin	! if a deferral would have happened, ;
+				! but was prevented by MC4 > 0, then ;
+				! we should do MC2 again.;
+	<< MC4 := MC4 + 1; a := MC4 >>	
+				! dont let any deferrals in during the;
+				! repeat of MC2.  ;
+	if a = 0 then endIt_ false;
+				! if nothing got deferred while we ;
+				!   were checking this out, redo MC2;
+				! otherwise, another XINT coming. ;
+				!   it will do the needed MC2, we stop;
+	end;
+  ENDC
+ end "XINT";
+
+simple procedure QINT;
+begin	! called at immediate level to queue a request for service;
+    integer C;
+    C _ memory['10];		! get interrupt channel number;
+    if M[C,4] _ M[C,4] + 1 
+	then ! don't queue it more than once;
+	else DFR1IN (!xwd(-4,location(M[C,0])));
+end;
+procedure IntPort( Integer  port, cause, interrupt,
+			    chan, page, size, parentprint );
+begin
+  Integer bytptr, bytpnt;
+  r!p (buffer) r;
+  !LOG6(SETPRT);
+  If the!int = null!record			! first time called?;
+   then begin
+    the!int_ new!circuit( port, interrupt,
+			  chan, page, size, parentprint, one.sample );
+    If chan > 0
+     then For Idx _ 2 step 1 until VirtualPages
+      do begin
+	bytptr _ NewFilePage( the!int );	!page & pointer;
+	If bytpnt_ bytptr land '777 then begin	! if offset non-zero then;
+	  r_ new!buffer( '5000, bytptr land lnot '777, the!int );
+	  Buffer:room[r]_ -(('1000 - bytpnt) * 5) ash 18;
+	  Buffer:bytePointer[ r ]_ bytptr;	!    use short buffer;
+	  addBuffer( the!int, r );		! then add buffer to list;
+	end
+	else addBuffer( the!int, new!buffer( '5000, bytptr, the!int ));
+      end;
+
+    ! start it up;
+    setIntMap( tinass( port, cause, interrupt ), the!int );
+    enable( Circuit:enableCode[the!int] );
+  end
+  else Circuit:auxArg[ the!int ]_ !Xwd(port,!AxI8S);
+!LOG6(ENDPRT);
+end;
+
+
+Internal integer procedure IntFin;
+begin
+!LOG6(FINPRT);
+  Circuit:auxArg[ the!int ]_ 0;
+  If Circuit:chan[ the!int ] > 0
+   then begin
+      while finishTop( the!int ) do poll;	! finish off leftover buffers;
+      If UnmapPage neq 0 then Calli( !Xwd( '2001, UnmapPage ), -'66);
+      Circuit:FilePage[ the!int ]_ (Circuit:FileTop[ the!int ] lsh -9) + 1;
+      Chnior( Circuit:Chan[ the!int ], Circuit:FileTop[ the!int ], '45 );
+  end;
+  Return( Circuit:FileTop[ the!int ] );	! length of file in words;
+!LOG6(ENDPRT);
+end;
+
+
+internal simple procedure IntLog( Boolean LogVariable );
+Circuit:Logging[ the!int ]_ LogVariable;
+
+Internal simple procedure INTINI(itemvar INTPRO;
+		integer Port, FileChan, Page, Size, ParentPrint);
+begin	! called by main prog to setup interrupts once port is known;
+    simple procedure DEFMAP (integer INDEX; procedure PROC);
+    begin
+	own integer C;
+	C _ INDEX land '77;	! extract channel number;
+	M[C,0] _ 4;		! 2 word arg to DF1INT;
+	now!safe M;
+	M[C,1] _ location(M[C,4]);! pending flag;
+	begin!code		! setup handler procedure;
+		protect!acs 1;
+		MOVE	1,-1(P);
+		MOVEM	1,access(M[C,2]);
+	end;
+	M[C,3] _ !xwd(-1,location(XINT));
+	M[C,4] _ -1;		! DF1INT needs to be called;
+	now!unsafe M;
+	intmap (INDEX,QINT,0);
+	enable (newenb(C));
+    end;
+
+    intset (INTPRO,pstack(8));
+    TIM! _ False;
+    intmap (intass(!IATIM,Int!TIM),TIM,0); enable (newenb(Int!TIM));
+    Auxclv (Port,#LF,!AXS8B);		! #lf is break;
+    intPort (Port, !IABRK, Int!CHR, FileChan, Page, Size, ParentPrint );
+    ZAP! _ False;
+    intmap (tinass(Port,!IAZAP,Int!ZAP),ZAP,0); enable (newenb(Int!ZAP));
+    ORG! _ False;
+    intmap (tinass(Port,!IAORG,Int!ORG),ORG,0); enable (newenb(Int!ORG));
+    NTQ! _ False;
+    intmap (intass(!IANTQ,Int!NTQ),NTQ,0);      enable (newenb(Int!NTQ));
+    intmap (tinass(-1,!IAESC,Int!ESC),NTQ,0);   enable (newenb(Int!ESC));
+end;
+
+
+end $
+
+    9\ø
