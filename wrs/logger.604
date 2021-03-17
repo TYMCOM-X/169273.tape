@@ -1,0 +1,595 @@
+    SUBTTL	LOGGER.602 - HANDLES THE PROCEDURE OF LOGON
+: ******************************************************************
+: **                  PROPRIETARY INFORMATION                     **
+: **                                                              **
+: **  This  source code listing constitutes the proprietary pro-  **
+: **  perty of TYMNET, Incorporated. The recipient, by receiving  **
+: **  this program listing, agrees that neither this listing nor  **
+: **  the   information  disclosed herein nor any  part  thereof  **
+: **  shall be  reproduced or transferred to other documents  or  **
+: **  used  or  disclosed to others for manufacturing or for any  **
+: **  other purpose except as specifically authorized in writing  **
+: **  by  TYMNET, Incorporated.                                   **
+: ******************************************************************
+: **                   MODULE IDENTIFICATION                      **
+: **                                                              **
+: **  File Name          :  LOGGER.602      last change: 11/20/86 **
+: **                                                              **
+: **  File Description   :  There are two logon processing, LGGO  **
+: **			    dealing with terminals and LSTAT with **
+: **			    the Supervisor and the environment.   **
+: **			    LGGO periodically polls the ports and **
+: **			    appends the successive logon string to**
+: **			    logon buffer until terminator char. is**
+: **			    encountered. Then SNDLOG transfers the**
+: **			    the string in logon buffer to Sup.    **
+: **			    LSTAT is called upon logon-status be- **
+: **			    ing received from Sup. XLSTAT also    **
+: **			    handles extended logon-status from Sup**
+: **			    TEXT routine outputs text to terminals**
+: **			    to show users logon-status information**
+: **                                                              **
+: **  File Abstract      :  This module handles logon state.      **
+: **                                                              **
+: ******************************************************************
+: **                    CHANGE LOG                                **
+: **                                                              **
+: **  Ver   Date    By   PIR/NSR  Changes (most recent at top)    **
+: ** ----- -------- ---  -------- ------------------------------- **
+: ** 06.02 11/20/86 dlg		  Removed CIRDSC from LOGCMD	  **
+: ** 06.02 11/07/86 dlg  	  Fixed RX3 caused assembly errors**
+: ** 06.02 11/06/86 DLG		  Added break key check while in  **
+: **				  login mode.  Changed code so sep**
+: **				  routine LOGCMD is called to	  **
+: **				  process log to cmd mode request.**
+: **				  Changed PMODE to PADACT.	  **
+: ** 06.02 11/05/86 dlg		  Removed checks for .ECOBF VS    **
+: **				  .TTBUF, replaced with .TPBUF.	  **
+: **				  Stored .ECOBF in .TPBUF when	  **
+: **				  going from login to cmd mode	  **
+: ** 06.02 11/03/86 dlg		  Modified code to store PAD 	  **
+: **				  filters when port goes from	  **
+: **				  login to command mode.	  **
+: ** 06.00 06/20/86 dlg		  Changed JAL SETALL to JAL INITCS**
+: **				  and JAL INITX3, changed GLs also**
+: ** 06.00 06/09/86 dlg		  Now the PAD's echo table is	  **
+: **				  placed in the port table before **
+: **				  going from login to cmd mode	  **
+: ** 06.00 06/06/86 cab		  Tighten up PAD hooks into logger**
+: ** 06.00 05/29/86 LH		  GL MPSCAN if MPVC defined	  **
+: ** 06.00 05/15/86 LH	 PIR#1824 Support IIX gateway logon status**
+: ** 05.00 04/25/86 sdw           Control Z drops users           **
+: ** 05.00 03/12/86 sdw           Reset NEWLOG bit upon entering  **
+: **                              mode so PAD banner is print once**
+: ** 05.00 03/12/86 sdw           set limbo upon entering command **
+: **                              mode if port addresabel port.   **
+: ** 04.03 01/28/86 sdw  n/a      Moved text msgs to DATA.403     **
+: ** 04.02 01/07/86 LH   PIR 1869 Check if port is declared RCV,  **
+: **			          If yes, don't process logon data**
+: **   ''     ''    ''            Add proprietary banner.         **
+: **                                                              **
+: ******************************************************************
+
+	SUBTTL	(LOGGER) LOGGER Handler
+
+	GL	LGGO,LGRET,RELOG	:definitions
+	GL	LSTAT,XLSTAT,TEXT,L3STAT,LGSTAT
+	GL	SNDLOG			:references
+
+  IF	X3ON
+	GL	CIRDSC,IX3PRT,IIXCAL,INITCS,INITX3,INITN3,LOGCMD,LGSAVE
+	GL	XTGATE,CMMODE,TCLASS,GLEVTC,X3OPRO,X3CPRO,TEMPA
+  EI	:X3ON
+
+  IF	NMPVC
+  	GL	MPSCAN
+  EI	:NMPVC
+  
+	SEG	A.CODE
+	MO	.,LOGGER
+
+	LO	DATA
+
+:	*      ***   ***   ***  ***** ****
+:	*     *   * *   * *   * *     *   *
+:	*     *   * *     *     ****  ****
+:	*     *   * *  ** *  ** *     *  *
+:	*****  ***   ****  **** ***** *   *
+
+
+:		LOGGER
+:		======
+:	run every 50 ms. from timeout list.
+LGGO	LHI	RPOL,(NGRP-2)*2		:word index into bit arrays
+LGRET	L	R0,TOLOG,RPOL		:data present
+	N	R0,LOGER,RPOL		:LOGER active
+	N	R0,LOGING,RPOL		:in login mode
+	JFFO	R0,LG1
+	SIS	RPOL,4
+	JGEBS	LGRET			:Next port-group:
+	J	SNDLOG,,		:done...exit to flush logon buffers
+
+LG1	LR	RP,RPOL			:Compute port number
+	SLLS	RP,3
+	AR	RP,R1
+	GETPTP(RPI,RP,RP)		:set up Port-Table-Pointer
+	JFS	VLOG			:Process logon characters
+
+
+
+:	Set a terminal parameter...
+:	R4 -	Signal to send
+LGSET	L	RBP,.TTBUF,RPI		:set to-terminal buffer-pointer
+	LIS	RBC,1			:set to 1
+	JAL	RCH,PUTSIG		:send signal and proceed
+
+:	LOGGER, called from LGGO
+:	======
+
+:	Check if more characters present for this port.
+RELOG	TBT	RP,TOLOG		:any more data present?
+	JE	LGRET			:no, so exit back to LOGON poller
+
+
+:	Entry point
+:	Process another logon character
+VLOG	L	RBP,.FTBUF,RPI		:Locate buffer to get char from
+	JAL	RCH,GETCHR		:get the character
+	 J	LOGSIG			:see if trying to enter command mode
+  IF	X3ON
+	CH	RBC,X3.N3,RPI		:is this character = break key?
+	JE	LOGSI1			:yes, process break key
+  EI	:X3ON
+	IF	NPAPRT			:** 4.02 LH
+	TBT	RP,AD.PRT		:is addressable port ?
+	JEFS	LOG0			:no - process login string
+	EI	:NPAPRT
+	IF	PVC
+	L	R6,.PVCX,RPI		:PVC parameter (exception)
+	TI	R6,PORCV		:if receive only port ?
+	JEFS	LOG0			:no - process login string
+	J	RELOG			:yes - ignore login string
+	EI	:PVC			:** 4.02 LH
+LOG0	NHI	RBC,7F			:Skip return...data...remove MSB
+	JE	RELOG			:ignore nulls in logon
+	CLHI	RBC,7F			:...and RUBOUT too
+	JE	RELOG
+	LR	R9,RBC			:save copy of data character
+	L	RBP,.TTBUF,RPI		:set to-term buffer for echoing
+	CLHI	RBC,20			:control character?
+	JLFS	LOG1			:yes, control...skip to service
+
+:	Data characters
+	TBT	RP,UNAME		:Don't echo unless in username state
+	JE	LOG3			:Password, skip echo
+	TBT	RP,LGECHO		:should we echo?
+	JE	LOG3			:No, skip echo
+	JAL	RCH,PUTCHR		:Echo it
+	J	LOG3			:and skip
+
+:	control-char...check it out
+LOG1	CLHI	R9,0D			:CR?
+	JN	LOG6			:skip if not
+	TBT	RP,LGECHO		:should we try to echo?
+	JEFS	LOG3			:should we try to echo?
+	TBT	RP,UNAME		:yes...in username?
+	JEFS	LOG3			:no...don't try to echo
+	TBT	RP,ASCII		:yes...should we echo?
+	JEFS	LOG3			:no
+	TBT	RP,HAFDUX		:yes...half-duplex?
+	JNFS	LOG2			:yes
+	JAL	RCH,PUTCHR		:no...echo CR
+LOG2	LIS	RBC,0A			:...|LF
+	JAL	RCH,PUTCHR
+
+:	printable character echoed...what else do we do with it?
+LOG3	 IF	NPAPRT
+
+:	If port-addressing is turned on, and a port is in limbo, there is
+:	no circuit to the sup...we'll have to rebuild it on the arrival of the
+:	first "real" logon character.
+	JAL	RLINK,PA.CL		:cancel limbo if required.
+	GL	PA.CL
+	 EI	:NPAPRT
+	 IF	PVC
+	LH	R3,.PVCLH,RPI		:potential PVC log character
+	JLFS	LGPVC1			:skip if not appropriate
+	JAL	RLINK,PVCLOG		:check PVC state
+LGPVC1	 EI	:PVC
+	LHI	RBC,80,R9		:set high-order bit
+	L	RBP,.LGBUF,RPI		:set pointer to LOGON-buffer
+	JAL	RCH,PUTCHR		:go buffer new character
+	LHL	RCH,BCT,RBP,		:check number of chars accumulated
+	SHI	RCH,$A 55
+	JGEFS	LOG5			:too many...send to sup to fix!
+	CLHI	R9,0D			:is this char CR?
+	JEFS	LOG4			:yes
+	CLHI	R9,3B			:was it semi-: ?
+	JN	RELOG			:no...see if anything else to do
+
+:	Terminator found...close out logon string
+LOG4	 IF	NMPVC
+	JAL	RLINK,MPSCAN		:check out user-name
+	 EI	:NMPVC			:return means not MPVC, so proceed
+LOG5	RBT	RP,LOGER		:terminator, defer until LSTAT received
+	SBT	RP,FL.LOG		:indicate logon-buffer may be flushed
+	 IF	NPAPRT
+	JAL	RLINK,PA.CL		:cancel limbo if required.
+	 EI	:NPAPRT
+	J	LGRET			: and go back for another port
+
+:	Control-character (other than CR)
+LOG6	L	RBP,.LGBUF,RPI		:set logon-buffer
+	LHI	RBC,80,R9		:place this character into buffer
+	JAL	RCH,PUTCHR
+	LHL	RCH,BCT,RBP,		:check number of chars accumulated
+	SHI	RCH,$A 55
+	JGE	LOG5			:too many...send to sup to fix!
+	CLHI	R9,1B			:check for various ESCAPE characters
+	JGE	LOG5			:yes...flush buffer
+  IF	X3ON
+	CLHI	RBC,4			:
+	JGFS	XLOG6			:if not gouging level
+	LB	R0,GLEVTC,RBC,		:  else get CCITT throughput class
+	STB	R0,TCLASS,RPI		:
+XLOG6
+  EI	:X3ON
+	TBT	RP,UNAME		:Control character...
+	JE	RELOG			:PASSWORD state...just pass on to sup
+	LHI	RBC,-8,R9		:^H (Half-duplex)?
+	JNFS	LOG7
+	RBT	RP,LGECHO		:LOGGER shouldn't echo
+	 LO	SIGNAL
+	LHI	R4,SHDSIG		:set HDUX signal
+	J	LGSET
+LOG7	SIS	RBC,10-8		:^P (Parity)?
+	JNFS	LOG8
+	LHI	R4,SPRSIG		:Set parity signal
+	J	LGSET
+LOG8	SIS	RBC,12-10		:^R (Reverse X-Enable)?
+	JNFS	LOG9
+	LHI	R4,SRXSIG		:yes...enable it
+	J	LGSET
+LOG9	SIS	RBC,18-12		:^X (backpressure)?
+	JNFS	LOG10
+	LHI	R4,SXESIG		:set backpressure
+	J	LGSET
+LOG10   AIS     RBC,18-0B               :Katakana port?
+        JNFS    LOG11
+        SBT     RP,KATERM               :katakana port after successful login
+         FO      SIGNAL
+LOG11   SIS	RBC,15-0B               :uppercase only port
+        JN      LOG12
+        SBT     RP,KATUPC               :set uppercase only
+        J       RELOG
+LOG12   SIS     RBC,1A-15               :^z *500.sdw
+	JN	RELOG
+	SBT	RP,HANGWT		:hang the user
+	J	RELOG
+
+:	Check for escape to command mode
+LOGSIG
+  IF	X3ON
+	 LO	SIGNAL	
+	CLHI	R5,BBSIG		:is this a break signal?
+	 FO	SIGNAL
+	JN	RELOG			:ignore all but breaks
+LOGSI1	TBT	RP,CMMODE,,		:can port enter command mode
+	JE	RELOG			:no, port can only be in login mode
+	JAL	RLINK,CIRDSC,,		:disconnect from network
+	JAL	RLINK,LOGCMD		:process switch from login to cmd mode
+    IF 	NPAPRT     
+	JAL	R0,PA.SL
+    EI	:NPAPRT    
+	LA	RLINK,LGRET		:restore return address
+	J	IX3PRT,,		:...and init PAD related parameters
+  ELSE
+	J	RELOG			:if not PAD, exit
+  EI	:X3ON
+
+
+  IF	X3ON
+:	Process port request to switch from login to command mode
+:	RLINK=link register
+LOGCMD
+	ST	RLINK,LGSAVE		:save return address
+
+:	empty buffers
+	L	RBP,.FTBUF,RPI		:get from-term buf pointer
+	JAL	RCH,EMPTY		:empty it
+	L	RBP,.LGBUF,RPI		:
+	JAL	RCH,EMPTY		:make sure no logon chars are sent
+	L	RBP,.TTBUF,RPI		:
+	JAL	RCH,EMPTY		:...or echoed
+	L	RBP,.ECOBF,RPI		:put hello in echo buf*500.sdw
+
+        LA      R6,XHELLO,,             :notify in command mode
+        JAL     R5,OUTSTR               :*500.sdw
+
+	RBT	RP,TOSING		:this break should NOT trash output
+	RBT	RP,ATTN			:...nor require reverse channel action
+	RBT	RP,LOGING		:indicate no longer in login mode
+	SBT	RP,PADACT		:...but in command mode
+	RBT	RP,PNMODE		:...where no pseudoneedle wanted(yet)
+        RBT     RP,NEWLOG               :print header only once 5.00*sdw
+
+:	Reset the CONSAT terminal bit arrays and
+:	the PAD default terminal parameters
+	STM	R0,TEMPA,,		:save registers
+	LB	R1,X3OPRO,RP,		:get the default profile
+	STB	R1,X3CPRO,RPI		:store it into current profile 
+	JAL	R9,INITCS,,		:set CONSAT arrays
+	JAL	R9,INITX3,,		:set all parameters
+
+:	Store PAD filters in port table
+	LA	R1,EASCID,,             :get EASCID address, and save
+	ST	R1,.ECHRF,RPI		:as input character filter pointer
+	LA	R1,EASCIS,,             :get EASCIS address, and save
+	ST	R1,.ESIGF,RPI		:as input signal filter pointer
+	LA	R1,XPADFI,, 		:get XPADFI address, and save
+	ST	R1,.XPADF,RPI		:as transmit filter pointer
+
+:	Replace .TTBUF in .TPBUF, with .ECOBF
+	L	R1,.ECOBF,RPI		:get ECHO BUFFER pointer
+	ST	R1,.TPBUF,RPI		:as PAD ECHO to TERMINAL BUFFER
+
+:	Change echo table in port table to that of the PAD's
+	LR	R1,R12			:preserve RPI, use R1 as index reg
+	LM	R12,PPABL		:get PAD-ASCII echoable char set
+	STM	R12,.ECHT1,R1		:place 1st 1/2 (0-127) in port table
+	STM	R12,.ECHT2,R1		:place 2nd 1/2 (127-255) in port table
+	LM	R0,TEMPA,,		:restore back registers
+
+	L	RLINK,LGSAVE		:restore link register
+	JR	RLINK			:return
+  EI	(X3ON)
+
+
+	SUBTTL	(LOGGER) LOGON STATUS
+
+
+:		   *      ***   ***   ***  *   *
+:		   *     *   * *   * *   * **  *
+:		   *     *   * *     *   * * * *
+:		   *     *   * *  ** *   * *  **
+:		   *****  ***   ****  ***  *   *
+
+:		 **** *****   *   ***** *   *  ****
+:		*       *    * *    *   *   * *
+:		 ***    *   *****   *   *   *  ***
+:		    *   *   *   *   *   *   *     *
+:		****    *   *   *   *    ***  ****
+
+:	Define some bits for control-functions:
+:       Bits defined in data module *4.03*sdw
+:L.USER	EQ	2000			:set UNAME bit
+:L.LOGG	EQ	1000			:set LOGER bit
+:L.P.SH	EQ	0200			:Prefix message with super-hang
+:L.P.CR	EQ	0100			:Prefix message with CR|LF
+:L.S.HG	EQ	0020			:Suffix message with hang
+:L.S.GB	EQ	0010			:Suffix message with green-ball
+
+:	Logon STATus
+:	Called by Environment-dependent code on command from Supe.
+:	R9 -	Status
+:	RP -	Port number
+:	RPI -	Port-table pointer
+:	RLINK -	Link register
+:	RBP -	Buffer-pointer (init'ed to To-terminal)
+LGSTAT	HS	0
+L3STAT	EQ	LGSTAT
+	JAL	R6,LSTAUS
+	J	TEXT
+
+LSTAT	JAL	R6,LSTAUS
+	J	XLSTAT
+
+LSTAUS	RBT	RP,UNAME		:turn off User-name
+	THI	R9,80			:This bit set to flush input buffer
+	JEFS	LSTA10			:not set
+	L	RBP,.FTBUF,RPI		:set from-terminal buffer
+	JAL	RCH,EMPTY		:Flush input buffer
+LSTA10	L	RBP,.TPBUF,RPI		:set to-terminal buffer
+	THI	R9,20			:This bit set to flush output buffer
+	JEFS	LSTA20
+	JAL	RCH,EMPTY		:Flush output buffer
+LSTA20	NHI	R9,1F			:extract status-type
+	JR	R6
+
+:	eXtended LOGON status
+:	Called by environment-dependent code for exceptions.
+:	Usage like LSTAT, except that:
+:		R9 -	contains message code (only)
+XLSTAT	L	RBP,.TPBUF,RPI		:set to-terminal buffer
+  IF	PVC
+:	PVC might want to intercept these
+	J	PSTATE			:non-pvc ports return to TEXT
+  EI	:PVC
+
+	SUBTTL	(LOGGER) Internal Text service
+
+:			***** ***** *   * *****
+:			  *   *      * *    *
+:			  *   ****    *     *
+:			  *   *      * *    *
+:			  *   ***** *   *   *
+
+:	Output text.
+:	RLINK -	Link register
+:	R9 -	message key:
+:		-4  -	LOGON ABORTED
+:		-3  -	NO PATH AVAILABLE
+:		-2  -	Zapper
+:		-1  -	Got a pseudo-needle
+:		0 -	no text
+:		1 -	"please log in"
+:		2 -	"error, type username"
+:		3 -	"error, type password"
+:		4 -	"username"
+:		5 -	"password"
+:		6 -	no text
+:		7 -	no text
+
+:	First check if there is an alternate status-handler.
+:	If there is (.LSTAT>0), we call that handler:
+:		R8 -	link register (from here)
+:		R9 -	status code
+:		RLINK -	alternate link register (who called us)
+TEXT	L	RBP,.TPBUF,RPI		:set to-terminal buffer
+	ST	RLINK,TXTSAV		:preserve linkage register
+	L	R8,.LSTAT,RPI		:is there an alternate handler?
+	JEFS	TEXT10			:no
+	JAL	R8,0,R8			:yes...call upon it to do it's thing
+
+:	Now set up R8 to index into a list of arrays of message pointers.
+:	Supervisor status messages differ based upon whether terminal is
+:	2741, Normal ASCII, Half-Duplex ASCII.  R8 will be set to:
+:		0	Non-PVC 2741,
+:		1	non-PVC normal ASCII,
+:		2	non-PVC Half-duplex ASCII,
+:		3	PVC 2741,
+:		4	PVC Normal ASCII,
+:	and	5	PVC Half-Duplex ASCII.
+TEXT10	L	RBP,.TPBUF,RPI		:set to-terminal buffer
+	LIS	R8,2*2			:Initialize R8
+	TBT	RP,HAFDUX		:Half-Duplex?
+	JNFS	TEXT12			:yes
+	LIS	R8,0*2			:
+	TBT	RP,ASCII		:2741?
+	JEFS	TEXT12			:no - normal ASCII
+	LIS	R8,1*2			:set to 1 for normal
+TEXT12	SLLS	R9,2			:Convert message number to index
+  IF	PVC
+	TBT	RP,PVCARY,,		:PVC port?
+	JEFS	TEXT14			:no
+	TBT	RP,PVCSTD
+	JEFS	TEXT14
+	AIS	R8,3*2			:PVC...set correct index
+TEXT14
+   EI	:PVC
+	LHL	RLINK,LSTBLX,R8		:Gateway message table pointer
+	TBT	RP,XTGATE,,
+	JNFS	TEXT16
+	LHL	RLINK,LSTBL,R8		:Array pointer based upon terminal
+TEXT16	AR	RLINK,R9		:type, message
+
+:	Set up bit arrays
+	LHL	R9,BASE+2,RLINK,	:get flag-bits
+	RBT	RP,UNAME		:
+	THI	R9,L.USER		:user-name?
+	JEFS	TEXT20			:no
+	SBT	RP,UNAME		:yes
+
+TEXT20	RBT	RP,LOGER		:
+	THI	R9,L.LOGG		:enable loger?
+	JEFS	TEXT22			:no
+	SBT	RP,LOGER		:yes
+
+:	Check for preficies
+TEXT22	THI	R9,L.P.SH		:Super-hang?
+	JEFS	TEXT24			:no
+	 LO	SIGNAL
+	LHI	R4,SHGSIG		:yes
+	JAL	RCH,PUTSIG		:send it
+
+TEXT24	THI	R9,L.P.CR		:CR|LF ?
+	JEFS	TEXT30			:no
+	LA	R6,CRLF			:yes
+	 IF	PVC
+	JAL	R9,PVCOUT		
+	 ELSE
+	JAL	R9,MSG
+	 EI	:PVC
+
+:	Output Message
+TEXT30	LHL	R6,BASE,RLINK,		:Get message pointer
+	LA	R6,BASE,R6,		:R6 points to desired message
+	 IF	PVC
+	JAL	R9,PVCOUT		:send text to terminal
+	GL	PVCOUT
+	 ELSE
+	JAL	R9,MSG			:move text into terminal-bound buffer
+	 EI	:PVC
+
+:	Now perform required suffix operations
+	LHL	R9,BASE+2,RLINK,	:get back flags
+	THI	R9,L.S.HG		:suffix with hang?
+	JEFS	TEXT40			:no
+	LHI	R4,HNGSIG		:yes
+	JAL	RCH,PUTSIG
+
+TEXT40	L	RLINK,TXTSAV		:get link register back
+	THI	R9,L.S.GB		:suffix with Green-ball?
+	JER	RLINK			:no
+	 IF	.2HD
+	TBT	RP,HD202		:half-duplex port ?
+	JEFS	TEXT41
+	SBT	RP,HAFDUX		:set half-duplex flag
+	LHI	RBC,TLTA		:suffix with xmit-LTA
+	JAL	RCH,PUTCHR		:stuff it to to-terminal buffer
+	JFS	TEXT42
+	EI	:.2HD
+TEXT41	LHI	R4,GBSIG		:yes
+	JAL	RCH,PUTSIG		:do it
+TEXT42	FO	SIGNAL
+	JR	RLINK			:then exit
+
+
+:		** Message Control Tables (Explanation) **
+:	The tables pointed to by LSTBL (LSMS27, LSMS, LSMSH, LSMS2P, LSMSP,
+:	LSMSHP) all contain 8 Full-word elements, indexed by Supervisor
+:	message type.  Each full-word element contains 2 fields:
+:	-	message address (relative to BASE, so only needs HW)
+:	-	bit-array flags.
+
+:	The tables pointed to by LSTBLX are basically the same as those
+:	described above but are used when logon status messages are received
+:	from an intelligent gateway.
+
+:	LSTBL - List of pointers to terminal-type arrays.  LSTBL is indexed
+:	basedhether terminal is 2741, ASCII, Half-duplex ASCII
+LSTBL	HC	EA(LSMS27)		:non-PVC 2741
+	HC	EA(LSMS)		:non-PVC normal ASCII
+	HC	EA(LSMSH)		:non-PVC Half-Duplex ASCII
+	 IF	PVC
+	HC	EA(LSMS2P)		:PVC-ALO 2741
+	HC	EA(LSMSP)		:PVC-ALO normal ASCII
+	HC	EA(LSMSHP)		:PVC-ALO Half-Duplex ASCII
+	 EI	:PVC
+
+
+:	LSTBLX	- List of pointers to terminal-type arrays. Used for
+:	gateway calls. Indexed same as *LSTBL*.
+LSTBLX	HC	EA(LSMSNU)		:non-PVC 2741 (unsupported)
+	HC	EA(LSMSX)		:non-PVC normal ASCII
+	HC	EA(LSMSNU)		:non-PVC Half-Duplex ASCII (unsupported)
+	 IF	PVC
+	HC	EA(LSMSNU)		:PVC-ALO 2741 (unsupported)
+	HC	EA(LSMSNU)		:PVC-ALO normal ASCII (unsupported)
+	HC	EA(LSMSNU)		:PVC-ALO Half-Duplex ASCII (unsupported)
+	 EI	:PVC
+
+
+
+:	Message control-tables follow:
+:	These are ordered according to:
+:	-4  -	LOGON ABORTED
+:	-3  -	NO PATH AVAILABLE
+:	-2  -	Zapper
+:	-1  -	Got a pseudo-needle
+:	0 -	continue
+:	1 -	"please log in"
+:	2 -	"error, type username"
+:	3 -	"error, type password"
+:	4 -	"username"
+:	5 -	"password"
+:	6 -	unused
+:	7 -	unused
+
+:       Messages moved to DATA.403 for more efficient data layout *sdw*403
+
+CRLF	XC	8D8A00			:CR|LF
+
+	FO	DATA
+	EM	:LOGGER
+  uV>J
