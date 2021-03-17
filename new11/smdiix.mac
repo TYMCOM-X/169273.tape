@@ -1,0 +1,701 @@
+
+;=========================================================
+; FILENAME: SMDIIX.MAC
+;
+; created:       2/16/87         by: Dianna Tai
+; last version:  6/27/87
+;
+; updates:
+;   6/18/87  DTAI   clean up SDIXSP#(SD) pointer in ZPLCKT
+;                   routine. It causes ATC to crash for next
+;                   IIX logins.
+;   6/23/87  DTAI   allocate a word SDIXTP for the terminal
+;                   side temporary buffer pointer, no longer
+;                   share the SDIXSP with the network side.
+;   6/23/87  DTAI   delete gateway B5 status message flag
+;                   this feature is never going to be supported
+;                   by the gateway group.
+;   6/27/87  DTAI   test SDIXTP after the load message is 
+;                   displayed then decide if want to free the
+;                   packet, type ahead could have caused the
+;                   packet to be freed twice. 
+;=============================================================
+	.PAGE
+	.TITLE	SMDIIX - IIX HANDLEING MODULES 
+	.SBTTL	LKIIIX - NETWORK SIDE
+	XLPAR
+.HLIST=!1
+
+.IF NDF ..IIX			;DEFAULT TO NOT SUPPORT
+   ..IIX=!0			;S-MODE
+.ENDC
+
+
+	CODE
+		
+
+	.PAGE
+	.SBTTL	DATAIN - CHECK ON DATA IN FRAME
+;-------------------------------------------------2/10/87- TAI
+; This routine enters from the LKIPK2 module when a character
+; (in R0) in record from frame is checked to be either a normal
+; data  or when the $I3MSG OR $I3GWY bits are on.
+; If is normal data, control goes back to DATLP5.
+; Otherwise the SIIX message byte in R0 will be put into the 
+; temporary  packet which links to SDIXSP(SD).
+;   In this code, we also need to check on several conditions:
+;   1. If it is the 3rd byte, check if is global IIX message
+;      or is S-Mode message
+;        GLOBAL IIX:
+;               SIIX 80 80 dialect list (variable length)
+;               SIIX 80 81 - ignore
+;		SIIX 80 82 - 
+; 		SIIX 80 83 -
+;		SIIX 80 84 status
+;		SIIX 80 85 - ignore
+;		SIIX 80 86 - ignore
+;		SIIX 80 87 - ignore
+;        S-MODE MSG:
+;		SIIX C0 80
+;		SIIX C0 81 len parity load-msg (variable length)
+;   2. If it is the 4th byte then
+;      a. it is status byte for gateway (SIIX 80 84) message
+;      b. it is length byte for load message (SIIX C0 81) message
+;   3. If the temporary packet overflow then
+;      a. zap logical circuit and flush data it taking dialect list
+;      b. send packet to terminal side and flush data if for load msg
+;----------------------------------------------------------
+DATAIN::
+	TBBN	$I3WAT!$I3MSG!$I3GWY,SDLIS3#(SD),100$
+                      	;IF WAIT FOR termination of SIIX message
+                        ;OR working on load message
+                        ;OR waiting for gateway status byte then
+                        ;put byte  into temp buffer
+	JMP	DATLP5#			;otherwise work on normal data
+
+;--- now we put the byte into temp buffer 
+100$:	MOV	SDIXSP#(SD),R1		;get temp packet
+	BIC	#^HFF00,R0		;IS IT ESCAPE?
+	BNE	120$			;NO, NORMAL CHARACTER
+	DEC	(SP)			;MORE?
+	BMI	500$			;NO, SERIOUS PROBLEM
+	CALL	NXTCHR#			;GET "THE" CHARACTER
+120$:	PUSH	R2			;RESPECT R2
+	MOVB	PKCNT(R1),R2		;KEEPS COUNT IN R2
+	INCB	PKCNT(R1)		;ADJUST COUNT
+	ADD	R2,R1			;FIX POINTER
+	ADD	#PKDATA,R1		;POINT TO THE LOCATION 
+	MOVB	R0,(R1)+		;store byte in
+	INCB	R2			;ADJUST BYTE COUNT
+	BIT	#77,R1			;OVERFLOW?
+	BNE	250$			;NO, CONTINUE
+;----- handle temporary packet overflow problem 
+;
+	POP	R2			;RESTORE R2
+	TBBN	$I3WAT,SDLIS3#(SD),600$	;dialect list overflow?
+	                                ;no, must be load msg overflow
+	BIC	#$I3MSG,SDLIS3#(SD)	;NOT WAITING FOR LOAD MSG ANYMORE
+	BIC	#77,R1			;POINT TO BEGINNING OF PKT
+	CALL	SNDIIX			;SEND TO TERMINAL
+	CLR	SDIXSP#(SD)		;CLEAN UP POINTER
+245$:	DEC	(SP)			;NOW FLUSH DATA, MORE?
+	BMI	247$			;NO
+	CALL	NXTCHR#			;YES, GET NEXT BYTE
+	BR	245$			;CONTINUE FLUSH IT
+247$:	TST	(SP)+			;ADJUST STACK
+	JMP	LKINXT#			;CONTINUE WITH FRAME
+
+;---- here packet not overflow, check if this is the 3rd byte
+;     we read, if so, find out if it is global IIX message or
+;     is S-Mode message
+
+250$:	CMPB	#3,R2			;DID WE JUST TAKE IN THE 3RD BYTE?
+	BNE	300$			;NO, CONTINUE
+	POP	R2			;NO NEED ANYMORE
+	MOVB	-2(R1),R0		;GET THE BYTE AFTER SIIX
+	CMPB	#.IIX80,R0		;IS IT GLOBAL IIX MESSAGE?
+	BEQ	260$			;YES, GO HANDLE GLOBAL IIX MSG
+	JMP	NOTGBL			;NO, SEE IF IS S-MODE MESSAGE
+260$:	JMP	DOGBL			;HANDLE GLOBAL IIX MSG
+;----here we want to see if is the 4th byte
+
+300$:	CMPB	#4,R2			;JUST GOT THE 4TH BYTE?
+	BNE	400$			;NO, CONTINUE
+	POP	R2			;NO NEED ANYMORE
+	TBBN	$I3MSG,SDLIS3#(SD),350$	;WAITING FOR LOAD MESSAGE?
+	TBBE	$I3GWY,SDLIS3#(SD),450$	;NO,WAITING FOR GATEWAY STATUS BYTE?
+	CMPB	-2(R1),#.IIX84		;YES,DOUBLE CHECK IF IS SO
+	BNE	600$
+	JMP	STA84			;YES, GO WORK ON GATEWAY STATUS
+
+350$:	ADD	#5,R0			;ADD LENGTH FOR "SIIX C0 81 LENGTH
+					;   PARITY" FOR LOAD MESSAGE
+	MOVB	R0,SDIXCT#(SD)		;IT IS THE LOAD MSG LENGTH
+	JMP	DATLP1#			;CONTINUE
+400$:	TBBE	$I3MSG,SDLIS3#(SD),420$	;LOAD MESSAGE?
+	CMPB	SDIXCT#(SD),R2		;YES,DONE WITH LOAD MESSAGE?
+	BNE	420$			;NO, CONTINUE
+;---- yes, got the complete load message
+	POP	R2			;NO NEED OF COUNTER ANYMORE
+	BIC	#$I3MSG,SDLIS3#(SD)	;CLEAR THE FLAG
+	BIC	#77,R1			;GET THE PACKET ADDRESS
+	CALL	SNDIIX			;SEND IT TO TERMINAL
+	CLR	SDIXSP#(SD)		;CLEAR THE POINTER	
+	BR	450$
+420$:	POP	R2			;DONE WITH THE COUNTER
+450$:	JMP	DATLP1#			;CONTINUE WITH FRAME
+500$:	JMP	BADCPR#			;BAD CHARACTER
+600$:	JMP	ZPLCKT
+;------------------------------------------------------------
+;   The following code is to check for the global IIX message:
+;   
+;------------------------------------------------------------
+DOGBL:
+	MOVB	-1(R1),R0		;GET THE BYTE AFTER SIIX 80
+	BIC	#^HFF80,R0		;GET RID OF UNNEEDED BITS
+	BEQ	100$			;IF IS 8080, CONTINUE
+; -- for anything bigger than 8080
+	TBBN 	$I3DIA,SDLIS3#(SD),BAD3 ;NOT WAITING FOR DIALECT EXCH.
+	ASL	R0			;FOR WORD INDEXING
+	CMP	#IIXMAX,R0		;WRONG OFFSET?
+	BLO	BAD3			;WRONG GLOBAL IIX MSG
+;-- between 81-87
+   
+100$:	JMP	@IIXDSP(R0)		;DISPATCH THE GLOBAL IIX
+
+;Dispatch table for the Global IIX message
+	
+	PURE
+
+IIXDSP:	.WORD	IIX80			;8080,SELECT DIALECT
+	.WORD	FREIIX			;8081,DIALECT SELECTED
+	.WORD	IIX82			;8082,GATEWAY REACHED SMART HOST
+	.WORD 	IIX83			;8083,GATEWAY REACHED DUMB HOST
+	.WORD	IIX84			;8084,NORMAL LOGON STATUS
+	.WORD	FREIIX			;8085,RESYNC INTERFACE EXCHANGE
+	.WORD	FREIIX			;8086,PRODUCT ID AND VERSION
+	.WORD	FREIIX			;8087,REQUEST PID AND VERSION
+IIXMAX=!.-IIXDSP
+
+	.PAGE
+; ---Here are code for global IIX message
+	.SBTTL	GLOBAL IIX ROUTINES
+	
+	CODE
+
+IIX80:	BIC	#$I3DIA,SDLIS3#(SD)	;CLEAR WAITING FOR DIALECT FLAG
+;	MOV	#ZPLCKT,R1		;SET ZAP LOGICAL CKT ROUTINE TO BE
+;					;KILLED
+;	CALL	TIMKIL#			;KILL THIS TIMER
+	JMP	DATLP1#			;CONTINUE WITH FRAME
+	
+IIX82:	BIS	#$I3DIA,SDLIS3#(SD)	;WAITING DIALECT
+	BIC	#$I3WAT,SDLIS3#(SD)	;DONE WITH SIIX MESSAGE
+	MOV	SDIXSP#(SD),R1		;DISPOSE TEMPORARY PKT
+	FREPKT	
+	CLR	SDIXSP#(SD)		;CLEAN UP POINTER
+	JMP	DATLP1#			;CONTINUE  WITH FRAME
+
+IIX83:	BIC	#$I3WAT,SDLIS3#(SD)	;DONE WITH SIIX MESSAGE
+	MOV	SDIXSP#(SD),R1		;DISPOSE TEMPORARY PKT
+	FREPKT	
+	CLR	SDIXSP#(SD)		;CLEAN UP POINTER
+
+INFTRM:	BIC	#$I3IIX,SDLIS3#(SD)	;DUMB HOST, NOT IIX
+	MAKPKT	.PLOPT#			;GET A PACKET
+	BCS	BAD3			;IF CANNOT GET ONE
+	MOVB	#.FNCLI,PKDATA(R1)	;SET UP CLEAR LOGIN FUNCTION PKT
+	CLRB	PKDATA+1(R1)		;INDICATE NOT IIX CKT
+	MOV	#.PTFUN*400+2,PKCNT(R1)	;SET UP FUNCTION 
+	CALL	SNDIIX			;SEND TO TERMINAL SIDE
+	JMP	DATLP1#			;CONTINUE  WITH FRAME
+
+IIX84:	BIC	#$I3WAT,SDLIS3#(SD)	;CLEAR WAIT FLAG
+	BIS	#$I3GWY,SDLIS3#(SD)	;SET FLAG TO WAIT FOR STATUS BYTE
+  	JMP	DATLP1#			;CONTINUE
+
+FREIIX:	BIC	#$I3WAT,SDLIS3#(SD)	;DONE WITH SIIX MESSAGE
+	MOV	SDIXSP#(SD),R1		;GET TEMP PKT ADDRESS
+	FREPKT				;FREE THIS PACKET
+	CLR	SDIXSP#(SD)		;CLEAN UP POINTER
+	JMP	DATLP1#			;CONTINUE
+	
+;--- the bad condition that logical circuit should be zapped
+BAD3:	JMP	ZPLCKT
+
+;-------------------------------------------------------------
+;   The following code is executed when a gateway status byte
+;   is detected in R0
+;------------------------------------------------------------
+
+STA84:	BIC	#$I3GWY,SDLIS3(SD)	;CLEAN UP FLAG 
+	MOV	SDIXSP#(SD),R1		;CLEAN UP TEMPORARY PACKET
+	FREPKT				;FREE THIS PACKET
+	CLR	SDIXSP#(SD)
+
+;--- clear output buffer?
+	TBBE	<^H20>,R0,10$		;CLEAR OUTPUT BUFFER?
+	MAKPKT	.PLSTP#			;YES-SEND EAT PACKET
+	BCS	10$			;CANNOT GET PACKET
+	MOV	#.PTEAT*400+1,PKCNT(R1)	
+	CLRB	PKDATA(R1)	
+	CALL	LKISPK
+
+;--- check echoing 
+10$:	BIS	#$I1PWM,SDLIS1#(SD)	;ASSUME DEFAULT OF PASSWD
+	TBBE	<^H40>,R0,20$		;ENABLE ECHOING?
+	BIC	#$I1PWM,SDLIS1#(SD)	;YES,CLEAR PASSWORD ENTRY
+					;MODE
+	MAKPKT	.PLSTP#			;GET A PACKET
+	BCS	20$			;CANNOT GET ONE
+	MOV	#.PTFUN*400+3,PKCNT(R1)	;SET FUNCTION & COUNT
+	MOV	#.TPECH*400+.FNSDP,PKDATA(R1)
+	MOVB	#1,PKDATA+2(R1)
+	CALL	LKISPK#			;SEND IT
+
+20$:	
+	TBBE	<^H80>,R0,30$		;GO FOR B5 FORMAT?
+	PUSH	R0			;RESPECT R0
+	PUSH	R2			;RESPECT R2
+	PUSH	R3			;RESPECT R3
+	CALL	CLRINP#			;CLEAR INPUT BUFFER
+	POP	R3			;RESTORE R3
+	POP	R2			;RESTORE R2
+	POP	R0			;RESTORE R0
+
+30$:	BIC	#^C^H1F,R0		;CLEAR EXTRA BIT
+	CMPB	#^H13,R0		;INVALID?
+	BLT	BADY			;YES, ZAP CIRCUIT
+	CMPB	#7,R0			;SEE HOW MUCH TO ADJUST
+	BGE	40$			;NO NEED TO ADJUST
+	ADD	#3,R0			;ADJUST INDEX TO MSG
+
+40$:	PUSH	#BACK			;PUSH RETURN ADDRESS ONTO
+					;STACK
+	PUSH	R0			;FOR LGIC36 TO POP IT
+	JMP	IIXCAL#			;MAKE AND SEND PACKET
+BACK:	JMP	DATLP1#
+BADY:	JMP	ZPLCKT
+
+	.PAGE
+	.SBTTL TOSIIX - HANDLE SIIX FUNCTION (FROM NETWORK)
+;-------------------------------------------------------
+; 1/29/87- TAI, S-MODE PROJECT
+;
+;THIS ROUTINE IS CALLED BY THE LKIPK2 MODULE WHEN CONDSP
+;DISPATCH THE SIGNAL TO 6 (= .CISIX) 
+;is called only when ..IIX=1
+;	C(SP) = BYTE COUNT OF THE RECORD 
+;-----------------------------------------------------
+TOSIIX::	
+	BIC	#77,R1			;POINT TO BEGINNING OF PACKET
+	TBBE	$I3IIX,SDLIS3#(SD),10$	;REQUEST IIX CIRCUIT?
+	TBBN	$I3MSG,SDLIS3#(SD),10$	;YES, STILL COLLECTING LOAD MSG?
+
+	BIS	#$I3WAT,SDLIS3#(SD)	;SET FLAG TO WAIT FOR TERMINATION
+					;OF THE SIIX MESSAGE
+	MOV	#.PTFUN*400+1,PKCNT(R1)	;PREPARE THE FUNCTION & BYTE COUNT
+	MOVB	#.FNSIX,PKDATA(R1)	;IS SIIX FUNCTION
+	MOV	R1,SDIXSP#(SD)		;LINK THIS TEMPORARY PACKET
+	JMP	DATLP1#			;CONTINUE
+
+10$:	FREPKT		
+	JMP	ZPLCKT			;ZAP THE LOGICAL CIRCUIT
+
+	.SBTTL	TOTIIX - HANDLE TIIX FUNCTION
+;-------------------------------------------------------
+; 2/6/87 - TAI, S-MODE SUPPORT
+;
+;THIS ROUTINE IS CALLED BY THE LKIPK2 MODULE WHEN CONDSP
+;DISPATCH THE SIGNAL TO 7 (= .CITIX)
+;IT IS CALLED ONLY WHEN ..IIX = 1, $I3MSG=0
+;  1. SEND  TIIX FUNCTION PACKET  TO TERMINAL SIDE
+;     if not in waiting for dialect list mode.
+;  2. IF $I3WAT = 1 
+;        a. RESET $I3WAT FLAG
+;        b. DISPATCH DIALECT LIST AND FIND THE DIALECT
+;        c. FREE THE TEMP BUFFER, CLEAR POINTER
+;        d. send SIIX 8081 dialect to network
+;        e. finishing up the tasks for each dialect case
+;----------------------------------------------------------
+TOTIIX::
+	BIC	#77,R1			;POINT TO BEGINNING OF PKT
+	TBBE	$I3IIX,SDLIS3#(SD),10$	;REQUEST IIX?
+	TBBE	$I3MSG,SDLIS3#(SD),20$	;YES, STILL TAKING LOAD MSG?
+10$:	FREPKT				;FREE THAT PACKET
+	JMP	ZPLCKT			;ZAP LOGICAL ZIRCUIT
+
+20$:	TBBN	$I3WAT,SDLIS3#(SD),25$ ;WAITING FOR TIIX?
+;---  prepare the TIIX record to send to terminal side
+	MOV	#.PTFUN*400+1,PKCNT(R1)	;SET UP FUNCTION TYPE & COUTN
+	MOVB	#.FNTIX,PKDATA(R1)	;PUT TIIX IN
+	CALL	LKISPK#			;SEND TO TERMINAL
+	JMP	DATLP1#			;no,CONTINUE WITH FRAME
+
+;--- ready to dispatch the dialect in a packet linked to SDIXSP
+; clear wait flag first
+25$:	FREPKT				;DISPOSE THE PACKET
+DODIA:	BIC	#$I3WAT,SDLIS3#(SD)	;CLEAR WAIT FLAG
+	MOV	SDIXSP#(SD),R1		;GET PACKET ADDRESS
+	PUSH	R2			;RESPECT R2
+	MOVB	PKCNT(R1),R2		;R2 HAS LENGTH OF DIALEC LIST
+	SUB	#3,R2			;DISCARD THE "SIIX 80 80"
+	ADD	#PKDATA+4,R1		;R1 POINTS TO 2ND BYTE OF DIALECT
+					;SKIP THE "SIIX 80 80"
+20$:	MOVB	(R1),R0			;GET THE DIALECT
+	CMPB	#.IIX93,R0		;IS IT 8093?
+	BEQ	60$			;YES
+	CMPB	#.IIX82,R0		;IS IT 8082?
+	BEQ	85$			;YES
+	CMPB	#.IIX81,R0		;IS IT 8081?
+	BEQ	60$			;YES
+	ADD	#2,R1			;NO, POINT TO 2ND BYTE OF NEXT DIALECT
+	SUB	#2,R2			;ADJUST COUNTER
+	BGT	20$			;MORE DIALECTR? YES, CONTINUE
+	MOV	#.IIX80,R0		;CANNOT FIND DIALECT,
+                                        ;PREPARE TO REJECT
+;--- now clear the pointer and free the packet linked to SdIXSP
+60$:	POP	R2			;RESTORE R2
+	BIC	#77,R1			;GET PACKET ADDRESS
+	FREPKT				;FREE THIS PACKET
+ 	CLR	SDIXSP#(SD)		;CLEAN UP POINTER
+;
+;--- now get a packet and send the dialect selected with SIIX
+;    8081 dialect 
+;
+	MAKPKT	.PLOPT#			;GET A PACKET
+	BCS	BAD1			;IF CANNOT GET ONE
+	MOV	#.PTFUN*400+5,PKCNT(R1)	;SET UP FUNCTION TYPE & COUNT
+	MOVB	#.FNSIX,PKDATA(R1)	;IS SIIX
+	MOVB	#.IIX80,PKDATA+1(R1)	;PUT 80 IN
+	MOVB	#.IIX81,PKDATA+2(R1)	;PUT 81 IN, DIALECT SELECTED
+	MOVB	#.IIX80,PKDATA+3(R1)	;PUT 80 IN FOR DIALECT
+	MOVB	R0,PKDATA+4(R1)		;PUT DIALECT IN   
+	PUSH	R0			;RESPECT R0
+	PUSH	R2			;RESPECT R2
+	PUSH	R3			;RESPECT R3
+	CALL	PKTSLF#			;SEND TO NETWORK
+	POP	R3			;RESTORE R3
+	POP	R2			;RESTORE R2
+	POP	R0			;RESTORE R0
+;--- finish remaining tasks
+80$:	CMPB	R0,#.IIX80 		;IS IT 8080?
+	BEQ	BAD1			;REJECT DIALECT, ZAP CIRCUIT
+
+	CMPB	R0,#.IIX81		;IS IT ASCII?
+	BNE	82$			;NO, CONTINUE
+	JMP	INFTRM			;YES, INFORM TRM IT IS DUMB
+					;HOST
+82$:	CMPB	R0,#.IIX93		;IS IT SMODE?
+	BNE	85$			;NO, CONTINUE
+	BIS	#$I3SMO,SDLIS3#(SD)	;INDICATE IN S-MODE STATE
+	JMP	DATLP1#			;CONTINUE WITH FRAME
+
+85$:	CMPB	R0,#.IIX82		;GATEWAY?
+	BNE	BAD1			;NO,IMPOSSIBLE
+
+;---- Here it is gateway
+	POP	R2			;RESTORE R2
+	BIC	#77,R1			;GET PACKET ADDRESS
+	FREPKT				;GET RID OF TEMP PACKET
+	CLR	SDIXSP#(SD)		;CLEAN UP POINTER
+	JMP	DATLP1#			;CONTINUE  WITH FRAME
+
+BAD1:	JMP	ZPLCKT
+
+
+	.PAGE
+	.SBTTL - HANDLE NON GLOBAL IIX MESSAGE (FROM NETWORK)
+;-----------------------------------------------------
+; This routine handles the NON-GLOBAL IIX message.
+; If is not in the S-MODE state --> zap logical circuit
+; otherwise check if the msg is
+;     C080 -- send an IIX function pkt with C080 to TRM
+;       data area:
+;               |--------|----|----|
+;               | .FNSIX | C0 | 80 |
+;               |--------|----|----|
+;     C081 -- set the flag $I3MSG,
+;             get a packet link to SDIXSP to store msg
+;             keep reading the packet until read # of
+;             bytes which meets byte count.
+;             reset I3MSG,
+;             send the packet to TRM
+;               |--------|----|----|-----|-----|-----|
+;     data area:| .FNSIX | C0 | 81 | len | par | msg |
+;               |--------|----|----|-----|-----|-----|
+;-----------------------------------------------------
+NOTGBL:	BIC	#$I3WAT,SDLIS3#(SD)	;DO NOT NEED THIS FLAG ANYMORE
+	TBBE	$I3SMO,SDLIS3#(SD),30$ ;ZAP CKT IF NOT IN SMODE
+	CMPB	#.IIXC0,R0		;IN S-MODE, IS IT C0?
+	BNE	30$			;NO
+	MOVB	-1(R1),R0		;GET BYTE AFTER SIIX C0
+	CMPB	#.IIX80,R0		;IS IT 80?
+	BNE	20$			;NO, TRY 81
+
+;--- is SIIX C0 80
+	BIC	#77,R1			;POINT TO BEGINNING OF PKT
+	CALL	SNDIIX			;SEND PACKET TO TERMINAL SIDE
+	JMP	DATLP1#
+
+;--- check if is SIIX C0 81
+20$:	CMPB	#.IIX81,R0		;IS IT 81?
+	BNE	30$			;NO, ZAP LOGICAL CIRCUIT
+	CLRB	SDIXCT#(SD)		;INITIALIZE COUNTER TO 0
+	BIS	#$I3MSG,SDLIS3#(SD)	;WAITING FOR LOAD MSG FLAG ON
+	JMP	DATLP1#			;CONTINUE  WITH FRAME
+30$:	JMP	ZPLCKT
+
+	
+	.PAGE
+	.SBTTL	CHKIIX - CONFIRM IIX CKT WITH NEEDLE INFORMATION
+;------------------------------------------------------------
+; This routine is called by LKIPK2 when a needle is returned.
+; It checks on 4 conditions and passes the IIX information to
+; the terminal side in the CLEAR LOGIN MODE PACKET data byte #2
+; (the first byte indicate the mode).
+; 4 conditions:
+;                 Needle(IIX)         Needle(Non-IIX)
+;  IIX request    leave it alone      reset $I3IIX bit
+;  NOT IIX req    FSTOP IIN           leave it alone
+;
+;	CALL 	CHKIIX
+;-------------------------------------------------------------
+CHKIIX::
+	TBBE	$I3IIX,SDLIS3#(SD),60$	;IIX REQUEST?
+	TBBN	$I2IIX,SDLIS2#(SD),70$	;YES,NEEDLE RETURNS IIX CKT?
+	BIC	#$I3IIX,SDLIS3#(SD)	;NO,RESET
+	BR	70$
+60$:	TBBE	$I2IIX,SDLIS2#(SD),70$	;NOT IIX REQ, BUT NEEDLE SAY IIX
+	FSTOP	IIN			;IMPOSSIBLE
+					;[ILLEGAL IIX IN NEEDLE]
+70$:	CLRB	PKDATA+1(R1)		;INFORM NON-IIX AS DEFAULT
+	TBBE	$I3IIX,SDLIS3#(SD),80$	;NOT IIX CIRCUIT
+	MOVB	#200,PKDATA+1(R1)	;SET IIX FLAG 
+	BIS	#$I3DIA,SDLIS3#(SD)	;WAITING FOR DIALECT EXCHANGE
+;	PUSH	R0			;RESPECT R0
+;	PUSH	R1			;RESPECT R1
+;	MOV	#JIFX90#,R0		;SET FOR 1.5 MINUTES TIMEOUT
+;	MOV	#ZPLCKT,R1		;DECLARE TIMEOUT ROUTINE ADDR
+;	CALL	TIMREQ#			;PUT IT ONTO TIMER LIST
+;	POP	R1
+;	POP	R0
+80$:	RETURN
+		
+
+	.PAGE
+	.SBTTL	SNDIIX - SEND THE IIX RELATED PACKET TO TERMINAL
+;------------------------------------------------------ 2/26/87,TAI
+; This routine sends the packet handled in the IIX routines to
+; the terminal side of the node.
+;------------------------------------------------------------------
+SNDIIX::
+	PUSH	R2			;RESPECT R2
+	PUSH	R3			;RESPECT R3
+	INCB	SDPCNT#(SD)		;BUMP PACKET COUNT
+	CALL	SNDPKT#			;SEND IT
+	POP	R3			;RESTORE R3
+	POP	R2			;RESTORE R2
+	RETURN
+
+
+	.PAGE
+	.SBTTL	ZPLCKT - ZAP LOGICAL CIRCUIT
+;------------------------------------------------2/4/87 - TAI
+; This routine is entered to kill the connection for any IIX 
+; protocol error. It performs the following:
+;   1. clear SDLIS3 flags
+;   2. if SDIXSP is not 0, free the pkt linked to it
+;       and clear the SDIXSP pointer
+;   3. kill the line and connection in node
+;   4. flush the data in the same record
+;----------------------------------------------------------------
+ZPLCKT::
+	CLR	SDLIS3#(SD)		;CLEAR FLAGS
+	TST	SDIXSP#(SD)		;ANY TEMP BUFFER?
+	BEQ	10$			;NO, CONTINUE
+	MOV	SDIXSP#(SD),R1		;GET PACKET ADDRESS
+        CLR     SDIXSP#(SD)             ;6/18/87 TAI,CLEAN UP PTR
+	FREPKT				;FREE THIS PACKET
+10$:	
+	PUSH	R0			;RESPECT R0
+	MOV	.ERIIX,R0		;PREPARE ERROR CODE
+	MAKPKT	.PLKIL#			;GET A PACKET
+	BCS	20$			;SHOULD ALWAYS GET ONE THOUGH
+	CALL	SETKIL#			;BUILD A KILL PACKET
+	POP	R0			;RESTORE R0
+
+	PUSH	R2			;SAVE R2
+	PUSH	R3			;SAVE THIS IMPORTANT REGISTER
+	CALL	SNDSRC#			;SEND ITURSELVES
+	POP	R3			;RESTORE R3
+	POP	R2			;RESTORE R2
+
+;now flush the data in the same record and  continue with the frame
+
+20$:
+	DEC	(SP)			;MORE THERE?
+	BMI	30$			;FINISHED?
+	CALL	NXTCHR#			;NO,FLUSH THE DATA
+	BR	20$			;CONTINUE
+30$:	TST	(SP)+			;POP THE RECORD COUNT
+	JMP	LKINXT#			;CONTINUE WITH THE FRAME
+
+	.PAGE
+	.SBTTL	TRMIIX - TERMINAL SIDE IIX HANDLING MODULES
+
+	.SBTTL	TRMSIX - TERMINAL SIDE SIIX HANDLING
+;--------------------------------------------------2/11/87- TAI
+; This routine is entered from TRMF the FUNDSP jump table
+; when R0 = 52 = .FNSIX.
+;
+; If request for IIX circuit flag is not set, send disconnect
+; packet to the network side, otherwise dispatch the packet:
+;    if C080 (clear msg) then
+;        give up the SIIX packet
+;        if there is load msg on SDIXTP, give up the pkt and
+;            clean up pointer
+;    else if C081 (load msg) then
+;        get a new packet  and dispatch on this one:
+;          1. message count --> SDIXCT
+;          2. parity byte   --> PARITY
+;          3. load message ---> new packet
+;          4. message count ---> new packet PKCNT field
+;          5. link the new packet to SDIXTP
+;          6. dispose the SIIX function packet
+;    else
+;        ignore this packet
+;    endif
+;    PKDATA area format for Load Message Packet
+; |--------|----|----|--------|--------|------------|
+; | .FNSIX | C0 | 81 | length | parity | data ......|
+; |--------|----|----|--------|--------|------------|
+;
+;------------------------------------------------------------
+TRMSIX::
+.IF NE ..IIX
+	TBBE	$T1IIX,SDTRS1#(SD),RTN000	;REQUEST IIX CKT?
+	CMPB	PKDATA+1(R1),#.IIXC0		;IS 2ND BYTE C0?
+	BNE	RTN000				;NO, IGNORE IT
+
+	CMPB	PKDATA+2(R1),#.IIX80		;IS IT C080 (CLEAR MSG)?
+	BNE	10$				;NO, CONTINUE
+
+	TST	SDIXTP#(SD)			;ANY LOAD MSG LINKED?
+	BEQ	RTN000				;NO, RETURN
+	PUSH	R1				;RESPECT R1
+	MOV	SDIXTP#(SD),R1			;YES, GET  PKT ADDRESS
+	FREPKT					;FREE THIS PACKET
+	POP	R1				;RESTORE R1
+	CLR	SDIXTP#(SD)			;CLEAR LOAD MSG POINTER
+	BR	RTN000				;RETURN
+
+10$:	CMPB	PKDATA+2(R1),#.IIX81		;IS IT C081 (LOAD MSG)?
+	BNE	RTN000				;NO, SIMPLY IGNORE
+;--- now copy this packet to a new data packet
+	PUSH	R2				;RESPECT R2
+	PUSH	R1				;RESPECT R1
+	MAKPKT	.PLOPT#				;GET A PACKET
+	BCS	RTNXXX				;RETURN IF CANNOT GET ONE
+	MOV	R1,R2				;R2 POINTS TO NEW PACKET
+	POP	R1				;R1 POINTS TO LOAD MSG PKT
+	CLRB	PKTYPE(R2)			;MAKE IT A DATA PACKET
+;---- now save the parity information
+	PUSH	R0
+	MOVB	PKDATA+4(R1),R0
+	MOVB	R0,PARITY#(SD)
+;---  get length counter
+	MOVB	PKDATA+3(R1),R0			;LOAD MESSAGE LENGTH
+	MOVB	R0,PKCNT(R2)			;ENTER BYTE COUNT
+	MOVB	R0,SDIXCT#(SD)			;SAVE BYTE COUNT
+	ADD	#PKDATA+5,R1			;R1 POINTS TO MESSAGE
+	ADD	#PKDATA,R2			;R2 POINTS TO DATA AREA
+20$:	MOVB	(R1)+,(R2)+			;COPY IT OVER
+	DEC	R0				;DECREMENT COUNTER
+	BGT	20$				;MORE?
+	MOVB	#0,(R2)+
+	POP	R0				;RESPECT R0
+;---- now done, release the load message function packet and
+;     link the new one to SDIXTP
+	BIC	#77,R2				;POINT TO BEGINNING ADDRESS
+	MOV	R2,SDIXTP#(SD)			;LINK TO SDIXTP
+	POP	R2				;RESTORE R2
+	BIC	#77,R1				;POINT TO BEGINNING ADDRESS
+	JMP	PKTFIN#
+RTNXXX:	POP	R1				;RESPECT R1
+	POP	R2				;RESPECT R2
+RTN000:	JMP	PKTFIN#				;RETURN
+.ENDC
+
+	.PAGE
+	.SBTTL OUTMSG - DISPLAY LOAD MESSAGE & CHANGE PARITY
+;------------------------------------------------2/11/87 - TAI
+; This subroutine is called from SATDIS routine in CMDSAT module. 
+; When the terminal side receives a Kill or Disconnect packet
+;   1. reset IIX circuit request bit
+;   2. change the parity according to parity byte:
+;         0 - current state parity
+;         1 - null parity (save parity)
+;         2 - space parity (parity bit = 0)
+;         3 - even parity
+;   3. Display the load message
+;   4. clear SDIXTP pointer, free load msg packet
+;   5. return parity to original state for next logon 
+;
+;	CALL	OUTMSG
+;------------------------------------------------------------
+OUTMSG::
+.IF  NE ..IIX
+	TBBE	$T1IIX,SDTRS1#(SD),RTN001	;REQUEST IIX CIRCUIT?
+	TST	SDIXTP#(SD)			;YES, GOT LOAD MSG?
+	BEQ	RTN001				;NO, RETURN
+
+	BIC	#$T1IIX,SDTRS1#(SD)		;RESET THE IIX FLAG
+;---- now work on the parity bit
+	TSTB	PARITY#(SD)			;CURRENT PARITY?
+	BEQ	40$				;SKIP	
+	CMPB	#1,PARITY#(SD)			;NULL (SAVE)PARITY?
+	BNE	10$				;NO, GO ON
+	BIC	#$T2SPP,SDTRS2#(SD)		;YES, SAVE PARITY
+	BR	40$
+10$:	CMPB	#3,PARITY#(SD)			;EVEN PARITY?
+	BNE	20$				;NO, GO ON
+	BIC	#$T2SPP,SDTRS2#(SD)		;YES, disable space p
+	BIS	#$T4PAR,SDTRS4#(SD)		;enable parity handling
+	BIC	#$T4ODD!$T4CHK,SDTRS4#(SD)	;and disable odd p
+	PUSH	R0				;RESPECT R0
+	MOV	#.LFSET,R0			;SET UP THE INTERFACE 
+						;  HARDWARE
+	CALL	TRMFNC#				;PERFORM TEMINAL FUNCTION
+	POP	R0				;RESTORE R0
+	BR	40$
+
+20$:	BIS	#$T2SPP,SDTRS2#(SD)		;OTHEWISE SPACE P.
+
+;--- now display load message
+40$:	MOV	SDIXTP#(SD),R1			;GET PKT ADDRESS
+	ADD	#PKDATA,R1			;POINT TO DATA AREA
+	CALL	OUTSTR#				;DISPLAY THIS STRING
+;--- now clear pointer and release packet
+	TST	SDIXTP#(SD)			;FREE PACKET?
+	BEQ	45$				;ALREADY CLEANED
+	MOV	SDIXTP#(SD),R1
+	FREPKT				
+	CLR	SDIXTP#(SD)			;CLEAN UP POINTER
+;---- now return the parity to its original state 
+45$:	BIC	#$T2SPP,SDTRS2#(SD)		;Disable space parity output
+	CMPB	#3,PARITY#(SD)			;EVEN parity?
+	BNE	50$				;NO, CONTINUE
+	BIC	#$T4PAR,SDTRS4#(SD)		;disable parity handling
+	PUSH	R0
+	MOV	#.LFSET,R0			;SET UP THE INTF HARDWARE
+	CALL	TRMFNC#
+	POP	R0
+
+50$:	CMPB	SDTRTT#(SD),#T.CRTO		;Prism type terminal?
+	BNE	RTN001
+	BIS	#$T2SPP,SDTRS2#(SD)		;Enable space parity output
+RTN001:	RETURN
+.ENDC
+	.END
+   U ,ß
