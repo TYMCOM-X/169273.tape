@@ -1,0 +1,453 @@
+begin	"SUPMAP"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(WRS)AUXLIB.REQ" source!file;
+require "(WRS)ARGS.REQ" source!file;
+require '17 version;
+
+! v17 3-Dec-86 WRS	Converted dates to YYMMDD format.
+! v16 7-Aug-86 WRS	Add "S" record to output file.
+! v15 2-Jul-86 WRS	Increased MaxNode to 65535, queue width to 18 bits.
+! v14 18-Jun-86 WRS	Setup for 5 digit host numbers.
+;
+
+string SYSNO;
+
+define MaxNode = 65535;
+boolean array Queued[1:MaxNode];
+string	Queue;
+integer RootNode;
+integer C,E;	! output channel vars;
+
+string item OUTFILE;
+item DETACH;
+item HELP;
+string item GATEWAY;
+integer item SUPHOST;
+item TRACE;
+
+simple boolean procedure lequ( string S1,S2 );
+begin
+    while length(S1) and S1 < " " do lop(S1);
+    return( kequ( S1[1 to length(S2)], S2 ) );
+end;
+
+integer isNumBrk,noBlanks,tokBrk;
+simple procedure BrkIni;
+begin
+    setbreak(isNumBrk_getbreak,"0123456789"," ","XT");
+    setbreak(noBlanks_getbreak,null," ","IS");
+    setbreak(tokBrk_getbreak," "&#ht&crlf," "&#ht&crlf,"TIS");
+end;
+require BrkIni initialization;
+
+simple string procedure tok( reference string S );
+begin
+    integer B;
+    return( scan( S, tokBrk, B ));
+end;
+
+simple boolean procedure isNumber( string S );
+begin
+    integer B;
+    return( length( scan( S, isNumBrk, B )));
+end;
+
+simple procedure enQueue( integer N );
+if arrinfo(Queued,1) leq N leq arrinfo(Queued,2) then begin
+    if not Queued[n] then begin
+	Queued[n] := true;
+	Queue := Queue& char!w( N, 18 );
+    end;
+end
+else
+    print( "%enQueue: node number out of range: ", N, crlf );
+
+simple string procedure Speed( string LS );
+begin
+    integer B;
+    return( ( scan( LS, noBlanks, B ) & "    " )[1 to 4] );
+end;
+
+preload!with 0,31,60,91,121,152,182,213,244,274,305,335;
+integer array MonthOrigin[1:12];
+
+string procedure cvDate( string JD );
+!	Takes supervisor standard date and time (DDD:HH:MM:SS) and converts to
+!	conventional date and time (YYMMDD:HH:MM:SS). ;
+begin
+	integer DOY,DEC,YY,MM,DD;
+	DOY := cvd( JD[1 to 3] );
+	DEC := calli( 0, '14 );
+	YY := DEC % 372 + 64;
+	if DEC mod 372 < 124 and DOY > 243 then YY := YY - 1;
+	if YY mod 4 and DOY geq 60 then DOY := DOY + 1;
+	for MM := 12 downto 1 do if MonthOrigin[MM] < DOY then done;
+	DD := DOY - MonthOrigin[MM];
+	return(
+		cvs(YY+100)[2 to inf]&
+		cvs(MM+100)[2 to inf]&
+		cvs(DD+100)[2 to inf]&
+		JD[4 to inf]  );
+end;
+
+procedure ScanArgs;
+begin
+    integer I;
+    if not ArgParse( any, OUTFILE, {DETACH,HELP,GATEWAY,SUPHOST,TRACE}, Args )
+    or ARGV[1] = "?" then calli(0,'12);
+    if props(HELP) then print( "
+SUPMAP (version ",cvos(memory['137]),
+		"): obtain network topology from supervisor
+
+Syntax:
+    SUPMAP outfile /SUPHOST:n /options
+
+Arguments:
+    outfile	- the name of the output file (default is SUPMAP.DAT)
+
+Options: (may be abbreviated to first letter)
+    /DETACH	- detach after connection is established
+    /GATEWAY:g	- specify username or host number of gateway
+    /HELP	- print this help message
+    /SUPHOST:n	- collect data from supervisor number ""n"" (default is *)
+    /TRACE	- display traffic on terminal (for debugging)
+    
+Output file format:
+    S supn status waketime currtime	('S',1X,I3,1X,A1,1X,A15,1X,A15)
+    N node version type passthroughs	('N',1X,I5,1X,I6,1X,I2,1X,I5)
+    H node host product			('H',1X,I5,1X,I5,1X,A16)
+    L node node speed window groups	('L',1X,I5,1X,I5,1X,A4,1X,A1,1X,I5)
+
+record type: S	- one record per file
+    supn	supervisor host number from which data was collected
+    status	sup status at time of collection (Awake,Frozen,Sleeping)
+    waketime	time sup was last awake in form yymmdd:hh:mm:ss
+    currtime    time collection was started in form yymmdd:hh:mm:ss
+
+record type: N	- one record per node
+    node	node number in octal
+    version	node version in decimal
+    type	node type in decimal
+    passthroughs number of passthroughs permitted in decimal
+
+record type: H	- one record per host interface
+    node	node number in octal
+    host	host number in decimal
+    product	product id code in ascii
+
+record type: L	- one record per link
+    node	node number in octal of first end
+    node	node number in octal of second end
+    speed	link speed in ascii
+    window	window size in decimal
+    groups	number of groups in decimal
+
+Caveat: collecting topology from the active supervisor may result in incon-
+sistent or incomplete data.  It is recommended that data be collected from
+the most recently active sleeping supervsior.
+
+", call(0,"EXIT") );
+
+    AuxTrace := props(TRACE);
+    if props(SUPHOST) then begin
+	if 1 leq datum(SUPHOST) leq 7
+	    then SYSNO := cvs(datum(SUPHOST)+120)
+	else if 121 leq datum(SUPHOST) leq 127
+	    then SYSNO := cvs(datum(SUPHOST))
+	else
+	    usererr(datum(SUPHOST),2,"?illegal SUP HOST specified: ","X");
+    end
+    else
+	SYSNO := "*";
+    if not props(OUTFILE) then datum(OUTFILE) := "SUPMAP.DAT";
+    open( C_getchan,"DSK",0,0,4, 0,0,E);
+    if E then usererr(0,0,"?ScanArgs: can't open DSK:","X");
+    enter( C, datum(OUTFILE), E );
+    if E then usererr(0,0,"?ScanArgs: can't enter DSK:"&datum(OUTFILE),"X");
+end;
+
+procedure Connect;
+begin
+    own integer BUILDcnt;
+    own string PRBPAS,NAME,PASS,Text;
+    own integer STATE;
+    boolean AUXOK;
+    label REBUILD;
+    if props(GATEWAY) and length(PRBPAS) = 0 then begin
+	auxcli(-1,'200,'64);
+	print( "LOGIN Password (PROBE): " );
+	PRBPAS := inchwl;
+	print( crlf );
+	auxcli(-1,0,'64);
+    end;
+    if length(NAME) = 0 then begin
+	print( "PROBE Name: " );
+	NAME := inchwl;
+    end;
+    if length(PASS) = 0 then begin
+	auxcli(-1,'200,'64);
+	print( "PROBE Password (",NAME,"): " );
+	PASS := inchwl;
+	print( crlf );
+	auxcli(-1,0,'64);
+    end;
+REBUILD:
+    setformat(0,0);
+    do begin
+	if ( BUILDcnt := BUILDcnt + 1 ) > 50 then
+	    usererr(0,0,"?connect: rebuild count expired - giving up","X");
+	print( "[ building circuit ]"& crlf );
+	AuxZap;
+	if props(GATEWAY)
+	    then if cvd(datum(GATEWAY))
+		then CREAUX( ":"&4&datum(GATEWAY) )
+		else CREAUX( 4&datum(GATEWAY) )
+	    else CREAUX( 4&"PROBE:"&SYSNO );
+	AUXOK := !SKIP!;
+	if not AUXOK then call(20,"SLEEP");
+    end until AUXOK;
+    STATE := 0;
+    while true do case AuxRead( Text, 10 ) of begin
+	[aux!zap] goto REBUILD;
+	[aux!prompt]
+	    if lequ(Text,"please log in:") then begin
+		if STATE > 1 then begin
+		    print( "%connect: zapped by PROBE"& crlf );
+		    goto REBUILD;
+		end;
+		print( "[ gateway circuit built ]"& crlf );
+		AuxEcho := AuxTrace;
+		auxout( 4&"PROBE:"& SYSNO& ";" );
+		AuxEcho := false;
+		auxout( PRBPAS& #cr );
+		auxsync( #lf );
+		STATE := 1;
+	    end else if lequ(Text,"NAME:") then begin
+		if STATE geq 2 then
+		    usererr(0,0,"?connect: bad PROBE Name","X");
+		print( "[ probe circuit built ]"& crlf );
+		AuxEcho := AuxTrace;
+		auxout( NAME&#cr );
+		STATE := 2;
+	    end else if lequ(Text,"PASSWORD:") then begin
+		if STATE geq 3 then
+		    usererr(0,0,"?connect: bad Password","X");
+		AuxEcho := false;
+		auxout( PASS&#cr );
+		STATE := 3;
+	    end else if lequ(Text,"error") then begin
+		usererr(0,0,"> "&Text&crlf&"?connect: login error","X");
+	    end else if lequ(Text,":") then begin
+		done;
+	    end else begin
+		print( "> ", Text, crlf& "%connect: unexpected prompt"& crlf );
+		goto REBUILD;
+	    end;
+	[aux!line] begin
+	    while length(Text) and Text leq " " do lop(Text);
+	    if length(Text)
+		then if cvd(Text)
+		    then RootNode := '2000+cvd(Text)-120
+		    else print( "> ", Text );
+	end;
+	[aux!timeout] goto REBUILD
+    end;
+    AuxEcho := AuxTrace;
+    if RootNode
+	then print("[ sup ", 120 + (RootNode land 7), " connected ]"&crlf )
+	else usererr(0,0,"?connect: can't find host number","X");
+    if props(DETACH) then begin
+	print("Detaching...");
+	calli(0,-6);
+    end;
+end;
+
+procedure Sleep!Time( integer SupHost );
+comment
+:time
+219:22:43:08
+SLEEPING
+:log 1ls
+219:20:14:04   BY SERANG: SLEEP COMMAND
+CAUGHT UP
+<esc>
+SLEEPING
+:
+;
+begin
+    string Text, STS, CurrUTC, WakeUTC;
+    label RETRY;
+RETRY:
+    STS := "A";
+    CurrUTC := WakeUTC := null;
+    auxOut( "TIME"& #cr );
+    while true do case auxRead( Text, 30 ) of begin
+	[aux!line] begin
+	    while length(Text) and Text leq " " do lop(Text);
+	    if lequ( Text, "SUP FROZEN" ) then STS := "F"
+	    else if lequ( Text, "SLEEPING" ) then STS := "S"
+	    else if lequ( Text, "CAUGHT UP" ) then done
+	    else if cvd( Text ) then begin
+		if length(CurrUTC) = 0
+		    then CurrUTC := Text[1 to 12]
+		    else WakeUTC := Text[1 to 12];
+	    end
+	    else print( "> ", Text, crlf );
+	end;
+	[aux!prompt]
+	    auxOut( "LOG 1LS"& #cr );
+	[aux!zap] begin
+	    print( "*ZAP*"& crlf );
+	    connect;
+	    goto RETRY;
+	end;
+	[aux!timeout] begin
+	    print( "*HUNG*"& crlf );
+	    connect;
+	    goto RETRY;
+	end
+    end;
+    auxOut( #esc );
+    while auxRead( Text, 30 ) = aux!line do;
+    setformat( 0, 0 );
+    case STS of begin
+	["A"] print( "% Warning: sup ", SupHost, " is AWAKE!"& crlf );
+	["F"] print( "% Warning: sup ", SupHost, " is FROZEN!"& crlf );
+	["S"]
+    end;
+    cprint( C, "S ",SupHost," ",STS," ",
+	cvDate(WakeUTC)," ",cvDate(CurrUTC),crlf );
+end;
+
+procedure Hosts!Links( integer Root );
+begin
+    integer I,B;
+    print( "Node: " );
+    Queue := null;
+    enQueue( Root );
+    while length( Queue ) do begin
+	label RETRY;
+	string Text, Buf;
+	integer N, N!, STATE, Version, Type, Passthroughs;
+	N := lop( Queue );
+RETRY:
+	setformat(0,0);
+	if not AuxTrace then print( cvos(N)," " );
+	auxout( "N "&cvos(N)&#cr );
+	setformat(-5,0);
+	STATE := 0;
+	Buf := null;
+	Version := Type := Passthroughs := 0;
+	while true do case AuxRead( Text, 30 ) of begin
+	    [aux!zap] begin
+		print( "*ZAP*"& crlf );
+		connect;
+		goto RETRY;
+	    end;
+	    [aux!prompt] done;
+	    [aux!line]
+		if STATE and isNumber( Text ) then case STATE of begin
+		    [1] begin
+			string pid;
+			Buf := Buf&
+			    "H "&
+			    cvos(N)&" "&
+			    cvs(cvd(tok(Text)))&" ";
+			while length(Text) do
+			    if equ( "IIX-", tok(Text)[1 to 4] )
+				then begin
+				    pid := tok(Text);
+				    done;
+				end
+				else pid := null;
+			Buf := Buf&
+			    pid& crlf;
+		    end;
+		    [2] begin
+			integer N!;
+			tok(Text);		! link number;
+			N! := cvo(tok(Text));	! node number;
+			enQueue( N! );
+			if N < N! then begin
+			    string LS,WS,GR;
+			    if N < '2000	! T-I has an extra field here;
+				then GR := cvs(cvd(tok(Text)))
+				else GR := "    ";
+			    LS := Speed(tok(Text));
+			    WS := " ";
+			    while length(Text) do begin
+				string S;
+				S := tok(Text);
+				if equ(S,"SAT") then
+				    WS := "S"
+				else if equ(S[1 to 2],"WS") then
+				    WS := S[3 for 1];
+			    end;
+			    Buf := Buf&
+				"L "&
+				cvos(N)& " "&
+				cvos(N!)& " "&
+				LS& " "&
+				WS& " "&
+				GR& crlf;
+			end;
+		    end
+		end
+		else if lequ(Text,"VERSION") then begin
+		    while length(Text) do begin
+			string T;
+			T := tok(Text);
+			if equ(T,"VERSION") then
+			    Version := cvd(tok(Text));
+			if equ(T,"TYPE") then
+			    Type := cvd(tok(Text));
+		    end;		    
+		end else if lequ(Text,"AVAILABLE PASSTHROUGHS") then begin
+		    Passthroughs := cvd(Text[24 to inf]);
+		end else if lequ(Text,"HOST STATUS") then begin
+		    if Version then begin
+			Buf := Buf& "N "& cvos(N)& " ";
+			setformat(-6,0);
+			Buf := Buf& cvs(Version)& " ";
+			setformat(-2,0);
+			Buf := Buf& cvs(Type)& " ";
+			setformat(-5,0);
+			Buf := Buf& cvs(Passthroughs)& crlf;
+			Version := 0;
+		    end;
+		    STATE := 1;
+		end else if lequ(Text,"LINK STATUS") then begin
+		    if Version then begin
+			Buf := Buf& "N "& cvos(N)& " ";
+			setformat(-6,0);
+			Buf := Buf& cvs(Version)& " ";
+			setformat(-2,0);
+			Buf := Buf& cvs(Type)& " ";
+			setformat(-5,0);
+			Buf := Buf& cvs(Passthroughs)& crlf;
+			Version := 0;
+		    end;
+		    STATE := 2;
+		end;
+	    [aux!timeout] begin
+		print( "*HUNG*"& crlf );
+		connect;
+		goto RETRY;
+	    end
+	end;
+	cprint( C, Buf );
+    end;
+    print( crlf );
+end;
+
+begin	"M A I N"
+    ScanArgs;
+    Connect;
+    Sleep!Time( 120 + RootNode mod 8 );
+    Hosts!Links( RootNode );
+    close(C);
+end	"M A I N";
+end	"SUPMAP"
+$
+  
