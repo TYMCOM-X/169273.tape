@@ -1,0 +1,5341 @@
+COMMENT
+
+
+
+
+
+
+
+
+		BAIL -- A DEBUGGER FOR SAIL
+
+			by
+
+		John F. Reiser
+		Computer Science Department
+		Stanford University
+		Stanford, California 94305
+
+
+
+
+
+
+
+		March 1976
+
+
+
+	This work was supported in part by a National Science Foundation Graduate
+Fellowship.  Computer facilities provided by the Stanford Artificial Intelligence
+Laboratory and the Institute for Mathematical Studies in the Social Sciences,
+Stanford.
+;
+
+COMMENT Data Structures Used by BAIL
+
+I.  The .SM1 file
+	This file is produced by the compiler.  It corresponds in a 
+	rough way to a .REL file, except that is has information for 
+	the debugger rather than for the loader.  The file is a 
+	sequence of tables.  Each table begins with a word containing 
+	a non-zero number which indicates the type of the table.  
+	Following this are an arbitrary number of words, and then a 
+	word which is zero.  Then comes the identifying number for
+	the next table, and so on.  The end of the file is indicated 
+	by a table number of -1.
+
+	The current table types are  
+	    BAIFIL [1],  BAICRD [2],  and BAIBLK [3], and BAIPRC [4].
+
+    A. BAIFIL -- text file (source/listing) name
+	The format of the table is:
+		XWD	file #, # of words which follow
+	NOTENX<
+		SIXBIT	/device/
+		SIXBIT	/name/
+		SIXBIT	/extension/
+		SIXBIT	/ppn/	>.,NOTENX
+	TENX<
+		ASCII	/<string returned by JFNS>/	>.,TENX
+
+    B. BAICRD -- coordinate to text index
+	This table contains two words for each coordinate of the source
+	program.  [The coordinate counter starts at zero for each 
+	compilation and is increased by one for each semicolon and ELSE
+	seen by the parser, provided that some code has been generated 
+	since the previous coordinate.  The semicolons of COMMENTs and 
+	DEFINEs are ignored in this counting.]  The words specify where
+	the text for the coordinate is located, the address of the 
+	first word of code for the coordinate, and whether the 
+	accumulators have any carry-over information from the previous 
+	coordinate.
+
+	BYTE	(6)<byte pointer "P">, (5)<file #>, (7)<word #>, (18)<USETI #>
+	BYTE	(1)<ALLSTO>, (17)<coordinate #>, (18)<address of code>
+
+	At runtime, the format of the first word is changed to
+	BYTE	(12)<file #> (24)<char # in file>.
+
+    C. BAIBLK -- block structure and symbol information
+	This table contains information on a block, followed by 
+	information describing the symbols declared inside that block.
+	The tables for the various blocks of a compilation occur in the
+	order in which their ENDs were seen--i.e., inner-most block 
+	first.
+
+	BYTE	(18)<coord #>, (1)0, (11)<DDT level>, (6)<# of words in name>
+	BYTE	(18)<last word of code>, (18)<first word of code>
+	ASCII	/name of block/
+
+	For each symbol:
+	BYTE	(18)0, (12)<DDT level>, (6)<# of words in name>
+	BYTE	(36)<pre-REFITEM datum for this symbol>
+	ASCII	/name of symbol/
+
+    D. BAIPRC -- procedure and parameter information
+	This table is very similar to a BAIBLK table, except that there
+	is one more word for the type bits and the pda of the procedure.
+
+	BYTE	(18)<coord #>, (1)1, (11)<DDT level>, (6)<# of words in name>
+	BYTE	(18)<location of last word of code>, (18)<pcnt at prdec>
+	BYTE	(18)<type bits for procedure>, (18)<pda>
+	ASCII	/name of procedure/
+
+	For each parameter:
+	BYTE	(18)0, (12)<DDT level>, (6)<# of words in name>
+	BYTE	(36)<pre-REFITEM datum for this symbol>
+	ASCII	/name of symbol/
+
+II. The .BAI file
+	The first disk block of the .BAI file is a header index block.
+	WORD	MEANING
+	0-7	unused
+	8	USETI pointer to beginning of T!CRDIDX
+	9	CRDCTR,,N!CRDIDX
+	10	USETI pointer to beginning of T!BLKADR
+	11	N!BLKADR
+	12	USETI pointer to beginning of T!NAME
+	13	N!NAME
+	14	USETI pointer to text file names
+	15	N!TXTFIL,,# of words taken up by names
+	16-127	unused
+
+III. Runtime data structures
+
+    A. The NAME table.
+	All symbols known to BAIL are kept in the NAME table.  This is 
+	a hash table of 31 buckets, with collisions resolved by 
+	separate chaining. Since its ultimate size is not known until 
+	it has been constructed, is is maintained as a MEMORY-LOCATION 
+	type table, constructed out of a CORGET block.  All pointers 
+	are relative to the zero-th location of the CORGET block.
+
+	0: BYTE	(2)<type>, (16)<father>, (18)<next symbol in this bucket>
+	1: BYTE	(36)<REFITEM datum>
+	2: ASCI3	/name/		.,three words, zero fill
+
+	The twenty most recently referenced symbols are kept in the 
+	CACHE to try to speed things up.  The cache is maintained by 
+	the "climb" algorithm--when referenced, a symbol is exchanged 
+	with the one above it in the table, thus the most commonly 
+	used symbols appear towards the top of the table.  An entry 
+	in the CACHE is the same as an entry in the NAME table, 
+	except that the <next symbol> pointer is replaced with the 
+	first word address of the block which you must be in to make 
+	the cache entry valid.  [Think about homonyms.]
+    B. The block locator table BLKADR
+	This table contains two words for every block and procedure, and
+	enables one to determine the block structure corresponding to
+	an arbitrary address.  This is a linear table in a CORGET block.
+
+	0: BYTE	(18)<father (in BLKADR)>, (18)<pointer to NAME table>
+	1: BYTE	(18)<last word of code+1>, (18)<first word of code>
+
+    C. The coordinate index CRDIDX
+	The whole coordinate table is likely to be very large, so it is
+	kept on disk and only an index is kept in core.  Since 
+	displaying the source text requires a disk access anyway, we 
+	might as well perform two of them--one to get the right 
+	coordinate pointer, and one to read the text.  The table 
+	CRDIDX contains the first word of every 64-th coordinate 
+	pointer. This is a linear table kept in a CORGET block, and 
+	the index of an entry directly corresponds to the disk block 
+	of the .BAI file which contains the full 64-coordinate 
+	section of the table.
+	BYTE	(1)<ALLSTO>, (17)<coord #>, (18)<core address>
+
+    D. The BALNK loader link block
+	This block is generated in the data portion of the code.  It 
+	contains relocation information and the name of the .SM1 file.
+	It is in the data portion since the loader linked chain must be
+	reversed before BAIL can use it.
+
+		<link word>
+		XWD	<high-segment one>,<low-segment one>
+		XWD	<0 for user, 1 for runtimes>,<# of words which follow>
+	NOTENX<
+		SIXBIT	/<.SM1 file name>/
+		SIXBIT	/<extension>/
+		SIXBIT	/<PPN>/
+	SFDS<	SIXBIT	/sfd list/	>.,SFDS
+		SIXBIT	/<device>/	>.,NOTENX
+	TENX<
+		ASCII	/<string returned by JFNS for .SM1 file name>/	>.,TENX
+
+    E. Descriptors ("refitems")
+	Each object known to BAIL is described by one word which has 
+	the format of the datum of a reference item.  No items are 
+	actually used, but the bits mean the same thing.  These bits 
+	are:
+
+	bit		    name		meaning
+	0	400000,,0   TEMPB	simple procedure or defaultable parameter
+	1	200000,,0   REFB	effective address is not a temp location
+	2	100000,,0   QUESB	? itemvar
+	3	 40000,,0   BINDB	binding itemvar
+	4	 20000,,0   PROCB	procedure. addr is pda (entry if simple)
+	5	 10000,,0   ITEMB	item or itemvar
+	6	  4000,,0   ARY2B	 array itemvar array
+	7-12	  3740,,0		type code, same as leap datum type (TYPEIT)
+	13-35	    37,,-1		effective address.  indirect and index
+					fields used mostly to indicate arrays or
+					parameters to procedures
+
+  IV.  The symbols for SAIL predeclared runtimes
+
+	The SAIL predeclared runtimes can be made known to BAIL.  
+	This requires that procedure descriptors for the runtimes be 
+	loaded.  The procedure descriptors are created by using the 
+	files generated by RTRAN as a side effect of creating the 
+	builtin symbol table for the compiler.
+	After running RTRAN:
+	.R FAIL
+	*BAICLC_BPDAHD,BAICLC   .,the   files   containing   procedure
+	*BAIIO1_BPDAHD,BAIIO1	.,  descriptors
+	*BAIIO2_BPDAHD,BAIIO2
+	*BAIMSC_BPDAHD,BAIMSD
+	*BAIPRC_BPDAHD,BAIPRC
+	
+	*BAISM1_BSM1HD,BAISM1	.,the program  to  construct  the  .SM1
+				.,  files
+
+	*BAIPDn_BAIPDn		.,does a .LOAD on all the procedure
+				., files
+	*^C
+	.R LOADER
+	*/E BAISM1$
+
+	Now transfer the .REL and .SM1 files to SYS: or <SAIL>.
+
+ENDCOMMENT ;
+
+ENTRY BAIL,B!;
+BEGIN "BILGE" 
+
+ifcr not declaration(production!version) thenc
+	define production!version=true;
+endc
+
+REQUIRE "[][]" DELIMITERS;
+REQUIRE 64 STRING!PDL; COMMENT STANDARD IS 40;
+
+LET DEFINE=REDEFINE;
+
+COMMENT INSTALLATION DEPENDENT MACROS AND SETTINGS.
+	STANFORD	sets STANFO on, DEC off
+	DEC		sets STANFO off, DEC on
+	TENEX		taken care of automatically by testing for GTJFN;
+IFCR DECLARATION(GTJFN)
+    THENC DEFINE TENX(A)=[A], NOTENX(A)=[], STANFO(A)=[], DEC(A)=[];
+    ELSEC DEFINE TENX(A)=[], NOTENX(A)=[A]; ENDC
+IFCR EQU(COMPILER!BANNER[LENGTH(SCANC(COMPILER!BANNER,"-",NULL,"IA"))+1 FOR 8]
+	 ,"TYMSHARE") THENC
+    DEFINE TYMSW(A)=[A],NOTYMSW(A)=[]; ELSEC
+    DEFINE TYMSW(A)=[],NOTYMSW(A)=[A]; ENDC
+
+NOTENX([
+    IFCR DECLARATION(LODED) THENC DEFINE STANFO(A)=[A], DEC(A)=[];
+			    ELSEC DEFINE STANFO(A)=[], DEC(A)=[A]; ENDC
+])
+
+STANFO([DEFINE CH!SETC=['176],CH!ALT=['175];	COMMENT RIGHT BRACE, ALTMODE;
+	DEFINE CORE!IMAGE!EXTENSION=["DMP"];
+	DEFINE MAX#TXTFIL=[31];
+	REQUIRE "
+STANFORD " MESSAGE;
+])
+DEC([	DEFINE CH!SETC=['175],CH!ALT=['33];
+	DEFINE CORE!IMAGE!EXTENSION=["SAV"];
+	DEFINE MAX#TXTFIL=[31];
+NOTYMSW([REQUIRE "
+DEC TOPS-10 " MESSAGE;])
+TYMSW([	REQUIRE "
+TYMSHARE " MESSAGE;])
+])
+TENX([	DEFINE CH!SETC=['175],CH!ALT=['33];
+	DEFINE CORE!IMAGE!EXTENSION=["SAV"];
+	DEFINE MAX#TXTFIL=[99];
+	REQUIRE "
+TENX " MESSAGE;
+])
+
+
+DEFINE HAND(A)=[A], NOHAND(A)=[];
+DEFINE FUTURE(A)=[],PAST(A)=[];
+DEFINE UPTO=[STEP 1 UNTIL], !=[COMMENT], CRLF=[('15 & '12)], LF=['12],TAB=['11];
+DEFINE SUPERCOMMENT(A)=[];
+DEFINE CHECK(A)=[NOW!UNSAFE A],NOCHECK(A)=[NOW!SAFE A];
+DEFINE MEMLOC(A,B)=[MEMORY[LOCATION(A),B]];
+DEFINE LEFT(A)=[((A) LSH -18)], RIGHT(A)=[((A) LAND '777777)];
+DEFINE	P=['17], SP=['16],
+    ATJRST=['254020000000],ARERR=['007000000000],FIX=['003000000000];
+DEFINE JRSTF=['254100000000],!JBDDT=['74],!JBOPC=['130],!JBSYM=['116],
+    !JBHRL=['115],HALT=[JRST 4,],!JBCST=['136];
+DEFINE PD!NPW=[4],PD!DSP=[5],PD!DLW=[7],PD!PPD=['11],PD!PCW=['12];
+
+
+EXTERNAL INTEGER !SKIP!,!ERRP!,!ERRJ!,BALNK;
+INTEGER !RECOVERY!,#ERRP#,#SKIP#;
+EXTERNAL INTEGER PDLNK;
+
+REQUIRE STANFO(["SYS:GOGTAB.DEF"])
+	DEC([	    "GOGTAB.DEF"])
+	TENX(["<SAIL>GOGTAB.DEF"])	SOURCE!FILE;
+EXTERNAL SAFE INTEGER ARRAY GOGTAB[0:endren];
+SUPERCOMMENT([
+	! ABOVE REQUIRE IS MOSTLY A TEST OF THE NEW WAY TO DO AWAY WITH USERCON.
+	  GOGTAB.DEF IS PRODUCED BY SCISS WHEN A NEW LIBRARY IS MADE, AND CONTAINS
+	  DEFINITIONS OF THE USER TABLE ENTRY NAMES AND THEIR VALUES. IF THE FILE
+	  IS NOT AROUND, TRY THESE:
+    DEFINE REMCHR=['12],TOPBYT=['11],UUO1=['0],BKTPRV=['34];
+    STANFO([DEFINE RACS=['135],BAILOC=['243];])
+    DEC([DEFINE RACS=['133],BAILOC=['241];])
+    TENX([DEFINE RACS=['133],BAILOC=['246];])
+]) ! END SUPERCOMMENT;
+EXTERNAL RECORD!CLASS $CLASS(INTEGER RECRNG,HNDLER,RECSIZ;
+    INTEGER ARRAY TYPARR; STRING ARRAY TXTARR);
+
+SIMPLE PROCEDURE FATAL(STRING A); USERERR(0,0,A);
+SIMPLE PROCEDURE NONFATAL(STRING A); USERERR(0,1,A);
+
+
+NOTENX([
+DEFINE CFILE(A)="RELEASE(A)";
+FORWARD SIMPLE STRING PROCEDURE CATCRLF(STRING A);
+
+EXTERNAL INTEGER INIACS;
+STRING RUNDEV,RUNPPN;	! set from INIACS if RUN or GET;
+
+SIMPLE INTEGER PROCEDURE OPENFILE(REFERENCE STRING FILNAM; STRING MODES);
+BEGIN "OPENFILE"
+! like TENEX-SAIL, extended if errors;
+EXTERNAL INTEGER !SKIP!;
+INTEGER CHN,FLAG,R,W,E,TRIAL; LABEL BAD,TRY,TRY2; STRING DEV,FIL;
+	PRESET!WITH
+	"no such file ", "illegal PPN ", "protection ",	"busy ", "???";
+	OWN SAFE STRING ARRAY REASON[0:4];
+IF (CHN_GETCHAN)<0 THEN GOTO BAD;
+QUICK!CODE SETZM TRIAL; END;
+TRY: DEV_"DSK";
+TRY2:
+START!CODE LABEL LOOP1,LOOP2,TEST1,TEST2,USEDFLT;
+	SETZB	1,2;		! R,W;
+	SETZM	E;
+	HRRZ	3,-1(SP);	! LENGTH(MODES);
+	MOVE	5,(SP);		! BP;
+	JRST	TEST1;
+    LOOP1:ILDB	4,5;
+	CAIN	4,"R";
+	 MOVEI	1,2(1);
+	CAIN	4,"W";
+	 MOVEI	2,2(2);
+	CAIN	4,"E";
+	 SETOM	E;
+    TEST1:SOJGE	3,LOOP1;
+	MOVEM	1,R;
+	MOVEM	2,W;
+
+	MOVEI	4,FIL;		! FIL_FILNAM;
+	MOVE	5,-1(P);	! ADDR(FILNAM);
+	HRRZ	1,-1(5);	! LENGTH(FILNAM);
+	MOVEM	1,-1(4);
+	MOVE	2,(5);		! BP;
+	MOVEM	2,(4);
+	JRST	TEST2;
+    LOOP2:ILDB	3,2;
+	CAIE	3,":";
+    TEST2:SOJGE	1,LOOP2;
+	JUMPL	1,USEDFLT;	! NO COLON, USE DEFAULT;
+	EXCH	1,-1(4);	! 1_ORIG LEN, -1(4)_LEN OF NAME;
+	EXCH	2,(4);		! 2_DEV BP, (4)_NAME BP;
+	MOVEI	3,DEV;
+	MOVEM	2,(3);		! DEVICE BP TO CORE;
+	SUB	1,-1(4);	! LEN+1 OF DEV=ORIG LEN - LEN OF NAME;
+	SUBI	1,1;		! CORRECT FOR COLON;
+	MOVEM	1,-1(3);	! LENGTH TO CORE;
+    USEDFLT:SETZM FLAG;
+	END;
+RELEASE(CHN); OPEN(CHN,DEV,'10,R,W,FLAG,FLAG,FLAG); IF FLAG THEN GOTO BAD;
+IF W THEN ENTER(CHN,FIL,!SKIP!) ELSE
+IF R THEN LOOKUP(CHN,FIL,!SKIP!);
+IF !SKIP! AND TRIAL=0 THEN BEGIN
+    ! try harder; IF LENGTH(RUNDEV) THEN DEV_RUNDEV; CVFIL(FIL,TRIAL,FLAG);
+    IF NOT(FLAG) THEN
+	! originally, no PPN; FILNAM_FILNAM&RUNPPN; QUICK!CODE SETOM TRIAL; END;
+    GOTO TRY2 END;
+IF !SKIP! AND NOT(E) THEN BEGIN
+	OUTSTR("
+File error, "&REASON[RIGHT(!SKIP!) MIN 4]& DEV&":"&FIL& "
+Try again, ALT to ignore:");
+	CLRBUF; STANFO([PTOSTR(0,DEV&":"&FIL);])
+	FILNAM_INCHWL; IF !SKIP! NEQ CH!ALT THEN GOTO TRY END;
+RETURN(CHN);
+BAD:	CFILE(CHN); RETURN(!SKIP!_TRUE);
+END "OPENFILE";
+]);	! NOTENX;
+
+TENX([	DEFINE USETOUT(CHAN,BLOCK)=[USETO(CHAN,BLOCK)],
+		USETIN(CHAN,BLOCK)=[USETI(CHAN,BLOCK)];
+]) ! TENX;
+NOTENX([
+STANFO([	DEFINE USETOUT(CHAN,BLOCK)=[USETO(CHAN,BLOCK)],
+			USETIN(CHAN,BLOCK)=[USETI(CHAN,BLOCK)];
+]);	! STANFO;
+DEC([
+SIMPLE PROCEDURE USETOUT(INTEGER CHAN,BLOCK); BEGIN
+START!CODE
+	HRLZ	1,CHAN;
+	LSH	1,5;
+	TLO	1,'067000;		! MAKE AN "OUTPUT" INSTRUCTION;
+	XCT	1;		! FORCE OUT PARTIAL BUFFER;
+END;
+USETO(CHAN,BLOCK); END;
+SIMPLE PROCEDURE USETIN(INTEGER CHAN,BLOCK); BEGIN
+! THIS IS MORE COMPLICATED, SINCE WE MAY HAVE TO FLUSH SEVERAL BUFFERS;
+START!CODE
+DEFINE ICOWNT=['12],BUFHED=[2];	LABEL TOPP,NOBUF;
+EXTERNAL INTEGER CHNCDB;
+	HRLZ	1,CHAN;
+	LSH	1,5;
+	IOR	1,['10+('047 LSH 27)];	! CALLI 10, WAIT;
+	XCT	1;		! WAIT TILL DISK STOPS;
+	PUSH	P,CHAN;
+	PUSHJ	P,CHNCDB;	! AC! GETS ADDR OF CHAN DATA BLOCK;
+	SETZM	ICOWNT(1);	! SO SAIL WILL DO AN IN NEXT TIME;
+	HRRZ	3,BUFHED(1);	! ADDR OF INPUT BUFFER HEADER;
+	JUMPE	3,NOBUF;
+	HRRZ	2,(3);		 ! AC2=BUFFER POINTED TO BY HEADER;
+	MOVEI	3,(2);		! AC3=BUFFER IN WHICH TO CLEAR USE BIT;
+	MOVSI	4,'400000;	! BIT TO CLEAR;
+TOPP:	ANDCAM	4,(3);		! CLEAR BIT;
+	HRRZ	3,(3);		! NEXT BUFFER;
+	CAIE	2,(3);		! SAME AS FIRST?;
+	 JRST	TOPP;		! NO;
+NOBUF:	END;
+USETI(CHAN,BLOCK); END;
+! ALL THIS IS NECESSARY BECAUSE THE DEC UUOs DO NOT FLUSH THE BUFFER,
+WHILE STANFORD IS NICE AND DOES;
+])	! DEC;
+])	! NOTENX;
+
+! SPECIAL BREAKTABLE STUFF;
+DEFINE DELIMS=[('00 & '11 & '12 & '13 & '14 & '15 & '40)];
+	! NULL,TAB,LF,VT,FF,CR,SP;
+! Dot (period) must be last for BK!ID2. Can save space by not mentioning
+  lowercase because BK!ID and BK!ID2 convert to upper first ("K" mode);
+! this has been changed to "|", since it isn't a legal token entity;
+DEFINE LETTERS=["ABCDEFGHIJKLMNOPQRSTUVWXYZ!" &
+		2&3&7&'10&'20&'21&'24&'25&'30&'31&'32 & "#$\.|"],
+	DIGITS=["0123456789"], SAILID=[(DIGITS & LETTERS)],
+	NUMBER=[(DIGITS & ".@")];
+	! THE ASCII FOR THOSE STANFORD CHARACTERS UNDER LETTERS IS:
+	002 (ALPHA), 003 (BETA), 007 (PI), 010 (LAMBDA),
+	020 (SUBSET), 021 (REVERSE SUBSET), 024 (FOR ALL), 025 (THERE EXISTS)
+	030 (UNDERSCORE), 031 (RIGHT ARROW), 032 (TILDE);
+DEFINE QUOTE=['042];
+
+PRESET!WITH
+	TAB,NULL,"INS",
+	DELIMS,NULL,"XNR",
+	QUOTE,NULL,"INA",
+	"01234567",NULL,"XNR",
+	NUMBER,NULL,"XNR",
+	".@",NULL,"INR",
+	SAILID,NULL,"XNRK";
+SAFE STRING ARRAY BK!SBR[0:6,0:2];	! SETBREAK WILL BE DONE WITH THESE;
+PRELOAD!WITH [8]0;
+SAFE INTEGER ARRAY BK!TBL[0:7];		! TABLE NUMBERS STORED HERE;
+DEFINE BK!TAB=[BK!TBL[0]],BK!DLM=[BK!TBL[1]],BK!QUO=[BK!TBL[2]],
+BK!OCT=[BK!TBL[3]],BK!NUM=[BK!TBL[4]],BK!DEC=[BK!TBL[5]],BK!ID=[BK!TBL[6]],
+BK!ID2=[BK!TBL[7]];
+! tab,delimiters,quote,octal digits,floating decimal,
+    decimal digits,identifiers,ids without period;
+! EXTERNAL INTEGER BKTPRV;	! BREAKTABLE PRIVILEGE WORD;
+
+SIMPLE INTEGER PROCEDURE BK!PRV(BOOLEAN MODE);
+BEGIN GOGTAB[BKTPRV] SWAP MODE; RETURN(MODE) END;
+! SETS BREAKTABLE PRIVILEGE;
+
+DEFINE SM1LNK(I)=[MEMORY[SM1PNT+I]], T!NAME(I)=[MEMORY[C!NAME+I]],
+    T!BLKADR(I)=[MEMORY[C!BLKADR+I]], T!CRDIDX(I)=[MEMORY[C!CRDIDX+I]];
+DEFINE PAGEIT(A,B)=[T!NAME(B)];
+DEFINE N!CACHE=[100], BOTTOM!SLOT=[95], N!BK=[16], L!BK=[(N!BK-1)];
+DEFINE HRELOC(A)=[(A+HZERO)], LRELOC(A)=[(A+LZERO)];
+INTEGER BAIJFN,TMPJFN;	! CHANNEL NUMBERS FOR .BAI FILE AND TEXT FILES;
+INTEGER C!NAME,		! ADDRESS OF NAME TABLE;
+	C!BLKADR,	! ADDRESS OF BLKADR TABLE;
+	C!CRDIDX,	! ADDRESS OF COORDINATE INDEX TABLE;
+	L!NAME,		! INDEX OF LAST ENTRY CURRENTLY USED IN NAME TABLE;
+	L!BLKADR,	!					BLKADR TABLE;
+	L!CACHE,	!					CACHE;
+	L!CRDIDX,	!					COORDINATE INDEX;
+	L!TXTFIL,	!					TEXTFILE TABLE;
+	N!NAME,		! NUMBER OF ENTRIES ALLOCATED IN NAME  TABLE;
+	N!BLKADR,	! 				BLKADR;
+	N!CRDIDX	!				COORDINATE INDEX;
+	;
+INTEGER BKLEV;		! BREAKPOINT RECURSION LEVEL;
+INTEGER PJPBAIL;	! CONTAINS  PUSHJ P,BAIL  AT RUNTIME;
+INTERNAL STRING !!QUERY;	! TO BE SET BY USER ON EXPLICIT CALL TO BAIL;
+INTEGER BAILOFF,NAME!POINTER;	! ANOTHER SWITCH, USETI POINTER TO NAME TABLE IN .BAI FILE;
+STRING ARRAY T!TXTFIL[0:MAX#TXTFIL];	! NAMES OF TEXT FILES;
+PRELOAD!WITH [MAX#TXTFIL+1] 0;
+INTEGER ARRAY STATUS[0:MAX#TXTFIL];	! FOR STATUS OF THESE FILES;
+PRELOAD!WITH [N!CACHE] 0;
+INTEGER ARRAY CACHE[0:N!CACHE-1];	! 20 MOST RECENT NAMES (5 WORDS PER);
+PRELOAD!WITH [256] 0;
+INTEGER ARRAY TARRAY[0:255];	! TEMPORARY ARRAY;
+PRELOAD!WITH [N!BK] 0;
+INTERNAL INTEGER ARRAY BK!LOC, BK!INSTR,BK!COUNT[0:L!BK]; 
+	! BREAK LOCATIONS, SAVED INSTRUCTIONS, MULTIPLE PROCEED COUNTS;
+INTERNAL STRING ARRAY BK!COND,BK!ACT,BK!NAME[0:L!BK]; 
+	! TO BE EVALUATED FOR CONDITIONAL BREAK, AUTOMATIC ACTION. ID;
+PRELOAD!WITH ['17+'12+1+1+1] 0;
+INTEGER ARRAY TEMP!ACS[0:'17+'12+1+1];	! HOLDING TANK UNTIL RECURSIVE SAIVING;
+PRELOAD!WITH [8] 0;
+INTEGER ARRAY TRAP[0:8];	! PLACE TO DO INTERCEPTIONS;
+STRING !STR!;			! GLOBAL ACCUMULATOR FOR PIECE-WISE OUTPUT;
+BOOLEAN SSF;			! SPECIAL STRING FLRUENO QUOTE-IZE;
+INTEGER MULDEF;			! FALSETOTALLY UNKNOWN, TRUEMULTIPLY DEFINED;
+INTEGER TLDEPTH;
+PRELOAD!WITH [16] 0;
+INTEGER ARRAY TLSCOPE[0:15];	! KLUGE FOR TFIND;
+INTEGER CRDCTR; ! "GLOBAL" COUNTER OF COORDINATE NUMBERS;
+PRELOAD!WITH ["G"-"A"] NULL," !!GO;",["P"-"H"] NULL," !!GO;",
+    ["S"-"Q"] NULL," !!STEP;",["X"-"T"] NULL," !!GSTEP;",["Z"-"Y"+1] NULL;
+INTERNAL SAFE STRING ARRAY MACTAB["A":"Z"];	! MACRO TABLE;
+INTEGER PRGSM1;			! ptr to "main program" on .SM1 BALNK chain;
+
+! MEMSTRING CATCRLF CRLFCAT STRCOPY FILTIM LAST!WRITTEN COREGET COREFREE EXTND NONULL PDFIND ADDSTR ADDCHR DUMPSTR MAKPPN;
+
+
+SIMPLE STRING PROCEDURE MEMSTRING(INTEGER ADDR); START!CODE
+! MEMSTRING(ADDR) IS A LEGAL WAY TO DO MEMORY[ADDR,STRING];
+DEFINE T=['14];
+	MOVE	T,ADDR;
+	PUSH	SP,-1(T);
+	PUSH	SP,0(T);
+	SUB	P,['2000002];
+	JRST	@2(P);
+	END;
+
+SIMPLE STRING PROCEDURE CATCRLF(STRING ARG); BEGIN
+NOHAND([RETURN(ARG&CRLF)]);
+HAND([	START!CODE EXTERNAL INTEGER CAT;
+	PUSH	SP,[2];
+	PUSH	SP,[CRLF];
+	JRST	CAT;
+	END;
+]);END;
+
+SIMPLE STRING PROCEDURE CRLFCAT(STRING ARG); BEGIN
+NOHAND([RETURN(CRLF&ARG)]);
+HAND([	START!CODE EXTERNAL INTEGER CAT!RV;
+	PUSH	SP,[2];
+	PUSH	SP,[CRLF];
+	JRST	CAT!RV;
+	END;
+]);END;
+
+SIMPLE STRING PROCEDURE STRCOPY(STRING ARG); BEGIN
+! COPY THE TEXT, TOO, NOT JUST THE DESCRIPTOR;
+NOHAND([ RETURN((ARG&".")[1 TO INF-1]); ])
+HAND([	START!CODE EXTERNAL INTEGER CATCHR;
+	PUSH	P,[0+"."];
+	PUSHJ	P,CATCHR;
+	SOS	-1(SP);
+	POPJ	P,;
+	END;
+]);END;
+
+SIMPLE INTEGER PROCEDURE FILTIM(INTEGER JFN); BEGIN
+TENX([	GTFDB(JFN,TARRAY); RETURN(TARRAY['14])])
+NOTENX([FILEINFO(TARRAY);
+	RETURN( NOTYMSW([ ((TARRAY[1] LAND '700000) LSH 8) LOR])
+		TYMSW([ ((TARRAY[1] LAND '140000) LSH 9) LOR])
+		((TARRAY[2] LAND '7777) LSH 11) LOR
+		((TARRAY[2] LSH -12) LAND '3777)	)])
+END;
+
+SIMPLE INTEGER PROCEDURE LAST!WRITTEN(REFERENCE STRING FILENAME; STRING MODES);
+BEGIN "LAST!WRITTEN"
+TENX([	INTEGER JFN; JFN_GTJFN(FILENAME,1 LSH 33); IF !SKIP! THEN RETURN(0);
+	GTFDB(JFN,TARRAY); RLJFN(JFN); RETURN(TARRAY['14])	])
+NOTENX([CFILE(OPENFILE(FILENAME,MODES)); RETURN(IF !SKIP! THEN 0 ELSE
+	    FILTIM(0))])
+END "LAST!WRITTEN";
+
+EXTERNAL PROCEDURE CORGET;
+SIMPLE INTEGER PROCEDURE COREGET(INTEGER LENGTH); BEGIN "COREGET"
+INTEGER LOC;	LABEL FOOEY;
+START!CODE
+	MOVE	3,LENGTH;	! PLACE WHERE CORGET TAKES ITS ARG;
+	PUSHJ	P,CORGET;	! CALL THE STEWARD;
+	 JRST	FOOEY;		! UNSUCCESSFUL RETURN;
+	MOVEI	3,(2);		! ISOLATE ADDRESS;
+	MOVEM	3,LOC;		! STORE ADDRESS OF BLOCK;
+	ADD	3,LENGTH;
+	SETZM	0,0(2);		! ZERO THE FIRST WORD FOR BLT;
+	HRLI	2,(2);
+	HRRI	2,1(2);
+	BLT	2,-1(3);	! WE LIKE ZEROED BLOCKS BETTER!;
+	END;
+RETURN(LOC);
+FOOEY:	FATAL("BAIL: No core")	END "COREGET";
+
+
+EXTERNAL PROCEDURE CORREL;
+SIMPLE PROCEDURE COREFREE(INTEGER ADDR);
+START!CODE "COREFREE"
+	SKIPE	2,ADDR;		! PLACE WHERE CORREL GETS ITS ARG;
+	PUSHJ	P,CORREL;
+END "COREFREE";
+
+
+SIMPLE STRING PROCEDURE NONULL(STRING ARG); BEGIN "NONULL"
+! RETURN ARG WITH ALL OCCURRANCES OF NULL BYTES REMOVED;
+NOHAND([
+INTEGER T,BRCHAR; STRING RESULT;
+T_BK!PRV(TRUE); RESULT_SCAN(ARG,BK!NONULL,BRCHAR); BK!PRV(T);
+RETURN(RESULT);
+]) ! NOHAND;
+HAND([
+START!CODE LABEL LOOP,BOT; DEFINE T=['13],OBP=['14],NBP=['15],CT=[1];
+	MOVE	OBP,(SP);	! OLD BYTE POINTER;
+	MOVE	NBP,(SP);	! NEW BYTE POINTER;
+	HRRZ	CT,-1(SP);	! CHAR COUNT;
+	HLLZS	-1(SP);		! NEW COUNT. PRESERVE CONSTANTNESS OF STRING;
+	JRST	BOT;		! IN CASE NULL STRING;
+LOOP:	ILDB	T,OBP;		! GET CHAR;
+	JUMPE	T,BOT;		! DON'T PUT IT BACK IF IT'S A NULL;
+	AOS	-1(SP);		! ANOTHER CHAR;
+	IDPB	T,NBP;
+BOT:	SOJGE	CT,LOOP;	! CONTINUE UNTIL DONE;
+	POPJ	P,;		! WE'RE DONE;
+END;
+]) ! HAND;
+END "NONULL";
+
+
+SIMPLE INTEGER PROCEDURE PDFIND(INTEGER ENTAD);
+! GIVEN ENTRY ADDRESS, RETURN ADDRESS OF PROCEDURE DESCRIPTOR;
+NOHAND([
+BEGIN INTEGER I;
+I_PDLNK; WHILE I NEQ 0 AND MEMORY[I+1] NEQ RIGHT(ENTAD) DO I_MEMORY[I];
+RETURN(I+1) END;
+]) ! NOHAND;
+HAND([
+START!CODE LABEL LOOP,BOT;
+	MOVE	1,PDLNK;
+	HRRZ	2,ENTAD;
+LOOP:	CAMN	2,1(1);
+	 JRST	BOT;
+	SKIPE	1,(1);
+	 JRST	LOOP;
+BOT:	ADDI	1,1;
+	SUB	P,['2000002];
+	JRST	@2(P);
+END;]) ! HAND;
+
+
+SIMPLE PROCEDURE EXTND(REFERENCE INTEGER ADDR, OLEN, INCR); BEGIN "EXTND"
+INTEGER TMPJFN,DUMMY;	LABEL OK; STRING T;
+    SIMPLE PROCEDURE GETTEMP(STRING MODE); BEGIN
+    TMPJFN_OPENFILE(T_"BBBBBB.TMP",MODE);
+    IF !SKIP! THEN BEGIN BAILOFF_TRUE;
+    FATAL("BBBBBB.TMP problems") END END;
+START!CODE	EXTERNAL INTEGER CORINC;
+	MOVE	2,ADDR;
+	MOVE	3,INCR;
+	PUSHJ	P,CORINC;	! ATTEMPT TO INCREASE THE CURRENT BLOCK;
+	 SKIPA;
+	JRST	OK;
+END;
+  GETTEMP("RWE" TENX([&"T"]) ); ARRYOUT(TMPJFN,MEMORY[ADDR],OLEN); COREFREE(ADDR);
+  ADDR_COREGET(OLEN+INCR); CFILE(TMPJFN);
+  GETTEMP("RE"); ARRYIN(TMPJFN,MEMORY[ADDR],OLEN);
+  NOTENX([	RENAME(TMPJFN,NULL,0,DUMMY); CFILE(TMPJFN);	])
+  TENX([	CLOSF(TMPJFN); DELF(TMPJFN); CFILE(TMPJFN);	])
+OK: OLEN_OLEN+INCR;
+END "EXTND";
+
+
+SIMPLE PROCEDURE ADDSTR(STRING A);BEGIN
+!STR!_!STR! & A;	END;
+
+
+SIMPLE PROCEDURE ADDCHR(INTEGER CHR);
+START!CODE	EXTERNAL INTEGER PUTCH;
+	POP	P,1;	! RET ADDR THIS PROC;
+	PUSHJ	P,PUTCH;! CONVERT CHR TO STRING;
+	PUSH	P,1;	! REPLACE RET ADDR;
+	JRST	ADDSTR;	! SOLVE SUBPROBLEM;
+END;
+
+
+SIMPLE STRING PROCEDURE DUMPSTR;BEGIN
+NOHAND([BEGIN STRING T; T_!STR!; !STR!_NULL; RETURN(T) END	]);
+HAND([	START!CODE	DEFINE T=['14];
+	MOVEI	T,!STR!;
+	PUSH	SP,-1(T);
+	PUSH	SP,(T);
+	SETZM	-1(T);
+	SETZM	(T);
+	POPJ	P,;
+END	]);	! HAND;
+END;
+
+SIMPLE STRING PROCEDURE MAKPPN(REFERENCE INTEGER PPN; INTEGER SFDLVL(0));
+BEGIN "MAKPPN"
+DEC([	
+STRING PPNSTR; INTEGER I;
+IF PPN=0 THEN RETURN(NULL);
+PPNSTR_"["&CVOS(LEFT(PPN))&","&CVOS(RIGHT(PPN));
+FOR I_1 UPTO SFDLVL DO IF MEMORY[LOCATION(PPN)+I] THEN
+  PPNSTR_PPNSTR&","&CV6STR(MEMORY[LOCATION(PPN)+I]);
+RETURN(PPNSTR&"]");
+]) ! DEC;
+STANFO([
+RETURN(IF PPN=0 THEN NULL ELSE
+	"["&CVXSTR(PPN)[1 TO 3]&","&CVXSTR(PPN)[4 TO 6]&"]")
+]) ! STANFO;
+TENX([
+RETURN(IF PPN=0 THEN NULL ELSE MEMSTRING(PPN));
+]) ! TENX;
+END "MAKPPN";
+
+! WRITEON PACKAGE;
+
+! first, the various type modifier bits;
+DEFINE	TEMPB=[(1 LSH 35)],
+	REFB =[(1 LSH 34)],
+	QUESB=[(1 LSH 33)],
+	BINDB=[(1 LSH 32)],
+	PROCB=[(1 LSH 31)],
+	ITEMB=[(1 LSH 30)],
+	ARY2B=[(1 LSH 29)];	! see (SAIL)HEAD p18 for definitive;
+
+! now, the 6-bit types (if array, then ARRY+type);
+DEFINE GETTYPE(A)=[((A) LAND (ITEMB+('77 LSH 23)))],
+	NOTYPE=[(  1 LSH 23)],
+	STRNG =[(  3 LSH 23)],
+	FLOTNG=[(  4 LSH 23)],
+	INTEGR=[(  5 LSH 23)],
+	SETYPE=[(  6 LSH 23)],
+	LSTYPE=[(  7 LSH 23)],
+	CTXTYP=[('13 LSH 23)],
+	RECTYP=[('15 LSH 23)],
+	LBLTYP=[('16 LSH 23)],
+	RCLTYP=[('17 LSH 23)],
+	ITVTYP=[('20 LSH 23)],	comment non-standard?;
+	lfltyp=[('21 lsh 23)],
+	RNGTYP=[('22 LSH 23)],	comment non-standard?;
+	ARRY  =[('24 LSH 23)];	! see (SAIL)HEAD p18 for definitive;
+
+! was: PRELOAD!WITH 0; INTEGER #$FSTR;
+! was: PRELOAD!WITH 0; INTEGER #$PROU;
+
+SIMPLE PROCEDURE SWAP!FSTR; GOGTAB[$$FSTR] SWAP #$FSTR;
+
+SIMPLE PROCEDURE SWAP!PROU; GOGTAB[$$PROU] SWAP #$PROU;
+
+SIMPLE PROCEDURE $PLBL(INTEGER CHAN,LOC); BEGIN
+SWAP!FSTR; CPRINT(CHAN,"'"&CVOS(RIGHT(LOC))); SWAP!FSTR END;
+
+SIMPLE PROCEDURE $PARY(INTEGER CHAN,LOC); BEGIN "$PARY"
+INTEGER I;
+SWAP!FSTR;
+if right(loc)=-1 lsh -18
+ then begin	! memory (bail special) *** fix this up later -SDD;
+	cprint(chan,"<fake array>[0:",gogtab[top]);
+	ifcr not declaration(segbot) thenc define segbot=183; endc
+	if gogtab[segbot] then cprint(chan, " & ",
+		gogtab[segbot], ":", right(memory['115]) );
+	! segbot is bottom of high segment, '115 is JOBHRL;
+	cprint(chan, "]");
+      end
+ else if 0 geq LOC_RIGHT(MEMORY[LOC])
+		- (IF GETTYPE(LOC)=(ARRY+STRNG) THEN 1 ELSE 0)
+ THEN CPRINT(CHAN,"Deallocated array") ELSE BEGIN
+    CPRINT(CHAN,"<array>[");
+    FOR I_1 UPTO ABS(MEMORY[LOC-1] ASH -18)
+       DO CPRINT(CHAN," ",MEMORY[LOC-3*I-1],":",MEMORY[LOC-3*I]);
+    CPRINT(CHAN,"]"); END;
+SWAP!FSTR END "$PARY";
+
+SUPERCOMMENT([	! use $PREC to get $CLASS.nnnnn for the moment;
+SIMPLE PROCEDURE $PRCL(INTEGER CHAN,LOC); BEGIN "$PRCL"
+SWAP!FSTR; CPRINT(CHAN,MEMSTRING(MEMORY[LOC+4])); SWAP!FSTR END "$PRCL";])
+
+SIMPLE PROCEDURE MYPRINT(INTEGER CHAN; STRING S); ADDSTR(S);
+
+SIMPLE STRING PROCEDURE FSTR(STRING STR);
+START!CODE LABEL LOOP,INNER,BOT; EXTERNAL INTEGER STRNGC;
+    ! EXTERNAL INTEGER REMCHR,TOPBYT,GOGTAB;
+DEFINE BP=['14],T=[1],QUOTE=['042],USER=['15],CNT=['13],OBP=[2],F=['12];
+	SKIPE	SSF;
+	 JRST	BOT;		! SPECIAL STRING MODE, DONT FIDDLE;
+	HRRZ	T,-1(SP);	! CHAR COUNT;
+	ADDI	T,2(T);		! POTENTIALLY THIS MANY CHARS GO OUT;
+	MOVE	USER,GOGTAB;
+	MOVEM	F,RACS+F(USER);	! KEEP STRNGC HAPPY;
+	ADDM	T,REMCHR(USER);
+	SKIPL	REMCHR(USER);
+	 PUSHJ	P,STRNGC;	! THE OUT-OF-SPACE DANCE;
+	HRRZ	CNT,-1(SP);
+	MOVE	BP,TOPBYT(USER);
+	MOVE	OBP,BP;		! REMEMBER WHERE WE STARTED;
+	EXCH	BP,(SP);
+	MOVEI	T,QUOTE;
+	JRST	INNER;
+    LOOP:ILDB	T,BP;
+	IDPB	T,(SP);
+	CAIN	T,QUOTE;
+    INNER:IDPB	T,(SP);
+	CAIN	T,QUOTE;
+	 AOS	-1(SP);
+	SOJGE	CNT,LOOP;
+	MOVEI	T,QUOTE;
+	IDPB	T,(SP);
+	AOS	-1(SP);
+	EXCH	OBP,(SP);
+	MOVEM	OBP,TOPBYT(USER);
+    BOT:POPJ	P,;
+END;
+
+SIMPLE PROCEDURE PREFIT(INTEGER CHAN,REFIT); BEGIN "PREFIT"
+! CPRINT(CHAN,MEMORY[REFIT,TYPE(REFIT)]);
+INTEGER TYPE;
+START!CODE
+EXTERNAL INTEGER $PSTR,$PREL,$PINT,$PSET,$PLST,$PITM,$PREC,$PLRL;
+	LABEL JTAB,NARRY,LAB1,LAB2;
+	DEFINE R=['13],S=['14],T=['15], L40=[0+('40 LSH 18)];
+
+	MOVE	R,REFIT;
+	LDB	T,[('270600 LSH 18)+R];	! 6 BIT TYPE;
+	CAIGE	T,0+ARRY LSH -23;
+	 JRST	NARRY;
+	MOVEI	T,'11;		! RECODE ARRAYS TO '11;
+	TLZ	R,'20+(ITEMB LSH -18);	! AND IGNORE ITEMness AND INDIRECT;
+	JRST	LAB1;
+NARRY:
+	CAIL	T,8;		! 8,9,10,11,12 ARE DATUMS OF STRANGE ITEMS;
+	CAILE	T,12;
+	 JRST	LAB2;
+	MOVEI	T,'16;		! FAKE TYPE LABEL, PRINT IN OCTAL;
+	JRST	LAB1;
+LAB2:	TLNE	R,0+ITEMB LSH -18;
+	 MOVEI	T,'10;		! RECODE ITEMS TO '10;
+LAB1:
+	caig	t,0+lfltyp lsh -23;  ! nothing defined past long reals;
+	CAIGE	T,3;
+	 MOVEI	T,0+lbltyp lsh -23;  	! 0-2 STRANGE, treat as label;
+	CAIN	T,'20;			! another strange one;
+	 MOVEI	T,0+lbltyp lsh -23;  	! treat as label;
+	CAILE	T,'11;
+	 SUBI	T,3;		! CONDENSE RANGE TO 3:'11,('15-3):('17-3);
+	MOVEM	T,TYPE;
+	PUSH	P,CHAN;		! WHICH CHANNEL TO USE;
+	HLLZ	S,JTAB(T);	! NOW WORRY ABOUT ARGUMENT;
+	HRRI	S,R;
+	tlne	S,-1;		! WHETHER DO GO DIRECT OR INDIRECT;
+	 movei	s,@0(s);	! indirect, calculate true address;
+	PUSH	P,0(S);		! STACK THING TO PRINT;
+	cain	t,'21-3;	! plus second word if double;
+	 push	p,1(s);
+	CAIN	T,'14;
+	 HRRZS	(P);		! TURN RCLASS DSCR INTO PLAIN RPTR;
+	CAIN	T,0+STRNG LSH -23;
+	 PUSHJ	P,MEMSTRING;	! GET STRING ON CORRECT STACK;
+	PUSHJ	P,@JTAB(T);	! FORMAT AND DISPOSE;
+	MOVE	T,TYPE;		! CPRINT BUILTINS DON'T REMOVE CHANNEL FROM STACK;
+	CAIE	T,'11;		! BUT $PARY;
+	CAIN	T,'13;		! AND $PLBL;
+	SKIPA;			! AREN'T BUILTIN, HAVE ALREADY REMOVED CHANNEL;
+JTAB:	 POP	P,(P);		! SO MUST DO IT HERE;
+	SUB	P,['3000003];
+	JRST	@3(P);
+	0	$PSTR;	! 3;
+	L40	$PREL;	! 4;
+	L40	$PINT;	! 5;
+	L40	$PSET;	! 6;
+	L40	$PLST;	! 7;
+	L40	$PITM;	! '10;
+	0	$PARY;	! '11;
+	L40	$PREC;	! '15;
+	0	$PLBL;	! '16;
+	0	$PREC;	! '17;
+	0	fatal;	! '20 (should have been eliminated);
+	L40	$PLRL;	! '21 (long real);
+	END;
+END "PREFIT";
+
+SIMPLE PROCEDURE WR!TON(INTEGER DSCR); BEGIN "WR!TON"
+INTEGER FSTR$#;
+    SIMPLE PROCEDURE SWFSTR; GOGTAB[$$FSTR] SWAP FSTR$#;
+FSTR$#_RIGHT(LOCATION(FSTR)); #$PROU_LOCATION(MYPRINT);
+SWFSTR; SWAP!PROU; ADDSTR("   "); PREFIT(0,DSCR); SWAP!PROU; SWFSTR END "WR!TON";
+
+! OPERATOR CODES, REFITEM TYPE DEFINITIONS;
+
+DEFINE asz3(b)=[	cvasc("] & [b] & ["),
+		cvasc("] & [b] & ["[6 for 5]),
+		cvasc("] & [b] & ["[11 for 4])];
+
+PRESET!WITH
+	asz3(ABS),	asz3(AND),	asz3(ANY),	asz3(ASH),
+	asz3(ASSOC),	asz3(CPRINT),	asz3(DATUM),	asz3(DIV),
+	asz3(EQV),	asz3(FALSE),	asz3(FOR),	asz3(GEQ),
+	asz3(IN),	asz3(INF),	asz3(INTER),	asz3(LAND),
+	asz3(LENGTH),	asz3(LEQ),	asz3(LNOT),	asz3(LOCATION),
+	asz3(LOR),	asz3(LSH),	asz3(MAX),	asz3(MIN),
+	asz3(MOD),	asz3(NEQ),	asz3(NEW!RECORD),asz3(NIL),
+	asz3(NOT),	asz3(NULL),	asz3(NULL!RECORD),asz3(OR),
+	asz3(PHI),	asz3(PRINT),	asz3(PROPS),	asz3(ROT),
+	asz3(SETC),	asz3(SETO),	asz3(SWAP),	asz3(TO),
+	asz3(TRUE),	asz3(UNION),	asz3(XOR);
+INTEGER ARRAY RWORD0[0:128];
+
+PRESET!WITH
+	'120,		'004,		'142,		'101,
+	'140,		'147,		'126,		'102,
+	'036,		'103,		'121,		'035,
+	'006,		'016,		'022,		'104,
+	'144,		'034,		'105,		'145,
+	'106,		'107,		'110,		'111,
+	'112,		'033,		'151,		'132,
+	'005,		'114,		'143,		'037,
+	'131,		'150,		'127,		'115,
+	STANFO(['176,])
+	DEC([	'175,])
+	TENX([	'175,])	'173,		'027,		'122,
+	'117,		'023,		'026,	0;
+INTEGER ARRAY RWORD1[0:43];
+DEFINE N!RWORD=[43];
+
+DEFINE Q1=[LSH 27+], Q2=[LSH 18+], Q3=[LSH 9+], Q4=[];
+define quad(leftbind,rightbind,degree,conformity)=
+	[leftbind lsh 27+ rightbind lsh 18+ degree lsh 9+ conformity];
+
+PRESET!WITH 
+! '000;	0,
+! '001;	0,
+! '002;	0,
+! '003;	0,
+! '004;	0,	! 220,222,  2,  0),	! AND;
+! '005;	quad(232,230,  1,  0),	! NOT;
+! '006;	quad(240,242,  2,  6),	! IN;
+! '007;	0,
+! '010;	0,
+! '011;	0,
+! '012;	0,
+! '013;	0,
+! '014;	0,
+! '015;	0,
+! '016;	quad(300,302,  0,  7),	! INF;
+! '017;	quad(272,449,  1,  0),	! PARTIAL "", EQUIVALENT TO "DATUM";
+! '020;	0,
+! '021;	0,
+! '022;	quad(220,222,  2,  8),	! INTER;
+! '023;	quad(210,212,  2,  8),	! UNION;
+! '024;	0,
+! '025;	0,
+! '026;	quad(250,252,  2, 10),	! XOR;
+! '027;	quad(310,312,  2,  0),	! SWAP;
+! '030;	0,
+! '031;	0,
+! '032;	0,
+! '033;	quad(240,242,  2, 12),	! NEQ;
+! '034;	quad(220,222,  2, 12),	! LEQ;
+! '035;	quad(240,242,  2, 12),	! GEQ;
+! '036;	quad(250,252,  2, 10),	! EQV;
+! '037;	0,	! 210,212,  2,  0),	! OR;
+! '040;	0,
+! '041;	0,
+! '042;	0,
+! '043;	0,
+! '044;	0,
+! '045;	quad(260,262,  2,  9),	! COMPATIBLE DIVIDE;
+! '046;	quad(260,262,  2,  3),	! CAT "&";
+! '047;	0,
+! '050;	quad(480,  0,  0,  0),	! LEFT PARENTHESIS "(";
+! '051;	quad(  0,480,  0,  0),	! RIGHT PARENTHESIS ")";
+! '052;	quad(260,262,  2,  9),	! TIMES "*";
+! '053;	quad(250,252,  2,  9),	! PLUS "+";
+! '054;	quad( 48,102,  0,  0),	! COMMA ",";
+! '055;	quad(250,252,  2,  9),	! MINUS "-";
+! '056;	0,
+! '057;	quad(260,262,  2,  2),	! DIVIDE "/";
+! '060;	0,
+! '061;	0,
+! '062;	0,
+! '063;	0,
+! '064;	0,
+! '065;	0,
+! '066;	0,
+! '067;	0,
+! '070;	0,
+! '071;	0,
+! '072;	quad(448,450,  2, 10),	! COLON ":";
+! '073;	quad( 40,480,  0,  0),	! SEMICOLON ;
+! '074;	quad(240,242,  2, 12),	! LESS THAN SIGN "<";
+! '075;	quad(240,242,  2, 12),	! EQUALS "=";
+! '076;	quad(240,242,  2, 12),	! GREATER THAN SIGN ">";
+! '077;	0,
+! '100;	0,
+! '101;	quad(260,262,  2,  5),	! ASH;
+! '102;	quad(260,262,  2,  1),	! DIV;
+! '103;	quad(504,504,  0,  0),	! FALSE;
+! '104;	quad(250,252,  2,  0),	! LAND;
+! '105;	quad(272,270,  1,  0),	! LNOT;
+! '106;	quad(250,252,  2,  0),	! LOR;
+! '107;	quad(260,262,  2,  5),	! LSH;
+! '110;	quad(240,242,  2,  9),	! MAX;
+! '111;	quad(240,242,  2,  9),	! MIN;
+! '112;	quad(260,262,  2,  1),	! MOD;
+! '113;	0,
+! '114;	quad(504,504,  0,  0),	! NULL;
+! '115;	quad(260,262,  2,  5),	! ROT;
+! '116;	0,
+! '117;	quad(504,504,  0,  0),	! TRUE;
+! '120;	quad(272,270,  1,  0),	! ABS;
+! '121;	quad(110,108,  2,  1),	! FOR (SUBSTRINGER);
+! '122;	quad(110,108,  2,  1),	! TO (SUBSTRINGER);
+! '123;	quad(272,270,  0,  0),	! UNARY MINUS (SPECIAL);
+! '124;	quad(272,270,  0,  0),	! ARRAY REFERENCE;
+! '125;	quad(272,270,  2,  1),	! MEMORY;
+! '126;	quad(272,449,  1,  0),	! DATUM;
+! '127;	quad(272,270,  1,  0),	! PROPS;
+! '130;	quad(272,270,  0,  0),	! PERFORM SUBSTRINGING;
+! '131;	quad(504,504,  0,  0),	! PHI;
+! '132;	quad(504,504,  0,  0),	! NIL;
+! '133;	quad(448,  0,  0,  0),	! LEFT BRACKET [;
+! '134;	quad(448,504,  2,  0),	! "\" (sbfld2 for ptr[field]) was 0,;
+! '135;	quad(  0,448,  0,  0),	! RIGHT BRACKET ];
+! '136;	quad(270,272,  2,  9),	! UP ARROW "^";
+! '137;	quad(440, 50,  2,  4),	! GETS "_";
+! '140;	quad(100,102,  2, 10),	! ASSOC "`";
+! '141;	quad(272,270,  1,  0),	! RECORD SUBFIELD REFERENCE;
+! '142;	quad(504,504,  0,  0),	! ANY;
+! '143;	quad(504,504,  0,  0),	! NULL!RECORD;
+! '144;	quad(272,270,  1,  0),	! LENGTH;
+! '145;	quad(272,270,  1, 11),	! LOCATION;
+! '146;	quad(100,448,  0,  0),	! LSTC (non-SUAI: "}}" -- SUAI: "~~");
+! '147;	quad(272,270,  0,  0),	! CPRINT;
+! '150;	quad(272,270,  0,  0),	! PRINT;
+! '151;	quad(272,270,  1,  0),	! NEW!RECORD;
+! '152;	0,
+! '153;	0,
+! '154;	0,
+! '155;	0,
+! '156;	0,
+! '157;	0,
+! '160;	0,
+! '161;	0,
+! '162;	0,
+! '163;	0,
+! '164;	0,
+! '165;	0,
+! '166;	0,
+! '167;	0,
+! '170;	0,
+! '171;	0,
+! '172;	0,
+! '173;	quad(448,100,  0,  0),	! SETO "{";
+! '174;	0,
+STANFO([
+! '175;	0,
+! '176;	quad(100,448,  0,  0),	! SETC (SUAI: "~");
+]) ! STANFO;
+DEC([
+! '175;	quad(100,448,  0,  0),	! SETC (non-SUAI: "}");
+! '176;	0,
+]) ! DEC;
+TENX([
+! '175;	quad(100,448,  0,  0),	! SETC (non-SUAI: "}");
+! '176;	0,
+]) ! TENX;
+! '177;	quad(  0,  1,  0,  0);	! END-OF-FILE;
+INTEGER ARRAY OPS1[0:'177];
+	! CHAR CODE FOR OPERATOR, LEFT BINDING POWER, RIGHT BINDING POWER,
+	  DEGREE (NULLARY, UNARY, BINARY), AND CONFORMITY CLASS;
+DEFINE OPMEMORY=['125],OPARRY=['124],OPSUBST=['130],OPCOMMA=[","],OPSUBFLD=['141],
+	OPLSTC=['146],RBNDCOMMA=[102];
+DEFINE N!OPS=['200];
+
+
+DEFINE REFMEMORY=[(REFB+ARRY+NOTYPE)+'777777];
+
+! FOR HAND CODING, THE REFxxx CONSTRUCTS HAVE BEEN REPLACED BY SOME 
+  FIDDLING ON P. 14;
+NOHAND([
+DEFINE	REFTRACE	=[(PRocb+	pdfIND(LOCATION(TRACE)))],
+	REFBREAK	=[(PRocb+	pdfIND(LOCATION(BREAK)))],
+	REFCOORD	=[(PROCB+INTEGR+PDFIND(LOCATION(COORD)))],
+	REFUNTRACE	=[(PRocb+	pdfIND(LOCATION(UNTRACE)))],
+	REFUNBREAK	=[(PRocb+	pdfIND(LOCATION(UNBREAK)))],
+	REFSETLEX	=[(PRocb+	pdfIND(LOCATION(SETLEX)))],
+	REF!!STEP	=[(PRocb+	pdfIND(LOCATION(!!STEP)))],
+	REF!!GSTEP	=[(PRocb+	pdfIND(LOCATION(!!GSTEP)))],
+	REF!!GOTO	=[(PRocb+	pdfIND(LOCATION(!!GOTO)))],
+	REF!!ARGS	=[(PROCB+strng+	PDFIND(LOCATION(!!ARGS)))],
+	REF!!TEXT	=[(PROCB+strng+	PDFIND(LOCATION(!!TEXT)))],
+	REFSHOW		=[(PROCB+strng+	PDFIND(LOCATION(SHOW)))],
+	REFHELP		=[(PROCB+strng+	PDFIND(LOCATION(HELP)))],
+	REFTRAPS	=[(PROCB+STRNG+PDFIND(LOCATION(TRAPS)))],
+	REF!!UP		=[(PRocb+	pdfIND(LOCATION(!!UP)))],
+	REFSETSCOPE	=[(PRocb+	pdfIND(LOCATION(SETSCOPE)))],
+	REF!!DEFINE	=[(PRocb+	pdfIND(LOCATION(!!DEFINE)))],
+	REFDDT		=[(PROCB+	PDFIND(LOCATION(DDT)))];
+]) ! NOHAND;
+DEFINE F=[('12 LSH 18)], INDIR=[(1 LSH 22)];
+
+
+PRESET!WITH	0,		! BSIMPLE;
+ARRY+INDIR,			! BARRY;
+		ITEMB,		! BITMV---ITEMVAR;
+		ITEMB+  ARY2B,	! BARITM--ITEMVAR WHOSE DATUM IS AN ARRAY;
+ARRY+INDIR+	ITEMB,		! BITMAR--ARRAY OF ITEMVARS;
+ARRY+INDIR+	ITEMB+	ARY2B,	! BARITA--ARRAY OF ITEMVARS WHOSE  ARE ARRAYS;
+			PROCB,	! BPROCED;
+		ITEMB;		! BITEM;
+INTEGER ARRAY COMPLEXTYPE[0:7];
+
+PRESET!WITH 0,INTEGR,FLOTNG,STRNG,LSTYPE,SETYPE,
+	ARRY,LBLTYP,RECTYP,RCLTYP;
+INTEGER ARRAY SIMPLETYPE[0:9];
+! BLAMDA,BINTGR,BREAL,BSTRNG,BLIST,BSET,BCNTXT,BLABEL,BRPNTR,BRCLAS;
+
+PRESET!WITH	0,	! BBILTN;
+	F+	INDIR,	! BREF;
+		0,	! BALLOC. ZERO FOR SETS, LISTS. ARRAYS GET  INDIR  SET
+					BY COMPLEXTYPE;
+	F,		! BSTAK;
+	0,		! BEXTRN;
+	PROCB,		! BXPROC;
+	PROCB;		! BBLTPRC;
+INTEGER ARRAY ACCESSTYPE[0:6];
+
+PRESET!WITH
+	'260000000000,	! PUSHJ;
+	'263000000000,	! POPJ;
+	'254020000000,	! JRST @;
+	'254000000000,	! JRST;
+	'320000000000,	! JUMPx;
+	'265000000000,	! JSP;
+	'344000000000,	! AOJA;
+	'364000000000;	! SOJA;
+INTEGER ARRAY STEPINSTR[0:7];
+PRESET!WITH
+	'777000000000,
+	'777000000000,
+	'777020000000,
+	'777000000000,
+	'770000000000,
+	'777000000000,
+	'777000000000,
+	'777000000000;
+INTEGER ARRAY STEPMASK[0:7];
+
+PRESET!WITH
+	'263000000000,	! POPJ;
+	'254020000000,	! JRST @;
+	'254000000000,	! JRST;
+	'320000000000,	! JUMPx;
+	'265000000000,	! JSP;
+	'344000000000,	! AOJA;
+	'364000000000;	! SOJA;
+INTEGER ARRAY GSTEPINSTR[0:6];
+PRESET!WITH
+	'777000000000,
+	'777020000000,
+	'777000000000,
+	'770000000000,
+	'777000000000,
+	'777000000000,
+	'777000000000;
+INTEGER ARRAY GSTEPMASK[0:6];
+
+INTEGER ARRAY NAME[0:2];
+
+
+
+FORWARD PROCEDURE BREAK(STRING LOCNAME,COND(""),ACT(""); INTEGER MPC(0));
+FORWARD PROCEDURE TRACE(STRING PROCNAME);
+FORWARD PROCEDURE UNBREAK(STRING LOCNAME);
+FORWARD INTEGER PROCEDURE COORD(STRING LOCNAME);
+FORWARD PROCEDURE UNTRACE(STRING PROCNAME);
+FORWARD SIMPLE INTERNAL PROCEDURE BAIL;
+NOTENX([FORWARD SIMPLE INTERNAL PROCEDURE DDBAIL;])
+FORWARD STRING PROCEDURE HELP;
+FORWARD PROCEDURE DDT;
+FORWARD STRING PROCEDURE TRAPS;
+EXTERNAL RECURSIVE PROCEDURE SETLEX(INTEGER DEPTH);
+EXTERNAL PROCEDURE !!STEP;
+EXTERNAL PROCEDURE !!GOTO;
+EXTERNAL PROCEDURE !!GSTEP;
+EXTERNAL PROCEDURE !!UP(INTEGER LEVEL);
+EXTERNAL PROCEDURE SETSCOPE(ITEMVAR PROCITM);
+EXTERNAL STRING PROCEDURE !!ARGS;
+EXTERNAL STRING PROCEDURE !!TEXT;
+FORWARD STRING PROCEDURE SHOW(INTEGER FIRST,LAST(0)); 
+FORWARD PROCEDURE !!DEFINE(INTEGER CHAR; STRING MAC);
+
+! TYPEMUNGE;
+SIMPLE INTEGER PROCEDURE TYPEMUNGE(INTEGER D,LZERO,HZERO); BEGIN "TYPIT"
+! CONVERT FROM BAIL TYPES TO REFITEM DATUMS. SIMPLE PROCEDURES WILL HAVE
+  THE "TEMPORARY" BIT ON IN THEIR REFITEMS;
+NOHAND([
+INTEGER COMPLX,SIMPL,ACCES,LBITS,RBITS,SW;
+	
+
+COMPLX_D LSH -18 LAND '7; SIMPL_(D LSH -21 LAND '7) LOR (D LSH -25 LAND '10);
+ACCES_D LSH -24 LAND '7;
+LBITS_COMPLEXTYPE[COMPLX] + SIMPLETYPE[SIMPL] LOR ACCESSTYPE[ACCES] LOR REFB;
+! CHECK FOR SIMPLE PROCEDURES;
+IF D<0 THEN LBITS_LBITS LOR (1 LSH 35);
+! DISTINGUISH BETWEEN ITEMS AND ITEMVARS.
+  ITEMS WILL HAVE LBITS=REFB+ITEMB, RBITS=ITEM NUMBER,
+  ITEMVARS WILL HAVE LBITS=REFB+ITEMB+TYPE CODE, RBITS=ADDR;
+IF (COMPLX=2 OR COMPLX=4) ! BITMV OR BITMAR; AND SIMPL=0 THEN LBITS_LBITS + NOTYPE;
+RBITS_RIGHT(D);
+]) ! NOHAND;
+HAND([
+START!CODE LABEL XHRELOC,NRELOC,JTAB,XBBILTN,XBXPROC,BOT1,UNALLOC;
+DEFINE COMPLX=[2],SIMPL=[3],ACCES=[4],LNK=[5];
+	MOVE	1,D;
+	LDB	COMPLX,['220300000001];
+	LDB	SIMPL,['250300000001];
+	TLNE	1,'2000;
+	 ADDI	SIMPL,8;
+	LDB	ACCES,['300300000001];
+	HLL	1,SIMPLETYPE[0](SIMPL);
+	TLO	1,0+REFB LSH -18;
+	ADD	1,COMPLEXTYPE[0](COMPLX);
+	IOR	1,ACCESSTYPE[0](ACCES);
+	SKIPGE	D;
+	 TLO	1,'400000;
+	CAIE	COMPLX,2;
+	CAIN	COMPLX,4;
+	 SKIPE	SIMPL;
+	 SKIPA;
+	ADD	1,[NOTYPE];
+]) ! HAND;
+NOHAND([
+! NOW CORRECT THE ADDRESS. WATCH OUT FOR ITEMS, PROCEDURES, LABELS,
+  AND HIGHSEG ARRAYS. ALSO PARAMETERS AND RECURSIVE LOCALS.
+  ALSO, IF THE ADDRESS IS ZERO, DON'T CHANGE IT.  THIS OCCURS FOR VARIABLES
+  WHICH ARE DECLARED BUT NEVER USED OR INTERNALED. CONSEQUENTLY THEY ARE NOT
+  ALLOCATED.  THIS IS A FEATURE OF SAIL;
+IF COMPLX NEQ 7 ! BITEM; AND RBITS NEQ 0 THEN RBITS_CASE ACCES OF (
+  ![0]BBILTN;	IF COMPLX=6 OR SIMPL=7 OR
+		    ((GETTYPE(LBITS) GEQ ARRY) AND (RBITS LAND '400000))
+		THEN HRELOC(RBITS) ELSE LRELOC(RBITS),
+  ![1]BREF;	RBITS LAND '377777,
+  ![2]BALLOC;	LRELOC(RBITS),
+  ![3]BSTAK;	RBITS,
+  ![4]BEXTRN;	RIGHT(MEMORY[HRELOC(RBITS)]),
+  ![5]BXPROC;	RIGHT(MEMORY[HRELOC(RBITS)]),
+  ![6]BBLTPRC;	HRELOC(RBITS)			);
+]) ! NOHAND;
+HAND([
+	TRNE	1,-1;		! IF ZERO ADDRESS;
+	CAIN	COMPLX,7;	! OR ITEM;
+	 JRST	UNALLOC;	! DON'T MANGLE;
+	XCT	JTAB(ACCES);
+	JRST	NRELOC;
+JTAB:	JRST	XBBILTN;
+	ANDCMI	1,'400000;
+	ADD	1,LZERO;
+	JFCL;
+	JRST	XBXPROC;
+	JRST	XBXPROC;
+	ADD	1,HZERO;
+XBBILTN:CAIE	COMPLX,6;
+	CAIN	SIMPL,7;
+	 JRST	XHRELOC;
+	HLRZ	5,1;
+	ANDI	5,'77 LSH 5;
+	CAIL	5,0+ARRY LSH -18;	! IF TYPE GEQ ARRY;
+	TRNN	1,'400000;	! AND FLAG;
+	SKIPA	5,LZERO;	! ELSE LRELOC;
+XHRELOC:MOVE	5,HZERO;	! THEN HRELOC;
+	ADDI	1,(5);
+	JRST	NRELOC;
+XBXPROC:ADD	1,HZERO;
+	HRR	1,(1);		! SUBSTITUTE BITS;
+NRELOC:
+]) ! HAND;
+NOHAND([
+IF ACCES=5 THEN RBITS_PDFIND(RBITS);
+
+! SHOULDN'T HAVE TO DO THIS. KLUGE TO FIX A BUG SOMEWHERE;
+! 7-11-76 EXTERNAL STRINGS ALSO REFER TO FIRST WORD;
+IF SIMPL=3 ! BSTRNG; AND (ACCES=0 ! BBILTN; OR ACCES=4 ! BEXTRN;)
+     AND COMPLX=0 ! BSIMPL; AND RBITS NEQ 0 THEN RBITS_RBITS+1;
+RETURN(LBITS LOR RBITS) 
+]) ! NOHAND;
+HAND([
+	CAIE	ACCES,5;
+	 JRST	BOT1;
+	PUSH	P,1;		! SAVE A COPY OF LEFT HALF BITS;
+	PUSH	P,1;		! ENTRY ADDR;
+	PUSHJ	P,PDFIND;
+	HLL	1,(P);		! INSERT SAVED LEFT HALF BITS;
+	POP	P,(P);		! ADJUST STACK;
+	JRST	UNALLOC;
+BOT1:	JUMPN	COMPLX,UNALLOC;
+	CAIE	ACCES,4;	! BEXTRN;
+	JUMPN	ACCES,UNALLOC;
+	CAIN	SIMPL,3;
+	 ADDI	1,1;
+UNALLOC:SUB	P,['4000004];
+	JRST	@4(P);
+END;]) ! HAND;
+END "TYPIT";
+
+! INSERT;
+SIMPLE INTEGER PROCEDURE INSERT(INTEGER TYPE,FATHER,DATA; INTEGER ARRAY NAME);
+BEGIN "INSERT"
+NOHAND([
+INTEGER K,I;
+
+! HASH TO FIND BUCKET;
+K_ABS(NAME[0] MOD 31);
+
+IF L!NAME+5 GEQ N!NAME THEN EXTND(C!NAME,N!NAME,500);
+L!NAME_L!NAME+1;
+T!NAME(L!NAME)_T!NAME(K) LOR (FATHER LSH 18) LOR (TYPE LSH 34);
+T!NAME(K)_L!NAME;	! CHAINING;
+T!NAME(L!NAME+1)_DATA; FOR I_0 UPTO 2 DO T!NAME(L!NAME+2+I)_NAME[I];
+L!NAME_L!NAME+4;
+RETURN(L!NAME-4)
+]) ! NOHAND;
+HAND([
+START!CODE LABEL ROOM; DEFINE I=[1],K=[2],T=[0],LN=[3],T2=[4];
+	MOVE	T,L!NAME;
+	ADDI	T,5;
+	CAMGE	T,N!NAME;
+	 JRST	ROOM;
+	MOVEI	T,C!NAME;
+	PUSH	P,T;
+	MOVEI	T,N!NAME;
+	PUSH	P,T;
+	MOVEI	T,[500];
+	PUSH	P,T;
+	PUSHJ	P,EXTND;
+ROOM:	MOVE	I,@NAME;		! ABS(NAME[0]);
+	IDIVI	I,31;
+	MOVM	K,K;
+	AOS	LN,L!NAME;
+	ADD	K,C!NAME;
+	ADD	LN,C!NAME;
+	MOVE	T,(K);		! T!NAME(K);
+	HRL	T,FATHER;	! LOR (FATHER LSH 18);
+	MOVE	T2,TYPE;
+	LSH	T2,34;
+	IOR	T,T2;		! LOR (TYPE LSH 34);
+	MOVEM	T,(LN);
+	MOVEI	T,(LN);
+	SUB	T,C!NAME;
+	MOVEM	T,(K);		! CHAINING;
+	MOVE	T,DATA;
+	MOVEM	T,1(LN);
+	HRLI	T,@NAME;	! FWA DATA;
+	HRRI	T,2(LN);
+	BLT	T,4(LN);	! XFER 3 WORD NAME;
+	ADDI	LN,4;
+	SUB	LN,C!NAME;
+	MOVEM	LN,L!NAME;
+	MOVEI	1,-4(LN);
+	SUB	P,['5000005];
+	JRST	@5(P);
+END;]) ! HAND;
+END "INSERT";
+
+! FIND;
+SIMPLE INTEGER PROCEDURE FIND(INTEGER ARRAY NAME,LCHAIN; INTEGER LDEPTH,
+			ANYNAM);
+BEGIN "FIND"
+NOHAND ([
+INTEGER K,I,FATHER,P!CACHE,HOMONYMN;
+DEFINE CURBLK=[LCHAIN[0]];
+
+! RETURN -1	 IF NAME NOT FOUND
+	+PNTR	TO CACHE TABLE IF FOUND;
+! ANYNAM IS A FLAG.  FALSE MEANS MUST RETURN A VARIABLE OR A PROCEDURE.
+  TRUE MEANS THAT A BLOCKNAME IS ALLOWED;
+
+! CHECK CACHE FIRST;
+FOR I_0 STEP 5 UNTIL L!CACHE-4 DO BEGIN "SEARCH CACHE"
+	K_-1; WHILE (K_K+1) LEQ 2 AND NAME[K]=CACHE[I+2+K] DO;
+	IF K=3 AND RIGHT(CACHE[I])=RIGHT(LCHAIN[0]) AND
+	    (ANYNAM OR (CACHE[I+1] LAND ('77 LSH 23 +PROCB+ITEMB)) NEQ 0)
+	THEN BEGIN "CLIMB"
+	IF I=0 THEN RETURN(0) ELSE FOR K_0 UPTO 4 DO
+	  CACHE[I+K] SWAP CACHE[I+K-5]; RETURN(I-5) END"CLIMB"
+END "SEARCH CACHE";
+
+! COULD NOT FIND IT IN CACHE, LOOK IN REGULAR PLACE;
+HOMONYMN_0;
+K_PAGEIT(T!NAME,ABS(NAME[0] MOD 31));	! INITIAL HASH;
+WHILE K NEQ 0 DO BEGIN "CHAIN"
+    I_-1; WHILE(I_I+1)<3 AND NAME[I]=PAGEIT(T!NAME,K+2+I) DO;
+    IF I NEQ 3 THEN K_RIGHT(PAGEIT(T!NAME,K))	! FOLLOW DOWN CHAIN;
+    ELSE BEGIN "HOM"
+	! FOUND A LIKE SPELLING;
+	HOMONYMN_K; FATHER_LEFT(PAGEIT(T!NAME,K)) LAND '177777;
+	I_-1; WHILE (I_I+1) LEQ LDEPTH AND LEFT(LCHAIN[I]) NEQ FATHER DO;
+	IF I=LDEPTH+1 OR (NOT ANYNAM AND
+		(PAGEIT(T!NAME,K+1) LAND (PROCB+ITEMB+('77 LSH 23))=0)	)
+	    THEN K_RIGHT(PAGEIT(T!NAME,K))	! TRY AGAIN;
+	ELSE BEGIN "GOTCHA"
+	    ! FOUND OUR MAN, SINCE INNER-MOST OCCURS FIRST IN CHAIN;
+	    ! PUT IN CACHE;
+	    IF L!CACHE<N!CACHE-1 THEN BEGIN P!CACHE_L!CACHE+1; L!CACHE_
+		L!CACHE+5 END ELSE P!CACHE_BOTTOM!SLOT;
+	    FOR I_1 UPTO 4 DO CACHE[P!CACHE+I]_PAGEIT(T!NAME,K+I);
+	    CACHE[P!CACHE]_LEFT(PAGEIT(T!NAME,K)) LSH 18 LOR RIGHT(CURBLK);
+	    RETURN(P!CACHE)
+	END "GOTCHA"
+    END "HOM"
+END "CHAIN";
+IF HOMONYMN AND ANYNAM THEN BEGIN
+	    IF L!CACHE<N!CACHE-1 THEN BEGIN P!CACHE_L!CACHE+1; L!CACHE_
+		L!CACHE+5 END ELSE P!CACHE_BOTTOM!SLOT;
+	    FOR I_1 UPTO 4 DO CACHE[P!CACHE+I]_PAGEIT(T!NAME,K+I);
+	    CACHE[P!CACHE]_LEFT(PAGEIT(T!NAME,K)) LSH 18 LOR RIGHT(CURBLK);
+	    RETURN(P!CACHE) END;
+RETURN(-1)
+]) ! NOHAND;
+HAND ([
+INTEGER RETVAL,HOMONYMN;
+START!CODE
+LABEL LOOP1,LSWAP,INC1,TEST1,LOOP2,LOOP3,BOTSLOT,RET,SUGAR,GOTCHA,LP3A;
+DEFINE N1=[2],N2=[3],N3=[4],I=[1],K=[5],CN=[6],FATHER=[8],LD=[9],T=[0],
+    PCACHE=['14],CURBLK=['15];
+	HRLI	T,@NAME;	! ADDR OF FIRST DATA WORD IN  NAME;
+	HRRI	T,N1;
+	BLT	T,N3;		! GET THE NAME INTO N1,N2,N3;
+	MOVE	I,L!CACHE;
+	MOVEI	I,CACHE[0](I);
+	HRRZ	CURBLK,@LCHAIN;	! RIGHT HALF OF LCHAIN[0];
+	JRST	TEST1;
+LOOP1:	CAME	N1,2(I);	! FIRST 5 CHARS;
+	 JRST	INC1;
+	CAMN	N2,3(I);	! SECOND 5;
+	CAME	N3,4(I);	! LAST 5;
+	 JRST	INC1;
+	HRRZ	T,0(I);		! BLOCK WHICH OWNS OBJECT IN CACHE;
+	CAME	CURBLK,T;	! SAME AS CURRENT?;
+	 JRST	INC1;		! NO;
+	MOVE	T,1(I);		! TYPE BITS OF REFITEM DATUM;
+	TLNN	T,'77 LSH 5 + ITEMB LSH -18 + PROCB LSH -18;
+	SKIPE	ANYNAM;		! IF ONLY VAR OR ITEM OR PROC WILL DO;
+	 SKIPA;			! IT'S OK;
+	JRST	INC1;		! IT'S BAD;
+	MOVEI	T,(I);		! POINT TO WORD 0, RELATIVE TO CACHE[0];
+	SUBI	T,CACHE[0];
+	MOVEM	T,RETVAL;
+! CLIMB;
+	CAMN	T,L!CACHE;	! AT END ALREADY?;
+	 JRST	RET;		! YES;
+	MOVEI	K,5;		! SWAP 5 WORDS;
+LSWAP:	MOVE	T,(I);
+	EXCH	T,5(I);
+	MOVEM	T,(I);
+	ADDI	I,1;
+	SOJG	K,LSWAP;
+	SUBI	I,CACHE[0];	! POINT TO WORD 0;
+	MOVEM	I,RETVAL;
+	JRST	RET;
+INC1:	SUBI	I,5;
+TEST1:	CAIL	I,CACHE[0];	! REACHED BOTTOM YET?;
+	 JRST	LOOP1;		! NO;
+]) ! HAND;
+HAND([
+! SEARCH NAME TABLE;
+	SETOM	RETVAL;		! NOT FOUND;
+	SETZM	HOMONYMN;
+	SETZM	MULDEF;
+	MOVE	CN,C!NAME;
+	MOVE	T,N1;		! COMPUTE BUCKET NUMBER;
+	IDIVI	T,31;
+	MOVM	K,1;
+	ADDI	K,(CN);
+LOOP2:	HRRZ	K,(K);		! DOWN ONE LINK IN CHAIN;
+	JUMPE	K,SUGAR;	! LAST ONE;
+	ADDI	K,(CN);		! GET MEMORY ADDRESS;
+	CAME	N1,2(K);	! FIRST 5 CHARS MATCH?;
+	 JRST	LOOP2;		! NO;
+	CAMN	N2,3(K);
+	CAME	N3,4(K);
+	 JRST	LOOP2;
+				! NEXT TWO COMMENTED OUT BY RHT;
+	! MOVSS	HOMONYMN;	! SAVE ANYTHING THAT MIGHT BE THERE ALREADY;
+	! HRRM	K,HOMONYMN;	! AND REMEMBER THIS ONE;
+	LDB	FATHER,[('222000+K) LSH 18];
+	MOVN	LD,LDEPTH;	! PREPARE FOR SEARCH ALONG LCHAIN;
+	HRLI	LD,-1(LD);	! CONSTRUCT AOBJN POINTER IN LD;
+	HRRI	LD,@LCHAIN;	! POINT TO LCHAIN[0];
+LOOP3:	HLRZ	T,(LD);
+	CAME	FATHER,T;
+	AOBJN	LD,LOOP3;
+	! JUMPGE LD,LOOP2; ! RHT -- CHANGES TO AVOID CONFUSION BY "SAME" OBJECTS;
+	MOVE	T,1(K);		! TYPE BITS OF REFITEM DATUM;
+	MOVE	FATHER,HOMONYMN;! IF 0 THEN TEST WITH AC1 WILL ALWAYS SKIP.;
+	CAMN	T,1(FATHER);	! CURRENT REFITEM DATUM WITH PREVIOUS;
+	JRST	LP3A;		! THEY ARE SAME, IGNORE THIS ONE;
+	MOVSI	FATHER,(FATHER);! SAVE OLD IN LEFT HALF;
+	HRRI	FATHER,(K);	! REMEMBER NEW;
+	MOVEM	FATHER,HOMONYMN;! TUCK IT AWAY;
+LP3A:	JUMPGE	LD,LOOP2;	! IF AOBJN COUNTED OUT THEN ITERATE;
+			   ! RHT -- END OF PATCH;
+	TLNN	T,'77 LSH 5 + ITEMB LSH -18 + PROCB LSH -18;
+	SKIPE	ANYNAM;
+	 SKIPA;
+	JRST	LOOP2;
+GOTCHA:	MOVE	I,L!CACHE;
+	CAIL	I,N!CACHE-5;
+	 JRST	BOTSLOT;
+	ADDI	I,5;
+	MOVEM	I,L!CACHE;
+	MOVEI	PCACHE,(I);
+	SKIPA;
+BOTSLOT:SETZ	PCACHE,;
+	MOVEM	PCACHE,RETVAL;
+	HRLI	T,1(K);
+	HRRI	T,CACHE[1](PCACHE);
+	BLT	T,CACHE[4](PCACHE);
+	HLL	CURBLK,(K);
+	MOVEM	CURBLK,CACHE[0](PCACHE);
+RET:	MOVE	1,RETVAL;
+	SUB	P,['5000005];
+	JRST	@5(P);
+SUGAR:	SKIPN	K,HOMONYMN;	! IF SPELLING NOT FOUND;
+	 JRST	RET;		! THEN GIVE UP;
+	MOVE	T,1(K);		! TYPE BITS;
+	TLNE	T,0+PROCB LSH -18;! IF NOT A PROCEDURE;
+	TLNE	T,'17;		! OR IF PARAMETER;
+	 SKIPA;			! KEEP TRYING;
+	 JRST	GOTCHA;		! USE OUTER-MOST PROCEDURE;
+	TLNE	K,-1;
+	 SETOM	MULDEF;
+	TLNN	K,-1;		! IF MULTIPLY DEFINED;
+	TLNE	T,'17;		! OR NOT A FIXED CORE ADDRESS;
+	 JRST	RET;		! GIVE UP;
+	JRST	GOTCHA;		! OTHERWISE, TRY THIS;
+	END;
+]) ! HAND;
+END "FIND";
+
+! CVNAME PREDEC;
+
+
+SIMPLE PROCEDURE CVNAME(STRING STRVAL; INTEGER ARRAY NAME);BEGIN "CVNAME"
+NOHAND([
+INTEGER I; FOR I_0 UPTO 2 DO NAME[I]_CVASC(STRVAL[5*I+1 FOR 5])	]) ! NOHAND;
+HAND([
+START!CODE DEFINE R=[1], L=[2], I=[3], D=[4], T=[5]; LABEL LOOP;
+	MOVEI	R,@NAME;	! ADDRESS OF FIRST DATA WORD IN  NAME;
+	SETZM	(R);	SETZM	1(R);	SETZM	2(R);	! CLEAR RESULT;
+	HRLI	R,'440700;	! POINT 7, ;
+	MOVE	I,(SP);		! BYTE POINTER TO SOURCE;
+	HRRZ	L,-1(SP);	! transfer LENGTH OF SOURCE;
+	caile	l,15;		! max 15 (max stored token length);
+	MOVEI	l,15;
+LOOP:	ILDB	T,I;
+	IDPB	T,R;
+	SOJG	L,LOOP;
+	END;			]) ! HAND;
+END "CVNAME";
+
+
+SIMPLE INTEGER PROCEDURE PREDEC(STRING NM; INTEGER TYPE,FATHER,DATA); BEGIN
+NOHAND([
+CVNAME(NM,NAME); RETURN(INSERT(TYPE,FATHER,DATA,NAME))
+]) ! NOHAND;
+HAND([
+START!CODE DEFINE T=['13];
+	PUSH	P,NAME;	! FWA;
+	PUSHJ	P,CVNAME;	! REMOVES NM FROM STACK UPON RETRUN;
+	MOVE	T,NAME;	! FWA;
+	EXCH	T,(P);	! BECOMES LAST ARG TO INSERT;
+	PUSH	P,T;	! RETURN ADDR;
+	JRST	INSERT;	! SICK 'EM;
+	END;
+]) ! HAND;
+END;
+
+! STBAIL;
+PROCEDURE STBAIL; BEGIN"STBAIL"
+INTEGER SM1PNT,BAITIM,DMPTIM,SM1TIM,N!BYTE,SM1JFN;
+INTEGER LZERO,HZERO,BPDALZERO,BPDAHZERO;
+      !	LZERO	LOW SEGMENT RELOCATION CONSTANT
+	HZERO	HIGH SEGMENT RELOCATION CONSTANT;
+INTEGER CRDNO,LEVEL,DAD,D;
+DEFINE ID=[0], BLK=[1], SIMPRC=[2], PRC=[3];
+BOOLEAN ENROLL;		! WHETHER TO READ ALL .SM1 FILES;
+INTEGER I,L,J,ADDR1,ADDR2,BRCHAR,W;
+INTEGER ARRAY FILMAP[0:MAX#TXTFIL];	! TRANSLATES FROM LOCAL FILE NUMBER TO GLOBAL;
+STRING T,PROGNAM,BAINAM,SM1NAM;
+LABEL DONESTBAIL;
+
+
+SIMPLE INTEGER PROCEDURE HORSECART(INTEGER HTIM; STRING HORSE;
+    REFERENCE STRING CART); BEGIN INTEGER T; T_0;
+IF LENGTH(CART) AND ((T_LAST!WRITTEN(CART,"R"))>HTIM OR T=0) THEN
+	NONFATAL(CART & " written after " & HORSE);
+RETURN(T); END;
+
+
+SIMPLE PROCEDURE AD!BLKADR(INTEGER I,J); BEGIN "AD!BLKADR"
+IF (L!BLKADR_L!BLKADR+2) GEQ N!BLKADR THEN EXTND(C!BLKADR,N!BLKADR,128);
+T!BLKADR(L!BLKADR-1)_I; T!BLKADR(L!BLKADR)_J END "AD!BLKADR";
+
+
+SIMPLE PROCEDURE AD!CRDIDX(INTEGER I); BEGIN "AD!CRDIDX"
+N!BYTE_N!BYTE+2; IF N!BYTE LAND '177 THEN RETURN;
+IF (L!CRDIDX_L!CRDIDX+1) GEQ N!CRDIDX THEN EXTND(C!CRDIDX,N!CRDIDX,64);
+T!CRDIDX(L!CRDIDX)_I END "AD!CRDIDX";
+
+
+SIMPLE INTEGER PROCEDURE INW; BEGIN
+NOHAND([RETURN(W_WORDIN(SM1JFN))])
+HAND([	START!CODE EXTERNAL INTEGER WORDIN;
+	PUSH	P,SM1JFN;
+	PUSHJ	P,WORDIN;
+	MOVEM	1,W;
+	POPJ	P,;
+	END;	])
+END;
+
+
+SIMPLE PROCEDURE SYMIN;
+NOHAND([BEGIN TARRAY[1]_TARRAY[2]_0;
+    FOR I_1 UPTO L DO TARRAY[I-1]_INW END;]) ! NOHAND;
+HAND([START!CODE LABEL LOOP;
+    SETZM   TARRAY[1];
+    SETZM   TARRAY[2];
+    MOVN    2,L;
+    HRLZI   2,(2);
+LOOP:PUSHJ  P,INW;
+    MOVEM   1,TARRAY[0](2);
+    AOBJN   2,LOOP;
+    POPJ    P,;
+    END;]) ! HAND;
+
+
+SIMPLE STRING PROCEDURE FILSPC(BOOLEAN R); BEGIN "FILSPC"
+! IF R THEN [READ L WORDS INTO TARRAY] ELSE [FILL TARRAY FROM SM1PNT BLOCK].
+  GIVEN TARRAY[0:3+SFDLFL]=SIXBIT DEV,NAM,EXT,PPN, RETURN STRING OF SAME.
+  ON TENEX, USE L WORDS OF ASCII;
+STRING A;
+IF R THEN SYMIN
+ELSE BEGIN
+    L_RIGHT(SM1LNK(2));
+    NOTENX([	! SET DEFAULTS;
+	tarray[0]_ cvsix("DSK");
+	TARRAY[2]_CVSIX("SM1");
+	TARRAY[3]_0;
+	IF LEFT(SM1LNK(2))
+	 THEN TARRAY[0]_ CVSIX("SYS");
+	! GET NON-DEFAULTS;	ARRBLT(TARRAY[1],SM1LNK(3),L);
+	! XFER DEVICE TO FRONT;	IF L>3 THEN TARRAY[0]_TARRAY[L];
+    ]) ! NOTENX;
+    TENX([
+	ARRBLT(TARRAY[0],SM1LNK(3),L);
+    ]) ! TENX;
+END;
+NOTENX([ RETURN(CV6STR(TARRAY[0]) & ":" &CVXSTR(TARRAY[1]) & "." &
+    (CVXSTR(TARRAY[2])[1 TO 3]) & MAKPPN(TARRAY[3],L-4));	]) ! NOTENX;
+TENX([ A_NULL; FOR I_0 UPTO L-1 DO A_A&CVASTR(TARRAY[I]);
+	RETURN(NONULL(A)) ]) ! TENX;
+END "FILSPC";
+
+
+SIMPLE PROCEDURE EATSYM(BOOLEAN INPRC; INTEGER $RUN$); BEGIN "EATSYM"
+! PROCESS SYMBOLS FOR BLOCK TYPES 3 AND 4 (BAIBLK AND BAIPRC);
+
+	SIMPLE PROCEDURE IND; D_TYPEMUNGE(INW,LZERO,HZERO);
+
+INW; L_W LAND '77; LEVEL_W LSH -6 LAND '77;
+CRDNO_LEFT(W);
+NOHAND([
+INW; IF RIGHT(W)=0 THEN W_W+LEFT(W); ! Bullet-proofing for RIGHT(W)=0;
+]) HAND([START!CODE		! THE ABOVE IS JUST TOO INEFFICIENT;
+	PUSHJ	P,INW;
+	TRNN	1,-1;
+	 HLR	1,1;
+	MOVEM	1,W;	END;
+]) ! HAND;
+D_ADDR1_HRELOC(RIGHT(W));
+ADDR2_HRELOC(LEFT(W)) MAX ADDR1;	! Bullet-proofing for LEFT(W)=0;
+
+IF INPRC THEN IND;
+
+SYMIN;
+! USE FATHER FIELD FOR LEVEL INFO UNTIL FATHER CHAIN IS BUILT;
+DAD_INSERT(IF INPRC THEN IF D<0 THEN SIMPRC ELSE PRC ELSE BLK,LEVEL+$RUN$,D,TARRAY);
+IF NOT $RUN$ THEN AD!BLKADR(DAD,ADDR2 LSH 18 LOR ADDR1);
+WHILE INW NEQ 0 DO BEGIN "IDENTIFIERS"
+	L_W LAND '77; IND; SYMIN; INSERT(ID,DAD,D,TARRAY) END "IDENTIFIERS"
+END "EATSYM";
+
+SIMPLE PROCEDURE DOSM1(INTEGER $RUN$); BEGIN "DOSM1"
+! Go down the BALNK loader chain and process the files on it.  If $RUN$ is zero,
+  process only user files., if $RUN$ is not zero, then process predeclared runtime
+  files, which have a 1 in the left half of the word which tells how many words
+  the file name takes;
+SM1PNT_BALNK;
+WHILE SM1PNT DO BEGIN "ONE COMPILATION"
+LABEL EOC;
+
+IF $RUN$ AND NOT(LEFT(SM1LNK(2))) THEN GOTO EOC;
+IF NOT($RUN$) AND LEFT(SM1LNK(2)) THEN GOTO EOC;
+	! Do runtimes iff correct to do so;
+LZERO_RIGHT(SM1LNK(1))-1; HZERO_(LEFT(SM1LNK(1))-1) LAND '377777;
+SM1NAM_FILSPC(FALSE);	! USE BALNK BLOCK AND FETCH FILE NAME;
+SM1JFN_OPENFILE(SM1NAM,"R"); SM1TIM_FILTIM(SM1JFN);
+IF NOT(!SKIP!) THEN BEGIN "SM1FILE"
+    OUTSTR(CRLFCAT(SM1NAM));
+    WHILE INW NEQ -1 DO CASE W OF BEGIN "CASES"
+    [1]	BEGIN "FILE INFO"
+	STRING TEXTFILE; INTEGER FILN;	LABEL OLDCHAP;
+	INW; L_RIGHT(W); FILN_LEFT(W);
+	TEXTFILE_FILSPC(TRUE);	! READ WORDS AND GET FILE NAME;
+	FOR I_0 UPTO L!TXTFIL DO IF EQU(TEXTFILE,T!TXTFIL[I]) THEN BEGIN
+	    FILMAP[FILN]_I; GOTO OLDCHAP; END;
+	IF L!TXTFIL=MAX#TXTFIL-1 THEN 
+	    NONFATAL("More than "&CVS(MAX#TXTFIL-1)&" text files.
+Rest ignored.");
+	FILMAP[FILN]_L!TXTFIL_(L!TXTFIL+1) MIN MAX#TXTFIL;
+	STATUS[L!TXTFIL]_IF HORSECART(SM1TIM,SM1NAM,TEXTFILE)=0 THEN -'1000 ELSE -1;
+	T!TXTFIL[L!TXTFIL]_TEXTFILE;
+OLDCHAP:OUTSTR(CRLFCAT("  " & TEXTFILE));
+	END "FILE INFO";
+
+    [2]	BEGIN "COORDINATES"
+	WHILE INW NEQ 0 DO BEGIN
+	! CONVERT TO CHARACTER COUNT AND MAPPED FILE NUMBER;
+	WORDOUT(BAIJFN,(RIGHT(W)-1)*640 + (LEFT(W) LAND '177)*5 +
+	    (((W LSH -30)LAND 7)XOR 4)-1 LOR
+	    (FILMAP[W LSH -25 LAND '37] LSH 24));
+	WORDOUT(BAIJFN,W_HRELOC(INW LAND '400000777777)+
+	    (CRDCTR LSH 18)); ! USE GLOBAL COORD NUMBERS;
+	CRDCTR_CRDCTR+1;
+	AD!CRDIDX(W); END
+	END "COORDINATES";
+
+    [3]	BEGIN "BLOCKS" EATSYM(FALSE,$RUN$) END "BLOCKS";
+
+    [4] BEGIN "PRC" EATSYM(TRUE,$RUN$) END "PRC"
+
+    END "CASES";
+    CFILE(SM1JFN);
+
+! There is some monkey business with outer blocks.  They act like procedures
+with no parameters, in that they put out the name twice, once for the params
+and once for the delcatations inwide the procedure.  The trouble is, the
+declarations should be treated as global in this case.  So kill the "params"
+block name, and set the FWA of the other one to HRELOC(0).  Also kill the
+outer block procedure name in the NAME table, to prevent confusion;
+IF NOT($RUN$) THEN BEGIN
+    T!NAME(RIGHT(T!BLKADR(L!BLKADR-1))+2)_0;	! KILLS THE NAME TABLE ENTRY;
+    L!BLKADR_L!BLKADR-2;	! THAT KILLS THE PARAM NAME BLOCK;
+    T!BLKADR(L!BLKADR)_T!BLKADR(L!BLKADR) LAND '777777000000 LOR HRELOC(0); END;
+END "SM1FILE";
+
+EOC:SM1PNT_SM1LNK(0);	! NEXT LINK;	END "ONE COMPILATION" 
+END "DOSM1";
+
+
+
+
+#SKIP#_!SKIP!;
+outstr( crlf & ifcr not production!version thenc "Test " & endc
+	"BAIL version " & 
+	compiler!banner[ length(scanc(compiler!banner,"1234567890",
+				 "","IS")) for 11] );
+
+IF BALNK=0 THEN BEGIN
+    NONFATAL("No /B switch used"); RETURN END;
+
+IF NOT PRGSM1 THEN BEGIN "NAMPRG"
+! Record the name of the program which was loaded first as the main program
+  name.  It could change when the .SM1 link is sorted by address.  In order
+  to find the program which was loaded first, we must go to the end of the
+  linked list;
+NOHAND([
+PRGSM1_BALNK; WHILE MEMORY[PRGSM1] NEQ 0 DO PRGSM1_MEMORY[PRGSM1];
+]) ! NOHAND;
+HAND([START!CODE LABEL T,B;
+	MOVE	1,BALNK;
+T:	SKIPN	(1);
+	 JRST	B;
+	MOVE	1,(1);
+	JRST	T;
+B:	MOVEM	1,PRGSM1;
+	END;
+]) ! HAND;
+END "NAMPRG";
+
+SM1PNT_PRGSM1;	! need to reconstruct string, since restart zeroes all strings;
+NOTENX([PROGNAM_CV6STR(SM1LNK(3));])
+TENX([ PROGNAM_FILSPC(FALSE); ])
+
+! The loader linked list needs to be sorted by first word address of code
+  so that we process files in ascending order of load address.
+  $#$#$#$#$# THIS MEANS THAT THE LINK BLOCKS MUST BE IN THE LOWSEG #$#$#$#$#$;
+
+NOHAND([		! insertion sort of non-null linked list headed at BALNK;
+I_0; I SWAP MEMORY[BALNK];	! BALNK gets first element, I gets rest;
+WHILE I NEQ 0 DO BEGIN
+    J_LOCATION(BALNK); L_MEMORY[J];	! top of what's already sorted;
+    WHILE L NEQ 0 AND LEFT(MEMORY[I+1])>LEFT(MEMORY[L+1]) DO
+	L_MEMORY[J_L];	! find L=first which has FWA code > FWA I;
+    J_MEMORY[J]_I;	! link in I, advance J to it;
+    I_MEMORY[I];	! CDR down stuff not yet processed;
+    MEMORY[J]_L;	! tack on rest of sorted list;
+    END;
+]) ! NOHAND;
+HAND([
+START!CODE LABEL TOP1,TOP2,BOT1,BOT2,OUT1,OUT2;
+DEFINE T=[0],T1=[1],I=['13],J=['14],L=['15];
+	MOVEI	I,0;
+	EXCH	I,@BALNK;
+	JRST	BOT1;
+TOP1:	MOVEI	J,BALNK;
+	HRRZ	L,(J);
+	JRST	BOT2;
+TOP2:	HLRZ	T,1(I);
+	HLRZ	T1,1(L);
+	CAIG	T,(T1);
+	 JRST	OUT2;
+	MOVEI	J,(L);
+	HRRZ	L,(J);
+BOT2:	JUMPN	L,TOP2;
+OUT2:	HRRZM	I,(J);
+	MOVEI	J,(I);
+	HRRZ	I,(I);
+	HRRZM	L,(J);
+BOT1:	JUMPN	I,TOP1;
+OUT1:	END;
+]) ! HAND;
+
+! MAKE FOR NICE RENTRANCY;
+ARRCLR(STATUS); COREFREE(C!NAME); COREFREE(C!BLKADR); COREFREE(C!CRDIDX);
+BKLEV_0;
+
+! Establish special break tables.  Kluge for BK!ID2 to save space;
+J_BK!PRV(TRUE);
+NOHAND([	FOR I_0 UPTO 7 DO BEGIN INTEGER K; K_IF I=7 THEN 6 ELSE I;
+    RELBREAK(BK!TBL[I]); IF (BK!TBL[I]_GETBREAK) GEQ 0 THEN FATAL("Brktbl ov.");
+    SETBREAK(BK!TBL[I],BK!SBR[K,0],BK!SBR[K,1],BK!SBR[K,2]) END;	]) ! NOHAND;
+HAND([ START!CODE LABEL NEWTBL,SPLOOP,GOOD;
+EXTERNAL INTEGER GETBREAK,SETBREAK,RELBREAK;
+	MOVEI	3,BK!SBR[0,0];	! ADDR OF WD2 OF FIRST STRING TO BE PUSHED;
+	MOVSI	2,-8;		! 8 TABLES TO BE SET;
+NEWTBL:	PUSH	P,BK!TBL[0](2);
+	PUSHJ	P,RELBREAK;
+	PUSHJ	P,GETBREAK;
+	JUMPL	1,GOOD;
+	PUSH	SP,[10];
+	PUSH	SP,["Brktbl ov."];
+	PUSHJ	P,FATAL;
+GOOD:	PUSH	P,1;		! TABLE NUMBER;
+	MOVEM	1,BK!TBL[0](2);
+	HLRZ	4,2;
+	CAIN	4,-1;
+	 SUBI	3,6;		! BK!ID2 KLUGE;
+	HRLI	3,-6;		! 6 WORDS ONTO SP;
+SPLOOP:	PUSH	SP,-1(3);
+	AOBJN	3,SPLOOP;
+	CAIN	4,-1;
+	 SOS	-5(SP);		! BK!ID2 KLUGE;
+	PUSHJ	P,SETBREAK;
+	AOBJN	2,NEWTBL;
+	END;
+]) ! HAND;
+BK!PRV(J);
+
+! Guess at where the core image originated;
+NOTENX([
+STANFO([DEFINE AC!DEV=[6],  AC!PPN=[3],AC!EXT=[1];  ])
+DEC([   DEFINE AC!DEV=['11],AC!PPN=[7],AC!EXT=['17];])
+IF LEFT(MEMORY[LOCATION(INIACS)+AC!EXT])=LEFT(CVSIX(CORE!IMAGE!EXTENSION))
+THEN BEGIN RUNDEV_CV6STR(MEMORY[LOCATION(INIACS)+AC!DEV]);
+    RUNPPN_MAKPPN(MEMORY[LOCATION(INIACS)+AC!PPN]) END;
+]) ! NOTENX;
+TENX([ J_BK!PRV(TRUE); PROGNAM_SCAN(PROGNAM,BK!DEC,BRCHAR); BK!PRV(J); ])
+
+! NOW MAKE LIKE RPG -- SEE IF WE CAN USE AN EXISTING .BAI FILE;
+ENROLL_FALSE; SM1PNT_BALNK;
+IF (BAITIM_LAST!WRITTEN(BAINAM_PROGNAM & ".BAI","RE"))<
+	(DMPTIM_LAST!WRITTEN(PROGNAM_PROGNAM & ("."&CORE!IMAGE!EXTENSION),"RE"))
+    OR DMPTIM=0
+THEN ENROLL_TRUE;
+WHILE SM1PNT AND NOT ENROLL DO BEGIN
+    SM1NAM_FILSPC(FALSE);	! USE SM1LNK AND GET FILE NAME;
+    SM1PNT_SM1LNK(0);	! FOLLOW DOWN LINK;
+    IF LAST!WRITTEN(SM1NAM,"RE") GEQ BAITIM THEN ENROLL_TRUE END;
+
+
+IF NOT ENROLL THEN BEGIN "NOROLL"
+    BAIJFN_OPENFILE(BAINAM,"R"); IF !SKIP! THEN BEGIN
+	OUTSTR(" reconstructing .BAI file");
+	ENROLL_TRUE END	
+    ELSE BEGIN
+	OUTSTR(" using " & BAINAM);
+	! FIRST DISK BLOCK OF .BAI FILE IS A HEADER INDEX BLOCK.
+	WORD	0-7    UNUSED
+		8	USETI POINTER TO BEGINNING OF T!CRDIDX
+		9	CRDCTR,,N!CRDIDX
+		10	USETI POINTER TO BEGINNNG OF T!BLKADR
+		11	N!BLKADR
+		12	USETI POINTER TO BEGINNING OF T!NAME
+		13	N!NAME
+		14	USETI POINTER TO TEXT FILE NAMES
+		15	N!TXTFIL,,! OF WORDS TAKEN UP BY NAMES
+		16-127	UNUSED;
+	! READ THE FIRST BLOCK TO GET THE INDEX INFO;
+	ARRYIN(BAIJFN,TARRAY[0],128);
+	! SET UP THE VARIOUS ARRAYS;
+	C!CRDIDX_COREGET(N!CRDIDX_RIGHT(TARRAY[9])); CRDCTR_LEFT(TARRAY[9]);L!CRDIDX_N!CRDIDX-1;
+	    USETIN(BAIJFN,TARRAY[8]); ARRYIN(BAIJFN,T!CRDIDX(0),N!CRDIDX);
+	C!BLKADR_COREGET(N!BLKADR_TARRAY[11]); L!BLKADR_N!BLKADR-1;
+	    USETIN(BAIJFN,TARRAY[10]); ARRYIN(BAIJFN,T!BLKADR(0),N!BLKADR);
+	C!NAME_COREGET(N!NAME_TARRAY[13]); L!NAME_N!NAME-1;
+	    USETIN(BAIJFN,TARRAY[12]); ARRYIN(BAIJFN,T!NAME(0),N!NAME);
+	L!TXTFIL_TARRAY[15] ASH -18; L_RIGHT(TARRAY[15]);
+	    USETIN(BAIJFN,TARRAY[14]); T_NULL; FOR I_0 UPTO L DO T_T &
+	    CVASTR(WORDIN(BAIJFN)); J_BK!PRV(TRUE);
+	    FOR I_0 UPTO L!TXTFIL DO
+		HORSECART(BAITIM,BAINAM,T!TXTFIL[I]_SCAN(T,BK!TAB,BRCHAR));
+	    BK!PRV(J);
+
+	! NOW WE ARE IN BUSINESS;
+	GOTO DONESTBAIL; END END "NOROLL";
+
+! HERE TO CONSTRUCT THE .BAI FILE;
+BAIJFN_OPENFILE(BAINAM,"W"); IF !SKIP! THEN BEGIN BAILOFF_TRUE;
+	OUTSTR("
+Bailor abandons ship.");RETURN END;
+
+! NOW GET SOME CORE FOR THE VARIABLE LENGTH TABLES;
+C!NAME_COREGET(N!NAME_2000);  L!NAME_32;	! FOR BUCKETS;
+C!BLKADR_COREGET(N!BLKADR_256);	L!BLKADR_-1;
+C!CRDIDX_COREGET(N!CRDIDX_64);	L!CRDIDX_-1;
+
+N!BYTE_0;CRDCTR_0;
+
+! WRITE A DUMMY FIRST BLOCK;	ARRYOUT(BAIJFN,TARRAY[0],128);
+
+L!TXTFIL_-1;
+DOSM1(0);	! PROCESS THOSE FILES WHICH DO NOT POINT TO PREDECLARED RUNTIMES;
+
+! SUPER OUTER BLOCK, FOR PREDECLARED STUFF;
+! FIRST THE BLOCK;
+L_PREDEC("$RUN$",BLK,0,0); AD!BLKADR(L,'777777000000);
+begin	own integer !!dad;
+	 !!dad_l;	! for runtime inserts;
+! NOW THE OTHER STUFF;
+NOHAND([
+PREDEC("!SKIP!"		,ID,L,REFB+INTEGR+LOCATION(!SKIP!));
+PREDEC("MEMORY"		,ID,L,REFMEMORY);
+PREDEC("INTEGER"	,ID,L,INTEGR+LOCATION(INTEGR));
+PREDEC("REAL"		,ID,L,INTEGR+LOCATION(FLOTNG));
+PREDEC("STRING"		,ID,L,INTEGR+LOCATION(STRNG));
+PREDEC("SET"		,ID,L,INTEGR+LOCATION(SETYPE));
+PREDEC("LIST"		,ID,L,INTEGR+LOCATION(LSTYPE));
+PREDEC("GOGTAB"		,ID,L,REFB+ARRY+INTEGR+LOCATION(GOGTAB));
+PREDEC("TRACE"		,PRC,L,REFTRACE);
+PREDEC("UNTRACE"	,PRC,L,REFUNTRACE);
+PREDEC("BREAK"		,PRC,L,REFBREAK);
+PREDEC("UNBREAK"	,PRC,L,REFUNBREAK);
+PREDEC("SETLEX"		,PRC,L,REFSETLEX);
+PREDEC("HELP"		,PRC,L,REFHELP);
+PREDEC("!!STEP"		,PRC,L,REF!!STEP);
+PREDEC("!!GOTO"		,PRC,L,REF!!GOTO);
+PREDEC("!!GSTEP"	,PRC,L,REF!!GSTEP);
+PREDEC("ARGS"		,PRC,L,REF!!ARGS);
+PREDEC("TEXT"		,PRC,L,REF!!TEXT);
+PREDEC("TRAPS"		,PRC,L,REFTRAPS);
+PREDEC("SHOW"		,PRC,L,REFSHOW);
+PREDEC("DDT"		,PRC,L,REFDDT);
+PREDEC("COORD"		,PRC,L,REFCOORD);
+PREDEC("!!UP"		,PRC,L,REF!!UP);
+PREDEC("SETSCOPE"	,PRC,L,REFSETSCOPE);
+PREDEC("DEFINE"		,PRC,L,REF!!DEFINE);
+predec("RECORD!POINTER"	,id,l,integr+location(rectyp));
+predec("ARRAY"		,id,l,integr+location(arry));
+predec("REFERENCE"	,id,l,integr+location(refb));
+predec("PROCEDURE"	,id,l,integr+location(procb));
+predec("!!DAD"		,id,l,integr+location(!!dad));
+predec("!!QUERY"	,id,l,refb+strng+location(!!query));
+predec("BAIL!BANNER"	,id,l,strng+location(compiler!banner));
+]) ! NOHAND;
+HAND([
+START!CODE DEFINE T=['13],T2=['14];
+DEFINE	NPD=26+7;	! watch out for parens!!;
+PRESET!WITH 
+	asz3(!SKIP!),
+	asz3(MEMORY),
+	asz3(INTEGER),
+	asz3(REAL),
+	asz3(STRING),
+	asz3(SET),
+	asz3(LIST),
+	asz3(GOGTAB),
+	asz3(TRACE),
+	asz3(UNTRACE),
+	asz3(BREAK),
+	asz3(UNBREAK),
+	asz3(SETLEX),
+	asz3(HELP),
+	asz3(!!STEP),
+	asz3(!!GOTO),
+	asz3(!!GSTEP),
+	asz3(ARGS),
+	asz3(TEXT),
+	asz3(TRAPS),
+	asz3(SHOW),
+	asz3(DDT),
+	asz3(COORD),
+	asz3(!!UP),
+	asz3(SETSCOPE),
+	asz3(DEFINE),
+	 asz3(RECORD!POINTER),
+	 asz3(ARRAY),
+	 asz3(REFERENCE),
+	 asz3(PROCEDURE),
+	 asz3(!!DAD),
+	 asz3(!!QUERY),
+	 asz3(BAIL!BANNER)
+		;
+OWN SAFE INTEGER ARRAY PRENAM[0:3*NPD-1];
+EXTERNAL INTEGER SETLEX,!!STEP,!!GSTEP,!!ARGS,!!TEXT;
+DEFINE	refstr=	['200140000000],
+	REFINT=	['200240000000],
+	REFMEM=	['201240777777],
+	valstr=	['000140000000],
+	valint=	['000240000000],
+	INTARY=	['001440000000],
+	PROC=	['020000000000],
+	STRPRC=	['020140000000],
+	INTPRC=	['020240000000];
+! REFB+INTEGR;
+! REFB+ARRY+NOTYPE;
+! INTEGR;
+! INTEGR ARRY;
+! PROCB;
+! PROCB+STRNG;
+! PROCB+INTEGR;
+LABEL LUP,REFTAB,BOT,NOTPRC;
+	MOVEI	T,NPD-1;! NPD SYMBOLS TO BE PREDECLARED, 0 THRU NPD;
+LUP:	MOVEM	T,I;	! TUCK IT AWAY IN MEMORY;
+	move	1,reftab(t);	! pick up type bits;
+	MOVEI	T2,PRC;	! ASSUME PROCEDURE;
+! ***	CAIGE	T,8;
+	tlnn	1,'020000;	! check procedure bit;
+	 MOVEI	T2,ID;	! WRONG ASSUMPTION;
+	PUSH	P,T2;
+	PUSH	P,L;
+! ***	PUSH	P,REFTAB(T);	! MAGIC BITS FOR THIS NAME;
+	PUSH	P,1;		! MAGIC BITS FOR THIS NAME;
+! ***	CAIGE	T,8;
+	tlnn	1,'020000;	! check procedure bit;
+	 JRST	NOTPRC;
+	PUSHJ	P,PDFIND;	! FIND PDA FOR THIS PROC;
+	MOVE	T,I;	! RETRIEVE DESTROYED AC;
+	HLL	1,REFTAB(T);	! REINSERT PROCEDURE TYPE BITS;
+	PUSH	P,1;	! STACK IT;
+NOTPRC:	IMULI	T,3;	! 3 WORDS PER NAME IN PRENAM ARRAY;
+	MOVEI	T,PRENAM[0](T);
+	PUSH	P,T;	! FWA;
+	PUSHJ	P,INSERT;	! STICK IT IN MAGIC TABLE;
+	MOVE	T,I;	! RESTORE DESTROYED AC;
+	SOJGE	T,LUP;
+	JRST	BOT;
+REFTAB:	REFINT	!SKIP!;
+	REFMEM;
+	valint	0,[INTEGR];
+	valint	0,[FLOTNG];
+	valint	0,[STRNG];
+	valint	0,[SETYPE];
+	valint	0,[LSTYPE];
+	INTARY	GOGTAB;
+	PROC	TRACE;
+	PROC	UNTRACE;
+	PROC	BREAK;
+	PROC	UNBREAK;
+	PROC	SETLEX;
+	STRPRC	HELP;
+	PROC	!!STEP;
+	PROC	!!GOTO;
+	PROC	!!GSTEP;
+	STRPRC	!!ARGS;
+	STRPRC	!!TEXT;
+	STRPRC	TRAPS;
+	STRPRC	SHOW;
+	PROC	DDT;
+	INTPRC	COORD;
+	PROC	!!UP;
+	PROC	SETSCOPE;
+	PROC	!!DEFINE;
+	valint	0,[rectyp];
+	valint	0,[arry];
+	valint	0,[refb];
+	valint	0,procb;
+	valint	0,!!dad;
+	refstr	0,!!query;
+	valstr	0,[compiler!banner];
+BOT:
+	END;
+]) ! HAND;
+end;
+
+DOSM1(L);	! Process those .SM1 files for predecalred runtimes, if any;
+
+! PUT A FLAG AT THE END OF THE COORDINATES ON THE .BAI FILE;
+WORDOUT(BAIJFN,MAX#TXTFIL LSH 24); ! ILLEGAL FILE FLAG;
+WORDOUT(BAIJFN,'377777777777); ! ALLSTO=0, CRDNO='377777, ADDR='777777;
+N!BYTE_((N!BYTE+'200) LAND LNOT '177)-2;	! FORCE NEW ENTRY IN INDEX,TOO;
+AD!CRDIDX('377777777777);
+
+! CONSTRUCT THE FATHER CHAINS IN THE BLKADR TABLE AND NAME TABLE;
+NOHAND([
+DEFINE FWA(I)=[RIGHT(T!BLKADR(I+1))], LWA(I)=[LEFT(T!BLKADR(I+1))];
+DEFINE NAMPTR(I)=[RIGHT(T!BLKADR(I))], FATHERBLOCK(I)=[LEFT(T!BLKADR(I))];
+L_0; TARRAY[L]_L!BLKADR-1;
+FOR I_L!BLKADR-3 STEP -2 UNTIL 0 DO BEGIN "FBLK"
+    ! DESCEND TO PROPER LEVEL. QUIT UPON REACHING ANY OUTER BLOCK;
+    WHILE LWA(I) LEQ FWA(TARRAY[L]) DO IF L NEQ 0 THEN L_L-1 ELSE BEGIN
+	TARRAY[0]_I; CONTINUE "FBLK" END;
+    T!BLKADR(I)_T!BLKADR(I) LOR TARRAY[L] LSH 18;  ! INSERT FATHER;
+    PAGEIT(T!NAME,NAMPTR(I))_PAGEIT(T!NAME,NAMPTR(I)) LAND '600000777777
+	LOR (NAMPTR(FATHERBLOCK(I)) LSH 18);	! TAKE CARE OF NAME TABLE, TOO;
+    TARRAY[L_L+1]_I;	! UP A NEW LEVEL AND RECORD; END "FBLK";
+]) ! NOHAND;
+HAND([
+START!CODE LABEL TOP2,BOT2,BOT1A;
+DEFINE I=['14],L=['15],T1=[1],T2=[2];
+	MOVE	I,L!BLKADR;
+	SUBI	I,1;
+	ADD	I,C!BLKADR;
+	SETO	L,;
+TOP2:	JUMPL	L,BOT1A;
+BOT2:	HLRZ	T1,1(I);		! LWA (I);
+	MOVE	T2,TARRAY[0](L);
+	HRRZ	T2,1(T2);		! FWA(TARRAY[L]);
+	CAIG	T1,(T2);
+	 SOJA	L,TOP2;
+	MOVE	T1,TARRAY[0](L);
+	SUB	T1,C!BLKADR;
+	HRLM	T1,(I);		! T!BLKADR(I)_ ... LOR TARRAY[L] LSH 18;
+	ADD	T1,C!BLKADR;	! FATHERBLOCK(I);
+	MOVE	T1,(T1);	! NAMPTR(   );
+	MOVE	T2,(I);		! NAMPTR(I);
+	ADD	T2,C!NAME;
+	DPB	T1,[('222000+T2)LSH 18];
+BOT1A:	MOVEM	I,TARRAY[1](L);
+	SUBI	I,2;
+	CAML	I,C!BLKADR;
+	 AOJA	L,BOT2;
+END;
+]) ! HAND;
+
+! REVERSE THE HASH CHAINING IN THE NAME TABLE, SO THAT THE INNERMOST 
+  OCCURRENCES OCCUR FIRST IN A CHAIN;
+NOHAND([
+FOR I_0 UPTO 31 DO BEGIN
+    INTEGER FATHER, SON;
+    FATHER_T!NAME(I); L_0;
+    WHILE FATHER NEQ 0 DO BEGIN
+	SON_RIGHT(T!NAME(FATHER));
+	T!NAME(FATHER)_T!NAME(FATHER) LAND '777777000000 LOR L;
+	L_FATHER; FATHER_SON END;
+    T!NAME(I)_L END;
+]) ! NOHAND;
+HAND([
+START!CODE LABEL TOP1,TOP2,BOT1;
+DEFINE F=['14],S=['15],L=[0],I=[2];
+	MOVSI	I,-32;
+	HRR	I,C!NAME;
+TOP1:	MOVE	F,(I);
+	SETZ	L,;
+	JRST	BOT1;
+TOP2:	ADD	F,C!NAME;	! RELOC FATHER;
+	HRRZ	S,(F);		! SON_RIGHT(T!NAME(FATHER));
+	HRRM	L,(F);
+	MOVEI	L,(F);
+	SUB	L,C!NAME;
+	MOVEI	F,(S);
+BOT1:	JUMPN	F,TOP2;
+	MOVEM	L,(I);
+	AOBJN	I,TOP1;
+END;
+]) ! HAND;
+
+! NOW WRITE THE VARIABLE LENGTH TABLES TO THE .BAI FILE;
+USETOUT(BAIJFN,TARRAY[8]_(N!BYTE + '577) LSH -7);	! PAST HEADER BLOCK AND COORDS;
+    ARRYOUT(BAIJFN,T!CRDIDX(0),RIGHT(TARRAY[9]_(CRDCTR LSH 18)+L!CRDIDX+1));
+USETOUT(BAIJFN,TARRAY[10]_TARRAY[8]+((L!CRDIDX+'200) LSH -7));
+    ARRYOUT(BAIJFN,T!BLKADR(0),TARRAY[11]_L!BLKADR+1);
+USETOUT(BAIJFN,TARRAY[12]_TARRAY[10]+((L!BLKADR+'200) LSH -7));
+    ARRYOUT(BAIJFN,T!NAME(0),TARRAY[13]_L!NAME+1);
+T_NULL; FOR I_0 UPTO L!TXTFIL DO T_T & T!TXTFIL[I] & TAB; L_(LENGTH(T)+4) DIV 5;
+    USETOUT(BAIJFN,TARRAY[14]_TARRAY[12]+((L!NAME+'200) LSH -7));
+    TARRAY[15]_L!TXTFIL LSH 18 LOR L;
+    FOR I_1 UPTO L DO WORDOUT(BAIJFN,CVASC(T[5*I-4 FOR 5]));
+
+! WRITE THE HEADER INDEX BLOCK AND CLOSE OUR GLORIOUS FILE;
+USETOUT(BAIJFN,1); ARRYOUT(BAIJFN,TARRAY[0],128); CFILE(BAIJFN);
+
+! NOW REOPEN IT FOR BUSINESS;
+BAIJFN_OPENFILE(BAINAM, "R"); ! RELEASE T!NAME CORE HERE IF
+		YOU ARE PAGING THE NAME TABLE;
+
+DONESTBAIL:
+NOHAND([L!CACHE_-1;]) HAND([L!CACHE_-5;])
+! INITIALIZE THE BREAKPOINT TRAP;
+PJPBAIL_'260000000000 ! PUSHJ; +(P LSH 23)+LOCATION(BAIL);
+
+
+
+START!CODE DEFINE USER=['15],TEMP=['14];
+	MOVE	USER,GOGTAB;
+	MOVSI	TEMP,'400000;
+	IORM	TEMP,BAILOC(USER);	! SIGN BIT IFF INITIALIZED,,LOC(BAIL);
+	SETZM	BAILOFF;
+END;
+OUTSTR("
+End of BAIL initialization.
+");
+!SKIP!_#SKIP#;
+END "STBAIL";
+
+! LINED DBANG !!EQU EVALERR;
+DEFINE INTVAL=[1], REALVAL=[2], STRCON=[3], ID=[4], SPCHAR=[5];
+
+SIMPLE STRING PROCEDURE LINED; BEGIN "LINED"
+DEFINE QUOTE=['042], SEMI=['073];
+! RETURN A STRING WHICH ENDS IN A SEMICOLON AND IS BALANCED WITH
+	RESPECT TO STRING QUOTES;
+NOHAND([
+STRING RESULT; INTEGER CHAR, QUOTECOUNT,#SKIP#;
+
+IF LENGTH(!!QUERY) THEN BEGIN
+	RESULT_!!QUERY; !!QUERY_NULL; RETURN(RESULT) END;
+QUOTECOUNT_0; RESULT_NULL; #SKIP#_!SKIP!;
+WHILE TRUE DO BEGIN
+   RESULT_RESULT & NOTENX([INCHWL]) TENX([INTTY]);
+    IF !SKIP!=CH!ALT OR !SKIP! GEQ '200 THEN BEGIN "MACRO EXPAND"
+	!skip!_ '177 land (IF !SKIP!=CH!ALT THEN INCHRW ELSE !SKIP!);
+	char_ !skip!  land '137;
+	IF "A" LEQ CHAR LEQ "Z" THEN RESULT_RESULT & MACTAB[CHAR]
+	    else if !skip! > 0 then result_ result & !skip!;
+	!SKIP!_0 END "MACRO EXPAND";
+    QUOTECOUNT_0; J_LENGTH(RESULT);
+    FOR I_1 UPTO J DO IF RESULT[I FOR 1]=QUOTE THEN QUOTECOUNT_LNOT (QUOTECOUNT);
+    IF NOT QUOTECOUNT THEN BEGIN
+	IF RESULT[INF FOR 1]=semi THEN BEGIN
+	    !SKIP!_#SKIP#;
+	    ! SYNTACTIC SUGAR;
+	    IF RESULT="?" THEN RETURN("HELP;")
+	    ELSE RETURN(RESULT) END;
+	IF !SKIP!='15 then begin !skip!_#skip#; return(result&semi) end
+	else IF !SKIP!='12 THEN RESULT_CATCRLF(RESULT)
+	   ELSE IF !SKIP!>0 THEN RESULT_RESULT&!SKIP!;
+END END;
+]) ! NOHAND;
+HAND([
+EXTERNAL INTEGER CAT,CATCHR;
+STRING RESULT,TSTR,TSTR1; INTEGER I,J;
+START!CODE LABEL LOOP1, LOOP2, CCRLF, NORAISE, SUGAR, CCRLF1,
+		 NOQ, CATR, notmac, TMAC;
+NOTENX([EXTERNAL INTEGER INCHWL;])
+TENX([EXTERNAL INTEGER INTTY;])
+EXTERNAL INTEGER INCHRW;
+DEFINE L=[1],T=[2],QC=[3],BP=[4];	! DO NOT CHANGE L=1;
+
+	MOVEI	T,!!QUERY;
+	HRRZ	L,-1(T);	! LENGTH OF !!QUERY;
+	JUMPE	L,NOQ;
+	PUSH	SP,-1(T);	! USE !!QUERY;
+	PUSH	SP,(T);
+	SETZM	-1(T);		! !!QUERY_NULL;
+	POPJ	P,;
+
+NOQ:	PUSH	SP,[0];
+	PUSH	SP,[0];	! NULL STRING;
+LOOP1:
+	PUSH	P,!SKIP!;	! PRESERVE OVER CALL WHICH MUNGES IT;
+	PUSHJ	P,NOTENX([INCHWL]) TENX([INTTY]);
+	POP	P,T;	! PREVIOUS !SKIP!;
+	EXCH	T,!SKIP!;
+	MOVEM	T,#SKIP#;
+CATR:	PUSHJ	P,CAT;
+	SETZ	QC,0;
+	HRRZ	L,-1(SP);	! LENGTH OF STRING;
+	JUMPE	L,TMAC;
+	MOVE	BP,(SP);	! BYTE POINTER TO STRING;
+	MOVE	T,(SP);		! BYTE POINTER;
+	ILDB	T,T;		! FIRST CHAR;
+	CAIN	T,"?";		! CHECK FIRST CHAR FOR HELP;
+	 JRST	SUGAR;
+LOOP2:	ILDB	T,BP;
+	CAIN	T,QUOTE;
+	 SETCA	QC,QC;
+	JUMPN	QC,NORAISE;	! IF IN STRING QUOTE, DON'T MUNGE;
+	CAIN	T,"";		! CHECK FOR UNDERBAR;
+	 MOVEI	T,"!";		! CHANGE TO BANG;
+	DPB	T,BP;
+NORAISE:
+	SOJG	L,LOOP2;
+
+TMAC:	MOVE	L,#SKIP#;	! CHECK FOR MACRO;
+	CAIE	L,CH!ALT;
+	CAIL	L,'200;
+	 SKIPA;			! IT'S A MACRO;
+	 JRST	notmac;		!  not macro and break < '200;
+	CAIN	L,CH!ALT;
+	 PUSHJ	P,INCHRW;	! ALTMODE STYLE, GET NEXT CHAR;
+	andi	l,'177;		! clear all nasty high order bits;
+	movem	l,#skip#;	! replace as break char;
+	ANDI	L,'137;		! map lower case into upper case;
+	CAIL	L,"A";
+	CAILE	L,"Z";
+	 JRST	notmac;		! NOT IN RANGE;
+	ADDI	L,-1-2*"A"(L);	! 2*L-1, TO GET WD1 OF STRING;
+	PUSH	SP,MACTAB["A"](L);
+	MOVEI	L,1(L);		! 2*L, TO GET WD2;
+	PUSH	SP,MACTAB["A"](L);
+	SETZM	#SKIP#;
+	JRST	CATR;		! CAT ON MACRO AND CONTINUE;
+
+notmac:	jumpn	qc,ccrlf;	! skip return stuff if in quotes;
+
+	CAIN	T,SEMI;
+	 POPJ	P,;		! line ends in semicolon, return;
+	move	t,#skip#;	! get break char;
+	caie	t,'15;		! <cr> ends unquoted line;
+	 jrst	CCRLF;		!   do append and input loop;
+	push	p,[semi];	! was <cr>, unquoted.  get a semicolon;
+	pushj	p,catchr;	! concatenate it and return result;
+	popj	p,;
+CCRLF:
+	hrrz	l,-1(sp);
+	jumpe	l,loop1;	! null lines re-input;
+	MOVE	T,#SKIP#;	! GET BREAK CHAR;
+	JUMPLE	T,LOOP1;	! IF NO BREAK CHAR, JUST CONTINUE;
+	CAIE	T,'15;
+	CAIN	T,'12;
+	 JRST	CCRLF1;		! IF CR OR LF, THEN PUT CRLF ON END;
+	PUSH	P,T;		! SOME CHAR OTHER THAN CR OR LF;
+	PUSHJ	P,CATCHR;
+	JRST	LOOP1;
+CCRLF1:	PUSHJ	P,CATCRLF;
+	push	p,['15];	! print a <cr> in case <lf> was brk;
+	pushj	p,outchr;
+	JRST	LOOP1;
+SUGAR:	MOVEI	T,5;
+	MOVEM	T,-1(SP);
+	MOVE	T,["HELP;"];
+	MOVEM	T,(SP);
+	POPJ	P,;
+END;
+]) ! HAND;
+END "LINED";
+
+SIMPLE STRING PROCEDURE DBANG(STRING ARG); START!CODE "DBANG"
+! CHANGE STANFORD UNDERBAR TO EXCLAMATION MARK;
+LABEL LOOP,LAB;
+	HRRZ	1,-1(SP);	! LENGTH;
+	SKIPN	1;
+	 POPJ	P,;		! NULL STRING;
+	MOVE	2,(SP);		! BYTE POINTER TO STRING;
+LOOP:	ILDB	3,2;		! GET CHAR;
+	CAIN	3,"";		! CHECK FOR STANFORD UNDERBAR;
+	 MOVEI	3,"!";		! CHANGE TO BANG;
+LAB:	DPB	3,2;
+	SOJG	1,LOOP;		! UNTIL DONE;
+	POPJ	P,;
+END "DBANG";
+
+
+SIMPLE INTEGER PROCEDURE !!EQU(STRING A,B);
+    EQU(DBANG(STRCOPY(A)),DBANG(STRCOPY(B)));
+! SAME AS EQU EXCEPT THAT STANFORD UNDERBARS EQUAL EXCLAMATION POINTS;
+
+
+SIMPLE PROCEDURE EVALERR(STRING WHY,OLDARG,ARG); BEGIN
+    !ERRP! SWAP !RECOVERY!; OUTSTR(DUMPSTR);
+    NONFATAL(WHY & ":  " & OLDARG & LF & ARG);END;
+SIMPLE PROCEDURE EV1ERR(STRING WHY); EVALERR(WHY,NULL,NULL);
+
+! GET!TOKEN;
+SIMPLE PROCEDURE GET!TOKEN( REFERENCE STRING ARG,STRVAL;
+	REFERENCE INTEGER CLASS, IVAL); BEGIN "GET!TOKEN"
+! CLASS: 0: use BK!ID for identifiers and expand macros.
+	-1: use BK!ID2 for identifiers, no macro expansion.
+;
+INTEGER BRCHAR,T,J,#SKIP#;		STRING A;
+DEFINE XDELIMS=[SCAN(ARG,BK!DLM,BRCHAR)];
+
+#SKIP#_!SKIP!;
+! Establish breaktable privilege and skip over initial delimiters;
+J_BK!PRV(TRUE);
+xdelims;
+
+! Check for string constant. String constants are returned without
+    surrounding  quotes, and with internal double quotes removed;
+! Note heavy dependence on SAIL type conversion in this "IF";
+IF ARG=QUOTE THEN BEGIN
+	STRVAL_NULL;
+	WHILE ARG=QUOTE DO BEGIN A_LOP(ARG);
+		STRVAL_STRVAL & SCAN(ARG,BK!QUO,BRCHAR) END;
+	IF BRCHAR NEQ QUOTE THEN
+	    NONFATAL("String quote added")
+	ELSE STRVAL_STRVAL[1 TO INF-1]; 	! REMOVE TERMINATING QUOTE;
+	CLASS_STRCON; END
+
+! Check for octal;
+ELSE IF ARG="'" THEN BEGIN
+	A_LOP(ARG);
+	IVAL_CVO(strval_SCAN(ARG,BK!OCT,BRCHAR));
+	strval_a & strval;
+	CLASS_INTVAL;
+	END
+
+! Check for integer or real;
+! This is a kluge because INTSCAN won't stop upon seeing a letter or 
+	special char or delimiter.  INTSCAN insists upon finding a 
+	number, even the "8" in "K[I]_FN(SYM8T)";
+ELSE IF LENGTH(A_SCAN(ARG,BK!NUM,BRCHAR)) THEN BEGIN
+	! Found a number. Reconstitute ARG, then decide real or integer;
+	T_LENGTH(STRVAL_ARG_A & ARG);
+	SCAN(A,BK!DEC,BRCHAR);
+	IF LENGTH(A) THEN BEGIN ! REAL CONSTANT;
+	    MEMLOC(IVAL,REAL)_REALSCAN(ARG,BRCHAR); CLASS_REALVAL; END
+	ELSE BEGIN ! INTEGER CONSTANT;
+	    IVAL_INTSCAN(ARG,BRCHAR); CLASS_INTVAL; END;
+	STRVAL_STRVAL[1 FOR T-LENGTH(ARG)] END
+
+! Check for identifier;
+ELSE BEGIN
+STRVAL_SCAN(ARG,IF CLASS geq 0 THEN BK!ID ELSE BK!ID2,BRCHAR); 
+IF length(STRVAL) THEN BEGIN
+	STRVAL_DBANG(STRVAL); CVNAME(STRVAL,NAME); class_id END
+ ELSE BEGIN STRVAL_t_LOP(ARG); class_SPCHAR;
+	if t="*"=arg then strval_"^"
+	else if t=":" and arg="=" then strval_ "_"
+	else if t="<" and arg="=" then strval_ '34	! leq;
+	else if t=">" and arg="=" then strval_ '35	! geq;
+	else t_0;
+	if t then t_lop(arg);
+      END;
+end;
+
+! COMMON RETURN POINT;
+XDELIMS; BK!PRV(J); !SKIP!_#SKIP#; RETURN END "GET!TOKEN";
+
+! INTARRAY, CRD!PC, FTEXT, SHOW, CRDFND, GETTEXT;
+SIMPLE PROCEDURE INTARRAY(INTEGER CHAN,BLOCK); BEGIN
+USETIN(CHAN,BLOCK); ARRYIN(CHAN,TARRAY[0],256) END;
+
+SIMPLE INTEGER PROCEDURE CRD!PC(INTEGER PC);
+! RETURN INDEX TO TARRAY OF COORDINATE WHICH IS FLOOR OF PC;
+NOHAND([
+BEGIN
+PC_RIGHT(PC);	! In case someone forgot;
+I_-1; DO I_I+1 UNTIL RIGHT(T!CRDIDX(I))>PC;
+INTARRAY(BAIJFN,I+2);
+I_-1; DO I_I+2 UNTIL RIGHT(TARRAY[I])>PC; RETURN(I-3) END;
+]) ! NOHAND;
+HAND([
+BEGIN
+START!CODE LABEL LOOP1,LOOP2; DEFINE I=[1],T=['15];
+	MOVE	I,C!CRDIDX;	! FWA DATA;
+	HRRZS	PC;		! SAFETY FIRST;
+LOOP1:	HRRZ	T,(I);		! PC FOR COORD;
+	CAMGE	T,PC;
+	 AOJA	I,LOOP1;	! FIND FIRST WHICH IS GREATER;
+	PUSH	P,BAIJFN;
+	ADDI	I,2;		! USETI POINTER;
+	SUB	I,C!CRDIDX;
+	PUSH	P,I;
+	PUSHJ	P,INTARRAY;
+	SETO	I,;	
+LOOP2:	ADDI	I,2;		! NEXT COORD;
+	HRRZ	T,TARRAY[0](I);
+	CAMG	T,PC;		! FIND FIRST WHICH IS GREATER;
+	 JRST	LOOP2;
+	SUBI	I,3;		! POINT TO RIGHT PLACE;
+	SKIPGE	I;
+	 SETZ	I,;		! JUST IN CASE;
+	SUB	P,['2000002];
+	JRST	@2(P);
+END; END;
+]) ! HAND;
+
+
+SIMPLE INTEGER PROCEDURE CRDFND(INTEGER CRDNO); BEGIN "CRDFND"
+! RETURN INDEX TO TARRAY WHICH POINTS TO COORDINATE INFO FOR CRDNO;
+IF L!CRDIDX<0 THEN EV1ERR("No coords");
+CRDNO_0 MAX CRDNO MIN (CRDCTR-1);	! Clip bounds. CRDCTR-1 for fake coord at end;
+INTARRAY(BAIJFN,(CRDNO LSH -6)+2);
+RETURN((CRDNO LAND '77) LSH 1) END "CRDFND";
+
+
+SIMPLE STRING PROCEDURE FTEXT(INTEGER CRDPNTR); BEGIN "FTEXT"
+! CONSTRUCT STRING CONTAINING TEXT OF COORDINATE GIVEN BY TARRAY[CRDPNTR];
+INTEGER ALLSTO,COORD1,NCHR;
+INTEGER PNTR1,PNTR2,I,FILN,OFILN;	STRING TEXT;
+#SKIP#_!SKIP!;
+! PICK UP FILE,BLOCK,WORD NUMBERS FOR CURRENT AND NEXT COORDINATE;
+NOHAND([
+PNTR1_TARRAY[CRDPNTR]; COORD1_LEFT(TARRAY[CRDPNTR+1]) LAND '377777;
+ALLSTO_TARRAY[CRDPNTR+1] LSH -35;
+FILN_PNTR1 LSH -24; PNTR1_PNTR1 LAND '77777777;
+PNTR2_TARRAY[CRDPNTR+2];
+NCHR_IF FILN=(PNTR2 LSH -24) THEN (PNTR2-PNTR1) LAND '77777777 ELSE 400;
+NOTENX([
+	MEMORY[LOCATION(TEXT)-1]_NCHR; MEMORY[LOCATION(TEXT)]_
+	    LOCATION(TARRAY[0]) + PNTR1%640%5 + (7 LSH 24) + 
+	    ((5-(PNTR1 MOD 5))*7+1) LSH 30;
+]) ! NOTENX;
+]) ! NOHAND;
+HAND([
+START!CODE DEFINE T=[1],T2=[2],CP=[3],U=['14];
+	MOVE	CP,CRDPNTR;
+	MOVE	T,TARRAY[0](CP);
+	LDB	T2,[('301400 LSH 18)+T];	! FILE NUMBER OF PNTR1;
+	MOVEM	T2,FILN;
+	TLZ	T,'777700;	! ISOLATE CHAR NUMBER;
+	MOVEM	T,PNTR1;
+	HLRZ	T,TARRAY[1](CP);
+	ANDI	T,'377777;
+	MOVEM	T,COORD1;
+	SETZM	ALLSTO;
+	SKIPGE	TARRAY[1](CP);
+	 SETOM	ALLSTO;
+	MOVE	T,TARRAY[2](CP);	! T HOLDS PNTR2;
+	LDB	T2,[('301400 LSH 18)+T];	! FILE NUMBER OF PNTR2;
+	SUB	T,PNTR1;	! PNTR2-PNTR1;
+	TLZ	T,'777700;	! BOTTOM 24 BITS;
+	CAME	T2,FILN;
+	 MOVEI	T,400;		! DIFFERENT FILES;
+TENX([	MOVEM	T,NCHR;	])
+NOTENX([MOVEI	CP,TEXT;	! ADR OF WD2;
+	MOVEM	T,-1(CP);	! STRING CHAR COUNT;
+! COMPUTE BYTE POINTER;
+	MOVE	T,PNTR1;
+	IDIVI	T,640;		! BLOCK OFFSET IN T, CHAR OFFSET IN T+1;
+	ADDI	T,1;		! USETI NUMBER;
+	MOVEM	T,PNTR1;	! SAVE USETI BLOCK NUMBER;
+	MOVEI	T,(T+1);	! CHAR OFFSET;
+	IDIVI	T,5;		! WORD OFFSET IN T, BYTE OFFSET IN T+1;
+	MOVEI	U,'400;		! ADJUST LENGTH TO NO MORE THAN WE READ IN;
+	SUBI	U,(T);		! 128+ WORDS TO NEXT BLOCK BOUNDARY;
+	IMULI	U,5;		! CHARS;
+	SUBI	U,(T+1);	! SOME WERE COUNTED ALREADY;
+	CAMGE	U,-1(CP);	! L_L MIN U;
+	 MOVEM	U,-1(CP);
+	MOVEI	T,TARRAY[0](T);	! WORD ADDRESS;
+	XORI	T+1,7;		! 0,1,2,3,4 BECOMES 7,6,5,4,3;
+	IMULI	T+1,'70000;	! BYTE POINTER "P" OF 49,42,35,28,21;
+	HRLI	T,'630700(T+1);
+	MOVEM	T,(CP);		! BYPTE POINTER AT LAST;
+]) ! NOTENX;
+	END;
+]) ! HAND;
+! STATUS OF FILES
+	-'1000	NOT ACCESSIBLE (DETERMINED AT INITIALIZATION TIME)
+	    -1	ACCESSIBLE, NOT OPEN
+	     1	OPEN;
+IF FILN=MAX#TXTFIL OR STATUS[FILN]=-'1000 THEN
+    RETURN("%%% File not viewable");
+IF STATUS[FILN] NEQ 1 THEN BEGIN "NOPEN"	! FILE NOT OPEN;
+    ! CLOSE PREVIOUS FILE, IF ANY;
+    IF TMPJFN GEQ 0 THEN CFILE(TMPJFN); STATUS[OFILN]_-1;
+    ! OPEN NEW FILE ON TMPJFN;
+    TMPJFN_OPENFILE(T!TXTFIL[FILN],"RE"); IF !SKIP! THEN BEGIN
+	!SKIP!_#SKIP#; RETURN("%%% File not viewable") END ELSE
+	STATUS[FILN]_1 END "NOPEN";
+! POSITION AND READ TEXT FILE;
+OFILN_FILN; NOTENX([ INTARRAY(TMPJFN,PNTR1); ])
+TENX([ SCHPTR(TMPJFN,PNTR1); ])
+TEXT_"#" & CVS(COORD1) & (IF ALLSTO THEN " " ELSE "+") & TAB &
+    NONULL(TENX([SINI(TMPJFN,NCHR,-1)]) NOTENX([TEXT]) );
+!SKIP!_#SKIP#; RETURN(TEXT)
+END "FTEXT";
+
+
+STRING PROCEDURE SHOW(INTEGER FIRST,LAST(0));
+BEGIN
+! TYPE OUT TEXT FOR COORDINATE(S) GIVEN.
+  FIRST IS THE FIRST COORDINATE TO BE SHOWN.
+  IF LAST<FIRST THEN SHOW FROM FIRST TO FIRST+LAST,
+  OTHERWISE SHOW FROM FIRST TO LAST.
+;
+IF LAST<FIRST THEN LAST_LAST+FIRST;
+FOR FIRST_FIRST STEP 1 UNTIL LAST DO
+	ADDSTR(CATCRLF(FTEXT(CRDFND(FIRST))));
+SSF_TRUE; RETURN(DUMPSTR)
+END;
+
+
+SIMPLE STRING PROCEDURE GETTEXT(INTEGER PC); BEGIN "GETTEXT"
+INTEGER T;
+START!CODE HRRZS PC; END;	! PC_RIGHT(PC);
+! TRY TO DO A FAVOR FOR BREAKS OF RECURSIVE PROCEDURES.  THE ENTRY POINT
+  IS AFTER ALL THE CODE, SO THE ADDRESS IS NOT PARTICULARLY MEANINGFUL;
+IF (MEMORY[PC] LAND '777777400000)='551517400000	! HRRZI F,-n(P);
+    AND LEFT(T_MEMORY[PC+1])='254000			! JRST;
+    AND RIGHT(T)<PC					! FWA<ENTRY;
+  THEN PC_RIGHT(T);
+T_CRD!PC(PC);
+IF ABS(PC-RIGHT(TARRAY[T+1]))>'400 THEN
+	RETURN("'" & CVOS(PC) &TAB& "%%% File not viewable");
+RETURN(FTEXT(T)) END "GETTEXT";
+
+! N!PARAMS DEFINE HELP;
+
+SIMPLE INTEGER PROCEDURE N!PARAMS(INTEGER REFIT);
+NOHAND([
+BEGIN"N!PARAMS"
+DEFINE PD(A)=[MEMORY[PDA+A]];
+INTEGER PDA;
+
+PDA_RIGHT(REFIT); RETURN(RIGHT(PD(PD!NPW))-1 + (LEFT(PD(PD!NPW)) LSH -1))
+END "N!PARAMS";
+]) ! NOHAND;
+HAND([
+START!CODE
+	HRRZ	2,REFIT;
+	HRRZ	1,PD!NPW(2);
+	SUBI	1,1;
+	HLRZ	2,PD!NPW(2);
+	LSH	2,-1;
+	ADDI	1,(2);
+	SUB	P,['2000002];
+	JRST	@2(P);
+END;]) ! HAND;
+
+
+PROCEDURE !!DEFINE(INTEGER CHAR; STRING MAC); BEGIN "DEFINE"
+CHAR_CHAR LAND '137; ! CONVERT TO UPPER CASE;
+IF "A" LEQ CHAR LEQ "Z" THEN MACTAB[CHAR]_MAC END "DEFINE";
+
+
+STRING PROCEDURE HELP; BEGIN SSF_TRUE; RETURN("
+	loc ::= procedure | block | label | ! coordinate | ' octalnumber
+expression;
+procedure!call;
+BREAK(""loc"",""condition""(null),""action""(null),count(0));
+UNBREAK(""loc"");
+TRACE(""procedure"");		UNTRACE(""procedure"");
+SHOW(coord,coord(0));		DEFINE(char,""string"");
+SETLEX(level);			!!UP(level);
+COORD(""loc"");			!!GOTO(""loc"");
+ARGS;		DDT;		HELP;		TEXT;		TRAPS;
+!!GO;		!!STEP;		!!GSTEP;	?
+");
+END;
+
+! CVINTEGR, CVREAL, CVSTRNG;
+
+INTEGER ARRAY EV1TEMP[1:2];	STRING ARRAY EV1STRTEMP[1:2];
+
+SIMPLE INTEGER PROCEDURE CVINTEGR(INTEGER REFIT,T); BEGIN "CVINTEGR"
+! CONVERT THE DATUM OF THE REFITEM TO INTEGER, USING TEMP CELL NUMBER T.
+  RETURN THE REFITEM OF THE RESULT;
+INTEGER TYP,LOC;
+
+IF (TYP_GETTYPE(REFIT))=INTEGR OR REFIT=-1 THEN RETURN(REFIT);
+! THE CHECK FOR REFIT=-1 IS TO ACCOMODATE THE  MEMORY  CONSTRUCT;
+LOC_RIGHT(REFIT);
+IF TYP=FLOTNG THEN MEMLOC(EV1TEMP[T],INTEGER)_MEMORY[LOC,REAL]
+ELSE IF TYP=STRNG THEN EV1TEMP[T]_MEMSTRING(LOC)
+ELSE EV1ERR("Can't convert to integer");
+RETURN(INTEGR+LOCATION(EV1TEMP[T]))
+
+END "CVINTEGR";
+
+
+SIMPLE INTEGER PROCEDURE CVREAL(INTEGER REFIT,T); BEGIN"CVREAL"
+! CONVERT REFIT DATUM TO REAL USING TEMP CELL T. RETURN REFITEM OF RESULT.;
+INTEGER TYP;
+
+IF (TYP_GETTYPE(REFIT))=FLOTNG THEN RETURN(REFIT);
+IF TYP=STRNG THEN BEGIN
+    REFIT_CVINTEGR(REFIT,T); TYP_INTEGR END;
+IF TYP=INTEGR THEN MEMLOC(EV1TEMP[T],REAL)_MEMORY[REFIT,INTEGER]
+ELSE EV1ERR("Can't convert to real");
+RETURN(FLOTNG+LOCATION(EV1TEMP[T]))
+
+END "CVREAL";
+
+
+SIMPLE INTEGER PROCEDURE CVSTRNG(INTEGER REFIT,T); BEGIN "CVSTRNG"
+! CONVERT THE DATUM OF THE REFIT TO STRING AND RETURN THE REFITEM OF THE RESULT;
+INTEGER TYP;
+
+IF (TYP_GETTYPE(REFIT))=STRNG THEN RETURN(REFIT);
+IF TYP=FLOTNG THEN BEGIN
+    REFIT_CVINTEGR(REFIT,T); TYP_INTEGR END;
+IF TYP=INTEGR THEN EV1STRTEMP[T]_MEMORY[REFIT,INTEGER]
+ELSE EV1ERR("Can't convert to string");
+RETURN(STRNG+RIGHT(LOCATION(EV1STRTEMP[T])))
+
+END "CVSTRNG";
+
+! INCOR;
+SIMPLE INTEGER PROCEDURE INCOR(INTEGER PCACHE;INTEGER ARRAY DCHAIN; INTEGER 
+	DDEPTH,DISPLVL); BEGIN "INCOR"
+! RETURN REFITEM DATUM WHICH HAS ABSOLUTE CORE ADDRESS OF THE OBJECT IN CACHE;
+DEFINE SIMPRC=[2];
+NOHAND([
+INTEGER IND,FATHER,REFIT,PPDA,T,ADDR,PTYPE,FREG;
+
+IF ((REFIT_CACHE[PCACHE+1]) LAND ('17 LSH 18))=0 THEN ! FIXED CORE LOCATION;
+    RETURN(REFIT);
+]) ! NOHAND;
+HAND([
+START!CODE LABEL ONSTACK,ON1T,UPPROC,LMSCP,SIMP,SERRCK,DONSIMP,TYCK,NSTR,PARAM,NSRP,
+	NSTR2,RET,BAD1,BAD2,RET1,BADRET;
+DEFINE DL=['14],DD=['15],DCH=[2],REFIT=[1],T3=[3],T4=[4],PPDA=[5],FREG=[6],
+	FATHER=[7],PTYPE=[8];
+EXTERNAL INTEGER OUTSTR;
+	SKIPL	REFIT,PCACHE;
+	CAILE	REFIT,N!CACHE;
+	 ARERR	1,["CACHE"];
+	MOVE	REFIT,CACHE[1](REFIT);	! REFITEM;
+	TLZN	REFIT,'17;
+	 JRST	RET;
+]) ! HAND;
+
+! WE NOW KNOW THAT THE OBJECT IS ON THE STACK AND IS EITHER A PARAMETER TO 
+  A PROCEDURE OR A LOCAL TO A RECURSIVE PROCEDURE.;
+NOHAND([
+IND_REFIT LAND(1 LSH 22); ADDR_RIGHT(REFIT); REFIT_REFIT LAND '777760000000;
+
+! FOLLOW UP THE FATHER CHAIN IN THE NAME TABLE UNTIL COMING TO A PROCEDURE;
+FATHER_LEFT(CACHE[PCACHE]) LAND '177777;
+WHILE NOT(PAGEIT(T!NAME,FATHER+1) LAND PROCB) DO
+	FATHER_LEFT(PAGEIT(T!NAME,FATHER)) LAND '177777;
+! FETCH PDA FOR THE PROCEDURE;
+PPDA_RIGHT(PAGEIT(T!NAME,FATHER+1)); PTYPE_LEFT(PAGEIT(T!NAME,FATHER)) LSH -16;
+]) ! NOHAND;
+HAND([
+ONSTACK:MOVE	FATHER,PCACHE;
+	ADDI	FATHER,CACHE[0];
+ON1T:	LDB	FATHER,[('222000+FATHER)LSH 18];
+	ADD	FATHER,C!NAME;
+	MOVE	PPDA,1(FATHER);
+	TLNN	PPDA,0+PROCB LSH -18;
+	 JRST	ON1T;
+	LDB	PTYPE,[('420200+FATHER)LSH 18];
+]) ! HAND;
+! IF PROCEDURE IS NON-simple,search from DISPLVL to DDEPTH to find FREG setting
+  which matches PDA;
+NOHAND([
+IF PTYPE NEQ SIMPRC THEN BEGIN
+    ! go up DCHAIN until finding a non-simple procedure;
+    WHILE DCHAIN[DISPLVL,0]<0 AND DISPLVL<DDEPTH DO DISPLVL_DISPLVL+1;
+    IF DCHAIN[DISPLVL,0]<0 THEN
+	EVALERR("BAIL error searching for procedure parameter",
+	    CVASC(CACHE[PCACHE+2])&CVASC(CACHE[PCACHE+3])&CVASC(CACHE[PCACHE+4]),
+	    NULL);
+    FREG_DCHAIN[DISPLVL,0];
+    ! SEARCH BACK THROUGH THE STACK (ALONG THE STATIC LINKS) TO FIND THE MSCP;
+    WHILE LEFT(T_MEMORY[FREG+1]) NEQ PPDA DO FREG_RIGHT(T); END
+! if procedure is simple, search from DISPLVL to DDEPTH for match of PUSHJ on entry addr;
+ELSE BEGIN
+    FOR DISPLVL_DISPLVL UPTO DDEPTH DO BEGIN
+	! Look for simple procedure activation and compare against
+	    addr that was PUSHJ'ed to;
+	IF DCHAIN[DISPLVL,0]<0 AND RIGHT(MEMORY[PPDA])=RIGHT(
+	    MEMORY[DCHAIN[DISPLVL+1,1]]) THEN DONE;
+	IF DISPLVL=DDEPTH THEN
+	    EVALERR("BAIL error searching for simple procedure parameter",
+		CVASC(CACHE[PCACHE+2])&CVASC(CACHE(PCACHE[PCACHE+3])&CVASC(CACHE[PCACHE+4]),
+		NULL);
+	END;
+    ! DCHAIN[DISPLVL,0] is now negative of P register at entry to proc. Simulate F reg;
+    FREG_1-DCHAIN[DISPLVL,0]; END;
+]) ! NOHAND;
+HAND([
+	MOVE	DL,DISPLVL;
+	CAIN	PTYPE,SIMPRC;
+	 JRST	SIMP;
+! GO UP DCHAIN UNTIL NON-SIMPLE;
+UPPROC:	MOVEI	DCH,@DCHAIN;		! FWA DATA;
+	ADDI	DCH,(DL);
+	ADDI	DCH,(DL);
+	SKIPGE	(DCH);
+	CAML	DL,DDEPTH;
+	SKIPA;
+	AOJA	DL,UPPROC;
+	SKIPGE	FREG,(DCH);
+	 JRST	BAD1;
+	SKIPA;
+LMSCP:	HRRZ	FREG,1(FREG);
+	JUMPE	FREG,BAD1;	! ANOTHER BUG TRAP;
+	HLRZ	T3,1(FREG);
+	CAIN	T3,(PPDA);
+	JRST	TYCK;	! FOUND THE RIGHT ONE;
+	CAIE	FREG,-1;! VALUE PUT ON STACK BY SAILOR;
+	 JRST	LMSCP;	! HAVEN'T GONE OFF END YET;
+	JRST	BAD1;	! TOO BAD;
+SIMP:	MOVEI	DCH,@DCHAIN;
+	ADDI	DCH,(DL);
+	ADDI	DCH,(DL);
+	SKIPL	(DCH);
+	 JRST	SERRCK;
+	HRRZ	T3,(PPDA);
+	HRRZ	T4,@3(DCH);
+	CAIN	T4,(T3);
+	 JRST	DONSIMP;
+SERRCK:	AOJ	DL,;
+	CAMG	DL,DDEPTH;
+	 JRST	SIMP;
+	JRST	BAD2;
+DONSIMP:MOVEI	FREG,1;
+	SUB	FREG,(DCH);
+]) ! HAND;
+
+! FIND OUT WHETHER THIS IS A PARAM OR A LOCAL.  LOCALS ARE FLAGGED WITH
+	'400000 IN ADDR;
+NOHAND([
+IF ADDR LAND '400000 THEN BEGIN "LOCAL"
+    ADDR_ADDR-'400000;
+     ! STRINGS CAUSE HAIR.  REFERENCE STRINGS ARE ON THE P-STACK, HENCE THE
+	ADDRESS OF THE SECOND WORD OF THE STRING DESCRIPTOR IS IN A WORD 
+	WHICH IS FOUND USING DISPLACEMENTS [POSITIVE FOR LOCALS, NEGATIVE
+	FOR PARAMS] ON THE F REGISTER.  LOCAL AND VALUE STRINGS ARE ON THE
+	SP-STACK, HENCE THE ADDRESS OF THE SECOND WORD OF THE STRING DESCRIPTOR
+	IS COMPUTED USING DISPLACEMENTS FROM THE OLD SP-REGISTER.  THE OLD
+	SP-REGISTER IS HANDILY SAVED AS THE LAST WORD OF THE 3-WORD MSCP.;
+    IF GETTYPE(REFIT)=STRNG THEN	! RECURSIVE STRING LOCAL;
+	RETURN(REFIT+RIGHT(MEMORY[FREG+2])+ADDR+1)
+    ELSE	! RECURSIVE NON-STRING LOCAL;
+	RETURN(REFIT+FREG+ADDR) END "LOCAL"
+ELSE BEGIN "PARAM"
+    IF IND AND GETTYPE(REFIT)<ARRY THEN	! SIMPLE REFERENCE PARAM;
+	RETURN((REFIT LAND '777740000000)+RIGHT(MEMORY[FREG-ADDR-1]))
+    ELSE	! VALUE PARAM OR ARRAY;
+	IF GETTYPE(REFIT)=STRNG THEN BEGIN
+	    ! check for simple procedure;
+	    IF PTYPE=SIMPRC AND DISPLVL NEQ 0 THEN OUTSTR("
+		BAIL warning: attempt to access value string parameter of simple
+		procedure which is not at top of stack");
+	RETURN(REFIT+RIGHT(MEMORY[FREG+2])-ADDR+1) END
+	ELSE RETURN(REFIT+FREG-ADDR-1) END "PARAM"
+]) ! NOHAND;
+HAND([
+TYCK:	TRZN	REFIT,'400000;
+	 JRST	PARAM;
+	TLZ	REFIT,'37;
+	LDB	T3,['270600000000+REFIT];
+	TLNN	REFIT,0+ITEMB LSH -18;	! STRING ITEM(var) IS NOT A STRING;
+	CAIE	T3,0+STRNG LSH -23;
+	 JRST	NSTR;
+	HRRZ	T3,2(FREG);
+	ADDI	REFIT,1(T3);
+	JRST	RET;
+NSTR:	ADDI	REFIT,(FREG);
+	JRST	RET;
+PARAM:	LDB	T3,['270600000000+REFIT];
+	CAIGE	T3,0+ARRY LSH -23;
+	TLZN	REFIT,'20;
+	 JRST	NSRP;		! NOT SIMPLE REF PARAM;
+	SUBI	FREG,1(REFIT);	! -ADDR-1;
+	HRR	REFIT,(FREG);
+	JRST	RET;
+NSRP:	CAIE	T3,0+STRNG LSH -23;
+	 JRST	NSTR2;
+	CAIN	PTYPE,SIMPRC;
+	SKIPN	DL;
+	 JRST	RET1;
+	MOVEI	T3,["
+Warning: value string parameter,
+simple procedure not at top of stack"];
+	PUSH	SP,-1(T3);
+	PUSH	SP,(T3);
+	PUSHJ	P,OUTSTR;
+RET1:	HRRZ	T3,2(FREG);
+	SUBI	T3,-1(REFIT);		! -ADDR+1;
+	HRRI	REFIT,(T3);
+	JRST	RET;
+NSTR2:	SUBI	FREG,1(REFIT);
+	HRRI	REFIT,(FREG);
+RET:	SUB	P,['5000005];
+	JRST	@5(P);
+BAD1:
+BAD2:		! IF WE NEED TO, WE CAN ALWAYS BREAK THE JRSTs TO HERE;
+	MOVEI	T3,["
+BAIL error, procedure parameter"];
+	PUSH	SP,-1(T3);
+	PUSH	SP,(T3);	! GENERAL MESSAGE;
+	MOVE	T3,PCACHE;	! NOW FOR THE CULPRIT;
+	ADDI	T3,CACHE[2];
+	HRLI	T3,'440700;	! FABRICATE A BYTE POINTER;
+	PUSH	SP,[15];
+	PUSH	SP,T3;
+	PUSH	SP,[0];
+	PUSH	SP,[0];		! EVALERR TAKES 3 STRINGS;
+	JRST	EVALERR;
+END;]) ! HAND;
+END "INCOR";
+
+! GETLSCOPE, PRLSCOPE;
+
+SIMPLE PROCEDURE GETLSCOPE(INTEGER ARRAY LCHAIN; REFERENCE INTEGER LDEPTH;INTEGER PC);
+BEGIN "GETLSCOPE"
+NOHAND([
+INTEGER I,U,L,T;	LABEL EXACT;
+DEFINE LWA(I)=[LEFT(T!BLKADR(I+1))], FWA(I)=[RIGHT(T!BLKADR(I+1))];
+! CONSTRUCT LEXICAL SCOPE CHAIN, MOST RECENT FIRST;
+
+PC_RIGHT(PC);
+L_0; U_(L!BLKADR+1) ASH -1;
+WHILE U GEQ L DO BEGIN
+    I_(L+U) ASH -1;
+    IF (T_LWA(I LSH 1))=1+PC THEN GOTO EXACT;
+    IF T>PC THEN U_I-1 ELSE L_I+1 END;
+IF LWA((I_L) LSH 1) LEQ PC THEN I_L+1;
+EXACT:	I_I LSH 1;
+! GO UP FATHER CHAIN UNTIL PC IS GEQ FWA;
+WHILE PC<FWA(I) DO I_LEFT(T!BLKADR(I));
+
+LDEPTH_-1; DO BEGIN "UP"
+    LCHAIN[LDEPTH_LDEPTH+1]_RIGHT(T!BLKADR(I)) LSH 18 LOR FWA(I);
+    I_LEFT(T!BLKADR(I));	! FATHER (IN T!BLKADR) OF THIS BLOCK;
+END "UP" UNTIL I=0;
+]) ! NOHAND;
+HAND([
+START!CODE LABEL TOP1,TOP2,TEST2,TOP3;
+DEFINE I=[1],LCH=[2],LWA=[3],FWA=[3],T=[0];
+	SETO	I,;
+	ADD	I,C!BLKADR;	! RELOCATE;
+	HRRZS	PC;
+TOP1:	ADDI	I,2;
+	HLRZ	LWA,(I);
+	CAMG	LWA,PC;
+	 JRST	TOP1;
+	SUBI	I,1;		! I NOW POINTS AT WORD ZEROES;
+	JRST	TEST2;
+TOP2:	HLRZ	I,(I);
+	ADD	I,C!BLKADR;
+TEST2:	HRRZ	FWA,1(I);
+	CAMLE	FWA,PC;
+	 JRST	TOP2;
+	MOVEI	LCH,@LCHAIN;	! FWA DATA;
+	SUBI	LCH,1;
+	SKIPA;
+TOP3:	ADD	I,C!BLKADR;
+	HRLZ	T,(I);
+	HRR	T,1(I);
+	ADDI	LCH,1;
+	MOVEM	T,(LCH);
+	HLRZ	I,(I);
+	JUMPN	I,TOP3;
+	SUBI	LCH,@LCHAIN;
+	MOVEM	LCH,LDEPTH;
+	MOVEI	FWA,@LCHAIN;	! FWA DATA;
+	CAMLE	LCH,-3(FWA);	! BOUNDS CHECK;
+	 ARERR	1,["LCHAIN"];
+END;]) ! HAND;
+END "GETLSCOPE";
+
+
+SIMPLE PROCEDURE PRLSCOPE(INTEGER ARRAY LCHAIN; INTEGER LDEPTH);BEGIN "PRLSCOPE"
+NOHAND([
+INTEGER I,T;
+ADDSTR("
+LEXICAL SCOPE, TOP DOWN:
+");
+FOR I_LDEPTH STEP -1 UNTIL 0 DO
+	ADDSTR(NONULL(CVASTR(PAGEIT(T!NAME,2+(T_LEFT(LCHAIN[I])))) &
+	CVASTR(PAGEIT(T!NAME,T+3)) & CATCRLF(CVASTR(PAGEIT(T!NAME,T+4))) ));
+]) ! NOHAND;
+HAND([
+ADDSTR("
+LEXICAL SCOPE, TOP DOWN:
+");
+START!CODE LABEL LOOP; EXTERNAL INTEGER CAT,CVASTR;
+DEFINE T=['14];
+LOOP:	MOVEI	T,@LCHAIN;	! FWA DATA;
+	ADD	T,LDEPTH;
+	HLRZ	T,(T);
+	ADD	T,C!NAME;
+	PUSH	SP,[15];	! 15 CHARS IN 3 WORDS;
+	ADD	T,['440700000002];	! MAKE B.P. TO WORD 2 IN CACHE;
+	PUSH	SP,T;
+	PUSHJ	P,CATCRLF;
+	PUSHJ	P,NONULL;
+	PUSHJ	P,ADDSTR;
+	SOSL	LDEPTH;
+	 JRST	LOOP;
+END;]) ! HAND;
+END "PRLSCOPE";
+
+! GETDSCOPE,PRDSCOPE;
+SIMPLE PROCEDURE GETDSCOPE(INTEGER FR,PR,PC;REFERENCE INTEGER DDEPTH;
+		INTEGER ARRAY DCHAIN); BEGIN "DSCOPE"
+! DYNAMIC SCOPE UNWINDER ROUTINE.  FILLS ARRAY DCHAIN [*,0] WITH THE
+  F (OR P) REGISTER VECTOR CORRESPONDING TO THE DYNAMIC ACTIVATIONS, AND
+  DCHAIN [*,1] WITH THE CORRESPONDING PC, WITH THE MOST RECENT ACTIVATION
+  FIRST.  THE ENTRIES [*,0] ARE THE F REGISTER VALUES FOR NON-SIMPLE
+  PROCEDURES, AND THE NEGATIVE OF THE P REGISTER FOR SIMPLE PROCEDURES.
+ I.E., DCHAIN[0,0] = VALUE OF F REGISTER FOR THE ROUTINE BEGIN BROKEN
+	     [0,1] = PC AT INTERRUPTION
+	     [1,0] = F REGISTER OF PARENT
+	     [1,1] = RETURN ADDRESS -1;
+NOHAND([
+INTEGER I,K,T,PDA;
+
+DDEPTH_-1; DCHAIN[0,1]_PC;
+! '777777 IS THE VALUE PUT ON THE BOTTOM OF THE STACK BY SAILOR;
+WHILE (FR_RIGHT(FR)) NEQ '777777 DO BEGIN
+    K_FR+RIGHT(MEMORY[(PDA_LEFT(MEMORY[FR+1]))+PD!DSP])+1;
+	! 1+RIGHT(P) AFTER PROLOG;
+    FOR I_RIGHT(PR) STEP -1 UNTIL K DO BEGIN
+	! SIMPLE PROCEDURE HAS BEEN CALLED, OR WE ARE IN THE MIDDLE OF
+	  STACKING SOME ARGUMENTS.  PICK UP THE WORD ON THE STACK AND SEE
+	  IF IT IS A REASONABLE RETURN ADDRESS.  THE INDIRECT AND
+	  INDEX FIELDS MUST BE ZERO.  THE OPCODE AND ADDRESS FIELDS
+	  MUST BE NON-ZERO.;
+	T_MEMORY[I]; IF (T LAND '37000000)=0 AND (T LAND '777000000000)
+	NEQ 0 AND (T LAND '777777) NEQ 0 THEN BEGIN
+	    ! THERE MUST BE A PUSHJ AT RIGHT(T)-1;
+	    IF LEFT(MEMORY[T_RIGHT(T)-1])=LEFT(PUSHJ+(P LSH 23)) THEN BEGIN
+		! SIMPLE PROCEDURE CALLED AT MEMORY[RIGHT(T)-1];
+		DCHAIN[DDEPTH_DDEPTH+1,0]_-I;	! NEGATIVE OF P AT ENTRY;
+		DCHAIN[DDEPTH+1,1]_T;		! PC OF CALL (IN PARENT);
+		PR_I-1;	! PESSIMISTIC ESTIMATE; END
+	    END
+	END;
+    ! NON-SIMPLE PROCEDURE CALLED;
+    DCHAIN[DDEPTH_DDEPTH+1,0]_FR;	! F REGISTER OF ROUTINE;
+    DCHAIN[DDEPTH+1,1]_RIGHT(MEMORY[FR-1])-1;	! PC OF CALL (IN PARENT);
+    PR_FR-2-(RIGHT(MEMORY[PDA+PD!NPW])-1);	! SUBTRACT P-STACK PARAMS;
+    FR_MEMORY[FR];
+    END;
+]) ! NOHAND;
+HAND([
+START!CODE LABEL TOP1,TEST2,OUT2,TEST1,BOT1;
+DEFINE I=[1],K=[2],QFR=[3],QPR=[4],PDA=[5],T=[6],T2=[7],DCH=['10];
+	MOVEI	QFR,FR;
+	MOVE	QPR,PR;
+	MOVEI	DCH,@DCHAIN;	! FWA DATA;
+	MOVE	T,PC;
+	MOVEM	T,1(DCH);
+	SUBI	DCH,2;		! ADJUST INITIAL VALUE;
+	JRST	TEST1;
+TOP1:	HLRZ	PDA,1(QFR);
+	HRRZ	K,PD!DSP(PDA);	! P STACK DISPLACEMENT;
+	ADDI	K,1(QFR);	! 1+RIGHT(P) AFTER PROLOG;
+	HRRZI	I,(QPR);
+TEST2:	CAIGE	I,(K);
+	 JRST	OUT2;
+	MOVE	T,(I);
+	TLNN	T,'37;		! CHECK INDIR, INDEX;
+	TLNN	T,'777000;	! CHECK OP CODE;
+	 SOJA	I,TEST2;
+	TRNN	T,-1;		! CHECK ADDR;
+	 SOJA	I,TEST2;
+	MOVEI	T,-1(T);
+	HLRZ	T2,(T);		! GET LEFT HALF OF INSTR AT -1(T);
+	CAIE	T2,'260740;	! PUSHJ P,;
+	 SOJA	I,TEST2;
+	ADDI	DCH,2;
+	MOVNM	I,(DCH);
+	MOVEM	T,3(DCH);
+	MOVEI	QPR,-1(I);
+	SOJA	I,TEST2;
+OUT2:	ADDI	DCH,2;
+	MOVEM	QFR,(DCH);
+	HRRZ	T,-1(QFR);
+	SUBI	T,1;
+	MOVEM	T,3(DCH);
+	MOVEI	QPR,-2(QFR);
+	MOVE	T2,PD!NPW(PDA);
+	SUBI	QPR,-1(T2);	! -! OF ARITH PARAMS;
+TEST1:	HRRZ	QFR,(QFR);
+	JUMPE	QFR,BOT1;	! IN CASE WE RUN OUT (PROCESSES, FOR EXAMPLE);
+	CAIE	QFR,-1;
+	 JRST	TOP1;
+BOT1:	SUBI	DCH,@DCHAIN;	! CURRENT ADDR MINUS FWA;
+	LSH	DCH,-1;
+	MOVEM	DCH,DDEPTH;
+	MOVEI	T,@DCHAIN;	! FWA DATA;
+	CAMLE	DCH,-3(T);	! BOUNDS CHECK;
+	 ARERR	1,["DCHAIN"];
+END;]) ! HAND;
+END "DSCOPE";
+
+SIMPLE PROCEDURE PRDSCOPE(INTEGER ARRAY DCHAIN; INTEGER DDEPTH); BEGIN "PRDSCOPE"
+INTEGER I;
+ADDSTR("
+DYNAMIC SCOPE, MOST RECENT FIRST:
+routine		text
+");
+FOR I_0 UPTO DDEPTH DO BEGIN
+    ADDSTR(IF DCHAIN[I,0]<0 THEN ".simple."
+	ELSE MEMSTRING(2+LEFT(MEMORY[DCHAIN[I,0]+1])));
+    ADDSTR(CATCRLF(TAB & GETTEXT(DCHAIN[I,1]))) END;
+
+END "PRDSCOPE";
+
+! TFIND,BREAK1,SWAP!BREAKS,PLANT!BREAKS,UNPLANT!BREAKS,LOC!PC,BREAK,COORD,TRAPS;
+
+SIMPLE INTEGER PROCEDURE TFIND(STRING LOCNAME; BOOLEAN ANYNAM;
+	REFERENCE INTEGER CRDADDR); BEGIN "TFIND"
+! Special find routine for TRACE, BREAK, etc, since one frequently wants to
+  specify names which are not in the current algol scope.
+
+  The format of LOCNAME is
+	[LOCNAME]:=[SAILID] or [BLOCKNAME].[LOCNAME]
+
+  The search for LOCNAME proceeds as follows.  The block table [T!BLKADR]
+  is searched from the end to the beginning [breadth first].  If just
+  [SAILID] appears, then [SAILID] must be a block or procedure name, and
+  the search is for a match on the name.  If more than just [SAILID]
+  appears, then the search is for a match on the [BLOCKNAME].
+  If more than oneE [BLOCKNAME] appears, the search
+  is continued for each succeeding [BLOCKNAME] at the point where the
+  previous search ended.  This is continued until the last [BLOCKNAME] is
+  located.  Then the ancestry of the last [BLOCKNAME] is consructed,,
+  and FIND is asked to locate [SAILID].
+
+  This is very flexible and powerful.  The complete history of [SAILID]
+  need not be specified in LOCNAME.  Indeed, the sequence of [BLOCKNAME]s
+  need not be a treelike path at all.
+;
+
+INTEGER CLASS,PNTR,I,CRDNO;	STRING STRVAL;
+
+PNTR_L!BLKADR+1;
+WHILE LENGTH(LOCNAME) DO BEGIN
+    GET!TOKEN(LOCNAME,STRVAL,CLASS_-1,CRDADDR_0);
+    IF CRDADDR THEN RETURN(-2);	! ABSOLUTE LOCATION;
+    IF LENGTH(STRVAL)=0 THEN EVALERR("Bad location",STRVAL,LOCNAME);
+    IF LENGTH(LOCNAME) THEN BEGIN "BLKNAM" LABEL NEXBLK;
+	WHILE (PNTR_PNTR-2) GEQ 0 DO BEGIN "HUNT"
+	    FOR I_0 UPTO 2 DO IF PAGEIT(T!NAME,RIGHT(T!BLKADR(PNTR))+2+I) NEQ
+		NAME[I] THEN CONTINUE "HUNT";
+	    I_LOP(LOCNAME); ! GET RID OF DELIM;
+	    GOTO NEXBLK END "HUNT"; NEXBLK: END "BLKNAM"
+    ELSE BEGIN "SAILID"
+	IF L!BLKADR+1 NEQ PNTR THEN GETLSCOPE(TLSCOPE,TLDEPTH,RIGHT(T!BLKADR(PNTR+1)));
+	IF (I_FIND(NAME,TLSCOPE,TLDEPTH,ANYNAM))GEQ 0 THEN RETURN(I);
+	I_LOP(STRVAL);
+	IF I="#" THEN ! COORDINATE SPECIFICATION;
+	    CRDADDR_RIGHT(TARRAY[CRDFND(INTSCAN(STRVAL,I))+1]);
+	RETURN(-1)
+	END "SAILID"
+END
+END "TFIND";
+
+
+BOOLEAN BREAKPOINTS!PLANTED;
+
+SIMPLE PROCEDURE SWAP!BREAKS; BEGIN "SWAPBR"
+NOHAND([
+INTEGER I; FOR I_0 UPTO L!BK DO IF BK!LOC[I] NEQ 0 THEN
+    MEMORY[BK!LOC[I]] SWAP BK!INSTR[I];BREAKPOINTS!PLANTED_NOT BREAKPOINTS!PLANTED;
+]) ! NOHAND;
+HAND([
+START!CODE LABEL LOOP,BOT; DEFINE I=['14],T=[0];
+	MOVSI	I,-N!BK;
+LOOP:	SKIPN	BK!LOC[0](I);
+	 JRST	BOT;
+	MOVE	T,BK!INSTR[0](I);
+	EXCH	T,@BK!LOC[0](I);
+	MOVEM	T,BK!INSTR[0](I);
+BOT:	AOBJN	I,LOOP;
+	SETCMM	BREAKPOINTS!PLANTED;
+END;
+]) ! HAND;
+END "SWAPBR";
+
+SIMPLE PROCEDURE PLANT!BREAKS;
+    IF NOT BREAKPOINTS!PLANTED THEN SWAP!BREAKS;
+
+SIMPLE PROCEDURE UNPLANT!BREAKS;
+    IF BREAKPOINTS!PLANTED THEN SWAP!BREAKS;
+
+
+
+SIMPLE PROCEDURE BREAK1(INTEGER LOC; STRING NAME,COND,ACT; INTEGER MPC,NEWINSTR);
+BEGIN "BREAK1"
+! INSERT A BREAKPOINT AT MEMORY[LOC], OVERWRITING ANY OLD BREAKPOINT
+  Left half of LOC has bit(s) which may flag temporary breakpoints.
+  Indirect through LOC should work;
+NOHAND ([
+INTEGER I; EXTERNAL PROCEDURE !UINIT;
+! DO NOT BREAK THE CALL ON !UINIT (WHICH IS THE FIRST INSTRUCTION IN THE OUTER BLOCK);
+IF RIGHT(MEMORY[LOC])=LOCATION(!UINIT) THEN LOC_LOC+1;
+UNPLANT!BREAKS;
+! SEARCH FOR DUPLICATE OR FOR EMPTY SLOT;
+FOR I_0 UPTO N!BK DO IF  I=N!BK OR BK!LOC[I]=0 OR RIGHT(BK!LOC[I])=RIGHT(LOC) THEN DONE;
+IF I=N!BK THEN EV1ERR("Brkpt ov.")
+ELSE BEGIN
+	BK!LOC[I]_LOC; BK!INSTR[I]_NEWINSTR;
+	BK!COND[I]_COND; BK!ACT[I]_ACT; BK!COUNT[I]_MPC; BK!NAME[I]_NAME END
+]) ! NOHAND;
+HAND ([
+LABEL BAD;
+START!CODE
+DEFINE I=['14],T=['13],KEY=['15],R=[1]; LABEL LOOP,LOOP2,FOUND;
+EXTERNAL INTEGER !UINIT;
+	HRRZ	I,@LOC;
+	CAIN	I,!UINIT;
+	 AOS	LOC;
+	PUSHJ	P,UNPLANT!BREAKS;
+	MOVSI	I,-N!BK;
+	HRRZ	R,LOC;
+LOOP:	HRRZ	KEY,BK!LOC[0](I);
+	CAIE	KEY,(R);
+	AOBJN	I,LOOP;
+	JUMPL	I,FOUND;	! WRITE OVER AN OLD BREAKPOINT;
+	MOVSI	I,-N!BK;	! ELSE SEARCH FOR AN EMPTY SLOT;
+LOOP2:	SKIPE	BK!LOC[0](I);
+	AOBJN	I,LOOP2;
+	JUMPGE	I,BAD;		! NONE LEFT;
+FOUND:	MOVE	T,LOC;
+	MOVEM	T,BK!LOC[0](I);
+	MOVE	T,NEWINSTR;
+	MOVEM	T,BK!INSTR[0](I);
+	MOVE	T,MPC;
+	MOVEM	T,BK!COUNT[0](I);
+	LSH	I,1;
+	HRROI	T,(SP);
+	MOVEI	R,BK!ACT[0](I);
+	POP	T,(R);
+	POP	T,-1(R);
+	MOVEI	R,BK!COND[0](I);
+	POP	T,(R);
+	POP	T,-1(R);
+	MOVEI	R,BK!NAME[0](I);
+	POP	T,(R);
+	POP	T,-1(R);
+END; RETURN;
+BAD:	EV1ERR("Brkpt ov.");
+]) ! HAND;
+END "BREAK1";
+
+
+SIMPLE INTEGER PROCEDURE LOC!PC(STRING LOCNAME; INTEGER ANYNAM(TRUE));
+BEGIN "LOC!PC"
+! RETURNS THE PC ASSOCIATED WITH THE PLACE NAMED IN LOCNAME.
+  IF ANYNAM IS FALSE THEN LOCNAME MUST BE A PROCEDURE AND THE PROCEDURE
+  DESCRIPTOR ADDRESS IS RETURNED;
+INTEGER PNTR,REFIT,T,CRDADDR;
+PNTR_TFIND(LOCNAME,ANYNAM,CRDADDR);
+IF PNTR=-1 AND CRDADDR=0 THEN EVALERR("Unknown " & (IF ANYNAM THEN "location"
+    ELSE "procedure"),LOCNAME,NULL);
+IF PNTR<0 THEN REFIT_CRDADDR	! COORDINATE OR OCTAL LOCATION;
+ELSE IF (T_GETTYPE((REFIT_CACHE[PNTR+1]))) NEQ 0 AND
+    NOT(REFIT LAND PROCB) AND T NEQ LBLTYP
+    THEN EVALERR("Need block, label, coordinate, or procedure",LOCNAME,NULL)
+ELSE IF ANYNAM AND (REFIT LAND PROCB) THEN BEGIN
+    ! We want to break a procedure.  There was (is?) some confusion about where
+    to put the break.  For a simple procedure (one with TEMPB on in its refitem)
+    the break belongs on the JFCL 0 which the compiler inserted for this purpose
+    at user request.  For a non-simple procedure the break belongs on the
+    HRRZI F,-n(P) which sets the F register.  In the case of a non-recursive
+    procedure (or a recursive procedure with no parameters) the location of the 
+    HRRZI is given by the  pcnt at MKSEMT  in the procedure descriptor.
+    In the case of a recursive procedure with parameters, a search must be
+    made for the HRRZI, because the code which puts the locals on the stack
+    and zeroes them is of undetermined length.  All this barf is made necessary
+    in the first place because the first instruction inside a procedure might
+    be a WHILE loop, and we want to break only on entry to the procedure, not
+    everytime around the loop;
+    PNTR_LEFT(MEMORY[RIGHT(REFIT)+PD!PPD]);    ! PCNT AT MKSEMT;
+    UNPLANT!BREAKS;	! MAKE SURE breakpoint doesn't hide THE INSTR;
+    IF REFIT LAND TEMPB	! ie a simple procedure;
+     then if MEMORY[PNTR_PNTR-1]='255 LSH 27	! JFCL;
+		 THEN REFIT_PNTR else
+     ELSE for t_ pntr step 1 until pntr+40	! ample prologue room;
+		do if LEFT(MEMORY[t]) = '551517	! HRRZI F,something(P);
+			then begin pntr_t; REFIT_PNTR; done end
+ END;
+RETURN(IF ANYNAM THEN RIGHT(REFIT) ELSE REFIT);
+	! RETURN FULL REFITEM FOR PROC;
+END "LOC!PC";
+
+PROCEDURE BREAK(STRING LOCNAME;STRING COND(""),ACT(""); INTEGER MPC(0));
+BEGIN "BREAK"
+! INSERT BREAKPOINT AT BEGINNING OF THING SPECIFIED IN LOCNAME.;
+BREAK1(LOC!PC(LOCNAME),LOCNAME,COND,ACT,MPC,PJPBAIL)
+END "BREAK";
+
+INTEGER PROCEDURE COORD(STRING LOCNAME);
+! RETURNS THE COORDINATE NUMBER OF THE PLACE NAMED BY LOCNAME.
+  IF LOCNAME HAS FORM 'NNNN, THEN NNNN WILL BE TREATED AS AN OCTAL NUMBER.;
+RETURN((TARRAY[1+CRD!PC(IF LOCNAME="'" THEN
+		CVO(LOCNAME[2 TO INF]) ELSE LOC!PC(LOCNAME))] LSH -18) LAND '377777);
+
+STRING PROCEDURE TRAPS; BEGIN INTEGER I;
+FOR I_0 UPTO N!BK-1 DO
+    IF LENGTH(BK!NAME[I]) THEN ADDSTR(CATCRLF(BK!NAME[I] & TAB & BK!COND[I] & TAB
+	& BK!ACT[I] & TAB & (IF BK!COUNT[I]>0 THEN CVS(BK!COUNT[I]) ELSE NULL)))
+    ELSE IF BK!LOC[I] THEN ADDSTR(CATCRLF((0+"'")&CVOS(BK!LOC[I])));
+RETURN(DUMPSTR) END;
+
+! PRARGS, TRACER, TRACE;
+
+SIMPLE PROCEDURE PRARGS(INTEGER REFIT,PPNTR,SPPNTR); BEGIN "PRARGS"
+! PRINT ARGUMENTS, GIVEN PROC DESCR AND STACK POINTERS;
+INTEGER PARAMPNTR,NP;
+START!CODE LABEL LOOP,NSTRV,BOT,OUT1,NARR,ARR; DEFINE T=['14],T2=['15];
+	PUSH	P,REFIT;
+	PUSHJ	P,N!PARAMS;
+	JUMPLE	1,OUT1;
+	MOVEM	1,NP;
+	HRRZ	2,PPNTR;	! TOS;	
+	MOVE	1,REFIT;
+	HRRZ	3,PD!NPW(1);	! #ARITH PARAMS+1;
+	SUBI	2,-1(3);
+	MOVEM	2,PPNTR;	! BEGINNING OF PSTACK PARAMS;
+	HRRZ	2,SPPNTR;
+	HLRZ	3,PD!NPW(1);	! 2*#STRING PARAMS;
+	SUBI	2,-2(3);
+	MOVEM	2,SPPNTR;	! BEGINNING OF SPSTACK PARAMS;
+	HRRZ	3,PD!DLW(1);	! POINTER TO PARAM INFO;
+	MOVEM	3,PARAMPNTR;
+LOOP:	MOVE	T,@PARAMPNTR;
+	AOS	PARAMPNTR;
+	LDB	T2,[('271000 LSH 18)+T];	! 8 BITS WIDE TO GET ITEMB, TOO;
+	CAIN	T2,0+STRNG LSH -23;
+	TLNE	T,0+REFB LSH -18;
+	 JRST	NSTRV;
+	HRR	T,SPPNTR;
+	AOS	SPPNTR;
+	AOS	SPPNTR;
+	JRST	BOT;
+NSTRV:	HRR	T,PPNTR;
+	AOS	PPNTR;
+	TLNE	T,0+ARY2B LSH -18;
+	 JRST	ARR;			!  ARRAY ITEMVAR ARRAY is an array;
+	TLNN	T,0+ITEMB LSH -18;	! BUT PLAIN ITEMVAR IS NOT;
+	CAIGE	T2,0+ARRY LSH -23;
+	 JRST	NARR;
+ARR:	TLO	T,'20;
+	JRST	BOT;
+NARR:	TLNE	T,0+REFB LSH -18;	! CHECK FOR REFERENCE PARAMS;
+	 HRR	T,(T);
+BOT:	PUSH	P,T;
+	PUSHJ	P,WR!TON;
+	SOSLE	NP;
+	 JRST	LOOP;
+OUT1:END;
+END "PRARGS";
+
+SIMPLE PROCEDURE TRACER;
+BEGIN "TRACER"
+! CALLED BY AN INSERTED PUSHJ FROM ENTRY ADDRESS OF ROUTINE BEING TRACED.
+WHAT TO DO:
+1.  PICK UP TOP WORD OF STACK AND GET THE REFITEM FROM THE MULTIPLE PROCEED	
+	COUNT OF THE CORRESPONDING BREAK ENTRY.
+2.  USE THE PDA INFO TO PRINT THE PROCEDURE NAME AND PARAMETERS.
+3.  MASSAGE THE P STACK SO THAT THE TRACED PROCEDURE RETURNS TO TRACER.
+4.  XCT THE DISPLACED INSTRUCTION.
+5.  JUMP TO ENTRY ADDRESS+1.
+6.  UPON RETURN FROM TRACED PROCEDURE, PRINT THE NAME (AND RESULT, IF ANY).
+7.  RESTORE P STACK TO ITS PROPER STATE.
+8.  RETURN.
+
+THE P-STACK GETS TWO EXTRA WORDS IN STEP 3.  THE FIRST ONE IS THE ORIGINAL RETURN ADDRESS,
+THE SECOND IS THE REFITEM FOR THE TRACED PROCEDURE, TO ALLOW PRINTING THE NAME AND RESULT;
+
+INTEGER REFIT,REFITA,I,BL,PPNTR,SPPNTR,PARAMPNTR,TRLEV,NP,ENTAD,T;
+DEFINE SPACES=["          "];
+
+! STACK LOOKS LIKE
+		(P)/	RETURN TO ENTRY+1
+		-1(P)/	RETURN TO CALLING PROC
+		-2(P)/	PARAM n
+		.
+		.
+		.
+		-n-3(P)/	PARAM 1;
+START!CODE
+	POP	P,0;		! REMOVE RETURN TO ENTRY+1;
+	SUBI	0,1;		! ENTRY ADDRESS;
+	MOVEM	0,ENTAD;
+	AOS	TRLEV;		! DEPTH OF TRACE;
+	END;
+NOHAND([
+FOR BL_0 UPTO L!BK DO IF BK!LOC[BL]=RIGHT(ENTAD) THEN DONE;
+REFIT_BK!COUNT[BL];
+]) ! NOHAND;
+HAND([START!CODE
+DEFINE KEY=[0],I=['14]; LABEL LOOP,GOOD;
+	HRRZ	KEY,ENTAD;
+	MOVSI	I,-N!BK;
+LOOP:	CAME	KEY,BK!LOC[0](I);
+	AOBJN	I,LOOP;
+	JUMPL	I,GOOD;
+	PUSH	SP,[10];
+	PUSH	SP,["TRACE sunk"];
+	PUSHJ	P,FATAL;	! TRACER CALLED BUT TRACE LOCATION NOT IN TABLE;
+GOOD:	MOVE	KEY,BK!COUNT[0](I);
+	MOVEM	KEY,REFIT;
+	HRRZM	I,BL;
+END;]) ! HAND;
+OUTSTR(CRLFCAT(SPACES[1 FOR TRLEV]&"Entering "&MEMSTRING(REFIT+2)));
+START!CODE	EXTERNAL INTEGER OUTSTR;
+	PUSH	P,REFIT;
+	MOVEI	'14,-1(P);
+	PUSH	P,'14;
+	MOVEI	'14,(SP);
+	PUSH	P,'14;
+	PUSHJ	P,PRARGS;
+	PUSHJ	P,DUMPSTR;
+	PUSHJ	P,OUTSTR;
+END;
+
+! MASSAGE THE STACK;
+
+START!CODE	LABEL TR!RET,TRRETW;
+	MOVE	1,REFIT;
+	HRRZ	2,PD!NPW(1);	! #ARITH PARAMS+1;
+	HRRZ	3,P;
+	SUBI	3,-1(2);	! AC3 POINTS AT FIRST PARAM;
+	HRLI	4,(3);
+	HRRI	4,TARRAY[0];
+	BLT	4,TARRAY[0](2);	! UNSTACK;
+	PUSH	P,0;		! SPACE FILLER;
+	MOVE	0,-1(P);	! RETURN TO CALLING PROC;
+	MOVEM	0,(3);		! PLANT IT;
+	MOVEM	1,1(3);		! PLANT REFIT;
+	HRLI	4,TARRAY[0];
+	HRRI	4,2(3);
+	BLT	4,(P);		! STACK;
+	MOVE	4,BL;
+	PUSH	P,TRRETW;	! PUT RETURN ON STACK;
+	XCT	BK!INSTR[0](4);	! THIS IS EITHER A  PUSH P,F  OR A  JFCL;
+	MOVE	2,ENTAD;
+	JRST	1(2);		! CALL THE TRACED PROC;
+TRRETW:	CAM	TR!RET;		! TYPICAL PUSHJ WORD;
+TR!RET:	POP	P,REFIT;
+	MOVEM	1,REFITA;
+	END;
+OUTSTR(CRLFCAT(SPACES[1 FOR TRLEV]&"Exiting "&MEMSTRING(REFIT+2)));
+IF (T_GETTYPE(REFIT)) NEQ 0 THEN BEGIN "RESULT"
+    OUTCHR("="); IF T=STRNG THEN
+	START!CODE
+	PUSH	SP,-1(SP);
+	PUSH	SP,-1(SP);
+	PUSHJ	P,OUTSTR;
+	END
+    ELSE BEGIN WR!TON(T LOR LOCATION(REFITA)); OUTSTR(DUMPSTR) END END "RESULT";
+OUTSTR(CRLF);
+START!CODE
+	MOVE	1,REFITA;
+	SOS	TRLEV;
+	POPJ	P,0;		! FINALLY!;
+	END;
+END "TRACER";
+
+
+PROCEDURE TRACE(STRING PROCNAME);
+BEGIN"TRACE"
+! BREAK ENTRY AND EXIT OF PROCEDURE;
+INTEGER REFIT;	 DEFINE PUSHJ=['260000000000];
+BREAK1(MEMORY[REFIT_LOC!PC(PROCNAME,FALSE)],PROCNAME,"","",REFIT,PUSHJ+(P LSH 23)+
+    LOCATION(TRACER));
+END "TRACE";
+
+ifcr not production!version thenc
+require "prtyp.sai" source!file;
+endc
+
+! UNBREAK1,UNBREAK,UNTRACE,CLRTBK,STEPPING;
+
+SIMPLE PROCEDURE UNBREAK1(INTEGER LOC); BEGIN "UNBREAK1"
+! REMOVE BREAKPOINT AT MEMORY[LOC];
+NOHAND([
+INTEGER I;
+UNPLANT!BREAKS;
+! SEARCH FOR THE BREAKPOINT;
+FOR I_0 UPTO N!BK DO IF I=N!BK OR RIGHT(BK!LOC[I])=RIGHT(LOC) THEN DONE;
+IF I=N!BK THEN EVALERR("UNBREAK1. Not currently broken",
+    CVOS(LOC),NULL);
+BK!INSTR[I]_0; BK!LOC[I]_0; BK!NAME[I]_NULL
+]) ! NOHAND;
+HAND([
+LABEL BAD;
+START!CODE	DEFINE I=['14],T=['13],KEY=['15]; LABEL LOOP;
+	PUSHJ	P,UNPLANT!BREAKS;
+	MOVSI	I,-N!BK;
+	HRRZ	KEY,LOC;
+LOOP:	HRRZ	T,BK!LOC[0](I);
+	CAIE	T,(KEY);
+	AOBJN	I,LOOP;
+	JUMPGE	I,BAD;
+	SETZM	BK!INSTR[0](I);
+	SETZM	BK!LOC[0](I);
+	ADDI	I,-1(I);	! 2*I-1;
+	SETZM	BK!NAME[0](I);	! TURNS IT INTO A STRING OF LENGTH 0, HENCE NULL;
+END; RETURN;
+BAD:	EVALERR("UNBREAK1. Not currently broken",CVOS(LOC),NULL)
+]) ! HAND;
+END "UNBREAK1";
+
+
+PROCEDURE UNBREAK(STRING LOCNAME);
+UNBREAK1(LOC!PC(LOCNAME));
+
+
+PROCEDURE UNTRACE(STRING PROCNAME);
+! SIGNIFY "PROC ONLY", WHICH GETS PROCEDURE DESCRIPTOR ADDR FROM LOC!PC.
+  THEN PICK UP ENTRY ADDR FROM PROCEDURE DESCRIPTOR;
+UNBREAK1(MEMORY[LOC!PC(PROCNAME,FALSE)]);
+
+
+SIMPLE PROCEDURE CLRTBK(INTEGER LOC); BEGIN "CLRTBK"
+! (CLEAR GROUP OF TEMPORARY BREAKPOINTS)
+  SEARCH THE BREAKPOINT TABLE FOR THE LOCATION.  IF NOT FOUND, EXIT.
+  IF LOCATION IS ONE OF A SET OF TEMPORARY BREAK POINTS, CLEAR THE WHOLE SET.
+  CLRTBK IS ALWAYS CALLED WITH THE BREAK-POINT INSTRUCTIONS IN.
+  MUST BE START!CODE BECAUSE AC'S MUST BE SAVED;
+START!CODE LABEL LOOP1,LOOP2,RET,BOT2; DEFINE I=['14],J=['15],KEY=['13];
+	MOVSI	I,-N!BK;
+	HRRZ	KEY,LOC;
+LOOP1:	HRRZ	J,BK!LOC[0](I);
+	CAIE	J,(KEY);
+	AOBJN	I,LOOP1;
+	JUMPGE	I,RET;
+	HLRZ	J,BK!LOC[0](I);
+	JUMPE	J,RET;
+	MOVSI	I,-N!BK;
+LOOP2:	HLRZ	KEY,BK!LOC[0](I);
+	CAIE	KEY,(J);
+	 JRST	BOT2;
+	MOVE	KEY,BK!INSTR[0](I);
+	MOVEM	KEY,@BK!LOC[0](I);
+	SETZM	BK!INSTR[0](I);
+	SETZM	BK!LOC[0](I);
+BOT2:	AOBJN	I,LOOP2;
+RET:	END;
+END "CLRTBK";
+
+SIMPLE PROCEDURE STEP!POPJ; START!CODE
+! CALLED BY PUSHJ; DEFINE I=['14]; LABEL DOT1;
+	SOS	(P);		! POINT TO BREAK THAT GOT US HERE;
+	PUSHJ	P,CLRTBK;	! CLEAR TEMP BREAKS, REMOVE EXTRA RETURN WORD;
+	JSP	I,DOT1;		! CURRENT FLAGS;
+DOT1:	TLO	I,'20;		! "JRST MODE" BREAK;
+	HLLM	I,(P);		! SUBSTITUTE FLAGS;
+	JRST	BAIL;		! POPS STACK AS RETURN WORD, GETS INTO BAILOR;
+END;
+
+SIMPLE PROCEDURE STEP!ATJRST; START!CODE
+! CALLED BY JSP '14,STEP!ATJRST;
+DEFINE KEY=['14],I=['13],J=['15]; LABEL LOOP;
+	MOVEI	KEY,-1(KEY);	! ADDR OF JSP;
+	MOVSI	I,-N!BK;
+LOOP:	HRRZ	J,BK!LOC[0](I);
+	CAIE	J,(KEY);
+	AOBJN	I,LOOP;
+	MOVEI	I,@BK!INSTR[0](I);	! THE EFFECTIVE ADDRESS;
+	TLO	I,'20;		! JRST MODE BREAK;
+	PUSH	P,I;		! A COPY FOR BAIL TO POP;
+	PUSH	P,KEY;		! LOCATION OF JSP '14,;
+	PUSHJ	P,CLRTBK;	
+	JRST	BAIL;
+END;
+
+SIMPLE PROCEDURE STEPIT(INTEGER PC; INTEGER ARRAY INSTR,MASK); BEGIN "STEPIT"
+DEFINE PUSHJ=['260000000000],POPJ=['263000000000],PUSH=['261000000000],
+       JSP14=['265600000000];
+NOHAND([
+	SIMPLE PROCEDURE BREAK2(INTEGER LOC);
+	BREAK1(RIGHT(LOC)+(1 LSH 23),"","","",0,PJPBAIL);
+INTEGER I,L,U,U2,J,T;
+U2_ARRINFO(INSTR,2);	! UPPER BOUND FOR FIRST DIMENSION;
+! SEARCH COORDINATE INDEX AND THEN COORDINATE TABLE TO FIND PC OF CURRENT
+  STATEMENT AND NEXT;
+I_CRD!PC(PC);
+L_RIGHT(TARRAY[I+1]); U_RIGHT(TARRAY[I+3]);	! PC OF CURRENT, NEXT STATEMENT;
+IF U='777777 THEN U_L+'200;
+UNPLANT!BREAKS;
+FOR I_L UPTO U DO BEGIN
+    FOR J_0 UPTO U2 DO BEGIN
+	IF ((T_MEMORY[I]) XOR INSTR[J]) LAND MASK[J]=0 THEN BEGIN
+	    IF INSTR[J]=POPJ 
+	    THEN BREAK1((1 LSH 23)+I,"","","",0,PUSHJ+(P LSH 23)+LOCATION(STEP!POPJ)
+	    ELSE IF INSTR[J]=ATJRST
+	    THEN BREAK1((1 LSH 23)+I,"","","",0,('265 LSH 27)+('14 LSH 23)+
+		    LOCATION(STEP!ATJRST))
+	    ELSE IF INSTR[J]=PUSHJ
+	    THEN BEGIN ! DON'T BREAK LOCATIONS IN SEGMENT OR CALLS ON BAIL;
+		IF RIGHT(T)<NOTENX('400000) TENX('640000) 
+		    AND RIGHT(T) NEQ LOCATION(BAIL)
+		THEN BEGIN
+			IF LEFT(MEMORY[T]) NEQ '255000	! JFCL (/4B simple proc.);
+			THEN WHILE LEFT(MEMORY[T]) NEQ '551517 DO T_T+1;
+				! find HRRZI RF,-n(P) which sets environment;
+			BREAK2(T) END END
+	    ELSE BREAK2(T);
+	    DONE END;
+    END END;
+BREAK2(U);
+]) ! NOHAND;
+HAND([
+INTEGER L,U,U2,J;
+START!CODE LABEL STPBBRK,STPBRK,TOP2,LAB1,LAB2,INC2,INC1,CHK1,SP0LUP,HRRZL,LAB3,LAB4;
+DEFINE A=[1],B=[2],I=[3],INS=[4];
+	MOVE	A,INSTR;
+	MOVE	A,-3(A);	! UPPER BOUND FOR FIRST DIM;
+	MOVEM	A,U2;
+	PUSH	P,PC;
+	PUSHJ	P,CRD!PC;
+	HRRZ	I,TARRAY[1](1);
+	MOVEM	I,L;		! PC CURRENT STMT;
+	HRRZ	B,TARRAY[3](1);
+	MOVEM	B,U;		! PC NEXT STMT;
+	MOVEI	A,'200(I);
+	CAIN	B,-1;
+	MOVEM	A,U;
+	PUSHJ	P,UNPLANT!BREAKS;
+	JRST	CHK1;
+STPBBRK:MOVE	A,PJPBAIL;
+STPBRK:	HRLI	B,'40;
+	PUSH	P,B;		! B=WHERE;
+	MOVEI	B,6;	! 6 ZEROES ON SP;
+SP0LUP:	PUSH	SP,[0];
+	SOJG	B,SP0LUP;
+	PUSH	P,[0];
+	PUSH	P,A;		! A=WHAT INSTR TO USE;
+	PUSHJ	P,BREAK1;
+	POPJ	P,;
+TOP2:	MOVE	INS,INSTR;	! FWA INSTR ARRAY;
+	ADDI	INS,(A);	! ADD J;
+	MOVE	B,MASK;	! FWA MASK ARRAY;
+	ADDI	B,(A);	! ADD J;
+	MOVE	A,(INS);
+	XOR	A,(I);
+	AND	A,(B);
+	JUMPN	A,INC2;	! INSTR NOT ONE WE WANT;
+	HLRZ	INS,(INS);	! OPCODE IN RIGHT HALF;
+	MOVE	A,PJPBAIL;	! GET PUSHJ P, IN TOP HALF OF A;
+	HRRI	A,STEP!POPJ;
+	MOVEI	B,(I);		! ADDR TO BREAK;
+	CAIE	INS,0+ATJRST LSH -18;
+	 JRST	LAB3;
+	MOVSI	A,0+JSP14 LSH -18;
+	HRRI	A,STEP!ATJRST;
+	JRST	LAB4;
+LAB3:	CAIE	INS,0+POPJ LSH -18;
+	 JRST	LAB1;
+LAB4:	PUSHJ	P,STPBRK;
+	JRST	INC1;
+LAB1:	HRRZ	B,(I);		! DEALING WITH PUSHJ, AOJA, SOJA, JUMPx, JRST;
+	CAIE	INS,0+PUSHJ LSH -18;
+	 JRST	LAB2;
+	CAIGE	B,NOTENX('400000) TENX('640000);	! NOW PUSHJ ONLY;
+	CAIN	B,BAIL;
+	 JRST	INC1;
+				! B CONTAINS ENTRY ADDR. FIND THE JFCL OR HRRZI;
+HRRZL:	HLRZ	A,(B);		! OPCODE HALF;
+	CAIE	A,'255000;	! JFCL;
+	CAIN	A,'551517;	! HRRZI F,(P);
+	 JRST	LAB2;		! FOUND THE ONE WE WANT;
+	AOJA	B,HRRZL;	! KEEP LOOKING;
+LAB2:	PUSHJ	P,STPBBRK;
+	JRST	INC1;		! ONCE WE'VE BROKEN IT, DON'T TRY TO BREAK IT AGAIN;
+INC2:	AOS	A,J;
+	CAMG	A,U2;
+	 JRST	TOP2;
+INC1:	AOS	I,L;
+CHK1:	SETOB	A,J;
+	CAMG	I,U;
+	 JRST	INC2;
+	MOVE	B,U;
+	PUSHJ	P,STPBBRK;
+	END;
+]) ! HAND;
+END "STEPIT";
+
+INTEGER PROCEDURE FNDSBFLD( integer class; STRING NAM );
+BEGIN	INTEGER I; record!pointer ($class) c;
+memloc(c,integer)_ right(class);
+if c=null!record then return(0);
+FOR I_ $CLASS:RECSIZ[C] step -1 until 1
+   DO IF !!EQU($CLASS:TXTARR[C][I],NAM)
+     THEN return( if gettype($class:typarr[c][i])=strng
+			 then -i else i );
+RETURN(0);
+END;
+
+! BAILOR,!!TEXT,!!ARGS,EVAL,PSH,OPPSH,SETLEX,X1TEMP,X1TEMP,NEWTEMP,NEWSTRTEMP;
+INTERNAL RECURSIVE PROCEDURE BAILOR; BEGIN "BAILOR"
+INTEGER ARRAY SAVED!ACS[0:'17+'12+1+1];
+INTEGER PC,FLAGS,I,T,DISPLVL;
+INTEGER LDEPTH,DDEPTH,CURBRK;	! LEXICAL DEPTH, DYNAMIC DEPTH,CURRENT
+				BREAKPOINT NUMBER;
+INTEGER ARRAY LCHAIN[0:15];	! MOST RECENT FIRST;
+INTEGER ARRAY DCHAIN[0:63,0:1];	! MOST RECENT FIRST;
+LABEL BRECOV;			! RECOVERY POINT FOR BAIL ERRORS;
+LABEL RET;			! !!GO COMES HERE IMMEDIATELY;
+DEFINE F=['12];
+
+
+INTERNAL STRING PROCEDURE !!TEXT; BEGIN PRLSCOPE(LCHAIN,LDEPTH);
+PRDSCOPE(DCHAIN,DDEPTH); ADDSTR("
+AT SETLEX("&CVS(DISPLVL)&");"); SSF_TRUE; RETURN(DUMPSTR) END;
+
+
+INTERNAL STRING PROCEDURE !!ARGS; BEGIN
+INTEGER T,PDA;
+IF (T_DCHAIN[DISPLVL,0])>0 THEN ! NON-SIMPLE PROCEDURE;
+    PRARGS(LEFT(MEMORY[T+1]),T-1,MEMORY[T+2])	! APPLAUD THE POWER OF DISPLAYS!!!;
+	!	PDA	RIGHT(P)	SP;
+ELSE BEGIN
+    IF DDEPTH NEQ 0 THEN OUTSTR("
+Warning: String parameters to simple procedure may be incorrect.
+");
+    IF (PDA_PDFIND(MEMORY[MEMORY[-T]-1]))=1 THEN OUTSTR("
+Can't find procedure descriptor.  Use actual names.
+")
+    ELSE PRARGS(PDA,-T,SAVED!ACS[SP]) END;
+SSF_TRUE; RETURN(DUMPSTR) END;
+
+
+! EVAL, PSH, OPPSH, SETLEX, X1TEMP, EVAL1;
+RECURSIVE INTEGER PROCEDURE EVAL(STRING ARG);
+BEGIN"EVAL"
+EXTERNAL PROCEDURE CAT;
+STRING STRVAL,OLDARG;
+INTEGER CLASS,IVAL,REFIT,PNTR,OP;
+LABEL OPCHAR;
+
+define StackDepth = [31];
+INTEGER ARRAY TEMPVAL[0:StackDepth];
+STRING  ARRAY TSTRVAL[0:StackDepth];
+INTEGER ARRAY RBIND,STACK,OPSTACK[0:StackDepth];
+INTEGER N!TEMPVAL,N!TSTRVAL,TOS,TOOPS,T;
+BOOLEAN BINARYMINUSFLAG;
+
+PROCEDURE EV1ERR(STRING WHY); EVALERR(WHY,OLDARG,ARG);
+
+simple integer procedure bump( reference integer tobump );
+nohand([
+    if StackDepth geq tobump_tobump+1 then return(tobump)
+     else ev1err("EVAL: expression too complicated");
+]) ! nohand;
+hand([
+    start!code	protect!acs 1; label good;
+	aos	1,tobump;
+	caig	1,StackDepth;
+	 jrst	good;
+	movei	1,["EVAL: expression too complicated"];
+	push	sp,-1(1);
+	push	sp,0(1);
+	pushj	p,ev1err;
+    good:
+    end;
+]) ! hand;
+
+SIMPLE PROCEDURE PSH(INTEGER ARG); STACK[bump(TOS)]_ARG;
+
+SIMPLE PROCEDURE OPPSH(INTEGER ARG,RBND); BEGIN
+    OPSTACK[bump(TOOPS)]_ARG; RBIND[TOOPS]_RBND END;
+
+INTEGER PROCEDURE NEWTEMP(INTEGER I);
+    RETURN(LOCATION(TEMPVAL[bump(N!TEMPVAL)]_I));
+
+INTEGER PROCEDURE NEWSTRTEMP(STRING s);
+    RETURN(RIGHT(LOCATION(TSTRVAL[bump(N!TSTRVAL)]_s)));
+
+INTERNAL RECURSIVE PROCEDURE SETLEX(INTEGER DEPTH); BEGIN "SETLEX"
+! MOVE LEXICAL SCOPE UP AND DOWN THE DYNAMIC SCOPE CHAIN;
+DISPLVL_DEPTH_0 MAX DEPTH MIN DDEPTH;	! Clip bounds;
+GETLSCOPE(LCHAIN,LDEPTH,DCHAIN[DEPTH,1]); PRLSCOPE(LCHAIN,LDEPTH);
+END "SETLEX";
+
+PROCEDURE X1TEMP(INTEGER REFIT);BEGIN
+REFIT_RIGHT(REFIT);	! ISOLATE ADDRESS PORTION;
+IF 0 leq REFIT - LOCATION(TEMPVAL[0]) leq n!tempval
+	THEN N!TEMPVAL_N!TEMPVAL-1
+ELSE if 0 leq refit - RIGHT(LOCATION(TSTRVAL[0])) leq N!TSTRVAL
+	THEN N!TSTRVAL_N!TSTRVAL-1;
+END;
+
+
+! EVAL1;
+RECURSIVE INTEGER PROCEDURE EVAL1; BEGIN "EVAL1"
+
+! EVALUATE OPERATOR ON TOP OF STACK AND ADJUST STACK;
+
+DEFINE PRINT=[WR!TON];	
+DEFINE CONFORM(A)=[(OPS1[A] LAND '777)],DEGREE(A)=[(OPS1[A] LSH -9 LAND '777)];
+INTEGER OP,ARG1,ARG2,TYP1,TYP2,MODE,TYP,I,DEG,RSLTTYP,LEAPFLAG;
+INTEGER TEMP; STRING TEMPSTR;
+
+
+if tos < 0 then ev1err("EVAL1: no operator");
+IF ABS(OP_STACK[TOS]) LEQ N!OPS THEN BEGIN "PRIMITIVE"
+LABEL $INF,$COMMA,$COLON,$SEMI,$LEN,
+	$ARRYREF,$MEMRY,$DATUM,$PROPS,$SUBST,$GETS,$SWAP,
+	$SUBFLD,$SETC,$LSTC,$AR,$ASSIGNRESULTS;
+LABEL $CPRINT,$PRINT,$NEWREC;
+label $sbfld2;	! special pntvar[fieldname] hack;
+
+    SIMPLE PROCEDURE TYPERR; EV1ERR("Type mismatch, " & OP);
+
+    SIMPLE PROCEDURE LEAP!TYPE!CHECK; BEGIN "LPTYCK"
+	IF (LEAPFLAG_(ARG1 LOR ARG2) LAND ITEMB) THEN BEGIN	! ONE IS AN ITEM;
+	    MODE_0;					! ITEMS COMPARE LIKE INTEGERS;
+	    IF (ARG1 LAND ARG2 LAND ITEMB)=0		! BOTH MUST BE ITEMS;
+		OR ((ARG1 XOR ARG2) LSH -(18+5+6)) NEQ 0	! SECOND ORDER TYPES MUST AGREE;
+		OR (TYP1 NEQ TYP2)
+		    AND  TYP1 NEQ (ITEMB+NOTYPE)
+	    THEN TYPERR END
+	ELSE IF TYP1=TYP2 AND (TYP1=SETYPE OR TYP1=LSTYPE)
+	    THEN BEGIN MODE_2; LEAPFLAG_TRUE END END "LPTYCK";
+
+    SIMPLE PROCEDURE MAKE!BOTH!STRING;
+	BEGIN RSLTTYP_STRNG; MODE_0;
+	ARG1_CVSTRNG(ARG1,1); ARG2_CVSTRNG(ARG2,2) END;
+
+    SIMPLE PROCEDURE MAKE!BOTH!REAL;
+	BEGIN RSLTTYP_FLOTNG; MODE_1;
+	ARG1_CVREAL(ARG1,1); ARG2_CVREAL(ARG2,2) END;
+
+    SIMPLE PROCEDURE MAKE!BOTH!INTEGER;
+	BEGIN RSLTTYP_INTEGR; MODE_0;
+	ARG1_CVINTEGR(ARG1,1); ARG2_CVINTEGR(ARG2,2) END;
+	
+    SIMPLE PROCEDURE MAX!DOMAIN;
+	! FLOTNG > INTEGR > STRNG, AND MUST GET AT LEAST AN INTEGR;
+	IF TYP1=FLOTNG OR TYP2=FLOTNG THEN MAKE!BOTH!REAL
+	ELSE MAKE!BOTH!INTEGER;
+
+    if tos<DEG_DEGREE(OP) THEN EV1ERR("Syntax error (too few args)");
+    ! HANDLE TEMPORARY LOCATIONS ASSIGNED BY EVAL;
+	arg1_arg2_0;	! just in case they are looked at, use a value;
+    IF DEG GEQ 2 THEN X1TEMP(ARG1_STACK[TOS-2]);
+    IF DEG GEQ 1 THEN X1TEMP(ARG2_STACK[TOS-1]);
+
+    ! CONFORM THE OPERANDS TO THE OPERATOR. DEFAULT TO INTEGER;
+    TYP1_GETTYPE(ARG1); TYP2_GETTYPE(ARG2);
+    MODE_0; RSLTTYP_INTEGR;
+    CASE CONFORM(OP) min 13 OF BEGIN "CONFORM"
+    [0] "OPERATOR UNTYPED. RETURN TYPE OF FIRST ARG"
+	RSLTTYP_GETTYPE(STACK[TOS-DEG]);
+    [1]	MAKE!BOTH!INTEGER;
+    [2] MAKE!BOTH!REAL;
+    [3] "CAT &" IF TYP1=LSTYPE AND TYP2=LSTYPE THEN BEGIN MODE_1; RSLTTYP_LSTYPE END
+	ELSE MAKE!BOTH!STRING;
+    [4] "SECOND GETS TYPE OF FIRST" BEGIN
+	LEAP!TYPE!CHECK; IF NOT LEAPFLAG THEN BEGIN
+	    IF (RSLTTYP_TYP1) NEQ TYP2 THEN BEGIN
+		IF (TYP_RSLTTYP LSH -23)<3 OR TYP>5 THEN TYPERR
+		ELSE CASE TYP OF BEGIN
+		    [3] MAKE!BOTH!STRING;
+		    [4] MAKE!BOTH!REAL;
+		    [5] MAKE!BOTH!INTEGER
+	END END END END;
+    [5] "SECOND GETS INTEGER; FOR LSH, ASH, ROT"
+	BEGIN RSLTTYP_TYP1; ARG2_CVINTEGR(ARG2,2) END;
+    [6]	"MEMBERSHIP"
+	IF NOT(ARG1 LAND ITEMB) OR (TYP2 NEQ SETYPE) THEN TYPERR;
+    [7]	"INF" ;
+    [8]	"SET"  BEGIN MODE_3; RSLTTYP_SETYPE END;
+    [9]	MAX!DOMAIN;
+   [10]	"ASSOCIATIVE POSSIBILITY"
+	IF (ARG1 LAND ARG2 LAND ITEMB)	! BOTH ITEMS;
+	THEN BEGIN MODE_1; RSLTTYP_SETYPE END	! DERIVED!SET_ITEM OP ITEM;
+	ELSE IF OP="`"
+	     THEN TYPERR	! ASSOC OF NON-ITEMS;
+	     ELSE RSLTTYP_TYP1;		! BIT OPERATOR XOR, EQV;
+   [11] ;		! LOCATION;
+   [12] "RELATION" BEGIN
+	LEAP!TYPE!CHECK; ! TO SET MODE TO 2 FOR SET OR LIST;
+	IF NOT(LEAPFLAG) OR (TYP1 NEQ TYP2)
+	THEN BEGIN ! TAKE MAX ALGEBRAIC DOMAIN BUT KEEP RESULT BOOLEAN;
+	    IF not(TYP1=TYP2=RECTYP) THEN MAX!DOMAIN;	! r!p > r!p ok;
+	    MODE_0; RSLTTYP_INTEGR
+	END END;
+    [13] "bad code (too large)" ev1err( "CONFORM: bad mode" )
+    END "CONFORM";
+
+
+! INTERPRETATION OF OPERATORS;
+START!CODE	! JUMP TABLE FOR OPERATORS;
+	LABEL $NOT,$AND,$OR;
+	LABEL $EQ,$NEQ,$LEQ,$LESS;
+	LABEL $JEQ,$JNEQ,$JLEQ,$JLESS;
+	LABEL $LPEQ,$LPNEQ,$LPLEQ,$LPLES;
+	LABEL $REVOP1,$REVOP2;
+	LABEL $PLUS,$MINUS,$MUL,$CDIV,$EXP,$EXPI,$EXPR;
+	LABEL $MIN,$MAX,$MOD,$LOC;
+	LABEL $CAT,$LPCAT,$JCAT,$JSUBST,$SUBST,$LPSUBST,$STRNG;
+	LABEL $ASSOC,$LPEQV,$LPXOR,$IN,$UNION,$INTER,$LPMINUS,
+	    LPSET,LPREL,LPDRV,LPRL2,LPDO1;
+	LABEL $XOR,$EQV;
+	LABEL $FOR,$TO;
+	LABEL $FALSE,$TRUE,$NULL,$PHI,$NIL,$ANY,$NLREC;
+	LABEL BADOP,ZERO,ONES,DONE,JTAB,$UMINUS,ZCONST,SCONST,ONES$,ZERO$;
+	EXTERNAL INTEGER LEAP,SUBST,CAT,POW,FLOGS;
+	DEFINE A=[1],B=[2],M=[3],T=[4];
+	PROTECT!ACS A,B,M,T;
+
+	MOVE	A,@ARG1;	! FIRST OPERAND;
+	MOVE	B,@ARG2;	! SECOND OPERAND;
+	MOVE	M,MODE;		! SOME OPS: 0=INTEGER, 1=REAL, 2=BOOL_(SET,SET), 3=SET_(SET,SET);
+	MOVE	T,OP;
+	XCT	JTAB(T);
+DONE:	MOVEM	A,TEMP;
+BADOP:	JRST	$ASSIGNRESULTS;
+ZERO:	TDZA	A,A;
+ONES:	SETO	A,;
+	JRST	DONE;
+JTAB:
+$JNEQ:	JRST	$NEQ;	! '000;
+	JRST	$NEQ;	! '001;
+	JRST	$LPNEQ;	! '002;
+	JRST	BADOP;	! '003;
+	JRST	$AND;	! "";
+	JRST	$NOT;	! "";
+	JRST	$IN;	! "";
+$JEQ:	JRST	$EQ;	! '007;
+	JRST	$EQ;	! '010;
+	JRST	$LPEQ;	! '011;
+$JLEQ:	JRST	$LEQ;	! '012;
+	JRST	$LEQ;	! '013;
+	JRST	$LPLEQ;	! '014;
+	JRST	BADOP;	! '015;
+	JRST	$INF;	! "";
+	JRST	$DATUM;	! "";
+	JRST	BADOP;	! '020;
+	JRST	BADOP;	! '021;
+	JRST	$INTER;	! "";
+	JRST	$UNION;	! "";
+	JRST	BADOP;	! '024;
+	JRST	BADOP;	! '025;
+	XCT	$XOR(M);! "";
+	JRST	$SWAP;	! "";
+$JLESS:	JRST	$LESS;	! '030;
+	JRST	$LESS;	! '031;
+	JRST	$LPLES;	! '032;
+	JRST @	$JNEQ(M);	! "";
+	JRST @	$JLEQ(M);	! "";
+	JRST	$REVOP1;	! "";
+	XCT	$EQV(M);! "";
+	JRST	$OR;	! "";
+$MAX:	CAMGE	A,B;	! '040;
+	MOVE	A,B;	! "!";
+	JRST	DONE;	! quote;
+$XOR:	XOR	A,B;	! "!";
+	JRST	$LPXOR;	! "$";
+	XCT	$CDIV(M);	! "%";
+	JRST @	$JCAT(M);! "&";
+$MIN:	CAMLE	A,B;	! "'";
+	MOVE	A,B;	! "(";
+	JRST	DONE;	! ")";
+	XCT	$MUL(M);	! "*";
+	XCT	$PLUS(M);	! "+";
+	JRST	$COMMA;	! ",";
+	XCT	$MINUS(M);	! "-";
+	JRST	BADOP;	! ".";
+	FDVR	A,B;	! "/";
+$AND:	JUMPE	A,ZERO;	! "0";
+	JUMPE	B,ZERO;	! "1";
+	JRST	ONES;	! "2";
+$NOT:	JUMPE	B,ONES;	! "3";
+	JRST	ZERO;	! "4";
+$NEQ:	CAMN	A,B;	! "5";
+	JRST	ZERO;	! "6";
+	JRST	ONES;	! "7";
+$EXP:	JRST	$EXPI;	! "8";
+	JRST	$EXPR;	! "9";
+	JRST	$COLON;	! ":";
+	JRST	$SEMI;	! '073;
+	JRST @	$JLESS(M);	! "<";
+	JRST @	$JEQ(M);	! "=";
+	JRST	$REVOP2;	! ">";
+$EQV:	EQV	A,B;	! "?";
+	JRST	$LPEQV;	! "@";
+	ASH	A,(B);	! '101;
+	IDIV	A,B;	! DIV;
+	JRST	$FALSE;	! '103;
+	AND	A,B;	! LAND;
+	SETCM	A,B;	! LNOT;
+	IOR	A,B;	! LOR;
+	LSH	A,(B);	! ' 107;
+	JRST	$MAX;	! '110;
+	JRST	$MIN;	! '111;
+	JRST	$MOD;	! '112;
+	JRST	BADOP;	! '113;
+	JRST	$NULL;	! '114;
+	ROT	A,(B);	! '115;
+	JRST	BADOP;	! '116;
+	JRST	$TRUE;	! '117;
+	MOVM	A,B;	! ABS;
+	JRST	$FOR;	! (SUBSTRINGER);
+	JRST	$TO;	! (SUBSTRINGER);
+	JRST	$UMINUS;! UNARY MINUS;
+	JRST	$ARRYREF;	! '124;
+	JRST	$MEMRY;	! '125;
+	JRST	$DATUM;	! '126;
+	JRST	$PROPS;	! '127;
+	JRST @	$JSUBST(M);	! PERFORM SUBSTRINGING OR SUBSLITING;
+	JRST	$PHI;	! '131;
+	JRST	$NIL;	! '132;
+	JRST	BADOP;	! LBRACKET;
+	jrst	$sbfld2; ! ("\") was: BADOP now pntvar[fieldname] hack;
+	JRST	BADOP;	! RBRACKET;
+	XCT	$EXP(M);	! UP ARROW;
+	JRST	$GETS;	! ASSIGN;
+	JRST	$ASSOC;	! ASSOC;
+	JRST	$SUBFLD;	! '141;
+	JRST	$ANY;	! '142;
+	JRST	$NLREC;	! '143;
+	JRST	$LEN;	! '144;
+	JRST	$LOC;	! '145;
+	JRST	$LSTC;	! '146;
+	JRST	$CPRINT;! '147;
+	JRST	$PRINT;	! '150;
+	JRST	$NEWREC;! '151;
+$MUL:	IMUL	A,B;	! '152;
+	FMPR	A,B;	! '153;
+$PLUS:	ADD	A,B;	! '154;
+	FADR	A,B;	! '155;
+$CDIV:	IDIV	A,B;	! '156;
+	FDVR	A,B;	! '157;
+$LESS:	CAML	A,B;	! '160;
+	JRST	ZERO;	! '161;
+	JRST	ONES;	! '162;
+$EQ:	CAME	A,B;	! '163;
+	JRST	ZERO;	! '164;
+	JRST	ONES;	! '165;
+$REVOP2:SUBI	T,1;	! '166;	! CONVERT ">" TO "<";
+$REVOP1:SUBI	T,1;	! '167;	! CONVERT "" TO "";
+	EXCH	A,B;	! '170;
+	XCT	JTAB(T);! '171;
+$LEQ:	CAMLE	A,B;	! '172;
+	JRST	ZERO;	! '173;
+	JRST	ONES;	! '174;
+STANFO([JRST	BADOP;	! ALT;
+	JRST	$SETC;	! '176;	])
+DEC([	JRST	$SETC;	! '175;
+	JRST	BADOP;	! '176;	])
+TENX([	JRST	$SETC;	! '175;
+	JRST	BADOP;	! '176;	])
+	JRST	DONE;	! BS, END-OF-FILE;
+! END OF 0:'177 JTAB;
+
+$OR:	JUMPN	A,ONES;
+	JUMPN	B,ONES;
+	JRST	ZERO;
+$MINUS:	SUB	A,B;
+	FSBR	A,B;
+	JRST	BADOP;
+	JRST	$LPMINUS;
+$JCAT:	JRST	$CAT;
+	JRST	$LPCAT;
+$JSUBST:JRST	$SUBST;
+	JRST	$LPSUBST;
+
+
+$MOD:	IDIV	A,B;
+	MOVE	A,A+1;
+	JRST	DONE;
+$EXPR:	PUSH	P,B;	! EXPONENT;
+	PUSH	P,A;	! BASE;
+	PUSHJ	P,FLOGS;
+	JRST	DONE;
+$EXPI:	PUSH	P,B;
+	PUSH	P,A;
+	PUSHJ	P,POW;
+	FIX	1,1;
+	JRST	DONE;
+
+$LOC:	HRRZ	A,ARG2;
+	JRST	DONE;
+
+SUPERCOMMENT([
+$FOR:	"FOR (SUBSTRINGER)" BEGIN	! CONVERT INDICES TO "TO";
+	    TEMP_MEMORY[ARG1]+MEMORY[ARG2]-1;	! COMPUTE END CHAR NUMBER;
+	    TEMPVAL[N!TEMPVAL_N!TEMPVAL+1]_MEMORY[ARG1]; ! BEGINNING CHAR !;
+	    RSLTTYP_RNGTYP;
+	    DEG_2; GOTO $AR END;
+$TO:	"TO (SUBSTRINGER)" BEGIN DEG_2;
+	    TEMP_MEMORY[ARG2];	! END CHAR !;
+	    TEMPVAL[N!TEMPVAL_N!TEMPVAL+1]_MEMORY[ARG1]; ! BEGINNING CHAR !;
+	    RSLTTYP_RNGTYP; GOTO $AR END;
+]) ! SUPERCOMMENT;
+$FOR:	ADD	B,A;
+	SUBI	B,1;
+$TO:	MOVEM	B,TEMP;		! END CHAR !;
+	PUSH	P,A;		! BEGINNING CHAR !;
+	PUSHJ	P,NEWTEMP;
+	MOVEI	A,2;
+	MOVEM	A,DEG;
+	MOVSI	A,0+RNGTYP LSH -18;
+	MOVEM	A,RSLTTYP;
+	JRST	$AR;
+
+$CAT:	PUSH	P,ARG1;
+	PUSHJ	P,MEMSTRING;
+	PUSH	P,ARG2;
+	PUSHJ	P,MEMSTRING;
+	PUSHJ	P,CAT;
+$STRNG:	HRROI	T,ACCESS(TEMPSTR);
+	POP	SP,(T);
+	POP	SP,-1(T);
+	MOVSI	T,0+STRNG LSH -18;
+	MOVEM	T,RSLTTYP;
+	JRST	$AR;
+
+SUPERCOMMENT([
+$SUBST:	"PERFORM SUBSTRINGING" BEGIN
+	    EXTERNAL STRING PROCEDURE SUBST(STRING ARG; INTEGER ENDCHAR, STARTCHAR);
+	    TEMPSTR_SUBST(MEMSTRING(OPSTACK[TOOPS]),MEMORY[STACK[TOS-1]],
+		MEMORY[STACK[TOS-1]-1]);
+	    X1TEMP(STACK[TOS-1]);
+	    DEG_2; RSLTTYP_STRNG; GOTO $AR
+	   END;
+]) ! SUPERCOMMENT;
+$SUBST:	MOVE	B,ACCESS(STACK[TOS-1]);
+	PUSH	P,(B);		! END CHAR;
+	PUSH	P,-1(B);	! START CHAR;
+	PUSH	P,ACCESS(OPSTACK[TOOPS]);	! ADDR OF STRING;
+	PUSH	P,B;
+	PUSHJ	P,X1TEMP;
+	PUSHJ	P,MEMSTRING;	! GET STRING ON SP;
+	PUSHJ	P,SUBST;
+	MOVEI	T,2;
+	MOVEM	T,DEG;
+	JRST	$STRNG;
+
+SUPERCOMMENT([
+$UMINUS:BEGIN ! CONVERT -X TO (0-X);
+	STACK[TOS]_STACK[TOS-1];	! COPY X;
+	STACK[TOS-1]_REFZERO;		! ZERO;
+	STACK[TOS_TOS+1]_"-";		! BINARY MINUS;
+	EVAL1;				! RECURSE;
+	GOTO $AR END;
+]) ! SUPERCOMMENT;
+$UMINUS:MOVEI	B,ACCESS(STACK[TOS]);
+	MOVE	T,-1(B);
+	MOVEM	T,(B);		! STACK[TOS]_STACK[TOS-1];
+	MOVSI	T,0+INTEGR LSH -18;
+	HRRI	T,ZERO$;
+	MOVEM	T,-1(B);	! STACK[TOS-1]_REFZERO;
+	MOVEI	T,"-";
+	MOVEM	T,1(B);		! STACK[TOS+1]_binary minus;
+	AOS	ACCESS(TOS);
+	PUSHJ	P,EVAL1;
+	JRST	$AR;
+
+ONES$:	-1;
+	0;
+ZERO$:	0;
+
+$TRUE:	MOVEI	A,ONES$;
+	HRLI	A,0+INTEGR LSH -18;
+	JRST	SCONST;
+$FALSE:	MOVSI	A,0+INTEGR LSH -18;
+	JRST	ZCONST;
+$NULL:	MOVSI	A,0+STRNG LSH -18;
+	JRST	ZCONST;
+$ANY:	MOVSI	A,0+(ITEMB+NOTYPE) LSH -18;
+	JRST	ZCONST;
+$NLREC:	MOVSI	A,0+RECTYP LSH -18;
+	JRST	ZCONST;
+$PHI:	MOVSI	A,0+SETYPE LSH -18;
+	JRST	ZCONST;
+$NIL:	MOVSI	A,0+LSTYPE LSH -18;
+ZCONST:	HRRI	A,ZERO$;
+SCONST:	MOVEM	A,ACCESS(STACK[TOS]);
+	SETZM	ACCESS(CLASS);		! SYMBOLIC CONSTANTS ARE NOT SPCHARs;
+	JRST	$AR;
+
+$LPLES:	MOVEI	5,'65;
+	JRST	LPREL;
+$LPEQ:	MOVEI	5,'67;
+	JRST	LPREL;
+$LPNEQ:	MOVEI	5,'70;
+	JRST	LPREL;
+$LPLEQ:	MOVEI	5,'71;
+LPREL:	HRLI	5,'110;
+LPRL2:	PUSH	P,A;
+	PUSH	P,B;
+	PUSHJ	P,LEAP;
+	JUMPN	1,ONES;
+	JRST	ZERO;
+
+$UNION:	MOVEI	5,'56;
+	JRST	LPSET;
+$INTER:	MOVEI	5,'57;
+	JRST	LPSET;
+$LPMINUS:MOVEI	5,'60;
+LPSET:	HRLI	5,'110;
+	JRST	LPDRV;
+
+$LPXOR:	MOVE	5,[('2 LSH 18)+'40];
+	JRST	LPDRV;
+$ASSOC:	MOVE	5,[('20 LSH 18)+'41];
+	JRST	LPDRV;
+$LPEQV:	MOVE	5,[('200 LSH 18)+'42];
+LPDRV:	PUSH	P,A;
+	PUSH	P,B;
+LPDO1:	PUSHJ	P,LEAP;
+	HRROI	'14,TEMP;
+	MOVE	5,[('110 LSH 18)+'61];
+	PUSHJ	P,LEAP;
+	JRST	$AR;
+
+$IN:	MOVE	5,[('10 LSH 18)+'63];
+	JRST	LPRL2;
+
+$LPCAT:	MOVE	5,[('110 LSH 18)+'121];
+	JRST	LPDRV;
+$LPSUBST:MOVE	B,ACCESS(STACK[TOS-1]);
+	PUSH	P,@ACCESS(OPSTACK[TOOPS]);
+	PUSH	P,-1(B);		! START EL;
+	PUSH	P,(B);		! END EL;
+	MOVE	5,[('100 LSH 18)+'125];
+	JRST	LPDO1;
+
+END;
+
+$INF:	BEGIN
+	    ! SPECIAL OPERATOR MEANING LENGTH OF STRING, SET, LIST;
+	CLASS_0;	! SYMBOLIC CONSTANTS ARE NOT SPCAHRS. CAUSES
+			PROBLEMS WITH UNARY MINUS;
+	FOR I_TOOPS STEP -1 UNTIL 0 DO
+	    IF (TYP1_GETTYPE(OP_OPSTACK[I])) NEQ 0 THEN DONE;
+	STACK[TOS]_INTEGR+NEWTEMP(IF TYP1=STRNG THEN LENGTH(MEMSTRING(OP))
+	    ELSE LENGTH(MEMORY[OP,SET])); GOTO $AR END;
+$LEN:	BEGIN TEMP_IF TYP2=STRNG THEN LENGTH(MEMSTRING(ARG2))
+	ELSE LENGTH(MEMORY[ARG2,SET]); RSLTTYP_INTEGR; GOTO $AR END;
+$COLON:	EV1ERR("No contexts in BAIL");
+$SEMI:	BEGIN IF TOOPS GEQ 0 THEN EV1ERR("Syntax error");
+	FOR I_0 UPTO TOS-1 DO PRINT(STACK[I]); OUTSTR(DUMPSTR);
+	N!TSTRVAL_N!TEMPVAL_TOS_-1; GOTO $AR END;
+$SETC:	BEGIN
+	! STACK HAS	[CODE FOR SETC]
+			[DESCR FOR LAST ITEMVAR]
+				:
+			[DESCR FOR FIRST ITEMVAR]
+			[-1];
+	MEMLOC(TEMP,SET)_PHI; FOR I_TOS-1 STEP -1 UNTIL 0 DO BEGIN
+	    IF STACK[I]=-1 THEN DONE;
+	    PUT MEMORY[STACK[I],ITEMVAR] IN MEMLOC(TEMP,SET) END;
+	RSLTTYP_SETYPE; DEG_TOS-I; GOTO $AR END;
+$LSTC:	BEGIN
+	MEMLOC(TEMP,LIST)_NIL; FOR I_TOS-1 STEP -1 UNTIL 0 DO BEGIN
+	    IF STACK[I]=-1 THEN DONE;
+	    PUT MEMORY[STACK[I],ITEMVAR] IN MEMLOC(TEMP,LIST) BEFORE 1 END;
+	RSLTTYP_LSTYPE; DEG_TOS-I; GOTO $AR END;
+
+$PROPS:	"PROPS()" START!CODE
+	    EXTERNAL INTEGER PROPS;
+		MOVE	3,@ARG2;
+		LDB	0,PROPS;
+		MOVEM	0,TEMP;
+		JRST	$AR;
+		END;
+
+$COMMA:	BEGIN
+	    INTEGER FPNTR;
+	    ! REMOVE OPCOMMA FROM TOP OF STACK;
+	    TOS_TOS-1;
+	    ! ARE WE PARSING PARAMETER LIST TO A PROCEDURE?;
+	    IF TOOPS>0 AND (FPNTR_RBIND[TOOPS-1])<0 THEN
+	    BEGIN
+	    NOHAND([
+	    INTEGER ACTREF,FRMREF,ACTTYP,FRMTYP;
+		! WE ARE PARSING THE PARAMETER LIST OF A PROCEDURE.
+		PERFORM TYPE COERCION.  ALSO ASSIGN VALUE PARAMETERS TO 
+		TEMPORARIES, TO PREVENT MISHAPS SUCH AS
+			EXTERNAL PROCEDURE A(INTEGER VALUE P,Q).,
+			A(I_3,I_4);
+		FRMTYP_GETTYPE(FRMREF_MEMORY[ABS FPNTR]);
+		ACTTYP_GETTYPE(ACTREF_STACK[TOS]);
+		IF FRMTYP NEQ ACTTYP THEN BEGIN ! COERCION NECESSARY;
+		    IF (FRMTYP=NOTYPE) OR (FRMTYP=NOTYPE+ITEMB) OR (FRMTYP=NOTYPE+ARRY)
+		    THEN STACK[TOS]_STACK[TOS] LAND LNOT('77 LSH 23) LOR FRMTYP
+		    ELSE BEGIN
+		    ! MAKE SURE WE ASSIGN A TEMP;
+		    ACTREF_ACTREF LAND (LNOT REFB);
+		    IF FRMTYP<STRNG OR FRMTYP>INTEGR THEN
+			EV1ERR("Can't coerce types")
+		    ELSE CASE FRMTYP LSH -23 OF BEGIN
+		    [3] ACTREF_CVSTRNG(ACTREF,1);
+		    [4] ACTREF_CVREAL(ACTREF,1);
+		    [5] ACTREF_CVINTEGR(ACTREF,1) END; END; END;
+		IF NOT (ACTREF LAND REFB) THEN BEGIN ! ASSIGN TEMP;
+		    X1TEMP(ACTREF); ! GET RID OF OLD;
+		    RSLTTYP_FRMTYP; ! RESULT IS SAME TYPE AS FORMAL;
+		    IF FRMTYP=STRNG THEN TEMPSTR_MEMSTRING(ACTREF)
+		    ELSE TEMP_MEMORY[ACTREF];
+		    ! RESULT ASSIGNMENT TAKE CARE OF ALLOCATING THE TEMP;
+		    ! BUT REMEMBER THAT WE ALREADY ADJUSTED TOS;
+		    TOS_TOS+1;
+		    DEG_1; END;
+		! SET UP POINTER TO NEXT PARAMETER REFITEM;
+		RBIND[TOOPS-1]_RBIND[TOOPS-1]-1;
+		END ]) ! NOHAND;
+	    HAND([
+	    INTEGER !FRMTYP;
+	    START!CODE LABEL COERCE,BAD,CHKTMP,OUT1,FIXTYP,NSTR;
+	    DEFINE ACTREF=[1],FRMREF=[2],ACTTYP=[3],FRMTYP=[4],!STACK=[5],T=[6];
+		MOVEI	!STACK,ACCESS(STACK[TOS]);
+		MOVM	T,FPNTR;
+		MOVE	FRMREF,(T);
+		LDB	FRMTYP,[('271000 LSH 18)+FRMREF]; ! 8 BITS INCLUDES ITEMB;
+		MOVEM	FRMTYP,!FRMTYP;
+		MOVE	ACTREF,(!STACK);
+		LDB	ACTTYP,[('271000 LSH 18)+ACTREF]; ! 8 BITS INCLUDES ITEMB;
+		CAIN	FRMTYP,(ACTTYP);
+		 JRST	CHKTMP;
+		CAIE	FRMTYP,0+NOTYPE LSH -23;
+		CAIN	FRMTYP,0+(NOTYPE+ITEMB) LSH -23;
+		 JRST	FIXTYP;
+		CAIN	FRMTYP,0+(NOTYPE+ARRY) LSH -23;
+		 JRST	FIXTYP;
+		CAIL	FRMTYP,0+STRNG LSH -23;
+		CAILE	FRMTYP,0+INTEGR LSH -23;
+		 JRST	BAD;
+		TLZ	ACTREF,0+REFB LSH -18;
+		PUSH	P,ACTREF;
+		MOVEI	T,1;
+	COERCE:	PUSH	P,T;
+		PUSHJ	P,@COERCE(FRMTYP);
+		JRST	CHKTMP;
+		PUSHJ	P,CVSTRNG;
+		PUSHJ	P,CVREAL;
+		PUSHJ	P,CVINTEGR;
+	BAD:	PUSH	SP,[18];
+		PUSH	SP,["Can't coerce types"];
+		PUSHJ	P,EV1ERR;
+	FIXTYP:	DPB	FRMTYP,[('271000+!STACK)LSH 18]; ! 8 BITS INCLUDES ITEMB;
+	CHKTMP:	TLNE	ACTREF,0+REFB LSH -18;
+		 JRST	OUT1;
+		MOVE	FRMTYP,!FRMTYP;
+		LSH	FRMTYP,23;
+		MOVEM	FRMTYP,RSLTTYP;
+		MOVE	T,(ACTREF);
+		MOVEM	T,TEMP;
+		CAME	FRMTYP,[0+STRNG];
+		 JRST	NSTR;
+		PUSH	P,ACTREF;
+		PUSHJ	P,MEMSTRING;
+		MOVEI	T,ACCESS(TEMPSTR);
+		POP	SP,(T);
+		POP	SP,-1(T);
+	NSTR:	MOVEI	T,ACCESS(TOS);
+		AOS	(T);
+		MOVEI	T,1;
+		MOVEM	T,DEG;
+	OUT1:	MOVEI	T,ACCESS(RBIND[TOOPS]);
+		SOS	-1(T);
+	END END ]) ! HAND;
+
+	ELSE BEGIN ! NOT AN ARG LIST. JUST ASSIGN TEMPORARY;
+	    IF ARG1 LAND REFB THEN BEGIN
+		RSLTTYP_TYP1;
+		IF TYP1=STRNG THEN TEMPSTR_MEMSTRING(ARG1)
+		ELSE TEMP_MEMORY[ARG1]; DEG_1 END END;
+	GOTO $AR; END;
+
+$ARRYREF:BEGIN
+	    ! THE STACK LOOKS LIKE
+		[OPCODE FOR ARRAY REFERENCE]
+		[REFIT FOR LAST SUBSCRIPT]
+		.
+		.
+		[REFIT FOR FIRST SUBSCRIPT]
+		-1
+	      THE TOP WORD OF THE OPSTACK IS THE REFIT FOR THE ARRAY;
+
+	    ! TO SAVE STACK SPACE AT RUNTIME;
+	    DEFINE REFIT=[ARG1],ADDR=[ARG2],NDIMS=[DEG],RNGFLG=[MODE],
+		STRARRFLG=[TYP],SUBSBASE=[OP];
+	    RECURSIVE PROCEDURE RNGPRNT(INTEGER SBPK,ADDRM3K,T); BEGIN "RNGPRNT"
+		! SBPK=LOCATION(STACK[SUBSBASE+index])
+		  ADDRM3K=ADDRESS-3*index
+		  T=OFFSET;
+	    NOHAND([
+		INTEGER I,U;
+		IF GETTYPE(MEMORY[SBPK])=RNGTYP THEN BEGIN RNGFLG_TRUE;
+		    U_MEMORY[SBPK]; I_MEMORY[SBPK-1] END
+		ELSE U_I_MEMORY[CVINTEGR(MEMORY[SBPK],1)];
+		UB_MEMORY[ADDRM3K]; LB_MEMORY[ADDRM3K-1];
+		T_T+(I-1)*(1-STRARRFLG)*MEMORY[ADDRM3K+1];
+		FOR I_I UPTO U DO BEGIN
+		    IF I<MEMORY[ADDRM3K-1] OR I>MEMORY[ADDRM3K] THEN
+			EV1ERR("Subscripting error.  index  value   min   max
+			"&CVS(SBPK-LOCATION(STACK[SUBSBASE]))&TAB&CVS(I)&TAB
+			&CVS(LB)&TAB&CVS(UB));
+		    T_T+(1-STRARRFLG)*MEMORY[ADDRM3K+1];
+		    IF MEMORY[SBPK+1]=OPARRY THEN BEGIN
+			STACK[SUBSBASE]_STACK[SUBSBASE]LAND '777777000000
+			   LOR RIGHT(T);
+			IF RNGFLG THEN PRINT(STACK[SUBSBASE]) END
+		    ELSE RNGPRNT(SBPK+1,ADDRM3K-3,T) END
+	    ]) ! NOHAND;
+	    HAND([
+	    INTEGER I,U;
+	    START!CODE LABEL NRNG,JOIN1,FORTOP,FORINC,FORCHK,BAD,NLDIM,BADCAT;
+	    EXTERNAL INTEGER CVS,CAT,CATCHR;
+	    DEFINE T1=[1],T2=[2],T3=[3],!STACK=[4],SBREF=[5];
+	    PROTECT!ACS T1,T2,T3,!STACK,SBREF;
+		MOVE	!STACK,SBPK;	! LOC OF SUBSCRIPT REFIT;
+		MOVE	SBREF,(!STACK);	! REFIT FOR SUBSCRIPT;
+		LDB	T1,[('270600 LSH 18)+SBREF];
+		CAIE	T1,0+RNGTYP LSH -23;
+		 JRST	NRNG;
+		SETOM	ACCESS(RNGFLG);
+		MOVE	T2,-1(SBREF);	! LOW LIMIT OF RANGE;
+		MOVE	T3,(SBREF);	! HIGH LIMIT;
+		JRST	JOIN1;
+	    NRNG:PUSH	P,SBREF;
+		PUSH	P,[1];
+		PUSHJ	P,CVINTEGR;
+		MOVE	T2,(1);
+		MOVE	T3,(1);
+	    JOIN1:MOVEM	T3,U;
+		MOVE	T1,T2;		! L;
+		SUBI	T1,1;
+		MOVE	T3,ADDRM3K;
+		IMUL	T1,1(T3);
+		SKIPE	ACCESS(STRARRFLG);
+		 ADD	T1,T1;		! CURSE YOU, STRING ARRAYS;
+		ADDM	T1,T;
+		JRST	FORCHK;
+	    FORTOP:MOVE	T3,ADDRM3K;
+		CAML	T2,-1(T3);	! LB/UB CHECK;
+		CAMLE	T2,(T3);
+		 JRST	BAD;
+		MOVE	T2,1(T3);
+		SKIPE	ACCESS(STRARRFLG);
+		 ADD	T2,T2;		! DOUBLE FOR STRING ARRAYS;
+		ADDB	T2,T;		! INCREMENT OFFSET;
+		MOVE	T3,SBPK;	! CHECK FOR LAST DIMENSION;
+		MOVE	T3,1(T3);
+		CAIE	T3,OPARRY;
+		 JRST	NLDIM;		! NOT LAST DIMENSION;
+		MOVEI	!STACK,ACCESS(STACK[SUBSBASE]);
+		HRRM	T2,(!STACK);
+		SKIPN	ACCESS(RNGFLG);
+		 JRST	FORINC;
+		PUSH	P,(!STACK);
+		PUSHJ	P,WR!TON;
+		JRST	FORINC;
+	    BADCAT:PUSHJ P,CVS;
+		PUSHJ	P,CAT;
+		PUSH	P,[TAB];
+		PUSHJ	P,CATCHR;
+		JRST	(T1);
+	    BAD:PUSH	SP,[52];
+		PUSH	SP,[
+"Subscripting error.   index    value	min    max
+			"];
+		MOVE	T1,SBPK;
+		SUBI	T1,ACCESS(STACK[SUBSBASE]);
+		PUSH	P,T1;
+		JSP	T1,BADCAT;
+		PUSH	P,T2;
+		JSP	T1,BADCAT;
+		PUSH	P,-1(T3);
+		JSP	T1,BADCAT;
+		PUSH	P,(T3);
+		JSP	T1,BADCAT;
+		PUSHJ	P,EV1ERR;
+	    NLDIM:MOVE	T1,SBPK;
+		MOVE	T2,ADDRM3K;
+		MOVE	T3,T;
+		ADDI	T1,1;
+		PUSH	P,T1;
+		SUBI	T2,3;
+		PUSH	P,T2;
+		PUSH	P,T3;
+		PUSHJ	P,RNGPRNT;
+	    FORINC:AOS	T2,I;
+	    FORCHK:MOVEM T2,I;
+		CAMG	T2,U;
+		 JRST	FORTOP;
+		END;
+	    ]) ! HAND;
+	    END "RNGPRNT";
+		
+	    REFIT_OPSTACK[TOOPS];
+	    STRARRFLG_IF GETTYPE(REFIT)=STRNG+ARRY THEN -1 ELSE 0;
+	    ! THE ADDRESS IN REFIT IS THE ADDRESS OF THE [AN] ALLOCATION CELL;
+	    ADDR_RIGHT(MEMORY[REFIT]);	! ADDR POINTS TO FIRST DATA WORD;
+	    IF NOT ADDR THEN EV1ERR("Deallocated array");
+	    ! FIND BEGINNING OF DIMENSIONS;
+	    I_TOS; DO I_I-1 UNTIL STACK[I]=-1; SUBSBASE_I;
+	    ! MAKE A REFIT WITH THE RIGHT ADDR AND THE ARRAY BIT OFF;
+	    STACK[SUBSBASE]_(REFIT-ARRY) LAND '777740000000;
+	    ADDR_ADDR+STRARRFLG; NDIMS_ABS(MEMORY[ADDR-1] ASH -18);
+	    IF TOS-SUBSBASE-1 NEQ NDIMS THEN
+		EV1ERR("Number of subscripts is "&CVS(NDIMS));
+
+	    RNGPRNT(LOCATION(STACK[SUBSBASE+1]),ADDR-3,MEMORY[ADDR-3*NDIMS-2]);
+	    FOR I_SUBSBASE UPTO TOS DO X1TEMP(STACK[I]);
+	    TOS_SUBSBASE+RNGFLG; DEG_0;
+	GOTO $AR; END;
+
+! $MEMRY,$DATUM,$SWAP,$GETS,$SUBFLD,$AR,$APPLY,$CPRINT,$PRINT,$NEWREC;
+$MEMRY:	"MEMORY[]" BEGIN
+	    ! THE "ARGUMENTS" (EITHER ONE OR TWO) HAVE BEEN CONVERTED TO INTEGER
+	    BY FUDGING ON THE DEGREE AND CONFOMITY CLASS.  IF THERE IS ONE ARG,
+	    THEN ARG1=-1 AND ARG2=[REFIT FOR ADDRESS].  IF THERE ARE TWO ARGUMENTS,
+	    THEN ARG1=[REFIT FOR ADDRESS] AND ARG2=[REFIT FOR TYPE BITS].  BEFORE
+	    WE FALL THROUGH WE MUST SET DEG_0 AND FIX UP THE STACK;
+
+	    IF ARG1=-1 THEN STACK[TOS_TOS-2]_REFB+INTEGR+
+		(IF (I_RIGHT(MEMORY[ARG2]))<'20 THEN LOCATION(SAVED!ACS[I]) ELSE I)
+	    ELSE STACK[TOS_TOS-3]_REFB+(MEMORY[ARG2] LAND (-1 LSH 23))+
+		(IF (I_RIGHT(MEMORY[ARG1]))<'20 THEN LOCATION(SAVED!ACS[I]) ELSE I);
+	    DEG_0; GOTO $AR END;
+$DATUM:	"DATUM()" START!CODE
+	    EXTERNAL INTEGER DATM,INFTB;
+		MOVE	3,@ARG2;	! ITEM NUMBER;
+		LDB	0,INFTB;	! ITEM TYPE BITS;
+		MOVEI	1,@DATM;	! AC1_ADDR OF DATUM, UNLESS DATUM IS STRING;
+		CAIN	0,0+STRNG LSH -23;! IS DATUM A STRING?;
+		 HRRZ	1,(1);		! YES, FETCH ADDR OF WORD2;
+		MOVEM	1,ARG1;		! LOCATION OF THIS OBJECT;
+		MOVE	2,0;		! COPY;
+		LSH	0,23;		! SHIFT OVER INTO PLACE;
+		CAIL	2,0+ARRY LSH -23;! IS DATUM AN ARRAY?;
+		 TLO	0,'20;		! YES, TURN ON INDIRECT BIT;
+		TLO	0,0+REFB LSH -18;! WE HAVE A REFERENCE, NOT A VALUE;
+		MOVEM	0,RSLTTYP;
+		JRST	$AR;
+		END;
+$SWAP:	BEGIN IF NOT(ARG1 LAND ARG2 LAND REFB) THEN EV1ERR("Invalid assignment");
+	RSLTTYP_ARG1 LAND '777777000000;
+	MEMORY[ARG1] SWAP MEMORY[ARG2]; GOTO $AR END;
+$GETS:	"GETS _" BEGIN
+DEFINE DOINT(OP)=[TEMP_MEMORY[ARG1] OP MEMORY[ARG2]];
+	    IF NOT(ARG1 LAND REFB) THEN EV1ERR("Invalid assignment");
+	    RSLTTYP_ARG1 LAND '777777000000;
+	    IF RSLTTYP=REFB+STRNG THEN START!CODE
+		MOVE	1,ARG2;		! WORD 2 OR SOURCE;
+		MOVE	2,ARG1;		! WORD 2 OF DEST.;
+		MOVE	0,(1);
+		MOVEM	0,(2);
+		MOVE	0,-1(1);
+		MOVEM	0,-1(2);
+		END
+	    ELSE DOINT([_]); GOTO $AR END;
+$sbfld2:begin	! special pntvar[fieldname] hack;
+		! stack: "\", field!name, refitem for pntr, ...;
+	record!pointer (any!class) rpclass;
+	integer subfield;
+	if 0=arg1_memory[arg1] then ev1err("Subfield of null!record");
+	if 0=subfield_ fndsbfld( memory[arg1], memstring(arg2))
+	 then ev1err( "No such subfield for that record" );
+	memloc(rpclass,integer)_right( memory[arg1] );
+	rslttyp_ refb lor $class:typarr[rpclass][abs subfield];
+	arg1_arg1 + abs subfield; if subfield<0 then arg1_memory[arg1];
+	goto $ar;
+	end;
+$SUBFLD:BEGIN
+		! STACK LOOKS LIKE
+		[OP CODE FOR SUBFIELDING]
+		[REFITEM FOR RECORD LPOINTER] (ARG2 HAS ADDR OF RECORD POINTER)
+		[-1]
+		[SUBFIELD ! (NEG. FOR STRINGS)]
+		THE TOP OF OPSTACK IS A REFITEM FOR THE CLASS;
+	    RECORD!POINTER(ANY!CLASS) RPCLASS;
+	    INTEGER CLASS,SUBFIELD;
+	    if tos<3 then ev1err("WETROT:$SUBFLD");
+	    IF MEMORY[ARG2]=0 THEN EV1ERR("Subfield of null record");
+	    MEMLOC(RPCLASS,INTEGER)_CLASS_OPSTACK[TOOPS];
+	    SUBFIELD_STACK[TOS-3];
+	    RSLTTYP_REFB lor $CLASS:TYPARR[RPCLASS][ABS(SUBFIELD)];
+	    IF RIGHT(MEMORY[MEMORY[ARG2]]) NEQ RIGHT(CLASS)
+	     THEN begin		! class mis-match...be careful;
+		memloc(rpclass,integer)_right(memory[memory[arg2]]);
+		if $class:recsiz[rpclass] < abs(subfield)
+		 or (subfield<0 and
+		     gettype($class:typarr[rpclass][abs subfield])
+			neq strng)
+		 then EV1ERR("Class-pointer mismatch")
+		 else outstr(" {faking CLASS} ");
+		end;
+	    ! COMPUTE ADDRESS OF DATA;
+	    ARG1_RIGHT(MEMORY[ARG2])+ABS(SUBFIELD);
+	    IF SUBFIELD<0 THEN ARG1_ RIGHT(MEMORY[ARG1]);
+	    DEG_3; GOTO $AR END;
+
+$PRINT:	BEGIN STACK[TOS_TOS+1]_0;	! Convert to CPRINT(-1, ... );
+	ARRTRAN(TARRAY,STACK); ARRBLT(STACK[1],TARRAY[0],TOS);
+	STACK[0]_INTEGR+LOCATION(-1);	END;
+$CPRINT:BEGIN
+	STACK[0]_CVINTEGR(STACK[0],1);
+	FOR I_1 UPTO TOS-1 DO PREFIT(MEMORY[STACK[0]],STACK[I]);
+	TOS_-1;		! CLEAR STACK;
+	GOTO $AR END;
+
+$NEWREC:BEGIN
+	EXTERNAL INTEGER PROCEDURE $RECFN(INTEGER OP,R); ! Type hacking;
+	IF GETTYPE(TEMP_STACK[TOS-1]) NEQ RCLTYP THEN EV1ERR("Invalid class name");
+	TEMP_$RECFN(1,RIGHT(TEMP)); RSLTTYP_RECTYP END;
+
+
+$AR: $ASSIGNRESULTS:
+	! REMEMBER THE CASE  PROC(I_3)  WHERE I IS A REFERENCE PARAM;
+    IF DEG>0 THEN if tos<deg then ev1err("primitive stack error") else
+		STACK[TOS_TOS-DEG]_RSLTTYP+
+	(IF RSLTTYP LAND REFB THEN RIGHT(ARG1)
+	ELSE (IF RSLTTYP=STRNG THEN NEWSTRTEMP(TEMPSTR)
+		ELSE NEWTEMP(TEMP)));
+
+SSF_FALSE;
+END "PRIMITIVE"
+
+
+ELSE BEGIN "PROC"
+    EXTERNAL PROCEDURE APPLY(REFERENCE STRING TEMPSTR;
+	REFERENCE INTEGER TEMP; INTEGER PDA,ARGLIS);
+    ! SEARCH BACK THROUGH STACK TO MARKER,
+	IN ORDER TO DETERMINE NUMBER OF PARAMS;
+    I_TOS; DO I_I-1 UNTIL STACK[I]=-1;
+    ! CHECK NUMBER OF PARAMETERS. DEFAULTABLE PARAMS HAVE SIGN BIT ON;
+    FOR ARG2_TOS-I UPTO (DEG_N!PARAMS(OP)) DO
+	IF MEMORY[MEMORY[OP+PD!DLW]+ARG2-1]>0 THEN
+	    EV1ERR(MEMSTRING(OP+2)&" takes "&CVS(DEG)&" arguments");
+    ! DO IT;
+    STACK[TOS]_0;
+    PLANT!BREAKS;
+    ! SEARCH FOR CORRECT STATIC LINK;
+    START!CODE	LABEL LUP,FOUND,BAD,OK;
+    DEFINE F=['12],T1=['13],T2=['14],T3=['15];
+	HRRZ	1,OP;		! PROC DESCR ADDR;
+	SETZ	T2,;		! DEFAULT CONTEXT IS NULL;
+	HRRZ	T1,PD!PPD(1);	! PARENT'S PDA;
+	JUMPE	T1,FOUND;	! "PROCEDURE" IS REALLY OUTER BLOCK;
+	HRRZ	T2,PD!PPD(T1);	! GRANDFATHER PDA;
+	JUMPE	T2,FOUND;	! PROC IS AT TOP LEVEL OF SOME OUTER BLOCK;
+	MOVEI	T2,F;		! NOT OUTER, MUST LOOK FOR PARENT;
+    LUP:HRRZ	T2,(T2);	! UP DYNAMIC LINK;
+	JUMPE	T2,BAD;		! F CHAIN RAN OUT;
+	CAIN	T2,-1;
+	 JRST	BAD;
+	HLRZ	T3,1(T2);	! PDA FROM STACK;
+	CAIE	T1,(T3);	! THE ONE WE WANT?;
+	 JRST	LUP;
+    FOUND:HRLI	1,(T2);		! CONTEXT,,PDA;
+	MOVEM	1,ARG2;
+	JRST	OK;
+    BAD:MOVEI	T1,["Proper context does not exist"];
+	PUSH	SP,-1(T1);
+	PUSH	SP,(T1);
+	PUSHJ	P,EV1ERR;
+    OK:	END;
+    APPLY(TEMPSTR,TEMP,ARG2,LOCATION(STACK[I]));
+    ! REMOVE PARAMS FROM TEMPORARY CELLS;
+    FOR DEG_I+1 UPTO TOS-1 DO X1TEMP(STACK[DEG]);
+    ! IF TYPED PROCEDURE, RETURN VALUE;
+    IF (TYP_GETTYPE(OP)) NEQ 0 THEN STACK[TOS_I]_TYP+
+	(IF TYP=STRNG THEN NEWSTRTEMP(TEMPSTR)
+	ELSE NEWTEMP(TEMP))
+    ELSE TOS_I-1;
+END"PROC";
+    
+END "EVAL1";
+
+
+! PARSER;
+PROCEDURE LOPARG; OLDARG_OLDARG & LOP(ARG);
+
+OLDARG_NULL; ARG_ARG&'177;	! PUT ON "END-OF-FILE";
+N!TSTRVAL_N!TEMPVAL_TOS_TOOPS_-1;
+
+WHILE LENGTH(ARG) DO BEGIN "PARSE"
+GET!TOKEN(ARG,STRVAL,CLASS_0,IVAL); OLDARG_OLDARG & " " & STRVAL;
+CASE CLASS OF BEGIN "CASES"
+    [INTVAL] PSH(NEWTEMP(IVAL)+INTEGR);
+    [REALVAL] PSH(NEWTEMP(IVAL)+FLOTNG);
+    [STRCON] PSH(NEWSTRTEMP(STRVAL)+STRNG);
+    [ID] BEGIN "ID"
+	LABEL NOTRW;
+	! CHECK IF THE ID IS EQUIVALENT TO A SPECIAL CHAR;
+	START!CODE LABEL LOOP,INCR,FOUND;	DEFINE A=[1],K0=[2],K1=[3],K2=[4];
+		MOVE	K0,NAME[0];
+		MOVE	K1,NAME[1];
+		MOVE	K2,NAME[2];
+		MOVSI	A,-N!RWORD;
+	LOOP:	CAMN	K0,RWORD0[0](A);
+		CAME	K1,RWORD0[1](A);
+		 JRST	INCR;
+		CAMN	K2,RWORD0[2](A);
+		 JRST	FOUND;
+	INCR:	ADDI	A,2;
+		AOBJN	A,LOOP;
+		JRST	NOTRW;
+	FOUND:	HLRE	A,A;
+		MOVE	A,RWORD1[N!RWORD](A);
+		MOVEM	A,OP;
+		END;
+	STRVAL_OP; CLASS_SPCHAR; GOTO OPCHAR;
+	NOTRW:
+	! CHECK FOR EVAL SPECIALS;
+	IF EQU(STRVAL,"!!GO") THEN GOTO RET
+	ELSE BEGIN
+	    ! SEARCH SYMBOL TABLE;
+	    TLDEPTH_LDEPTH; ARRTRAN(TLSCOPE,LCHAIN);	! FOR TFIND KLUGE;
+	    IF (PNTR_TFIND(STRVAL,FALSE,IVAL))<0
+	    THEN BEGIN MEMLOC(REFIT,ITEMVAR)_CVSI(STRVAL,PNTR);
+		IF PNTR THEN EV1ERR(IF MULDEF THEN "Mul. def. ID" ELSE "Unknown ID");
+		REFIT_ITEMB+RIGHT(REFIT) END
+	    ELSE IF RIGHT(CACHE[PNTR+1]) THEN
+		REFIT_INCOR(PNTR,DCHAIN,DDEPTH,DISPLVL) ELSE
+		EV1ERR("Unallocated variable") END;
+	! CHECK FOR ITEMS;
+	IF (REFIT LAND ITEMB) AND (REFIT LAND ('77 LSH 23))=0 THEN
+	    PSH(REFB+ITEMB + (TYPEIT(MEMLOC(REFIT_RIGHT(REFIT),ITEMVAR)) LSH 23) +
+		NEWTEMP(REFIT))
+	! CHECK FOR PROCEDURE;
+	ELSE IF REFIT LAND PROCB THEN BEGIN "PROCED"
+	    IF RIGHT(REFIT)<'140 THEN EV1ERR("Procedure descriptor missing");
+	    ! MARK STACK FOR CHECKING NUMBER OF PARAMS;
+	    PSH(-1);
+	    IF N!PARAMS(REFIT)>0 AND ARG="(" THEN BEGIN "WITH PARAMS"
+		! REMOVE THE "(" AND PLACE PROCEDURE NAME ON OPSTACK;
+		LOPARG;
+		OPPSH(REFIT,-(RIGHT(MEMORY[REFIT+PD!DLW])));
+		! ALSO STICK IN AN EXTRA COMMA.  THEN THERE WILL BE AS MANY
+		COMMAS AS ARGUMENTS, AND TYPE CHECKING AND COERCION WORKS BETTER;
+		OPPSH(OPCOMMA,RBNDCOMMA);
+		! REMEMBER THAT WE HAVE SEEN A SPECIAL CHARACTER, SO THAT UNARY
+		  MINUS WORKS IN  PROC(-1,-1);
+		CLASS_SPCHAR;
+		END "WITH PARAMS"
+	    ELSE BEGIN PSH(REFIT); EVAL1 END END "PROCED"
+	! CHECK FOR RECORD CLASS NAME;
+	ELSE IF GETTYPE(REFIT)=RCLTYP THEN BEGIN
+	    IF ARG NEQ ":" THEN PSH(REFIT) ! Probably a call to NEW!RECORD;
+	    ELSE BEGIN LOPARG; ! Remove colon;
+		! LOOK FOR SUBFIELD NAME;
+		GET!TOKEN(ARG,STRVAL,CLASS_0,IVAL); OLDARG_OLDARG&STRVAL;
+		IF CLASS NEQ ID OR (0=IVAL_FNDSBFLD(REFIT,STRVAL))
+		    THEN EV1ERR("No such subfield");
+		PSH(IVAL); PSH(REFIT) END END
+	ELSE PSH(REFIT)
+	END "ID";
+
+    [SPCHAR] OPCHAR: BEGIN "SPCHAR"	now!safe ops1;
+	! FIND WHICH OPERATOR IT IS AND ITS LEFT AND RIGHT BINDING POWER;
+	DEFINE	LBND=[(OPS1[OP] LSH -27)],
+		RBND=[(OPS1[OP] LSH -18 LAND '777)];
+
+	OP_STRVAL; IF OP="-" AND NOT BINARYMINUSFLAG THEN OP_'123;
+	IF OPS1[OP]=0 THEN EV1ERR("Invalid operator");
+	! EVALUATE OPERATORS OF HIGHER PRECEDENCE WHICH OCCUR TO THE LEFT;
+	WHILE TOOPS > -1 AND RBIND[TOOPS]>LBND DO BEGIN
+	    PSH(OPSTACK[TOOPS]); EVAL1; TOOPS_TOOPS-1 END;
+	! CHECK FOR  "[" OR ")" OR "]" AND PROCEDURES, ARRAYS, STRINGS;
+	IF OP=")" or op="]" THEN BEGIN "closes"
+	    IF TOOPS<0 THEN EV1ERR("Too many ) or ]");
+	    IF (REFIT_OPSTACK[TOOPS])="(" ! OP OF LEFT PAREN "(";
+		THEN begin
+			if op="]" then outstr("converting ]");
+			TOOPS_TOOPS-1
+		     end
+	    ELSE IF REFIT LAND PROCB THEN BEGIN "PROCS"
+		if op="]" then outstr("converting ]");
+		PSH(REFIT); EVAL1; TOOPS_TOOPS-1 END "PROCS"
+	    else if (t_gettype(refit)) geq arry or
+		t=strng or t=lstype or t=rcltyp
+		then begin
+			if op = ")" then outstr("converting )");
+			psh(if refit=refmemory then opmemory
+			    else if t geq arry then oparry
+			    else if t=strng or t=lstype then opsubst
+			    else opsubfld);
+		EVAL1; TOOPS_TOOPS-1;
+		END
+	    else ev1err("unmatched " & op)
+	    END "closes"
+	ELSE IF OP="[" THEN BEGIN
+	    IF tos geq 0 and ((T_GETTYPE((REFIT_STACK[TOS]))) GEQ ARRY
+		 OR T=STRNG OR T=RCLTYP OR T=LSTYPE)
+		 THEN BEGIN OPPSH(REFIT,0); STACK[TOS]_-1 END
+	    ELSE if tos geq 0 and t=rectyp ! for pntvar[subfield-name];
+		 then begin
+			get!token(arg,strval,class_0,ival);
+			oldarg_oldarg&strval;
+			if class neq id or (")" neq arg neq "]")
+				! PNTVAR [ STRVAL    here;
+			 then ev1err("Invalid syntax");
+			psh(newstrtemp(strval)+strng);	! field name;
+			loparg; psh("\"); eval1;	! sbfld2 code;
+		end
+	    ELSE begin outstr("converting [");
+			strval_"("; goto opchar;  end;
+	    END
+	ELSE IF OP=";" THEN BEGIN PSH(OP); EVAL1 END
+	ELSE IF OP="{" THEN BEGIN
+	    IF ARG="{" THEN LOPARG;
+	    OPPSH("{",0); PSH(-1) END
+	ELSE IF OP=CH!SETC THEN BEGIN
+	    IF ARG=CH!SETC THEN BEGIN OP_OPLSTC; LOPARG END;
+	    IF TOOPS<0 OR OPSTACK[TOOPS] NEQ "{" THEN EV1ERR("Bad set or list");
+	    PSH(OP); EVAL1; TOOPS_TOOPS-1 END
+	ELSE OPPSH(OP,RBND)
+	END "SPCHAR"
+END "CASES";
+BINARYMINUSFLAG_IF CLASS NEQ SPCHAR OR OP=")" OR OP="]" THEN TRUE
+    ELSE FALSE
+END "PARSE";
+RETURN(STACK[0])
+END "EVAL";
+
+! SETSCOPE !!STEP !!GSTEP !!GOTO CLNRET !!UP Q!BRECOV P!BRECOV;
+
+INTEGER NXTINSTR,PCSHADOW;
+
+INTERNAL PROCEDURE SETSCOPE(ITEMVAR PROCITM); BEGIN "SETSCOPE"
+DEFINE PCW=['23],ACF=['15],ACP=['22],STATUS=['30];
+INTEGER PB;
+IF TYPEIT(PROCITM) NEQ '11 THEN EV1ERR("Not a process item");
+START!CODE EXTERNAL INTEGER DATM;
+	MOVE	3,PROCITM;	! PB_DATUM(PROCITM);
+	MOVE	5,@DATM;	! PROCITM must be untyped to work at runtime;
+	MOVEM	5,PB;		! but compiler gives message UNTYPED ITEMVAR;
+END;
+IF (PB LAND '1000000) OR MEMORY[PB+STATUS]=2 THEN
+    EV1ERR("Terminated");
+GETLSCOPE(LCHAIN,LDEPTH,MEMORY[PB+PCW]);
+GETDSCOPE(MEMORY[PB+ACF],MEMORY[PB+ACP],MEMORY[PB+PCW],DDEPTH,DCHAIN);
+END "SETSCOPE";
+
+INTERNAL PROCEDURE !!STEP; BEGIN STEPIT(PC,STEPINSTR,STEPMASK);
+    GOTO RET END;
+
+INTERNAL PROCEDURE !!GSTEP; BEGIN STEPIT(PC,GSTEPINSTR,GSTEPMASK);
+    GOTO RET END;
+
+INTERNAL PROCEDURE !!GOTO(STRING WHERE); BEGIN
+    PC_LOC!PC(WHERE); FLAGS_FLAGS LOR ('20 LSH 18); ! JRST MODE; GOTO RET END;
+
+PROCEDURE Q!BRECOV; GOTO BRECOV;
+
+SIMPLE PROCEDURE CLNRET; BEGIN "CLNRET"
+PLANT!BREAKS;
+IF CURBRK=N!BK AND NOT(FLAGS LAND '20)
+    THEN NXTINSTR_MEMORY[PC_PC+1];	! EXPLICIT USER CALL;
+ARRTRAN(TEMP!ACS,SAVED!ACS);	! RESTORE ACS;
+START!CODE LABEL LUP1,SIM1,SIMI2,SIM2,SIMDON;
+DEFINE T1=['13],T2=['14],T3=['15];
+	SOS	BKLEV;
+	MOVE	T1,PCSHADOW;
+	MOVEM	T1,-1(F);	! CORRECT THE FAKE RETURN ADDR;
+	MOVS	T1,FLAGS;
+	TLZ	T1,'37;
+	HRRI	T1,TRAP[1];
+	MOVEM	T1,TRAP[0];	! JRSTF @[FLAGS,,TRAP[1]] RESUMES;
+	HRRZ	T2,PC;
+	TLO	T2,'254000;	! JRST;
+	MOVSI	T3,-6;
+LUP1:	MOVEM	T2,TRAP[1](T3);	! JRST PC+i IN TRAP[i+1];
+	ADDI	T2,1;
+	AOBJN	T3,LUP1;
+	HRRI	T1,-5(T2);	! FLAGS,,PC+1;
+	MOVEM	T1,TRAP[7];	! RETURN WORD TO BE PUSHED;
+	MOVE	T2,NXTINSTR;
+	MOVEM	T2,TRAP[1];	! DONE FOR USUSAL CASE, NOW CHECK SUBROUTINE CALLS;
+	MOVE	T3,T2;		! COPY OF NEXT INSTR;
+
+	LDB	T1,[('331100 LSH 18)+T2];	! 9 BIT OPCODE;
+	CAIE	T1,'260;	! PUSHJ;
+	 JRST	SIM1;
+	TLZ	T3,'000037;	! CLEAR INDEX AND INDIR;
+	TLO	T3,'261000;	! TURN INTO PUSH;
+	HRRI	T3,TRAP[7];
+	MOVEM	T3,TRAP[1];	! FIRST HALF: PUSH RETURN WORD;
+	TLZ	T2,'777740;	! LEAVE INDEX AND INDIR;
+	TLO	T2,'254000;	! TURN INTO JRST;
+	MOVEM	T2,TRAP[2];	! SECOND HALF: JUMP TO DESTINATION;
+SIM1:	CAIE	T1,'264;	! JSR;
+	 JRST	SIM2;
+	TLZ	T2,'777740;	! LEAVE ONLY INDIRECT AND INDEX;
+	TLO	T2,'202040;	! MOVEM 1,;
+	MOVEM	T2,TRAP[1];	! SAVE AC1 IN JSR DESTINATION;
+	MOVE	T3,SIMI2;
+	MOVEM	T3,TRAP[2];	! GET ACTUAL RETURN WORD IN AC1;
+	TLC	T2,'052000;	! TURN MOVEM INTO EXCH;
+	MOVEM	T2,TRAP[3];	! PLANT RETURN WORD, RETRIEVE AC1;
+	TLO	T2,'254000;	! TURN EXCH INTO JRST;
+	HRRI	T2,1(T2);	! AND INCREMENT ADDR;
+	MOVEM	T2,TRAP[4];
+SIMI2:	MOVE	1,TRAP[7];	! A LITERAL;
+SIM2:	CAIE	T1,'265;	! JSP;
+	 JRST	SIMDON;
+	TLZ	T3,'777037;	! LEAVE ONLY AC;
+	TLO	T3,'200000;	! MOVE;
+	HRRI	T3,TRAP[7];
+	MOVEM	T3,TRAP[1];	! PLACE RETURN WORD IN AC;
+	TLZ	T2,'777740;	! LEAVE INDEX AND INDIR;
+	TLO	T2,'254000;	! JRST;
+	MOVEM	T2,TRAP[2];
+SIMDON:	END;
+END "CLNRET";
+CLEANUP CLNRET;
+
+
+INTERNAL PROCEDURE !!UP(INTEGER LEVEL); BEGIN "!!UP"
+! PEEL BACK TO LEVEL (CF SETLEX);
+OWN INTEGER BACKF,PC;
+LEVEL_0 MAX LEVEL MIN DDEPTH;	! Clip bounds;
+WHILE (BACKF_DCHAIN[LEVEL,0])<0 DO LEVEL_LEVEL+1;	! AVOID GOING TO SIMPLE LEVEL;
+PC_DCHAIN[LEVEL,1]+1;
+START!CODE DEFINE LPSA=['13];
+LABEL LUP,DUN,DUN1; EXTERNAL INTEGER STKUWD;
+LUP:	HRRZ	LPSA,BACKF;	! DESIRED DESTINATION;
+	CAIN	LPSA,(F);	! VS. CURRENT;
+	 JRST	DUN;
+	HRRZ	LPSA,(F);	! UP DYNAMIC LINK;
+	HLRO	LPSA,1(LPSA);	! LEVEL 777777,,PDA -- THUS NO DEALLOCATION AT DEST;
+	HRLM	F,BACKF;	! REMEMBER F BEFORE STKUWD;
+	PUSHJ	P,STKUWD;	! ATTEMPT IT;
+	HLRZ	LPSA,BACKF;	! OLD F;
+	CAIE	LPSA,(F);	! VS. CURRENT;
+	 JRST	LUP;		! MADE IT;
+	HRRZ	LPSA,(F);	! DIDN'T MAKE IT, MUST FORCE IT;
+	HLRZ	LPSA,1(LPSA);	! LEVEL 0,,PDA -- THUS EVERYTHING DEALLOCATED;
+	PUSHJ	P,STKUWD;	! DEALLOCATE;
+	HRRZ	F,(F);		! FORCE BACK;
+	JRST	LUP;
+DUN:				! RESTORE ACS IF F REGISTER MATCHES;
+	HRRZ	LPSA,TEMP!ACS[F];
+	CAIE	LPSA,(F);
+	 JRST	DUN1;		! DON'T KNOW WHAT'S GOING ON HERE;
+	MOVSI	'17,TEMP!ACS[0];
+	BLT	'17,'17;
+DUN1:	PUSH	P,PC;
+	JRST	BAIL;
+	END;
+END "!!UP";
+
+
+SIMPLE INTEGER PROCEDURE P!BRECOV(INTEGER LOC; STRING MSG,RSP); BEGIN
+LABEL PRUNE;
+!ERRJ!_LOCATION(PRUNE); RETURN("C"+(2 LSH 18)); ! CONTINUE, INHIBIT Called from;
+PRUNE: !ERRP! SWAP !RECOVERY!;
+START!CODE LABEL LUP; DEFINE T2=['14],T1=['13],T3=['15];
+	MOVEI	T2,Q!BRECOV;		! ENTRY ADDR;
+	PUSH	P,T2;
+	PUSHJ	P,PDFIND;		! AC1_PDA;
+	HRRZ	T3,PD!PPD(1);		! PARENT'S PDA;
+	MOVEI	T2,(F);
+LUP:	HRRZ	T2,(T2);		! UP DYNAMIC LINK;
+	HLRZ	T1,1(T2);		! PDA FROM STACK;
+	CAIE	T1,(T3);
+	 JRST	LUP;
+	PUSH	P,F;			! NEW DYNAMIC LINK;
+	HRLI	T2,(1);
+	PUSH	P,T2;			! PDA,,STATIC LINK;
+	PUSH	P,SP;
+	HLRZ	T2,PD!PPD(1);
+	JRST	(T2);			! PCNT AT MKSEMT;
+	END;
+END;
+
+
+ARRTRAN(SAVED!ACS,TEMP!ACS);	! RECURSIVE SAVE;
+! There are three modes of calling: explicit user call via PUSHJ P,BAIL,
+  call from a BAIL-planted breakpoint via PUSHJ P,BAIL with a displaced
+  instruction, and "JRST MODE" in which a fake return word is put on the
+  stack and then JRST BAIL.  In the case of JRST, the '20 bit is on
+  (otherwise illegal as a flag bit);
+IF (FLAGS_LEFT(TRAP[0])) LAND '20
+THEN BEGIN PC_RIGHT(TRAP[0]); CURBRK_N!BK END
+ELSE BEGIN
+    PC_RIGHT(TRAP[0])-1;
+    NOHAND([
+    CURBRK_-1; WHILE (CURBRK_CURBRK+1)<N!BK AND RIGHT(BK!LOC[CURBRK])
+	NEQ PC DO;
+    ]) ! NOHAND;
+    HAND([
+    START!CODE LABEL LOOP;
+    DEFINE KEY=[0],I=['14];
+	MOVSI	I,-N!BK;
+    LOOP:HRRZ	KEY,BK!LOC[0](I);
+	CAME	KEY,PC;
+	AOBJN	I,LOOP;
+	HRRZM	I,CURBRK;
+    END;]) ! HAND;
+END;
+START!CODE DEFINE T=['14];
+	AOS	BKLEV;		! RECURSION LEVEL;
+	MOVE	T,PC;		! Make it look like BAILOR was called from;
+	MOVEI	T,1(T);		!  PC  rather than BAIL+16, but remember return;
+	HLL	T,-1(F);	! word so that CLNRET can put it back together;
+	EXCH	T,-1(F);
+	MOVEM	T,PCSHADOW;
+END;
+CLRTBK(PC);	! CLEAR TEMPORARY BREAKPOINTS;
+UNPLANT!BREAKS;
+NXTINSTR_MEMORY[PC];
+
+DISPLVL_0;
+!RECOVERY!_LOCATION(P!BRECOV);	! GOTO BRECOV IF BAIL ERRORS OCCUR;
+GETLSCOPE(LCHAIN,LDEPTH,PC);
+IF (CURBRK=N!BK) THEN 	! EXPLICIT USER CALL;
+    GETDSCOPE(SAVED!ACS[F],SAVED!ACS[P],PC,DDEPTH,DCHAIN)
+ELSE BEGIN	! BAIL-PLANTED BREAKPOINT;
+    IF LEFT(NXTINSTR)='551517 THEN
+	! '551517 IS THE LEFT HALF OF  HRRZI F,(P).  IF THE BROKEN INSTR
+	  IS THIS, ASSUME THAT WE HAVE BROKEN A NON-SIMPLE PROCEDURE AND THAT
+	  THE INSTR IS THE ONE THAT SETS THE F REGISTER.  IN ORDER TO MAKE
+	  PARAMETER ACCESSING CONSISTENT WITH BREAKS INSIDE THE PROCEDURE,
+	  SET UP SAVED!ACS AS IF THE HRRZI HAD BEEN EXECUTED;
+	SAVED!ACS[F]_RIGHT(SAVED!ACS[P])+
+	    (RIGHT(NXTINSTR) LSH 18 ASH -18);
+    GETDSCOPE(SAVED!ACS[F],SAVED!ACS[P],PC,DDEPTH,DCHAIN);
+    IF LENGTH(BK!COND[CURBRK]) AND MEMORY[EVAL(BK!COND[CURBRK])]
+	AND (BK!COUNT[CURBRK]_BK!COUNT[CURBRK]-1)<0 AND
+	LENGTH(BK!ACT[CURBRK]) THEN EVAL(BK!ACT[CURBRK]) END;
+
+! TELL USER HOW HE GOT HERE, BUT KEEP QUIET IF USER STUFFED REQUEST INTO !!QUERY;
+IF NOT(LENGTH(!!QUERY)) THEN
+OUTSTR(CRLFCAT(
+    (IF CURBRK=N!BK OR NOT LENGTH(BK!NAME[CURBRK]) THEN GETTEXT(PC)
+    ELSE BK!NAME[CURBRK])	));
+
+BRECOV:
+WHILE TRUE DO BEGIN
+    IF NOT(LENGTH(!!QUERY)) THEN OUTSTR(CRLFCAT(CVS(BKLEV)&":"));
+    EVAL(LINED) END;
+
+"BREAK RETURN"
+RET:	! ALL THE WORK IS DONE IN THE CLEANUP;
+
+RETURN
+END "BAILOR";
+
+
+! BAIL,UBINIT,DDBAIL,B!;
+SIMPLE INTERNAL PROCEDURE BAIL; START!CODE "BAIL"
+DEFINE TEMP=['14],USER=['15],F=['12];
+	POP	P,TRAP[0];
+	MOVEM	'17,TEMP!ACS['17];
+	MOVEI	'17,TEMP!ACS[0];
+	BLT	'17,TEMP!ACS['16];
+	MOVE	'17,TEMP!ACS['17];
+	MOVE	USER,GOGTAB;	! DAMN RUNTIMES AREN'T REENTRANT, MUST SAVE THEIR;
+	HRRI	TEMP,TEMP!ACS['20];	! SAVED ACS;
+	HRLI	TEMP,RACS(USER);
+	BLT	TEMP,TEMP!ACS['20+F];
+	MOVE	TEMP,UUO1(USER);	! AND THIS FUNNY RETURN LOCATION;
+	MOVEM	TEMP,TEMP!ACS['20+F+1];
+	SKIPL	BAILOC(USER);	! SIGN BIT SET IFF INITIALIZED;
+	 PUSHJ	P,STBAIL;
+	SKIPE	BALNK;		! IN CASE BAIL LOADED BUT NO /B COMPILATIONS;
+	 PUSHJ	P,BAILOR;
+	MOVE	USER,GOGTAB;
+	MOVE	TEMP,TEMP!ACS['20+F+1];
+	MOVEM	TEMP,UUO1(USER);
+	HRRI	TEMP,RACS(USER);
+	HRLI	TEMP,TEMP!ACS['20];
+	BLT	TEMP,RACS+F(USER);
+	HRLZI	'17,TEMP!ACS[0];
+	BLT	'17,'17;
+	JRSTF	@TRAP[0];
+END "BAIL";
+
+
+	
+SIMPLE INTERNAL PROCEDURE DDBAIL; START!CODE
+! Break the next location to be executed, except try to diagnose procedure
+  returns which rely on positive stack displacements.  Use a "JRST MODE" break
+  to avoid problems in case the location is in an upper segment.
+
+  For TENEX, this procedure is entered only via ctrl-B pseudo interrupt, since
+  TENEX always manages to find DDT somehow.  For non-TENEX, you get here
+  when BAIL is your DDT and you say "DDT" to the monitor or "D" to the SAIL
+  error handler.  The assumption is that !JBOPC contains the PC.  Thus you
+  should not say "D" to the SAIL error handler, because the PC will be lost.;
+
+LABEL BOT,LOOP,BOT1,BOT2,SIMSTK,STKCHK,SIMXCT;
+NOTENX([
+	MOVEM	1,TEMP!ACS[1];
+	MOVEM	2,TEMP!ACS[2];
+	MOVE	2,!JBOPC;
+]) ! NOTENX;
+TENX([		EXTERNAL INTEGER PS3ACS;	! ACS AT INTERRUPT;
+	MOVEI	1,'400000;	! CURRENT FORK;
+	RIR;			! READ INTERRUPT REGISTER?;
+	MOVSS	2;		! CHNTAB,,LEVTAB;
+	MOVE	2,@2(2);	! PC FOR LEVEL 2;
+	MOVEI	1,PS3ACS;	! GET REAL P AND SP FOR A WHILE;
+	EXCH	P,P(1);
+	EXCH	SP,SP(1);
+]) ! TENX;
+		! IF LAST INSTR EXECUTED KILLED THE STACK,
+		  THEN MUST ALLOW THE STACK KILL TO FINISH, SINCE
+		  4 INSTR COULD BE INVOLVED (MOVE F,(F)	  SUB SP,[m,,m]
+		  SUB P,[n,,n]	JRST @k(P)	) AND WE DONT WANT
+		  TO BE IN THE MIDDLE;
+STKCHK:	HLRZ	1,-1(2);	! OPCODE HALF OF LAST INSTR;
+	CAIE	1,'274740;	! SUB P,;
+	CAIN	1,'274700;	! SUB SP,;
+	 JRST	SIMSTK;		! BLETCH, STACK HAS BEEN WIPED;
+	CAIE	1,'105740;	! ADJSP P,;
+	CAIN	1,'105700;	! ADJSP SP,;
+	 JRST	SIMSTK;		! BLETCH, STACK HAS BEEN WIPED;
+	CAIE	1,'200512;	! MOVE F,(F);
+	 JRST	BOT;		! WAS OK, NO WORRY;
+SIMSTK:	HLRZ	1,(2);		! GET OPCODE HALF OF NEXT INSTR;
+	CAIE	1,'105740;	! ADJSP P,;
+	CAIN	1,'105700;	! ADJSP SP,;
+	 JRST	SIMXCT;
+	CAIE	1,'274740;	! SUB P,;
+	CAIN	1,'274700;	! SUB SP,;
+	 SKIPA;			! MUST SIMULATE THIS ONE;
+	JRST	BOT1;		! DONE INTERPRETING;
+SIMXCT:	XCT	(2);		! DO THE SUBTRACT;
+	AOJA	2,SIMSTK;	! KEEP ON SIMULATING UNTIL NO MORE BAD ONES;
+BOT1:	CAIE	1,'263740;	! POPJ P,;
+	 JRST	BOT2;
+	HRR	2,(P);		! MUST SIMULATE THIS ONE, TOO;
+	SUB	P,['1000001];
+BOT2:	CAIN	1,'254037;	! JRST @(P);
+	 HRRI	2,@(2);		! AND THIS ONE;
+	MOVEM	2,!JBOPC;	! LEAVE GOOD TRACKS;
+BOT:	TLO	2,'20;		! JRST MODE;
+	PUSH	P,2;		! CREATED RETURN WORD;
+NOTENX([MOVE	1,TEMP!ACS[1];
+	MOVE	2,TEMP!ACS[2];
+	JRST	BAIL;
+]) ! NOTENX;
+TENX([	MOVEI	1,'400000;	! ALL THIS BALONEY AGAIN;
+	RIR;
+	MOVS	1,2;
+	MOVE	2,!JBOPC;
+	HRRI	2,BAIL;		! THIS IS HOW WE GET INTO BAIL;
+	MOVEM	2,@2(1);
+	MOVEI	1,PS3ACS;
+	EXCH	P,P(1);		! RESTORE ACS;
+	EXCH	SP,SP(1);
+]) ! TENX;
+	END;
+
+FORWARD INTERNAL SIMPLE PROCEDURE B!;
+
+SIMPLE PROCEDURE UBINIT; BEGIN ! TRY TO LIVE WITH RESETS AND SAVED CORE IMAGES;
+GOGTAB[BAILOC]_LOCATION(BAIL);	! INFORM ERROR HANDLER WE ARE HERE;
+C!NAME_C!BLKADR_C!CRDIDX_0;	BAIJFN_TMPJFN_-1;
+NOTENX([			! SET !JBDDT IF NOT ALREADY SET;
+	DEFINE SETDDT=['047000000002];
+    START!CODE
+	MOVEI	1,DDBAIL;
+	SKIPN	!JBDDT;
+	 SETZM	!JBSYM;		! WE REALLY DONT HAVE SYMBOLS;
+	SKIPE	2,!JBDDT;
+	CAIN	2,B!;		! IF (.JBDDT)=B., THEN RESET IT ANYWAY;
+	 SETDDT	1,0;
+	END;
+]) ! NOTENX;
+TENX([
+	PSIMAP(34,DDBAIL,0,3);	! USE CHANNEL 34, GOTO DDBAIL, , LEVEL 3;
+	ENABLE(34); ATI(34,"B"-'100);	! <ctrl>B !!!!!!!!;
+]) ! TENX;
+END;
+REQUIRE UBINIT INITIALIZATION [0];
+
+INTERNAL SIMPLE PROCEDURE B!;
+BEGIN
+COMMENT
+	The location B! (B. in DDT or RAID) is meant to be
+a universal entry to BAIL from DDT.  By typing B.$G, we get
+to BAIL.  Upon exit from BAIL, we return to DDT.
+	The main problem is that if the core image is
+not initialized by the SAILOR call, then we must initialize it.
+
+Non-TENEX sites: When loaded, .JBDDT (location '74) will be set to LOCATION(B.)
+by some external means.  This is so that GET followed by DD works.  Attempt to
+!!GO from this first entry will start the program.
+;
+INTEGER SAVE13,OJOBSA;
+EXTERNAL INTEGER JOBSA,SAILOR;
+LABEL DOINIT,GO,B!DDT;
+DEFINE !  = [COMMENT];
+DEFINE P=['17],SP=['16],RF=['12];
+    START!CODE
+	MOVEM '13,SAVE13;
+	MOVE '13,JOBSA;
+	MOVEM '13,OJOBSA;	! SAVE IT;
+	MOVS '13,('13);		! GET THE CONTENTS OF THE STARTING
+				ADDRESS;
+	SKIPE SAILOR;		! ANOTHER CONDITION WHICH FORCES INITIALIZATION;
+	CAIN '13,'334000;	! IS IT THE ORIGINAL STARTING ADDRESS?;
+	  JRST DOINIT;		! GO THRU SAIL INITIALIZATION;
+GO:	MOVE '13,SAVE13;
+	ADD P,['12000012];	! ADD A FEW LOCATIONS TO THE P STACK;
+	PUSHJ P,BAIL;		! CALL BAIL;
+	SUB P,['12000012];	
+B!DDT:
+	HRRZ	'13,!JBDDT;
+	SKIPE	'13;		! IF !JBDDT=0 THEN WE ARE AT FUNNY TENEX;
+	CAIN	'13,B!;		! IF !JBDDT=B. THEN USER TYPED  GET  THEN  DDT;
+	HRRZ	'13,JOBSA;	! IN EITHER CASE, START PROGRAM;
+	JRST	('13);
+
+DOINIT:	JSR SAILOR;		! INITIALIZE;
+	HRLOI 	RF,1;		! SET UP RF;
+	PUSH	P,RF;
+	HRRZ	'13,OJOBSA;	! OLD STARTING ADDRESS;
+	PUSH	P,@4('13);	! PDA,,0 FOR OUTER BLOCK;
+	PUSH	P,SP;
+	HRRI	RF,-2(P);
+	HRRZ 	'13,OJOBSA;	! GET THE OLD STARTING ADDRESS;
+	ADDI 	'13,3;		! ADD 3;
+	HRLI 	'13,'310000;	! PUT A "CAM" ON THE LEFT ;
+	MOVEM 	'13,SAILOR;	! CONVINCE IT THAT THIS IS 
+				THE USER'S STARTING ADDRESS;
+	MOVE 	'13,SAVE13;	! GET BACK 13;
+	PUSHJ	P,BAIL;					! CALL SDDT;
+	SUB	P,['3000003];	! ADJUST P STACK, FOR PUSHING DONE ABOVE;
+	JRST	B!DDT;		! RETURN TO DDT (PRESUMABLY);
+END;  ! OF START!CODE;
+END;
+
+NOTENX([
+PROCEDURE DDT; START!CODE LABEL DUMB,DONE;
+DEC([	LABEL	FNDDDT;	])
+STANFO([ LABEL	PRAID;	])
+EXTERNAL INTEGER OUTSTR;
+DEC([
+	HRRZ	1,!JBCST;	! "SDDT" PUTS DDT START ADDR HERE;
+	JUMPN	1,FNDDDT;
+]) ! DEC;
+	HRRZ	1,!JBDDT;	! PICK UP ADDRESS;
+	CAIN	1,DDBAIL;
+	 JRST	DUMB;
+DEC([
+FNDDDT:
+	PUSH	SP,[29];
+	PUSH	SP,["
+DDT  (POPJ 17,$X to return)"];
+	PUSHJ	P,OUTSTR;
+]) ! DEC;
+STANFO([
+	MOVEI	2,["
+DDT  (P or POPJ 17,$X to return)"];
+	PUSH	SP,-1(2);
+	PUSH	SP,(2);
+	PUSHJ	P,OUTSTR;
+	MOVE	2,-1('12);	! RETURN WD FOR THIS PROCEDURE, FLAGS IN LH;
+	HRRI	2,PRAID;	! FAKE RETURN ADDR;
+	MOVEM	2,!JBOPC;	! SO <CTRL>P WORKS FROM RAID;
+]) ! STANFO;
+	PUSHJ	P,(1);
+	JRST	DONE;
+STANFO([
+PRAID:	POPJ	P,;		! A "LITERAL";
+]) ! STANFO;
+DUMB:	PUSH	SP,[18];
+	PUSH	SP,["
+BAIL is your DDT"];
+	PUSHJ	P,OUTSTR;
+DONE:	END;
+]) ! NOTENX;
+
+TENX([
+PROCEDURE DDT;
+COMMENT
+	Call from SAIL to go to DDT on a TENEX system.
+Tries several ways.;
+BEGIN
+EXTERNAL INTEGER JOBDDT,JOBSYM;
+DEFINE	DDTORG=['770000],
+	DDTPAGE=['770];
+
+SIMPLE PROCEDURE GO1(INTEGER ADDR);
+BEGIN
+OUTSTR("
+DDT  POPJ 17,$x to return
+");
+START!CODE PUSHJ P,@ADDR; END;
+END;
+
+
+SIMPLE BOOLEAN PROCEDURE PAGE!EXISTS(INTEGER PAGE);
+START!CODE
+	MOVE	1,PAGE;
+	HRLI	1,'400000;
+	RPACS;
+	TLNE	2,'010000;
+	  SKIPA	1,[-1];
+	SETZ	1,;
+END;
+	  
+
+IF JOBDDT AND RIGHT(JOBDDT) NEQ LOCATION(DDBAIL)
+THEN GO1(JOBDDT LAND '777777)
+ELSE
+   BEGIN
+	IF PAGE!EXISTS(DDTPAGE) AND MEMORY[DDTORG]='254000000000+DDTORG+2 THEN
+	GO1(DDTORG+2) ELSE
+	    BEGIN
+		INTEGER JFN;
+		JFN _ GTJFN("<SAIL>UDDT.SAV",'100000000000);
+		IF JFN=-1 THEN JFN _ GTJFN("<SUBSYS>UDDT.SAV",'100000000000);
+		IF JFN=-1 THEN NONFATAL("CANNOT GO TO DDT") ELSE
+		    BEGIN
+			START!CODE
+				PUSH	P,JFN;
+				PUSHJ	P,CVJFN;
+				HRLI	1,'400000;
+				GET;
+			END;
+			COMMENT MOVE UP SYMBOL TABLE POINTER;
+			MEMORY[MEMORY[DDTORG+1]]_JOBSYM;
+			GO1(DDTORG+2);
+		   END;
+	    END;
+    END;
+END;
+
+
+END;
+]) ! TENX;
+
+
+
+END "BILGE"
+
+  ?W
