@@ -1,0 +1,938 @@
+Entry;
+begin "DED - File I/O"
+  require "DED.DEF" source!file;
+!! title Tops-20 File I/O Module ;
+
+ifcr TymcomX thenc
+  require "!!! This is the Tops-20 File I/O module !!!" message;
+  TryAgainWithTheTymcomXVersion
+endc
+
+
+! *************************************************************************
+*									  *
+*	 This module handles all disk I/O, and isolates all system	  *
+*      dependent file system calls into one file.  The RPG interface	  *
+*			     also lives here.				  *
+*									  *
+*		     Dave W. Smith,  October '81 - ...			  *
+*									  *
+**************************************************************************;
+
+
+!            Entry points in other modules that we reference.
+;
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                      From the SAIL runtime system
+;
+
+  external integer
+    !skip!,                             ! Indicates an error occurred in
+                                        ! some quadrant of the Runtimes.
+                                        ;
+    RPGSW,              		! True iff called w/ offset
+                                        ;
+    C!Debug;                            ! True if we are doing run-time
+                                        ! debugging and performance
+                                        ! monitoring.
+                                        ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                         From the Utility Module
+;
+
+  external simple procedure
+    DoErStr;                            ! Print out the message of the
+                                        ! last error to occur.
+                                        ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                         From the Buffer Module.
+;
+
+  external integer
+    B!Size,                             ! Total number of characters in
+                                        ! the buffer.
+                                        ;
+    B!MaxPgIdx;                         ! Index of the last page of the
+                                        ! Checkpoint file.
+                                        ;
+
+  external string
+    B!File;				! Name of the Text file being
+                                        ! edited. 
+                                        ;
+
+  external simple boolean procedure
+    B!CreateChkPntFile
+        (string TName, TAlias(null); 
+        integer TPage(0), TLine(0),
+        TChar(0));                      ! Create a new checkpoint file
+                                        ! and fill it with the named
+                                        ! Text file.
+                                        ;
+  external simple boolean procedure
+    B!WriteTextFile (string FName);     ! Write the Checkpoint file to
+                                        ! the named Text file.
+                                        ;
+  external procedure
+    B!SetP (integer Position);          ! Set the point.
+                                        ;
+  external procedure
+    B!Insert (integer C);		! Insert a character.
+                                        ;
+
+  external procedure
+    B!Delete (integer Dir);		! Delete a chracter.
+                                        ;
+
+  external integer procedure
+    B!GetP;			        ! Get the point.
+                                        ;
+
+  external simple integer procedure
+    B!GetC;			        ! Get char at point.
+                                        ;
+
+  external simple procedure
+    B!Move (integer Dir);		! Move the point.
+                                        ;
+
+
+  external boolean
+    B!BegP,                             ! The Point is at the beginning
+                                        ! of the Buffer.
+                                        ;
+    B!EndP,			        ! The Point is at the end of the
+                                        ! Buffer.
+                                        ;
+    B!ModP;				! The Buffer is modified.
+                                        ;
+
+  external integer
+    B!Prot,				! Buffer protection.
+                                        ;
+    B!Lock;                             ! The current Buffer lock
+                                        ! condition.
+                                        ;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                         From the Window Module
+;
+
+
+  external procedure
+    W!Disp (boolean PuntIfKeyHit);
+
+  external procedure
+    W!Msg (string S);
+
+  external boolean
+    W!MsgF;
+
+  external procedure
+    W!NewS;			        ! Create new status line.
+                                        ;
+
+  external procedure
+    W!FixS;
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                         From the Command Module
+;
+
+
+  external boolean
+    G!RNulls,                           ! Remove nulls from the Text file
+                                        ! automatcially if true.
+                                        ;
+    G!ShowGens;                         ! Show Generation numbers in file
+                                        ! names.
+                                        ;
+
+  external boolean procedure
+    C!Ask (string Question);
+
+  external safe integer array
+    C!Tab['0:'177];
+
+
+! - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - ;
+
+!                        From the Redisplay Module
+; 
+
+  external procedure
+    T!Bell;
+
+  external procedure
+    T!Fini;
+
+  external procedure
+    T!RSet;
+
+
+! ------------------------------------------------------------------------;
+!! title Internal Storage ;
+!                    Storage internal to this module.
+;
+
+  internal integer
+    F!Chars;		                ! Chars yet to be read from file.
+                                        ;
+
+  own integer
+    F!Chan,			        ! Channel of current file.
+                                        ;
+    F!EOF,			        ! True iff eof reached.
+                                        ;
+    F!EOFSeen,
+    F!InputCount,
+    F!OutputCount,
+    F!Prot;			        ! File protection.
+                                        ;
+
+
+!                       Stuff scanned from a filename
+;
+
+  internal boolean
+    F!RpgFlag;          		! true iff to exit to RPG.
+                                        ;
+  own boolean
+    F!Lock;     			! true iff /read.
+                                        ;
+  own integer
+    F!Page,
+    F!Line,
+    F!Char;                     	! where to start.
+                                        ;
+  own string
+    F!ReScanLine,                       ! Contents of the legendary
+                                        ! rescan buffer.
+                                        ;
+    F!Name,     			! file name.
+                                        ;
+    F!Alias,    			! r e g n a d   k c i n.
+                                        ;
+    F!String;                           ! String for holding a filespec.
+                                        ;
+!! title Rtn MakeFName ;
+! Return a filename compiled of the parts supplied.
+;
+
+simple string procedure MakeFName (string Dev, Usr, Nam, Ext, Gen);
+begin "MakeFName"
+  string
+    Str;
+
+  Str _ null;
+
+  if (length(Dev)) then
+    appnd(Str, Dev & ":");
+
+  if (length(Usr)) then
+    appnd(Str, "<" & Usr & ">");
+
+  appnd(Str, Nam);
+
+  if (length(Ext) or (length(Gen) and G!ShowGens)) then
+    appnd(Str, ("." & Ext));
+
+  if (G!ShowGens) then
+    appnd(Str, ("." & Gen));
+
+  return(Str);
+end "MakeFName";
+!! title Rtn F!Exit ;
+! Do system dependent termination stuff.
+;
+! <<  In Tymcom-X, this did a run of (Sys)Rpg in order to facilitate
+!     ^X^E.  What should we do here?
+!
+!     Virgil proposes a push-to-compile or push-to-load or
+!     push-to-execute command set, since he does not see that this is
+!     possible with the Tops-20 exec, which does not keep tmpcore files.
+!
+!     Does Tymcom-X presuppose an Exe when no tmpcore exists?
+;
+
+internal procedure F!Exit;
+begin
+  if (F!RPGFlag) then
+  begin
+    T!Fini;
+
+    start!code
+      haltf;
+    end;
+
+      ! ** hack **
+      ;
+
+    T!RSet;
+    T!Bell;
+  end;
+end;
+!! title Rtn F!Decompose ;
+! Decompose a Tops-20/PEAK FileSpec, which must be of the following form:
+!
+! <FileSpec>    ->      <Fs>(<Alias>)(<Switches>)
+! <Fs>          ->      (<Device>)(<UserName>)<FileName>(<Prot>)
+! <UserName>    ->      '<' <Un> '>' | '[' <Un> ']'
+! <Un>          ->      repeat(<V0>, 1-39)
+! <Device>      ->      repeat(<V1>, 1-39) ':'
+! <FileName>    ->      <FilePart> ('.' <ExtPart>)('.' <GenPart>)
+! <FilePart>    ->      repeat(<V1>, 1-39)
+! <ExtPart>     ->      repeat(<V1>, 0-39)
+! <GenPart>     ->      repeat(<DecNum>, 0-*)
+! <Prot>        ->      <semicolon> repeat(<OctNum>, 6)
+! <Alias>       ->      '"' repeat(<V2>, 1-*) '"'
+! <Switches>    ->      '/' <Sw> | '%' <Sw>
+! <Sw>          ->      repeat(ASCII, 1-*)
+! 
+! <V0>          ->      <V1> | '.'
+! <V1>          ->      <Alpha> | <DecNum> | '-'
+! <V2>          ->      {ASCII - '"'}
+! 
+! <Alpha>       ->      'A' - 'Z' | 'a' - 'z' 
+! <DecNum>      ->      '0' - '9'
+! <OctNum>      ->      '0' - '7'
+!
+! <semicolon>   ->      (This is literally a semicolon, which cannot be
+!                       included here without being taken personally by
+!                       SAIL.)
+! 
+! 
+! (The function repeat(Item, Minimum-Maximum) is replaced by between
+! Minimum and Maximum number of occurences of Item, inclusively.  The
+! special symbol '*' indicates no limit.)
+!
+! The symbol 'ASCII' indicates the entire ASCII character set.
+!
+! Braces ('{' and '}') enclose set specifications - eg, "{ASCII - '"'}"
+! means all characters except '"'.
+;
+
+
+internal boolean procedure F!Decompose (string InStr; reference string Dev, UserName, File, Ext, Gen, Alias, Switches);
+begin "F!Decompose"
+  label
+    S0, S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12, SGood, SBad;
+  integer
+    C;
+  string
+    LDev, LUserName, LFile, LExt, LGen, LProt, LAlias, LSwitches,
+    Str, Tst;
+  define
+    sp               = {" "},
+    IsAlphabetic (X) = {("A" <= UpShift(X) <= "Z")},
+    IsNumeric    (X) = {("0" <= X <= "9")},
+    IsOctal      (X) = {("0" <= X <= "7")},
+    IsWhiteSpace (X) = {(X = sp or X = tab)},
+    IsV1         (X) = {(IsAlphabetic(X) or IsNumeric(X) or (X = "-"))},
+    IsV0         (X) = {(IsV1(X) or (X = "."))};
+
+  Str  _
+  LDev _ LUserName _ LFile _ LExt _ LGen _ LProt _ LAlias   _ LSwitches _
+  Dev  _ UserName  _ File  _ Ext  _ Gen  _ Alias _ Switches _ null;
+
+
+  S0:
+      ! Nothing seen
+      ;
+
+    if (not length(InStr)) then goto SBad;
+    C _ lop(InStr);
+    if (C = "[" or C = "<") then goto S3;
+    if (IsV1(C)) then
+    begin
+      appnd(Str, ToUpper(C));
+      goto S1
+    end;
+    goto SBad;
+
+
+  S1:
+      ! Picking up Device or Filename
+      ;
+
+    if (not length(InStr)) then
+    begin
+      LFile _ Str;
+      goto SGood;
+    end;
+    C _ lop(InStr);
+    if (C = ":") then
+    begin
+      LDev _ Str;
+      goto S2;
+    end;
+    if (C = ".") then
+    begin
+      LFile _ Str;
+      goto S5;
+    end;
+    if (C = """") then
+    begin
+      LFile _ Str;
+      goto S9;
+    end;
+    if (C = "/" or C = "%") then
+    begin
+      LFile _ Str;
+      goto S11;
+    end;
+    if (IsV1(C)) then
+    begin
+      appnd(Str, ToUpper(C));
+      goto S1;
+    end;
+    goto SBad;
+
+
+  S2:
+      ! Colon seen - we just picked up the Device name.
+      ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (C = "[" or C = "<") then goto S3;
+    if (C = ".") then goto S5;
+    if (C = """") then goto S9;
+    if (C = "/" or C = "%") then goto S11;
+    if (C = ";") then goto S7;
+    if (IsV1(C)) then
+    begin
+      appnd(LFile, ToUpper(C));
+      goto S2;
+    end;
+    goto SBad;
+
+
+  S3:
+      ! '[' or '<' seen - pick up UserName.
+      ;
+
+    if (not length(InStr)) then goto SBad;
+    C _ lop(InStr);
+    if (C = "]" or C = ">") then goto S4;
+    if (IsV0(C)) then
+    begin
+      appnd(LUserName, ToUpper(C));
+      goto S3;
+    end;
+    goto SBad;
+
+
+  S4:
+      ! "]" or ">" seen - pick up FileName.
+      ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (C = ".") then goto S5;
+    if (C = """") then goto S9;
+    if (C = "/" or C = "%") then goto S11;
+    if (C = ";") then goto S7;
+    if (IsV1(C)) then
+    begin
+      appnd(LFile, ToUpper(C));
+      goto S4;
+    end;
+    goto SBad;
+
+
+  S5:
+      ! Dot seen - pick up an Ext.
+      ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (C = ".") then goto S6;
+    if (C = """") then goto S9;
+    if (C = "/" or C = "%") then goto S11;
+    if (C = ";") then goto S7;
+    if (IsV1(C)) then
+    begin
+      appnd(LExt, ToUpper(C));
+      goto S5;
+    end;
+    goto SBad;
+
+
+  S6:
+      ! Dot seen - pick up a Generation number.
+      ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (C = """") then goto S9;
+    if (C = "/" or C = "%") then goto S11;
+    if (C = ";") then goto S7;
+    if (IsNumeric(C)) then
+    begin
+      appnd(LGen, C);
+      goto S6;
+    end;
+    goto SBad;
+
+
+  S7:
+      ! Semicolon seen - pickup Protection field.
+      ;
+
+    if (not length(Instr)) then goto SBad;
+    appnd(LProt, C);
+    C _ lop(InStr);
+    if (ToUpper(C) = "P") then
+    begin
+      appnd(LProt, ToUpper(C));
+      goto S8;
+    end;
+    goto SBad;
+
+
+  S8:
+      ! 'P' seen - pick up Protection expression.
+      ;
+
+    if (length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (C = """") then goto S9;
+    if (C = "/") then goto S11;
+    if (IsOctal(C)) then
+    begin
+      appnd(LProt, C);
+      goto S8;
+    end;
+    goto SBad;
+
+
+  S9:
+      ! Quote seen - pick up an Alias.
+      ;
+
+    if (not length(InStr)) then goto SBad;
+    C _ lop(InStr);
+    if (C = """") then goto S10;
+    appnd(LAlias, ToUpper(C));
+    goto S9;
+
+
+  S10:
+      ! Second quote seen.
+      ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    if (C = "/" or C = "%") then goto S11;
+    goto SBad;
+
+
+  S11:
+      ! '/' or '%' seen - put it on the front of the switch.
+      ;
+
+    LSwitches _ C;
+    goto S12;
+
+
+  S12:
+      ! Gather the rest of the line as switches.
+      ;
+
+    if (not length(InStr)) then goto SGood;
+    C _ lop(InStr);
+    appnd(LSwitches, ToUpper(C));
+    goto S12;
+
+
+  SGood:
+      ! Many Happy Returns ;
+
+    Tst _ MakeFName(LDev, LUserName, LFile, LExt, LGen);
+
+    if (gtjfn(Tst, (bit(12) lor bit(17))) = -1) then
+
+      ! Parse-only gtjfn to verify the legitimacy of what we've got.
+      ;
+
+      goto SBad;
+      
+    Dev      _ LDev;
+    UserName _ LUserName;
+    File     _ LFile;
+    Ext      _ LExt;
+    Gen      _ LGen;
+    Alias    _ LAlias;
+    Switches _ LSwitches;
+
+!    print
+    (
+      "Dev: (", Dev, ")", crlf,
+      "UserName: (", UserName, ")", crlf,
+      "File: (", File, ")", crlf,
+      "Ext: (", Ext, ")", crlf,
+      "Gen: (", Gen, ")", crlf,
+      "Alias: (", Alias, ")", crlf,
+      "Switches: (", Switches, ")", crlf
+    );
+
+    return(true);
+
+
+  SBad:
+      ! Oops - something smells funny ;
+
+    UserName _ File _ Ext _ Gen _ Alias _ Switches _ null;
+
+    return(false);
+end "F!Decompose";
+!! title Rtn F!Parse ;
+! Parse and sanctify a file name, returning a kosher-processed version of
+! the input string, to be used by the caller for approved purposes.
+;
+
+internal string procedure F!Parse(string FName);
+begin "F!Parse"
+  string
+    JfnStr,
+    Dev,
+    Usr,
+    Fn,
+    Ext,
+    Gen,
+    Dummy;
+
+  if (not F!Decompose(FName, Dev, Usr, Fn, Ext, Gen, Dummy, Dummy)) then
+    return(null);
+
+  JfnStr _ null;
+
+  if (length(Dev)) then
+    appnd(JfnStr, Dev & ":");
+
+  if (length(Usr)) then
+    appnd(JfnStr, "<" & Usr & ">");
+
+  appnd(JfnStr, Fn);
+
+  if (length(Ext) or length(Gen)) then
+  begin
+    appnd(JfnStr, "." & Ext);
+
+    if (length(Gen)) then
+      appnd(JfnStr, "." & Gen);
+  end;
+
+  return(JfnStr);
+end "F!Parse";
+!! title Rtn F!Writ ;
+! Write the current Buffer to the specified Text file.
+;
+
+internal boolean procedure F!Writ (string FName);
+begin "F!Writ"
+  if (FName = null) then
+    FName _ B!File;
+
+  if (not B!WriteTextFile(FName)) then
+    return(false);
+
+  W!FixS;
+  return(true);
+end "F!Writ";
+!! title Rtn F!Scan ;
+! Look at a command-line filespec and decide whether it is ok or not. In
+! general, a filespec can be OK or have a BAD FILESPEC or have BAD
+! SWITCHES.
+;
+
+forward simple boolean procedure SetSwitches (string Switches);
+
+internal simple integer procedure F!Scan (string FName);
+begin "F!Scan"
+  string
+    Dummy,
+    Sw;
+  define
+    F.OK           = 0,
+    F.BAD.SWITCH   = 1,
+    F.BAD.FILESPEC = 2;
+
+  if (not F!Decompose(FName, Dummy, Dummy, Dummy, Dummy, Dummy,
+      Dummy, Sw)) then
+    return(F.BAD.FILESPEC);
+
+  if (length(Sw) and not SetSwitches(Sw)) then
+    return(F.BAD.SWITCH);
+
+  return(F.OK);
+end "F!Scan";
+!! title Rtn Elsewhere ;
+! Give the luser somehwere else to go ...
+;
+
+simple procedure Elsewhere;
+begin
+  runprg("Ps:[Emacs]Teco.Exe", 0, false);
+                                        ! Run Teco in this fork,
+                                        ;
+  exit;                                 ! Just in case.
+                                        ;
+end;
+!! title Rtn SanctifyUser ;
+! Verify the user's rights of passage.
+;
+! <<  Can we tell the pedigree of both caller and program on T20?
+!     Probably not.
+;
+
+simple procedure SanctifyUser;
+begin
+end;
+!! title Rtn DoRescan ;
+! Pick up and return the contents of the legendary ReScan Buffer.
+;
+
+simple string procedure DoRescan;
+begin "DoRescan"
+  integer
+    Byte,                               ! A character temporary.
+                                        ;
+    RescanBytes;                   ! The number of bytes in the
+                                        ! ReScan Buffer.
+                                        ;
+  string
+    Str;                                ! We form our reply in this
+                                        ! string.
+                                        ;
+
+  start!code
+    setz        1,;
+    rscan;
+      setz      1,;
+    movem       1, RescanBytes;
+  end;
+
+  Str _ null;
+
+  while (RescanBytes) do
+  begin
+    start!code
+      movei     1, -1;
+      bin;
+      movem     2, Byte;
+    end;
+
+    appnd(Str, Byte);
+    decr(RescanBytes);
+  end;
+
+  while (length(Str) and (Str[inf for 1] <= " ")) do
+    Str _ Str[1 to inf - 1];
+
+    ! Lop garbage off the end of Str.
+    ;
+
+  return(Str);
+end "DoRescan";
+!! title Rtn SetSwitches ;
+! Analyse the specified switch string, set the appropriate global
+! switches, and return true if all went well.
+;
+
+simple boolean procedure SetSwitches (string Switches);
+begin "SetSwitches"
+  integer
+    BC,                                 ! Suprizingly useful.
+                                        ;
+    C;
+  string
+    S;
+
+  set(G!RNulls);
+
+    ! Remove nulls from the Text file automatically by default.
+    ;
+
+  F!Page _
+  F!Line _
+  F!Char _ 0;
+  C _ lop(Switches);
+
+  while (true) do
+  begin "get switch"
+    if (not (C = "/" or C = "%")) then
+      done "get switch";
+
+    if (Switches <= " ") then
+      done "get switch";
+
+    S _ null;
+
+    while (length(Switches)) do
+    begin "switch"
+      if not (C!Tab[Switches] land IsAlpha) then
+        done "switch";
+
+      appnd(S, lop(Switches));
+    end "switch";
+
+    if (kequ(S, "Nulls"[1 for length(S)])) then
+      clear(G!RNulls)
+    else if (kequ(S, "READ"[1 to length(S)])) then
+      F!Lock _ -1
+    else if (kequ(S, "RPG"[1 to length(S)])) then
+      F!RPGFlag _ true
+    else if (kequ(S, "P")) then
+      F!Page _ intscan(Switches, BC)
+    else if (kequ(S, "L")) then
+      F!Line _ intscan(Switches, BC)
+    else if (kequ(S, "C")) then
+      F!Char _ intscan(Switches, BC)
+    else if (length(S)) then
+      return(false);
+
+    C _ lop(Switches);
+  end "get switch";
+
+  return(true);
+end "SetSwitches";
+!! title Rtn F!Rpg ;
+! Determine the credentials of the user, the editor, and the invocation.
+;
+
+internal simple procedure F!Rpg;
+begin "F!Rpg"
+  integer
+    C;                                  ! A character temporary.
+                                        ;
+  string
+    ReScanLine,                         ! A local copy of the contents of
+                                        ! the ReScan line.
+                                        ;
+    Verb;                               ! The first token of the command
+                                        ! line should be a verb.
+                                        ;
+
+  SanctifyUser;
+
+  F!ReScanLine _
+  ReScanLine   _ DoReScan;
+
+  Verb _ null;
+
+  while (length(ReScanLine)) do
+    if ((C _ lop(ReScanLine)) > " ") then
+      done;
+
+  while (length(ReScanLine)) do
+  begin
+    if ((C _ lop(ReScanLine)) = " ") then
+      done;
+
+    appnd(Verb, C);
+  end;
+
+  if (not length(ReScanLine)) then
+  begin
+    F!Name  _ "NoName.Txt";
+    F!Alias _ null;
+    return;
+  end;
+
+  begin
+    string
+      Alias,                            ! Magnum Alias.
+                                        ;
+      Dev,                              ! Device Name.
+                                        ;
+      Ext,                              ! File Extension.
+                                        ;
+      Gen,                              ! File Generation count.
+                                        ;
+      FName,                            ! File Name.
+                                        ;
+      Switches,                         ! User-specified switches.
+                                        ;
+      User;                             ! File's Username
+                                        ;
+
+    if (F!Decompose(ReScanLine, Dev, User, FName, Ext, Gen, Alias,
+        Switches)) then
+    begin
+      if (not SetSwitches(Switches)) then
+      begin
+        print(ReScanLine, " [bad switches]", crlf);
+        exit;
+      end;
+
+      F!Name  _ MakeFName(Dev, User, FName, Ext, Gen);
+      F!Alias _ Alias;
+    end
+    else
+    begin
+      print(ReScanLine, " [bad command line]", crlf);
+      exit;
+    end;
+  end;
+end "F!Rpg";
+!! title Rtn F!FileExists ;
+! Determine whether a specified file exists.
+;
+
+internal simple boolean procedure F!FileExists (string FName);
+begin "F!FileExists"
+  integer
+    F!Chan;
+  define
+    ForInput = 0;
+
+  if (not length(FName)) then
+    return(false);
+
+  F!Chan _ gtjfn(FName, ForInput);
+
+  if (not !skip!) then
+  begin
+    rljfn(F!Chan);
+    return(true);
+  end;
+
+  return(false);
+end "F!FileExists";
+!! title Rtn F!Init ;
+! Initialize the file I/O module.  (This assumes that F!Rpg has already
+! been invoked, and that F!Name & Co. are set up.)
+;
+
+internal procedure F!Init;
+begin "F!Init"
+  if (not B!CreateChkPntFile(F!Name, F!Alias, F!Page, F!Line,
+      F!Char)) then
+    exit;
+
+  if (F!FileExists(F!Name)) then
+    B!Lock _ F!Lock
+  else
+    W!Msg("New File");
+
+  B!ModP _ false;
+end "F!Init";
+end "DED - File I/O";
+
+
+! *************************  End of XXFile.Sai  ************************* ;
+    }G3
