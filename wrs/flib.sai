@@ -1,0 +1,513 @@
+entry	fAlloc
+,	fClear
+,	fClose
+,	fError
+,	fFree
+,	fMap
+,	fScan
+,	fOpen
+,	fRename
+,	fSelect
+;
+begin	"fLIB"
+
+require "(SAILIB)SAIL.DEF" source!file;
+require "(MPL)UUOSYM.SAI" source!file;
+
+internal string fErrMsg;
+
+internal record!class FILE (
+    string	Name;
+    integer	Chan;
+    integer	OSMode;
+    integer	NBuf;
+    integer	Count;
+    integer	Break;
+    integer	EOF;
+    string	Mode;
+    integer	Mode1;
+    integer	Mode2;
+    integer	ErrMode;
+    integer	Timeout;
+    integer array LKB    );
+
+internal integer fLKB;	! size of longest meaningful lookup block;
+integer	NameBreak;
+
+simple procedure fini;
+begin
+    fLKB := calli(!xwd(!ldLKB,!gtLVD),calli!GETTAB);
+    setbreak( NameBreak_getbreak, ":().[,]", " "&#ht, "SINK" );
+end;
+require fini initialization;
+
+simple integer procedure CHNIOR( integer C; reference integer A; integer X );
+comment
+	Special cnhior because real one doesn't return error codes.
+;
+start!code
+    external integer !skip!;
+    define R1 = 1;
+    protect!acs R1;
+	hrl	 R1,access(X);
+	hrr	 R1,access(C);
+	setom	 !skip!;
+	chanio	 R1,access(A);
+	 setzm	 !skip!;
+end;
+
+simple integer procedure CHNIOV( integer C, A, X );
+comment
+	Special cnhiov because real one doesn't return error codes.
+;
+start!code
+    external integer !skip!;
+    define R1 = 1;
+    protect!acs R1;
+	hrl	 R1,access(X);
+	hrr	 R1,access(C);
+	setom	 !skip!;
+	chanio	 R1,access(A);
+	 setzm	 !skip!;
+end;
+
+internal procedure fError( r!p(FILE) F; string MSG; integer ERR(-1) );
+begin
+    if F neq null!record then begin
+	if file:Chan[f] > 0 then begin
+	    release( file:Chan[f], '50 );
+	    file:Chan[f] := 0;
+	end;
+	file:EOF[f] := !xwd( -1, ERR );
+	fErrMsg := ( if file:ErrMode[f] < 3 then "%" else "?" )&
+	    "fError: file """& file:Name[f]& """, "&
+	    "mode """& file:Mode[f]& """"& crlf& MSG;
+	case file:ErrMode[f] of begin
+	    [0] ;
+	    [1] usererr( 0,1,fErrMsg,"C" );
+	    [2] usererr( 0,1,fErrMsg );
+	    [3] usererr( 0,0,fErrMsg );
+	    [else] usererr( 0,0,fErrMsg,"X" )
+	end;
+    end
+    else begin
+	fErrMsg := "?fError: null file descriptor record"& crlf& MSG;
+	usererr( 0,0,fErrMsg );
+    end;
+end;
+
+comment
+	PageNumber := fAlloc( NumberPagesNeeded )
+
+	Returns the page number of the first of a block of NumberPagesNeeded or
+	more free pages in the virtual address space.  The highest block is
+	returned.
+;
+
+internal integer procedure fAlloc( integer NPGS(1) );
+begin
+    integer PG,N;
+    N := 0;
+    for PG := '777 downto 1 do begin
+	integer STS;
+	STS := calli( PG, calli!PAGSTS );
+	if not !SKIP! then usererr(PG,2,"?PAGSTS: bad page ");
+	if STS land ps!CPR
+	    then N := 0
+	    else begin
+		N := N + 1;
+		if N geq NPGS then return( PG );
+	    end;
+    end;
+    return( 0 );
+end;
+
+comment
+	fClear( PageNumber, NumberOfPages )
+
+	Clear the pages specified - no error if non-existant.
+;
+
+internal procedure fClear( integer PG, NPGS(1) );
+begin
+    calli( !xwd( NPGS, PG ), calli!VCLEAR );
+end;
+
+comment
+	fFree( PageNumber, NumberOfPages )
+
+	Release the pages specified - no error if non existant.
+;
+
+internal procedure fFree( integer PG, NPGS(1) );
+begin
+    fClear( PG, NPGS );
+end;
+
+comment
+	success := fSelect( FileDescriptor, ChanioOpCode, NOCX )
+
+	Perform the file selection chanio specified by ChanioOpCode on
+	the file indicated by FileDescriptor.  NOCX optionally specifies
+	a mode: N-New O-Old C-Confirm X-DontCare.  If no NOCX is given,
+	the mode found in the file descriptor is assumed.
+;
+
+internal boolean procedure fSelect( r!p(FILE) F; integer OP, M2(0) );
+begin
+    label RETRY;
+    if f = null!record or file:Chan[f] leq 0 then begin
+	fError( f, "I/O to unassigned channel." );
+	return( false );
+    end;
+    if M2 = 0 then M2 := file:Mode2[f];
+RETRY:
+    chnior( file:Chan[f], file:LKB[f][0], OP );
+    if !SKIP! 
+	then begin "OK"
+	    file:EOF[f] := 0;
+	    if OP = !chLK and M2 = "n" then begin
+		fError( f, "File already exists.", !erAEF );
+		return( false );
+	    end;
+	    if OP = !chENT then begin
+		boolean NEWFILE;
+		NEWFILE := 0 = ( file:LKB[f][!rbEXT] land !bit(18) );
+		case M2 of begin
+		    ["x"] return( true );
+		    ["c"] while true do begin "confirm"
+			outstr( file:Name[f] );
+			outstr( if NEWFILE
+			    then " [new file], okay? "
+			    else " [old file], okay? " );
+			case inchwl of begin
+			    ["y"]["Y"] return( true );
+			    ["n"]["N"] begin
+				fError( f, "Not confirmed.", if NEWFILE
+				    then !erAEF else !erFNF );
+				return( false );
+			    end;
+			    [else] outstr( "Please enter Y or N."& crlf )
+			end;
+		    end "confirm";
+		    ["n"] if NEWFILE
+			then return( true )
+			else begin
+			    fError( f, "File already exists.", !erAEF );
+			    return( false );
+			end;
+		    ["o"] if not NEWFILE
+			then return( true )
+			else begin
+			    fError( f, "File not found.", !erFNF );
+			    return( false );
+			end;
+		    [else] usererr( M2, 2, "?fSelect: illegal mode " )
+		end;
+	    end;
+	    return( true );
+	end "OK"
+	else begin "ERR"
+	    integer ERR;
+	    case ERR := !rh(file:LKB[f][!rbEXT]) of begin
+		[!erFNF] if M2 = "o"
+		    then fError( f, "File not found.", ERR )
+		    else file:EOF[f] := !xwd(-1,!erFNF);
+		[!erIPP] fError( f, "Invalid username or PPN.", ERR );
+		[!erPRT] fError( f, "File protected.", ERR );
+		[!erFBM] if file:Timeout[f]
+		    then begin
+			file:Timeout[f] := file:Timeout[f] - 1;
+			calli( 1, calli!SLEEP );
+			goto RETRY;
+		    end
+		    else fError( f, "File being modified.", ERR );
+		[!erAEF] fError( f, "File already exists.", ERR );
+		[!erTRN] fError( f, "Device or data error.", ERR );
+		[!erNRM] fError( f, "Quota or disk space exhausted.", ERR );
+		[!erNET] fError( f, "Monitor free core exhausted.", ERR );
+		[else] fError( f, "File selection error code '"&
+		    cvos(ERR), ERR )
+	    end;
+	    return( false );
+	end "ERR";
+end;
+
+comment
+	Scan a file name.  Return lookup block and canonical string.
+	Lookup block is not cleared, so values contained on entry are
+	used as defaults.  To convert a lookup block to a string, just
+	call with a null filename (default everything).  Note these
+	special entries into lookup block:
+		[-3]	device
+		[-2]	username
+;
+
+internal string procedure fScan(
+    string Name;
+    integer array LKB  );
+begin
+    string TOKEN;
+    integer B,LastB;
+    while length( Name ) do begin
+	TOKEN := scan( Name, NameBreak, B );
+	if TOKEN = "'" then TOKEN := cvxstr(cvo(TOKEN[2 to inf]));
+	case B of begin
+	    [":"] LKB[-3] := cvsix(TOKEN);
+	    ["("] begin
+		TOKEN := scan( Name, NameBreak, B );
+		while length( Name ) and B neq ")" do
+		    TOKEN := TOKEN& B& scan( Name, NameBreak, B );
+		if equ( TOKEN, "~" )
+		    then begin
+			LKB[-2] := calli(!xwd(-1,!gtUNM),calli!GETTAB);
+			LKB[-1] := calli(!xwd(-1,!gtUN1),calli!GETTAB);
+		    end
+		    else begin
+			LKB[-2] := cvsix( TOKEN );
+			LKB[-1] := cvsix( TOKEN[7 to inf] );
+		    end;
+		LKB[!rbPPN] := location( LKB[-2] );
+	    end;
+	    ["."] begin
+		if length(TOKEN) then LKB[!rbNAM] := cvsix(TOKEN);
+		LKB[!rbEXT] := LKB[!rbEXT] land !xwd(0,-1);
+	    end;
+	    [","] LKB[!rbPPN] := cvo(TOKEN);
+	    ["]"] LKB[!rbPPN] := !xwd( LKB[!rbPPN], cvo(TOKEN) );
+	    [else] if LastB = "."
+		then LKB[!rbEXT] := LKB[!rbEXT]
+		    lor cvsix(TOKEN) land !xwd(-1,0)
+		else LKB[!rbNAM] := cvsix(TOKEN)
+	end;
+	LastB := B;
+    end;
+    return(
+	(if LKB[-3] then cv6str(LKB[-3])& ":" else null)&
+	(if LKB[!rbPPN] = location(LKB[-2]) then
+	    "("&cv6str(LKB[-2])&cv6str(LKB[-1])&")" else null)&
+	cv6str(LKB[!rbNAM])&
+	(if !lh(LKB[!rbEXT]) then
+	    "."&cv6str(LKB[!rbEXT] land !xwd(-1,0)) else null)&
+	(if !lh(LKB[!rbPPN]) then
+	    "["&cvos(!lh(LKB[!rbPPN]))&
+	    ","&cvos(!rh(LKB[!rbPPN]))&"]" else null)  );
+end;
+
+comment
+	FileDescriptor := fOpen( FileName, FileMode )
+
+	The file named is opened for the mode named.  A r!p(FILE) is returned
+	containing all pertinent information about the file, including the
+	lookup block.  If the file name is null, only the OPEN is done.  The
+	file modes are:
+	    one of:
+		r	read (lookup)
+		w	write (enter)
+		u	update (lookup,enter)
+		a	append (lookup,enter,seek)
+		m	multiple-update (lookup,menter)
+	    and optionally one of:
+		n	new - error if file exists
+		o	old - error if file absent (default for read)
+		c	confirm - confirm new/old on enter
+		x	don't care if file exists (default except read)
+	    and optionally any of:
+		999B	SAIL buffered mode, allocate 999 buffers
+		9999C	SAIL input character count in decimal
+		0E	suppress error messages (default)
+		1E	auto continue after error message
+		2E	pause after error message (warning)
+		3E	pause after error message (error)
+		4E	terminate after error message
+		777M	monitor file mode in octal
+		9999T	timeout in seconds for file-busy retry
+		:spec	default file spec follows (must be last)
+
+	!SKIP! is set true if no errors occured.  Otherwise,
+	!rh(file:EOF[fileDescriptor]) contains the file selection error
+	code.  A device name may be specified, otherwise DSK: is assumed.
+;
+		
+internal r!p(FILE) procedure fOpen( string Name, Mode );
+begin
+    r!p(FILE) F;
+    integer B,C,M1,M2,PPN,N;
+    integer array LKB[-3:fLKB];
+    string S;
+    M1 := M2 := 0;
+    F := new!record(FILE);
+    memory[location(file:LKB[f])] swap memory[location(LKB)];
+    file:Name[f] := Name;	! rewritten later, for now in case error;
+    file:Mode[f] := Mode;
+    file:Count[f] := 2560;
+    file:LKB[F][0] := fLKB;
+    file:LKB[F][-3] := cvsix("DSK");
+    while length(Mode) do case C := lop(Mode) of begin
+	["r"]["w"]["a"]["u"]["m"] begin
+	    if M1 neq 0 then fError( F, "Duplicate R/W modes specified." );
+	    file:Mode1[f] := M1 := C;
+	end;
+	["n"]["o"]["x"]["c"] begin
+	    if M2 neq 0 then fError( F, "Duplicate New/Old modes specified." );
+	    file:Mode2[f] := M2 := C;
+	end;
+	["b"] begin
+	    if N = 0 then N := 1;
+	    file:NBuf[f] := N;
+	    N := 0;
+	end;
+	["M"] begin
+	    file:OSMode[f] := N := cvo(cvs(N));
+	    N := 0;
+	end;
+	["C"] begin
+	    file:Count[f] := N;
+	    N := 0;
+	end;
+	["E"] begin
+	    file:ErrMode[f] := N;
+	    N := 0;
+	end;
+	["T"] begin
+	    file:Timeout[f] := if N then N else 60;
+	    N := 0;
+	end;
+	[":"] begin
+	    fScan( Mode, file:LKB[F] );
+	    Mode := null;
+	end;
+	["0"]["1"]["2"]["3"]["4"]["5"]["6"]["7"]["8"]["9"]
+	    N := N * 10 + C - "0";
+	[else] fError( F, "Unrecognized mode specified." )
+    end;
+    if M1 = 0 then file:Mode1[f] := M1 := "r";
+    if M2 = 0 then file:Mode2[f] := M2 := if M1 = "r" then "o" else "x";
+    file:Name[F] := fScan( Name, file:LKB[F] );
+    open( file:Chan[f]:=getchan, cv6str(file:LKB[F][-3]),
+	file:OSMode[f] lor '770000,
+	if M1 neq "w" then file:NBuf[f] else 0,
+	if M1 neq "r" then file:NBuf[f] else 0,
+	file:Count[f], file:Break[f], file:EOF[f] );
+    if file:Chan[f] = 0 then begin
+	fError( f, "Out of I/O channels." );
+	!SKIP! := false;
+	return( f );
+    end;
+    if file:EOF[f] then begin
+	fError( f, "Unable to open I/O channel." );
+	!SKIP! := false;
+	return( f );
+    end;
+    if file:LKB[f][!rbNAM] = 0 then begin
+	!SKIP! := true;
+	return( f );
+    end;
+    if M1 neq "w" then begin "LOOKUP"
+	!SKIP! := fSelect( f, !chLK );
+	if not !SKIP!
+	and file:Chan[f] > 0
+	and !rh(file:EOF[f]) = !erFNF
+	and M1 neq "r"
+	then begin
+	    !SKIP! := fSelect( f, !chENT );
+	    if !SKIP! then begin
+		close( file:Chan[f] );
+		!SKIP! := fSelect( f, !chLK, "o" );
+	    end;
+	end;
+	if not !SKIP! then return( f );
+    end "LOOKUP";
+    if M1 neq "r" then begin "ENTER"
+	!SKIP! := fSelect( f,
+	    if M1 = "m" then !chMEN else !chENT,
+	    if M1 = "w" then M2 else "x" );
+	if not !SKIP! then return( f );
+    end "ENTER";
+    if M1 = "a" and file:NBuf[f] then begin "buffered-append"
+	string S;
+	integer Temp,Block;
+	Block := ( file:LKB[f][!rbSIZ] + '200 ) lsh -7;
+	useti( file:Chan[f], Block );
+	Temp := file:Count[f];
+	file:Count[f] := 641;		! one more than a block;
+	S := input( file:Chan[f], 0 );
+	file:Count[f] := Temp;
+	if not file:EOF[f] then
+	    fError( f, "EOF expected while preloading buffer." );
+	useto( file:Chan[f], Block );
+	out( file:Chan[f], S );
+	file:EOF[f] := false;
+    end "buffered-append";
+    !SKIP! := true;
+    return( f );
+end;
+
+comment
+	fRename( fileDescriptor )
+	fRename( fileDescriptor, NewName )
+
+	If a new name is given, the name is parsed and filled into the lookup
+	block contained in the file descriptor.  Then renames the file open
+	on the channel specified in the file descriptor using the lookup block
+	in the file descriptor.  When called with only one argument, it is
+	presumed the user has made the desired changes to the lookup block
+	directly before the call.
+;
+
+internal procedure fRename( r!p(FILE) F; string Name(").(") );
+begin	"fRename"
+    if not equ(Name,").(") then begin
+	integer PPN;
+	file:LKB[f][!rbNAM] := cvfil( Name, file:LKB[f][!rbEXT], PPN );
+	if !lh(PPN) = 0 and !rh(PPN) neq 0 then begin
+	    file:LKB[f][-2] := memory[PPN];
+	    file:LKB[f][-1] := memory[PPN+1];
+	    PPN := !rh(location(file:LKB[f][-2]));
+	end;
+	file:LKB[f][!rbPPN] := PPN;
+    end;
+    fSelect( F, !chREN );
+end	"fRename";
+
+comment
+	fClose( FileDescriptor, bits )
+
+	Close the file specifying the bits in bits.  Deallocate the
+	file descriptor record.  Release the channel.
+;
+
+internal procedure fClose( reference r!p(FILE) F; integer bits(0) );
+begin
+    if F neq null!record then begin
+	external procedure $REC$( integer FUNCT; r!p(any!class) REC );
+	if file:Chan[f] > 0 then release( file:Chan[f], bits );
+	$REC$( 5, F );			! delete record and subfields;
+	F := null!record;
+    end;
+end;
+
+internal procedure fMap( r!p(FILE) F; integer VP, FP, CNT, PROT(0) );
+comment
+	Map the specified file pages into virtual memory.  The default
+	protection is COW if file is mode "r" otherwise, R/W.  Valid
+	protections are "r", "c" and "w".
+;
+if F neq null!record then begin "fMap"
+    integer array X[0:1];
+    PROT := case PROT of (
+	[0] if file:Mode1[f] = "r" then !prCW else !prRW,
+	["r"] !prRO,
+	["c"] !prCW,
+	["w"] !prRW );
+    X[0] := PROT lor !xwd( CNT, VP );
+    X[1] := FP;
+    X[0] := chnior( file:Chan[f], X[0], !chMFP );
+    if not !SKIP! then
+	fError( F, ".chMFP paging error '"& cvos(!rh(X[0]))&
+	    " for file page "& cvs(FP+!lh(X[0])-VP), X[0] );
+end	"fMap"
+else	fError( F, "fMap: null!record" );
+
+end $
+  
