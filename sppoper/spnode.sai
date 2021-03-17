@@ -1,0 +1,353 @@
+BEGIN "SpNode"
+
+COMMENT	Description of program:
+	This program is used to assist in maintaining the PDP-10
+	version of SPOOL.  It reads the files containing the street
+	addresses of the line printers and the associations between
+	Tymnet nodes and printers.  It checks for a variety of errors
+	in the file formats, informing the program user of any errors
+	found.  It finishes by producing a list of printers and
+	associated nodes in the same format as produced by 1PNUPD on
+	System 8 when that program is run using the PPA option.  So
+	SPNODE can be used to confirm that 1PNUPD and the associated
+	PJ job on System 8 are properly maintaining the address and
+	node files on the PDP-10's.
+
+	See SPNODE.DOC for more documentation on this program.
+
+	Written in Tymshare SAIL by Michael Hinckley on 21 Sep. 1978.
+
+	This program is compatible with SPOOL v. 5.31 and earlier.
+;
+
+REQUIRE "<><>" DELIMITERS;
+
+DEFINE
+!	= <COMMENT>,		DSCR	= <COMMENT>,
+CRLF	= <'15&'12>,		SPACE	= <'40&'0>,
+TAB	= <'11&'0>,		R!C	= <RECORD!CLASS>,
+R!P	= <RECORD!POINTER>,	N!R	= <NULL!RECORD>;
+
+DEFINE DebugSw = <FALSE>;	! TRUE for debug version;
+
+IFC DebugSw THENC
+  DEFINE  AddrFil = <"(MCH)PRIADR">,
+	  NodeFil = <"(MCH)NODPRI">;
+  EXTERNAL PROCEDURE BAIL;
+  REQUIRE CRLF & "Debugging Version" & CRLF MESSAGE;
+ELSEC
+  DEFINE  AddrFil = <"(SPOOL)PRIADR">,
+	  NodeFil = <"(SPOOL)NODPRI">;
+  REQUIRE CRLF & "Production Version" & CRLF MESSAGE;
+ENDC
+
+! Parameters used to help describe the data structures;
+
+DEFINE RecSiz	= <'100>;	! No. of words in a record in AddrFil;
+DEFINE LinSiz	= <10>;		! No. of words in a line in AddrFil;
+DEFINE MaxLin	= <6>;		! Max no. of lines used in an Addr rec;
+DEFINE PhLine	= <5>;		! Line no. of phone no. in an Addr rec
+				  (should be the last non-null line in
+				   an address record);
+DEFINE MaxPri	= <99>;		! Largest printer no. currently in use
+				  (must be kept current to allow proper
+				   error checking);
+DEFINE MaxNod	= <'3777>;	! Largest possible node no.;
+
+! Global declarations and data structures;
+
+R!C Node (INTEGER NodNum; BOOLEAN InHouse; R!P (Node) NxtNod );
+
+R!C Printer (INTEGER PriNo; STRING ARRAY AdrLin; STRING Phone;
+	     R!P (Node) TopNod; R!P (Printer) NxtPri);
+R!P (Printer) ARRAY PriPtr[0:MaxPri];
+R!P (Printer) PriTop;
+
+R!P (Printer) PROCEDURE New!Printer;
+DSCR Create and return a record!pointer of class Printer and allocate
+     the array AdrLin for this new record.  All of this is necessary
+     because SAIL does not allocate arrays in records when NEW!RECORD
+     is called--so we do the allocation here.  When this procedure is
+     called, SAIL will allocate TmpAry (which must have the bounds we
+     actually want to have in AdrLin).  When the new record is created 
+     we get a handle on the array descriptor associated with AdrLin.
+     We swap it with the descriptor for TmpAry.  And walla, hacker:
+     we've got a nice allocated array (that will stay around).
+
+     If you want to understand what all of this is about see the SAIL
+     MANUAL (the material on formals to procedures, the section on
+     records, and the material on array implementation).
+
+     Note:  The technique used below can be generalized to play lots
+	    of games with arrays used inside of records.
+;
+BEGIN "NewPrinter"
+STRING ARRAY TmpAry[1:MaxLin];
+R!P (Printer) NewRec;
+
+NewRec _ NEW!RECORD(Printer);
+MEMORY[ LOCATION( TmpAry)] SWAP
+  MEMORY[ LOCATION( Printer:AdrLin[ NewRec ])];
+
+RETURN(NewRec);
+END "NewPrinter";
+
+PROCEDURE GetAddress;
+DSCR Open the printer address file.  Read each address record.  If
+     the address is non-null make a Printer record containing the
+     printer number, address, and phone number.  If it is the first
+     record set PriTop, otherwise add it to the chain of records.
+;
+BEGIN "GetAdd"
+INTEGER PriChn, PriEOF, PriFlg, PriCnt, LinCnt;
+INTEGER ARRAY PriDat[0:(RecSiz-1)];	! Used to hold an address rec;
+R!P (Printer) OldPri, CurPri;
+
+OPEN(PriChn_GETCHAN,"DSK",'10, 4,0, 0,0,PriEOF);
+DO BEGIN
+     LOOKUP(PriChn, AddrFil, PriFlg);
+     IF PriFlg NEQ 0
+       THEN USERERR(1,0,CRLF & "Couldn't open " & AddrFil & "!" &
+		    CRLF & "  Type C to try again or X to exit.");
+   END UNTIL PriFlg = 0;
+
+FOR PriCnt _ 0 STEP 1 UNTIL MaxPri DO
+  BEGIN "ReadAddr" INTEGER PriNum;
+    IF PriEOF THEN DONE "ReadAddr";		! End of file, so fini;
+    ARRCLR(PriDat);
+    ARRYIN(PriChn, PriDat[0], RecSiz);
+
+    IF PriDat[0] NEQ PriCnt		! Oops--printer no. is bad;
+      THEN PRINT( CRLF, "BAD printer number (word 0 of record) for #",
+		  PriCnt, CRLF, "  Bad value = ", PriDat[0]);
+
+    IF PriDat[1] = 0 THEN CONTINUE "ReadAddr";	! No addr, so skip;
+
+  ! Found something so make a new Printer record;
+    CurPri _ New!Printer;
+    PriPtr[PriCnt] _ CurPri;		! File this rec by printer no.;
+
+  ! Set up and/or save record pointers for later use;
+    IF PriTop = N!R
+      THEN PriTop _ CurPri
+      ELSE Printer:NxtPri[OldPri] _ CurPri;
+    OldPri _ CurPri;
+
+    Printer:PriNo[CurPri] _ PriCnt;		! Save printer no.;
+
+  ! Get the address and phone no., line by line;
+
+  LinCnt _ 1;
+
+    FOR PriNum _ 1 STEP 1 UNTIL PhLine DO
+      BEGIN INTEGER WrdCnt, Where; STRING TmpStr;
+	TmpStr _ NULL;
+	FOR WrdCnt _ 1 STEP 1 UNTIL LinSiz DO
+	  BEGIN
+	    Where _ (LinSiz*(LinCnt-1))+WrdCnt;   ! The offset we need;
+	    IF PriDat[Where] NEQ 0
+	      THEN TmpStr _ TmpStr & CVXSTR(PriDat[Where]);
+	  END;
+	IF LinCnt < PhLine
+	  THEN Printer:AdrLin[CurPri][LinCnt] _ TmpStr
+	  ELSE Printer:Phone[CurPri] _ TmpStr;
+	LinCnt _ LinCnt+1;
+      END;
+  END "ReadAddr";
+
+! Error check to see if it looks like there is more in the file;
+IF NOT PriEOF
+  THEN BEGIN
+	 ARRCLR(PriDat);
+	 ARRYIN(PriChn, PriDat[0], RecSiz);
+	 IF (PriDat[0] NEQ 0) OR (PriDat[1] NEQ 0)
+	   THEN PRINT(CRLF, "WARNING:  There may be more than ",
+		      MaxPri, "printers!", CRLF, "(Or else the file ",
+		      AddrFil, " is bad.)", CRLF, "Find out which.");
+       END;
+
+RELEASE( PriChn );
+END "GetAdd";
+
+PROCEDURE GetNode;
+DSCR Open the NodeFil.  Build a chain of Node records giving the
+     node assignments for each printer--first the customer node
+     assignments, then the in-house node assignments.
+;
+BEGIN "GetNode"
+INTEGER NodChn, NodEOF, NodFlg, TmpNod;
+R!P (Node) CurNod;
+R!P (Node) ARRAY NodPtr[0:MaxPri];	! Holds last node in chain;
+
+OPEN(NodChn_GETCHAN,"DSK",'10,4,0,0,0,NodEOF);
+DO BEGIN
+     LOOKUP(NodChn, NodeFil, NodFlg);
+     IF NodFlg NEQ 0
+       THEN USERERR(1,0,CRLF & "Couldn't open " & NodeFil & "!" & CRLF
+	            & "  Type C to try again or type X to EXIT.");
+   END UNTIL NodFlg = 0;
+
+  ! Now read in a word from the node file.  Check to see that (a) the
+    left half of the word represents a printer number, (b) that we have
+    a record for that printer and (c) that the right half of the word
+    is the same as the word #.  If anything is wrong, ignore the word
+    and continue with the next one.  Otherwise make a Node rec for it.
+  ;
+FOR TmpNod _ 0 STEP 1 UNTIL 2*MaxNod DO
+  BEGIN "NodLoop" INTEGER PrNum, NodWrd;
+    IF NodEOF THEN USERERR(0,0,CRLF & "PREMATURE end of " & NodeFil
+	& "!!" & CRLF & "  (Probably the file is bad.)");
+    NodWrd _ WORDIN(NodChn);
+    IF ((PrNum _ (NodWrd LSH -18)) < 0) OR (PrNum > MaxPri)
+      THEN BEGIN
+	     PRINT(CRLF, "Impossible printer # (= ", PrNum, ") for ",
+		   "node # ", TmpNod);
+	     CONTINUE "NodLoop";		! Ignore this one;
+	   END;
+
+  ! Now check to see that the right half of NodWrd looks OK;
+    IF (NodWrd _ NodWrd LAND '777777) NEQ TmpNod
+      THEN BEGIN
+	     PRINT( CRLF, "Right half of entry for node #", TmpNod,
+		   " is bad.", CRLF, "  It should be the node #, but ",
+		   "it is ", NodWrd, " instead.  Ignoring it.");
+	     CONTINUE "NodLoop";
+	   END;
+
+    IF (PrNum NEQ 0) AND (PriPtr[PrNum] = N!R)
+      THEN BEGIN
+	     PRINT(CRLF,"Node #",TmpNod," claims that it is assigned ",
+		   "to printer #", PrNum, CRLF, " but there is no ",
+		   "address for that printer!");
+	     CONTINUE "NodLoop";
+	   END;
+
+    IF PrNum = 0 THEN CONTINUE "NodLoop";	! Node not assigned;
+
+  ! If we get this far in the loop we have a reasonable value for the
+    printer and the file format looks fine, so make a Node record for
+    it and include it in the chain.
+  ;
+    CurNod _ NEW!RECORD( Node );
+    IF Printer:TopNod[PriPtr[PrNum]] = N!R
+      THEN Printer:TopNod[PriPtr[PrNum]] _ CurNod;
+    IF NodPtr[PrNum] NEQ N!R
+      THEN Node:NxtNod[NodPtr[PrNum]] _ CurNod;
+    NodPtr[PrNum] _ CurNod;
+
+    IF TmpNod > MaxNod
+      THEN Node:NodNum[CurNod] _ TmpNod-(MaxNod+1)
+      ELSE Node:NodNum[CurNod] _ TmpNod;	! Save the node no.;
+
+    IF TmpNod > MaxNod THEN Node:InHouse[CurNod] _ TRUE;
+  END "NodLoop";
+
+RELEASE(NodChn);
+END "GetNode";
+
+PROCEDURE PrintAddr( R!P (Printer) PrinterRec );
+DSCR This takes the record (of class Printer) and uses PRINT to
+     print out the address and phone number contained in it--
+     unless there are no nodes for this printer.
+;
+BEGIN "PrintAddr"
+INTEGER PATmp;
+
+IF PrinterRec = N!R THEN RETURN;	! Just in case;
+
+IF Printer:TopNod[PrinterRec] NEQ N!R
+  THEN BEGIN
+	 PRINT(CRLF,CRLF,"PRINTER LOCATION NUMBER ",
+	       Printer:PriNo[PrinterRec]);
+         FOR PATmp _ 1 STEP 1 UNTIL (PhLine-1) DO
+	   IF LENGTH(Printer:AdrLin[PrinterRec][PATmp])
+	     THEN PRINT( CRLF, Printer:AdrLin[PrinterRec][PATmp]);
+	 IF LENGTH(Printer:Phone[PrinterRec])
+	   THEN PRINT(CRLF, Printer:Phone[PrinterRec]);
+	 PRINT(CRLF,CRLF,"NODES",CRLF);
+       END;
+END "PrintAddr";
+
+PROCEDURE PrintNodes( R!P (Printer) PNPtr );
+DSCR PRINTs the node numbers (in octal) for all nodes associated
+     with the printer record pointed to by PNPtr.  If it is an
+     in-house node, follow the number with " +".
+;
+BEGIN "PrintNodes"
+R!P (Node) PNodPtr;
+
+IF PNPtr = N!R THEN RETURN;			! Just in case;
+
+PNodPtr _ Printer:TopNod[ PNPtr ];		! Find 1st node;
+
+WHILE PNodPtr NEQ N!R DO
+  BEGIN						! Chase the chain;
+    PRINT(CRLF, CVOS(Node:NodNum[PNodPtr]));
+    IF Node:InHouse[PNodPtr] THEN PRINT(" +");
+    PNodPtr _ Node:NxtNod[PNodPtr];
+  END;
+
+END "PrintNodes";
+
+! ************		T O P  O F  P R O G R A M	************;
+
+STRING TheFile;
+R!P (Printer) PrintPtr;
+
+DEFINE HelpMsg = <"
+
+This program reads the files " & AddrFil & " and " & NodeFil & "
+and prints a list of known printer addresses and node assignments
+in the same format as produced by the program 1PNUPD on System 8
+when the PPA option is used.  While the files are being read they
+are checked for (internal) formatting errors and the program will
+print a list of errors if it finds any.
+
+You may specify a file name for the output file or type a carriage-
+return (or any substring of TTY:) to have the output sent to the
+terminal instead.  A ? repeats this message.
+">;
+
+TTYUP(TRUE);		! Force input from the user to upper case;
+
+PRINT( CRLF, "SHOW SPOOL NODES (v. 1.0)",
+       IFC DebugSw THENC " [Debugging Version]", ENDC
+       CRLF);
+
+WHILE TRUE DO
+  BEGIN "GetFile" INTEGER Junk;
+    PRINT(CRLF, "Output file (? for help): ");
+    TheFile _ INCHWL;
+  ! remove any leading/trailing spaces/tabs from TheFile;
+    WHILE (TheFile = SPACE) OR (TheFile = TAB) DO
+      Junk _ LOP(TheFile);
+    WHILE ((Junk _ TheFile[INF TO INF]) = SPACE) OR (Junk = TAB) DO
+      TheFile _ TheFile[1 TO INF-1];
+    IF TheFile = "?"
+      THEN BEGIN PRINT(HelpMsg); CONTINUE "GetFile"; END;
+    IF LENGTH(TheFile) = 0 OR
+       EQU(TheFile[1 TO 3], "TTY:"[1 TO LENGTH(TheFile)])
+      THEN BEGIN TheFile _ NULL; DONE "GetFile"; END
+      ELSE DONE "GetFile";
+  END "GetFile";
+
+! If user gave us a file name open it for output from PRINT;
+IF LENGTH( TheFile ) THEN SETPRINT(TheFile, "F");
+
+GetAddress;			! Look up the printer addresses;
+GetNode;			! And the node assignments;
+
+PrintPtr _ PriTop;		! Find the first printer record;
+
+WHILE PrintPtr NEQ N!R DO
+  BEGIN
+    PrintAddr( PrintPtr );
+    PrintNodes( PrintPtr );
+    PrintPtr _ Printer:NxtPri[PrintPtr];
+  END;
+
+! Close the output file (if we opened one);
+IF LENGTH( TheFile ) THEN SETPRINT( TheFile, "T");
+
+END "SpNode" .
+   
