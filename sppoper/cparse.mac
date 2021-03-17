@@ -1,0 +1,3468 @@
+        TITLE     SPOOL
+;
+;  115	Enable SPECIAL forms to print properly for lengths greater
+;	than 66 physical lines.  /Carl 22-Sep-81
+;	CPARSE:  Don't truncate special forms length to LARMAX (66),
+;	but continue to use LARMAX for calculating pages printed.
+;
+;  114	CPARSE: Add DEBUG code under the conditional FTSTAT which
+;	will keep selected statistics about user SPOOL requests
+;	and record them in word '37 of the GDF for later analysis.
+;	The selected bits thus far are:
+;
+;		bit chr function       tape(?)
+;		 0   1  top of form	ch1
+;		 1   2  1/2 page	ch2
+;		 2   3  1/3 page	ch7
+;		 3   /  1/6 page	ch6
+;		 4   +  overprint	---
+;		 5   *  next line	ch5
+;		 6   ,  2nd line	ch3
+;		 7   .  3rd line	ch4
+;		 8   0  skip a line	ch8
+;		 9   -  skip 2 lines	ch8
+;
+;
+;  111	CPARSE-CPROMP:  Change calls to FORPGS to always use USRLPP
+;	rather than MAXLIN for calculating fortran carriage controls.
+;	If we are 'faking' it, we should do it right... A different
+;	tape format for each lines= that the user wants.
+;	/CAB 15-Sep-81
+;
+;  105	CPARSE:  Remove references to SAV7 in REDBUF since the same
+;	result can be obtained by using a push/pop, which appears to
+;	be cleaner.  /CAB 2-Sep-81
+;
+;  104	CPARSE:  Fix FORTRAN option switch to count lines properly when
+;	a user is using any of the "2 3 / * . ," carriage controls.  It
+;	used to add N lines rather than skip to the next occurrance of
+;	1/Nth of a page, etc.  /CAB 2-Sep-81
+;	DATAS:  Added globals CTLFLG and FTNMOD. /CAB 9-Sep-81.
+;
+;  103	CPARSE:  Fix loophole where a user could specify a large number
+;	of lines per page via the LINES= option and thus be charged for
+;	a much smaller page count (which is all that is charged for when
+;	it is a CENTER request).  This can be done by insuring that the
+;	user specified page size is always kept separate (USRLPP) from
+;	the billable page size by paper type (MAXLIN).  This however,
+;	does not affect special forms whose billable maximum is still
+;	equal to LARMAX (^D66). /CAB 29-Aug-81
+;
+;  102	CPARSE:  Add check for "empty" files and don't allow them to be
+;	spooled at all.  Add the appropriate error message to the user
+;	and increment the number of error counts against the number of
+;	files specified for spooling.  /CAB 29-Aug-81
+;
+;  101	CPARSE:  Fix mis-calculation of lines for files spooled without
+;	the FORTRAN option, where the number of lines could be off by
+;	(pagesize mod spacing) for unpaged files, thus giving the user
+;	a "free" page every pagesize / (pagesize mod spacing) pages.
+;	/CAB 29-Aug-81
+;
+;  100	* Removed entirely by edit #104, FORTRN counting rewritten. *
+;	CPARSE:  Fix bad coding of JRST to label+1 which was a jrst.
+;	Fixed if "+" with FORTRAN option, wouldn't copy file because
+;	bad code lost return by popping of the popj address & returned
+;	at copy complete address instead.  /CAB 28-Aug-81
+;
+;	---- Revision History Added ---- August 28, 1981 ----
+; Version 5.6
+;       5.14 FIXES INDENT PROBLEM	-- Complete previous history?
+;
+
+
+IFNDEF FTSTAT,<FTSTAT==0>	;[114] Default to "OFF", #0="ON"
+
+Define	$Djrst(Adr,Bit)<
+ifn FTSTAT,<
+	JRST [Skipe	DEB$'Bit	;;[114] Skip if not set
+	     Jrst	Adr		;;[114] Done, so be normal
+	     Setom	DEB$'Bit	;;[114] Set
+	     Move	Ac,GDBUFF+37	;;[114] Get debug word
+	     Tlo	Ac,DEB.'Bit	;;[114] Set bit
+	     Movem	Ac,GDBUFF+37	;;[114] Replace current value
+	     Jrst	Adr]		;;[114] Do normal thing
+	> ; End ifn FTSTAT
+Ife FTSTAT,<
+	JRST	Adr		;;[104] Go do the RIGHT thing!
+	> ; End ife FTSTAT
+> ; End Define $Djrst
+Ifn FTSTAT,<
+	DEB.0==400000
+	DEB.1==200000
+	DEB.2==100000
+	DEB.3==040000
+	DEB.4==020000
+	DEB.5==010000
+	DEB.6==004000
+	DEB.7==002000
+	DEB.8==001000
+	DEB.9==000400
+> ; Remember that these are LH values...!!!
+
+
+        ENTRY   SPOOL,VRFY1,SUPCPY
+
+        EXTERNAL FIXFDP,OPNFD,PUTFD,RDLFD,UPDGD,CURBLK,NOFIFD,OPNOUT
+        EXTERNAL PROMPT,BINDEC,UPCASE,LFPASS
+        EXTERNAL DSTRCT,ALLDIS,MARGIN
+        EXTERNAL OUTLIN,CHROUT,YORN
+        EXTERNAL MAKTMP,INNTMP,OUTTMP
+        EXTERNAL HRDCPY,SUPCHK,REPORT,DUPREQ
+        EXTERNAL SPLGAN,UPCADD,TYMSHR,USRPPN,ESCSET
+        EXTERNAL DISABL,RENABL,SEEREP,FONADR
+        EXTERNAL INTAB,ALTTYP,LOKAGN
+        EXTERNAL CPOL,TOTSPC,TOTCHR
+
+        ENTRY  WRIPRI,FINPRI,GETPRI
+        ENTRY  GITVAL,FORPGS,PRIADR
+
+        INTERNAL  SUPOUT,PRTLIT
+        EXTERNAL  CALSPL,ERRNUM
+        EXTERNAL  TWOBLE,TTYON,TEMPAC
+	EXTERNAL  CTLFLG,FTNMOD		;[104] For FORTRAN C/C stuff.
+        EXTERNAL  GDBUFF,FDBUFF,FLIST
+        EXTERNAL  VALPPN,GETGAN,USRLOC,WTIME,WDATE
+        EXTERNAL  FORTRN,HALFP,THIRDP,SIXTHP,HEAD,PAGECT
+        EXTERNAL  TOTPGS,NCOPYS,MAXLIN,LINECT,USRLPP,LINPAG
+        EXTERNAL  OUTBLK,INBLK,ECHO
+        EXTERNAL  NODFLG,HCOPYS,FCOPYS,LOKHED,SITENO
+;
+;
+OUTCHL==17
+INCHL==16
+;
+;
+;
+;
+LARMAX==^D66            ;MAX LINE SPEC. FOR SPECIAL FORMS
+SMLMAX==^D51
+TTYLOL==125000          ;85 CHAR LSH 11 FOR STORING
+SMLLOL==154000          ;108 CHAR LSH 11 FOR STORING
+LARLOL==204000          ;132 CHAR LSH 11 FOR STORING
+LARLIN==^D60            ;LINES FPR LARGE PAPER
+SMLLIN==^D45            ;LINES FOR SMALL PAPER
+%TRAREQ==020000         ;SHOWS TRANSFER REQUEST
+HEDMSK==100000          ;HEADING WANTED
+FTNMSK==100             ;FORTRAN WANTED
+TWOMSK==40              ;DOUBLE SPACING
+QSTMSK==200             ;SPECIAL CONTROL CHAR.
+FULMSK==200000          ;FULL CHARACTER SET
+KFMSK==4		;KATAKANA FILE TEST.
+;
+;       CONDITIONAL ASSEMBLIES
+;
+;       TO ALLOW FOR .ALL COMMAND THE VARIBLE 'ALL' MUST = 0
+;       TO ALLOW FOR WILD CHAR. USE (* #) THE VARIABLE %WILD MUST = 0
+;
+        %ALL= 1                 ;TURN OFF .ALL COMMAND
+        %WILD= 1                ;TURN OFF WILD CHAR. USE
+                                ;OF CR, LF, FF AND FORTRAN CC
+;
+;
+;       PURPOSE OF THIS PART OF THE ROUTINE IS TO POLL THE USER
+;       ASKING HIM VARIOUS PERTENENT INFORMATION DEALING WITH WHO
+;       HE IS, MAILING INSTRUCTIONS FOR THE OUTPUT AND INFORMATION
+;       NEEDED FOR PRINTING OUT THE FILES, LIE PARTS PER PAGE AND 
+;       PAPER SIZE.
+;
+;
+;       ACCUMULATOR ASSIGNMENTS
+;
+        AC=  0
+        AC1= 1
+        AC2= 2
+        AC3= 3
+        AC4= 4
+        AC5= 5
+        AC6= 6
+        AC7= 7
+        AC8= 10
+        AC9= 11
+        AC10= 12
+        SUPCHL==14
+        ADRCHL==13
+        P==17
+CR:     064000000000            ;TEMP CR
+CRLF:  ASCIZ/
+/
+SPOOL:  HRROI   AC1,-22        ;GOING FOR USER NAME
+        HRROI   AC2,-21
+        GETTAB  AC1,
+        JFCL
+        GETTAB  AC2,
+        JFCL
+        DMOVEM  AC1,GDBUFF+27   ;SAVE CHARGERS USERNAME
+        DMOVEM  AC1,GDBUFF+31   ;SAVE AS CHARGEES USERNAME
+        SKIPN   CALSPL
+        JRST    SPOOL2
+;
+;       FOR CALLING SPOOL ALLOW AN IDENTIFIER NAME
+;       IN THE CALL SPOOL SEQUENCE
+;
+        CAIN    AC,12           ;SEE IF LF
+        JRST    SPOOL1          ;GO ON, ALL DONE
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        JRST    .-3             ;GO DO REST
+SPOOL1: SETZM   ,ECHO           ;TURN OFF ECHO TO FILE
+
+SPOOL2: SETZM   ,BATCHN         ;ZERO BATCH NUMBER AREA
+        DATE    AC,             ;GET DATE OF REQUEST
+        HRLM    AC,GDBUFF+3     ;SAVE DATE OF REQUEST
+        MSTIME  AC,             ;GET TIME OF REQUEST
+        IDIVI   AC,^D60000      ;REDUCE TO MINUTES
+        HRRM    AC,GDBUFF+1     ;STORE FOR ACCOUNTING
+        MOVE    AC,USRLOC	;GET USER PRI. LOC. NO
+        MOVEM   AC,REQREM#      ;SAVE CURRENT LOCATION
+        MOVEM   AC,GDBUFF+33    ;SAVE CURRENT LOCATION AGAIN
+        MOVEM   AC,GDBUFF+4	;STORE TO BUFFER
+;
+;       COME HERE TO FIND OUT IF THE USER IS TYMSHARE
+;       EMPLOYEE.  IF SO, FIND OUT IF THIS IS AN INHOUSE
+;       REQUEST.  IF NOT, GET USER NAME TO HAVE CHARGES
+;       BROUGHT AGAINST
+;
+        MOVE    AC,USRPPN       ;GET USERS PPN
+        MOVEM   AC,GDBUFF+2     ;STORE FOR REQUESTOR
+        MOVEM   AC,GDBUFF+20    ;STORE FOR CHARGER
+        SKIPN   ,TYMSHR         ;SKIP IF TYMSHARE USER
+        JRST    SETBIT          ;GO SET CUSTOMER BIT
+BILAGN:
+        SKIPN   CALSPL          ;NO DO FOR CALL
+        OUTSTR  [ASCIZ/BILL TO CUSTOMER? /]
+        PUSHJ   P,UPCASE        ;GO CONVERT TO UPPER CASE
+        CAIN    AC,40           ;CHECK FOR BLANKS
+        JRST    .-2             ;BYPASS ALL PRE BLANKS
+        CAIE    AC,77           ;CHECK FOR QUERRY
+        JRST    GOTBIL          ;GO CHECK ANSWER
+        MOVEI   AC,BILQUS
+        PUSHJ   P,OUTLIN
+BILGN1: PUSHJ   P,LFPASS
+        JRST    BILAGN          ;GO ASK AGAIN
+GOTBIL: PUSHJ   P,YORN+1
+        JRST    SETDST          ;ON NO GO SET INHOUSE
+;
+;       COME HERE IS A CUSTOMER IS TO BE BILLED, ASK FOR NAME
+;
+BILMOR:
+        SKIPN   CALSPL          ;NO OUT FOR CALL
+        OUTSTR  [ASCIZ/USER NAME: /]
+        SETZM   ,TUSER          ;ZERO OUT TEMP AREA
+        SETZM   ,TUSER+1        ;SAME
+        MOVEI   AC7,14          ;LENGTH OF USER NAME
+        MOVE    AC1,[POINT 6,TUSER] ;POINT TO STORAGE AREA
+BILGET: PUSHJ   P,UPCASE        ;CONVERT TO UPPER CASE
+        CAIN    AC,15           ;CHECK FOR CR
+        PUSHJ   P,UPCASE        ;GET THE LF
+        CAIN    AC,12           ;CHECK FOR LINE FEED
+        JRST    PBLVAL          ;GO VALIDATE USER NAME
+        SOJL    AC7,BILGET      ;SKIP IF TOO MUCH TIL GET LF
+        SUBI    AC,40           ;CONVERT TO SIXBIT
+        IDPB    AC,AC1          ;STORE USER NAME
+        JRST    BILGET          ;GO GET MORE USER NAME
+PBLVAL:
+BILVAL: CAIN    AC7,14          ;SEE IF ANYTHING BROUGHT IN
+        JRST    BILMOR          ;GO ASK AGAIN
+        MOVEI   AC,TUSER        ;GET ADDRESS FOR EXTENDED LOOKUP
+        PUSHJ   P,VALPPN        ;GO GET PPN
+        MOVE    AC,GETGAN+1     ;GET BILLABLE GAN/UUN
+        MOVEM   AC,GDBUFF+20    ;STORE IN GD BUFFER
+        MOVEI   AC,1            ;USED TO INDICATE A BILLABLE USER
+        LSH     AC,^D21         ;SHIFT FOR STORING
+        IORM    AC,GDBUFF+5     ;STORE IN GD BUFFER
+        DMOVE   AC1,TUSER       ;GET USER NAME TO CHARGE
+        DMOVEM  AC1,GDBUFF+31   ;SAVE AS CHARGEES USER NAME
+        PUSHJ   P,ALLDIS        ;GO GET DISTRICT
+        SKIPN   AC1,DSTRCT      ;GET DST AND CHECK IS DIST. 0
+        JRST    BILVL1          ;DIST.0 CHARGES ANYONE
+        CAILE   AC1,^D9         ;SKIP IF DIST. 1-9
+        JRST    CHKRGN          ;NOT DIST. 1-9, GO CHECK REGION
+        CAME    AC1,AC3         ;SEE IF IN SAME DISTRICT
+        JRST    CANTDO          ;CANT CHARGE OUTSIDE DISTRICT
+        JRST    BILVL1          ;CAN CHARGE IN OWN DISTRICT
+CHKRGN: MOVEM   AC3,AC4         ;SAVE CHARGEES DISTRICT
+        IDIVI   AC1,^D10        ;GET CHARGERS REGION
+        MOVE    AC2,AC3         ;GET CHARGEES DISTRICT
+        IDIVI   AC2,^D10        ;GET CHARGEES REGION
+        CAME    AC1,AC2         ;SEE IF IN SAME REGION
+        JRST    NOTRGN          ;NOT IN SAME REGION
+        MOVE    AC3,AC4         ;BRING BACK CHARGEES DISTRICT
+BILVL1: LSH     AC3,^D18        ;SHIFT DISTRICT FOR STORING
+        IORM    AC3,GDBUFF+21   ;STORE IN GD BUFFER
+        JUMPN   AC,ASKNAM       ;BR. IF TYSHARE BIT SET
+        MOVEI   AC,5            ;INHOUSE FOR CUSTOMER
+        LSH     AC,^D21         ;SHIFT FOR STORING
+        IORM    AC,GDBUFF+5     ;STORE INDICATORS
+        JRST    ASKNAM          ;GO ASK FOR PROJECT CODE
+CANTDO:
+        MOVEI   AC,OUTDIS
+        SKIPA
+NOTRGN:
+        MOVEI   AC,OUTREG
+        PUSHJ   P,OUTLIN
+        JRST    PROMPT
+;
+;       SET BIT SHOWING CUSTOMER AND STORE DISTRICT
+;
+SETBIT: MOVEI   AC,1            ;WILL SHOW A CUSTOMER
+        LSH     AC,^D23         ;SHIFT FOR STORING
+        IORM    AC,GDBUFF+5     ;SET CUSTOMER FLAG BIT
+SETDST: MOVE    AC,DSTRCT       ;GET DISTRICT OF CUSTOMER
+        LSH     AC,^D18         ;SHIFT FOR STORING
+        IORM    AC,GDBUFF+21    ;STORE IN BUFFER
+        JRST    ASKNAM          ;GO ASK FOR REQ. NAME
+ASKNAM:
+        SKIPN   CALSPL          ;NO OUT FOR CALL
+        OUTSTR  [ASCIZ/REQUESTED BY: /]
+        PUSHJ   P,UPCASE        ;CONVERT TO UPPER CASE
+        CAIN    AC,40           ;CHECK FOR BLANKS
+        JRST    .-2             ;BYPASS ALL BLANKS
+        CAIE    AC,77           ;CHECK FOR QUERRY
+        JRST    GOTNAM          ;GO PROCESS NAME
+        MOVEI   AC,NAMQUS
+        PUSHJ   P,OUTLIN
+ASKNM1: PUSHJ   P,LFPASS
+        JRST    ASKNAM          ;GO ASK AGAIN
+;
+;       COME HERE TO RECEIVE REQUESTOR NAME
+;
+GOTNAM: MOVE    AC1,[POINT 6,GDBUFF+6] ;GET POINTER FOR STORING NAME
+        MOVEI   AC2,30          ;ALLOW MAX 24 CHAR
+        JRST    .+2             ;BYPASS NEXT INST.
+CKNAM:  PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIN    AC,15           ;CHECK FOR CARRIAGE RETURN
+        PUSHJ   P,UPCASE        ;GET LF
+        CAIE    AC,12           ;CHECK FOR LINEFEED
+        JRST    MORNAM          ;GO GET MORE REQUESTOR NAME
+        CAIN    AC2,30          ;SEE IF ANY NAME
+        JRST    ASKNAM          ;GO GET NAME AGAIN
+        JRST    PROAGN          ;GO GET PROJECT
+MORNAM: SOJL    AC2,CKNAM       ;MORE 24 CHAR., JUST SKIP TIL LF
+        SUBI    AC,40           ;REDUCE TO SIXBIT
+        IDPB    AC,AC1          ;STORE NAME
+        JRST    CKNAM           ;GO GET MORE NAME
+;
+;       COME HERE TO ASK FOR THE PROJECT CODE.
+;       FIRST SEE IF A REQUESTOR NAME WAS RECEIVED
+;
+PROAGN:
+        SKIPN   CALSPL          ;NO OUT FOR CALL
+        OUTSTR  [ASCIZ/PROJECT CODE: /]
+        PUSHJ   P,UPCASE        ;GET A RESPONSE
+        CAIN    AC,40           ;CHECK FOR A BLANK
+        JRST    .-2             ;BYPASS ALL PRE BLANKS
+        CAIE    AC,77           ;CHECK FOR A QUERRY
+        JRST    GOTPRO          ;GO PROCESS PROJECT CODE
+        MOVEI   AC,PROQUS
+        PUSHJ   P,OUTLIN
+PROGN1: PUSHJ   P,LFPASS
+        JRST    PROAGN          ;GO ASK AGAIN
+GOTPRO: MOVE    AC1,[POINT 6,GDBUFF+12] ;POINT TO PROJECT CODE AREA
+        MOVEI   AC2,14          ;ALLOW 12 CHAR.
+        JRST    .+2             ;BYPASS NEXT INST.
+CKPROJ: PUSHJ   P,UPCASE        ;GET NEXT INST.
+        CAIN    AC,15           ;CHECK FOR A CARRIAGE RETURN
+        PUSHJ   P,UPCASE        ;GET LF
+        CAIE    AC,12           ;CHECK FOR LINEFEED
+        JRST    MORPRO          ;GO GET MORE PROJECT CODE
+        JRST    TELAGN          ;GO GET TELEPHONE NO.
+MORPRO: SOJL    AC2,CKPROJ      ;SKIP MORE THAN 12 CHAR.
+        SUBI    AC,40           ;REDUCE TO SIXBIT
+        IDPB    AC,AC1          ;STORE PROJECT CODE
+        JRST    CKPROJ          ;GET MORE PROJECT CODE
+;
+;       COME HERE NOW FOR ASKING OF THE USERS TELEPHONE NUMBER
+;
+TELAGN:
+        SKIPN   CALSPL          ;NO OUT FOR CALL
+        OUTSTR  [ASCIZ/TELEPHONE NUMBER: /]
+        PUSHJ   P,UPCASE        ;GET RESPONSE
+        CAIN    AC,40           ;CHECK FOR BLANKS
+        JRST    .-2             ;BYPASS ALL BLANKS
+        CAIE    AC,77           ;CHECK FOR A QUERRY
+        JRST    GOTTEL          ;GO PROCESS TELEPHONE NUMBER
+        MOVEI   AC,TELQUS
+        PUSHJ   P,OUTLIN
+TELGN1: PUSHJ   P,LFPASS
+        JRST    TELAGN          ;GO ASK AGAIN
+GOTTEL: MOVE    AC1,[POINT 6,GDBUFF+14] ;AREA USED FOR TELE. NUMBER
+        MOVEI   AC2,30          ;ALLOW MAX 24 CHAR.
+        JRST    .+2             ;BYPASS NEXT INST.
+CKTELE: PUSHJ   P,UPCASE        ;GET NEXT CHAR
+        CAIN    AC,15           ;CHECK FOR CARRIAGE RETURN
+        PUSHJ   P,UPCASE        ;GET LF
+        CAIE    AC,12           ;CHECK FOR LINE FEED
+        JRST    MORTEL          ;GO GET TELEPHONE NUMBER
+        CAIN    AC2,30          ;SEE IF ANY TELE
+        JRST    TELGN1          ;NO, GO ASK AGAIN
+        JRST    FORMS           ;GO GET FORMS
+MORTEL: SOJL    AC2,TOOTEL      ;BR. IF TOO MUCH PHONE
+        SUBI    AC,40           ;CONVERT TO SIXBIT
+        IDPB    AC,AC1          ;STORE TELEPHONE NUMBER
+        JRST    CKTELE          ;GO GET NEXT CHAR
+TOOTEL: SETZM   ,GDBUFF+14      ;ZERO PHONE AREA
+        SETZM   ,GDBUFF+15      ;
+        SETZM   ,GDBUFF+16      ;       
+        SETZM   ,GDBUFF+17      ;
+        MOVEI   AC,TELBIG
+        PUSHJ   P,OUTLIN
+        SKIPN   CALSPL
+        JRST    TELGN1
+        JRST    PROMPT
+;
+;       COME HERE TO ASK FOR THE FORMS DESIRED
+;
+FORMS:
+        SKIPN   CALSPL          ;NO OUT FOR CALL
+        OUTSTR  [ASCIZ/FORMS: /]
+        PUSHJ   P,UPCASE        ;GET RESPONSE
+        CAIN    AC,40           ;CHECK FOR BLANKS
+        JRST    .-2             ;BYPASS ANY BLANKS
+        CAIE    AC,77           ;CHECK FOR QUERRY
+        JRST    GOTFRM          ;BR. TO PROCESS FORMS DESIRED
+        MOVEI   AC,FORMAV
+        PUSHJ   P,OUTLIN
+FORMGN: PUSHJ   P,LFPASS
+        JRST    FORMS           ;GO ASK AGAIN
+GOTFRM: MOVEI   AC10,FHUH       ;ERROR RETURN ADDRESS
+        CAIN    AC,123          ;CHECK FOR SMALL OR SPECIAL
+        JRST    SFORM           ;GO PROCESS SPECIAL OR SMALL
+        CAIN    AC,114          ;CHECK FOR LARGE FORMS
+        JRST    LFORM           ;GO PROCESS LARGE FORMS
+        CAIN    AC,102          ;CHECK FOR BIG FORMS
+        JRST    BFORM           ;GO PROCESS AS BIG FORMS
+        CAIN    AC,124          ;CHECK FOR TTY FORMS
+        JRST    TFORM           ;GO PROCESS AS TTY FORMS
+;
+;       NOT A RECOGNIZABLE COMMAND
+;
+FHUH:   MOVEI   AC,WHAT
+        PUSHJ   P,OUTLIN
+        SKIPN   CALSPL
+        JRST    FORMGN          ;GO ASK AGAIN
+        JRST    PROMPT
+SFORM:  PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        JFCL
+        CAIE    AC,115          ;CHECK FOR M OF SMALL
+        JRST    SPFORM          ;GO CHECK FOR SPECIAL
+        MOVEI   AC,7            ;SHOWS TO CHECK FOR SMALL
+        PUSHJ   P,VRFY1         ;VERIFY CMND
+        CAIE    AC,40
+        JRST    SFORM2
+        PUSHJ   P,CKWH
+        JRST    SFORM2
+        MOVEI   AC,5
+        JRST    SFORM3
+SFORM2: MOVEI   AC,1            ;SHOWS USE SMALL FORMS
+SFORM3: MOVEI   AC2,SMLLIN      ;MAX LINES PER PAGE
+        MOVEI   AC1,SMLMAX      ;GET MAX. ALLOW PER PAGE
+        JRST    FORMVA          ;GO SAVE FORM VALUE
+SPFORM: CAIE    AC,120          ;CHECK FOR P OF SPECIAL
+        JRST    FHUH            ;CANT UNDERSTAND COMMAND
+        MOVEI   AC,13           ;SHOWS TO CHOR SPECIAL
+        PUSHJ   P,VRFY1
+ASKMAX: SKIPN   CALSPL          ;NO OUT FOR CALL
+        OUTSTR  [ASCIZ/MAX. LINES PER PAGE: /]
+        PUSHJ   P,GETVL1        ;GO GET VALUE
+        JRST    NUMBAD          ;ON BAD RETURN
+        JUMPN   AC,MAX          ;GOT NUMBER
+        SKIPA
+NUMBAD: PUSHJ   P,LFPASS
+        MOVEI   AC,WONGNO
+        PUSHJ   P,OUTLIN
+        SKIPN   CALSPL
+        JRST    ASKMAX          ;GO ASK AGAIN
+        JRST    PROMPT
+MAX:
+;[115] *** Don't truncate Special forms size to LARMAX *** Code removed ***
+;[115]  CAILE   AC,LARMAX       ;SKIP IF DOESNT EXCEED MAX.
+;[115]  MOVEI   AC,LARMAX       ;DEFAULT ON EXCEEDING IS LARGE
+        MOVEM   AC,GDBUFF+144   ;SAVE MAX. LINES PER PAGE
+ASKCHR:
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/
+MAX. CHARACTERS PER LINE: /]
+        PUSHJ   P,GETVL1        ;GO GET CHAR. COUNT
+        JRST    BADCHR          ;ON ERROR RETURN
+        JUMPN   AC,MAXCHR       ;JUMP IF HAVE SOMETHING
+        SKIPA
+BADCHR: PUSHJ   P,LFPASS
+        MOVEI   AC,ILLNUM
+        PUSHJ   P,OUTLIN
+        SKIPN   CALSPL
+        JRST    ASKCHR
+        JRST    PROMPT
+MAXCHR: LSH     AC,11           ;SHIFT FOR STORING
+        CAILE   AC,LARLOL       ;SEE IF EXCEED MAX LIMIT OF PRINTER
+        MOVEI   AC,LARLOL       ;SET LIMIT
+        IORM    AC,GDBUFF+4     ;STORE IN REQUEST
+SPAGN:  MOVE    AC1,[POINT 7,GDBUFF+145] ;INITIAL MESSAGE AREA POINTER
+        MOVEI   AC7,207         ;SET MAX. CHAR LIMIT TO MESSAGE
+	SKIPN   CALSPL          ;NO OUT FOR CALL
+        OUTSTR  [ASCIZ/DESCRIBE SPECIAL FORMS: /]
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        SOJL    AC7,TOOSPE      ;BR. IF MESSGE TOO LONG
+        IDPB    AC,AC1          ;STORE MESSAGE
+        CAIN    AC,4            ;SEE IF CONTROL-D
+        JRST    SPCAL           ;GO ON
+        JRST    .-5             ;GO GET NEXT CHAR.
+TOOSPE: SETZ    AC,             ;ZERO FOR ZEROING BUFFER
+        MOVEI   AC1,32          ;LENGTH OF BUFFER
+        MOVEM   AC,GDBUFF+145(AC1) ;ZERO BUFFER
+        SOJGE   AC1,.-1         ;CONTINUE TO ZERO
+        MOVEI   AC,TOO135
+        PUSHJ   P,OUTLIN
+        SKIPE   CALSPL		; keep going if this isn't a prog call
+        JRST    PROMPT
+	MOVEI	AC1,1		; sleep for 1 sec. so that user's input
+	SLEEP	AC1,		; will show on term. before the flush
+	CLRBFI			; flush to avoid nasty surprises
+        JRST    SPAGN
+;
+;       THIS ROUTINE CHECKS FOR WHITE FORM SKIP RET IF WHITE
+;
+CKWH:   PUSHJ   P,UPCASE
+        CAIN    AC,40
+        JRST    .-2
+        CAIE    AC,127
+        JRST    CKWHR
+        PUSHJ   P,UPCASE
+        CAIE    AC,110
+        JRST    CKWHR
+        PUSHJ   P,UPCASE
+        CAIE    AC,111
+        JRST    CKWHR
+        AOS     (P)
+CKWHR:  PUSHJ   P,LFPASS
+        POPJ    P,
+;
+SPCAL:  MOVEI   AC,4            ;SHOWS SPECIAL FORMS
+        MOVE    AC1,GDBUFF+144  ;GET MAX. LINE PER PAGE
+        MOVE    AC2,AC1         ;MAKE LINES SAME AS MAX TIL CHANGED
+	CAILE	AC1,LARMAX	;[115] For charging purposes, if length is
+	  MOVEI	AC1,LARMAX	;[115] greater than LARMAX (66), truncate.
+        JRST    FORMVA          ;GO STORE FORM VALUE
+LFORM:  MOVEI   AC,10           ;INDICATES A CHECK FOR LARGE
+        PUSHJ   P,VRFY1
+        CAIE    AC,40
+        JRST    LFORM2
+        PUSHJ   P,CKWH
+        JRST    LFORM2
+        MOVEI   AC,6
+        JRST    LFORM3
+LFORM2: MOVEI   AC,2            ;INDICATES LARGE PAPER
+LFORM3: MOVEI   AC2,LARLIN      ;MAX LINES PER PAGE
+        JRST    GETMAX          ;GO SET MAX LINE/PAGE
+BFORM:  MOVEI   AC,11           ;CHECK FOR BIG COMMAND
+        JRST    LFORM+1         ;GO VERIFY COMMAND
+TFORM:  MOVEI   AC,12           ;CHECK FOR TTY COMMAND
+        PUSHJ   P,VRFY1
+        MOVEI   AC,3            ;INDICATE TTY FORMS
+        MOVEI   AC2,LARLIN      ;MAX LINES PER PAGE
+GETMAX: MOVEI   AC1,LARMAX      ;SET MAX. LINE/PAGE
+FORMVA: MOVE    AC3,AC          ;SAVE TYPE OF FORMS
+        LSH     AC,^D33         ;SHIFT FOR STORING
+        IORM    AC,GDBUFF+5     ;STORE FORMS VALUE
+        MOVEM   AC1,MAXLIN      ;STORE MAX LINES PER PAGE
+        HRRM    AC2,GDBUFF+5    ;SAVE ALSO TO REQUEST
+        MOVEM   AC2,USRLPP
+        MOVEM   AC2,ERRCNT      ;SAVE JUST IN CASE
+        CAIN    AC3,4           ;CHECK FOR SPECIAL
+        JRST    DECOL           ;DONT DO PARTS FOR SPECIAL
+        CAIN    AC3,1           ;CHECK FOR SMALL PAPER
+        MOVEI   AC,SMLLOL       ;GET LOL OF LINE SMALL PAPER
+        CAIN    AC3,2           ;CHECK FOR LARGE
+        MOVEI   AC,LARLOL       ;LARGE LOL
+        CAIN    AC3,3           ;CHECK FOR TTY
+        MOVEI   AC,TTYLOL       ;TTY LOL
+        CAIN    AC3,5           ;CHECK FOR SMALL WHITE
+        MOVEI   AC,SMLLOL
+        CAIN    AC3,6
+        MOVEI   AC,LARLOL
+        IORM    AC,GDBUFF+4     ;SAVE CHAR TO LOL
+        CAIGE   AC3,5
+        JRST    PARTS
+        MOVEI   AC,1
+        JRST    PARCN
+;
+;       NOW GET THE PART PAPER THE USER WANTS
+;
+PARTS:
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/PARTS: /]
+        PUSHJ   P,UPCASE        ;GET RESPONSE
+        CAIN    AC,40           ;CHECK FOR BLANKS
+        JRST    .-2             ;BYPASS ALL BLANKS
+        PUSHJ   P,LFPASS
+        CAIE    AC,77           ;CHECK FOR QUERRY
+        JRST    GETPAR          ;GO GET PARTS
+PARAGN:
+        MOVEI   AC,PRTLIT
+        PUSHJ   P,OUTLIN
+        SKIPN   CALSPL
+        JRST    PARTS           ;GO ASK AGAIN
+        JRST    PROMPT
+GETPAR: CAILE   AC,64           ;SEE IF GREATER THAN 4
+        JRST    PARAGN          ;ILLEGAL VALUE
+        CAIGE   AC,61           ;SEE IF LESS THAN 1
+        JRST    PARAGN          ;ILLEGAL VALUE
+PARTW:  SUBI    AC,60           ;CONVERT TO NO. OF PARTS
+PARCN:  LSH     AC,^D30         ;SHIFT PARTS FOR STORING
+        IORM    AC,GDBUFF+5     ;STORE PARTS WANTED
+        LSH     AC,-^D30        ;RETURN VALUE
+        CAIN    AC,1            ;SEE IF VALUE IS A 1
+        JRST    NODEC           ;DONT ASK FOR DECOLATION
+;
+;       ASK USER IF HE WANTS THE OUTPUT DECOLATED
+;
+DECOL:
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/DECOLLATE? /]
+        PUSHJ   P,UPCASE        ;GET RESPONSE
+        CAIN    AC,40           ;CHECK FOR BLANK
+        JRST    .-2             ;BYPASS ANY BLANKS
+        CAIE    AC,77           ;CHECK FOR QUERRY
+        JRST    GETDEC          ;GO SEE IF HE WANTS IT DECOLATED
+        PUSHJ   P,LFPASS
+        MOVEI   AC,DECQUS
+        PUSHJ   P,OUTLIN
+        SKIPN   CALSPL
+        JRST    DECOL           ;GO ASK AGAIN
+        JRST    PROMPT
+GETDEC: PUSHJ   P,YORN+1        ;GET YES OR NO
+        JRST    NODEC           ;ON NO
+        HRLZI   AC,1000         ;SHOWS YES ON DECOLATION
+        SKIPA                   ;BR. OVER
+NODEC:  SETZ    AC,             ;SHOWS NO DECOLATION
+        IORM    AC,GDBUFF+5     ;STORE VALUE
+;
+;       FIND OUT THE OPTIONS THE USER WANTS FOR HIS PRINTOUT
+;
+OPNASK:
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/OPTIONS: /]
+        PUSHJ   P,UPCASE        ;GET RESPONSE
+        CAIN    AC,40           ;CHECK FOR BLANKS
+        JRST    .-2             ;BYPASS PRE BLANKS
+        CAIE    AC,77           ;CHECK FOR A QUERRY
+        JRST    GOTOPT          ;GO PROCESS OPTION
+        MOVEI   AC,OPTN1        ;FIRST LIST OF OPTIONS
+        PUSHJ   P,OUTLIN
+        SKIPE   LOKHED          ;SKIP IF NOT LOCKHEED
+        JRST    DEFOPN
+        MOVEI   AC,OPTN2
+        PUSHJ   P,OUTLIN
+DEFOPN: MOVEI   AC,OPTN3
+        PUSHJ   P,OUTLIN
+ASKOPN: PUSHJ   P,LFPASS
+        JRST    OPNASK          ;GO ASK AGAIN
+GOTOPT:
+GOTOP1: CAIN    AC,15           ;CHECK FOR CR
+        PUSHJ   P,UPCASE        ;GET LF
+        CAIN    AC,12           ;CHECK FOR LF
+        JRST    SETSIZ          ;END OF OPTIONS
+        CAIN    AC,"Q"          ;SPECIAL CHAR.
+        JRST    QUEST0
+        CAIN    AC,"H"          ;CHECK FOR H OF HEAD
+        JRST    HOPT            ;GO DO HEAD OPTION
+        CAIN    AC,"I"          ;CHECK FOR INDENT
+        JRST    INDENT          ;GO DO INDENT
+        CAIN    AC,"C"          ;CHECK FOR C COMMAND
+        JRST    CCMND           ;GO DO A C COMMAND
+        CAIN    AC,"L"          ;CHECK FOR L OF LINES
+        JRST    LOPT            ;GO PROCESS LINES OPTION
+        CAIN    AC,"F"          ;CHECK FOR FORTRAN OPTION
+        JRST    FOPT            ;GO DO FORTRAN OPTION
+        CAIN    AC,"D"          ;LOOK FOR DOUBLE SWITCH
+        JRST    USRDBL          ;GO DO DOUBLE
+        SKIPE   LOKHED          ;SKIP IF NOT LOCKHEED
+        JRST    OPTCMA          ;NO REM,CEN,TRA OR NODE FOR LOKHED
+        CAIN    AC,"R"          ;CHECK FOR REMOTE
+        JRST    RCMND           ;GO DO REMOTE COMMAND
+        CAIN    AC,"N"          ;CHECK FOR NODE=
+        JRST    DONODE          ;GO CHECK NODE
+        CAIN    AC,"T"          ;CHECK FOR TRANSFER
+        JRST    DOXFER          ;GO DO TRANSFER
+OPTCMA: CAIE    AC,54           ;CHECK FOR COMMA
+        JRST    NOPTN           ;NOT A VALID OPTION
+OPTBLK: PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+GOTOP2: CAIN    AC,40           ;CHECK FOR BLANK
+        JRST    .-2             ;BYPASS BLANKS
+        JRST    GOTOP1          ;GO CHECK FOR REST OF OPTIONS
+NOPTN:
+        MOVEI   AC,WHAOPN
+        PUSHJ   P,OUTLIN
+        SKIPE   CALSPL
+        JRST    PROMPT
+        SETZB   AC,FORTRN       ;ZERO FLAGS
+        MOVE    AC,ERRCNT       ;GET LINES PER PAGE AGAIN
+        HRRM    AC,GDBUFF+5     ;RESTORE LINES PER PAGE
+        MOVEM   AC,USRLPP
+        HLLZS   ,GDBUFF+3       ;ZERO OPETIONS AREA
+        HRROI   AC,777000       ;TO RESET PRINT LOCATION
+        ANDM    AC,GDBUFF+4     ;DO IT
+        MOVE    AC,USRLOC       ;GET LOGED IN LOCATION
+        IORM    AC,GDBUFF+4     ;PUT IT BACK TO REQUEST
+        HRLOI   AC,007777       ;TO MASK OUT POSSIBLE TRANSFER
+        ANDM    AC,GDBUFF       ;DO IT
+        SETZM   ,TWOBLE
+        SETZM   ,HALFP          ;ZERO HALF PAGE MAX
+        SETZM   ,THIRDP         ;ZERO THIRD PAGE MAX
+        SETZM   ,SIXTHP         ;ZERO SIXTH PAGE MAX
+        SETZM   ,HEAD           ;ZERO HEADING FLAG
+        SETZM   NODFLG          ;NOD = STUFF
+        JRST    ASKOPN          ;GO ASK AGAIN
+;
+;       SEE IF THE USER SPECIFED NUMBER OF LINES PER PAGE.
+;       IF NOT, FIND OUT TYPE OF PAPER SPECIFIED AND USE
+;       THE DEFAULT NO. OF LINES PER PAGE.
+;
+SETSIZ: SETZM   ,TOTPGS         ;ZERO PAGE COUNTER FOR REQUEST
+        HRRZ    AC,GDBUFF+3     ;GET STATISTICS WD.
+        ANDI    AC,7            ;GET TYPE, CENTER OR REMOTE
+        SKIPE   LOKHED          ;SKIP IF NOT LOCKHEED
+        JRST    SETSZ2          ;LOCKHEED GOES TO CENTER ALWAYS
+        CAIE    AC,1            ;SEE IF USER WANTS CENTER
+        JRST    MAYCEN          ;NO, GO SEE WHAT HE GETS
+;
+;       WANTS CENTER. THEN GIVE HIM CENTER
+;
+SETSZ2: SETZM   ,REQREM         ;SHOWS TO UPDATE SPLCNT.
+        MOVEI   AC,1            ;SHOWS DOING CENTER
+        JRST    SETSZ1          ;GO ENTER TO BUFFER
+;
+;       USER WANTS REMOTE, BUT NO REMOTE PRINTER
+;       IF TRANSFER, NO DIFFERENCE, ELSE TELL WHAT GOING TO DO
+;
+SETSZ3: SKIPN   ,REMOTE#        ;SKIP IF WANTED REMOTE
+        JRST    SETSZ2          ;NO, THEN GIVE CENTER
+        MOVE    AC,GDBUFF       ;TO CHECK FOR TRANSFER
+        TLNE    AC,%TRAREQ      ;SKIP IF NO MATTER
+        JRST    SETSZ2          ;GO SPOOL TO CENTER
+        MOVEI   AC,NOREMP
+        PUSHJ   P,OUTLIN
+        JRST    SETSZ2          ;GO SPOOL TO CENTER
+;
+MAYCEN: SKIPN   AC1,REQREM      ;SEE IF REMOTE PRINTER THERE
+        JRST    SETSZ3          ;NO, GO CEHECK IF HE WANTED ONE
+        MOVEI   AC,2            ;SHOWS REMOTE REQUEST
+SETSZ1: HRROI   AC1,777770      ;TO MASK OFF OLD TYPE
+        ANDM    AC1,GDBUFF+3    ;DO IT
+        IORB    AC,GDBUFF+3     ;PUT IN NEW AND BRING BACK
+        ANDI    AC,77000        ;GET NO. COPIES WANTED
+        LSH     AC,-^D9         ;RIGHT JUSTIFY
+        JUMPN   AC,.+4          ;SKIP IF SOMETHING SPECIFIED
+        MOVEI   AC1,1000        ;DO 1 COPY DEFAULT
+        IORM    AC1,GDBUFF+3    ;STORE NO. COPIES
+        MOVEI   AC,1            ;FOR NEXT INST
+        MOVEM   AC,NCOPYS       ;STORE NO. COPIES WANTED
+        MOVEM   AC,FCOPYS       ;SAVE INDIV. FILE COPY CNT.
+        MOVEM   AC,HCOPYS       ;KEEP HIGHEST COPY COUNT
+        JRST    CHKTRA          ;GO CHECK FOR TRANSFER
+;
+;  SPECIAL CONTROL CHAR. ?CHAR
+;
+QUEST0: MOVEI   AC10,QSTRN
+        MOVEI   AC,31
+        PUSHJ   P,VRFY1
+QSTDO:  MOVEI   AC,QSTMSK
+        JRST    SAVMSK
+QSTRN:  CAIN    AC2,54
+        JRST    QSTDO
+        JRST    NOPTN
+;
+;       COME HERE FOR PROCESSING A POSSIBLE HEAD OPTION
+;
+HOPT:   MOVEI   AC10,HRTN       ;RETURN ERROR ADDRESS
+        MOVEI   AC,14           ;SHOWS WHICH COMMAND TO CHECK
+        PUSHJ   P,VRFY1
+HEDCMA: MOVEI   AC,HEDMSK       ;HEADING WANTED
+        SETOM   HEAD            ;SET HEADING FLAG
+        JRST    SAVMSK          ;GO SAVE MASK
+HRTN:   CAIN    AC2,54          ;CHECK FOR COMMA
+        JRST    HEDCMA          ;GO SAVE INDICATOR
+        JRST    NOPTN           ;BAD COMMAND
+;
+;       DETERMINE WHICH COMMAND TO DO
+;
+CCMND:  PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIN    AC,"O"          ;CHECK O OF COPIES
+        JRST    COPT            ;GO DO COPY COMMAND
+        SKIPE   LOKHED          ;SKIP IF NOT LOCKHEED
+        JRST    NOPTN           ;NO CENTER FOR LOCKHEED
+        MOVEI   AC10,CERTN      ;ERROR RETURN FOR CENTERS
+        MOVEI   AC,21           ;CHECK FOR CENTERS
+        PUSHJ   P,VRFY1
+CNTER1: MOVEI   AC,1            ;TO SHOW WANT CENTER
+        SETZM   ,REMOTE         ;CANCELS ANY REMOTE DESIRES
+        SETZM   NODFLG          ;CANCELS NODE=
+        JRST    RCMND2          ;GO STORE PRINT TYPE
+CERTN:  CAIN    AC2,","         ;CHECK FOR SEPERATOR
+        JRST    CNTER1          ;YES, HAVE GOOD COMMAND
+        JRST    NOPTN           ;CANT UNDERSTAND
+;
+;       COME HERE TO CHECK FOR COPY COMMAND AND TO
+;       GET THE NUMBER OF COPIES THE USER WANTS
+;
+COPT:   MOVEI   AC10,CRTN       ;ERROR RETURN ADDRESS
+        MOVEI   AC,15           ;SHOWS WHICH COMMAND TO CHECK
+        HRROI   AC1,700777      ;TO MASK COPIES AREA
+        ANDM    AC1,GDBUFF+3    ;ZERO OUT GD AREA
+        PUSHJ   P,VRFY1
+        CAIE    AC2,12          ;CHECK TERMINATION CHARACTER
+        PUSHJ   P,GITVAL        ;GET NO. COPIES
+        JRST    NOPTN           ;BAD RETURN
+COPT1:  CAIL    AC,100          ;MAX COPIES = 63 
+        JRST    TOOCOP          ;TOO MANY COPIES
+        SKIPN   ,AC             ;SEE IF ZERO RETURNED
+        MOVEI   AC,1            ;DEFAULT TO 1
+        LSH     AC,11           ;SHIFT FOR STORING
+        IORM    AC,GDBUFF+3     ;STORE IN GD BUFFER
+        JRST    LOPT2           ;GO CHECK MORE OPTIONS
+CRTN:   CAIN    AC2,75          ;CHECK ERROR CHARACTER
+        PUSHJ   P,GETVL1        ;GET NO. COPIES
+        JRST    NOPTN
+        JRST    COPT1           ;GO SAVE IN GD BUFFER
+;
+;       REMOTE COMMAND
+;
+RCMND:  MOVEI   AC10,RRTN	;ERROR RETURN
+        MOVEI   AC,22           ;CHECK REMOTE COMMAND
+        PUSHJ   P,VRFY1
+RCMND1: SETOM   ,REMOTE         ;SHOWS WANT REMOTE AT THIS POINT
+        MOVE    AC,USRLOC       ;GET CURRENT LOCATION WHATECER
+        MOVEM   AC,REQREM       ;SAVE IT
+        MOVEI   AC,2            ;SHOWS WANT REMOTE
+RCMND2: HRROI   AC1,777770      ;TO MASK OLD PRINT TYPE
+        ANDM    AC1,GDBUFF+3    ;MASK OLD TYPE OUT IF ANY
+        IORM    AC,GDBUFF+3     ;STORE IN NEW TYPE
+COPT2:  MOVE    AC,AC2          ;GET TERMINATOR
+        JRST    GOTOP2          ;GO CHECK IT
+RRTN:   CAIN    AC2,","         ;CHECK SEPERATOR
+        JRST    RCMND1          ;GOOD, PROCESS COMMAND
+        JRST    NOPTN           ;BAD OPTION
+;
+;       COME HERE TO CHECK FOR NUMBER OF LINES OPTION
+;
+LOPT:   MOVEI   AC10,LRTN       ;RETURN ERROR ADDRESS
+        MOVEI   AC,16           ;SHOWS WHICH COMMAND TO CHECK
+        PUSHJ   P,VRFY1
+        CAIE    AC2,12          ;CHECK TERMNATION CHARACTER
+        PUSHJ   P,GITVAL
+        JRST    NOPTN           ;ON BAD COMMAND
+LOPT1:  CAILE   AC,^D262143     ;CHECK FOR MAX
+        JRST    TOOLIN          ;TO MANY LINES TO INPUT
+        HRRM    AC,GDBUFF+5     ;STORE VALUE
+        MOVEM   AC,USRLPP	;STORE LINES PER PAGE
+;[103] **** Do not allow user settable LINES= to affect physical page
+;[103]	MOVEM   AC,MAXLIN	;STORE LINES PER PAGE ;(Comment out)
+LOPT2:  MOVE    AC,AC4          ;GET TERMINATION CHARACTER
+        JRST    OPTBLK+1        ;GO CHECK FOR MORE OPTIONS
+LRTN:   CAIN    AC2,75          ;CHECK FOR A =
+        PUSHJ   P,GETVL1
+        JRST    NOPTN
+        JRST    LOPT1           ;GO SAVE VALUE
+;
+;       PROCESS INDENT SUBCOMMAND
+;
+INDENT: MOVEI   AC10,INDRTN     ;ERROR RETURN
+        MOVEI   AC,27           ;COMMAND TO CHECK
+        HRRZS   ,GDBUFF+1       ;ZERO STORAGE
+        PUSHJ   P,VRFY1         ;GO VERIFY COMMAND
+        CAIE    AC2,12          ;SKIP ON TERMINATOR
+        PUSHJ   P,GITVAL        ;NO, GET VALUE
+        JRST    NOPTN           ;NO, VALUE SPECIFIED
+INDNT1: CAILE   AC,^D35         ;MAX INDENT IS 35
+        MOVEI   AC,^D35         ;IF TOO BIG, SET LIMIT
+        MOVEM   AC,SAVIND#      ;SAVE INDENT VALUE
+        JRST    LOPT2           ;GO DO NEXT COMMAND
+INDRTN: CAIN    AC2,"="		;CHECK DESIGNATOR
+        PUSHJ   P,GETVL1        ;GO GET VALUE
+        JRST    NOPTN           ;BAD VALUE
+        JRST    INDNT1          ;GO SAVE IT
+;
+;       CHECK FOR FORTRAN CARRIAGE CONTROL OPTION
+;
+FOPT:   PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIE    AC,"O"          ;CHECK O FOR FORTRN
+        JRST    FULL            ;GO CHECK FULLCH
+        MOVEI   AC10,FRTN       ;ERROR RETURN
+        MOVEI   AC,17           ;SHOWS TO CHECK FORTRAN COMMAND
+        PUSHJ   P,VRFY1
+FRNCMA: SETOM   FORTRN          ;SET FORTRAN FLAG
+        MOVE    AC5,AC2         ;SAVE TERMINATOR
+        MOVE    AC2,USRLPP      ;[111] GET MAX user LINES PER PAGE
+        PUSHJ   P,FORPGS
+        MOVE    AC2,AC5         ;GET TERMINATOR
+        MOVEI   AC,FTNMSK       ;GET FORTRAN FLAG
+        JRST    SAVMSK          ;GO SAVE IT
+FRTN:   CAIN    AC2,54          ;CHECK FOR COMMA TERMINATOR
+        JRST    FRNCMA          ;DO DO FORTRAN SAVE
+        JRST    NOPTN           ;BAD COMMAND
+;
+;       COME HERE TO GET PAGES FOR FORTRAN C/C
+;
+FORPGS: MOVE    AC,AC2          ;SAME
+        IDIVI   AC,2            ;GET MAX LINES HALF PAGE
+        MOVEM   AC,HALFP        ;SAVE FOR HALF PAGE
+        MOVE    AC,AC2          ;GET MAX LINES PER PAGE
+        IDIVI   AC,3            ;GET LINES THIRD PAGE
+        MOVEM   AC,THIRDP       ;STORE FOR A THIRD PAGE
+        MOVE    AC,AC2          ;GET MAX LINES PER PAGE
+        IDIVI   AC,6            ;GET LINES FOR SIXTH PAGE
+        MOVEM   AC,SIXTHP       ;STORE FOR A SIXTH PAGE
+        POPJ    P,
+;
+;       CHECK FOR FULL CASE OPTION
+;
+FULL:   MOVEI   AC10,FULRTN     ;ERROR RETURN
+        MOVEI   AC,30           ;COMMAND TO CHECK
+        PUSHJ   P,VRFY1         ;GO VERIFY COMMAND
+FULL1:  MOVEI   AC,FULMSK       ;FLAGS AS FULLCH
+        JRST    SAVMSK
+FULRTN: CAIN    AC2,","         ;CHECK SEPERATOR
+        JRST    FULL1           ;GOOD IF IT IS
+        JRST    NOPTN           ;BAD OPTION OTHERWISE
+;
+;       DOUBLE SPACING DESIRED
+;
+USRDBL: MOVEI   AC10,DRTN       ;FOR FAILURE
+        MOVEI   AC,24           ;TO CHECK DOUBLE
+        PUSHJ   P,VRFY1
+TWOBL1: MOVEI   AC,TWOMSK       ;TO MAKE DOUBLE
+        SETOM   ,TWOBLE
+SAVMSK: IORM    AC,GDBUFF+3     ;SAVE CURRENT MASK
+        JRST    COPT2           ;GO GET NEXT OPTION
+DRTN:   CAIN    AC2,","         ;LOOK FOR SEPERATOR
+        JRST    TWOBL1          ;OK, PROCESS COMMAND
+        JRST    NOPTN           ;CANT UNDERSTAND
+;
+;       COME HERE FOR TRANSFER COMMAND
+;
+DOXFER: MOVEI   AC10,XFER2      ;FOR ERROR RECOVERY
+        MOVEI   AC,26           ;COMMAND TO CHECK
+        PUSHJ   P,VRFY1
+XFER1:  HRLZI   AC,%TRAREQ      ;TRANSFER FLAG
+        IORM    AC,GDBUFF       ;SET TRANSFER FLAG
+        SETZM   NODFLG
+        JRST    COPT2           ;GET NEXT COMMAND
+XFER2:  CAIN    AC2,","         ;CHECK FOR SEPERATOR
+        JRST    XFER1           ;YES , GO ON
+        JRST    NOPTN           ;CANT GET THIS OPTION
+;
+;       COME HERE TO GET A NODE SPECIFIED
+;       SET REMOTE WANTED FLAG, AND GO GET PRINTER LOC. NO.
+;
+DONODE: MOVEI   AC10,NODE5      ;ERROR ADDRESS
+        MOVEI   AC,25           ;SHOWS TO CHECK NODE COMMAND
+        PUSHJ   P,VRFY1
+        CAIN    AC2,12          ;CHECK FOR TERMINATOR
+        JRST    NOPTN           ;BAD OPTION
+NODE1:  PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIN    AC,40           ;BLANK?
+        JRST    NODE1           ;SKIP BLANKS
+        CAIN    AC,"="          ;CHECK FOR DEFINER
+        JRST    NODE1           ;SKIP IT
+        MOVEI   AC4,1000        ;NODE DIVIDER
+        SETZ    AC3,            ;ZERO HOLDING AREA
+        MOVEI   AC1,4           ;TIMES TO MAKE CALL
+        PUSHJ   P,ASCOCT
+        SKIPA                   ;SKIP ON SOMETHING BAD
+        SOJG    AC1,.-2         ;KEEP IT UP TIL GOT GOOD ONE
+        SOJL    AC1,TRMNOD      ;GO WITH TERMINATOR
+        IDIVI   AC3,10          ;REDUCE NUMBER
+        JRST    .-2             ;RUDECE TO WHAT IT SHOULD BE
+TRMNOD: CAIGE   AC3,1000        ;SKIP IF WANTS REMOTE
+        MOVEI   AC3,1           ;ANYTHING ELSE MAKE CENTER
+        CAIE    AC,12           ;CHECK FOR TERMINATORS
+        CAIN    AC,15           ;SAME
+        JRST    NODE2           ;GO SAVE TERMINATOR
+;
+;       CHECK FOR "+" WHICH IS INDIRECT ROUTING (FOR TYMSHARE ONLY)
+;
+        CAIE    AC,40           ;BLANKS INDICATES NO INDIRECT
+        CAIN    AC,","          ;SAME FOR COMMA
+        JRST    NODE2           ;ASSUME AS IS
+        CAIE    AC,"+"          ;INDIRECT INTERNAL
+        JRST    NOPTN           ;WHAT WE GOT?
+        CAIE    AC3,1           ;SKIP IF GOING TO CENTER
+        ADDI    AC3,4000        ;ADJUST TO INTERNAL
+        PUSHJ   P,UPCASE        ;GET TERMINATOR
+NODE2:  PUSH    P,AC            ;SAVE TERMINATOR
+        MOVE    AC1,AC3         ;GET NODE SPECIFIED
+        SETZM   REMOTE          ;ZERO REMOTE INDICATOR
+        CAIL    AC1,1000        ;SKIP IF NOT REMOTE NODE
+        SETOM   REMOTE          ;SET REMOTE FLAG
+        PUSHJ   P,GETPRI        ;GET PRINT LOC
+        MOVEM   AC1,REQREM      ;SAVE PRINTER LOC.
+        MOVEM   AC1,NODFLG      ;SAVE FOR LATER
+        HRROI   AC,777000       ;TO RESET LOC. NO.
+        ANDM    AC,GDBUFF+4     ;ZERO OUT OLD NO.
+        IORM    AC1,GDBUFF+4    ;PUT IN NEW LOC. NO.
+        HRROI   AC,777770       ;TO RESET OLD WHERE TO PRINT
+        ANDM    AC,GDBUFF+3     ;RESET OLD OUT
+        MOVEI   AC,2            ;FOR REMOTE
+        SKIPN   REMOTE          ;SKIP IF HAVE REMOTE NODE
+        MOVEI   AC,1            ;ELSE FLAG AS CENTER
+        IORM    AC,GDBUFF+3     ;STORE TO REQUEST FOR REMOTE
+        POP     P,AC            ;RETURN TERMINATOR
+        JRST    GOTOP2          ;GO PROCESS IT
+NODE5:  CAIN    AC2,"="         ;CHECK FOR DESIGNATOR
+        JRST    NODE1           ;GO GET NODE NO.
+        JRST    NOPTN           ;BAD OPTION
+ASCOCT: CAIL    AC,"0"          ;MUST BE 0-7
+        CAILE   AC,"7"          ;MUST BE 7 OR LESS
+        POPJ    P,              ;BAD STUFF
+        SUBI    AC,60           ;REDUCE TO BINARY
+        IMUL    AC,AC4          ;INCREASE NUMBER TO NODE STANDARDS
+        ADDM    AC,AC3          ;ADD TO NODE NO. HOLDER
+        IDIVI   AC4,10          ;REDUCE DIVISOR
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR
+        AOS     (P)             ;GOOD RETURN
+        POPJ    P,
+;
+;       THIS ROUTINE WILL PICK UP THE REMAINING CHARACTERS,
+;       AND CREATE A BINARY NUMBER OF THE DATA
+;
+GITVAL: PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIN    AC,40           ;CHECK FOR PRE BLANKS
+        JRST    .-2             ;BYPASS BLANKS
+        CAIE    AC,75           ;CHECK FOR A =
+        JRST    DECPAS+1        ;ERROR RETURN
+GETVL1: PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIN    AC,40           ;CHECK FOR BLANKS
+        JRST    .-2             ;BYPASS BLANKS
+        MOVEI   AC5,6           ;MAX NUMBER CHARACTERS TO GET
+        SETZ    AC3,            ;ZERO RECEIVING AREA
+        MOVE    AC1,[POINT 6,AC3] ;POINT TO STORAGE AREA
+GETVL2: SUBI    AC,40           ;CONVERT TO SIXBIT
+        CAIG    AC,31           ;SEE IF GREATER THAN 9
+        CAIGE   AC,20           ;SEE IF LESS THAN 0
+        JRST    DECPAS+1        ;BAD COMMAND
+        SOJGE   AC5,.+2         ;JUMP IF MORE CAN COME
+        JRST    DECPAS+1        ;TOO MANY CHARACTERS
+        IDPB    AC,AC1          ;STORE CHARACTER
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIE    AC,54           ;CHECK FOR COMMA TERMINATOR
+        CAIN    AC,40           ;CHECK FOR BLANK
+        JRST    DECBIN          ;GO CONVERT TO BINARY
+        CAIN    AC,15           ;CHECK FOR CR
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIE    AC,12           ;CHECK FOR LF
+        JRST    GETVL2          ;GO STORE CHARACTER
+;
+;       CONVERT THE CHARACTER STRING TO A BINARY NUMBER AND RETURN
+;
+DECBIN: MOVE    AC4,AC          ;SAVE TERMINATOR
+        MOVE    AC1,AC3         ;GET THE VALUE TO BE CONVERTED
+        IMULI   AC5,6           ;NUMBER OF CHAR TO SHIFT OVER
+        MOVNS   ,AC5            ;MAKE NEGATIVE
+        HRLI    AC5,(LSH AC1,)  ;BUILD SHIFT INSTRUCTION
+        XCT     AC5             ;RIGHT JUSTIFY FIGURE
+        SETZ    AC,             ;ZERO BINARY RECEIVER
+        MOVEI   AC5,6           ;NO TIME TO CREATE NUMBER
+        MOVEI   AC3,1           ;INITIAL MULTIPLER
+DECBN1: JUMPE   AC1,DECPAS      ;DONT DO ANY OF THIS IF ZERO
+        LSHC    AC1,-6          ;GET FIRST DIGIT
+        LSH     AC2,-36         ;RIGHT JUSTIFY IT
+        SUBI    AC2,20          ;CONVERT TO DECIMAL
+        IMUL    AC2,AC3         ;CREATE BINARY NUMBER
+        ADD     AC,AC2          ;ADD TO RECEIVER
+        IMULI   AC3,12          ;CHANGE MULTIPLIER
+        SOJG    AC5,DECBN1      ;GO DO REST OF NUMBER
+DECPAS: AOS     (P)             ;ON GOOD RETURN
+        POPJ    P,              ;RETURN
+TOOCOP:
+        MOVEI   AC,COPTOO
+        SKIPA
+TOOLIN:
+        MOVEI   AC,LINTOO
+        PUSHJ   P,OUTLIN
+TOOLN1: SKIPN   CALSPL
+        JRST    OPNASK
+        JRST    PROMPT
+;
+;       CHECK FOR TRANSFER, IF SO, GET LOCATION
+;
+CHKTRA: SKIPN   AC1,NODFLG      ;SKIP IF NODE= STILL VALID
+        JRST    CHKTR1
+        PUSH    P,FONADR        ;SAVE FLAG
+        MOVEM   AC1,FONADR      ;TO START UP PRINTING
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/
+SPOOLING TO: /]
+        PUSHJ   P,PRIADR
+        POP     P,FONADR        ;GET FLAG BACK
+CHKTR1: MOVE    AC,GDBUFF
+        TLNN    AC,%TRAREQ      ;SKIP IF WANTS TRANSFER
+        JRST    DELAGN          ;GO GET DELIVERY MODE
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/TRANSFER LOCATION: /]
+        MOVE    AC1,[POINT 7,GDBUFF+22]
+        MOVEI   AC2,^D24        ;MAX 24 CHARACTERS
+        PUSHJ   P,UPCASE        ;GET CHAR
+        CAIN    AC,40           ;LEADING BLANKS?
+        JRST    .-2             ;BYPASS THEM
+        CAIN    AC,"?"          ;QUERRY
+        JRST    TRAHOW          ;GO TELL HOW
+TRAFR1: CAIN    AC,15           ;TERMINATOR
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIN    AC,12           ;FINAL TERMINATOR?
+        JRST    ENDXFR          ;END OF DATA
+        SOJL    AC2,ENDXF9      ;TOO MUCH DATA
+        IDPB    AC,AC1          ;STORE TO REQ.
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR
+        JRST    TRAFR1          ;GO PROCESS IT
+ENDXFR: CAIN    AC2,^D24        ;GET ANYTHING
+        JRST    CHKTRA          ;NO, GO ASK AGAIN
+        IDPB    AC,AC1          ;SAVE LF
+        JRST    DELAGN          ;GO GET DELIVERY MODE
+ENDXF9: MOVEI   AC,TRA024
+        SKIPA
+TRAHOW: MOVEI   AC,HOWTRA
+        PUSHJ   P,OUTLIN
+ENDXF8: PUSHJ   P,LFPASS
+        SKIPN   CALSPL
+        JRST    CHKTRA          ;GO ASK AGAIN
+        JRST    PROMPT
+;
+DELAGN:
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/DELIVER BY: /]
+        PUSHJ   P,UPCASE        ;GET RESPONSE
+        CAIN    AC,40           ;CHECK FOR A BLANK
+        JRST    .-2             ;BYPASS ALL BLANKS
+        CAIE    AC,77           ;CHECK FOR A QUERRY
+        JRST    GOTDEL          ;GO PROCESS DELIVERY MODE
+        MOVEI   AC,MAILMOD
+        PUSHJ   P,OUTLIN
+        SKIPN   ,TYMSHR         ;SKIP FOR TYMSHARE
+        JRST    DELGN1          ;NON-TYM DOESNT GET OFFICE
+        MOVEI   AC,OFFMOD
+        PUSHJ   P,OUTLIN
+DELGN1: PUSHJ   P,LFPASS
+        JRST    DELAGN          ;GO ASK AGAIN
+GOTDEL: MOVEI   AC10,HUH        ;PUT IN ERROR RETURN ADDRESS
+        CAIN    AC,115          ;CHECK FOR M OF MAIL
+        JRST    MDEL            ;PROCESS AS MAIL DELIVERY
+        CAIN    AC,"P"          ;CHECK FOR P OF PICKUP
+        JRST    HDEL            ;PROCESS AS HOLD
+        CAIN    AC,103          ;CHECK FOR C FOR COURIER
+        JRST    CDEL            ;PROCESS AS COURIER
+        CAIN    AC,123          ;CHECK FOR S FOR SPECIAL DEL.
+        JRST    SDEL            ;PROCESS AS SPECIAL DELIVERY
+        CAIN    AC,101          ;CHECK FOR A FOR AIR
+        JRST    ADEL            ;PROCESS AS AIR
+        SKIPN   ,TYMSHR         ;SKIP IF TYMSHARE
+        JRST    HUH             ;NON-TYMSHARE NO FURTHER
+        CAIN    AC,"O"          ;CHECK FOR OFFICE
+        JRST    OFCDEL          ;GO CHECK FOR OFFICE
+;
+;       ERROR MESSAGE IF COMMAND WASNT RECOGNIZED
+;
+HUH:
+        MOVEI   AC,WHAT
+        PUSHJ   P,OUTLIN
+        SKIPN   CALSPL
+        JRST    DELGN1          ;GO ASK AGAIN
+        JRST    PROMPT
+MDEL:   MOVEI   AC,0            ;SHOWS TO CHECK FOR MAIL
+        JRST    ADRLOP          ;GO VERIFY COMMAND
+HDEL:   MOVEI   AC,1            ;SHOWS TO CHECK FOR HOLD COMMAND
+        SETOM   ,FONADR         ;TO GIVE PICKUP ADDRESS
+        JRST    ADRLOP          ;GO VERIFY COMMAND
+CDEL:   MOVEI   AC,2            ;SHOWS TO CHECK FOR COURIER COMMAND
+        JRST    ADRLOP          ;GO VERIFY COMMAND
+SDEL:   MOVEI   AC,3            ;SHOWS TO CHECK FOR SPECIAL COMMAND
+        JRST    ADRLOP          ;GO VERIFY COMMAND
+OFCDEL: MOVEI   AC,6            ;TO CHECK FOR OFFICE
+        JRST    ADRLOP          ;GO VERIFY COMMAND
+ADEL:   PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIE    AC,111          ;CHECK FOR I IN AIR
+        JRST    HUH             ;CNAT UNDERSTAND COMMAND
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR
+        CAIE    AC,122          ;CHECK FOR R IN AIR
+        JRST    HUH             ;CANT UNDERSTAND COMMAND
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR
+        CAIE    AC,40           ;CHECK FOR A BLANK
+        JRST    HUH             ;CANT UNDERSTAND COMMAND
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIE    AC,105          ;CHECK FOR E FOR AIR EXPRESS
+        JRST    HUH             ;CANT UNDERSTAND COMMAND
+        MOVEI   AC,5            ;SHOWS TO CHECK FOR AIR EXPRESS
+ADRLOP: PUSHJ   P,VRFY          ;VERIFY CMD
+;
+;       COME HERE TO GET PICKUP ADDRESS AND GIVE TO USER
+;
+
+        PUCHL= 12               ;CHANNEL FOR READ FILE
+
+PICLOC: SKIPE   AC1,REQREM      ;GET REMOTE NO. IF ANY
+        JRST    GOTLOC          ;BR. IF HAVE ONE
+        MOVE    AC1,SITENO      ;GET SITE DESIGNATOR
+        HRROI   AC,777000       ;TO MASK OFF OLD LOC.
+        ANDM    AC,GDBUFF+4     ;DO IT
+        IORM    AC1,GDBUFF+4    ;RESET POINTER LOC.
+GOTLOC: MOVE    AC,GDBUFF       ;GET TRANSFER FLAG WD.
+        TLNN    AC,%TRAREQ      ;SKIP IF TRANSFER REQ.
+        JRST    ADROUT          ;GO PUT OUT ADDRESS
+        SKIPN   ,FONADR         ;SKIP IF HOLD FOR PICKUP
+        JRST    ADROUT          ;NO, THEY GO PUT OUT
+        SETZM   ,FONADR         ;ZERO, SO NOTHING OUT
+        MOVEI   AC,LATPIC
+        PUSHJ   P,OUTLIN
+ADROUT: PUSHJ   P,PRIADR        ;GO PUT OUT
+        MOVEM   AC1,FONADR+1    ;SAVE ADDRESS OF PHONE
+        HLRZ    AC,GDBUFF+5     ;GET DELIVERY MODE
+        ANDI    AC,700          ;SAME
+        LSH     AC,-6           ;SAME
+        CAIE    AC,1            ;FOR PICKUP GO GET SPECIAL INST.
+        CAIN    AC,6            ;FOR INTEROFFICE GET SPECIAL INST.
+        JRST    SINST           ;GET SPECIAL INSTRUCTIONS
+        JRST    ADDRES          ;ELSE GET DELIVERY ADDRESS
+;
+;       GET ADDRESS AND PUT IT OUT
+;
+PRIADR: MOVEM   AC1,AC5         ;SAVE LOC POINTER
+        OPEN    PUCHL,FFIL      ;GET PICKUP CHANNEL
+        JRST    INERR1          ;CANT GET CHANNEL
+        MOVE    AC,SPLGAN       ;GET SPOOLERS PPN
+        MOVEM   AC,PRILOC+3     ;STORE FOR LOOKUP
+        LOOKUP  PUCHL,PRILOC    ;GET PICKUP FILE
+        JRST    LOCER1          ;CANT FIND FILE
+        ADDI    AC1,2           ;TO GET BLK TO READ
+        IDIVI   AC1,2           ;SHOW WHAT BLK TO READ
+        USETI   PUCHL,@AC1      ;SET INPUT POINTER
+        IN      PUCHL,          ;READ BLK IN
+        SKIPA                   ;SKIP ON GOOD READ
+        JRST    LOCER2          ;TROUBLE INPUTTING FILE
+;
+;       DETERMINE WHICH HALF OF BLK TO READ
+;
+        SKIPE   ,AC2            ;0 MEANS READ 1ST HALF
+        MOVEI   AC2,100         ;NOT ZERO MEANS READ SECOND HALF
+        ADDI    AC2,1           ;TO ADJUST FOR POINTER
+        HRRZ    AC1,FILBLK+1    ;GET POINTER
+        ADDB    AC1,AC2         ;CREATE ADDRESS TO START READ
+        MOVE    AC,@AC1         ;GET PRI. LOC. NO.
+        CAME    AC,AC5          ;MAKE SURE HAVE RIGHT ADDRESS
+        JRST    LOCER3          ;GOT WRONT ADDRESS
+        MOVE    AC1,[POINT 6,AC1] ;TO PICK UP DATA
+        ADD     AC1,AC2         ;SET WD. POINTER
+;
+;       PUT OUT ADDRESS FOR PICKUP
+;
+        MOVEI   AC4,^D60        ;NO. CHAR. TO LINE
+        MOVEI   AC5,4           ;NO. LINES TO DO
+        SETZ    AC3,            ;ZERO SPACE COUNTER
+        MOVEI   AC,PICKUP
+        SKIPGE  FONADR          ;SKIP FOR NODE ADDRESS
+        PUSHJ   P,OUTLIN        ;PUT IT OUT
+TAB11:  SKIPN   ,FONADR         ;SKIP TO DO ADDRESS
+        JRST    TAB1            ;ELSE GO ON
+        MOVEI   AC,TYMINC       ;TYMSHARE HEADER
+        SKIPN   LOKHED          ;SKIP IF THIS LOCKHEED
+        PUSHJ   P,OUTLIN        ;PUT OUT HEADER
+TAB1:   ILDB    AC,AC1          ;GET A CHAR.
+        JUMPE   AC,TAB2         ;BR. IF A SPACE
+        SKIPE   ,AC3            ;SKIP IF NO SPACES TO DO
+        JRST    TABOUT          ;GO PUT OUT SPACES
+TAB4:   ADDI    AC,40           ;CONVERT TO ASCII
+        SKIPE   FONADR          ;SKIP IF NO OUT ADDRESS
+        PUSHJ   P,CHROUT        ;PUT OUT ADDRESS
+TAB3:   SOJG    AC4,TAB1        ;SEE IF ENTIRE LINE OUT YET
+        MOVEI   AC4,^D60        ;RESET NO. CHAR. TO LINE
+        SETZ    AC3,            ;RESET SPACE COUNTER
+        MOVEI   AC,CRLF         ;GET CR,LF
+        SKIPE   FONADR          ;SKIP IF NO PUT OUT
+        PUSHJ   P,OUTLIN        ;PUT IT OUT
+TAB22:  SOJG    AC5,TAB1        ;SEE IF MORE LINES TO DO
+        POPJ    P,
+TAB2:   ADDI    AC3,1           ;ADJUST FOR SPACES
+        JRST    TAB3            ;GO SEE IF LINE DONE YET
+TABOUT: PUSH    P,AC            ;SAVE AC
+        MOVEI   AC,40           ;GET SPACE TO DO
+        SKIPE   FONADR          ;SKIP IF NO PUT OUT
+        PUSHJ   P,CHROUT        ;PUT IT OUT
+TAB23:  SOJG    AC3,TABOUT+1    ;PUT OUT ALL SPACES
+        POP     P,AC            ;RETURN AC
+        JRST    TAB4            ;DO CURRENT CHARACTER
+;
+;       GET MAILING ADDRESS FOR OUTPUT
+;
+ADDRES:
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/TYPE ADDRESS TO CONTROL-D
+/]
+        PUSHJ   P,UPCASE        ;GET RESPONSE
+        CAIN    AC,40           ;CHECK FOR BLANK
+        JRST    .-2             ;BYPASS ALL BLANKS
+        SETZ    16,             ;FLAG SHOWING WHERE TO GET DATA
+        CAIN    AC,"@"          ;FILE INPUT INDICATOR?
+        JRST    ADRFIL          ;SET UP INPUT FILE
+        CAIE    AC,77           ;CHECK FOR QUERRY
+        JRST    GOTADR          ;GO PROCESS ADDRESS
+        MOVEI   AC,ADREXP
+        PUSHJ   P,OUTLIN
+ADRAGN: CLRBFI
+        JRST    ADDRES          ;GO ASK FOR ADDRESS AGAIN
+GOTADR: MOVEI   AC2,6           ;MAX. LINE INPUT
+        MOVEI   AC3,^D39        ;MAX. CHAR. PER LINE
+        SETZ    AC5,            ;CHAR. COUNTER
+        MOVE    AC1,[POINT 6,GDBUFF+40] ;STORAGE POINTER
+        SKIPE   ,16             ;SKIP IF NOT FROM FILE
+        JRST    CHRADR          ;GET FIRST CHAR OF FILE
+MORADR: CAIE    AC,36           ;SPECIAL TERMINATOR
+        CAIN    AC,4            ;CONTROL-D?
+        JRST    ADRCHK          ;SEE IF HAVE ANYTHING
+        CAIN    AC,15           ;CHECK FOR CR.
+        JRST    CHRADR          ;GET A CHARACTER
+        CAIN    AC,12           ;END OF LINE?
+        JRST    EOL             ;PROCESS IT
+        SOJL    AC3,TOOADR      ;LINE TOO BIG, GIVE MESSAGE
+        SUBI    AC,40           ;REDUCE TO SIXBIT
+ADRCHR: IDPB    AC,AC1          ;SAVE IT
+        ADDI    AC5,1           ;INCREASE CHARACTER COUNT
+CHRADR: SKIPE   ,16             ;SKIP IF NORMAL INPUT
+        JRST    CHRAD1          ;GET INPUT FROM FILE
+        PUSHJ   P,UPCASE        ;GET A CHAR.
+        JRST    MORADR          ;GO PROCESS IT
+CHRAD1: SOSGE   FILBLK+2        ;BUFFER EMPTY?
+        JRST    CHRAD2          ;REFILL IT
+        ILDB    AC,FILBLK+1     ;GET A CHAR.
+        JUMPE   AC,CHRAD1       ;IGNORE NULLS
+        JRST    MORADR          ;PROCESS IT
+CHRAD2: IN      ADRCHL,         ;READ NEXT BLK
+        JRST    CHRAD1          ;PROCESS IT
+        STATZ   ADRCHL,340000   ;CHECK FOR EOF
+        JRST    INERR2
+        JRST    ADRCHK          ;CHECK IF ANY INPUT
+EOL:    SOJL    AC2,TOOADR      ;TOO MANY LINES
+        MOVEI   AC3,^D39        ;RESET LINE CHAR. COUNT
+        SKIPN   AC2             ;SEE IF ANY MORE EXPECTED
+        SETZ    AC3,            ;BUFFER FULL, NEXT MUST BE CONT-D
+        MOVEI   AC,76           ;FOR LF
+        JRST    ADRCHR          ;STORE IT, GET NEXT
+ADRCHK: JUMPE   AC5,ADDRES      ;NOTHING INPUT
+        MOVEI   AC,77           ;END OF FIELD FLAG
+        CAIGE   AC5,^D240       ;BUFFER FULL?
+        IDPB    AC,AC1          ;NO, FLAG AS END
+        JRST    SINST           ;GET SPECIAL INSTRUCTIONS
+TOOADR:
+        MOVEI   AC,ADRTOO
+        PUSHJ   P,OUTLIN
+        SETZ    AC,             ;ZERO FOR CLEANING BUFFER
+        MOVEI   AC1,47          ;MAX LENGTH OF BUFFER
+        MOVEM   AC,GDBUFF+40(AC1)  ;ZERO BUFFER
+        SOJGE   AC1,.-1         ;CONTINUE TO ZERO
+        JRST    ADRAGN          ;GO ASK FOR ADDRESS AGAIN
+ADRFIL: PUSHJ   P,BYPAS1        ;GET USERNAME AND FILE
+        OPEN    ADRCHL,FFIL     ;GET A CHANNEL
+        JRST    INERR1
+        SKIPN   AC1,FLIST+2
+        JRST    ADRFL1
+        MOVEI   AC1,FLIST+2     ;ADDRESS OF USERNAME
+        MOVEM   AC1,GETGAN+1    ;GET PPN
+        LOOKUP  ADRCHL,GETGAN   ;DO IT
+        JFCL
+        CAMN    AC1,GETGAN+1    ;SEE IF GOT SOMETHING
+        JRST    BADADR          ;ADR FILE NOT THERE
+        MOVE    AC1,GETGAN+1    ;GET PPN
+        MOVEM  AC1,FLIST+3
+ADRFL1: HLLZS   FLIST+1
+        LOOKUP  ADRCHL,FLIST
+        JRST    BADADR
+        SETO    16,
+        JRST    GOTADR          ;PROCESS FILE
+BADADR: MOVEI   AC,ADRMIS
+        PUSHJ   P,OUTLIN
+        JRST    ADRAGN
+;
+;       COME HERE AND ASK FOR SPECIAL INSTRUCTIONS
+;
+SINST:
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/
+ADDITIONAL DELIVERY INST. TO CONT-D: /]
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIN    AC,40           ;CHECK FOR BLANKS
+        JRST    .-2             ;BYPASS ALL BLANKS
+        CAIE    AC,77           ;CHECK FOR QUERRY
+        JRST    GOTINS          ;GO PROCESS SPECIAL INST.
+        MOVEI   AC,DELQUS
+        PUSHJ   P,OUTLIN
+SPIAGN: CLRBFI
+        JRST    SINST           ;GO ASK AGAIN
+GOTINS: MOVE    AC3,[POINT 7,GDBUFF+110] ;POINT TO DATA
+        CAIE    AC,36           ;SPECIAL CONTROL-D
+        CAIN    AC,4            ;CHECK FOR CONTROL-D
+        JRST    FRMEND          ;IF CONTROL-D, GO NO FURTHER
+        CAIN    AC,15           ;CHECK FOR CR
+        PUSHJ   P,UPCASE        ;GET LF
+        CAIN    AC,12           ;CHECK FOR LINEFEED
+        JRST    FRMEND          ;GO NO FURTHER
+        MOVEI   AC1,213         ;MAX. SPECIAL MESSAGE LENGTH
+GOTIN1: SOJL    AC1,TOOINS      ;BR. IF TOO MUCH INST.
+        IDPB    AC,AC3          ;STORE INSTRUCTIONS
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIE    AC,4            ;CHECK FOR CONTROL-D
+        CAIN    AC,36           ;CHECK SPECIAL CONT-D
+        SKIPA                   ;IF 4 OR 36
+        JRST    GOTIN1          ;SEARCH TIL HAVE IT
+FRMEND: MOVEI   AC,4            ;SET UP CONTROL-D
+        IDPB    AC,AC3          ;STORE CONTROL D
+        SETZM   BATCHN          ;ZERO NUMBER AREA
+        SETZM   ERRCNT#
+        JRST    ZROBUF          ;GO GET FILES TO SPOOL
+TOOINS:
+        MOVEI   AC,INSTOO
+        PUSHJ   P,OUTLIN
+        SKIPE   CALSPL
+        JRST    PROMPT
+        SETZ    AC,             ;ZERO OUT AC FOR BUFFER
+        MOVEI   AC1,33          ;LENGTH OF MESSAGE BUFFER
+        MOVEM   AC,GDBUFF+110(AC1) ;ZERO OUT BUFFER
+        SOJGE   AC1,.-1         ;CONTINUE TO ZERO
+        MOVEI   AC1,1           ;SLEEP IT OFF
+        SLEEP   AC1,            ;SLEEP 
+        JRST    SPIAGN          ;GO ASK FOR INSTRUCTIONS AGAIN
+;
+;       PURPOSE IS TO VERIFY THE COMMAND AND SAVE A MESSAGE
+;       FOLLOWING IT TIL A CR. OR LF IS FOUND
+;
+VRFY:   LSH     AC,^D24         ;SHIFT CODE FOR STORING
+        HRLOI   AC1,777077      ;GET MASK FOR WD.
+        ANDM    AC1,GDBUFF+5    ;ZERO STORAGE AREA
+        IORM    AC,GDBUFF+5     ;STORE IN BUFFER AREA
+        LSH     AC,-^D24        ;RETURN CODE
+VRFY1:  MOVE    AC8,AC          ;SAVE VALUE FOR LATER
+        MOVE    AC7,CMDLEN(AC8)  ;GET LENGTH OF COMMAND
+        IMULI   AC,2            ;CREATE COMMAND NAME INDEX TO TABLE
+        MOVE    AC1,[POINT 7,CMDTAB] ;GET POINTER TO COMMAND TABLE
+        ADD     AC1,AC          ;ADJUST POINTER TO CORRECT PLACE
+        ILDB    AC2,AC1         ;BYPASS FIRST CHARACTER
+VRFYCK: PUSHJ   P,UPCASE        ;GET NEXT CHAR FROM INPUT
+        CAIN    AC,40           ;CHECK FOR BLANKS
+        JRST    VRFYRN
+        CAIN    AC,15           ;CHECK FOR CARRIAGE RETURN
+        PUSHJ   P,UPCASE        ;GET THE LF
+        CAIN    AC,12           ;CHECK FOR A LINE FEED
+        JRST    VRFYRN
+VRFYCN: ILDB    AC2,AC1         ;GET CHARACTER FROM COMMAND TABLE
+        CAIL    AC,140          ;SKIP IF UPPER CASE
+        SUBI    AC,40           ;REDUCE LOWER TO UPPER
+        CAME    AC,AC2          ;SEE IF CHARACTERS MATCH
+        JRST    VRFYXX          ;CANT UNDERSTAND COMMAND
+        SOJG    AC7,VRFYCK      ;BR. IF MORE CANT BE PROCESSES
+        PUSHJ   P,UPCASE        ;GET NEXT INPUT CHAR.
+        CAIN    AC,40           ;CHECK FOR A BLANK
+        JRST    VRFYRN
+        CAIN    AC,15           ;CHECK FOR CARRIAGE RETURN
+        PUSHJ   P,UPCASE        ;GET LF
+        CAIE    AC,12           ;CHECK LF
+        JRST    VRFYXX          ;CANT UNDERSTAND COMMAND
+VRFYRN: MOVE    AC2,AC          ;GET LAST CHAR.
+        POPJ    P,
+VRFYXX: POP     P,AC2           ;GET RETURN ADDRESS
+        MOVE    AC2,AC          ;GET LAST CHAR
+        JRSTF   @AC10           ;RETURN
+;
+;       TABLE USED BY VRFY TO VERIFY COMMANDS
+;	Note: *** UNDER "NO" CIRCUMSTANCES should the order of this
+;	      *** list be changed.  All indicies into this table are
+;	      *** 'hard-wired' and would require extensive searching
+;	      *** to insure that you didn't "MISS" one.
+;
+CMDTAB: ASCIZ/MAIL  /
+        ASCIZ/PICKUP /
+        ASCIZ/COURIER/
+        ASCIZ/SPECIAL/
+        ASCIZ/MAIL  /
+        ASCIZ/EXPRESS/
+        ASCIZ/OFFICE /
+        ASCIZ/MALL   /
+        ASCIZ/LARGE  /
+        ASCIZ/BIG    /
+        ASCIZ/TTY    /
+        ASCIZ/PECIAL/
+        ASCIZ/HEAD   /
+        ASCIZ/OPIES  /
+        ASCIZ/LINES /
+        ASCIZ/ORTRAN/          ;FORTRAN SWITCH
+        ASCIZ/FORM   /
+        ASCIZ/ENTER  /
+        ASCIZ/REMOTE /
+        ASCIZ/TAPE   /
+        ASCIZ/DOUBLE/
+        ASCIZ/NODE  /
+        ASCIZ/TRANSFER/
+        ASCIZ/INDENT/
+        ASCIZ/ULLCH /           ;FULLCH SWITCH
+        ASCIZ/QUEST /
+        ASCIZ/WHITE/
+CMDLEN: OCT 3,5,6,6,3,6,5,3,4,2,2,5,3,4,4,5,3,4,5,3,5,3,7,5,4,4,4;LENGTH OF COMMAND - 1
+;       PURPOSE OF THIS ROUTINE IS TO ACCEPT AN INPUT STRING OF
+;       CHARACTERS FROM A TTY.  THIS STRING IS TO SPECIFY IN SOME
+;       MANNER A LIST OF FILES THAT THE USER WISHES TO BE PRINTED.
+;
+;       ACCUMULATOR ASSIGNMENTS
+;
+        AC=  	0
+        FILE= 	1	;CONTAINS MAX. NO. OF CHAR. IN FILE NAME
+        EXT= 	2       ;CONTAINS MAX NO. OF CHAR. IN EXT. NAME
+        USRC= 	3       ;CONTAINS MAX. NO. OF CHAR. IN USER-NAME
+        FFLAG= 	4       ;FILE FLAG
+        EFLAG= 	5       ;EXTENSION FLAG
+        FCNT= 	6       ;FILE COUNTER
+        AC7= 	7       ;EXTRA ACCUMULATOR
+        INDEX= 10       ;CONTAINS ADDR. OF FILE STORE AREA
+        FROM= 11        ;INDICATES IF FILES ARE TO BE TAKEN
+                        ;FROM A COMMANDS FILE
+        ERRCHR==16      ;HOLD ERROR CHAR ON PARSING
+;
+;       ZERO OUT A BLOCK AREA WHICH WILL CONTAIN A LIST OF ALL
+;       FILES TO BE PROCESSED
+;
+PARSE:  MOVNI   AC,MAXFIL       ;SET THE BUFFER COUNT OF FILES
+        HRLZM   AC,FCOUNT       ;STORE COUNTER
+;
+        MOVE    AC,FCOUNT
+        MOVEM   AC,SAVFCO#
+        SETZB   FROM,SAVFCN#    ;ZERO CMD FILE AND FILE COUNT
+        SETZB   FFLAG,INDEX     ;ZERO LIST INDEX AND FILE FLAG
+;
+;	IF we are GATHERING STATISTICS
+;
+ifn FTSTAT,<
+	SETZM	DEB$0		;[114]
+	SETZM	DEB$1		;[114]
+	SETZM	DEB$2		;[114]
+	SETZM	DEB$3		;[114]
+	SETZM	DEB$4		;[114]
+	SETZM	DEB$5		;[114]
+	SETZM	DEB$6		;[114]
+	SETZM	DEB$7		;[114]
+	SETZM	DEB$8		;[114]
+	SETZM	DEB$9		;[114]
+
+	> ; End ifn FTSTAT
+;
+;       SEND OUT REQUEST FOR A LIST OF FILES
+;
+REQST:
+        SKIPN   CALSPL
+        OUTSTR  [ASCIZ/
+ENTER FILES: 
+/]
+        MOVE    AC,SAVFCO
+        MOVEM   AC,FCOUNT
+        MOVE    FCNT,SAVFCN	; RESTORE IN CASE OF ERROR
+        SETZ    INDEX,
+        PUSHJ   P,UPCASE        ;GET FIRST CHAR.
+        CAIN    AC,"?"          ;QUERRY?
+        JRST    QUERRY          ;TELL EM HOW
+        PUSHJ   P,BYPAS1        ;GET STRING
+        JRST    PROCES          ;GO PROCESS STRING
+;
+;       BYPASS ANY BLANKS, LINE FEEDS, CARRIAGE RETURNS OR COMMAS
+;       TIL A GOOD CHAR IS FOUND
+;
+BYPAS:  PUSHJ   P,UPCASE        ;GET A CHAR.
+BYPAS1: CAILE   AC,40           ;SEE IF TO SKIP THIS
+        CAIN    AC,","          ;SKIP THIS ALSO
+        JRST    BYPAS           ;IT WAS A CR, THUS BYPASS
+;
+;       ANY OTHER CHAR. WILL NOW BE BELIEVED TO BE A VALID FILE NAME
+;       CHAR.  IF IT IS A PERIOD,THIS WILL INDICATE A SPECIAL
+;       COMMAND.  IF IT IS A LEFT PAREN, IT WILL INDICATE A USER NAME.
+;
+;       NEXT TWO INST. ARE CONDITIONAL.  THEY ALLOW A .ALL
+;       COMMAND TO BE PERFORMED
+;       THE VARIABLE 'ALL' MUST BE CHANGED TO 0 TO ASSEMBLE
+;
+IFE %ALL,<
+        CAIN    AC,56           ;CHECK FOR A PERIOD
+        JRST    PERIOD          ;GO DO ALL COMMAND
+	>
+
+PNCHK:  CAIN    AC,"@"          ;CHECK FOR COMMAND FILE
+        JRST    FCMND           ;GO DO COMMAND FILE
+        CAIN    AC,"("          ;CHECK FOR USER NAME SPEC.
+        JRST    USERN           ;GO PULL OUT USER NAME AND SAVE IT
+;
+;       AT THIS POINT, THE CHAR. IN QUESTION WILL BE CONSIDERED 
+;       TO BE THE FIRST CHAR. OF THE FILE NAME.  ROUTINE WILL TAKE 
+;       UP TO 6 CHAR. FOR THE FILE NAME AND IF THERE ARE MORE, IT
+;       WILL CONTINUE TO BYPASS ALL OTHER CHARS. TIL A PERIOD OR ONE
+;       OF THE SPECIAL FILE END
+;       CHARACTERS. (COMMA, BLANK, LF OR CR) ARE FOUND
+;
+;       SET THE COUNTERS AS TO MAX. NO. OF CHARS. ALLOWED IN THE
+;       FILE NAMES AND EXTENSION.
+;
+        MOVEI   FILE,6          ;6 CHAR. MAX FOR FILE NAME
+        MOVEI   EXT,3           ;3 CHAR. MAX FOR EXTENSION NAME
+;
+;       SET POINTERS FOR WHERE TO BEGIN STORING THE FILE NAME,
+;       THE EXTENSION NAME AND THE USER NAME
+;
+        PUSHJ   P,RESPTR        ;RESTORE POINTERS
+;
+        SETZB   ERRCHR,NAME     ;ZERO CHR HOLDER AND NAME AREA
+;
+;
+;       NOW CALL THE CONVERSION ROUTINE TO CONVERT THE CHAR FROM
+;       7 BIT ASCII TO 6 BIT.  ROUTINE WILL NOW RETURN IF AN
+;       ILLEGAL 6 BIT CHAR WAS CREATED.  STORE THE CHAR. IF IT 
+;       WAS CONVERTED OK, THEN GET NEXT ONE TO CHECK, AND CONTINUE
+;       TIL A SPECIAL CHAR. IS FOUND
+;
+CNVRT:SOJL      FILE,GETN       ;SEE IF WE ALREADY HAVE 6 CHAR FOR FILE
+        SUBI    AC,40           ;CONVERT TO SIXBIT
+        IDPB    AC,PNTF         ;STORE THE 6 BIT CHAR OF THE FILE NAME
+        MOVEI   FFLAG,1         ;SET FLAG TO SHOW FILE BEING PROCESSED
+GETN:   PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+;
+;       LABEL URTN IS RETURN FROM PROCESSING A USER NAME WITHIN PARENS
+;
+;       BEGIN CHECKING NEXT CHAR. FOR A COMMA, LF, CR OR PERIOD.
+;       COMMA, LF OR CR INDICATE ENDING OF THIS FILE.  PERIOD
+;       SHOWS AN EXTENSION NAME FOLLOWS.
+;
+URTN:   CAIE    AC,012          ;CHECK FOR A LINE FEED
+        JRST    URTN1           ;NO, GO CHECK ANOTHER THEN
+        SKIPN   CALSPL
+        OUTSTR  CR              ;DO A CR
+        JRST    NAMEO           ;JMP, SHOWS NAME ONLY FILE
+URTN1:  CAIE    AC,054          ;CHECK FOR A COMMA
+        CAIN    AC,40           ;CHECK FOR BLANK
+        JRST    NAMEO           ;BLANK SHOW END OF FILE SPEC.
+        CAIE    AC,"/"          ;CHECK COPIES SWITCH
+        JRST    URTN2           ;NO, THEN SKIP
+        PUSHJ   P,GETCOP        ;GO GET COPIES
+        SKIPE   ERRCHR          ;SKIP IF NO ERROR
+        JRST    NAMEO           ;NAME ONLY
+        JRST    URTN            ;LOOK FOR SEPERATOR
+URTN2:  CAIE    AC,015          ;A CR, REQUIRES SPECIAL CHECKING
+        JRST    PCHK            ;JUMP TO CONTINUE CHECKING
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+;
+;       COME HERE IF A CR WAS FOUND.  IT SHOWS THAT THER IS
+;       NO MORE FILE INPUT.
+;
+        MOVE    AC,NAME         ;GET FILE NAME
+        MOVEM   AC,FLIST(INDEX) ;SAVE THE FILE NAME
+        JRST    ENDLST          ;GO UPDATE COUNT
+;
+;       CONTINUE CHECKING FOR A PERIOD.  IF FOUND, THIS
+;       INDICATES EXTENSION, IF NOT THEN GO GET ANOTHER NAME CHAR.
+;
+PCHK:   CAIE    AC,056          ;CHECK FOR A PERIOD
+        JRST    CNVRT           ;GO CONVERT MORE FILE NAME CHARS.
+        MOVE    AC,NAME         ;GET THE CONVERTED FILE NAME
+        MOVEM   AC,FLIST(INDEX) ;SAVE THE FILE NAME
+        SETZB   EFLAG,EXTN      ;ZERO FLAG AND STORAGE
+        MOVEI   AC,2000         ;FOR POSSIBLE COMMAND FILE EXT.
+        SKIPE   ,FLIST+1(INDEX) ;SKIP IF NOT COMMAND FILE
+        MOVEM   AC,FLIST+1(INDEX) ;RESET FOR EXT. SPECIFIED
+;
+;
+;       BEGIN PROCESSING THE EXTENSION NAME.  IT IS TERMINATED BY A
+;       LF, CR OR COMMA.  ONLY 3 CHARS. ARE ACCEPTED FOR THE EXTENSION.
+;       ALL OTHERS ARE BYPASSED TILL A TERMINATING CHAR IS FOUND
+;
+GEXT:   PUSHJ   P,UPCASE        ;GET NEXT EXT. CHAR.
+        CAIE    AC,12           ;CHECK FOR A LF
+        JRST    GEXT1           ;GO CHECK FOR ANOTHER CHAR
+        SKIPN   CALSPL
+        OUTSTR  CR              ;DO A CARRIAGE RETURN
+        JRST    ECHK            ;GO SEE IF THERE WAS AN EXT.
+GEXT1:  CAIE    AC,054          ;CHECK FOR A COMMA
+        CAIN    AC,40           ;CHECK FOR BLANK
+        JRST    ECHK            ;SHOWS END OF SPECIFICATION
+        CAIE    AC,"/"          ;CHECK COPIES SWITCH
+        JRST    GEXT2           ;NO, SKIP THEN
+        PUSHJ   P,GETCOP        ;GET COPIES
+        SKIPE   ERRCHR          ;SKIP IF NO ERROR
+        JRST    ECHK            ;END OF FILE
+        JRST    GEXT+1          ;CHECK TERMINATOR
+GEXT2:  CAIN    AC,015          ;CHECK FOR A CARRIAGE RETURN
+        JRST    CRCHK           ;SPECIAL BRANCH
+        SOJL    EXT,GEXT        ;HAVE WE GOT 3 EXT CHAR, THEN BYPASS
+        SUBI    AC,40           ;CONVERT TO SIXBIT
+        IDPB    AC,PNTE         ;STORE THE CONVERTED EXT. CHAR.
+        MOVEI   EFLAG,1         ;SET THE EXTENSION FLAG
+        JRST    GEXT            ;GO GET NEXT EXTENSION CHAR.
+;
+;       COME HERE FOR A CHECK AFTER DISCOVERING A LF OR COMMA.
+;       SEE IF AN EXTENSION EXISTS, IF SO SAVE IT.
+;
+ECHK:   JUMPE   EFLAG,UPDATE    ;NO EXT.  GO UPDATE POINTERS
+        MOVE    AC,EXTN         ;GET THE EXTENSION NAME
+        HLLM    AC,FLIST+1(INDEX) ;STORE THE EXTENSION NAME
+        JRST    UPDATE          ;GO UPDATE POINTERS
+;
+;       COME HERE FOR PROCESSING CR AFTER THE EXTENSION.  SEE IF 
+;       EXTENSION SHOULD BE SAVED, INCREASE FILE COUNT AND THEN GO
+;       ON TO PROCESSING THE LIST.  COMMING HERE MEANS THERE ARE
+;       NO MORE FILES TO BE PROCESSED IN THE INPUT STRING
+;
+CRCHK:  PUSHJ   P,UPCASE        ;GET LF
+        JUMPE   EFLAG,.+3       ;SKIP IF NO EXTENSION
+        MOVE    AC,EXTN         ;GET THE EXTENSION NAME
+        HLLM    AC,FLIST+1(INDEX) ;STORE THE EXTENSION NAME
+ENDLST: ADDI    FCNT,1          ;INCREASE THE FILE COUNT
+        MOVE    AC,FCOPYS       ;GET COPYS WANTED
+        IORM    AC,FLIST+1(INDEX) ;SAVE THEM
+        POPJ    P,              ;GO BEGIN PROCESSING
+;
+;       COME TO NAMEO IF IT IS SUSPECTED THERE IS A NAME ONLY IN THE
+;       FILE NAME AND THERE IS NO EXTENSION.  
+;
+NAMEO: MOVE    AC,NAME          ;GET FILE NAME
+       MOVEM   AC,FLIST(INDEX) ;STORE THE FILE NAME
+;
+;       UPDATE POINTERS TO SHOW HOW MANY FILES WE HAVE AND 
+;       STORAGE AREA LOCATIONS
+;
+UPDATE: SETZ    FFLAG,          ;ZERO FILE FLAG
+        MOVE    AC,FCOPYS       ;GET NO. COPYS WANTED IN FILE
+        IORM    AC,FLIST+1(INDEX) ;SAVE IT
+        MOVE    AC,NCOPYS       ;GET REQ. COPYS
+        MOVEM   AC,FCOPYS       ;SAVE AS FILE TIL CHANGED
+        ADDI    FCNT,1          ;INCREASE FILE COUNT
+        CAIL    FCNT,24         ;SEE IF LESS THAN 20 FILES ARE IN
+        POPJ    P,              ;BR. IF MAX 20 ARE IN
+        ADDI    INDEX,4         ;CHANGE ADDRESS POINTER
+        MOVE    AC,ERRCHR       ;GET ERROR FLAG
+        JUMPN   AC,PAS+1        ;WORK WITH CURRENT CHAR.
+;
+;       GET NEXT CHAR., BYPASS ALL BLANKS, LF, CR AND COMMAS.
+;       AT SIGHT OF ANY OTHER CHAR., THIS INDICATES BEGINNING 
+;       OF NEW FILE SPECIFICATION
+;
+PAS:    PUSHJ   P,UPCASE        ;GET NEXT  CHAR.
+        CAILE   AC,40           ;SEE IF TO SKIP THIS
+        CAIN    AC,54
+        JRST    PAS             ;BYPASS THE CARRIAGE RETURN
+        JRST    PNCHK           ;GO CHECK FOR NEXT FILE SPECIFICATION
+;
+;       COME HERE IF A LEFT PAREN WAS FOUND.  THIS INDICATES
+;       A USER NAME IS BEING SPECIFIED.  PURPOSE IS TO EXTRACT
+;       THE USER NAME AND PUT IT IN THE LIST
+;
+USERN:  SETZM   ,USER           ;ZERO OUT THE USER NAME
+        SETZM   ,USER+1         ;STORAGE AREA
+        MOVEI   USRC,14         ;MAX. NO. OR CHAR. ALLOWED IN USER NAME
+ULOOP:  PUSHJ   P,UPCASE        ;GET A CHAR.
+        CAIN    AC,051          ;CHECK FOR A RIGHT PAREN
+        JRST    PSAVE           ;GO SAVE THE USER NAME
+        SOJL    USRC,ULOOP      ;SEE IF WE HAVE ALL CHAR. FOR USER NAME
+        SUBI    AC,40           ;CONVERT TO ASCII
+        IDPB    AC,PNTU         ;SAVE THE CHAR
+        JRST    ULOOP           ;GO GET ANOTHER CHAR.
+;
+;       FOUND A RIGHT PAREN, SEE IF THERE WAS A NAME CREATED
+;
+PSAVE:  CAIN    USRC,14         ;SEE IF WE GO ANY USER NAME CHAR
+        JRST    BLNKP           ;BR. SINCE WE DIDNT GET ANY
+        DMOVE   AC,USER         ;GET USER NAME
+        DMOVEM  AC,FLIST+2(INDEX) ;STORE THEN FOR LOOKUP
+;
+;       NOW BYPASS ANY BLANK THAT MAY BE BETWEEN THE 
+;       RIGHT PAREN AND THE FIRST CHAR OF THE FILE NAME
+;
+BLNKP:  PUSHJ   P,UPCASE        ;GET A CHAR.
+        CAIN    AC,040          ;CHECK FOR A BLANK
+        JRST    BLNKP           ;BR. IF IT WAS A BLANK
+;
+;       RESTORE POINTERS AND COUNTERS BEFORE PROCESSING FILE NAME
+;
+        MOVEI   FILE,6          ;SET 6 CHAR LIMIT TO FILE NAME
+        MOVEI   EXT,3           ;SET 3 CHAR LIMIT TO EXT NAME
+        PUSHJ   P,RESPTR        ;RESTORE POINTERS
+        SETZB   16,NAME         ;ZERO FLAG AND NAME STORAGE
+        JRST    URTN            ;GO PROCESS FILE NAME
+;
+;       COME HERE FOR PROCESSING A COMMAND FILE.  COMMAND FILE
+;       IS ONE WHICH BEGINS WITH A @ SIGN
+;
+FCMND:  MOVE    AC,[435544,,1000] ;EXT OF CMD AND CMD FLAG
+        MOVEM   AC,FLIST+1(INDEX) ;SHOWS THIS A CMND FILE
+        JRST    PAS             ;GO GET FILE NAME
+;
+;       CHECK FOR AN .ALL COMMAND
+;
+IFE %ALL,<
+PERIOD: PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIE    AC,101          ;CHECK FOR AN A IN ALL
+        JRST    BADCMD          ;CANT RECOGNIZE COMMAND
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIE    AC,114          ;CHECK FOR THE FIRST L IN ALL
+        JRST    BADCMD          ;NO .ALL CMND, GO RESTORE CMND FILE
+        PUSHJ   P,UPCASE        ;GET LAST CHAR.
+        CAIE    AC,114          ;CHECK FOR LAST L IN ALL
+        JRST    BADCMD          ;NOT .ALL CMND, GO RESTORE CMND FILE
+        PUSHJ   P,UPCASE        ;GET NEXT CHAR.
+        CAIN    AC,040          ;CHECK FOR A BLANK
+        JRST    .-2             ;BYPASS BLANKS
+        CAIN    AC,15           ;CHECK FOR CR
+        PUSHJ   P,UPCASE        ;GET LF
+        CAIE    AC,12           ;CHECK FOR LF
+        JRST    BADCMD          ;NOT .ALL CMND, GO REST CMND. FILE
+;
+;       HACE A GOOD .ALL COMMAND,SET UP LIST AND THEN BEGIN PROCESSING
+;
+NOMORE: MOVEI   FCNT,1          ;SET FILE LIST COUNT
+        MOVSI   AC,(SIXBIT/*/)  ;GET A *
+        MOVEM   AC,FLIST	;STORE AS A FILE NAME
+        MOVEM   AC,FLIST+1      ;STORE AS EXTENSION NAME
+        JRST    PROCES          ;GO BEGIN PROCESSING
+>
+;
+;       PURPOSE IS TO RESTORE POINTERS  USED TO
+;       ACCESS DATA AREAS THAT ARE USED FREQUENTLY BY ILDB AND IDPB.
+;
+RESPTR: MOVEI   AC7,44          ;
+        DPB     AC7,FPNT        ;
+        DPB     AC7,EPNT        ;
+        DPB     AC7,UPNT        ;
+        MOVEI   AC7,USER        ;
+        HRRM    AC7,PNTU        ;
+        POPJ    P,
+;
+;       PURPOSE IS TO PARSE THE COPIES SWITCH OUT AND SAVE IT
+;
+GETCOP: PUSH    P,AC1           ;SAVE ACS
+        PUSH    P,AC2
+        PUSH    P,AC3
+        PUSH    P,AC4
+        PUSHJ   P,INPCHR        ;GET A CHAR.
+        CAIN    AC,40           ;LEADING BLANKS
+        JRST    .-2
+        MOVEI   AC2,2           ;MAX ALLOWED TO 2 CHAR.
+        MOVE    AC1,[POINT 6,AC3,^D23]
+        SETZ    AC3,            ;ZERO STORAGE
+GETCP1: CAIE    AC,40           ;CHECK FOR TERMINATOR
+        CAIN    AC,","          ;SAME
+        JRST    GETCP3          ;GO PROCESS FILE
+        CAIE    AC,15           ;CHECK FOR TERMINATOR
+        CAIN    AC,12
+        JRST    GETCP3          ;PROCESS FILE
+        CAIL    AC,"0"          ;SEE IF LESS THAN ZERO
+        CAILE   AC,"9"          ;SEE IF VALID NUMER
+        JRST    GETCP4          ;USER ERROR ON COPY SWITCH
+        SOJL    AC2,GETCP2      ;MORE THAN 2 JUST BYPASS
+        SUBI    AC,60           ;CONVERT TO BINARY
+        IDPB    AC,AC1          ;SAVE IT
+GETCP2: PUSHJ   P,INPCHR        ;GET NEXT CHAR
+        JRST    GETCP1          ;PROCESS IT
+GETCP3: CAIN    AC2,1           ;CHECK IF ANYTHING INPUT
+        LSH     AC3,-6          ;FOR ONLY 1 DIGIT
+        CAIE    AC2,1   
+        CAIN    AC2,0
+        SKIPA                   ;SKIP IF SOMETHING VALID
+GETCP4: MOVEI   AC3,7777	;INVALID SIZE
+        PUSH    P,AC            ;SAVE TERMINATOR
+        SETZ    AC,             ;ZERO HOLDER
+        PUSHJ   P,COPGE1        ;GET A CHARACTER
+        ADD     AC,AC4          ;CREATE COUNT
+        PUSHJ   P,COPGE1        ;GET NEXT DIGIT
+        IMULI   AC4,12  
+        ADD     AC,AC4          ;CREATE ENTIRE COUNT
+        CAILE   AC,^D63         ;SKIP IF NOT TOO MANY COPIES
+        MOVEI   AC,777          ;MAKE IT INVALID
+        MOVEM   AC,FCOPYS       ;NEW FILE COPY LENGTH
+        MOVE    AC1,AC          ;SAVE WHATEVER LENGTH
+        CAILE   AC,^D63         ;SEE IF VALID AMT.
+        JRST    .+3             ;NO. THEN SKIP THIS NEXT STUFF
+        CAMLE   AC,HCOPYS       ;SEE IF EXCEEDS HIGHEST COPY CNT.
+        MOVEM   AC,HCOPYS       ;SAVE NEW HIGH COUNT
+        POP     P,AC            ;RESTORE TERMINATOR
+        CAIN    AC1,777         ;SEE IF PROBLEM
+        MOVEM   AC,ERRCHR       ;SAVE TERMINATOR
+        POP     P,AC4           ;RESTORE ACS
+        POP     P,AC3
+        POP     P,AC2
+        POP     P,AC1
+        POPJ    P,              ;RETURN
+COPGE1: SETZ    AC4,            ;ZERO HOLDER
+        LSHC    AC3,-6          ;PUSH DIGIT OVER
+        ROT     AC4,6           ;RIGHT JUSTIFY IT
+        POPJ    P,              ;RETURN
+INPCHR: JUMPN   FROM,INPCH1     ;IF COMMAND FILE
+        PUSHJ   P,UPCASE        ;GET CHAR.
+        POPJ    P,
+INPCH1: PUSHJ   P,GETNEX        ;GET FROM FILE
+        SKIPN   AC              ;SKIP IF HAVE SOMETHING
+        MOVEI   AC,15           ;END OF FILE
+        POPJ    P,
+;
+;       COME HERE TO BEGIN PROCESSING OF FILES--PURPOSE IS TO
+;       FIND OUT GAN/UUN OF ALL FILES AND TO FIND OUT IF THEY
+;       ARE ACCESSABLE.
+;
+;       FIRST START OFF BY FINDING THE LICENSE OF THE USER
+;
+        AC1= 1                  ;REDEFINES AC1 TO JUST AN ACCUMULATOR
+        FLAG=2                  ;REDEFINES AC2 AS A FLAG
+        LIC= 3                  ;REDEFINES AC3 AS HOLDER OF LICENSE
+        GANUUN= 4               ;REDEFINES AC4 AS HOLDER OF GAN/UUN
+        TYPE= 5                 ;SHOWS FILE.EXT STRUCTURE
+        HOLD14= 14              ;DEFINES SECOND TEMP HOLDING AREA
+        ERROR=13                ;REDEFINES AC13 AS ERROR TRACTING FLAG
+        COUNT=12                ;COUNTS CHAR. FOR OUTPUT STRING
+        HOLD15= 15              ;DEFINES TEMP HOLDING AREA
+        INFIL= 2                ;DEFINES FILE INPUT CHANNEL
+        INUFD= 1                ;DEFINES UFD INPUT CHANNEL
+        FINUFD= 3               ;DEFINE CHANNEL FOR UFD OF FROM CMND.
+        FINFIL= 4               ;DEFINE CHANNEL FOR FILE OF CMND. FILE
+        OUFIL= 5                ;OUTPUT CHANNEL
+        CKFIL= 6                ;CHANNEL FOR CHECKING NEW FILES
+        SPLCH= 7                ;CHANNEL FOR SPOOLING FD BUFFER
+        HOLD= 12                ;TEMPORARY HOLDING ACCUMULATOR
+;
+;       DATA AREAS FOR GETTING SPOOL NUMBER
+;
+BCHBLK: SIXBIT /REQNUM/
+        SIXBIT /DAT/
+        0
+        0
+;
+;       INITIALIZE CHANNELS FOR I/O
+;
+PROCES: SETZM   ERRCNT          ;ZERO FLAG
+        INIT    INUFD,10        ;
+        SIXBIT  /DSKB/          ; FOR THE LOOKUP OF THE UFD
+        XWD     IUFD
+        JRST    INERR1
+        INIT    INFIL,10 
+        SIXBIT  /DSK/
+        XWD     IFILB
+        JRST    INERR1
+        INBUF   INFIL,4
+        OPEN    OUFIL,OUTDEF    ;OPEN CHANNEL FOR OUTPUT FILE
+        JRST    OUTER1          ;ERROR EXIT JUMP
+        OUTBUF  OUFIL,4
+        OPEN    CKFIL,CKDEF     ;OPEN CHANNEL FOR CHECKING FILES
+        JRST    INERR1          ;ERROR EXIT JUMP
+        HRROI    LIC,-20	;GETTAB VALUE FOR GETTING LICENSE
+        GETTAB  LIC,            ;GO GET THE LICENSE
+        JRST    ERLIC           ;CANT SECURE LICENSE FOR THIS USER
+        ANDI    LIC,17          ;SET LIC TO USERS LICENSE (TOTAL)
+;
+;       NOW GO GET THIS USER GAN/UUN
+;
+        PJOB    GANUUN,         ;TO GET GFD PPN
+        HRLI    GANUUN,2        ;SAME
+        MOVSS   ,GANUUN         ;SET UP FOR GETING PPN
+        GETTAB  GANUUN,         ;GET IT
+        JFCL
+;
+;       GET GAN/UUN OF THE USER TO RECEIVE THE SPOOLED DATA
+;       GET BATCH REQUEST NUMBER IF IT HAS NOT BEEN GOTTEN
+;
+        SKIPE   BATCHN          ;SEE IF HAVE NO. YET
+        JRST    PROCON          ;BR IF HAS BEEN GOTTEN
+        OPEN    10,SPLDEF       ;SECURE A CHANNEL
+        JRST    INERR1          ;CANT SECURE A CHANNEL
+        IFNDEF DEBUG<
+AGAIN:  MOVE    AC,[1,,2]>      ;OWNER OF REQNUM.DAT
+        IFDEF DEBUG<
+AGAIN:  MOVE    AC,[3,,234620]> ;sppoper
+        MOVEM   BCHBLK+3        ;STORE FOR LOOKUP
+        SETZM   ,BCHBLK+2       ;ZERO FOR LOOKUP
+        LOOKUP  10,BCHBLK       ;DO LOOKUP ON SPOOL.NUM
+        JRST    BCHERR          ;NO BATCH NO. DATA FILE
+        MOVEM   AC,BCHBLK+3     ;STORE FOR ENTER
+        ENTER   10,BCHBLK       ;DO ENTER ON BATCH NO. FILE
+        JRST    BCHWHY          ;GO SEE WHY
+        PUSHJ   P,DISABL
+        INBUF   10,1            ;
+        OUTBUF  10,1            ;
+        IN      10,             ;READ A BLK
+        JRST    .+2             ;SKIP OVER
+        JRST    BCHERR          ;NO FIRST BLK
+        OUTPUT  10,             ;DUMMY OUTPUT
+        MOVEI   AC1,1           ;PREPARE POINTER
+        USETO   10,@AC1         ;SET OUTPUT POINTER
+        ILDB    AC,BCHIN+1      ;GET BATCH NUMBER
+        MOVEM   AC,BATCHN       ;STORE BATCH NUMBER
+        IDIVI   AC,^D1000       ;GET SYSTEM AND REQ. NO
+        CAIL    AC1,^D999       ;SEE IF TO RECYCLE NO.
+        SETZ    AC1,            ;RECYCLE NUMBER
+        ADDI    AC1,1           ;INCREASE IT BY ONE
+        IMULI   AC,^D1000       ;CREATE FULL SIZE NUMBER
+        ADD     AC,AC1          ;CREATE NEW NUMBER FOR NEXT CALLER
+        IDPB    AC,BCHOUT+1     ;STORE FOR OUTPUT
+        OUTPUT  10,             ;PUT BACK THE BLOCK
+        RELEASE 10,             ;RELEASE THE CHANNEL
+;
+;       CONVERT NUMBER TO SIXBIT
+;
+        MOVE    AC7,[POINT 6,BATCHN,5] ;POINT TO BATCH NUMBER
+        MOVEI   HOLD14,^D10000  ;GET DIVISOR
+        MOVE    AC,BATCHN       ;GET THE REQUEST NO.
+        SETZM   ,BATCHN         ;ZERO THE AREA
+        MOVEI   5,5             ;NO CHAR. TO PROCESS
+REDUCE: IDIV    AC,HOLD14       ;REDUCE NUMBER TO SMALLER PARTS
+        ADDI    AC,20           ;CONVERT TO SIXBIT
+        IDPB    AC,AC7          ;STORE NUMBER
+        MOVE    AC,AC1          ;GET REMAINDER
+        IDIVI   HOLD14,12       ;REDUCE POWER OF DIVISOR
+        SOJG    5,REDUCE        ;GO DO REST OF NUMBER
+        JRST    PROCON          ;GO PROCEED ON
+;
+;       SEE WHY WE CANT GET AT SPOOL.NUM FILE
+;
+BCHWHY: HRRZ    AC,BCHBLK+1     ;GET REASON FOR NO ENTER
+        CAIE    AC,3            ;SEE IF SOMEONE ELSE USING IT
+        JRST    NONUM           ;CANT GET AT BATCH NUMBERS
+        MOVEI   AC,12           ;TIME TO SLEEP
+        SLEEP   AC,             ;GO TO SLEEP FOR 10 SEC.
+        JRST    AGAIN           ;GO TRY AGAIN FOR THE NUMBER
+;
+;       SET INDEX TO POINT WITHIN THE LIST ARRAY
+;
+PROCON: SETZ    INDEX,          ;INDEX WITHIN LIST
+        MOVEI   AC,SPLESC       ;SET UP WHERE TO GO ON ESCAPES
+        MOVEM   AC,INTAB+1      ;DO IT
+        PUSHJ   P,RENABL
+;
+;       CHECK TO SEE IF FILE TO BE CHECK HAS A DIFFERENT
+;       USER NAME OTHER THAN CURRENT USER
+;       GIVE MESSAGE GIVING STATUS ON ALL FILES
+;
+        MOVEI   AC,CRLF
+        PUSHJ   P,OUTLIN
+RNROBN: SETZM   ,TUSER+2        ;ZERO OUT SIGNAL BLANK AREA
+        SETZM   ,TUSER          ;ZERO OUT TEMPORAY STORAGE AREA
+        SETZB   FLAG,TUSER+1    ;ZERO FLAG AND TEMP STORAGE
+        HRRZ    FROM,FLIST+1(INDEX) ;GET CMND FILE INDICATOR
+        HRRZ    AC,FROM         ;GET COPIES INDICATOR ALSO
+        LSH     FROM,-^D9       ;GET COMND FILE FLAG
+        ANDI    AC,777          ;KEEP COPIES SWITCH
+        SKIPE   ,FROM           ;SKIP IF NOT COMMAND FILE
+        MOVE    AC,NCOPYS       ;NO COPY SWITH ON CMND FILE NAME
+        MOVEM   AC,FCOPYS       ;SAVE AS FILE COPY COUNT
+        JUMPN   FROM,CFILS      ;JUMP IF COMMAND FILE
+FCALL:  CLOSE   INUFD,          ;CLOSE THE CHANNEL FOR UFD LOOKUPS
+        HLLZS   ,FLIST+1(INDEX) ;ZERO OUT COPIES SWITCHES
+        SETO    TYPE,           ;ASSUME NORMAL FILE
+        DMOVE   AC,FLIST(INDEX) ;GET FILE AND EXT.
+        DMOVEM  AC,NAME         ;SAVE FOR LATER
+        MOVE    AC,FCOPYS       ;GET COPY AMT.
+        MOVEI   ERROR,SYNTAX    ;COPYS SWITCH BAD
+        CAIN    AC,777          ;SEE IF COPY SWITCH BAD
+        JRST    LICERR+1        ;BAD COPY SWITCH
+        DMOVE   AC,FLIST+2(INDEX) ;GET USER NAME
+        DMOVEM  AC,TUSER        ;SAVE NAME FOR LATER
+        JUMPE   AC,SGAN         ;BR. IF OWN USER
+        SETO    FLAG,           ;SET DIFF. USER FLAG
+        MOVEI   AC7,FLIST+2(INDEX) ;GIVE ADDRESS FOR EXT. LOOKUP
+;
+;       WILL HAVE TO CONVERT USER NAME AND CHECK PROTECTION AND
+;       POSSIBLY THE USER LICENSE--BUILD BUFFER FOR EXTENDED 
+;       LOOKUP TO GET GAN/UUN OF USER NAME
+;
+        MOVEM   AC7,GETGAN+1    ;STORE ADDRESS OF USER NAME AREA
+        LOOKUP  INUFD,GETGAN    ;DO EXTENDED LOOKUP
+        JFCL                    ;NO-OP INSTRUCTION
+;
+;       COMPARE ADDRESS STORED WITH THE RETURNED VALUE.  
+;       RETURNED VALUE SHOULD BE GAN/UUN OF USER IN QUESTION.
+;       IF RETURNED VALUE IS STILL THE ADDRESS, THEN THAT USER
+;       DOES NOT EXIST.  SET FLAG FOR LATER PROCESSING.
+;
+        CAME    AC7,GETGAN+1    ;CHECK THE RETURNED VALUE
+        JRST    HGAN            ;BR. IF WE HAVE A GAN
+        AOS     ,ERRCNT         ;ADD 1 FOR FILE NOT SPOOLED
+        MOVEI   ERROR,NOTUSR    ;ADDRESS OF ERROR MESSAGE
+        PUSHJ   P,ERPRO         ;OUT ERROR MESSAGE
+        JRST    NEXT            ;GO PROCESS NEXT ENTRY IN LIST
+;
+;       HAVE A GAN/UUN, SAVE IT
+;
+HGAN:   MOVE    AC,GETGAN+1     ;GET THE GAN/UUN
+        SETZM   ,FLIST+2(INDEX)	;ZERO THE 3RD WORD OF ENTRY
+        MOVEM   AC,FLIST+3(INDEX) ;SAVE GAN/UUN WITH ITS ENTRY
+;
+;       NOW DO A LOOKUP OF THIS USERS UFD TO SEE HIS PROTECTION
+;
+        CAMN    AC,GANUUN       ;SKIP IF NOT SAME AS USER
+        SETZ    FLAG,           ;FLAG AS SAME AS USER
+        JRST    SGAN1           ;GO DO UFD LOOKUP
+SGAN:   MOVE    AC,GANUUN       ;GET OWN USERS GAN/UUN
+        SETZM   ,GETGAN+1       ;ZERO OUT NON-USED GAN/UUN FOR
+                                ;  FUTURE LOOKUPS
+SGAN1:  MOVEM   AC,UFDLU        ;STORE GAN/UUN FOR UFD LOOKUP
+        MOVSI   AC,(SIXBIT/*/)
+        CAMN    AC,FLIST(INDEX) ;FILE NAME WILD?
+        JRST    SGAN2           ;YES, WORK ON UFD
+        CAMN    AC,FLIST+1(INDEX) ;CHECK EXT.
+        JRST    SCAN            ;TREAT AS NORMAL FILE
+        MOVE    AC7,[POINT 6,NAME]
+        MOVEI   AC1,6           ;NO. CHAR. TO CHECK
+        ILDB    AC,AC7          ;GET FILE NAME CHAR
+        CAIN    AC,'#'          ;WILD CHAR.?
+        JRST    SGAN2           ;HAVE FILE WILD
+        SOJG    AC1,.-3         ;SEARCH ENTIRE WORD
+        JRST    SCAN            ;TREAT AS NORMAL FILE
+SGAN2:  SETZB   TYPE,UFDLU+2
+        MOVE    AC7,UFDDTA      ;
+        MOVEM   AC7,UFDLU+3     ;
+        LOOKUP  INUFD,UFDLU     ;DO LOOKUP ON UFD
+        JFCL                    ;NO-OP INSTRUCTION
+        JUMPE   FLAG,USRCVT     ;BR. SINCE NO PROTECT CHECK ON USERS
+                                ;OWN UFD
+        LSH     AC,-^D18        ;PUT GAN ON RIGHT OF AC
+        HLRZ    AC7,GANUUN      ;GET JUST GAN OF USER
+;
+;       CHECK GANS OF USERS AND FILE UFD..THIS SHOWS 
+;       WHICH PROCTECTION SHOULD BE CHECKED
+;
+        HLRZ    AC1,UFDLU+2     ;GET ENTIRE PROTECTION OF UFD
+        CAME    AC7,AC          ;COMPARE GANS
+        JRST    PUBCHK          ;BR. MEANS GANS ARNT THE SAME
+                                ;MUST CHECK THE PUBLIC PROTECTION
+;
+;       COMPARSION EQUAL.  THUS IN SAME GAN.  CHECK THAT
+;       PROTECTION.  SEE IF SHARABLE SET.  IF NOT SET, IF USER HAS
+;       AND READ OR WRITE LICENSE SET, HE IS STILL OK.
+;
+        ANDI    AC1,40000       ;CHECK SHARABLE OPTION
+        JUMPN   AC1,USRCVT      ;UFD WILL ALLOW SHARABLE OPTION
+        JUMPN   LIC,USRCVT      ;ANY READ OR WRITE LICENSE ALLOWS 
+;                               ;  SAME GAN TO GET AT UFD
+        JRST    LICERR          ;NO LIC., TOO BAD
+;
+;       COME HERE TO CHECK PUBLIC SHARABLE OF UFD
+;
+PUBCHK: ANDI    AC1,4000        ;CHECK SHARABLE OPTION OF PUBLIC
+        JUMPN   AC1,USRCVT      ;UFD ALLOWS PUBLIC SHARABLE
+;
+;       COME HERE IF SHARABLE NOT ALLOWED.  CHECK USERS LICENSE
+;       TO SEE IF HE HAS POWER TO READ THE FILES ANYWAY.
+;
+        JUMPE   LIC,LICERR      ;NO LICENSE, TOO BAD
+        MOVE    AC,LIC          ;GET LICENSE FOR CHECKING
+        ANDI    AC,3            ;GET WRITE LICENSES
+        CAILE   AC,1            ;CHECK POWER OF WRITING LICENSE
+        JRST    USRCVT          ;BR. IF HE HAS ENOUGH POWER
+        MOVE    AC,LIC          ;GET LICENSE AGAIN
+        ANDI    AC,14           ;CHECK READ LICENSES
+        CAILE   AC,4            ;CHECK POWER OF READ LICENSE
+        JRST    USRCVT          ;BR. CAUSE USER HAS ENOUGH LICENSE
+;
+;       USER HASNT ENOUGH LICENSE, SEND OUT ERROR MESSAGE
+;
+LICERR: MOVEI   ERROR,NOLIC     ;GET ADDRESS OF ERROR MESSAGE
+        PUSHJ   P,ERPRO         ;OUT ERROR MESSAGE
+        AOS     ERRCNT          ;INCREASE ERROR COUNT
+        JRST    NEXT            ;GO GET NEXT ENTRY IN LIST
+USRCVT: DMOVE   AC,FLIST(INDEX) ;GET FILE TO START WITH
+        DMOVEM  AC,UFDARG+1     ;SAVE FOR UUO CALL
+        SETZM   UFDARG+3        ;ZERO CONTROL BITS
+        SETZM   UFDARG+4        ;ZERO MONITOR WORD
+        SETZM   UFDARG+5        ;ZERO STARTING FILE
+        SETZM   UFDARG+6        ;SAME FOR EXT.
+
+SCAN:   JUMPE   TYPE,WILDFL     ;GO IF WORKING WITH WILD FILE
+        PUSHJ   P,GETVAL        ;GO GET FILE
+        PUSHJ   P,XFER          ;MOVE IT ACROSS
+        JRST    NEXT            ;GO DO NEXT FILE
+WILDFL: MOVE    AC7,[33,,INUFD]
+        CHANIO  AC7,UFDARG      ;GET FILE FROM UFD
+        JRST    NEXT            ;DO NEXT REQ.
+        SKIPN   UFDARG+7        ;RETURN WITH SOMETHING?
+        JRST    WILDFL          ;NO, TRY TIL EOF
+        DMOVEM  AC,FLIST(INDEX) ;SAVE FILE NAME EXT.
+        MOVE    AC,GETGAN+1     ;GET PPN
+        MOVEM   AC,FLIST+3(INDEX)
+        PUSHJ   P,GETVAL        ;GO GET FILE
+        PUSHJ   P,XFER          ;MOVE FILE ACROSS
+        JRST    WILDFL          ;GET NEXT ONE TO MATCH
+;
+;       COME HERE FOR PROCESSING A COMMAND FILE.  A COMMAND FILE
+;       IS ONW WHOSE CONTENTS IS A STRING OF CHARACTERS SPECIFYING
+;       WHICH FILES TO BE PRINTED.
+;
+;       DO EXTENDED LOOKUP TO GET GAN/UUN OF FILE, THEN DO
+;       LOOKUP OF UFD OF THE USER TO SEE IF HE ALLOWS PEOPLE
+;       TO GET AT HIS FILES.  THEN DO LOOKUP ON THE COMMAND
+;       FILE, AFTER WHICH START PICKING OUT THE COMMANDS
+;       FROM THE COMMAND FILE (WHICH ARE THE FILES TO BE 
+;       PRINTED) AND TRY TO PROCESS THE FILES SPECIFIED.
+;
+CFILS:  OPEN    FINUFD,FUFD     ;OPEN CHANEL FOR READING UFD
+        JRST    INERR1          ;ERROR RETURN EXIT
+        OPEN    FINFIL,FFIL     ;OPEN CHANNEL FOR READING CMND. FILE
+        JRST    INERR1          ;ERROR RETURN EXIT
+;
+        SETZM   ,BCHBLK+2       ;ZERO TEMP STORAGE
+        SETZM   ,BCHBLK+3       ;SAME
+        DMOVE   AC,FLIST+2(INDEX) ;GET 1ST WORD OF USER NAME
+        JUMPE   AC,FSGAN        ;SKIP IF NO USER CONVERSION
+        DMOVEM  AC,BCHBLK+2     ;SAVE NAME IN TEMP AREA
+        DMOVEM  AC,TUSER        ;SAVE FOR POSSIBLE ERROR JUMP
+        MOVEI   AC7,FLIST+2(INDEX) ;TO GET PPN
+        MOVEM   AC7,GETGAN+1    ;STORE FOR LOOKUP
+        SETO    FLAG,           ;SET DIFFERENT USER FLAG
+        LOOKUP  FINUFD,GETGAN   ;DO EXTENDED LOOKUP TO GET GAN/UUN
+        JFCL
+        CAME    AC7,GETGAN+1    ;SEE IF GAN/UUN RETURNED
+        JRST    FHGAN           ;BR. CAUSE WE HAVE GAN/UUN
+        MOVEI   ERROR,NOTUSR    ;GET ADDRESS OF ERROR MESSAGE
+        JRST    FCKFIL+1        ;GIVE ERROR MESSAGE
+FHGAN:  MOVE    AC,GETGAN+1     ;GET GAN/UUN
+        SETZM   ,FLIST+2(INDEX) ;ZERO 3RD WD. OF ENTRY
+        MOVEM   AC,FLIST+3(INDEX) ;STORE GAN/UUN WITH ENTRY
+        JRST    .+3
+FSGAN:  MOVE    AC,GANUUN       ;GET OWN USERS GAN/UUN
+        SETZM   ,GETGAN+1       ;ZERO FOR FUTURE LOOKUPS
+        MOVEM   AC,UFDLU        ;STORE GAN/UUN FOR UFD LOOKUP
+        SETZM   ,UFDLU+2        ;RESTORE ARGUMENT FOR UFD LOOKUP
+        MOVE    AC7,UFDDTA      ;SAME
+        MOVEM   AC7,UFDLU+3     ;SAME
+        LOOKUP  FINUFD,UFDLU    ;DO LOOKUP OF UFD 
+        JFCL
+        JUMPE   FLAG,FUSRCVT    ;BR. IF UFD OF OWN USER
+        LSH     AC,-^D18        ;SHIFT GAN TO RIGHT
+        HLRZ    AC,GANUUN       ;GET GAN OF USER
+        HLRZ    AC1,UFDLU+2     ;GET PROTECTION OF UFD
+        CAME    AC,AC7          ;COMPARE GANS
+        JRST    FPUBCK          ;BR. TO CHECK PUBLIC PROTECTION
+        ANDI    AC1,40000       ;CHECK SHARABLE OPTION OF ACCOUNT
+        JUMPN   AC1,FUSRCVT     ;BR. IF SHARABLE ALLOWED
+        JUMPN   LIC,FUSRCVT     ;BR. IF LICENSE OVERPOWERS PROT.
+        JRST    FLICERR         ;NOT ENOUGH LICENSE, TOO BAD.
+FPUBCK: ANDI    AC1,4000        ;CHECK PUBLIC SHARABLE
+        JUMPN   AC1,FUSRCVT     ;SHARABLE ALLOWED, THUS BRANCH
+        JUMPE   LIC,FLICERR     ;BR. IF NO LICENSE AT ALL
+        MOVE    AC,LIC          ;GET USERS LICENSE
+        ANDI    AC,3            ;GET WRITE LICENSES
+        CAILE   AC,1            ;CHECK POWER OF LICENSE
+        JRST    FUSRCVT         ;BR. CAUSE POWERFUL LICENSE
+        MOVE    AC,LIC          ;GET LICENSE OF USER AGAIN
+        ANDI    AC,14           ;GET READ LICENSES
+        CAILE   AC,4            ;CHECK POWER OF LICENSE
+        JRST    FUSRCVT         ;BR. CAUSE HAS ENOUGH LICENSE
+FLICERR:MOVEI   ERROR,NOLIC     ;ERROR MESSAGE OF NOT ENOUGH LICENSE
+        PUSHJ   P,ERPRO         ;OUT MESSAGE
+        JRST    PROMPT
+;
+;       TO GET HERE WE HAVE GOT TO UFD WHICH SAYS WE CAN 
+;       GO LOOK AT ITS FILES OR WE HAVE LICENSE TO DO SO.
+;       NOW DO LOOKUP ON FILE AND CHECK ITS PROTECTION
+;
+FUSRCVT:LOOKUP  FINFIL,FLIST(INDEX) ;DO LOOKUP ON THE COMMAND FILE
+        JRST    DEFCMD          ;MAYBE OTHER NAME FOR FILE
+        PUSHJ   P,GETCON        ;CHECK PROT.
+        JRST    NEXLP1          ;NORMAL RETURN JUMP OVER
+        JRST    FLICERR         ;NOT ENOUGH LICENSE
+;
+;       SEE IF USER SPECIFIED DEFAULT NAME, IS SO, GIVE NEW NAME
+;       TO CHECK
+;
+DEFCMD: CAIN    FROM,2          ;SKIP IF DEFAULT NAME USED
+        JRST    FCKFIL          ;NO, GUESS FILE NOT THERE
+        MOVEI   FROM,2          ;SET UP ORIGINAL NAME
+        SETZM   ,FLIST+2(INDEX) ;ZERO FOR NEW LOOKUP
+        MOVE    AC,UFDLU        ;GET GANUUN
+        MOVEM   AC,FLIST+3(INDEX) ;STORE FOR LOOKUP
+        SETZM   ,FLIST+1(INDEX) ;ZERO EXT. NAME
+        JRST    FUSRCVT         ;GO TRY AGAIN
+;
+FCKFIL: MOVEI   ERROR,NOTFIL    ;GET ERROR ADDRESS MESSAGE
+        PUSHJ   P,ERPRO         ;OUT MESSAGE
+        AOS     ,ERRCNT         ;SHOWS GOT ERROR ON FILE
+        JRST    NEXT1           ;GO GET NEXT REQ. FILE
+;
+;       HAVE NOW DONE LOOKUP ON FILE, CAN NOW ACCES IT
+;
+NEXLP1: INPUT   FINFIL,         ;GET 1ST BLK. OF FILE
+NEXLOP: PUSHJ   P,RESPTR        ;RESTORE POINTERS
+        MOVE    AC,ERRCHR       ;GET ERROR CHAR.
+        SKIPN   ERRCHR          ;SKIP IF HAVE WHAT TO WORK WITH
+        PUSHJ   P,GETNEX        ;GET NEXT CHAR FROM FILE
+        CAILE   AC,40           ;SEE IF TO SKIP THIS
+        CAIN    AC,54
+        JRST    NEXLOP          ;BYPASS ALL COMMAS
+        JUMPE   AC,MORNEX       ;BR. IF EOF
+        SETZB   ERRCHR,USER
+        SETZM   ,USER+1         ;SAME
+        SETZM   ,NAME           ;ZERO NAME AREA
+        SETZM   ,EXTN           ;ZERO OUT EXT. NAME AREA
+        CAIN    AC,050          ;CHECK FOR LEFT PAREN
+        JRST    LPAREN          ;BR. TO PROCESS USER NAME
+NEWFIL: MOVEI   COUNT,6         ;SET MAX. CHAR. SIZE TO FILE NAME
+FILCON: CAIN    AC,056          ;CHECK FOR PERIOD
+        JRST    FEXT            ;GO PROCESS EXT. NAME
+        SOJL    COUNT,PASNEX    ;SEE IF MAX. CHAR. PROCESSED
+        SUBI    AC,40           ;CONVERT TO SIXBIT
+        IDPB    AC,PNTF         ;STORE FILE NAME CHARACTER
+PASNEX: PUSHJ   P,GETNEX        ;GET NEXT CHAR
+        JUMPE   AC,GOFILE       ;END OF FILE
+        CAIE    AC,015          ;CHECK FOR C.R.
+        CAIN    AC,012          ;CHECK FOR L.F.
+        JRST    GOFILE          ;GO GET FILE
+        CAIN    AC,"/"          ;CHECK COPIES SWITCH
+        JRST    CMDCOP          ;GO GET COPIES SWITCH
+        CAIE    AC,40           ;BLANKS TERMINATE FILE NAME
+        CAIN    AC,054          ;CHECK FOR COMMA
+        JRST    GOFILE          ;GO GET FILE
+        JRST    FILCON          ;GO CHECK FOR MORE FILE NAME
+FEXT:   MOVEI   COUNT,3         ;SET MAX. CHAR. LIMIT TO EXT. NAME
+EXTLOP: PUSHJ   P,GETNEX        ;GET NEXT CHAR.
+        JUMPE   AC,GOFILE       ;END OF FILE
+        CAIE    AC,054          ;CHECK FOR COMMA
+        CAIN    AC,012          ;CHECK FOR L.F.
+        JRST    GOFILE          ;GO GET FILE AND PROCESS IT
+        CAIN    AC,"/"          ;CHECK COPIES SWITCH
+        JRST    CMDCOP          ;GO GET COPIES
+        CAIE    AC,40           ;BLANKS TERMINATE FILE EXT NAME
+        CAIN    AC,015          ;CHECK FOR C.R.
+        JRST    GOFILE          ;GO GET FIEL AND PROCESS IT
+        SOJL    COUNT,EXTLOP    ;SEE IF MAX. CHAR. PROCESSED
+        SUBI    AC,40           ;CONVERT TO SIXBIT
+        IDPB    AC,PNTE         ;STORE EXT. CHAR.
+        JRST    EXTLOP          ;GO GET NEXT CHAR
+LPAREN: MOVEI   COUNT,14        ;SET CHAR. LIMIT TO USER NAME
+PARLOP: PUSHJ   P,GETNEX        ;NEXT CHAR.
+        CAIN    AC,051          ;CHECK FOR RIGHT PAREN
+        JRST    RPAREN          ;SHOWS END OF USER NAME
+        SOJL    COUNT,PARLOP    ;BR. PASS EXTRA USERNAME CHAR.
+        SUBI    AC,40           ;CONVERT TO SIXBIT
+        IDPB    AC,PNTU         ;STORE USERNAME CHAR.
+        JRST    PARLOP          ;GO PROCESS MORE OF USERNAME
+RPAREN: PUSHJ   P,GETNEX        ;GET NEXT CHAR
+        CAIN    AC,040          ;CHECK FOR BLANKS
+        JRST    RPAREN          ;BYPASS BLANKS
+        JRST    NEWFIL          ;GO PROCESS FILE NAME
+;
+CMDCOP: PUSHJ   P,GETCOP        ;GO GET COPIES
+;
+;       NOW GET THE FILE
+;
+;
+;       HAVE PARSED OUT FILE NAME, NOW CALL SUBROUTINE TO
+;       PROCESS IT
+;
+GOFILE: DMOVE   AC,NAME         ;GET NAME AND EXT.
+        DMOVEM  AC,FLIST(INDEX) ;SAVE FILE AND EXT. NAME
+        DMOVE   AC,USER         ;GET USER NAME IF SPECIFIED
+        SKIPN   ,AC             ;SKIP IF ONE GIVEN
+        DMOVE   AC,BCHBLK+2     ;GET DEFAULT USER NAME
+        DMOVEM  AC,FLIST+2(INDEX) ;PUT IN NAME FOR LOOKUP
+        PUSHJ   P,FCALL         ;GO PROCESS FILE
+        SETZM   ,NAME           ;ZERO FOR POSSIBLE EOF CHECK
+        MOVE    AC,NCOPYS       ;GET REQ. COPYS COUNT
+        MOVEM   AC,FCOPYS       ;SAVE TIL CHANGED
+        JRST    NEXLOP          ;GET NEXT FILE NAME FROM CMND. FILE
+;
+;       PURPOSE IS TO GET NEXT CHAR. FROM INPUT FILE
+;
+GETNEX: SOSGE   FILBLK+2        ;BR. OVER IF BUFFER NOT EMPTY
+        JRST    MORNEX          ;BUFFER EMPTY, GO FILL IT
+        ILDB    AC,FILBLK+1     ;GET NEXT CHAR.
+	CAIL	AC,"a"		;skip if char < a
+	CAILE	AC,"z"		;skip if char leq z
+	SKIPA			;wasn't a lower case letter
+	SUBI	AC,40		;was lower case letter--make it upper
+        POPJ    P,
+MORNEX: IN      FINFIL,         ;READ NEXT BLOCK
+        JRST    GETNEX          ;GO GET NEXT CHAR. FROM BUFFER
+        STATZ   FINFIL,340000   ;CHECK STATUS FOR ERROR RETURN
+        JRST    INERR2          ;SOME TYPE ERROR OTHER THAN EOF
+        SETZ    AC,             ;ZERO FOR POSSIBLE JUMP
+        SKIPE   ,NAME           ;SKIP IF NO NAME IN AND EOF
+        POPJ    P,
+        RELEASE FINUFD,         ;RELEASE UFD CHANNEL
+        RELEASE FINFIL,         ;RELEASE CMND. FILE CHANNEL
+        JRST    NEXT1           ;GO GET NEXT FILE IF ANY
+;
+;       PURPOSE IS TO SPOOL FILES OVER TO SPECIAL USER
+;       AREA FOR LATER PROCESSING.
+;
+XFER:   MSTIME  AC1,            ;GET CURRENT TIME
+        LSH     AC1,^D21        ;GET BITS WANTED
+        SETZ    AC,             ;ZERO HOLDER
+        LSHC    AC,3            ;GET FIRST DIGIT
+        LSH     AC,3            ;SEPERATE BIT SPACE
+        LSHC    AC,3            ;BRING OVER NEXT DIGIT
+        LSH     AC,3            ;SPACE IN
+        LSHC    AC,3            ;OVER LAST DIGIT
+        ADDI    AC,202020       ;CONVERT TO SIXBIT
+        HRLZM   AC,EBLK+3       ;NEW EXT NAME
+        MOVE    AC,FLIST(INDEX) ;GET FILE NAME
+        MOVEM   AC,EBLK+2       ;STORE FILE NAME FOR ENTER
+        SETZM   ,EBLK+4         ;ZERO 4TH WD OF ENTRY
+        MOVE    AC,SPLGAN       ;GET GAN/UUN OF SPOOL USER
+        MOVEM   AC,EBLK+1       ;STORE GAN/UUN FOR ENTER
+	MOVEI	AC,4		;LENGTH OF THIS LOOKUP
+	MOVEM	AC,EBLK
+        LOOKUP  CKFIL,EBLK      ;GO SEE IF FILE ALREADY EXISTS
+        JRST    XOK             ;FILE DOESNT EXIST, GO ON
+        JRST    XFER            ;FILE EXISTS, GO CREATE NEW NAME
+XOK:    SETZ    AC,             ;ZERO AC FOR NEXT INST.
+        HRRM    AC,EBLK+3       ;ZERO 2ND HALF 3RD WD.
+        MOVE    AC,SPLGAN       ;GET SPOOL RECEIVER GAN/UUN
+        MOVEM   AC,EBLK+1       ;STORE FOR ENTER
+	SETZM	EBLK+4		;PUT ZEROES IN WDS 4-14 OF
+	HRLZI	AC,EBLK+4
+	HRRI	AC,EBLK+14
+	BLT	AC,EBLK+14	;  EXTENDED LOOKUP BLOCK.
+	SETZ	AC,		;THEN SET KATAKANA FILE BIT
+	SKIPE	KANA		;IN WD 14 IF NECESSARY.
+	TLO	AC,400
+	MOVEM	AC,EBLK+14
+	MOVEI	AC,14		;SIZE OF THIS LOOKUP
+	MOVEM	AC,EBLK
+        ENTER   OUFIL,EBLK      ;ENTER FILE NAME TO DIRECTORY
+        JRST    NOENTR          ;DIRECTORY PROBABLY FULL
+        OUTPUT  OUFIL,          ;DUMMY OUTPUT TO CLEAR BUFFER
+        JRST    XOVER           ;GO BRING FILE ACROSS
+;
+;       COME HERE IF CANT ENTER FILES
+;
+NOENTR: HRRZ    AC,EBLK+1       ;GET REASON FOR ABORT
+        CAIE    AC,14           ;DISK IS FULL
+        JRST    DONTNO          ;DONT KNOW THE REASON
+        JRST    DIRFUL          ;SPOOLERS DIRECTORY FULL
+;
+;       SEE IF FORTRAN C/C TO BE USED
+;
+XOVER:  SETZM   ,LINPAG         ;ZERO LINES DONE THIS PAGE
+        SETZM   ,LINECT         ;ZERO TOTAL LINES DONE THIS FILE
+        SETZM   ,PAGECT         ;ZERO TOTAL PAGES THIS FILE
+        SETOM   ,ESCSET         ;SHOWS WORKING ON FILE
+        SETZM   ,CPOL           ;ZERO COUNT ON LINE
+        PUSHJ   P,REDBF1        ;GO READ FIRST BUFFER
+;  AC7 is used below to load characters via LSHC instructions.
+	MOVEI	AC7,7		;for ASCII files
+	SKIPGE	KANA#		;skip if non-KANA file
+	MOVEI	AC7,11		;9 bits for KANA files
+        SKIPE   ,FORTRN         ;SKIP IF NO FORTRAN C/C
+        JRST    FTN1ST          ;DO 1ST CNTL CHAR.
+;
+;	ChrXfr is used to count pages in non-fortran files.
+;
+        SKIPE   ,HEAD           ;SKIP IF NO HEADING
+        PUSHJ   P,PUTHED	;otherwise go do the 1st heading
+CHRXFR: SOSGE   IFILB+2         ;SEE IF INPUT BUFFER EMPTY
+        PUSHJ   P,REDBUF        ;YES, READ BUFFER
+	ILDB    AC1,IFILB+1     ;GET DATA
+DOCNTL: JUMPE   AC1,CHRXFR	;if 0, go get next word
+        SETZ    AC,             ;ZERO STORAGE
+        LSHC    AC,(AC7)	;BRING OVER A CHAR.
+        CAIN    AC,12           ;LINE FEED?
+        JRST	ORDNLF		;DO LINE FEED
+        CAIN    AC,14           ;FORM FEED?
+	JRST	ORDNFF		;GO DO FORMFEED
+        JRST    DOCNTL		;else get next char
+;
+;       COME HERE TO PROCESS LINE FEEDS
+;
+ORDNLF: AOS     ,LINECT         ;add to no. of user lines on this page
+        AOS     ,LINPAG         ;and no. of billable lines
+        SKIPN   ,TWOBLE         ;test for double spacing
+        JRST    .+5             ;nope
+        AOS     ,LINECT
+        AOS     ,LINPAG
+        AOS     ,TOTCHR
+        AOS     ,TOTCHR         ;add 2 chars for the inserted crlf
+        MOVE    AC,LINECT	;get current user lines per page
+        CAMLE	AC,USRLPP	;skip if page hasn't overflowed yet
+        JRST    INSERT          ;otherwise simulate FF for user
+        MOVE    AC,LINPAG	;get no. of billable lines on this pg
+        CAMG	AC,MAXLIN	;skip if page has overflowed
+	JRST	DOCNTL		;otherwise go get next char
+        JRST    DUFORM          ;increase page count
+;
+;       We come here when we have overflowed a page.  Subtract the limit
+;	for either user or physical pages and proceed by increasing the
+;	page count.  If desired do a heading.
+;
+;	Note: *** INSERT & DUFORM expect LINECT and LINPAG values to be
+;	      *** loaded in AC upon entry.  (Both are called only once
+;	      *** from the routine directly above.  If you change this,
+;	      *** then CHANGE this comment also!!!) /CAB 29-Aug-81
+;
+INSERT:	Sub	ac,Usrlpp	;[101] Sub user limit leaving exceeded lines
+        MOVEM	AC,LINECT	;[101] Reset user's lines on new page
+	  Caia			;[101] Skip next, and set billable lines
+DUFORM: Sub	ac,Maxlin	;[101] Sub physical limit leaving exc. lines
+        MOVEM	AC,LINPAG	;reset billable lines on new page
+	AOS	,PAGECT		;increase page count
+	SKIPE	,HEAD		;see if user wants a heading
+	PUSHJ	P,PUTHED	;yes, go do it
+	JRST	DOCNTL		;go do next char
+;
+;       COME HERE FOR DOING FORM FEEDS
+;
+ORDNFF:	AOS     ,PAGECT         ;INCREASE PAGE COUNT
+        SETZM   ,LINPAG         ;zero out billable lines on new page
+        SETZM   ,LINECT		;zero out user lines on new page
+	SKIPE   ,HEAD           ;SKIP IF NO HEADING WANTED
+        PUSHJ   P,PUTHED
+	JRST	DOCNTL		;go do next char
+;
+;       COME HERE TO PUT OUT THE HEADINGS
+;
+PUTHED: MOVEI   AC,2            ;NO. OF LINES TO INCREASE
+        ADDM    AC,LINPAG       ;INCREASE LINES THIS PAGE
+        ADDM    AC,LINECT       ;INCREASE LINES PAST FF
+        MOVEI   AC,^D46         ;NO. CHAR. FOR XMIT HEADING
+        ADDM    AC,TOTCHR       ;ADD TO XMIT COUNT
+        POPJ    P,
+;
+;       COME HERE TO READ IN BLKS and copy the file to (SPOOL) dir.
+;
+REDBUF: OUTPUT  OUFIL,          ;WRITE OUT BUFFER JUST CHECKED
+REDBF1: IN      INFIL,          ;READ IN NEXT BLK
+        JRST    REDBF2          ;BR. ON GOOD READ
+        STATZ   INFIL,340000    ;CHECK STATUS
+        JRST    INERR2          ;HARDWARE ERROR
+        POP     P,              ;RID OF THIS PUSH TO REDBUF
+        JRST    FINXFR          ;BR. ON EOF
+REDBF2: HRRZ    AC,IFILB+2      ;GET BLK LENGTH IN WORDS
+	PUSH	P,AC7		;[105] SAVE AN AC FOR WORKSPACE
+        MOVE	AC7,AC          ;SAVE WD. LENGTH FOR LATER
+        HRRZ    AC1,OBUF+1      ;GET TO BUFFER ADDRESS
+        ADD     AC1,AC7         ;END ADDRESS OF TO BUFFER
+        HRL     AC,IFILB+1      ;GET FROM BUFFER ADDRESS
+        HRR     AC,OBUF+1       ;GET TO BUFFER ADDRESS
+        AOBJN   AC,.+1          ;CREATE CORRECT ADDRESSES
+        ADDM    AC7,OBUF+1      ;ADJUST OUTPUT BUFFER POINTER
+        BLT     AC,@AC1         ;XFER INPUT TO OUTPUT BUFFER
+	POP	P,AC7		;[105] RESTORE THE BITS PER CHARACTER WORD
+        POPJ    P,
+;
+;       COME HERE TO DO FORTRAN CARRIAGE CONTROL FOR
+;	1ST CHARACTER OF FILE OR IF FOLLOWING A LINEFEED
+;
+FTN1ST:	SETOM	CTLFLG		;[104] SET CONTROL CHARACTER FLAG
+	SETZ	AC1,		;[104] INDICATE THAT WE HAVE NOTHING LEFT
+FTNCHR:	JUMPN	AC1,FORCHR	;[104] JUMP IF WE HAVE SOMETHING TO CHECK
+	SOSGE   IFILB+2         ;[104]  NO--SEE IF BUFFER EMPTY ?
+	  PUSHJ	P,REDBUF        ;[104]   YES--REFILL BUFER
+        ILDB    AC1,IFILB+1     ;[104] GET A WORD OF CHARACTERS
+FORCHR:	SETZ    AC,             ;[104] ZERO RECEIVING AREA
+        LSHC    AC,(AC7)	;[104] BRING OVER THE CHAR
+	SKIPE	CTLFLG		;[104] IS THIS A CARRIAGE CONTROL CHARACTER?
+	  JRST	FORCCC		;[104]   YES--PROCESS IT
+        CAIN    AC,12           ;[104] IS A CARRIAGE CONTROL CHARACTER NEXT?
+	  SETOM	CTLFLG		;[104]   YES--SET FLAG
+	JRST	FTNCHR		;[104] LOOP TILL OUT OF DATA
+;
+;	COME HERE IF WE NEED TO PROCESS A FORTRAN CARRIAGE CONTROL
+;	CHARACTER TO DETERMINE PROPER PAGE / LINE SPACING
+;	FROM HERE WE BRANCH TO THE RIGHT ROUTINE
+;	** -- ALL RETURN TO FTNCHR -- **
+;
+FORCCC:	SETZM	CTLFLG		;[104] CLEAR C/C FLAG BEFORE PROCESSING
+	CAIN    AC," "          ;[104] CHECK FOR A BLANK
+	  JRST	SINGLE          ;[104] GO DO A SINGLE SPACE
+        CAIN    AC,"0"          ;[104] CHECK FOR A ZERO
+	 $Djrst	Double,<8>	;[114] GO DO A DOUBLE SPACE
+        CAIN    AC,"1"          ;[104] CHECK FOR A ONE
+	 $Djrst	DOFORM,<0>	;[114] GO DO A FORM FEED
+        CAIN    AC,"+"          ;[104] CHECK FOR A PLUS
+	 $Djrst	FTNCHR,<4>	;[114]  NO CHANGE TO LINE COUNTS -- RETURN
+	CAIN    AC,"-"          ;[104] CHECK FOR A MINUS
+	 $Djrst	TRIPLE,<9>	;[114] Do TRIPLE LINE FEED
+	CAIE    AC,"*"          ;[104] CHECK FOR A STAR
+	 JRST	.+3		;[104] LINES=1 IGNORE PEFORATIONS (CHAN 5)
+	  MOVEI	AC,1		;[104] EVERY LINE - NO FORMS BREAK
+	 $Djrst	ESKIPE,<5>	;[114]  DO CODE
+        CAIE    AC,"2"          ;[104] CHECK FOR A TWO
+	 JRST	.+3		;[104] DO SKIP TO 1/2 PAGE BOUNDARY (HALFP)
+	  MOVE	AC,HALFP	;[104] HALF  PAGE, CHANNEL 2
+	 $Djrst	ESKIPE,<1>	;[114] DO CODE
+	CAIE    AC,"3"          ;[104] CHECK FOR 3
+	 JRST	.+3             ;[104] DO SKIP TO 1/3 PAGE BOUNDARY (THIRDP)
+	  MOVE	AC,THIRDP	;[104] THIRD PAGE, CHANNEL 7
+	 $Djrst	ESKIPE,<2>	;[114] DO CODE
+	CAIE    AC,"/"          ;[104] CHECK FOR A SLASH
+	 JRST	.+3             ;[104] DO SKIP TO 1/6 PAGE BOUNDARY (SIXTHP)
+	  MOVE	AC,SIXTHP	;[104] SIXTH PAGE, CHANNEL 6
+	 $Djrst	ESKIPE,<3>	;[114] DO CODE
+	CAIE    AC,"."          ;[104] CHECK FOR A PERIOD
+	 JRST	.+3		;[104] SKIP 2 LINES - TRIPLE SPACE (CHAN 4)
+	  MOVEI	AC,3		;[104] SKIP 2, CHANNEL 4
+	 $Djrst ESKIPE,<7>	;[114] DO CODE
+	CAIE    AC,","          ;[104] CHECK FOR A COMMA
+	  JRST  SINGLE          ;[104] DEFAULT TO SINGLE LF - IGNORE CHAR
+	MOVEI	AC,2		;[104] SKIP 1 LINE  - DOUBLE SPACE (CHAN 3)
+	$Djrst	ESKIPE,<6>	;[114] SKIP 1, CHANNEL 3
+;
+;       COME HERE FOR "LF" C/C'S (SPACE=1, ZERO=2, DASH=3)
+;
+TRIPLE:	MOVEI   AC,3            ;[104] AMOUNT TO INCREASE LINES
+	  CAIA			;[104] SKIP INTO CODE
+DOUBLE:	MOVEI	AC,2		;[104] AMOUNT TO INCREASE LINES
+	ADDM	AC,TOTCHR	;[104] COUNT EXTRA LF'S
+	SOS	TOTCHR		;[104] ADJUST SINCE C/C = 1 CHAR ALREADY
+	  CAIA			;[104] SKIP INTO CODE
+SINGLE:	MOVEI	AC,1		;[104] AMOUNT TO INCREASE LINES
+FTNCKP:	ADDB	AC,LINPAG	;[104] INCREASE LINES PER PAGE
+        CAMG	AC,MAXLIN	;[104] SEE IF EXCEEDS MAX LINES/PAGE
+	  JRST	FTNCHR		;[104] NO--DONE
+	SUB	AC,MAXLIN	;[104] YES-SUBTACT A PAGE'S WORTH OF LINES
+	MOVEM	AC,LINPAG       ;[104] ----SAVE THE NEW COUNT
+	 CAIA			;[104] ---- *** SKIP ***
+DOFORM:	SETZM	LINPAG		;[104] ZERO LINE COUNT THIS PAGE
+	AOS	PAGECT		;[104] INCREMENT THE PAGE COUNT & RETURN
+	JRST	FTNCHR		;[104] ----RETURN
+;
+;
+;       COME HERE FOR * 2 3 / , AND .
+;
+ESKIPE:	PUSH	P,AC1		;[104] SAVE FOR REMAINDER STORAGE
+	MOVEM	AC,FTNMOD	;[104] SAVE MODULO N
+	MOVE	AC,LINPAG	;[104] GET LINES PER PAGE
+	IDIV	AC,FTNMOD	;[104] DIVIDE TO GET REMAINDER
+	EXCH	AC1,FTNMOD	;[104] SWAP SO SUBTRACT WORKS
+	SUB	AC1,FTNMOD	;[104] GET ADDITIONAL LINES TO ADD
+	MOVE	AC,AC1		;[104] COPY VALUE
+	POP	P,AC1		;[104] RESTORE WORD OF CHARACTERS
+        ADDM    AC,TOTCHR	;[104] ADD FOR ALL THOSE LF DONE
+	JRST	FTNCKP		;[104] USE COMMON CODE FOR FINALE!
+
+
+Ifn FTSTAT,<
+
+DEB$0:	Block	1
+DEB$1:	Block	1
+DEB$2:	Block	1
+DEB$3:	Block	1
+DEB$4:	Block	1
+DEB$5:	Block	1
+DEB$6:	Block	1
+DEB$7:	Block	1
+DEB$8:	Block	1
+DEB$9:	Block	1
+
+> ; End ifn FTSTAT
+
+	SUBTTL	FINISH TRANSFERRING FILE TO (SPOOL) AREA
+;
+;       FILE HAS BEEN TRANSFERED, CLOSE CHANNEL OF OUTPUT,
+;       SEND OUT MESSAGE AND RETURN
+;
+FINXFR: PUSHJ   P,DISABL
+        CLOSE   OUFIL,0         ;PUT FILE IN UFD OF SPOOL
+;
+;       BUILD FILE DESCRIPTOR BUFFER AND POSSIBLY WRITE
+;       IT OUT TO THE SPOOL.FDF (SPOOLED FILE DESCRIPTOR FILE)
+;
+        AOS     ,PAGECT         ;ADD 1 TO PAGE COUNT
+        MOVE    AC7,FCOPYS      ;GET NO. COPYS WANTED
+        IMULM   AC7,TOTCHR      ;GET COPIES NO. CHAR.
+        IMULB   AC7,PAGECT      ;CREATE NO. TOTAL PAGES WANTED
+        ADDM    AC7,TOTPGS      ;STORE PAGES FOR THIS FILE
+        MOVE    AC,AC7          ;PUT PAGES IN AC FOR CONVERSION
+        PUSHJ   P,BINDEC        ;PUT OUT NO PAGES THIS FILE
+        MOVEI   ERROR,PROMES    ;ADDRESS OF MESSAGE
+        PUSHJ   P,ERPRO         ;OUT MESSAGE
+FNXFR1: HLRZ    AC7,FCOUNT      ;GET NEG. INDEX
+        ADDI    AC7,MAXFIL##    ;CREATE POSITIVE PARTIAL INDE
+        IMULI   AC7,10          ;CREATE FDBUFF INDEX FOR THIS FILE
+        HRLZ    AC,FCOPYS       ;GET COPIES WANTED
+        LSH     AC,^D12         ;LEFT JUSTIFY
+        IOR     AC,BATCHN       ;GET BATCH NUMBER
+        MOVEM   AC,FDBUFF(AC7)  ;STORE BATCH REQUEST NO.
+        MOVE    AC,PAGECT       ;GET PAGE CT. FOR THIS FILE
+        LSH     AC,^D21         ;SHIFT NO. PAGES
+        IOR     AC,TOTCHR       ;PUT IN CHAR. COUNT
+        MOVEM   AC,FDBUFF+6(AC7) ;STORE PAGES AND CHAR COUNT
+        MOVE    AC,FLIST(INDEX) ;GET FILE NAME
+        HLL     AC1,EBLK+3      ;GET DIRECTORY EXT. NAME
+        HLR     AC1,FLIST+1(INDEX);GET ORIGINAL EXT. NAME
+        DMOVEM  AC,FDBUFF+1(AC7);STORE DIR. AND ORG. EXT NAME
+        DMOVE   AC,TUSER        ;GET ORG. OWNER OF FILE
+        MOVEM   AC,FDBUFF+4(AC7) ;SAVE FIRST HALF OF NAME
+        MOVEM   AC1,FDBUFF+7(AC7) ;SAVE LAST HALF OF NAME
+        MOVE    AC,GDBUFF+2     ;GET REQUESTOR PPN
+        MOVEM   AC,FDBUFF+3(AC7) ;STORE IN FD RECORD
+        MOVE    AC,GDBUFF+5     ;GET PAPER AND LINES PER PAGE
+	SKIPE	KANA		;IF KATAKANA FILE, MAKE SURE
+	TLO	AC,KFMSK	;BIT IS SET IN THE GROUP
+	MOVEM	AC,GDBUFF+5	;DESCRIPTOR FILE.
+        HLR     AC,GDBUFF+3     ;GET DATE OF REQUEST
+	SKIPE	KANA		;IF KATAKANA FILE, SET BIT
+	TLOA	AC,KFMSK	;IN FD ENTRY.
+	TLZ	AC,KFMSK	;UNSET BIT IF NOT.
+        MOVEM   AC,FDBUFF+5(AC7) ;STORE IN FD
+        SKIPG   ,ESCSET         ;SKIP IF THIS AN ESCAPE 1
+        SETZM   ,ESCSET         ;GO FILE ENTERED
+        MOVE    AC,FCOUNT       ;GET FILE AND BUFFER COUNT
+        AOBJP   AC,TURNON
+TURNON: MOVEM   AC,FCOUNT       ;RESTORE COUNTER, BUFFER NOT FULL
+        SKIPLE  ESCSET          ;SKIP IF NOT ESCAPE
+        JRST    .+3
+        PUSHJ   P,RENABL
+        POPJ    P,
+        SETZM   ERRCNT          ;DONT CARE
+        JRST    WRITGD          ;GO SAVE GD
+;       PURPOSE IS TO READ IN A FILE
+;       AND TO CHECK THE PROTECTION TO SEE IF READING IS ALLOWED.
+;       IF READING IS NOT ALLOWED, A CHECK IS MADE TO SEE IF 
+;       THE USERS LICENSE WILL OVERRIDE THE PROCTECTION
+;
+GETVAL:	MOVE	AC,FLIST(INDEX)	;MOVE THE FILE INFORMATION TO
+	MOVEM	AC,FILINF+2	;THE BLOCK WHICH WILL BE USED
+	MOVE	AC,FLIST+1(INDEX)
+	MOVEM	AC,FILINF+3	;AS THE EXTENDED LOOKUP BLOCK.
+	MOVE	AC,FLIST+3(INDEX)
+	MOVEM	AC,FILINF+1
+	MOVEI	AC,14		;THE LOOKUP LENGTH WORD.
+	MOVEM	AC,FILINF
+	LOOKUP  INFIL,FILINF	;DO LOOKUP ON THE FILE
+        JRST    GETV1           ;ERROR JUMP
+	MOVE	AC,FILINF+3	;MOVE INFORMATION FROM LOOKUP
+	MOVEM	AC,FLIST+1(INDEX)
+	MOVE	AC,FILINF+4	;BLOCK BACK TO FLIST.
+	MOVEM	AC,FLIST+2(INDEX)
+	MOVE	AC,FILINF+14	;FIND OUT IF THE FILE IS
+	LSH	AC,^D9		;KATAKANA FROM BIT 9 OF
+	SETZM	KANA		;.RBLIC WORD.
+	SKIPGE	AC		;SET KANA SWITCH TO ALL ONES
+	SETOM	KANA		;IF KATAKANA FILE.
+	Skipe	AC7,FILINF+5	;[102] Get # words, skip if an empty FILE
+	JRST	CNTCHR		;and convert to a char count
+	  Skipa	Error,[Emptyf]	;[102] If empty, give error (fall below)
+
+GETV1:	MOVEI   ERROR,NOTFIL    ;GET ADDRESS OF ERROR MESSAGE
+        AOS     ,ERRCNT         ;ADD 1 FOR FILE NOT SPOOLED
+        JRST    LICFAL+1        ;GO PUT OUT ERROR MESSAGE
+;
+;       SEE IF THIS FILE BELONGS TO THIS USER--IF IT IS, MAKE
+;       SURE HE HAS PERMISSION TO USE IT
+;
+GETCON: HLRE    AC7,FLIST+3(INDEX) ;GET WORD LENGTH
+        JUMPG   AC7,.+3         ;SKIP IF IN BLK LENGTH
+        MOVNS   ,AC7            ;MAKE POSITIVE WORD LENGTH
+        SKIPA                   ;SKIP BLK CONVERSION
+        IMULI   AC7,200         ;CONVERT BLKS TO WDS
+CNTCHR: SKIPGE	,KANA		;skip if not a Kana file
+	IMULI	AC7,4		;4 chars/word for Kana
+	SKIPL	,KANA		;skip if Kana file
+        IMULI   AC7,5           ;CONVERT WDS TO CHAR. COUNT
+        MOVEM   AC7,TOTCHR      ;SAVE NO. CHAR. TO FILE
+;
+        HLRZ    AC7,FLIST+2(INDEX) ;GET ENTIRE FILE PROTECTION
+        JUMPN   FLAG,NOTOWN     ;BR. IF NOT USERS FILE
+        LSH     AC7,-^D15       ;SEPERATE THE PRIVATE PROTECTION
+        JRST    NOTON1
+;
+;       COME HERE IF FILE DOES NOT BELONG TO USER--
+;       CHECK GAN TO SEE WHICH PROTECTION WE HAVE TO CHECK
+;
+NOTOWN: HLRZ    AC,GANUUN       ;GET USER GAN
+        HLRZ    AC1,GETGAN+1    ;GET THE FILES GAN
+        CAME    AC,AC1          ;GET IF THEY ARE THE SAME
+        JRST    CHKPUB          ;BR. TO CHECK PUBLIC PROTECTION
+;
+;       CHECK ACCOUNT PROTECTION
+        LSH     AC7,-^D12       ;SEPERATE THE
+        ANDI    AC7,7           ;  ACCOUNT PROTECTION
+NOTON1: CAILE   AC7,4           ;CHECK FOR READ ALLOWANCE
+        JUMPE   LIC,LICFAL      ;LIC=0, THUS NO LICENSE, THUS ERROR
+        POPJ    P,
+;
+;       CHECK PUBLIC PROTECTION
+;
+CHKPUB: LSH     AC7,-^D9        ;SEPERATE PUBLIC PROTECTION
+        ANDI    AC7,7           ;GET PUBLIC PROTECTION
+        CAIG    AC7,4           ;CHECK FOR READ ALLOWANCE
+        POPJ    P,
+;
+;       COME HERE TO CHECK LICENSE BECAUSE PROTECTION STOPS
+;       US FROM READING THE FILE
+;
+        JUMPE   LIC,LICFAL      ;NO LICENSE, FATAL MISTAKE
+        MOVE    AC,LIC          ;GET USERS LICENSE
+        ANDI    AC,3            ;GET WRITE LICENSES
+        CAILE   AC,1            ;CHECK POWER OF WRITE LICENSE
+        POPJ    P,
+        MOVE    AC,LIC          ;GET LICENSE AGAIN
+        ANDI    AC,14           ;GET READ LICENSES
+        CAILE   AC,4            ;CHECK POWER OF LICENSE
+        POPJ    P,
+;
+;       USER HASNT ENOUGH LICENSE, SEND OUT ERROR MESSAGE
+;
+LICFAL: MOVEI   ERROR,NOLIC     ;GET ADDRESS OF ERROR MESSAGE
+        PUSHJ   P,ERPRO         ;OUT ERROR MESSAGE
+        AOS     (P)             ;ADJUST RETURN ADDRESS
+        POPJ    P,              ;RETURN
+;
+;       INCREMENT POINTERS TO GET NEXT ENTRY IN LIST
+;
+NEXT:   SKIPE   ,FROM           ;SKIP IF FROM COMMAND NOT SET
+        POPJ    P,
+NEXT1:  ADDI    INDEX,4         ;INCREASE POINTER IN FILE LIST
+        SOJLE   FCNT,WRITGD     ;BR. TO SAVE GROUP DESCRIPTOR
+                                ; SINCE ALL FILES SPOOLED
+        JRST    RNROBN          ;GO GET NEXT ENTRY
+;
+;       COME HERE WHEN ALL FILES SPECIFIED BY THE USER HAVE
+;       BEEN SPOOLED OVER FOR PRINTING.  FIRST SEE IF THERE
+;       ARE ANY FILE DESCRIPTORS TO BE SAVED, AND IF SO, DO SO.
+;       THEN IF THERE WERE ANY FILES SPOOLED, SAVE THE
+;       GROUP DESCRIPTOR.
+;
+WRITGD: SKIPN   ERRCNT          ; ANY ERRORS?
+        JRST    WRITG1          ; NO DONE
+        MOVE    AC,FCOUNT
+        MOVEM   AC,SAVFCO
+        MOVEM   FCNT,SAVFCN
+        JRST    RENTER
+WRITG1: PUSHJ   P,DISABL
+        SETOM   OPNOUT          ; WE ARE OUTPUTTING
+        HRRZ    HOLD,FCOUNT     ;GET NO. FILE IN FDBUFF
+        MOVEM   HOLD,NOFIFD
+        PUSHJ   P,OPNFD         ; OPEN FD FILE
+        ADDI    AC,1            ; ASSUME ON BLOCK BOUNDARY
+        MOVEM   AC,CURFD        ; SET TO NEXT BOUNDARY
+        SKIPE   AC1             ; IF AC1=0 => EVEN BUFFER
+        PUSHJ   P,RDLFD         ; READ LAST BLOCK (PARTIAL)
+        PUSHJ   P,FIXFDP        ; FIX UP BUFFER POINTERS
+        PUSHJ   P,PUTFD         ; ONLY THING NOW IS TO PUT IT OUT
+        MOVE    AC,CURFD##
+        MOVEM   AC,GDBUFF+34
+NOSAVE: HRLZ    AC,FCOUNT       ;GET TOTAL NO. FILES SPOOLED
+        LSH     AC,^D8          ;SHIFT TO ADD TO FIELD
+        HLLM    AC,GDBUFF+1     ; SAVE TO GD REQUEST
+;       SKIPE   ,ERRCNT         ;SEE IF FILES NOT SPOOLED
+;                               ;WHICH WE CAN STILL GET
+;       JRST    RENTER          ;MAYBE GO GET THEM
+        TLNN    AC,777400       ;SKIP IF SOMETHING SPOOLED
+        JRST    GOTAN1          ;NO, FILES, DONT ENTER REQ.
+;
+;       NOW WRITE OUT THE GROUP DESCRIPTOR
+;
+SAVEGD: MOVE    AC,TOTPGS       ;GET TOTAL NUMBER OF PAGES TO REQUEST
+        HRLM    AC,GDBUFF+4     ;STORE IN GD BUFFER
+        HLRZ    AC,GDBUFF+1     ; LETS FIX UP INDENT
+        IOR     AC,SAVIND       ; THAT'S IT
+        HRLM    AC,GDBUFF+1     ; THAT'S IT
+        HRLZ    AC,HCOPYS       ;GET HIGHEST COPY COUNT
+        LSH     AC,^D9          ;SHIHT FOR STORING
+        IORM    AC,GDBUFF+21    ;SAVE HIGH COUNT
+        MOVE    AC,BATCHN       ;GET BATCH REQUEST NUMBER
+        IORM    AC,GDBUFF       ;STORE IN GROUP DESCRIPTOR
+        SETOM   CURBLK          ; SET CURBLK TO -1 SO APPEND TO GD FILE
+        PUSHJ   P,UPDGD         ; UPDATE IT DUMMY
+;
+;       DETERMINE WHICH FILE FOR SPOOL UPDATE AND DO IT
+;
+        SKIPN   AC1,REQREM      ;SKIP IF THIS REQUEST TRUE REMOTE
+        JRST    CENPEN          ;BR. IF CENTER REQUEST
+;
+;       HAVE VALID PRINTER NO., GO UPDATE REMOTE COUNT
+;
+        PUSHJ   P,FINPRI        ;FIND PRINT LOC
+        ADDI    AC,1            ;INCREASE COUNT
+        TLO     AC,400000       ;TURN CHANGE BIT ON
+        PUSHJ   P,WRIPRI        ;PUT IT BACK
+        JRST    OUTINF          ;GO PUT OUT INFO
+;
+;       COME HERE TO UPDATE CENTERS PENDING COUNT AND
+;       MAKE HARDCOPY OF REQ. TO SUPCHECK FILE
+;
+CENPEN: PUSHJ   P,UPCADD        ;GO UPDATE COUNT
+        SKIPE   ESCSET
+        JRST    ESCCAN          ;GO CAN CEL REQ.
+        MOVE    AC,TTYON        ;GET TTY MODE
+        PUSH    P,AC            ;SAVE IT
+        MOVEI   AC,100          ;GET ANY POS. NUMBER
+        SETZM   REPORT          ;SHOWS WHERE TO GET FILE LIST
+        MOVEM   AC,DUPREQ       ;SHOWS WHAT TO STORE
+        SKIPN   LOKHED          ;DO NOT MAKE COPY FOR LOCKHEED
+        PUSHJ   P,SUPCPY        ;GO MAKE COPY FOR SUPCHECK
+        POP     P,AC            ;RETURN TTY MODE
+        MOVEM   AC,TTYON        ;RESTORE IT
+        JRST    OUTINF          ;GO ON
+;
+;       COME HERE TO MAKE A COPY OF THE REQUEST TO SSPOOL.DAT
+;       FOR SUPCHECK SO OPERATOR GET HARDCOPY
+;
+SUPCPY: INIT    SUPCHL,0        ;GET CHANNEL FOR SUPCHECK FILE
+        SIXBIT/DSK/
+        XWD SUPOUT,0
+        JRST    INERR1
+TRYSUP: DMOVE   AC,SUPBLK       ;PREPARE TO GET FILE
+        DMOVE   AC2,SUPBLK+2
+        LOOKUP  SUPCHL,AC
+        JRST    [SETZ   AC4,
+                 JRST   MAKSUP]
+        HLRE    AC4,AC3         ;GET NEG. LENGTH
+        MOVN    AC4,AC4         ;MAKE POSITIVE
+MAKSUP: SETZ    AC2,
+        MOVE    AC3,SUPBLK+3    ;GET PPN
+        ENTER   SUPCHL,AC       ;DO ENTER ON FILE
+        JRST    [HRRZ   AC2,AC1  ;GET STATUS
+                 CAIE   AC2,3   ;SEE IF BUSY
+                 JRST   OUTER2  ;CANT DO ENTER
+                 MOVEI  AC2,10
+                 SLEEP  AC2,
+                 JRST   TRYSUP]
+        OUTPUT  SUPCHL,         ;DUMMY
+        MOVE    AC,AC4          ;GET FILE LENGTH
+        IDIVI   AC,200          ;GETTING BLK TO WORK ON
+        ADDI    AC,1            ;POINT TO NEXT BLK
+        SKIPE   ,AC1            ;SKIP IF NONE IN NEXT BLK
+        ADDI    AC,1            ;START ON BOUNDRY
+        USETO   SUPCHL,@AC      ;SET POINTER
+        SETOM   SUPCHK          ;SHOWS WHAT FILE TO WORK ON
+        SETZM   TTYON           ;PREVENTS OUTPUT TO TTY
+        MOVEI   10,GDBUFF       ;GET ADDRESS OF BUFFER
+        PUSHJ   P,HRDCPY        ;GO DO HARDCOPY
+        MOVE    AC1,GDBUFF      ;GET STATUS
+        MOVEI   AC,[ASCIZ/
+*** THE ABOVE IS A TRANSFER REQUEST ***/]
+        TLNE    AC1,770000      ;SKIP IF NOT TRANSFER
+        PUSHJ   P,OUTLIN        ;PUT MESSAGE TO SUPCHECK FILE
+        MOVEI   AC,CRLF         ;DO A CR,LF
+        PUSHJ   P,OUTLIN        ;DO CR,LF AT END
+        OUTPUT  SUPCHL,         ;EMPTY LAST BUFFER
+        RELEAS  SUPCHL,         ;RELEASE FILE
+        SETZM   SUPCHK          ;TURN OFF OUTPUT TO SUPCHECK FILE
+        POPJ    P,              ;RETURN
+;
+;
+OUTINF: SKIPE   ,ESCSET         ;SKIP IF NO ESCAPES
+        JRST    ESCCAN          ;GO CANCEL REQUEST
+        MOVEI   AC,ALTTYP       ;RESET ESCAPE ADDRESS
+        MOVEM   AC,INTAB+1      ;SAME
+        MOVEI   AC,ANYQUS
+        PUSHJ   P,OUTLIN
+        MOVEI   AC5,^D60        ;MAX. CHAR. TO DO
+        SETZ    AC3,            ;ZERO SPACE COUNTER
+TPHON1: ILDB    AC,FONADR+1     ;GET A CHAR.
+        JUMPE   AC,TPHON2       ;BR. ON SPACE
+        SKIPE   ,AC3            ;SKIP IF NO PREVIOUS SPACES TO DO
+        JRST    TPHON3          ;GO PUT OUT LEADING SPACES
+TPHON5: ADDI    AC,40           ;CONVERT TO ASCII
+        PUSHJ   P,CHROUT        ;PUT IT OUT
+TPHON4: SOJG    AC5,TPHON1      ;BR. IF MORE CHAR. TO DO
+        RELEAS  12,             ;RELEASE ADDRESS FILE AND CHAN.
+        MOVEI   AC,CRLF
+        PUSHJ   P,OUTLIN
+        JRST    OUTIN1          ;GO GIVE REST OF INFORMATION
+TPHON2: ADDI    AC3,1           ;ADJUST SPACE COUNTER
+        JRST    TPHON4          ;GO ADJUST CHAR/LINE COUNT
+TPHON3: PUSH    P,AC            ;SAVE AC
+        MOVEI   AC,40           ;GET A BLANK
+        PUSHJ   P,CHROUT        ;PUT IT OUT
+        SOJG    AC3,.-2         ;PUT THEM ALL OUT
+        POP     P,AC            ;RESTORE AC
+        JRST    TPHON5          ;GO ON
+OUTIN1: HLRZ    AC1,GDBUFF+3    ;GET DATE
+        PUSHJ   P,WDATE
+        MOVEI   AC,FILR03
+        PUSHJ   P,OUTLIN
+        HRRZ    AC2,GDBUFF+1    ;GET TIME OF REQ.
+        PUSHJ   P,WTIME
+        MOVEI   AC,CRLF
+        PUSHJ   P,OUTLIN
+        HLRZ    AC,GDBUFF+1     ;GET NO. FILES SPOOLED
+        LSH     AC,-^D8         ;RIGHT JUSTIFY
+        PUSHJ   P,BINDEC        ;OUT NO. FILES SPOOLED
+        MOVEI   AC,FILSPO
+        PUSHJ   P,OUTLIN
+        HLRZ    AC,GDBUFF+4     ;GET PAGES PRINTED
+        PUSHJ   P,BINDEC        ;PUT OUT NO PAGES
+        MOVEI   AC,REQNUM
+        PUSHJ   P,OUTLIN
+        MOVE    AC1,[POINT 6,BATCHN,5] ;POINT TO BATCH NO.
+        MOVEI   AC7,5           ;NO. OF CHAR. TO PUT OUT
+BNOOUT: ILDB    AC,AC1          ;GET A BATCH NUMBER
+        ADDI    AC,40           ;CONVERT TO ASCII
+        PUSHJ   P,CHROUT        ;PUT OUT BATCH NO.
+        SOJG    AC7,BNOOUT      ;DO REST OF NUMBER
+        JRST    PROMPT          ;RETURN TO COMMANDER
+;
+;       COME HERE IF USER ESCAPES WHILE SPOOLING FILES
+;
+SPLESC: PUSHJ   P,DISABL
+        CLOSE   OUFIL,          ;CLOSE ANY FILE
+        MOVEI   AC,WRITGD       ;POSSIBLE JUMP AREA
+        MOVEM   AC,USER         ;FOR ONE OF THE POSSIBLE JUMPS
+        SKIPE   ,ESCSET         ;JUMP IF NOT WORKING ON A FILE
+        MOVEI   AC,FNXFR1       ;WHERE TO GO SINCE WORKING ON ONE
+        MOVEM   AC,INTAB        ;CHANGE THE PC
+        MOVEI   AC,1            ;SHOWS DOING AN ESCAPE
+        MOVEM   AC,ESCSET       ;SAME
+        MOVEI   AC,CANREQ       ;SAME
+        PUSHJ   P,OUTLIN
+        DISMIS                  ;DO IT
+;       COME HERE TO GO CANCEL REQUEST
+;
+ESCCAN: MOVEI   AC,ALTTYP       ;RETURN ESCAPE JUMP ADDRESS
+        MOVEM   AC,INTAB+1      ;DO IT
+        MOVE    13,USRPPN       ;GET THIS USERS PPN FOR CANCEL
+        MOVE    6,BATCHN        ;BET BATCH NO. FOR CANCEL
+        SETZ    3,              ;ZERO FOR CANCEL
+        SETOM   ,ESCSET         ;FOR CANCELING REQ.
+        CLRBFI
+        JRST    LOKAGN          ;GO CANCEL REQUEST
+;
+;
+REQNUM: ASCIZ/  PAGES
+SPOOL REQUEST NUMBER /
+RENTER:
+        MOVE    AC,FCOUNT                       ; SAVE IT
+        MOVEM   AC,SAVFCO
+        MOVEM   FCNT,SAVFCN
+        HRLZ    AC,FCOUNT               ; SET UP GDBUFF IN CASE
+        LSH     AC,^D8          ; SHIFT FOR CORRECT POS
+        ADDB    AC,GDBUFF+1
+        HRLZI   AC,-12          ;FOR POSSIBLE ESCAPE
+        MOVEM   AC,FCOUNT       ;SAME
+        PUSHJ   P,RENABL
+        SKIPE   CALSPL
+        JRST    ASSMNO
+        OUTSTR  [ASCIZ/
+RE-ENTER FILES NOT SPOOLED? /]
+        PUSHJ   P,YORN          ;GET YES OR NO
+        JRST    ASSMNO          ;ON NO
+ZROBUF: SETZM   ,FLIST          ;PREPARE TO ZERO STORAGE
+        MOVE    AC,[FLIST,,FLIST+1] ;PLACES TO ZERO
+        BLT     AC,FLIST+^D79   ;ZERO STORAGE
+        SKIPN   ERRCNT
+        JRST    PARSE
+        SETZM   ERRCNT
+        JRST    REQST           ;GO ON YES
+ASSMNO: HLRZ    AC,GDBUFF+1     ;GET NO. FILES SPOOLED
+        LSH     AC,-^D8         ;RIGHT JUSTIFY COUNT
+        JUMPE   AC,GOTAN1       ;NO SAVE GD
+        MOVE    FCNT,SAVFCO     ;RESTORE
+        MOVE    AC,SAVFCO
+        MOVEM   AC,FCOUNT
+        SETZM   ERRCNT
+        JRST    WRITGD
+GOTAN1: MOVEI   AC,ALTTYP       ;RETURN OLD ESCAPE ADDRESS
+        MOVEM   AC,INTAB+1      ;SAVE TO INTERRUPT TABLE
+        MOVEI   AC,NUNSPO       ;NO FILES SPOOLED
+        PUSHJ   P,OUTLIN
+        JRST    PROMPT          ;NO FILES, DONT SAVE GD
+;
+;       GET NODE, OBTAIN PRINTER LOC.
+;
+        RCHL=11
+GETPRI: ANDI    AC1,7777        ;KEEP NODE
+        OPEN    RCHL,SPLDEF     ;GET CHANNEL
+        JRST    INERR1          ;CANT GET CHANNEL
+        INBUF   RCHL,1          ;NO. INPUT BUFFERS
+        MOVE    AC,SPLGAN       ;GET SPOOLERS PPN
+        MOVEM   AC,NODPRI+3     ;STORE FOR LOOKUP
+        LOOKUP  RCHL,NODPRI     ;GET NODPRI FILE
+        JRST    REMER1          ;NODPRI FILE NOD THERE
+REMOT4: MOVEM   AC1,BATCHN      ;SAVE NODE FOR LATER
+        IDIVI   AC1,200         ;GET BLK TO READ
+        ADDI    AC1,1           ;POINT TO CORRECT BLK TO READ
+        USETI   RCHL,@AC1       ;POINT TO BLK TO READ
+REMOT2: IN      RCHL,           ;READ BLK OF NODE IN
+        JRST    REMOT1          ;JUMP ON GOOD READ
+        STATZ   RCHL,340000     ;CHECK STATUS
+        JRST    INERR2          ;ERROR DOING INPUT
+        SETZ    AC1,            ;SHOWS NODE NOT HERE
+        JRST    REMOT3          ;RETURN TO CALLER
+REMOT1: HRRZ    AC1,SPIBUF+1    ;GET BUFFER POINTER
+        ADDI    AC1,1           ;POINT BEGINNING BUFFER
+        ADD     AC1,AC2         ;ADD INCREMENT TO BUFFER
+        HLRZ    AC1,@AC1        ;GET PRI. LOC. NO.
+        JUMPN   AC1,REMOT3      ;JUMP IF HAVE SOMETHING
+        MOVE    AC2,DSTRCT      ;GET USERS DISTRICT
+        CAILE   AC2,^D9         ;SKIP IF DISTRICT LESS THAN 10
+        JRST    REMOT3          ;NO, THEN TAKE WHAT WE HAVE
+        MOVE    AC2,BATCHN      ;GET NODE
+        CAIGE   AC2,5000        ;SKIP IF ALTERNATE MAP NODE
+        JRST    REMOT3          ;NO, THEN TAKE WHAT WE HAVE
+        SUBI    AC2,4000        ;RESET TO ORIG. NODE
+        MOVE    AC1,AC2         ;MOVE FOR STORING NODE
+        JRST    REMOT4          ;GO SAVE IT, GET NEXT PRI.LOC.
+REMOT3: RELEAS  RCHL,           ;CLOSE FILE
+        POPJ    P,
+;
+;       FROM PRI. LOC. IN AC1, READ CORRECT BLOCK
+;       OF REMOTE COUNT AND GET CORRECT WORD
+;
+FINPRI: OPEN    RCHL,SPLDEF     ;GET CHANNEL
+        JRST    INERR1          ;CANT GET CHANNEL
+        INBUF   RCHL,1
+        OUTBUF  RCHL,1
+        MOVE    AC,SPLGAN       ;GET SPOOLERS PPN
+        MOVEM   AC,REMCNT+3     ;STORE FOR LOOKUP
+        SETZM   ,REMCNT+2       ;ZERO FOR LOOKUP
+        HLLZS   ,REMCNT+1       ;SAME
+        LOOKUP  RCHL,REMCNT     ;GET FILE
+        JFCL
+        MOVEM   AC,REMCNT+3     ;STORE PPN FOR ENTER
+        ENTER   RCHL,REMCNT     ;SEIZE FILE FOR OUTPUT
+        JRST    REMWHY          ;GO SEE WHY CANT GET IT
+        MOVEM   AC1,AC          ;SAVE PRINTER LOC
+        LSH     AC1,-7          ;CONVERT TO BLK NO.-1
+        ADDI    AC1,1           ;ADJUST BLK POINTER
+        USETI   RCHL,@AC1       ;SET INPUT POINTER
+        IN      RCHL,           ;READ IN CORRECT BLK
+        JRST    FINPR2          ;GO ON GOOD READ
+        STATZ   RCHL,340000     ;DO STATUS CHECK
+        JRST    INERR2          ;ERROR INPUTING
+        OUTPUT  RCHL,           ;DUMMY OUTPUT
+        ADDI    AC1,1           ;INCREASE POINTER
+        USETO   RCHL,@AC1       ;SET POINTER
+        OUTPUT  RCHL,           ;WRITE ZERO OUT TO FILE
+        SUBI    AC1,1           ;RESET POINTER
+        USETI   RCHL,@AC1       ;RESET INPUT POINTER
+        INPUT   RCHL,           ;READ ZERO BLOCK IN
+        JRST    FINPR1          ;GO SET UP FOR OUTPUT
+FINPR2: OUTPUT  RCHL,
+FINPR1: USETO   RCHL,@AC1       ;SET OUTPUT POINTER
+        IDIVI   AC,200          ;GET INDEX TO BLOCK
+        HRRZ    AC,SPIBUF+1     ;GET INPUT POINTER
+        ADD     AC1,AC          ;ADDRESS OF WD. TO READ
+        ADDI    AC1,1           ;ADJUST FOR BUFFER POINTER
+        MOVE    AC,@AC1         ;GET WD. TO CHANGE
+        POPJ    P,
+;
+;       WRITE CHANGE COUNT BACK OUT
+;
+WRIPRI: MOVEM   AC,@AC1         ;WRITE CHANGE BACK OUT
+        HRL     AC,SPIBUF+1     ;GET INPUT POINTER
+        HRR     AC,SPOBUF+1     ;GET OUTPUT POINTER
+        AOBJN   AC,.+1          ;ADJUST POINTERS
+        HRRZ    AC1,AC          ;GET OUTPUT POINTER
+        ADDI    AC1,177         ;LAST WD TO CARRY OVER
+        BLT     AC,@AC1         ;MOVE BLOCK OVER
+        MOVEI   AC1,200         ;NO. WDS. MOVED
+        ADDM    AC1,SPOBUF+1    ;CHANGE BYTE POINTER
+        OUTPUT  RCHL,           ;WRITE BLOCK BACK OUT
+        RELEAS  RCHL,           ;CLOSE FILE, RELEASE CHANNEL
+        POPJ    P,
+REMWHY: HRRZ    AC,REMCNT+1     ;GET REASON FOR ERROR
+        CAIE    AC,3            ;FILE BUSY
+        JRST    REMER3          ;CANT ACCESS FILE
+        MOVEI   AC,1            ;SLEEP FOR A WHILE
+        SLEEP   AC,             ;SAME
+        JRST    FINPRI          ;GO TRY AGAIN
+;
+;       COME HERE FOR PROCESSING- PRINT OUT USERNAME, FILE
+;       AND EXTENSION OF FILE IN ERROR.  ALSO PRINT REASON
+;       WHY IN ERROR.
+;
+ERRFLG: 0
+ERPRO:  MOVE    AC,ERROR        ;GET MESSAGE ADDRESS
+        SETZM   ERRFLG          ;SHOWS WHETHER TO STORE NAME
+        CAIN    AC,PROMES       ;SEE IF GOOD STORE
+        SETOM   ERRFLG          ;SHOWS TO SAVE FILE NAME
+        PUSHJ   P,OUTLIN        ;GO PUT IT OUT
+INDDON:
+        MOVE    AC,TUSER        ;GET USER NAME
+        JUMPE   AC,ERNUSR       ;NO USER NAME, BYPASS ALL THIS
+        MOVEI   AC,50           ;GET A PAREN
+        PUSHJ   P,CHRSUP        ;GO SAVE IT
+        MOVE    AC7,[POINT 6,TUSER] ;SET UP POINTER
+        MOVEI   AC1,14          ;SET CHAR. LIMIT TO USER NAME
+NXTURN: ILDB    AC,AC7          ;GET A CHARACTER FROM USER NAME
+        SOJL    AC1,ENDUSR      ;BR. OUT IF PROCESSED MAX. CHAR.
+        JUMPE   AC,ENDUSR       ;BR. IF ZERO, NO MORE USER NAME FOLLOWS
+        ADDI    AC,40           ;CONVERT BACK TO ASCII
+        PUSHJ   P,CHRSUP
+        JRST    NXTURN          ;PROCESS THE NEXT CHAR.
+ENDUSR: MOVEI   AC,51           ;GET A RIGHT PAREN
+        PUSHJ   P,CHRSUP
+ERNUSR: MOVEI   AC1,6           ;SET CHAR. LIMIT TO FILE NAME
+        MOVE    AC7,[POINT 6,TUSER+2] ;RESTOREING POINTER
+        MOVE    AC,FLIST(INDEX) ;GET FILE NAME
+        MOVEM   AC,TUSER+2      ;STORE IN TEMP. AREA
+NXTFLN: ILDB    AC,AC7          ;GET FILE NAME CHARACTER
+        JUMPE   AC,ENDNAM       ;BR. IF ZERO, NO MORE FILE NAME FOLLOWS
+        ADDI    AC,40           ;CONVERT TO SIXBIT
+        PUSHJ   P,CHRSUP
+        SOJE    AC1,ENDNAM      ;BR. OUT IF ALL CHAR. PROCESSED
+        JRST    NXTFLN          ;GO PROCESS THE NEXT CHAR.
+ENDNAM: HLLZ    AC,FLIST+1(INDEX); GET THE EXTENSION NAME
+        JUMPE   AC,MESAGE       ;BR. IF NO EXTENSION NAME
+        MOVE    AC7,[POINT 6,TUSER+3] ;CREATE POINTER
+        MOVEM   AC,TUSER+3      ;STORE EXTENSION NAME
+        MOVEI   AC,56           ;GET A PERIOD
+        PUSHJ   P,CHRSUP
+NXTEXN: ILDB    AC,AC7          ;GET AN EXTENSION CHARACTER
+        JUMPE   AC,MESAGE       ;BR. MEANS NO MORE EXTENSION CHAR.
+        ADDI    AC,40           ;CONVERT BACK TO ASCII
+        PUSHJ   P,CHRSUP
+        JRST    NXTEXN          ;GO PROCESS THE NEXT CHARACTER
+MESAGE: MOVEI   AC,15           ;GET NEW LINE
+        PUSHJ   P,CHRSUP
+        MOVEI   AC,12
+        PUSHJ   P,CHRSUP
+        POPJ    P,
+;
+;       PUT CHAR WHERE TO GO, SEE IF TO GO TO SUPCHECK FILE
+;
+CHRSUP: PUSHJ   P,CHROUT        ;PUT IT WHERE TO GO
+        POPJ P,
+;
+;       COME HERE FOR TYPING OUT INSTRUCTIONS FOR SPOOLING
+;
+QUERRY:
+        MOVEI   AC,QUEST
+        PUSHJ   P,OUTLIN
+        PUSHJ   P,LFPASS
+        JRST    PARSE           ;GO START OVER
+QUEST:  ASCIZ/
+ENTER UP TO 20 FILE SPECIFICATIONS.  FILE SPECIFICATIONS
+MAY BE EITHER AN INDIVIDUAL FILE OR A COMMAND FILE.
+
+COMMAND FILES ARE PRECEDED BY @, I.E. @(USER)COMMAND.FIL.
+ONLY INDIVIDUAL FILE SPECIFICATIONS MAY BE USED WITHIN
+A COMMAND FILE AND THEIR QUANTITY IS UNLIMITED.
+
+FILE SPECIFICATIONS ARE SEPARATED BY LINEFEEDS, COMMAS OR 
+BLANKS.
+
+TERMINATION OF REQUEST IS INDICATED BY A CARRIAGE RETURN
+FOLLOWING A FILE SPECIFICATION.
+/
+        JRST    REQST
+
+ERLIC:  MOVSI   AC,(ASCIZ/1/)   ;CANT GET USERS LICENSE
+        SKIPA
+INERR1: MOVSI   AC,(ASCIZ/2/)   ;CANT SECURE CHANNEL
+        SKIPA
+OUTER1: MOVSI   AC,(ASCIZ/3/)   ;CAN OPEN OUTPUT FILE
+        SKIPA
+OUTER2: MOVSI   AC,(ASCIZ/4/)   ;EEROR DOING OUTPUT
+        SKIPA
+DIRFUL: MOVSI   AC,(ASCIZ/5/)   ;SPOOL DIRECTORY FULL
+        SKIPA
+DONTNO: MOVSI   AC,(ASCIZ/6/)   ;CANT SPOOL ANY MORE FILES
+        SKIPA
+ENTER2: MOVSI   AC,(ASCIZ/7/)   ;ERROR ENTERING SPOOL FILE DESC.
+        SKIPA
+SPLER1: MOVSI   AC,(ASCIZ/8/)   ;CANT CREATE FILE DESC FILE
+        SKIPA
+INERR2: MOVSI   AC,(ASCIZ/9/)  ;ERROR INPUTTING FILE
+        SKIPA
+BCHERR: MOVSI   AC,(ASCIZ/10/)  ;BATCH NUMBER FILE MISSING
+        SKIPA
+NONUM:  MOVSI   AC,(ASCIZ/11/)  ;CANT GET NO. FOR THIS REQ.
+        SKIPA
+REMER1: MOVSI   AC,(ASCIZ/12/)  ;NOPRI FILE NOT FOUND
+        SKIPA
+REMER2: MOVSI   AC,(ASCIZ/13/)  ;ERROR INPUTTING REMCNT FILE
+        SKIPA
+REMER3: MOVSI   AC,(ASCIZ/14/)  ;CANT ACCESS REMCNT FOR OUTPUT
+        SKIPA
+LOCER1: MOVSI   AC,(ASCIZ/15/)  ;CANT FIND PRILOC
+        SKIPA
+LOCER2: MOVSI   AC,(ASCIZ/16/)  ;TROUBLE INPUTTING FILE
+        SKIPA
+LOCER3: MOVSI   AC,(ASCIZ/17/)  ;GOT WRONG ADDRESS
+        PUSH    P,AC            ;SAVE AC
+        MOVEI   AC,SPLERR
+        PUSHJ   P,OUTLIN
+        POP     P,AC            ;RETURN AC
+        JRST    ERRNUM
+SPLERR: ASCIZ/
+SPOOL ERROR /
+NOLIC:  ASCIZ/***PROTECTED        /
+NOTUSR: ASCIZ/***INVALID USER     /
+NOTFIL: ASCIZ/***CAN'T FIND FILE  /
+SYNTAX: ASCIZ/***BAD COPY SWITCH  /
+EMPTYF:	ASCIZ/***EMPTY FILE NOT SPOOLED /;[102] Message for empty files
+PROMES: ASCIZ/  PAGES        /
+PRTLIT: ASCIZ/PARTS ARE 1,2,3 OR 4
+/
+FPNT:   POINT   6,PNTF,5        ;RESTORINT POINTERS OF POINTERS
+EPNT:   POINT   6,PNTE,5        ;SAME
+UPNT:   POINT   6,PNTU,5        ;SAME
+;
+PNTF:   POINT   6,NAME          ;POINTERS INTO STORAGE AREAS
+PNTE:   POINT   6,EXTN          ;SAME
+PNTU:   POINT   6,USER          ;SAME
+;
+NAME:   BLOCK 1
+EXTN:   BLOCK 1         ;MUST BE NEXT TO AND BEHIND NAME
+USER:   BLOCK 2
+;******DO NOT SEPERATE*****
+UFDARG: -2,,0
+        BLOCK 7
+;****************
+;
+;
+;
+FILINF:	BLOCK	15		;FOR EXTENDED LOOKUP OF USER FILE.
+NCMND:  POINT   6,FLIST         ;SPECIAL POINTERS
+ECMND:  POINT   6,FLIST+1       ;  FOR COMMANDS
+UCMND:  POINT   6,FLIST+2       ;    FILE INFO
+UFDLU:  0                       ;FOR LOOKING UP UFD OF A USER
+        SIXBIT/UFD/
+        0
+        1,,1
+ARRAY TUSER [4]
+;       NEXT 8 PSEUDO OPS FOR RESTORING POINTERS
+T1PNT:  POINT 6,TUSER
+T2PNT:  POINT 6,TUSER+1
+T3PNT:  POINT 6,TUSER+2
+T4PNT:  POINT 6,TUSER+3
+ARRAY IUFD [3]
+ARRAY IFILB [3]
+UFDDTA: 1,,1                    ;USED FOR RESTORING ARGUMENTS TO LOOKUP
+FUFD:   EXP 10
+        SIXBIT/DSKB/
+        XWD     UFDBLK
+ARRAY UFDBLK [3]
+FFIL:   EXP 0
+        SIXBIT/DSK/
+        XWD     FILBLK
+ARRAY FILBLK [3]
+OUTDEF: EXP  0
+        SIXBIT  /DSK/
+        XWD     OBUF,0  
+ARRAY OBUF [3]
+ARRAY EBLK [15]
+CKDEF:  EXP 10                  ;USED FOR CHECKING FOR EXISTING FILES
+        SIXBIT  /DSK/
+        XWD     CKBUF
+ARRAY CKBUF [3]
+ARRAY FCOUNT [1]
+ARRAY BATCHN [1]
+
+SPLDEF: EXP 10          ;DEF. FOR PUTTING OUT FILE DESCRIPTOR
+        SIXBIT/DSK/
+        XWD     SPOBUF,SPIBUF
+SUPBLK: SIXBIT/SSPOOL/
+        SIXBIT/DAT/
+        0
+        IFNDEF DEBUG<
+SUPOWN:         1,,2            ;*1BATCH>
+        IFDEF DEBUG<
+SUPOWN: 3,,234620           ;sppoper>
+SUPOUT:
+BCHOUT:
+SPOBUF: BLOCK 3
+BCHIN:
+SPIBUF: BLOCK 3
+REMCNT: SIXBIT/REMCNT/
+        0
+        BLOCK 2
+NODPRI: SIXBIT/NODPRI/
+        0
+        BLOCK 2
+PRILOC: SIXBIT/PRIADR/
+        0
+        BLOCK 2
+FILR03: ASCIZ/   /
+WHAT:   ASCIZ/?
+/
+OUTDIS: ASCIZ/
+USER NOT IN YOUR DISTRICT/
+OUTREG: ASCIZ/
+USER NOT IN YOUR REGION/
+NAMQUS: ASCIZ/ENTER YOUR NAME
+/
+PROQUS: ASCIZ/ENTER PROJECT CODE
+/
+TELQUS: ASCIZ/ENTER YOUR TELEPHONE NUMBER
+/
+TELBIG: ASCIZ/
+LIMIT PHONE TO 24 CHARACTERS/
+HOWTRA: ASCIZ/ENTER CITY & STATE TO 24 CHARACTERS
+/
+FORMAV: ASCIZ/AVAILABLE FORMS ARE (WIDTH BY LENGTH)
+SMALL   - 11 BY 9
+BIG     - 14 BY 11
+LARGE   - 14 BY 11
+TTY     - 8 1-2 BY 11
+SPECIAL - FOR SPECIAL FORMS
+WHITE MAY ALSO BE SPECIFIED AFTER SMALL, BIG AND LARGE
+TO INDICATE THE REVERSE SIDE OF THAT TYPE OF PAPER.
+/
+WONGNO: ASCIZ/
+ILLEGAL NUMBER/
+TOO135: ASCIZ/
+RE-ENTER, LIMIT TO 135 CHARACTERS
+/
+BILQUS:
+DECQUS: ASCIZ/ ANSWER Y OR N
+/
+OPTN1:  ASCIZ/VALID OPTIONS ARE
+HEAD            - PROVIDES HEADING AND PAGE NUMBERS
+COPIES=         - NUMBER OF TIMES TO PRINT ALL FILES
+LINES=          - NUMBER OF LINES PER PAGE
+FORTRAN         - USE FORTRAN CARRIAGE CONTROL
+DOUBLE          - EXTRA LINEFEED FOR EVERY LINE OUTPUT
+FULLCH          - USE FULL CHARACTER SET
+INDENT=         - AMOUNT OF MARGIN FROM LEFT SIDE OF PAPER
+/
+OPTN2:  ASCIZ/NODE=           - SPECIFIES NODE OF REMOTE SITE TO SPOOL TO
+TRANSFER        - SHOWS DESIRE TO PRINT REQUEST AT DIFFERENT
+                  SITE. LOCATION ASKED LATER ON
+REMOTE          - FORCES PRINTING TO REMOTE PRINTER
+CENTER          - FORCES PRINTING TO COMPUTER CENTER
+/
+OPTN3:  ASCIZ/CARRIAGE RETURN DEFAULTS TO 1 COPY
+/
+WHAOPN: ASCIZ/BAD OPTIONS, REENTER THEM AGAIN
+/
+ILLNUM: ASCIZ/
+ILLEGAL NUMBER/
+NOREMP: ASCIZ/NO REMOTE PRINTER,SPOOLING TO CENTER
+/
+NUNSPO: ASCIZ/
+NO FILES SPOOLED FOR PRINTING/
+COPTOO: ASCIZ/
+TOO MANY COPIES, MAX IS 64
+/
+LINTOO: ASCIZ/
+TOO MANY LINES, MAX IS 262143
+/
+TRA024: ASCIZ/
+LIMIT LOCATION TO 24 CHAR.
+/
+MAILMOD:ASCIZ/ENTER ONE OF THE FOLLOWING:
+MAIL            - BY MAIL, 1ST CLASS
+PICKUP          - HOLD FOR PICKUP
+COURIER         - BY COURIER SERVICE
+SPECIAL         - BY MAIL, SPECIAL DELIVERY
+AIR EXPRESS     - BY AIR EXPRESS
+/
+OFFMOD: ASCIZ/OFFICE            - BY INTER OFFICE MAIL
+/
+LATPIC: ASCIZ/
+TO DETERMINE YOUR PICKUP ADDRESS, DO A WHERE COMMAND
+AFTER THE REQUEST IS COMPLETED/
+PICKUP: ASCIZ/
+PICKUP ADDRESS:
+/
+TYMINC: ASCIZ/TYMSHARE, INC.
+/
+ADREXP: ASCIZ/EXAMPLE:   JOHN DOE
+   YOUR COMPANY
+   COMPANY ADDRESS
+   CITY, STATE   ZIP
+/
+ADRTOO: ASCIZ/
+REDO ADDRESS (6 LINES, 39 CHAR. PER LINE)
+/
+ADRMIS: ASCIZ/
+ADDRESS FILE MISSING OR USERNAME WRONG
+/
+DELQUS: ASCIZ/TYPE DELIVERY INSTRUCTIONS TO CONT-D
+/
+INSTOO: ASCIZ/
+REDO INSTRUCTIONS TO 139 CHAR./
+ANYQUS: ASCIZ/
+ANY QUESTIONS CONCERNING THIS REQUEST,
+PLEASE CALL /
+FILSPO: ASCIZ/  FILES SPOOLED
+/
+CANREQ: ASCIZ/
+CANCELING REQUEST/
+        END
+    EmFEU
