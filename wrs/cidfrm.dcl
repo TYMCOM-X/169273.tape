@@ -1,0 +1,21 @@
+external integer CFD;		comment crash frame descriptor;
+external integer UBA;		comment user page table page number in crash;
+external integer EBA;		comment exec page table page number in crash;
+external integer CNFTBL;	comment address of config table in crash;
+
+define CONFIG = "CNFTBL";	comment an alternate name;
+external integer CRSDB;		comment address of CRSDB table in crash;
+external integer NUMTAB;	comment address of NUMTAB table;
+external integer NSWTBL;	comment address of NON-SWAP TABLE in crash;
+external integer CPU;		comment cpu type;
+external integer array MAP[0:'777]; comment page table data (word per page);
+external integer FMBloc;	comment fast mem block address in crash;
+external integer array FMB[0:'17]; comment fast memory block;
+external simple boolean procedure GETCRASH (string FileName);
+external simple integer procedure RPM (integer LOC);
+external simple procedure RPA (integer LOC; integer array A);
+external simple integer procedure RVM (integer LOC);
+external simple procedure RVA (integer LOC; integer array A);
+external simple procedure SETFMB (integer LOC);
+external procedure CREFRM;
+external simple procedure RELFRM;
