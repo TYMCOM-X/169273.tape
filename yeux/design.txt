@@ -1,0 +1,507 @@
+
+![ VUE %2 REDESIGN ]
+!
+![ BUFFER DESIGN NOTES ]
+!
+!	Internal Buffer Organization
+!
+!
+!	Ordered list of special buffers:
+!
+!	o  Window-Bar        STATIC    WINBUF:
+!	o  Status-Line       STATIC    STSBUF:
+!	o  Echo-Area         STATIC    ECHBUF:
+!	o  Keyboard-Macro    NORMAL    (allowed so it may be edited)
+!	   Macro-Definitions ??????    (mechanism to view,copy,edit,replace)
+!
+!	o  Current Text Buffer         TXTBUF:
+!	o  Current Kill Buffer         KILBUF:
+!	o  Current Command Buffer      CMDBUF:
+!	o  Current Temp Buffer         TMPBUF:
+!
+!	Ring-Buffer to Environment     ENVRNG:
+!
+!	   Text-Buffer-List  READONLY  (emacs-style display list)
+!	   Environment-Vars  SETUP     (user-defined variables)
+!	   Key-Binding-List  SETUP     (unbound functions, macros)
+!
+!	Ring-Buffer for Text-Buffers   TXTRNG:
+!	   (always in buffer file)
+!
+!	Ring-Buffer for Kill-Buffers   KILRNG:
+!	   (potentially in memory)
+!
+!	Ring-Buffer for Command-Files  CMDRNG:
+!	   (usually one, maybe more)
+!
+!	Ring-Buffer for Temp-Buffers   TMPRNG:
+!	   ("named" TEMP; super-temp)
+!
+!
+!	Buffer Ring Link Format		(? Allow circular construct ?)
+!
+!	+=======================================+
+!	|					|	Header
+!	|  Ring Status:  IN-USE IN-MEM ON-DSK	|
+!	|  Ring Previous Buffer			|	0 means HEAD
+!	|  Ring Next Buffer			|	0 means TAIL
+!	|  Ring Directory Address (Page?)	|
+!	|					|
+!	+=======================================+
+!
+
+
+
+!
+!	VUEENV - Buffer Environment Format
+!
+!	The following format will be used for the buffer environment
+!	file and the alternate "saved" buffer environment.  This will
+!	make it easier to move buffers back and forth between the two
+!	(or more) environment files.  Channel considerations will also
+!	be minimal since all buffers will co-exist in one file.
+!
+!	+=======================================+
+!	|					|	Header Info
+!	|      Environment Directory Page	|	Ptrs to DIR Pages
+!	|					|
+!	+---------------------------------------+
+!	|					|	Single Bit Map
+!	|	  Environment Page Map		|	of pages in-use
+!	|					|	1 to 18432
+!	+---------------------------------------+
+!	|					|	Header Info
+!	|	 Buffer # 1 - Directory		|	Ptr to MAP Pages
+!	|					|	Ptr to GAP Pages
+!	+---------------------------------------+
+!	|					|	MAP Page(s)
+!	|	   Buffer # 1 - Pages		|	GAP Page(s)
+!	|		   ...			|
+!	|	   Buffer # 1 - Pages		|	Data Pages
+!	|					|
+!	+---------------------------------------+
+!	|					|	Header Info
+!	|	 Buffer # 2 - Directory		|	Ptr to MAP Pages
+!	|					|	Ptr to GAP Pages
+!	+---------------------------------------+
+!	|					|	MAP Page(s)
+!	|	   Buffer # 2 - Pages		|	GAP Page(s)
+!	|		   ...			|
+!	|	   Buffer # 1 - Pages		|	Data Pages
+!	|		   ...			|	Data Pages
+!	|	   Buffer # 2 - Pages		|	Data Pages
+!	|					|
+!	+---------------------------------------+
+!	|					|	Header Info
+!	|	 Buffer # N - Directory		|	Ptr to MAP Pages
+!	|					|	Ptr to GAP Pages
+!	+---------------------------------------+
+!	|					|	MAP Page(s)
+!	|	   Buffer # N - Pages		|	GAP Page(s)
+!	|		   ...			|
+!	|	   Buffer # 1 - Pages		|	Data Pages
+!	|		   ...			|	   ...
+!	|	   Buffer # 2 - Pages		|	As more buffers
+!	|		   ...			|	are added the
+!	|	   Buffer # N - Pages		|	data pages will
+!	|		   ...			|	become more and
+!	|	   Buffer # 2 - Pages		|	more mixed.
+!	|					|
+!	+=======================================+
+!
+
+
+!
+!	EDIR:  Environment Directory Page
+!
+!	Information necessary for verifying that this is indeed
+!	a proper VUE environment file as well as version, status
+!	and pointers to each buffer directory entry.
+!
+!	+=======================================+
+!	|					|
+!	|  Environment Version, Header Size	|	Header Info
+!	|  Environment Designator		|	Verify Code
+!	|  Environment Status			|	State of Env
+!	|  Environment Name (ID)		|	Name of Env
+!	|  Environment Page Allocation Table	|	No. of Pages,,Loc
+!	|  Environment Free Word		|	Ptr to First Free
+!	|  Environment Lock Word		|	Access Lock to Env
+!	|  Environment Buffer Count		|	Number of Buffers
+!	|  Environment Max Buffers		|	Maximum Buffers
+!	| 					|
+!	|  Buffer Pointer # 1			|	Ptr to Dir Page #1
+!	|  Buffer Pointer # 2			|	Ptr to Dir Page #2
+!	|	...				|
+!	|  Buffer Pointer # N			|	Ptr to Dir Page #N
+!	|					|
+!	+=======================================+
+!
+!
+!	EPAT:  Environment Page Allocation Table
+!
+!	Each bit represents a single file page in the environment
+!	file.  If the bit is set (1), then the page is allocated.
+!	One EPAT page exists for every 18,432 file pages needed to
+!	contain the collected user buffer pages.
+!
+!	+=======================================+
+!	|					|	Bit Map of pages
+!	|  Bit Map of pages in use		|	starting at 1
+!	|					|	ending at 18,432
+!	+---------------------------------------+
+!	|					|	Bit Map of pages
+!	|  ...additional pages if necessary...	|	starting at 18,433
+!	|					|	ending at n*18,432
+!	+=======================================+
+!
+
+
+!
+!	BDIR:  Buffer Directory Page
+!
+!	Each BDIR will is segmented into 1 to 4 major areas:
+!
+!	{1} The bare minimum amount of information needed to
+!	    keep track of a particular buffer and its contents;
+!
+!	{2} The information about a buffer needed to allow its
+!	    contents to be edited as text;
+!
+!	{3} File related information which is needed to write
+!	    write the buffer out to a disk file;
+!
+!	{4} The free pool used by various parts of the previous
+!	    three sections.
+!
+!	+=======================================+
+!	|					|
+!	|	{1} The bare minimum		|
+!	|					|
+!	+---------------------------------------+
+!	|					|
+!	|	{2} The edit essentials		|
+!	|					|
+!	+---------------------------------------+
+!	|					|
+!	|	{3} The file info		|
+!	|					|
+!	+---------------------------------------+
+!	|					|
+!	|	{4} The free pool		|
+!	|					|
+!	+=======================================+
+!
+!	This organization is made to allow a BDIR to fit into as
+!	compact a space as is needed for the particular buffer
+!	and to allow for expansion when all the information is
+!	needed.  In general, each BDIR will use an entire page of
+!	memory, but for certain internal buffers it is desired to
+!	keep only a small stub for reference.  This is become
+!	clear "later".
+!
+!
+
+
+!
+!	BDIR:  {1}  "Bare Minimum"
+!
+!	This is the information needed by any routine which needs
+!	to read or write complete portions of the buffer, where
+!	a "complete portion" is considered to be the entire buffer,
+!	the first N line(s) of the buffer or appending at the end.
+!	Special internal buffers such as the status-line or the bar
+!	used to separate windows on the screen make heavy use of
+!	this information without regard to anything else.
+!
+!	This information is part of EVERY buffer.
+!
+!	+=======================================+
+!	|					|
+!	|  Buffer Entry Size,,Header Size	|	Format Size
+!	|  Buffer Status Info,,Version		|	Type, etc.
+!	|					|
+!	|  Buffer Size in Bytes			|	EOF * Byte-Size
+!	|  Buffer Byte Size			|	Character size
+!	|					|
+!	|  Buffer ILDB to first byte		|	For Reading
+!	|  Buffer IDPB to N+1st byte		|	For Writing
+!	|					|
+!	|  Buffer ILDB to This Char		|	For GetThis
+!	|  Buffer Chars before This		|	... GetPrev
+!	|  Buffer Chars after This		|	... GetNext
+!	|					|
+!	|  Buffer Page Map ( Zero if none )	|	Multi-Page
+!	|  Buffer Gap Map ( Zero if none )	|	Multi-Gap
+!	|					|
+!	+---------------------------------------+
+!	|		...			|
+!
+!	For internal buffers the ILDB pointers to the first byte
+!	and to the N+1st byte actually point to the data in the
+!	user's address space.  For external ("file") buffers these
+!	pointers will be 0.
+!
+!	The ILDB pointer to "this" char points at the current
+!	byte of the buffer being examined.  The count variables
+!	refer to the number of characters in this memory page
+!	before and after the current point which can be examined
+!	without having to re-frame the page due to exceeding the
+!	page limits or reaching the current page gap.
+!
+!	The PMAP and GMAP entries will be 0 if the buffer fits
+!	entirely in the space provided by the free pool section
+!	of the BDIR.  Otherwise they will contain the respective
+!	process page and file page for the first of the PMAP and
+!	GMAP page(s).
+!	
+
+
+!
+!	BDIR:  {2}  "Edit Essentials"
+!
+!	The information in this section describes the current
+!	pointer into the buffer and the position of any marks
+!	set by the user during the course of editing.  These
+!	fields are only necessary when text is to be inserted
+!	or deleted from someplace other than the end of the
+!	buffer.  Mode information affects how various editing
+!	commands work and how the text is to be displayed.
+!
+!	This information is needed if the buffer is to be edited
+!	in any way.  (That is, edited as TEXT)
+!
+!
+!	|		...			|
+!	+---------------------------------------+
+!	|					|
+!	|  Buffer Point in Bytes		|	Current Loc
+!	|  Buffer Point Page			|	Current Page
+!	|  Buffer Point Line			|	Current Line
+!	|  Buffer Last Point in Bytes		|	Last Loc
+!	|  Buffer Last Page			|	Last Page
+!	|  Buffer Last Line			|	Last Line
+!	|					|
+!	|  Buffer Mark in Bytes (List Offset)	|	Mark List
+!	|					|
+!	|  Buffer Mode	(Sixbit /Mode/)		|	Mode Name
+!	|  Buffer Name				|	Ptr to Name
+!	|  Buffer Alias				|	Ptr to Alias
+!	|					|
+!	+---------------------------------------+
+!	|		...			|
+!
+!	The "point" mentioned here is always kept as the full
+!	absolute character position in the buffer.  This does
+!	not include space used by gaps.  Page and line numbers
+!	refer to TEXT pages separated by form-feed characters
+!	and lines separated by line-feed characters.  (Note:
+!	vertical tabs will be counted as a single line-feed.)
+!
+!	The "last" point will be the point at which the user was
+!	positioned prior to the beginning of a search command.
+!
+!	The mark-list is to be interpreted as a mark-stack with
+!	a -1 value meaning <no-marks>.  A non-negative value will
+!	indicate a single mark at the absolute character position
+!	specified (0 = beginning of buffer) and a negative value
+!	other than -1 will indicate a push-down pointer to the
+!	list of marks (completely variable in size)
+!
+
+
+!
+!	BDIR:  {3}  "File Info"
+!
+!	This section contains information needed to keep track
+!	of the original disk file which is being edited.  The
+!	information is stored when the buffer is created from
+!	a "real" file.  It may then be used to compare the current
+!	buffer data against an external file to determine whether
+!	the buffer or file is the same as the one being edited.
+!
+!	When the buffer is written out, the appropriate file
+!	information is used for the new output file.
+!
+!	This information is only needed for external TEXT files.
+!
+!
+!	|		...			|
+!	+---------------------------------------+
+!	|					|
+!	|  Buffer File Status			|	Flags
+!	|					|
+!	|  Buffer File Structure		|	Device
+!	|  Buffer File Name			|	File
+!	|  Buffer File Extension		|	Ext
+!	|  Buffer File PPN			|	PPN
+!	|  Buffer File Username (2w)		|	User
+!	|					|
+!	|  Buffer File Creation Date,,Time	|	Creation stuff
+!	|  Buffer File License,,Protection	|	License/Prot
+!	|  Buffer File Checksum (Sixbit)	|	Verify stuff
+!	|  Buffer File Author PPN		|	Real Author
+!	|					|
+!	+---------------------------------------+
+!	|		...			|
+
+
+!
+!	BDIR:  {4}  "Free Pool"
+!
+!	This section may contain the buffer TEXT, pointers to any
+!	marks set by the user, ascii text strings and text pointers
+!	or any "spare" information which is needed by the three
+!	previously described sections.  This space is included in
+!	the entry size, but is not included in the header size.
+!	All other sections must be included in the header size to
+!	be part of the BDIR entry.
+!
+!	For special internal buffers such as the status line and
+!	the echo area, the entire buffer is included in this area.
+!	Small "scratch" buffers may also utilize this area until
+!	the text exceeds the size limitation imposed by the entry.
+!
+!	Note: There is NO restriction which declares that this
+!	      area plus the previous header information must fit
+!	      into a single page.  Internal buffers may exceed
+!	      this size when necessary!!!
+!
+!
+!	|		...			|
+!	+---------------------------------------+
+!	|					|
+!	|  Buffer Free Pool /Text/Marks/etc/	|	Variable Size
+!	|					|	with variable
+!	|					|	data.
+!	+=======================================+
+!
+!
+
+
+!
+!	PMAP:  Page Map Format
+!
+!	One entry is kept for each buffer "file" page, without
+!	regard to whether the buffer is part of a file or not.
+!	The memory page refers to the user's current address
+!	space and the file page is which page to map from the
+!	environment file.  If an entry is 0, then that page
+!	is non-existent in this buffer.  If either the memory
+!	or file page is zero, then that particular buffer page
+!	is not currently mapped (to memory or to a file).
+!
+!	Note: No buffer will EVER be mapped to process page 0
+!	      and file page 0 doesn't exist on TYMCOM-X.  On
+!	      TOPS-20 file page 0 exists, but this will ALWAYS
+!	      be the directory page of the environment file.
+!
+!	+-------------------------------------------------------+
+!	|            |                                          |
+!	|   Memory   |          Environment File Page           |
+!	|    Page    |            1 to 134,217,728              |
+!	|            |                                          |
+!	|   9 Bits   |                 27 Bits                  |
+!	|            |                                          |
+!	+-------------------------------------------------------+
+!
+!
+!	GMAP: Gap Map Format
+!
+!	One entry is kept per corresponding page in the PMAP
+!	which is described above.  If the entry is 0, then
+!	there is no gap on that particular page.  A position
+!	of 0 means the beginning of the page, or "after" the
+!	zero-th character in the buffer.
+!
+!	+-------------------------------------------------------+
+!	|                           |                           |
+!	|       Size of Gap in      |    Absolute Character     |
+!	|         Characters        |     Position of Gap       |
+!	|                           |                           |
+!	|          18 Bits          |         18 Bits           |
+!	|                           |                           |
+!	+-------------------------------------------------------+
+!
+!
+
+
+!
+!	Routines needed to manipulate buffers and their contents
+!
+!	Create ENV
+!	Initialize ENV
+!	Query/Set ENV Flags
+!	Lock/Unlock ENV (password)
+!	Kill ENV
+!	Create Alternate ENV
+!	Kill Alternate ENV
+!	Query/Set Alternate ENV Flags
+!	Delete Alternate ENV Buffer
+!	Lock/Unlock Alternate ENV Buffer
+!
+!	Create Buffer Ring
+!	Add Buffer to Ring
+!	Remove Buffer from Ring
+!	Rotate Ring
+!	Next Buffer
+!	Previous Buffer
+!
+!	Archive (Write) Buffer to ENV (with options)
+!	Retrieve (Copy) Buffer from ENV (with options)
+!	Encrypt/Decrypt Buffer in ENV (with options)
+!
+!	Read File into Buffer (Encrypted)
+!	Insert File into Buffer (Encrypted)
+!	Write File from Buffer (Encrypted)
+!	Execute File (Encrypted)
+!	Read Keyboard Macro into Buffer
+!	Insert Keyboard Macro into Buffer
+!	Write Keyboard Macro from Buffer
+!
+
+
+!
+!	Insert (Empty) Page in Buffer
+!	Delete (Empty) Page from Buffer
+!	Insert (Non-Empty) Page in Buffer
+!	Delete (Non-Empty) Page from Buffer
+!	Copy (Non-Empty) Page into Buffer
+!
+!	Create Buffer (Add Buffer to Ring)
+!	Copy Buffer   (Add Buffer to Ring)
+!	Erase Buffer  (-Empty- Buffer)
+!	Kill Buffer   (Erase Buffer : Remove Buffer from Ring)
+!	Insert Buffer [after point]
+!	Execute Buffer [as commands]
+!
+!	Read Point Position
+!	Set Point Position
+!
+!	Get Char from Buffer
+!	Get This (LDB)
+!	Get Next (ILDB)
+!	Get Previous (DBP-LDB)
+!
+!	Set Char in Buffer
+!	Set This (DPB)
+!	Set Next (IDPB)
+!	Set Previous (DBP-DPB)
+!
+!	Insert Char in Buffer
+!
+!	Delete Char in Buffer
+!	Delete Next
+!	Delete Previous
+!
+!	Copy Char from Buffer to Buffer
+!	Copy Next
+!	Copy Previous
+!
+
+
+!
+!	More? ...
+!
+
+   
