@@ -1,0 +1,286 @@
+module vueman(stack=own(stack,2000),optimize,ccl) = begin
+
+!
+! This module is the main command processing loop.  It is
+! concerned with the invocation and execution of basic commands
+! as well as the extended and user-defined macro commands.
+! When the dust settles, the macro commands should be moved into
+! the normal command module VUECMD.
+!
+
+bind	MetaValue = #200,		! offset for " Meta- "
+ 	CtrlXValue = #400,		! offset for " C-X "
+	Null = plit asciz'';		! a null string
+
+global	bind Maxcalls=100;		! size of stacks
+global	cmdstk[MaxCalls+1];		! command pointer stack
+global	repstk[Maxcalls+1];		! repeat count stack
+
+global	cclflag,			! flag for type of entry
+	kbdptr;				! current keyboard macro pointer
+
+external
+
+	hbot, hend, hptr,		! buffer bottom, top, pointer
+	nowait,				! flag for tty waiting
+
+	EscValue,			! escape value
+	MetaPrefix,			! meta prefix value
+	XPrefix,			! control-X prefix value
+	DelValue,			! delete value
+	AbortValue,			! control-G (command abort) value
+
+	argflg,				! flag for argument possible
+	radix,				! value of argument radix (10)
+	repeat,				! repeat count for command
+	cmdlvl,				! command execution level
+
+	mcrlvl,				! macro execution level
+	mcrstk,				! stack of macro pointers
+	mcrptr,				! current macro pointer (ildb)
+	mcrdef,				! flag for macro-by-example
+
+	flush,				! flag for "input" flushed
+	killer,				! flags that we were a kill
+	laskil,				! flags that last was a kill
+	PrmptC,				! commands since toPrompt
+
+	argmpy,				! value for C-U repeat count
+	comchar,			! current command "character value"
+	distbl;				! pointer to dispatch table
+
+!
+!  Routines defined elsewhere::
+!
+external
+
+	begtxt,				! move to beginning of buffer
+	abortC,				! command abort (command)
+
+	release,			! release a file channel
+
+	reset,				! reset io and check out user
+	dspini,				! setup dispatch table
+	bufini,				! initialize buffers
+	wndini,				! initialize window
+	vueini,				! read init file commands
+	cclstuff,			! read TMP file (if one)
+	dorescan,			! read terminal command line
+	asktty,				! get a legal terminal
+	varini,				! initialize environment vars
+
+	autoloss,			! automatic checkpoint facility
+	numarg,				! routine to read a numeric arg
+	redisp,				! window redisplay
+
+	ttyidle,			! check input buffer for commands
+	readch,				! read a character
+	readcc,				! read a command character
+	getstr,				! read a string
+	getaun,				! get users account # from exec
+
+	toPrompt,			! print a message in prompt line
+	writeloss,			! print a character on the screen
+	errstr;				! print error message routine
+
+global routine pushio =			! PUSH DOWN ONE COMMAND LEVEL
+
+    if .cmdlvl geq MaxCalls		! too deep?
+     then return errstr(plit asciz'Macro Depth Overflow')
+     else begin
+	repstk[.cmdlvl]_ .repeat;	! store appropriate stuff
+	repeat_1;			! reset repeat count = 1
+	cmdlvl_ .cmdlvl+1;		! increment stack
+	cmdstk[.cmdlvl]_ 0		! read from the terminal
+     end;
+
+
+global routine pushlvl( value ) = begin	! PUSH DOWN ONE LEVEL TO VALUE
+    pushio();				! push one level
+    cmdstk[.cmdlvl]_ .value		! set value
+end;
+
+
+global routine popio =			! POP OUT ONE COMMAND LEVEL
+
+    if .cmdlvl gtr 0			! If we have any depth
+     then begin				!  then
+	if .cmdstk[.cmdlvl]<18,18>	!   check for file pointer
+	   eql #777777			!     of the form -1,,chan
+	 then Release( .cmdstk[.cmdlvl]<0,18> );
+	cmdlvl_ .cmdlvl-1;		!   return one level
+	repeat_ .repstk[.cmdlvl]	!   copy old repeat count
+     end
+     else repeat_ 1;			!  else zap repeat
+
+
+global routine zapmac = begin		! POP OUT OF A COMMAND
+    repeat_1;				! Set repeat count
+    toPrompt(plit asciz' Pop!  Done.');	! Let user know it finished
+    if .cmdlvl gtr 0			! If we have any depth
+     then cmdlvl_ .cmdlvl-1		!  then decrement a level
+end;
+
+
+global routine zaplvl = begin		! POP OUT OF ALL COMMANDS
+    toPrompt(plit asciz' Pop!  Done.');	! Let user know it finished
+    decr i from .cmdlvl			! for all levels
+     do Popio()				!  decrement out
+end;
+
+
+global routine RetKbd = Popio();	! RETURN FROM KEYBOARD MACRO
+
+
+global routine XctKbd = begin		! EXECUTE KEYBOARD MACRO
+    pushio();				! push command level
+    cmdstk[.cmdlvl]_ .kbdptr		! setup macro pointer & fall out
+end;
+
+global routine metaa = begin		! MACRO - Command level QUERY
+    local tc;
+
+    redisp(1);				! settle the redisplay down
+
+    pushio();				! bump stack a level
+    toPrompt(plit asciz 'Query:');	! print a message
+    tc_readch();			! read a character
+    popio();				! restore stack
+
+    if .tc eql .AbortValue		! if user wants abort
+     then return abortC();		!  then do it
+
+    if (.tc eql " ") or			!  else check for space
+       (.tc eql "y") or			!    or "y"  (lower case)
+       (.tc eql "Y")			!    or "Y"  (upper case)
+     then return			! if match then continue
+     else return RetKbd()		!  else return from "macro"
+end;
+
+global routine metal = begin		! COPY BUFFER INTO KEYBOARD MACRO
+    local ptr;
+
+    BegTxt();				! move to beginning of buffer
+    ptr_ .hptr;				! and copy starting pointer
+    incr i from 1 to .hend-.hbot	! for each character
+     do begin
+	replacei(KbdPtr,scann(ptr));	! copy it into the macro buffer
+	incp(ptr)			! then move pointer ahead
+     end;
+    replacei(KbdPtr,CtrlXValue+")");	! store terminator C-X )
+    return
+end;
+
+global routine mcrbydef =		! SETUP DEFINE BY EXAMPLE
+    if .mcrdef				! If already in here, complain
+     then return errstr(plit asciz'Already in define mode.')
+     else mcrdef_-1;
+
+
+global routine ctrlxm = begin
+    local char,lastchar;
+
+    lastchar_0;
+    toPrompt(plit asciz'Macro def: ');
+    while 1 do begin
+	char_readch();
+	replacei (mcrptr,.char);
+	if ((.char and CtrlXValue) neq 0)
+	 then writeloss("?X");
+	if ((.char and MetaValue) neq 0)
+	 then writeloss("$");
+	writeloss(.char and #177);
+	if .lastchar eql .XPrefix and .char eql ")"
+	 then return;
+	if .char eql ( CtrlXValue+")" )
+	 then return;
+	lastchar_.char
+    end
+end;
+
+Global routine GetCmd = begin
+    own cnt;
+
+    if .cmdstk[.cmdlvl] eql 0		! if not reading a pointer
+     then if ttyidle()			!  then if nothing to do
+	 then begin
+	    autoloss();			! call check-point code.
+	    if redisp(.cnt geq 10)	! 1 vs 0 works out perfect T/F
+	     then cnt_ 0		! then no ignored commands.
+	 end;
+
+    comchar_ readcc();			! read a command.
+    cnt_ .cnt+1				! count undisplayed commands.
+end;
+
+
+global routine XctVue = begin
+    local cmd,lastcmd;
+
+    while 1 do begin
+	if not .argflg			! if not inside an argument
+	 then repeat_ 1;		!  then reset repeat count
+	getcmd();			! read a command
+	if .comchar eql -1		! check for no-wait flag
+	 then return;			!  if done... then exit.
+
+	PrmptC_ .PrmptC + 1;		! count times through
+	if .PrmptC eql 25		! after 25 commands or chars
+	 then toPrompt(plit asciz'');	!  feel free to clear prompt
+
+	while .repeat gtr 0
+	 do begin			! Check > 0, else -big loop!
+	    cmd_ 0;			! initialize command variable
+
+	    if .argflg			! if argument possible next
+	     then if .comchar geq "0"	!  then if command was a digit 0-n
+		 and .comchar leq .radix+"0"
+		   then begin		!    handle it specially.
+		      NumArg();		!    "get argument"
+		      ExitLoop		!     and loop for next cmd
+		   end;
+
+	    cmd_ .(@distbl)[.comchar];	! setup dispatch for command
+	    argflg_ 0;			! clear flag for each command
+
+	    if .cmd neq 0		! if we got something
+	     then (.cmd)();		!  then execute command
+
+	    if .argflg			! if argument count command
+	     then exitloop;		!  then don't decrement count
+
+	    laskil_ .killer;		! copy kill flag
+	    killer_ 0;			! then clear it.
+
+	    repeat_.repeat-1		! repeat for count
+	end
+    end
+end;
+
+
+!	***    MAIN PROGRAM STARTS HERE    ***
+
+    Cclflag_ .Vreg;			! Save CCL info.
+    Reset();				! Checkout user & clear ECHO.
+    Bufini();				! Initialize a buffer
+    Dspini();				! Initialize dispatch table.
+
+    If .cclflag
+     then cclstuff()			! Either read TMP file
+     else dorescan();			!   or   possible command line.
+
+    If Asktty()				! If we get a legal terminal
+     then begin				!  then we have work to do
+	varini();			!    Initialize environment vars
+	wndini();			!    Initialize window
+	If vueini()			!    If user has an INIT file
+	 then begin			!     then read it.
+	    nowait_ 1;			!       No wait for user during INIT
+	    XctVue()			!       Read Init file and type-ahead
+	 end;				!     ...
+	nowait_ 0;			!    Clear "no-waiting" flag
+	XctVue()			!    On your way!
+     end
+
+end eludom
+ 
