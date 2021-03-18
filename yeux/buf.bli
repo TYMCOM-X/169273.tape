@@ -1,0 +1,571 @@
+module buf(optimize) = begin
+
+!
+!  Module to maintain the buffer environment and the alternate
+!  environment file(s) created by the user.  All actual I/O is
+!  performed by routines in VUEIO which is monitor dependent,
+!  however almost all references are made in this module.
+!
+
+Require MACROS.DEF;			! Useful Macros
+Require IOBLKS.DEF;			! Tymcom-X IO Block Definitions
+
+!
+!    Routines needed to manipulate buffers and their contents
+!
+! *  Create ENV				Routine EnvCreate( EnvLookupBlk );
+! *  Initialize ENV			Routine EnvIni;
+!    Kill ENV
+!
+!    Query/Set ENV Flags
+!    Lock/Unlock ENV (password)
+!
+!    Create Buffer Ring
+!    Add Buffer to Ring
+!    Remove Buffer from Ring
+!    Rotate Ring
+!    Next Buffer
+!    Previous Buffer
+!
+!    Read File into Buffer (Encrypted)
+!    Insert File into Buffer (Encrypted)
+!    Write File from Buffer (Encrypted)
+!    Execute File (Encrypted)
+!    Read Keyboard Macro into Buffer
+!    Insert Keyboard Macro into Buffer
+!    Write Keyboard Macro from Buffer
+!
+
+
+!
+!    Insert (Empty) Page in Buffer
+!    Delete (Empty) Page from Buffer
+!    Insert (Non-Empty) Page in Buffer
+!    Delete (Non-Empty) Page from Buffer
+!    Copy (Non-Empty) Page into Buffer
+!
+!    Create Buffer (Add Buffer to Ring)
+!    Copy Buffer   (Add Buffer to Ring)
+!    Erase Buffer  (-Empty- Buffer)
+!    Kill Buffer   (Erase Buffer : Remove Buffer from Ring)
+!    Insert Buffer [after point]
+!    Execute Buffer [as commands]
+!
+!    Read Point Position
+!    Set Point Position
+!
+!    Get Char from Buffer
+!    Get This (LDB)
+!    Get Next (ILDB)
+!    Get Previous (DBP-LDB)
+!
+!    Set Char in Buffer
+!    Set This (DPB)
+!    Set Next (IDPB)
+!    Set Previous (DBP-DPB)
+!
+!    Insert Char in Buffer
+!
+!    Delete Char in Buffer
+!    Delete Next
+!    Delete Previous
+!
+!    Copy Char from Buffer to Buffer
+!    Copy Next
+!    Copy Previous
+!
+
+
+!    Create Alternate ENV
+!    Kill Alternate ENV
+!    Query/Set Alternate ENV Flags (NOT Environment Variables!)
+!    Delete Alternate ENV Buffer
+!    Lock/Unlock Alternate ENV Buffer
+!
+!    Archive (Write) Buffer to ENV (with options)
+!    Retrieve (Copy) Buffer from ENV (with options)
+!    Encrypt/Decrypt Buffer in ENV (with options)
+!
+
+
+!
+!  External Variables used in this module
+!
+
+external
+
+    MyAun,				! My Account Number (PPN)
+    MyUser;				! My Username (2 words)
+
+
+!
+!  External Routines used in this module
+!
+
+external
+
+!
+!  Defined in module: MAC
+!
+    TmpNam,				! Get "###NAM"
+
+
+!
+!  Defined in module: UTL
+!
+    AlcPag,				! Allocate memory pages (address)
+    DlcPag,				! De-Allocate memory pages
+    Error,				! Error Msg and Return 0
+
+!
+! Defined in module: IO
+!
+    SetOpn,				! Open Block setup
+    SetLkb,				! Lookup Block setup
+    Mapp,				! Page Mapping functions
+    UnMapp,				! Page Un-Mapping functions
+    Open,				! Channel Open
+    Close,				! Close and Release
+    Release,				! Channel Release
+    Lookup,				! File Lookup
+    Enter;				! File Enter
+
+
+!
+!  Channel designations.
+!
+
+Global Bind
+	UseChn = 1,			! Free-Use channel (can clobber)
+	ModChn = 2,			! Mode environment channel
+	EnvChn = 3,			! Buffer environment channel
+	AltChn = 4,			! Alternate environment channel
+	TxtChn = 5,			! Text (input/output) channel
+	MacChn = 6,			! Macro - Bindings channel
+	XctChn = 7;			! Take file channel
+
+!
+!  Miscellaneous Bindings for messages and data to make the
+!  actual code more readable.
+!
+
+bind
+
+    TmpEnvName = sixbit 'ENV',		! Environment File Name
+    TmpEnvType = sixbit 'TMP',		! Environment File Type
+    TmpEnvPPN  = 0,			! Environment File PPN (Owner)
+    Disk       = sixbit 'DSK',		! Default Open Device
+
+    EnvMAIN    = sixbit '#MAIN#',	! MAIN Environment ID Name
+    EnvVerify  = sixbit '#EDIR#',	! Verify Code for EDIR page
+    BufVerify  = sixbit '#BDIR#',	! Verify Code for BDIR page
+
+    WedgedDsk  = plit asciz 'Wedged Disk - NO Channels Available.',
+    WedgedEnt  = plit asciz 'Wedged Enter - Cannot Write Environment.',
+    WedgedEnv  = plit asciz 'Wedged Environment File - Bad Format.',
+    WedgedFil  = plit asciz 'Wedged File - Cannot Find Created File.',
+    WedgedMap  = plit asciz 'Wedged Map - Cannot Do Mapping Function.',
+    WedgedMem  = plit asciz 'Wedged Memory - Cannot Allocate Memory.';
+
+
+
+!
+!  The (buffer) Environment File
+!
+!  The following format will be used for the buffer environment
+!  file and the alternate "saved" buffer environment.  Having all
+!  buffers reside in one file will make it easier to manipulate
+!  multiple buffers and multiple occurrances of the same buffer in
+!  different window areas on the screen.
+!
+!	+=======================================+
+!	|      Environment Directory Page	|
+!	+---------------------------------------+
+!	|	  Environment Page Map		|
+!	+---------------------------------------+
+!	|	 Buffer # 1 - Directory		|
+!	+---------------------------------------+
+!	|	   Buffer # 1 - Pages		|
+!	+---------------------------------------+
+!	|	 Buffer # 2 - Directory		|
+!	+---------------------------------------+
+!	|	   Buffer # 2 - Pages		|
+!	|	   Buffer # 1 - Pages		|
+!	|		   ...			|
+!	+---------------------------------------+
+!	|	 Buffer # N - Directory		|
+!	+---------------------------------------+
+!	|	   Buffer # N - Pages		|
+!	|	   Buffer # ? - Pages		|
+!	|		   ...			|
+!	+=======================================+
+!
+!
+!  EDIR: Environment Directory Page Offsets
+!
+
+Bind
+!	Offset     =  Value		! data stored in location
+!	----------    -----------------	! -----------------------
+	EnvVersion =  0,		! Version ,, Header size
+	EnvStatus  =  EnvVersion+1,	! Status of file/buffers
+	EnvName    =  EnvStatus+1,	! Identity
+	EnvPATable =  EnvName+1,	! Page Allocation (bit) Table
+	EnvHash    =  EnvPATable+1,	! Hashed Password to Env
+	EnvAuthor  =  EnvHash+1,	! Author AUN/Username (3w)
+	EnvUsed    =  EnvAuthor+3,	! Count of buffers in use
+	EnvCurrent =  EnvUsed+1,	! Offset to Current/Last used
+	EnvBuffer  =  EnvCurrent+1,	! Offset to First buffer slot
+	EnvFree    =  EnvBuffer+1,	! Offset to First free slot
+
+	EnvCode	   =  #776,		! Verify Code Location
+	EnvEnd     =  #777;		! End of Env Directory
+
+
+
+!
+!  BDIR:  Buffer Directory Page
+!
+
+Bind					! ----------------------- Essential
+!	Offset     =  Value		! data stored in location
+!	----------    -----------------	! -----------------------
+	BufEntry   =  0,		! Entry size  ,, Header size
+	BufInfo    =  BufEntry+1,	! Status info ,, Version
+	BufSize    =  BufInfo+1,	! Size in bytes
+	BufByte    =  BufSize+1,	! Byte size (1-36)
+
+	BufBegin   =  BufByte+1,	! ILDB to first byte (or 0)
+	BufAppend  =  BufBegin+1,	! IDPB to N+1st byte (or 0)
+	BufChar    =  BufAppend+1,	! LDB to This character
+	BufBefore  =  BufChar+1,	! Count of chars before This
+	BufAfter   =  BufBefore+1,	! Count of chars after This
+
+	BufPageMap =  BufAfter+1,	! Memory, File page of PMAP
+	BufGapMap  =  BufPageMap+1,	! Memory, File page of GMAP
+
+					! ----------------------- Edit Info
+	BufPoint   =  BufGapMap+1,	! Byte count before point
+	BufPntPage =  BufPoint+1,	! Text Page at Cursor Point
+	BufPntLine =  BufPntPage+1,	! Text Line at Cursor Point
+	BufPntLast =  BufPntLine+1,	! Last Point: (3 word copy)
+
+	BufMark    =  BufPntLast+3,	! Pointer to Mark(s)
+
+	BufMode    =  BufMark+1,	! Sixbit mode name
+	BufName    =  BufMode+1,	! Sixbit buffer name
+	BufAlias   =  BufName+1,	! Pointer to asciz "alias"
+
+					! ----------------------- File Info
+	BufFStatus =  BufAlias+1,	! File status
+
+	BufFDevice =  BufFStatus+1,	! File structure
+	BufFName   =  BufFDevice+1,	! File Name (on disk)
+	BufFType   =  BufFName+1,	! File Type (extension)
+	BufFPPN    =  BufFType+1,	! File PPN
+	BufFUser   =  BufFPPN+1,	! File Username (2 words)
+
+	BufFDay    =  BufFUser+2,	! File Creation Date ,, Time
+	BufFProt   =  BufFDay+1,	! File License ,, Protection
+	BufFHash   =  BufFProt+1,	! File Hash for Encryption
+	BufFAuthor =  BufFHash+1,	! File Author PPN
+
+					! ----------------------- Free Pool
+					! The first word after the header.
+
+	BufCode    =  #776,		! Verify Code
+	BufEnd     =  #777;		! End of directory page
+
+
+!
+!  PMAP:  Page Map Format
+!
+!  One entry is kept for each buffer "file" page, without regard
+!  to whether the buffer is part of a file or not.  The memory
+!  page refers to the user's current process address space and
+!  the file page is which page to map from the environment file.
+!  If an entry is 0, then that page is non-existent in this buffer.
+!  If only one of the memory or file pages is zero, then that page
+!  is not currently mapped (to memory or to a file).
+!
+!	+-------------------------------------------------------+
+!	|            |                                          |
+!	|   Memory   |          Environment File Page           |
+!	|    Page    |            1 to 134,217,728              |
+!	|            |                                          |
+!	|   9 Bits   |                 27 Bits                  |
+!	|            |                                          |
+!	+-------------------------------------------------------+
+!
+    Macro
+	PageM( Memory, File ) = ( ((Memory)^27) or (File) ) $,
+	PageMM( Loc ) = ( Loc<27, 9> ) $,
+	PageMF( Loc ) = ( Loc< 0,27> ) $;
+
+!
+!  GMAP: Gap Map Format
+!
+!  One entry is kept per corresponding page in the PMAP which is
+!  described above.  If the entry is 0, then there is no gap on
+!  that particular page.  A position of 0 means the beginning of
+!  the page, or "after" the zero-th character in the page.
+!
+!	+-------------------------------------------------------+
+!	|                           |                           |
+!	|       Size of Gap in      |    Absolute Character     |
+!	|         Characters        |     Position of Gap       |
+!	|                           |                           |
+!	|          18 Bits          |         18 Bits           |
+!	|                           |                           |
+!	+-------------------------------------------------------+
+!
+!  Of course, this was designed with 7-9 bit files in mind.  Later
+!  versions will propose to allow files with byte sizes to range
+!  from 1 to 36 bits thus requiring a field large enough to specify
+!  values in the range 18,432 (1-bit bytes) to 512 (36-bit bytes).
+!  The normal value will be 2,560 allowing 3,072 for (sixbit),
+!  2,048 for (8-bit and 9-bit) bytes.
+!
+    Macro
+	GapM( Position, Size ) = ( Xwd( Position, Size ) ) $,
+	GapMP( Loc ) = ( Loc<18,18> ) $,
+	GapMS( Loc ) = ( Loc< 0,18> ) $;
+
+
+
+!
+!  Internal buffer list format
+!
+!  Pointers to buffer headers.  These items are used to access
+!  the data in specific buffers using the following construct:
+!
+!	(@ITEM)[OFFSET] _  .(@ITEM)[OFFSET]
+!    or
+!	(@ITEM)[.VAR] _  .(@ITEM)[.VAR]
+!
+!  where
+!    ITEM is one of the variables listed below
+!    OFFSET is the appropriate buffer or ring offset name
+!    VAR is an offset variable
+!
+
+Own
+
+!
+!  These pointers will change as often as necessary to point from one
+!  buffer to another and will generally be COPIES of other pointers.
+!
+
+	BDir,				! Pointer to Current Buffer
+	PMap,				! Pointer to Current PMAP
+	GMap,				! Pointer to Current GMAP
+
+!
+!  These pointers will be setup at the beginning and will rarely
+!  change since their contents remain fairly stable.
+!
+	WinBuf,				! Pointer to Window Separator
+	StsBuf,				! Pointer to Status Line
+	EchBuf,				! Pointer to Echo Area
+
+!
+!  These pointers will contain the current buffer being acted on
+!  of each type.  Note that these will all be duplicated by the
+!  actual pointer found in the buffer ring for each type.
+!
+	TxtBuf,				! Pointer to Current Text
+	KilBuf,				! Pointer to Current Kill
+	CmdBuf,				! Pointer to Current Command
+	TmpBuf;				! Pointer to Current Temp
+
+
+!
+!  Buffer Ring Pointers
+!
+!  These pointers are the mainstay of the editor.  Each points at a
+!  ring entry which contains pointers to other ring entries of the
+!  same type and to the buffer associated with the ring entry.  It
+!  is this buffer pointer (from the ring entry) which is copied to
+!  the appropriate buffer pointer above.
+!
+
+Own
+	EnvRng,				! Pointer into Environment Ring
+	TxtRng,				! Pointer into Text Ring
+	KilRng,				! Pointer into Kill Ring
+	CmdRng,				! Pointer into Command Ring
+	TmpRng;				! Pointer into Temp Ring
+
+!
+!  Buffer Ring Offsets
+!
+!  Initially the Ring will be 0 (no buffers).  The first buffer
+!  will point to itself, thus when the second buffer is made then
+!  both pointers of the first buffer will point to the second and
+!  vicea versa.  The third buffer then makes a "real" ring.
+!
+
+Bind
+	RingStatus = 0,			! Status of this ring entry
+	RingLast   = RingStatus+1,	! Pointer to previous entry
+	RingNext   = RingLast+1,	! Pointer to next entry
+	RingDir    = RingNext+1;	! Pointer to Buffer Directory
+
+!
+!  Buffer Ring status bits
+!
+
+Bind  ! maybe change to MACRO  ???
+
+	StatusModified =  1,		! Buffer has been modified
+	StatusOnDisk   =  2,		! Buffer is "on disk" (ENV)
+	StatusInMemory =  4,		! Buffer is in memory
+	StatusLocked   =  8;		! Buffer is locked
+
+! More to come...
+
+
+!
+!  Miscellaneous variables and pointer information
+!  (the names can easily be changed - this is to get them in here)
+!
+
+Own
+	EDir,				! Current Env. Directory ?
+	EPat,				! Current Env. P-A-T
+
+	EnvDir,				! Buffer Env. Directory
+	EnvPat,				! Buffer Page Allocation Table
+	AltDir,				! Alternate Env. Directory
+	AltPat,				! Alternate Page Alloc Table
+
+	MemMap,				! Process Memory Page Map
+	MemPat,				! Process Page Allocation Table
+
+!
+!  Data Arrays
+!
+	DefDev[OpnLength],		! Default Open (device) Block
+	AltDev[OpnLength],		! Alternate Open (device) Block
+
+	DefEnv[LkbLen],			! Default ENV Lookup Block
+	AltEnv[LkbLen];			! Alternate ENV Lookup Block
+
+
+
+Routine EnvCreate( Block ) =
+begin
+
+!
+!  This routine will create an "empty" environment file using
+!  the lookup block parameter passed by the calling procedure.
+!
+
+    If ( not Open(UseChn, DefDev) )	! If not (Open USE channel)
+     then Return Error( WedgedDsk );	!  then error return.
+
+    If ( not Enter(UseChn, DefEnv) )	! If not (Create File)
+     then begin				!  then take drastic action.
+	Release(UseChn);		!    Release the channel.
+	Return Error( WedgedEnt )	!    And error return.
+     end;
+
+    If ( 0 eql (Edir_ AlcPag( 2 )) )	! If not (Allocate 2 pages)
+     then begin				!  then take drastic action.
+	Release(UseChn);		!    Release the channel.
+	Return Error( WedgedMem )	!    And error return.
+     end;
+
+    If ( not Mapp( 0, Edir, 2 ) )	!  If not (Create Edir pages)
+     then begin				!   then take drastic action.
+	DlcPag( .Edir, 2 );		!    De-allocate two pages.
+	Release(UseChn);		!    Release the channel.
+	Return Error( WedgedMem )	!    And error return.
+     end;
+
+    (@Edir)[ EnvVersion ]_ Xwd( 1,EnvFree+1 );
+    (@Edir)[ EnvName    ]_ EnvMAIN;	! Set MAIN Environment ID
+    (@Edir)[ EnvPATable ]_ PageM(1,2);	! Set PAT page (2)
+    (@Edir)[ EnvAuthor  ]_ .MyAUN;	! Set Self as Author
+    (@Edir)[ EnvAuthor+1]_ .MyUser[0];	! Set My Username
+    (@Edir)[ EnvAuthor+2]_ .MyUser[1];	!  (in two parts)
+
+    (@Edir)[ EnvCode    ]_ EnvVerify;	! Set Unlikely Code
+    (@Edir)[ EnvEnd     ]_ -1;		! Set End of Page
+
+    (@Edir)[512]_ 3;			! Setup PAT (pages 1&2 in use)
+
+    If ( not UnMapp( Edir, Plit(UseChn,1), 2 ) )
+     then begin				!  If not (Unmap pages to file)
+	DlcPag( .Edir, 2 );		!    De-allocate two pages.
+	Release(UseChn);		!    Release the channel.
+	Return Error( WedgedMap )	!    And error return.
+     end;
+
+    DlcPag( .Edir, 2 );			! De-allocate the EDIR pages
+    Close(UseChn, 0);			! Normal close
+    Return 1				! Successful Return
+
+end;
+
+
+Global Routine EnvIni =
+begin
+
+!
+!  This routine initializes the environment file and reads in the
+!  pages necessary for it to be utilized by the editor.  No buffers
+!  are examined or read at this point.
+!
+
+    SetOpn(DefDev, Disk, #17, 0);	! Setup Open Defaults
+    If ( not Open(EnvChn, DefDev) )	! If not (Open ENV channel)
+     then Return Error( WedgedDsk );	!  then error return.
+
+    SetLkb(DefEnv, TmpNam(TmpEnvName), TmpEnvType, TmpEnvPPN);
+
+    If ( not Lookup(EnvChn, DefEnv) )	! If not (Find ENV file)
+     then begin				!  then create one.
+	If ( not EnvCreate(DefEnv) )	!    If not (Create ENV file)
+	 then Return 0;			!     then error return.
+	If (not Lookup(EnvChn,DefEnv))	!    If still not (Find ENV file)
+	 then Return Error( WedgedFil )	!     then error return.
+     end;
+
+    If ( not Enter(EnvChn, DefEnv) )	! If not (Set Update Mode)
+     then begin				!  then take drastic action.
+	Release(EnvChn);		!    Release the channel.
+	Return Error( WedgedEnt )	!    And error return.
+     end;
+
+    If ( 0 eql (Edir_ AlcPag( 2 )) )	! If not (Allocate 2 pages)
+     then begin				!  then this is silly.
+	Release(EnvChn);		!    Release the channel.
+	Return Error( WedgedMem )	!    And error return.
+     end;
+
+    If ( not Mapp( Plit(EnvChn,1), Edir, 2 ) )
+     then begin				! If not (Map Edir pages)
+	DlcPag( .Edir, 2 );		!    De-allocate the pages.
+	Release(EnvChn);		!    Release the channel.
+	Return Error( WedgedMap )	!    And error return.
+     end;
+
+    If ( .(@Edir)[ EnvCode ] neq  EnvVerify )
+     then begin				! If not (An EDIR page)
+	UnMapp( Edir, 0, 2 );		!    UnMap the pages.
+	DlcPag( .Edir, 2 );		!    De-allocate the pages.
+	Release(EnvChn);		!    Release the channel.
+	Return Error( WedgedEnv )	!    And error return.
+     end;
+
+    EPat_ .Edir + 512;			! Setup PAT page pointer
+
+    Return 1				! Successful Return
+
+end;
+
+
+
+end eludom
+    
